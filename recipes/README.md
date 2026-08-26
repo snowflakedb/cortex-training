@@ -1,8 +1,8 @@
 # Cortex Training Recipes
 
-Recipes are runnable, end-to-end workflows organized by task. Each
-recipe owns its code, documentation, metadata, optional notebooks, and future
-typed configuration examples.
+Recipes are runnable, end-to-end workflows organized by task. Each recipe owns
+its code, documentation, metadata, optional notebooks, and the JSON job configs
+under its `configs/` directory.
 
 ## Available Recipes
 
@@ -11,15 +11,6 @@ typed configuration examples.
 | [Conversational SFT](sft/conversational/README.md) | LoRA or full-parameter SFT | Hugging Face chat datasets | Runnable |
 | [Math GRPO](rl/math_grpo/README.md) | Reinforcement learning | Hendrycks MATH and MATH-500 | Runnable |
 | [Inference endpoint](inference/README.md) | Serve, generate, eval | Open weights, checkpoints, MATH-500 | Runnable |
-
-## Planned Recipes
-
-- [Continued pre-training](continued_pretraining/README.md)
-- [Preference optimization](alignment/README.md)
-- [Knowledge distillation](distillation/README.md)
-- [Tool-use training](tool_use/README.md)
-- [Multimodal training](multimodal/README.md)
-- [Framework integrations](integrations/README.md)
 
 ## Prerequisites
 
@@ -30,6 +21,8 @@ uv pip install -e .
 uv pip install 'tinker-cookbook[math-rl] @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
 uv pip install wandb
 ```
+
+(`pip install ...` works in place of `uv pip install ...` if you prefer.)
 
 Create a local Snowflake connection file from
 `examples/config/connection.json.template` (account host and PAT).
@@ -65,7 +58,8 @@ Every runnable recipe should provide:
   CLI knobs, JSON job configs, evaluation, and troubleshooting
 - `recipe.yaml` metadata used by the compatibility catalog
 - A runnable entry point
-- A last-validated date and environment
+- `last_validated` in `recipe.yaml`: the date of the last verified run, or `null`
+  when the recipe has not been validated since it last changed
 - Tests for local validation logic where practical
 - Attribution when adapted from an upstream cookbook or framework
 
