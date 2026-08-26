@@ -83,6 +83,7 @@ class JobListScreen(Screen):
         self._status_by_item: dict[str, str] = {}
         self._all_jobs: list = []
         self._filter = ""
+        self._last_refreshed = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -91,10 +92,22 @@ class JobListScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.app.sub_title = "select a job (↑/↓, Enter · / filter · r refresh)"
+        self._update_subtitle()
         self._load_jobs()
         # Gentle auto-refresh so status changes appear without pressing r.
         self.set_interval(self._REFRESH_SECONDS, self._auto_refresh)
+
+    def on_screen_resume(self) -> None:
+        # LogScreen owns the same app-level subtitle while it is active. Restore
+        # the picker status when the user returns from a job.
+        self._update_subtitle()
+
+    def _update_subtitle(self) -> None:
+        refreshed = self._last_refreshed or "—"
+        self.app.sub_title = (
+            "select a job (↑/↓, Enter · / filter · r refresh)"
+            f"  ·  last refreshed {refreshed}"
+        )
 
     def _auto_refresh(self) -> None:
         # Only refetch while the picker is the active screen — don't poll GS in
@@ -145,6 +158,8 @@ class JobListScreen(Screen):
             lv.append(ListItem(Label(f"[error] {error}")))
             return
         self._all_jobs = sort_jobs(jobs)
+        self._last_refreshed = time.strftime("%H:%M:%S")
+        self._update_subtitle()
         await self._render_jobs()
 
     async def _render_jobs(self) -> None:

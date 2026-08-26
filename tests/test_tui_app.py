@@ -19,6 +19,7 @@ the optional ``textual`` extra is installed (``pip install 'cortex-training[tui]
 import asyncio
 import glob
 import os
+import re
 from unittest.mock import MagicMock
 
 import pytest
@@ -97,6 +98,7 @@ async def _run_with_picker():
         # active job (RUNNING) sorted first
         assert screen._job_by_item["job-0"] == "7"
         assert screen._job_by_item["job-1"] == "old"
+        assert re.search(r"last refreshed \d{2}:\d{2}:\d{2}", app.sub_title or "")
         await _settle(app, pilot)
 
 
