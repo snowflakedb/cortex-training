@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared Cortex Training recipe helpers."""
+"""Cortex Training recipe helpers."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ import re
 from collections.abc import Iterator
 from collections.abc import Mapping
 from collections.abc import Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -49,11 +50,19 @@ LORA_TARGET_MODULES = (
 )
 
 
-def make_client(config_path: str, **overrides: Any) -> CortexTrainingClient:
+def load_connection_mapping(config_path: str) -> dict[str, Any]:
+    """Load a recipe connection file (PAT host, database, schema)."""
     parsed = json.loads(Path(config_path).expanduser().read_text(encoding="utf-8"))
     if not isinstance(parsed, dict):
         raise ValueError(f"connection config {config_path} must be a JSON object")
     config = parsed.get("connection", parsed)
+    if not isinstance(config, dict):
+        raise ValueError(f"connection config {config_path} must be a JSON object")
+    return config
+
+
+def make_client(config_path: str, **overrides: Any) -> CortexTrainingClient:
+    config = load_connection_mapping(config_path)
 
     pat = config.get("pat")
     kwargs: dict[str, Any] = dict(
@@ -78,12 +87,36 @@ def make_client(config_path: str, **overrides: Any) -> CortexTrainingClient:
     )
 
 
-def training_sub_job_id(job_id: str) -> str:
-    return f"{job_id}:training:0"
+def resolve_cortex_training_config_path(path: str, *, search_dirs: Sequence[Path] = ()) -> Path:
+    """Resolve ``job_config=`` to an existing JSON file."""
+    raw = Path(path).expanduser()
+    candidates = [raw]
+    if not raw.is_absolute():
+        for directory in search_dirs:
+            root = Path(directory)
+            candidates.extend((root / raw, root / raw.name))
+            if raw.suffix == "":
+                candidates.append(root / f"{raw.name}.json")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    raise FileNotFoundError(f"cortex_training config file not found: {path}")
 
 
-def sampling_sub_job_id(job_id: str) -> str:
-    return f"{job_id}:sampling:0"
+def load_job_body(
+    path: str,
+    *,
+    search_dirs: Sequence[Path] = (),
+) -> dict[str, Any]:
+    """Load a create-job JSON file as a dict."""
+    resolved = resolve_cortex_training_config_path(path, search_dirs=search_dirs)
+    try:
+        parsed = json.loads(resolved.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{resolved} is not valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{resolved} must be a JSON object")
+    return deepcopy(parsed)
 
 
 def lora_peft_config(rank: int) -> dict[str, Any] | None:
@@ -160,7 +193,7 @@ def sampling_job_body(
     source_checkpoint_info: dict[str, str] | None = None,
     debug_image_tag: str | None = None,
 ) -> dict[str, Any]:
-    """Standalone sampling from original HF weights or a weights-only checkpoint."""
+    """Standalone sampling job from original HF weights or a weights-only checkpoint."""
     inference_config: dict[str, Any] = {
         "max_seq_len": max_seq_len,
         "n_gpus": n_gpus,
@@ -170,6 +203,9 @@ def sampling_job_body(
             "trust_remote_code": True,
         },
     }
+    peft = lora_peft_config(lora_rank)
+    if peft is not None:
+        inference_config["peft_config"] = peft
 
     sub_job: dict[str, Any] = {
         "job_type": "sampling",
@@ -185,50 +221,6 @@ def sampling_job_body(
     if debug_image_tag:
         body["debug"] = {"job": {"image_tag": debug_image_tag}}
     return body
-
-
-def inference_job_body(
-    *,
-    model_name: str,
-    max_seq_len: int,
-    n_gpus: int,
-    dtype: str = "bfloat16",
-    seed: int = 42,
-    gpu_memory_utilization: float = 0.8,
-    lora_rank: int = 0,
-    source_checkpoint_info: dict[str, str] | None = None,
-    training_gpus: int | None = None,
-    debug_image_tag: str | None = None,
-) -> dict[str, Any]:
-    """Sampling from original weights or a weights-only checkpoint."""
-    return sampling_job_body(
-        model_name=model_name,
-        max_seq_len=max_seq_len,
-        n_gpus=n_gpus,
-        dtype=dtype,
-        seed=seed,
-        gpu_memory_utilization=gpu_memory_utilization,
-        lora_rank=lora_rank,
-        source_checkpoint_info=source_checkpoint_info,
-        debug_image_tag=debug_image_tag,
-    )
-
-
-def prepare_inference_weights(
-    client: CortexTrainingClient,
-    job_id: str,
-    job_body: dict[str, Any],
-    *,
-    lora_rank: int,
-) -> dict[str, Any] | None:
-    """After a colocated LoRA job starts, sync adapters into sampling."""
-    sub_types = {str(sub.get("job_type") or "") for sub in job_body.get("sub_job_configs") or []}
-    if "training" not in sub_types or "sampling" not in sub_types:
-        return None
-    if lora_rank <= 0:
-        return None
-    logger.info("Syncing LoRA adapters from training into sampling on %s", job_id)
-    return sync_weights(client, job_id, weight_format="lora")
 
 
 def _sampling_cli(
@@ -250,16 +242,13 @@ def log_saved_checkpoints(
     job_id: str,
     saved: Mapping[str, Mapping[str, Any]],
     sampling_command: str | None = None,
-    lora_rank: int = 0,
+    job_config: str | None = None,
     sample_prompt: str | None = None,
     enable_thinking: bool = False,
     renderer_name: str | None = None,
-    model_name: str | None = None,
-    n_gpus: int | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
     top_p: float | None = None,
-    seed: int | None = None,
     max_examples: int | None = None,
 ) -> None:
     weights = saved["weights-only"]
@@ -271,19 +260,17 @@ def log_saved_checkpoints(
         job_id,
     )
     if sampling_command == "evaluate":
-        module = "recipes.inference.sampling.evaluate"
-        verb = "evaluate"
-    elif sampling_command == "sample":
-        module = "recipes.inference.sampling.sample"
-        verb = "sample"
+        module = "recipes.inference.evaluate"
+        lead = "Evaluate this weights-only checkpoint with"
+    elif sampling_command in ("sample", "generate"):
+        module = "recipes.inference.generate"
+        lead = "Generate from this weights-only checkpoint with"
     else:
         return
 
     extra = ""
-    if model_name:
-        extra += f" model_name={model_name}"
-    if n_gpus is not None:
-        extra += f" n_gpus={n_gpus}"
+    if job_config:
+        extra += f" job_config={job_config}"
     if checkpoint_id:
         extra += f" checkpoint_id={checkpoint_id}"
     if sampling_command == "evaluate":
@@ -293,8 +280,6 @@ def log_saved_checkpoints(
             extra += f" max_tokens={max_tokens}"
         if top_p is not None:
             extra += f" top_p={top_p}"
-        if seed is not None:
-            extra += f" seed={seed}"
         if max_examples is not None:
             extra += f" max_examples={max_examples}"
     elif sample_prompt:
@@ -307,8 +292,8 @@ def log_saved_checkpoints(
         extra += f" renderer_name={renderer_name}"
 
     logger.info(
-        "%s this weights-only checkpoint with:\n%s",
-        verb,
+        "%s:\n%s",
+        lead,
         _sampling_cli(
             module=module,
             config_path=config_path,
@@ -435,8 +420,8 @@ def bootstrap_router_replay(
     job_id: str,
     max_cache_bytes: int | None = None,
 ) -> dict:
-    training = training_sub_job_id(job_id)
-    sampling = sampling_sub_job_id(job_id)
+    training = f"{job_id}:training:0"
+    sampling = f"{job_id}:sampling:0"
     result = client.bootstrap_router_replay(
         job_id,
         source_sub_job_id=sampling,
@@ -459,7 +444,7 @@ def discard_router_replay(
     return client.router_replay_discard(
         job_id,
         list(sample_ids),
-        sub_job_id=sampling_sub_job_id(job_id),
+        sub_job_id=f"{job_id}:sampling:0",
         sub_job_type="sampling",
     )
 
@@ -665,14 +650,6 @@ def forward_backward(
     return client.poll_request(job_id, request_id)
 
 
-def forward_loss(
-    client: CortexTrainingClient,
-    job_id: str,
-    kwargs: dict[str, torch.Tensor],
-) -> dict:
-    return forward_backward(client, job_id, kwargs)
-
-
 def optimizer_step(
     client: CortexTrainingClient,
     job_id: str,
@@ -714,8 +691,8 @@ def sync_weights(
 ) -> dict:
     request_id = client.weight_sync(
         job_id,
-        source_sub_job_id=training_sub_job_id(job_id),
-        target_sub_job_ids=[sampling_sub_job_id(job_id)],
+        source_sub_job_id=f"{job_id}:training:0",
+        target_sub_job_ids=[f"{job_id}:sampling:0"],
         weight_format=weight_format,
     )
     return client.poll_request(job_id, request_id)
