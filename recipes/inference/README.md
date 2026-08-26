@@ -96,11 +96,6 @@ python -m recipes.inference.serve \
 python -m recipes.inference.serve \
   config=/path/to/config.json \
   job_config=configs/qwen36_35b_a3b_full.json
-
-# Inference-only catalog model
-python -m recipes.inference.serve \
-  config=/path/to/config.json \
-  job_config=configs/glm52_fp8.json
 ```
 
 ## Examples
