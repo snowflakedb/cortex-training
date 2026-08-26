@@ -10,9 +10,13 @@
         "max_seq_len": 2048,
         "train_batch_size": 8,
         "gradient_clipping": 1.0,
-        "model_provider": "huggingface",
+        "model_provider": "prime_rl",
         "attn_implementation": "flash_attention_3",
-        "activation_checkpointing": true,
+        "ac_config": {
+          "mode": "full",
+          "freq": 1
+        },
+        "ep_size": 4,
         "optimizer": {
           "name": "AdamW",
           "lr": 1e-04,
@@ -44,10 +48,7 @@
             "q_proj",
             "k_proj",
             "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj"
+            "o_proj"
           ]
         }
       }

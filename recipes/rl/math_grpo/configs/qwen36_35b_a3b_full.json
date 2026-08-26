@@ -30,7 +30,6 @@
         "gradient_clipping": 1.0,
         "model_provider": "prime_rl",
         "attn_implementation": "flash_attention_3",
-        "attn_impl": "flash_attention_3",
         "ac_config": {
           "mode": "full",
           "freq": 1

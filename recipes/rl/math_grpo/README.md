@@ -103,7 +103,7 @@ sub-jobs. Pass a shipped example or a copy with `job_config=JOB_CONFIG`.
         "max_seq_len": MAX_SEQ_LEN,
         "train_batch_size": TRAIN_BATCH_SIZE,
         "gradient_clipping": GRADIENT_CLIPPING,
-        "model_provider": MODEL_PROVIDER,
+        "model_provider": MODEL_PROVIDER, // Use prime_rl for MoE
         "attn_implementation": "flash_attention_3",
         "mb_spec": {
           "max_tokens_per_mb": MAX_TOKENS_PER_MB
@@ -118,7 +118,7 @@ sub-jobs. Pass a shipped example or a copy with `job_config=JOB_CONFIG`.
         "ds_config": {
           "train_batch_size": TRAIN_BATCH_SIZE,
           "train_micro_batch_size_per_gpu": MICRO_BATCH_SIZE,
-          "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
+          "gradient_accumulation_steps": TRAIN_BATCH_SIZE / (MICRO_BATCH_SIZE * NUM_TRAINING_GPUS),
           "zero_optimization": {
             "stage": ZERO_STAGE,
             "reduce_scatter": true
@@ -139,7 +139,6 @@ sub-jobs. Pass a shipped example or a copy with `job_config=JOB_CONFIG`.
         },
 
         // Optional expert parallelism for MoE. NUM_TRAINING_GPUS must be a multiple of EP_SIZE.
-        "attn_impl": "flash_attention_3",
         "ac_config": {"mode": "full", "freq": 1},
         "prime_rl": {
           "fused_lm_head_token_chunk_size": 8192,
