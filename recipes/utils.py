@@ -38,16 +38,6 @@ logger = logging.getLogger(__name__)
 
 
 IGNORE_INDEX = -100
-_ROUTER_REPLAY_DEFAULT_MAX_CACHE_BYTES = 16 * 1024**3
-LORA_TARGET_MODULES = (
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
-)
 
 
 def load_connection_mapping(config_path: str) -> dict[str, Any]:
@@ -119,19 +109,6 @@ def load_job_body(
     return deepcopy(parsed)
 
 
-def lora_peft_config(rank: int) -> dict[str, Any] | None:
-    if rank <= 0:
-        return None
-    return {
-        "peft_type": "Lora",
-        "r": rank,
-        "lora_alpha": rank,
-        "lora_dropout": 0.0,
-        "bias": "none",
-        "target_modules": list(LORA_TARGET_MODULES),
-    }
-
-
 def checkpoint_id_from_stage_path(stage_path: str | None) -> str | None:
     """Return the checkpoint id (``cp_*``) from a save-poll ``stage_path``.
     Example: ``s3://.../checkpoints/cp_<uuid>/global_step1/`` → ``cp_<uuid>``.
@@ -179,48 +156,6 @@ def source_checkpoint_info(
         "checkpoint_id": str(checkpoint_id).strip(),
         "source_job_id": source_job_id,
     }
-
-
-def sampling_job_body(
-    *,
-    model_name: str,
-    max_seq_len: int,
-    n_gpus: int,
-    dtype: str = "bfloat16",
-    seed: int = 42,
-    gpu_memory_utilization: float = 0.8,
-    lora_rank: int = 0,
-    source_checkpoint_info: dict[str, str] | None = None,
-    debug_image_tag: str | None = None,
-) -> dict[str, Any]:
-    """Standalone sampling job from original HF weights or a weights-only checkpoint."""
-    inference_config: dict[str, Any] = {
-        "max_seq_len": max_seq_len,
-        "n_gpus": n_gpus,
-        "vllm_config": {
-            "max_model_len": max_seq_len,
-            "gpu_memory_utilization": gpu_memory_utilization,
-            "trust_remote_code": True,
-        },
-    }
-    peft = lora_peft_config(lora_rank)
-    if peft is not None:
-        inference_config["peft_config"] = peft
-
-    sub_job: dict[str, Any] = {
-        "job_type": "sampling",
-        "model_name": model_name,
-        "dtype": dtype,
-        "seed": seed,
-        "inference_config": inference_config,
-    }
-    if source_checkpoint_info is not None:
-        sub_job["source_checkpoint_info"] = dict(source_checkpoint_info)
-
-    body: dict[str, Any] = {"sub_job_configs": [sub_job]}
-    if debug_image_tag:
-        body["debug"] = {"job": {"image_tag": debug_image_tag}}
-    return body
 
 
 def _sampling_cli(
@@ -334,10 +269,12 @@ def recommended_renderer_name(
         raise ValueError(f"tinker_cookbook listed no renderers for {model_name!r}")
     if enable_thinking is False:
         disabled = [name for name in recommended if name.endswith("_disable_thinking")]
-        return disabled[0]
-    if enable_thinking is True:
+        if disabled:
+            return disabled[0]
+    elif enable_thinking is True:
         enabled = [name for name in recommended if not name.endswith("_disable_thinking")]
-        return enabled[0]
+        if enabled:
+            return enabled[0]
     return recommended[0]
 
 
@@ -375,18 +312,6 @@ def stop_params_for(stop_sequences: Sequence[Any]) -> dict:
     if len(strings) > 0:
         params["stop"] = strings
     return params
-
-
-def router_replay_config(
-    enabled: bool = True,
-    max_cache_bytes: int | None = None,
-) -> dict[str, Any]:
-    if not enabled:
-        return {"enabled": False}
-    return {
-        "enabled": True,
-        "max_cache_bytes": int(_ROUTER_REPLAY_DEFAULT_MAX_CACHE_BYTES if max_cache_bytes is None else max_cache_bytes),
-    }
 
 
 def router_replay_stop_params(
@@ -650,6 +575,16 @@ def forward_backward(
     return client.poll_request(job_id, request_id)
 
 
+def average_forward_backward_metrics(results: Sequence[Mapping[str, Any]]) -> dict[str, float]:
+    metrics = [result.get("metrics") or {} for result in results]
+    if not metrics:
+        return {}
+    return {
+        name: sum(float(values[name]) for values in metrics) / len(metrics)
+        for name in metrics[0]
+    }
+
+
 def optimizer_step(
     client: CortexTrainingClient,
     job_id: str,
@@ -657,31 +592,6 @@ def optimizer_step(
 ) -> dict:
     request_id = client.step(job_id, learning_rate=learning_rate)
     return client.poll_request(job_id, request_id)
-
-
-def forward_backward_step(
-    client: CortexTrainingClient,
-    job_id: str,
-    kwargs: dict[str, torch.Tensor],
-    context: dict[str, torch.Tensor] | None = None,
-    learning_rate: float | None = None,
-    processing: dict | None = None,
-    rr_sample_ids: Sequence[str] | None = None,
-    rr_discard: bool = True,
-    router_replay_sampling_job_id: str | None = None,
-) -> tuple[dict, dict]:
-    fwd_bwd_result = forward_backward(
-        client,
-        job_id,
-        kwargs,
-        context=context,
-        processing=processing,
-        rr_sample_ids=rr_sample_ids,
-        rr_discard=rr_discard,
-        router_replay_sampling_job_id=router_replay_sampling_job_id,
-    )
-    step_result = optimizer_step(client, job_id, learning_rate=learning_rate)
-    return fwd_bwd_result, step_result
 
 
 def sync_weights(

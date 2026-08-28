@@ -30,16 +30,17 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any
 
 import chz
 import datasets
+from recipes.utils import average_forward_backward_metrics
 from recipes.utils import build_renderer
 from recipes.utils import collate
-from recipes.utils import forward_backward_step
+from recipes.utils import forward_backward
 from recipes.utils import load_job_body
 from recipes.utils import log_saved_checkpoints
 from recipes.utils import make_client
+from recipes.utils import optimizer_step
 from recipes.utils import running_job
 from recipes.utils import save_recipe_checkpoints
 from recipes.utils import sequence_from_conversation
@@ -152,6 +153,8 @@ def main(config: Config):
     training_sub = next((sub for sub in body.get("sub_job_configs") or () if sub.get("job_type") == "training"), {})
     training = training_sub.get("training_config") or {}
     batch_size = int(training.get("train_batch_size"))
+    accumulation_steps = (training.get("ds_config") or {}).get("gradient_accumulation_steps", 1)
+    request_batch_size = batch_size // accumulation_steps
     max_seq_len = int(training.get("max_seq_len"))
     learning_rate = float((training.get("optimizer") or {}).get("lr"))
     model_provider = str(training.get("model_provider") or "huggingface")
@@ -204,27 +207,35 @@ def main(config: Config):
             current_lr = learning_rate * lr_mult
 
             batch_start = step * batch_size
-            batch_rows = train_dataset.select(range(batch_start, batch_start + batch_size))
-            sequences = [
-                sequence_from_conversation(
-                    row["messages"],
-                    renderer,
-                    train_on_what=config.train_on_what,
-                    max_seq_len=max_seq_len,
-                    next_token_labels=next_token_labels,
+            train_loss = 0.0
+            fwd_bwd_results = []
+            for accumulation_step in range(accumulation_steps):
+                request_start = batch_start + accumulation_step * request_batch_size
+                batch_rows = train_dataset.select(
+                    range(request_start, request_start + request_batch_size)
                 )
-                for row in batch_rows
-            ]
-            kwargs, _ = collate(
-                sequences,
-                pad_token_id=pad_token_id,
-                max_seq_len=max_seq_len,
-                pad_to_max_seq_len=config.pad_to_max_length,
-            )
-            fwd_bwd_result, step_result = forward_backward_step(client, job_id, kwargs, learning_rate=current_lr)
+                sequences = [
+                    sequence_from_conversation(
+                        row["messages"],
+                        renderer,
+                        train_on_what=config.train_on_what,
+                        max_seq_len=max_seq_len,
+                        next_token_labels=next_token_labels,
+                    )
+                    for row in batch_rows
+                ]
+                kwargs, _ = collate(
+                    sequences,
+                    pad_token_id=pad_token_id,
+                    max_seq_len=max_seq_len,
+                    pad_to_max_seq_len=config.pad_to_max_length,
+                )
+                fwd_bwd_result = forward_backward(client, job_id, kwargs)
+                fwd_bwd_results.append(fwd_bwd_result)
+                train_loss += float(fwd_bwd_result["avg_loss"]) / accumulation_steps
 
-            train_loss = float(fwd_bwd_result["avg_loss"])
-            metrics.update(fwd_bwd_result.get("metrics") or {})
+            step_result = optimizer_step(client, job_id, learning_rate=current_lr)
+            metrics.update(average_forward_backward_metrics(fwd_bwd_results))
             metrics.update(step_result.get("metrics") or {})
 
             metrics.update(

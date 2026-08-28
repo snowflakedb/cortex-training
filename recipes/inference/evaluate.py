@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import chz
+from recipes.rl.math_grpo.scoring import build_prompt
+from recipes.rl.math_grpo.scoring import score_response
 from recipes.utils import build_renderer
 from recipes.utils import make_client
 from recipes.utils import running_job
@@ -78,9 +80,6 @@ def _run_math500(
     generate_batch_size: int,
     max_seq_len: int,
 ) -> dict[str, float]:
-    from recipes.rl.math_grpo.train import build_prompt
-    from recipes.rl.math_grpo.train import score_response
-
     examples = _load_math500(max_examples)
     if len(examples) == 0:
         raise ValueError("MATH-500 produced no examples")
