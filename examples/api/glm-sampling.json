@@ -6,15 +6,12 @@
         "max_seq_len": 32768,
         "n_gpus": 8,
         "vllm_config": {
-          "enable_auto_tool_choice": true,
-          "enable_flashinfer_autotune": false,
-          "reasoning_parser": "glm45",
-          "tensor_parallel_size": 8,
-          "tool_call_parser": "glm47"
+          "quantization": "fp8",
+          "tensor_parallel_size": 8
         }
       },
       "job_type": "sampling",
-      "model_name": "zai-org/GLM-5.3-Flash"
+      "model_name": "zai-org/GLM-5.2-FP8"
     }
   ]
 }
