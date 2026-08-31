@@ -10,6 +10,11 @@ When a recommendation is rendered, its `maxContextTokens` value is injected as
 declared for that model and workflow. Treat GPU counts and optimization values
 as starting points that might need adjustment for a specific workload.
 
+For GLM 5.2 on the recommended H200 configuration, use
+`zai-org/GLM-5.2-FP8` for 1M-token inference. The unquantized
+`zai-org/GLM-5.2` checkpoint is limited to the existing 32K configuration
+because its weights and a 1M-token MLA cache do not fit on 16 H200 GPUs.
+
 For `Qwen/Qwen3.6-35B-A3B`, LoRA training and checkpoint save/load require the
 `prime_rl` model provider. Current PrimeRL LoRA support for this MoE model is
 limited to `q_proj`, `k_proj`, `v_proj`, and `o_proj`. Routed expert LoRA is not

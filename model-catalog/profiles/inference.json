@@ -58,7 +58,7 @@
       "id": "inference-16gpu-fp8-kv",
       "workflow": "inference",
       "tuningMethod": "none",
-      "summary": "Sixteen-GPU inference with FP8 KV cache for GLM 5.2.",
+      "summary": "Sixteen-GPU H200 inference with the Hopper FP8 MLA cache layout for GLM 5.2.",
       "recipePath": "recipes/inference/serve.py",
       "evidencePaths": [
         "examples/api/glm-sampling.json"
@@ -73,7 +73,7 @@
             "extra_sampling": {
               "vllm_config": {
                 "tensor_parallel_size": 16,
-                "kv_cache_dtype": "fp8",
+                "kv_cache_dtype": "fp8_ds_mla",
                 "gpu_memory_utilization": 0.8
               }
             }

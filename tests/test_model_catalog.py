@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 import sys
 
@@ -34,7 +35,7 @@ def test_checked_in_catalog_is_valid():
     }
 
 
-def test_catalog_context_limits_match_upstream_models():
+def test_catalog_context_limits_match_supported_profiles():
     models_doc, _ = load_catalog(CONFIG_DIR)
     expected_limits = {
         "Qwen/Qwen3-0.6B": 32768,
@@ -45,7 +46,7 @@ def test_catalog_context_limits_match_upstream_models():
         "Qwen/Qwen3.8-27B": 262144,
         "deepseek-ai/DeepSeek-V4-Flash-0731": 1048576,
         "openai/gpt-oss-120b": 131072,
-        "zai-org/GLM-5.2": 1048576,
+        "zai-org/GLM-5.2": 32768,
         "zai-org/GLM-5.2-FP8": 1048576,
     }
 
@@ -177,6 +178,43 @@ def test_large_quantized_inference_uses_single_node_tp8_with_fp8_kv_cache(
     assert vllm_config["kv_cache_dtype"] == "fp8"
 
 
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "zai-org/GLM-5.2",
+        "zai-org/GLM-5.2-FP8",
+    ],
+)
+def test_glm52_inference_uses_multinode_tp16_with_hopper_mla_cache(model_id):
+    models_doc, profiles = load_catalog(CONFIG_DIR)
+    model = next(item for item in models_doc["models"] if item["modelId"] == model_id)
+    recommendation = model["capabilities"]["inference"]
+    profile = next(
+        item
+        for item in profiles
+        if item["id"] == recommendation["recommendedProfileId"]
+    )
+    sampling = profile["subJobs"][0]["args"]
+    vllm_config = sampling["extra_sampling"]["vllm_config"]
+
+    assert recommendation["recommendedProfileId"] == "inference-16gpu-fp8-kv"
+    assert sampling["n_gpus"] == 16
+    assert vllm_config["tensor_parallel_size"] == 16
+    assert vllm_config["kv_cache_dtype"] == "fp8_ds_mla"
+
+
+def test_glm52_fp8_api_example_advertises_the_supported_1m_profile():
+    request = json.loads((REPO_ROOT / "examples/api/glm-sampling.json").read_text())
+    inference = request["sub_job_configs"][0]["inference_config"]
+    vllm_config = inference["vllm_config"]
+
+    assert inference["max_seq_len"] == 1048576
+    assert inference["n_gpus"] == 16
+    assert inference["gpu_memory_utilization"] == 0.8
+    assert vllm_config["tensor_parallel_size"] == 16
+    assert vllm_config["kv_cache_dtype"] == "fp8_ds_mla"
+
+
 def test_router_replay_sampling_uses_single_node_tensor_parallelism():
     _, profiles = load_catalog(CONFIG_DIR)
     profile = next(item for item in profiles if item["id"] == "moe-rl-full-16x16")
@@ -194,7 +232,7 @@ def test_router_replay_sampling_uses_single_node_tensor_parallelism():
         ("Qwen/Qwen3.8-27B", "sftFull", 262144),
         ("deepseek-ai/DeepSeek-V4-Flash-0731", "inference", 1048576),
         ("openai/gpt-oss-120b", "inference", 131072),
-        ("zai-org/GLM-5.2", "inference", 1048576),
+        ("zai-org/GLM-5.2", "inference", 32768),
     ],
 )
 def test_recommendation_uses_advertised_model_limit(
