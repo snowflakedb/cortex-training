@@ -75,6 +75,7 @@ See the [CLI reference](docs/reference/cli.md) for commands and configuration.
 
 | Path | Purpose |
 |---|---|
+| `model-catalog/` | Supported models, context limits, and recommended job profiles |
 | `docs/` | Getting started material, concepts, guides, and reference |
 | `recipes/` | End-to-end training, sampling, and evaluation workflows |
 | `examples/api/` | Small JSON examples for individual API operations |
