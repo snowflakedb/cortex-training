@@ -36,15 +36,21 @@ from pathlib import Path
 from typing import Any
 
 import chz
+from recipes.rl.math_grpo.scoring import FORMAT_COEF
+from recipes.rl.math_grpo.scoring import build_prompt
+from recipes.rl.math_grpo.scoring import score_response
+from recipes.rl.math_grpo.scoring import stopped_cleanly
 from recipes.utils import TrainSequence
+from recipes.utils import average_forward_backward_metrics
 from recipes.utils import bootstrap_router_replay
 from recipes.utils import build_renderer
 from recipes.utils import collate
 from recipes.utils import discard_router_replay
-from recipes.utils import forward_backward_step
+from recipes.utils import forward_backward
 from recipes.utils import load_job_body
 from recipes.utils import log_saved_checkpoints
 from recipes.utils import make_client
+from recipes.utils import optimizer_step
 from recipes.utils import router_replay_stop_params
 from recipes.utils import running_job
 from recipes.utils import sampling_params_with_sample_ids
@@ -61,8 +67,6 @@ logging.getLogger("httpx").setLevel(logging.WARN)
 logging.getLogger("urllib3").setLevel(logging.WARN)
 logging.getLogger("tinker_cookbook.renderers.base").setLevel(logging.ERROR)
 
-# Match MathEnv / ProblemEnv defaults.
-FORMAT_COEF = 0.1
 _RECIPE_DIR = Path(__file__).resolve().parent
 _CONFIG_SEARCH_DIRS = (_RECIPE_DIR, _RECIPE_DIR / "configs")
 
@@ -92,62 +96,6 @@ def load_math(seed: int = 0) -> MathProblems:
     for row in _get_hendrycks_math_test():
         test.append((row["problem"], extract_boxed(row["solution"])))
     return MathProblems(train=train, test=test or None)
-
-
-def question_suffix() -> str:
-    from tinker_cookbook.recipes.math_rl.math_env import MathEnv
-
-    return MathEnv.question_suffix()
-
-
-def convo_prefix() -> list[dict[str, str]]:
-    from tinker_cookbook.recipes.math_rl.math_env import MathEnv
-
-    return list(MathEnv.standard_fewshot_prefix())
-
-
-def build_prompt(question: str, renderer) -> list[int]:
-    conversation = [
-        *convo_prefix(),
-        {"role": "user", "content": question + question_suffix()},
-    ]
-    return renderer.build_generation_prompt(conversation).to_ints()
-
-
-def _stopped_cleanly(result: dict, max_tokens: int | None) -> bool:
-    finish_reason = result.get("finish_reason")
-    if isinstance(finish_reason, str) and finish_reason:
-        return finish_reason != "length"
-    if max_tokens is None:
-        return True
-    return len(result.get("token_ids") or []) < max_tokens
-
-
-def score_response(
-    response: str,
-    answer: str,
-    *,
-    result: dict,
-    max_tokens: int | None,
-    format_coef: float = FORMAT_COEF,
-) -> tuple[float, dict[str, float]]:
-    from tinker_cookbook.recipes.math_rl.math_env import safe_grade
-    from tinker_cookbook.recipes.math_rl.math_grading import extract_boxed
-
-    well_formed = _stopped_cleanly(result, max_tokens)
-    try:
-        given = extract_boxed(response)
-        format_ok = True
-    except ValueError:
-        given = None
-        format_ok = False
-
-    correct_format = float(well_formed and format_ok)
-    correct_answer = 0.0
-    if format_ok and given is not None:
-        correct_answer = float(safe_grade(given, answer))
-    reward = format_coef * (correct_format - 1.0) + correct_answer
-    return reward, {"format": correct_format, "correct": correct_answer}
 
 
 @dataclass
@@ -183,7 +131,7 @@ class MathAccuracyEvaluator:
             text = result.get("text") or ""
             token_ids = result.get("token_ids") or []
             completion_lengths.append(len(token_ids))
-            if not _stopped_cleanly(result, max_tokens):
+            if not stopped_cleanly(result, max_tokens):
                 n_truncated += 1
             reward, metrics = score_response(
                 text,
@@ -292,6 +240,7 @@ def _train(config: Config, ml_logger: Any) -> None:
     training = training_sub.get("training_config") or {}
     sampling = sampling_sub.get("inference_config") or {}
     learning_rate = float((training.get("optimizer") or {}).get("lr"))
+    accumulation_steps = (training.get("ds_config") or {}).get("gradient_accumulation_steps", 1)
     max_seq_len = int(training.get("max_seq_len") or sampling.get("max_seq_len"))
     lora_rank = int((training.get("peft_config") or sampling.get("peft_config") or {}).get("r") or 0)
     router_replay = bool(
@@ -457,25 +406,36 @@ def _train(config: Config, ml_logger: Any) -> None:
                     batch_idx,
                 )
             else:
-                kwargs, context = collate(
-                    datums_D,
-                    pad_token_id=pad_token_id,
-                    max_seq_len=max_seq_len,
-                    with_rl_context=True,
-                    temperature=config.temperature,
-                )
-                fwd_bwd_result, step_result = forward_backward_step(
-                    client,
-                    job_id,
-                    kwargs,
-                    context=context,
-                    learning_rate=learning_rate,
-                    processing=processing_block(config, global_batch_size=len(datums_D)),
-                    rr_sample_ids=(trained_sample_ids if router_replay else None),
-                    router_replay_sampling_job_id=sampling_job_id,
-                )
-                train_loss = float(fwd_bwd_result["avg_loss"])
-                metrics.update(fwd_bwd_result.get("metrics") or {})
+                request_batch_size = len(datums_D) // accumulation_steps
+                processing = processing_block(config, global_batch_size=len(datums_D))
+                train_loss = 0.0
+                fwd_bwd_results = []
+                for accumulation_step in range(accumulation_steps):
+                    request_start = accumulation_step * request_batch_size
+                    request_end = request_start + request_batch_size
+                    kwargs, context = collate(
+                        datums_D[request_start:request_end],
+                        pad_token_id=pad_token_id,
+                        max_seq_len=max_seq_len,
+                        with_rl_context=True,
+                        temperature=config.temperature,
+                    )
+                    fwd_bwd_result = forward_backward(
+                        client,
+                        job_id,
+                        kwargs,
+                        context=context,
+                        processing=processing,
+                        rr_sample_ids=(
+                            trained_sample_ids[request_start:request_end] if router_replay else None
+                        ),
+                        router_replay_sampling_job_id=sampling_job_id,
+                    )
+                    fwd_bwd_results.append(fwd_bwd_result)
+                    train_loss += float(fwd_bwd_result["avg_loss"]) / accumulation_steps
+
+                step_result = optimizer_step(client, job_id, learning_rate=learning_rate)
+                metrics.update(average_forward_backward_metrics(fwd_bwd_results))
                 metrics.update(step_result.get("metrics") or {})
                 sync_weights(
                     client,

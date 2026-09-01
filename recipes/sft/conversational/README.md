@@ -69,6 +69,7 @@ shipped example or a copy with `job_config=JOB_CONFIG`.
         "gradient_clipping": GRADIENT_CLIPPING,
         "model_provider": MODEL_PROVIDER, // Use prime_rl for MoE
         "attn_implementation": "flash_attention_3",
+        "activation_checkpointing": ACTIVATION_CHECKPOINTING,
         "optimizer": {
           "name": "AdamW",
           "lr": LEARNING_RATE,

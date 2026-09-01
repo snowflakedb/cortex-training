@@ -9,6 +9,7 @@ under its `configs/` directory.
 | Recipe | Method | Dataset | Status |
 |---|---|---|---|
 | [Conversational SFT](sft/conversational/README.md) | LoRA or full-parameter SFT | Hugging Face chat datasets | Runnable |
+| [Hugging Face Corpus CPT](cpt/README.md) | LoRA or full-parameter continual pre-training | Hugging Face text datasets | Runnable |
 | [Math GRPO](rl/math_grpo/README.md) | Reinforcement learning | Hendrycks MATH and MATH-500 | Runnable |
 | [Inference endpoint](inference/README.md) | Serve, generate, eval | Open weights, checkpoints, MATH-500 | Runnable |
 
@@ -27,7 +28,7 @@ uv pip install wandb
 Create a local Snowflake connection file from
 `examples/config/connection.json.template` (account host and PAT).
 
-To log SFT or GRPO metrics to Weights & Biases, set a project on the train
+To log SFT, CPT, or GRPO metrics to Weights & Biases, set a project on the train
 command (`wandb_project=...`) and export:
 
 ```bash
@@ -41,14 +42,15 @@ Recipes are Python modules so they can share code without path manipulation:
 
 ```bash
 python -m recipes.sft.conversational.train config=/path/to/config.json
+python -m recipes.cpt.train config=/path/to/config.json dataset=DATASET_ID
 python -m recipes.rl.math_grpo.train config=/path/to/config.json
 python -m recipes.inference.serve config=/path/to/config.json
 ```
 
 `config=` is the Snowflake PAT/connection file. See each recipe README for
 hardware, expected metrics, common variations, and the JSON job configs
-loaded from `configs/` (SFT and GRPO examples, plus inference configs for
-every catalog model).
+loaded from `configs/` (SFT, CPT, and GRPO examples, plus inference configs
+for every catalog model).
 
 ## Recipe Contract
 
