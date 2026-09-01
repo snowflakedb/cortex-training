@@ -2,7 +2,7 @@
   "$schema": "./schema.json",
   "schemaVersion": 1,
   "catalog": "cortex-training",
-  "lastReviewed": "2026-08-31",
+  "lastReviewed": "2026-09-01",
   "models": [
     {
       "name": "Qwen3 0.6B",
@@ -203,7 +203,8 @@
         "inference": {
           "supported": true,
           "maxContextTokens": 1048576,
-          "recommendedProfileId": "inference-8gpu-tp8-fp8-kv"
+          "recommendedProfileId": "inference-8gpu-tp8-fp8-kv",
+          "lastValidated": "2026-08-31"
         },
         "training": {
           "supported": false
@@ -245,7 +246,8 @@
         "inference": {
           "supported": true,
           "maxContextTokens": 1048576,
-          "recommendedProfileId": "inference-16gpu-fp8-kv"
+          "recommendedProfileId": "inference-16gpu-fp8-kv",
+          "lastValidated": "2026-09-01"
         },
         "training": {
           "supported": false

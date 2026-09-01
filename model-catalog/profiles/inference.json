@@ -74,7 +74,7 @@
               "vllm_config": {
                 "tensor_parallel_size": 16,
                 "kv_cache_dtype": "fp8_ds_mla",
-                "gpu_memory_utilization": 0.8
+                "gpu_memory_utilization": 0.9
               }
             }
           }

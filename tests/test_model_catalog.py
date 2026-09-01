@@ -29,7 +29,7 @@ def test_checked_in_catalog_is_valid():
 
     assert summary == {
         "schemaVersion": 1,
-        "lastReviewed": "2026-08-31",
+        "lastReviewed": "2026-09-01",
         "models": 10,
         "profiles": 12,
     }
@@ -95,22 +95,35 @@ def test_qwen_inference_tensor_parallel_recommendations(
     )
 
 
-def test_changed_recommendations_are_not_marked_as_live_validated():
+def test_validation_dates_match_completed_live_smokes():
     models_doc, profiles = load_catalog(CONFIG_DIR)
 
     assert all("lastValidated" not in profile for profile in profiles)
-    recommendations = []
+    recommendations = {}
     for model in models_doc["models"]:
         capabilities = model["capabilities"]
         if capabilities["inference"]["supported"]:
-            recommendations.append(capabilities["inference"])
+            recommendations[(model["modelId"], "inference")] = capabilities["inference"]
         if capabilities["training"]["supported"]:
-            recommendations.extend(capabilities["training"]["profiles"].values())
+            recommendations.update(
+                {
+                    (model["modelId"], profile_key): recommendation
+                    for profile_key, recommendation in capabilities["training"][
+                        "profiles"
+                    ].items()
+                }
+            )
 
     assert len(recommendations) == 34
-    assert all(
-        "lastValidated" not in recommendation for recommendation in recommendations
-    )
+    validated = {
+        key: recommendation["lastValidated"]
+        for key, recommendation in recommendations.items()
+        if "lastValidated" in recommendation
+    }
+    assert validated == {
+        ("deepseek-ai/DeepSeek-V4-Flash-0731", "inference"): "2026-08-31",
+        ("zai-org/GLM-5.2-FP8", "inference"): "2026-09-01",
+    }
     assert all(
         "max_seq_len" not in sub_job["args"]
         for profile in profiles
@@ -201,6 +214,7 @@ def test_glm52_inference_uses_multinode_tp16_with_hopper_mla_cache(model_id):
     assert sampling["n_gpus"] == 16
     assert vllm_config["tensor_parallel_size"] == 16
     assert vllm_config["kv_cache_dtype"] == "fp8_ds_mla"
+    assert vllm_config["gpu_memory_utilization"] == 0.9
 
 
 def test_glm52_fp8_api_example_advertises_the_supported_1m_profile():
@@ -210,7 +224,7 @@ def test_glm52_fp8_api_example_advertises_the_supported_1m_profile():
 
     assert inference["max_seq_len"] == 1048576
     assert inference["n_gpus"] == 16
-    assert inference["gpu_memory_utilization"] == 0.8
+    assert inference["gpu_memory_utilization"] == 0.9
     assert vllm_config["tensor_parallel_size"] == 16
     assert vllm_config["kv_cache_dtype"] == "fp8_ds_mla"
 
