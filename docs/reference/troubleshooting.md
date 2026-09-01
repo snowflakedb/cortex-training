@@ -14,3 +14,13 @@ For recipe failures, first capture:
 
 Recipe-specific failure modes are documented beside the recipe rather than
 accumulated on this page.
+
+## HTTP 429 and capacity after cancel
+
+`POST /cortex-training` can return **429 Too Many Requests** while jobs are
+draining. `cortex-training capacity` may still show `in_use_gpus` at the account
+ceiling after `cancel`, even when `cortex-training list --status running` is
+empty. Wait and re-check `available_gpus` before the next recipe.
+
+Default Math GRPO needs **8** GPUs (4 train + 4 sample). Conversational SFT
+Qwen3-8B needs **4**. Inference `qwen3_8b_*` sampling configs request **2**.
