@@ -204,7 +204,7 @@
           "supported": true,
           "maxContextTokens": 1048576,
           "recommendedProfileId": "inference-8gpu-tp8-fp8-kv",
-          "lastValidated": "2026-08-31"
+          "lastValidated": "2026-09-01"
         },
         "training": {
           "supported": false

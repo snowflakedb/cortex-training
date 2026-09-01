@@ -35,6 +35,8 @@ expert LoRA is not yet supported, and Hugging Face MLP names such as
 2. Include checked-in evidence paths for every changed profile. Remove
    `lastValidated` from each affected model recommendation until that exact
    model and profile completes a live smoke test, then set it to the test date.
+   For a maximum-context inference claim, use `--full-context-prefill`; a short
+   prompt validates startup and basic generation but not the context limit.
 3. Run:
 
    ```bash
@@ -63,6 +65,11 @@ The job is then cancelled. The PAT is intentionally not accepted as a
 command-line argument, which keeps it out of shell history and process
 listings.
 
+The default inference probe uses a short text prompt and validates engine
+startup plus basic generation. Add `--full-context-prefill` to send exactly
+`max_seq_len - 1` pre-tokenized tokens and generate one token. Only the latter
+validates execution at the configured context limit.
+
 ```bash
 export SNOWFLAKE_HOST='ACCOUNT.snowflakecomputing.com'
 export SNOWFLAKE_DATABASE='CORTEX_TRAINING_DB'
@@ -73,6 +80,7 @@ export SNOWFLAKE_PAT
 python scripts/smoke_test_model_catalog.py \
   --model-id Qwen/Qwen3.8-27B \
   --profile inference \
+  --full-context-prefill \
   --submit
 
 unset SNOWFLAKE_PAT

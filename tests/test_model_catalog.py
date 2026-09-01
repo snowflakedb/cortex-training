@@ -121,7 +121,7 @@ def test_validation_dates_match_completed_live_smokes():
         if "lastValidated" in recommendation
     }
     assert validated == {
-        ("deepseek-ai/DeepSeek-V4-Flash-0731", "inference"): "2026-08-31",
+        ("deepseek-ai/DeepSeek-V4-Flash-0731", "inference"): "2026-09-01",
         ("zai-org/GLM-5.2-FP8", "inference"): "2026-09-01",
     }
     assert all(
@@ -523,6 +523,49 @@ def test_live_smoke_rejects_non_finite_forward_backward_loss(monkeypatch):
 
     with pytest.raises(RuntimeError, match="non-finite avg_loss"):
         run_data_plane_probes(FakeClient(), "job-1", "sftFull", request)
+
+
+def test_full_context_inference_probe_prefills_to_one_token_below_limit():
+    class FakeClient:
+        def __init__(self):
+            self.prompts = None
+
+        def generate(self, job_id, prompts, sampling_params):
+            self.prompts = prompts
+            assert sampling_params == {"max_tokens": 1, "temperature": 0.0}
+            return "generate-request"
+
+        def poll_request(self, job_id, request_id):
+            return {"results": [{"text": "OK"}]}
+
+    request = build_profile_request(
+        CONFIG_DIR,
+        REPO_ROOT,
+        "Qwen/Qwen3-0.6B",
+        "inference",
+    )
+    client = FakeClient()
+
+    probes = run_data_plane_probes(
+        client,
+        "job-1",
+        "inference",
+        request,
+        full_context_prefill=True,
+    )
+
+    assert client.prompts is not None
+    assert len(client.prompts) == 1
+    assert len(client.prompts[0]) == 32767
+    assert set(client.prompts[0]) == {1}
+    assert probes == [
+        {
+            "operation": "generate",
+            "requestId": "generate-request",
+            "resultCount": 1,
+            "promptTokens": 32767,
+        }
+    ]
 
 
 def test_duplicate_model_id_is_rejected():

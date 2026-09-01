@@ -216,10 +216,43 @@ def _build_forward_backward_probe_payload(
     )
 
 
-def _run_generate_probe(client, job_id: str) -> dict[str, Any]:
+def _sampling_max_seq_len(request: dict[str, Any]) -> int:
+    sampling = next(
+        (
+            sub_job["inference_config"]
+            for sub_job in request["sub_job_configs"]
+            if sub_job["job_type"] == "sampling"
+        ),
+        None,
+    )
+    if sampling is None:
+        raise ValueError("generate probe requires a sampling sub-job")
+    max_seq_len = sampling.get("max_seq_len")
+    if (
+        isinstance(max_seq_len, bool)
+        or not isinstance(max_seq_len, int)
+        or max_seq_len <= 1
+    ):
+        raise ValueError("inference_config.max_seq_len must be an integer > 1")
+    return max_seq_len
+
+
+def _run_generate_probe(
+    client,
+    job_id: str,
+    request: dict[str, Any],
+    full_context_prefill: bool,
+) -> dict[str, Any]:
+    if full_context_prefill:
+        prompt_tokens = _sampling_max_seq_len(request) - 1
+        prompts: list[str | list[int]] = [[1] * prompt_tokens]
+    else:
+        prompt_tokens = None
+        prompts = ["Reply with OK."]
+
     request_id = client.generate(
         job_id,
-        prompts=["Reply with OK."],
+        prompts=prompts,
         sampling_params={
             "max_tokens": 1,
             "temperature": 0.0,
@@ -233,6 +266,7 @@ def _run_generate_probe(client, job_id: str) -> dict[str, Any]:
         "operation": "generate",
         "requestId": request_id,
         "resultCount": len(generated),
+        "promptTokens": prompt_tokens,
     }
 
 
@@ -268,11 +302,20 @@ def run_data_plane_probes(
     job_id: str,
     profile_key: str,
     request: dict[str, Any],
+    *,
+    full_context_prefill: bool = False,
 ) -> list[dict[str, Any]]:
     """Execute the minimal operations required by a catalog workflow."""
     probes = []
     if profile_key in SAMPLING_PROFILE_KEYS:
-        probes.append(_run_generate_probe(client, job_id))
+        probes.append(
+            _run_generate_probe(
+                client,
+                job_id,
+                request,
+                full_context_prefill,
+            )
+        )
     if profile_key in TRAINING_PROFILE_KEYS:
         probes.append(_run_forward_backward_probe(client, job_id, profile_key, request))
     return probes
@@ -345,6 +388,14 @@ def main() -> int:
         ),
     )
     parser.add_argument("--poll-timeout", type=float, default=1800.0)
+    parser.add_argument(
+        "--full-context-prefill",
+        action="store_true",
+        help=(
+            "For sampling profiles, prefill max_seq_len - 1 token IDs and "
+            "generate one token instead of running the short text probe."
+        ),
+    )
     args = parser.parse_args()
 
     plans = []
@@ -393,6 +444,7 @@ def main() -> int:
                 job_id,
                 profile_key,
                 plan["request"],
+                full_context_prefill=args.full_context_prefill,
             )
             results.append(
                 {
