@@ -58,7 +58,9 @@ python -m recipes.rl.math_grpo.train \
 
 LoRA, GPU counts, sequence length, and MoE live in the job-config JSON. Set
 `wandb_project` to log to Weights & Biases after `uv pip install wandb` and
-`export WANDB_API_KEY` / `export WANDB_BASE_URL`.
+`export WANDB_API_KEY` (set `WANDB_BASE_URL` only for a non-Cloud W&B host).
+
+The schematic below uses placeholders and `//` comments; it is **not** valid JSON. Copy a file from `configs/`.
 
 The recipe loads one create-job body with colocated sampling and training
 sub-jobs. Pass a shipped example or a copy with `job_config=JOB_CONFIG`.
@@ -163,7 +165,8 @@ MATH-500 generate eval runs every `eval_every` batches (`test/env/all/correct`;
 ```bash
 uv pip install wandb
 export WANDB_API_KEY=...
-export WANDB_BASE_URL=...
+# optional: only if you are not using W&B Cloud
+# export WANDB_BASE_URL=https://your-wandb-host
 ```
 
 Then pass `wandb_project=WANDB_PROJECT` on the train command.
@@ -180,3 +183,27 @@ python -m recipes.inference.evaluate \
   temperature=1.0 \
   max_tokens=MAX_TOKENS
 ```
+
+## Smoke
+
+A 1-step plumbing check (still needs the default 4+4 GPUs):
+
+```bash
+python -m recipes.rl.math_grpo.train \
+  config=/path/to/config.json \
+  max_steps=1 problems_per_batch=1 group_size=4 \
+  max_tokens=64 eval_every=0 \
+  remove_constant_reward_groups=false
+```
+
+Keep `remove_constant_reward_groups=false` on tiny batches. The default `true`
+drops the whole batch when every rollout gets the same reward (common when
+`max_tokens` is too small for boxed answers), which logs
+`no rollouts to train on` and `train/avg_loss nan` even though sampling ran.
+
+## Troubleshooting
+
+- **HTTP 429** on `create_job`: back off and retry. Cancels can leave
+  `in_use_gpus` high with `list --status running` empty for several minutes.
+- **`capacity` after a cancel**: wait until `available_gpus` covers 4 train + 4
+  sample before submitting another GRPO job.

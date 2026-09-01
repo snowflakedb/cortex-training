@@ -47,9 +47,11 @@ python -m recipes.sft.conversational.train \
 
 LoRA, GPU count, batch shape, sequence length, and MoE live in the job-config
 JSON. Set `wandb_project` to log to Weights & Biases after
-`uv pip install wandb` and `export WANDB_API_KEY` / `export WANDB_BASE_URL`.
+`uv pip install wandb` and `export WANDB_API_KEY` (set `WANDB_BASE_URL` only for a non-Cloud W&B host).
 
 ## Job config JSON
+
+The schematic below uses placeholders and `//` comments; it is **not** valid JSON. Copy a file from `configs/` instead.
 
 The recipe loads one create-job body with a single training sub-job. Pass a
 shipped example or a copy with `job_config=JOB_CONFIG`.
@@ -142,7 +144,8 @@ metrics to Weights & Biases:
 ```bash
 uv pip install wandb
 export WANDB_API_KEY=...
-export WANDB_BASE_URL=...
+# optional: only if you are not using W&B Cloud
+# export WANDB_BASE_URL=https://your-wandb-host
 ```
 
 Then pass `wandb_project=WANDB_PROJECT` on the train command.
