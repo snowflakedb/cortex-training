@@ -102,6 +102,7 @@ sub-jobs. Pass a shipped example or a copy with `job_config=JOB_CONFIG`.
         "n_gpus": NUM_TRAINING_GPUS,
         "max_seq_len": MAX_SEQ_LEN,
         "train_batch_size": TRAIN_BATCH_SIZE,
+        "sp_size": SEQUENCE_PARALLEL_SIZE,
         "gradient_clipping": GRADIENT_CLIPPING,
         "model_provider": MODEL_PROVIDER, // Use prime_rl for MoE
         "attn_implementation": "flash_attention_3",

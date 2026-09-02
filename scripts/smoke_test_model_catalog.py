@@ -116,11 +116,48 @@ def build_profile_request(
     return request
 
 
+def enable_training_memory_telemetry(request: dict[str, Any]) -> None:
+    """Enable server-side peak memory reporting without changing placement."""
+    for sub_job in request["sub_job_configs"]:
+        if sub_job["job_type"] != "training":
+            continue
+        training = sub_job["training_config"]
+        training["step_peak_memory_log"] = True
+        training["training_memory_telemetry"] = True
+
+
+def apply_training_sequence_parallelism(
+    request: dict[str, Any],
+    sp_size: int,
+) -> None:
+    """Apply Ulysses SP and its logical data-parallel batch-size contract."""
+    if sp_size <= 1:
+        raise ValueError("training sequence-parallel size must be greater than 1")
+    for sub_job in request["sub_job_configs"]:
+        if sub_job["job_type"] != "training":
+            continue
+        training = sub_job["training_config"]
+        n_gpus = training["n_gpus"]
+        if n_gpus % sp_size != 0:
+            raise ValueError(
+                f"training n_gpus {n_gpus} is not divisible by sp_size {sp_size}"
+            )
+        logical_dp = n_gpus // sp_size
+        training["sp_size"] = sp_size
+        training["train_batch_size"] = logical_dp
+        ds_config = training["ds_config"]
+        ds_config["train_batch_size"] = logical_dp
+        ds_config["train_micro_batch_size_per_gpu"] = 1
+        ds_config["gradient_accumulation_steps"] = 1
+
+
 def build_forward_backward_probe_spec(
     request: dict[str, Any],
     profile_key: str,
+    *,
+    full_context: bool = False,
 ) -> dict[str, Any]:
-    """Build a small, tokenizer-independent training batch for a catalog job."""
+    """Build a tokenizer-independent training batch for a catalog job."""
     training = next(
         (
             sub_job["training_config"]
@@ -140,14 +177,25 @@ def build_forward_backward_probe_spec(
     ):
         raise ValueError("training_config.train_batch_size must be a positive integer")
 
-    token_ids = [1, 2, 3, 4, 5, 6, 7, 8]
+    sequence_tokens = training["max_seq_len"] if full_context else 8
+    token_ids = [1] * sequence_tokens if full_context else [1, 2, 3, 4, 5, 6, 7, 8]
     input_ids = [token_ids[:] for _ in range(batch_size)]
     payload: dict[str, Any] = {
         "input_ids": input_ids,
         "position_ids": "arange",
     }
     spec: dict[str, Any] = {"payload": payload}
-    if profile_key in ("rlLora", "rlFull"):
+    token_chunk_size = training.get("fused_lm_head_token_chunk_size")
+    if token_chunk_size is None:
+        token_chunk_size = (training.get("prime_rl") or {}).get(
+            "fused_lm_head_token_chunk_size"
+        )
+    chunked_sft = (
+        profile_key in ("sftLora", "sftFull")
+        and isinstance(token_chunk_size, int)
+        and not isinstance(token_chunk_size, bool)
+    )
+    if profile_key in ("rlLora", "rlFull") or chunked_sft:
         payload.update(
             {
                 "attention_mask": [[1] * len(token_ids) for _ in range(batch_size)],
@@ -155,30 +203,39 @@ def build_forward_backward_probe_spec(
                 "labels": "none",
             }
         )
-        policy_mask = [0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+        if chunked_sft:
+            loss_mask = [1.0] * (sequence_tokens - 1) + [0.0]
+            processing = {
+                "loss_fn": "causal_cross_entropy",
+                "post": ["compute_logprobs"],
+                "config": {},
+            }
+        else:
+            loss_mask = [0.0, 0.0] + [1.0] * (sequence_tokens - 3) + [0.0]
+            processing = {
+                "loss_fn": "grpo",
+                "post": ["compute_logprobs"],
+                "config": {
+                    "eps_clip": 0.2,
+                    "loss_agg_mode": "token-mean",
+                    "entropy_coeff": 0.0,
+                    "global_batch_size": batch_size,
+                },
+            }
         spec.update(
             {
                 "context": {
                     "input_ids": {"data": input_ids, "dtype": "long"},
                     "advantages": {
-                        "data": [policy_mask[:] for _ in range(batch_size)],
+                        "data": [loss_mask[:] for _ in range(batch_size)],
                         "dtype": "float32",
                     },
                     "loss_mask": {
-                        "data": [policy_mask[:] for _ in range(batch_size)],
+                        "data": [loss_mask[:] for _ in range(batch_size)],
                         "dtype": "float32",
                     },
                 },
-                "processing": {
-                    "loss_fn": "grpo",
-                    "post": ["compute_logprobs"],
-                    "config": {
-                        "eps_clip": 0.2,
-                        "loss_agg_mode": "token-mean",
-                        "entropy_coeff": 0.0,
-                        "global_batch_size": batch_size,
-                    },
-                },
+                "processing": processing,
             }
         )
     else:
@@ -192,13 +249,18 @@ def build_forward_backward_probe_spec(
 def _build_forward_backward_probe_payload(
     request: dict[str, Any],
     profile_key: str,
+    full_context: bool,
 ) -> bytes:
     sys.path.insert(0, str(SOURCE_ROOT))
     from cortex_training import build_forward_backward_kwargs
     from cortex_training import build_forward_backward_payload
     from cortex_training import wire
 
-    spec = build_forward_backward_probe_spec(request, profile_key)
+    spec = build_forward_backward_probe_spec(
+        request,
+        profile_key,
+        full_context=full_context,
+    )
     if "processing" not in spec:
         return build_forward_backward_payload(spec)
 
@@ -275,8 +337,13 @@ def _run_forward_backward_probe(
     job_id: str,
     profile_key: str,
     request: dict[str, Any],
+    full_context: bool,
 ) -> dict[str, Any]:
-    payload = _build_forward_backward_probe_payload(request, profile_key)
+    payload = _build_forward_backward_probe_payload(
+        request,
+        profile_key,
+        full_context,
+    )
     request_id = client.forward_backward(job_id, payload)
     result = client.poll_request(job_id, request_id)
     avg_loss = result.get("avg_loss")
@@ -290,11 +357,98 @@ def _run_forward_backward_probe(
         raise RuntimeError(
             f"forward-backward probe returned non-finite avg_loss: {avg_loss!r}"
         )
-    return {
+    result = {
         "operation": "forward-backward",
         "requestId": request_id,
         "avgLoss": avg_loss_value,
     }
+    if full_context:
+        training = next(
+            sub_job["training_config"]
+            for sub_job in request["sub_job_configs"]
+            if sub_job["job_type"] == "training"
+        )
+        result.update(
+            {
+                "sequenceTokens": training["max_seq_len"],
+                "globalTokens": (
+                    training["max_seq_len"] * training["train_batch_size"]
+                ),
+            }
+        )
+    return result
+
+
+def _run_optimizer_step_probe(
+    client, job_id: str, request: dict[str, Any]
+) -> dict[str, Any]:
+    training = next(
+        sub_job["training_config"]
+        for sub_job in request["sub_job_configs"]
+        if sub_job["job_type"] == "training"
+    )
+    optimizer = training.get("optimizer") or {}
+    request_id = client.step(job_id, learning_rate=optimizer.get("lr"))
+    result = client.poll_request(job_id, request_id)
+    return {
+        "operation": "step",
+        "requestId": request_id,
+        "globalSteps": result.get("global_steps"),
+        "peakMemory": result.get("peak_memory"),
+    }
+
+
+def _checkpoint_id(result: dict[str, Any]) -> str:
+    checkpoint_id = result.get("checkpoint_id")
+    if isinstance(checkpoint_id, str) and checkpoint_id:
+        return checkpoint_id
+    for key in ("stage_path", "checkpoint_path"):
+        path = result.get(key)
+        if not isinstance(path, str):
+            continue
+        for part in path.split("/"):
+            if part.startswith("cp_"):
+                return part
+    raise RuntimeError(f"checkpoint save returned no checkpoint id: {result!r}")
+
+
+def _run_checkpoint_round_trip_probe(
+    client,
+    job_id: str,
+) -> list[dict[str, Any]]:
+    save_request_id = client.save(job_id, checkpoint_type="resumable")
+    save_result = client.poll_request(job_id, save_request_id)
+    checkpoint_id = _checkpoint_id(save_result)
+
+    try:
+        load_request_id = client.load(
+            job_id,
+            checkpoint_id,
+            source_job_id=job_id,
+            target_sub_job_id=f"{job_id}:training:0",
+        )
+        load_result = client.poll_request(job_id, load_request_id)
+        loaded_checkpoint_id = load_result.get("checkpoint_id")
+        if loaded_checkpoint_id not in (None, checkpoint_id):
+            raise RuntimeError(
+                "checkpoint load returned a different checkpoint id: "
+                f"{loaded_checkpoint_id!r} != {checkpoint_id!r}"
+            )
+    finally:
+        client.delete_checkpoint(job_id, checkpoint_id)
+    return [
+        {
+            "operation": "save",
+            "requestId": save_request_id,
+            "checkpointId": checkpoint_id,
+            "checkpointType": "resumable",
+        },
+        {
+            "operation": "load",
+            "requestId": load_request_id,
+            "checkpointId": checkpoint_id,
+        },
+    ]
 
 
 def run_data_plane_probes(
@@ -304,6 +458,9 @@ def run_data_plane_probes(
     request: dict[str, Any],
     *,
     full_context_prefill: bool = False,
+    full_context_training: bool = False,
+    training_step: bool = False,
+    checkpoint_round_trip: bool = False,
 ) -> list[dict[str, Any]]:
     """Execute the minimal operations required by a catalog workflow."""
     probes = []
@@ -317,7 +474,19 @@ def run_data_plane_probes(
             )
         )
     if profile_key in TRAINING_PROFILE_KEYS:
-        probes.append(_run_forward_backward_probe(client, job_id, profile_key, request))
+        probes.append(
+            _run_forward_backward_probe(
+                client,
+                job_id,
+                profile_key,
+                request,
+                full_context_training,
+            )
+        )
+        if training_step or checkpoint_round_trip:
+            probes.append(_run_optimizer_step_probe(client, job_id, request))
+        if checkpoint_round_trip:
+            probes.extend(_run_checkpoint_round_trip_probe(client, job_id))
     return probes
 
 
@@ -396,6 +565,40 @@ def main() -> int:
             "generate one token instead of running the short text probe."
         ),
     )
+    parser.add_argument(
+        "--full-context-training",
+        action="store_true",
+        help=(
+            "For training profiles, execute forward-backward with "
+            "train_batch_size sequences of exactly max_seq_len tokens."
+        ),
+    )
+    parser.add_argument(
+        "--training-step",
+        action="store_true",
+        help="Run and poll one optimizer step after forward-backward.",
+    )
+    parser.add_argument(
+        "--checkpoint-round-trip",
+        action="store_true",
+        help=(
+            "After forward-backward and an optimizer step, save a resumable "
+            "checkpoint, load it back into the training sub-job, and delete it."
+        ),
+    )
+    parser.add_argument(
+        "--memory-telemetry",
+        action="store_true",
+        help="Enable server-side training peak-memory reporting for the probe.",
+    )
+    parser.add_argument(
+        "--training-sp-size",
+        type=int,
+        help=(
+            "Test a Ulysses sequence-parallel candidate and adjust the global "
+            "batch to n_gpus / sp_size."
+        ),
+    )
     args = parser.parse_args()
 
     plans = []
@@ -406,6 +609,10 @@ def main() -> int:
             args.model_id,
             profile_key,
         )
+        if args.memory_telemetry and profile_key in TRAINING_PROFILE_KEYS:
+            enable_training_memory_telemetry(request)
+        if args.training_sp_size and profile_key in TRAINING_PROFILE_KEYS:
+            apply_training_sequence_parallelism(request, args.training_sp_size)
         plans.append(
             {
                 "profileKey": profile_key,
@@ -445,6 +652,9 @@ def main() -> int:
                 profile_key,
                 plan["request"],
                 full_context_prefill=args.full_context_prefill,
+                full_context_training=args.full_context_training,
+                training_step=args.training_step,
+                checkpoint_round_trip=args.checkpoint_round_trip,
             )
             results.append(
                 {

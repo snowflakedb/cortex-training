@@ -70,6 +70,23 @@ startup plus basic generation. Add `--full-context-prefill` to send exactly
 `max_seq_len - 1` pre-tokenized tokens and generate one token. Only the latter
 validates execution at the configured context limit.
 
+For a training recommendation, use `--full-context-training` to execute
+forward-backward with exactly `max_seq_len` tokens in every sequence in the
+configured global batch. Add `--training-step` to exercise the optimizer, and
+`--checkpoint-round-trip` to step, save a resumable checkpoint, load it back
+into the training sub-job, and delete it. Job startup or the default
+eight-token forward-backward probe does not validate a training context-limit
+claim. Add `--memory-telemetry` to include the server's per-step peak GPU and
+CPU memory measurements in the result.
+
+Use `--training-sp-size` to evaluate a Ulysses sequence-parallel candidate
+before changing a catalog profile. The generated request sets `sp_size` and
+adjusts `train_batch_size` to the logical data-parallel size
+`n_gpus / sp_size`; it does not silently change `max_seq_len`.
+For Qwen3.8, the degree must divide its 24 full-attention heads, 16 GDN key
+heads, and 48 GDN value heads. SP8 is the largest valid common degree; SP24 is
+invalid even though it divides the full-attention head count.
+
 ```bash
 export SNOWFLAKE_HOST='ACCOUNT.snowflakecomputing.com'
 export SNOWFLAKE_DATABASE='CORTEX_TRAINING_DB'

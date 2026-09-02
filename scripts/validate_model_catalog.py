@@ -25,8 +25,15 @@ CAPABILITY_PROFILE_TYPES = {
 }
 PROFILE_BUILDERS = {"training_job", "sampling_job"}
 SUPPORTED_ZERO_STAGES = {0, 1, 2}
+LONG_CONTEXT_TRAINING_THRESHOLD = 200_000
 QWEN36_MODEL_ID = "Qwen/Qwen3.6-35B-A3B"
 QWEN36_LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
+QWEN38_MODEL_ID = "Qwen/Qwen3.8-27B"
+QWEN38_SP_HEAD_LAYOUTS = {
+    "num_attention_heads": 24,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 48,
+}
 
 
 class CatalogValidationError(ValueError):
@@ -318,7 +325,7 @@ def _validate_profile_reference(
                 raise CatalogValidationError(
                     f"profile {profile_id}.training_job.optimizer must be a non-empty object"
                 )
-            _require_positive_int(
+            train_batch_size = _require_positive_int(
                 args.get("train_batch_size"),
                 f"profile {profile_id}.training_job.train_batch_size",
             )
@@ -334,6 +341,63 @@ def _validate_profile_reference(
                 ds_config.get("zero_optimization"),
                 f"profile {profile_id}.training_job.extra_training.ds_config.zero_optimization",
             )
+            ds_train_batch_size = _require_positive_int(
+                ds_config.get("train_batch_size"),
+                f"profile {profile_id}.training_job.extra_training.ds_config.train_batch_size",
+            )
+            if ds_train_batch_size != train_batch_size:
+                raise CatalogValidationError(
+                    f"profile {profile_id}.training_job train_batch_size must match "
+                    "extra_training.ds_config.train_batch_size"
+                )
+
+            sp_size = extra_training.get("sp_size")
+            if max_context >= LONG_CONTEXT_TRAINING_THRESHOLD and sp_size is None:
+                raise CatalogValidationError(
+                    f"model {model_id}.{profile_key}: {max_context}-token training "
+                    "requires extra_training.sp_size"
+                )
+            if (
+                max_context >= LONG_CONTEXT_TRAINING_THRESHOLD
+                and profile_key in {"sftLora", "sftFull"}
+                and extra_training.get("model_provider", "huggingface") != "prime_rl"
+            ):
+                _require_positive_int(
+                    extra_training.get("fused_lm_head_token_chunk_size"),
+                    f"model {model_id}.{profile_key} dense long-context SFT "
+                    "fused_lm_head_token_chunk_size",
+                )
+            if sp_size is not None:
+                sp_size = _require_positive_int(
+                    sp_size,
+                    f"profile {profile_id}.training_job.extra_training.sp_size",
+                )
+                if sp_size <= 1 or n_gpus % sp_size != 0:
+                    raise CatalogValidationError(
+                        f"profile {profile_id}.training_job sp_size must be greater "
+                        f"than one and divide n_gpus ({n_gpus})"
+                    )
+                logical_dp = n_gpus // sp_size
+                if train_batch_size != logical_dp:
+                    raise CatalogValidationError(
+                        f"profile {profile_id}.training_job with sp_size {sp_size} "
+                        f"requires train_batch_size {logical_dp}"
+                    )
+                if (
+                    ds_config.get("train_micro_batch_size_per_gpu") != 1
+                    or ds_config.get("gradient_accumulation_steps") != 1
+                ):
+                    raise CatalogValidationError(
+                        f"profile {profile_id}.training_job sequence parallelism "
+                        "requires DeepSpeed micro batch and accumulation of one"
+                    )
+                if model_id == QWEN38_MODEL_ID:
+                    for head_field, head_count in QWEN38_SP_HEAD_LAYOUTS.items():
+                        if head_count % sp_size:
+                            raise CatalogValidationError(
+                                f"model {model_id}.{profile_key}: sp_size {sp_size} "
+                                f"must divide {head_field} ({head_count})"
+                            )
             zero_stage = zero_optimization.get("stage")
             if (
                 isinstance(zero_stage, bool)

@@ -11,8 +11,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import smoke_test_model_catalog as smoke_catalog  # noqa: E402
+from smoke_test_model_catalog import apply_training_sequence_parallelism  # noqa: E402
 from smoke_test_model_catalog import build_profile_request  # noqa: E402
 from smoke_test_model_catalog import build_forward_backward_probe_spec  # noqa: E402
+from smoke_test_model_catalog import enable_training_memory_telemetry  # noqa: E402
 from smoke_test_model_catalog import run_data_plane_probes  # noqa: E402
 from validate_model_catalog import (  # noqa: E402
     CatalogValidationError,
@@ -31,8 +33,22 @@ def test_checked_in_catalog_is_valid():
         "schemaVersion": 1,
         "lastReviewed": "2026-09-01",
         "models": 10,
-        "profiles": 12,
+        "profiles": 16,
     }
+
+
+def test_docs_model_data_keeps_catalog_model_ids():
+    models_doc, _ = load_catalog(CONFIG_DIR)
+    data_lines = (REPO_ROOT / "docs/_data/models.yaml").read_text().splitlines()
+    docs_model_ids = [
+        line.removeprefix("  - id: ")
+        for line in data_lines
+        if line.startswith("  - id: ")
+    ]
+
+    assert docs_model_ids == [
+        model["modelId"] for model in models_doc["models"]
+    ]
 
 
 def test_catalog_context_limits_match_supported_profiles():
@@ -59,6 +75,43 @@ def test_catalog_context_limits_match_supported_profiles():
                 profile["maxContextTokens"]
                 for profile in capabilities["training"]["profiles"].values()
             } == {expected}
+
+
+def test_shipped_qwen_recipes_use_model_limits_and_long_context_sp():
+    expected_limits = {
+        "Qwen/Qwen3-8B": 32768,
+        "Qwen/Qwen3.6-35B-A3B": 262144,
+    }
+    config_paths = [
+        *REPO_ROOT.glob("recipes/inference/configs/qwen*.json"),
+        *REPO_ROOT.glob("recipes/rl/math_grpo/configs/qwen*.json"),
+        *REPO_ROOT.glob("recipes/sft/conversational/configs/qwen*.json"),
+    ]
+
+    assert len(config_paths) == 12
+    for path in config_paths:
+        request = json.loads(path.read_text())
+        for sub_job in request["sub_job_configs"]:
+            model_id = sub_job["model_name"]
+            config = sub_job.get("training_config") or sub_job.get("inference_config")
+            assert config["max_seq_len"] == expected_limits[model_id]
+            if sub_job["job_type"] == "training":
+                ds_config = config["ds_config"]
+                sp_size = config.get("sp_size", 1)
+                logical_dp = config["n_gpus"] // sp_size
+                assert config["train_batch_size"] == ds_config["train_batch_size"]
+                assert config["train_batch_size"] == (
+                    logical_dp
+                    * ds_config["train_micro_batch_size_per_gpu"]
+                    * ds_config["gradient_accumulation_steps"]
+                )
+            if (
+                model_id == "Qwen/Qwen3.6-35B-A3B"
+                and sub_job["job_type"] == "training"
+            ):
+                assert config["sp_size"] == 8
+                assert config["train_batch_size"] == 1
+                assert config["ds_config"]["train_batch_size"] == 1
 
 
 @pytest.mark.parametrize(
@@ -295,6 +348,34 @@ def test_every_recommendation_materializes_its_advertised_context_limit():
             } == {recommendation["maxContextTokens"]}
 
 
+def test_every_long_context_training_recommendation_uses_sequence_parallelism():
+    models_doc, _ = load_catalog(CONFIG_DIR)
+
+    for model in models_doc["models"]:
+        training = model["capabilities"]["training"]
+        if not training["supported"]:
+            continue
+        for profile_key, recommendation in training["profiles"].items():
+            if recommendation["maxContextTokens"] < 200_000:
+                continue
+            request = build_profile_request(
+                CONFIG_DIR,
+                REPO_ROOT,
+                model["modelId"],
+                profile_key,
+            )
+            config = next(
+                sub_job["training_config"]
+                for sub_job in request["sub_job_configs"]
+                if sub_job["job_type"] == "training"
+            )
+            assert config["sp_size"] == 8
+            assert config["train_batch_size"] == config["n_gpus"] // 8
+            assert config["ds_config"]["train_batch_size"] == config["train_batch_size"]
+            assert config["ds_config"]["train_micro_batch_size_per_gpu"] == 1
+            assert config["ds_config"]["gradient_accumulation_steps"] == 1
+
+
 @pytest.mark.parametrize("profile_key", ["sftFull", "rlFull"])
 def test_dense_full_recommendations_use_zero_stage_two(profile_key):
     request = build_profile_request(
@@ -411,7 +492,7 @@ def test_rl_forward_backward_probe_uses_packing_aware_grpo_contract():
     spec = build_forward_backward_probe_spec(request, "rlFull")
     payload = spec["payload"]
 
-    assert len(payload["input_ids"]) == 32
+    assert len(payload["input_ids"]) == 2
     assert payload["include_attention_mask"] is True
     assert payload["labels"] == "none"
     assert spec["processing"] == {
@@ -421,7 +502,7 @@ def test_rl_forward_backward_probe_uses_packing_aware_grpo_contract():
             "eps_clip": 0.2,
             "loss_agg_mode": "token-mean",
             "entropy_coeff": 0.0,
-            "global_batch_size": 32,
+            "global_batch_size": 2,
         },
     }
     assert spec["context"]["advantages"]["dtype"] == "float32"
@@ -435,6 +516,91 @@ def test_rl_forward_backward_probe_uses_packing_aware_grpo_contract():
         1.0,
         0.0,
     ]
+
+
+def test_full_context_training_probe_uses_exact_declared_limit():
+    request = build_profile_request(
+        CONFIG_DIR,
+        REPO_ROOT,
+        "Qwen/Qwen3-0.6B",
+        "sftLora",
+    )
+
+    spec = build_forward_backward_probe_spec(
+        request,
+        "sftLora",
+        full_context=True,
+    )
+
+    assert len(spec["payload"]["input_ids"]) == 8
+    assert len(spec["payload"]["input_ids"][0]) == 32768
+    assert set(spec["payload"]["input_ids"][0]) == {1}
+
+
+@pytest.mark.parametrize("profile_key", ["sftLora", "sftFull"])
+def test_qwen38_long_sft_uses_chunked_logprob_loss(profile_key):
+    request = build_profile_request(
+        CONFIG_DIR,
+        REPO_ROOT,
+        "Qwen/Qwen3.8-27B",
+        profile_key,
+    )
+    training = request["sub_job_configs"][0]["training_config"]
+
+    assert training["sp_size"] == 8
+    assert training["fused_lm_head_token_chunk_size"] == 8192
+
+    spec = build_forward_backward_probe_spec(
+        request,
+        profile_key,
+        full_context=True,
+    )
+    assert spec["payload"]["labels"] == "none"
+    assert spec["processing"] == {
+        "loss_fn": "causal_cross_entropy",
+        "post": ["compute_logprobs"],
+        "config": {},
+    }
+    assert spec["context"]["loss_mask"]["data"][0][-2:] == [1.0, 0.0]
+
+
+def test_training_memory_telemetry_is_enabled_only_for_training_sub_jobs():
+    request = build_profile_request(
+        CONFIG_DIR,
+        REPO_ROOT,
+        "Qwen/Qwen3-0.6B",
+        "rlLora",
+    )
+
+    enable_training_memory_telemetry(request)
+
+    training = request["sub_job_configs"][0]["training_config"]
+    sampling = request["sub_job_configs"][1]["inference_config"]
+    assert training["step_peak_memory_log"] is True
+    assert training["training_memory_telemetry"] is True
+    assert "step_peak_memory_log" not in sampling
+    assert "training_memory_telemetry" not in sampling
+
+
+def test_training_sequence_parallelism_adjusts_logical_dp_batch_only():
+    request = build_profile_request(
+        CONFIG_DIR,
+        REPO_ROOT,
+        "Qwen/Qwen3.6-35B-A3B",
+        "rlFull",
+    )
+
+    apply_training_sequence_parallelism(request, 16)
+
+    training = request["sub_job_configs"][0]["training_config"]
+    sampling = request["sub_job_configs"][1]["inference_config"]
+    assert training["n_gpus"] == 16
+    assert training["sp_size"] == 16
+    assert training["train_batch_size"] == 1
+    assert training["ds_config"]["train_batch_size"] == 1
+    assert training["ds_config"]["train_micro_batch_size_per_gpu"] == 1
+    assert training["ds_config"]["gradient_accumulation_steps"] == 1
+    assert "sp_size" not in sampling
 
 
 @pytest.mark.parametrize(
@@ -499,6 +665,96 @@ def test_live_smoke_executes_workflow_data_plane_probes(
             b"forward-backward-payload",
         ) in client.calls
         assert ("poll", "job-1", "forward-backward-request") in client.calls
+
+
+def test_training_step_and_checkpoint_round_trip_follow_forward_backward(monkeypatch):
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def forward_backward(self, job_id, payload):
+            self.calls.append(("forward-backward", job_id, payload))
+            return "forward-backward-request"
+
+        def step(self, job_id, learning_rate=None):
+            self.calls.append(("step", job_id, learning_rate))
+            return "step-request"
+
+        def save(self, job_id, checkpoint_type=None):
+            self.calls.append(("save", job_id, checkpoint_type))
+            return "save-request"
+
+        def delete_checkpoint(self, job_id, checkpoint_id):
+            self.calls.append(("delete-checkpoint", job_id, checkpoint_id))
+
+        def load(
+            self,
+            job_id,
+            checkpoint_id,
+            source_job_id=None,
+            *,
+            target_sub_job_id=None,
+        ):
+            self.calls.append(
+                (
+                    "load",
+                    job_id,
+                    checkpoint_id,
+                    source_job_id,
+                    target_sub_job_id,
+                )
+            )
+            return "load-request"
+
+        def poll_request(self, job_id, request_id):
+            self.calls.append(("poll", job_id, request_id))
+            return {
+                "forward-backward-request": {"avg_loss": 0.25},
+                "step-request": {"global_steps": 1},
+                "save-request": {
+                    "stage_path": "s3://bucket/checkpoints/cp_test/global_step1/"
+                },
+                "load-request": {"checkpoint_id": "cp_test"},
+            }[request_id]
+
+    request = build_profile_request(
+        CONFIG_DIR,
+        REPO_ROOT,
+        "Qwen/Qwen3-0.6B",
+        "sftLora",
+    )
+    monkeypatch.setattr(
+        smoke_catalog,
+        "_build_forward_backward_probe_payload",
+        lambda *_: b"forward-backward-payload",
+    )
+    client = FakeClient()
+
+    probes = run_data_plane_probes(
+        client,
+        "job-1",
+        "sftLora",
+        request,
+        training_step=True,
+        checkpoint_round_trip=True,
+    )
+
+    assert [probe["operation"] for probe in probes] == [
+        "forward-backward",
+        "step",
+        "save",
+        "load",
+    ]
+    assert ("step", "job-1", 0.00002) in client.calls
+    assert ("save", "job-1", "resumable") in client.calls
+    assert (
+        "load",
+        "job-1",
+        "cp_test",
+        "job-1",
+        "job-1:training:0",
+    ) in client.calls
+    assert ("delete-checkpoint", "job-1", "cp_test") in client.calls
 
 
 def test_live_smoke_rejects_non_finite_forward_backward_loss(monkeypatch):
@@ -614,6 +870,51 @@ def test_sampling_tensor_parallel_size_must_divide_gpu_count():
     with pytest.raises(
         CatalogValidationError,
         match="tensor_parallel_size must be a divisor of n_gpus",
+    ):
+        validate_catalog(models_doc, profiles, REPO_ROOT)
+
+
+def test_long_context_training_without_sequence_parallelism_is_rejected():
+    models_doc, profiles = load_catalog(CONFIG_DIR)
+    profile = next(
+        item for item in profiles if item["id"] == "dense-long-sft-full-8gpu"
+    )
+    del profile["subJobs"][0]["args"]["extra_training"]["sp_size"]
+
+    with pytest.raises(CatalogValidationError, match="requires extra_training.sp_size"):
+        validate_catalog(models_doc, profiles, REPO_ROOT)
+
+
+def test_dense_long_context_sft_without_chunked_loss_is_rejected():
+    models_doc, profiles = load_catalog(CONFIG_DIR)
+    profile = next(
+        item for item in profiles if item["id"] == "dense-long-sft-full-8gpu"
+    )
+    del profile["subJobs"][0]["args"]["extra_training"][
+        "fused_lm_head_token_chunk_size"
+    ]
+
+    with pytest.raises(
+        CatalogValidationError,
+        match="dense long-context SFT fused_lm_head_token_chunk_size",
+    ):
+        validate_catalog(models_doc, profiles, REPO_ROOT)
+
+
+def test_qwen38_sequence_parallelism_must_divide_gdn_heads():
+    models_doc, profiles = load_catalog(CONFIG_DIR)
+    profile = next(
+        item for item in profiles if item["id"] == "dense-long-sft-full-8gpu"
+    )
+    args = profile["subJobs"][0]["args"]
+    args["n_gpus"] = 24
+    args["train_batch_size"] = 1
+    args["extra_training"]["sp_size"] = 24
+    args["extra_training"]["ds_config"]["train_batch_size"] = 1
+
+    with pytest.raises(
+        CatalogValidationError,
+        match=r"sp_size 24 must divide linear_num_key_heads \(16\)",
     ):
         validate_catalog(models_doc, profiles, REPO_ROOT)
 

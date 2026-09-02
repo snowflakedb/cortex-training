@@ -114,19 +114,19 @@
           "profiles": {
             "sftLora": {
               "maxContextTokens": 262144,
-              "recommendedProfileId": "dense-sft-lora-8gpu"
+              "recommendedProfileId": "dense-long-sft-lora-8gpu"
             },
             "sftFull": {
               "maxContextTokens": 262144,
-              "recommendedProfileId": "dense-sft-full-8gpu"
+              "recommendedProfileId": "dense-long-sft-full-8gpu"
             },
             "rlLora": {
               "maxContextTokens": 262144,
-              "recommendedProfileId": "dense-rl-lora-8x8"
+              "recommendedProfileId": "dense-long-rl-lora-8x8"
             },
             "rlFull": {
               "maxContextTokens": 262144,
-              "recommendedProfileId": "dense-rl-full-8x8"
+              "recommendedProfileId": "dense-long-rl-full-8x8"
             }
           }
         }
@@ -178,11 +178,11 @@
           "profiles": {
             "sftLora": {
               "maxContextTokens": 262144,
-              "recommendedProfileId": "dense-sft-lora-8gpu"
+              "recommendedProfileId": "dense-long-sft-lora-8gpu"
             },
             "sftFull": {
               "maxContextTokens": 262144,
-              "recommendedProfileId": "dense-sft-full-8gpu"
+              "recommendedProfileId": "dense-long-sft-full-8gpu"
             },
             "rlLora": {
               "maxContextTokens": 262144,
@@ -190,7 +190,7 @@
             },
             "rlFull": {
               "maxContextTokens": 262144,
-              "recommendedProfileId": "dense-rl-full-8x8"
+              "recommendedProfileId": "dense-long-rl-full-8x8"
             }
           }
         }
