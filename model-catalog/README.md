@@ -63,7 +63,8 @@ profiles execute and poll a one-token `generate` request, SFT profiles execute
 and poll a minimal `forward-backward` request, and RL profiles execute both.
 The job is then cancelled. The PAT is intentionally not accepted as a
 command-line argument, which keeps it out of shell history and process
-listings.
+listings. Use `--debug-image-tag` when a validation run must select a specific
+backend build.
 
 The default inference probe uses a short text prompt and validates engine
 startup plus basic generation. Add `--full-context-prefill` to send exactly

@@ -178,11 +178,13 @@
           "profiles": {
             "sftLora": {
               "maxContextTokens": 262144,
-              "recommendedProfileId": "dense-long-sft-lora-8gpu"
+              "recommendedProfileId": "dense-long-sft-lora-8gpu",
+              "lastValidated": "2026-09-02"
             },
             "sftFull": {
               "maxContextTokens": 262144,
-              "recommendedProfileId": "dense-long-sft-full-8gpu"
+              "recommendedProfileId": "dense-long-sft-full-8gpu",
+              "lastValidated": "2026-09-02"
             },
             "rlLora": {
               "maxContextTokens": 262144,

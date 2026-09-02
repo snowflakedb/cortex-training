@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -11,6 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import smoke_test_model_catalog as smoke_catalog  # noqa: E402
+from smoke_test_model_catalog import apply_debug_image_tag  # noqa: E402
 from smoke_test_model_catalog import apply_training_sequence_parallelism  # noqa: E402
 from smoke_test_model_catalog import build_profile_request  # noqa: E402
 from smoke_test_model_catalog import build_forward_backward_probe_spec  # noqa: E402
@@ -46,9 +48,7 @@ def test_docs_model_data_keeps_catalog_model_ids():
         if line.startswith("  - id: ")
     ]
 
-    assert docs_model_ids == [
-        model["modelId"] for model in models_doc["models"]
-    ]
+    assert docs_model_ids == [model["modelId"] for model in models_doc["models"]]
 
 
 def test_catalog_context_limits_match_supported_profiles():
@@ -105,10 +105,7 @@ def test_shipped_qwen_recipes_use_model_limits_and_long_context_sp():
                     * ds_config["train_micro_batch_size_per_gpu"]
                     * ds_config["gradient_accumulation_steps"]
                 )
-            if (
-                model_id == "Qwen/Qwen3.6-35B-A3B"
-                and sub_job["job_type"] == "training"
-            ):
+            if model_id == "Qwen/Qwen3.6-35B-A3B" and sub_job["job_type"] == "training":
                 assert config["sp_size"] == 8
                 assert config["train_batch_size"] == 1
                 assert config["ds_config"]["train_batch_size"] == 1
@@ -174,6 +171,8 @@ def test_validation_dates_match_completed_live_smokes():
         if "lastValidated" in recommendation
     }
     assert validated == {
+        ("Qwen/Qwen3.8-27B", "sftLora"): "2026-09-02",
+        ("Qwen/Qwen3.8-27B", "sftFull"): "2026-09-02",
         ("deepseek-ai/DeepSeek-V4-Flash-0731", "inference"): "2026-09-01",
         ("zai-org/GLM-5.2-FP8", "inference"): "2026-09-01",
     }
@@ -580,6 +579,21 @@ def test_training_memory_telemetry_is_enabled_only_for_training_sub_jobs():
     assert training["training_memory_telemetry"] is True
     assert "step_peak_memory_log" not in sampling
     assert "training_memory_telemetry" not in sampling
+
+
+def test_debug_image_tag_is_added_to_create_job_body(monkeypatch):
+    monkeypatch.delenv(smoke_catalog.DEBUG_OPTIONS_ENV, raising=False)
+    request = build_profile_request(
+        CONFIG_DIR,
+        REPO_ROOT,
+        "Qwen/Qwen3.8-27B",
+        "sftFull",
+    )
+
+    apply_debug_image_tag(request, "dev_test")
+
+    assert request["debug"] == {"job": {"image_tag": "dev_test"}}
+    assert os.environ[smoke_catalog.DEBUG_OPTIONS_ENV] == "1"
 
 
 def test_training_sequence_parallelism_adjusts_logical_dp_batch_only():

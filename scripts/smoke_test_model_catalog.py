@@ -21,6 +21,7 @@ SOURCE_ROOT = REPO_ROOT / "src"
 PROFILE_KEYS = ("inference", "sftLora", "sftFull", "rlLora", "rlFull")
 TRAINING_PROFILE_KEYS = ("sftLora", "sftFull", "rlLora", "rlFull")
 SAMPLING_PROFILE_KEYS = ("inference", "rlLora", "rlFull")
+DEBUG_OPTIONS_ENV = "CORTEX_TRAINING_ENABLE_DEBUG_OPTIONS"
 TOP_LEVEL_ARGS = {
     "global_batch_size",
     "dtype",
@@ -124,6 +125,12 @@ def enable_training_memory_telemetry(request: dict[str, Any]) -> None:
         training = sub_job["training_config"]
         training["step_peak_memory_log"] = True
         training["training_memory_telemetry"] = True
+
+
+def apply_debug_image_tag(request: dict[str, Any], image_tag: str) -> None:
+    """Select a specific backend image for a live smoke test."""
+    os.environ[DEBUG_OPTIONS_ENV] = "1"
+    request["debug"] = {"job": {"image_tag": image_tag}}
 
 
 def apply_training_sequence_parallelism(
@@ -592,6 +599,10 @@ def main() -> int:
         help="Enable server-side training peak-memory reporting for the probe.",
     )
     parser.add_argument(
+        "--debug-image-tag",
+        help="Run the submitted job with a specific backend image tag.",
+    )
+    parser.add_argument(
         "--training-sp-size",
         type=int,
         help=(
@@ -611,6 +622,8 @@ def main() -> int:
         )
         if args.memory_telemetry and profile_key in TRAINING_PROFILE_KEYS:
             enable_training_memory_telemetry(request)
+        if args.debug_image_tag:
+            apply_debug_image_tag(request, args.debug_image_tag)
         if args.training_sp_size and profile_key in TRAINING_PROFILE_KEYS:
             apply_training_sequence_parallelism(request, args.training_sp_size)
         plans.append(
