@@ -455,6 +455,13 @@ def validate_catalog(
         if model_id in model_ids:
             raise CatalogValidationError(f"duplicate model id: {model_id}")
         model_ids.add(model_id)
+        license_info = _require_dict(item.get("license"), f"model {model_id}.license")
+        _require_string(license_info.get("name"), f"model {model_id}.license.name")
+        license_url = _require_string(
+            license_info.get("url"), f"model {model_id}.license.url"
+        )
+        if not license_url.startswith("https://"):
+            raise CatalogValidationError(f"model {model_id}.license.url must use https")
 
         capabilities = _require_dict(
             item.get("capabilities"), f"model {model_id}.capabilities"

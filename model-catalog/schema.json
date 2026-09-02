@@ -182,6 +182,7 @@
       "required": [
         "name",
         "modelId",
+        "license",
         "capabilities"
       ],
       "properties": {
@@ -192,6 +193,25 @@
         "modelId": {
           "type": "string",
           "minLength": 1
+        },
+        "license": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "url"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "format": "uri"
+            }
+          }
         },
         "capabilities": {
           "type": "object",

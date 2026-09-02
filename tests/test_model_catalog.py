@@ -77,6 +77,29 @@ def test_catalog_context_limits_match_supported_profiles():
             } == {expected}
 
 
+def test_catalog_models_include_license_links():
+    models_doc, _ = load_catalog(CONFIG_DIR)
+
+    assert {
+        model["modelId"]: model["license"]["name"] for model in models_doc["models"]
+    } == {
+        "Qwen/Qwen3-0.6B": "Apache 2.0",
+        "Qwen/Qwen3-1.7B": "Apache 2.0",
+        "Qwen/Qwen3-8B": "Apache 2.0",
+        "Qwen/Qwen3.5-4B": "Apache 2.0",
+        "Qwen/Qwen3.6-35B-A3B": "Apache 2.0",
+        "Qwen/Qwen3.8-27B": "Apache 2.0",
+        "deepseek-ai/DeepSeek-V4-Flash-0731": "MIT",
+        "openai/gpt-oss-120b": "Apache 2.0",
+        "zai-org/GLM-5.2": "MIT",
+        "zai-org/GLM-5.2-FP8": "MIT",
+    }
+    assert all(
+        model["license"]["url"].startswith("https://huggingface.co/")
+        for model in models_doc["models"]
+    )
+
+
 def test_shipped_qwen_recipes_use_model_limits_and_long_context_sp():
     expected_limits = {
         "Qwen/Qwen3-8B": 32768,
