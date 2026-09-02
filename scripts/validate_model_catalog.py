@@ -222,31 +222,34 @@ def _validate_profile_reference(
     recommendation: dict[str, Any],
     profile_by_id: dict[str, dict[str, Any]],
     builder_signatures: dict[str, tuple[set[str], set[str]]],
-) -> str:
+    allow_long_sequence: bool = False,
+    long_sequence: bool = False,
+) -> set[str]:
+    variant = ".longSequence" if long_sequence else ""
     max_context = _require_positive_int(
         recommendation.get("maxContextTokens"),
-        f"model {model_id}.{profile_key}.maxContextTokens",
+        f"model {model_id}.{profile_key}{variant}.maxContextTokens",
     )
     profile_id = _require_string(
         recommendation.get("recommendedProfileId"),
-        f"model {model_id}.{profile_key}.recommendedProfileId",
+        f"model {model_id}.{profile_key}{variant}.recommendedProfileId",
     )
     validated = recommendation.get("lastValidated")
     if validated is not None:
         validated = _require_string(
             validated,
-            f"model {model_id}.{profile_key}.lastValidated",
+            f"model {model_id}.{profile_key}{variant}.lastValidated",
         )
         try:
             date.fromisoformat(validated)
         except ValueError as exc:
             raise CatalogValidationError(
-                f"model {model_id}.{profile_key}.lastValidated must be an ISO date"
+                f"model {model_id}.{profile_key}{variant}.lastValidated must be an ISO date"
             ) from exc
     profile = profile_by_id.get(profile_id)
     if profile is None:
         raise CatalogValidationError(
-            f"model {model_id}.{profile_key}: unknown profile {profile_id}"
+            f"model {model_id}.{profile_key}{variant}: unknown profile {profile_id}"
         )
     expected_workflow, expected_tuning = CAPABILITY_PROFILE_TYPES[profile_key]
     if (profile["workflow"], profile["tuningMethod"]) != (
@@ -254,7 +257,7 @@ def _validate_profile_reference(
         expected_tuning,
     ):
         raise CatalogValidationError(
-            f"model {model_id}.{profile_key}: profile {profile_id} has incompatible "
+            f"model {model_id}.{profile_key}{variant}: profile {profile_id} has incompatible "
             f"workflow/tuningMethod"
         )
 
@@ -267,7 +270,7 @@ def _validate_profile_reference(
         training_extra = training_sub_job["args"].get("extra_training") or {}
         if training_extra.get("model_provider") != "prime_rl":
             raise CatalogValidationError(
-                f"model {model_id}.{profile_key}: LoRA save/load requires "
+                f"model {model_id}.{profile_key}{variant}: LoRA save/load requires "
                 "extra_training.model_provider='prime_rl'"
             )
         for sub_job in profile["subJobs"]:
@@ -276,7 +279,7 @@ def _validate_profile_reference(
             targets = (extra.get("peft_config") or {}).get("target_modules")
             if targets != QWEN36_LORA_TARGET_MODULES:
                 raise CatalogValidationError(
-                    f"model {model_id}.{profile_key}: PrimeRL LoRA supports only "
+                    f"model {model_id}.{profile_key}{variant}: PrimeRL LoRA supports only "
                     f"attention target_modules {QWEN36_LORA_TARGET_MODULES}"
                 )
 
@@ -290,7 +293,7 @@ def _validate_profile_reference(
         missing = sorted(required - set(args))
         if unexpected or missing:
             raise CatalogValidationError(
-                f"model {model_id}.{profile_key}: profile {profile_id} does not match "
+                f"model {model_id}.{profile_key}{variant}: profile {profile_id} does not match "
                 f"SubJobConfig.{builder}; unexpected={unexpected}, missing={missing}"
             )
         n_gpus = _require_positive_int(
@@ -352,6 +355,15 @@ def _validate_profile_reference(
                 )
 
             sp_size = extra_training.get("sp_size")
+            if (
+                not long_sequence
+                and recommendation.get("longSequence") is not None
+                and sp_size not in (None, 1)
+            ):
+                raise CatalogValidationError(
+                    f"model {model_id}.{profile_key}: standard training must use "
+                    "sequence-parallel size one"
+                )
             if max_context >= LONG_CONTEXT_TRAINING_THRESHOLD and sp_size is None:
                 raise CatalogValidationError(
                     f"model {model_id}.{profile_key}: {max_context}-token training "
@@ -395,7 +407,7 @@ def _validate_profile_reference(
                     for head_field, head_count in QWEN38_SP_HEAD_LAYOUTS.items():
                         if head_count % sp_size:
                             raise CatalogValidationError(
-                                f"model {model_id}.{profile_key}: sp_size {sp_size} "
+                                f"model {model_id}.{profile_key}{variant}: sp_size {sp_size} "
                                 f"must divide {head_field} ({head_count})"
                             )
             zero_stage = zero_optimization.get("stage")
@@ -408,7 +420,37 @@ def _validate_profile_reference(
                     f"profile {profile_id}.training_job ZeRO stage {zero_stage!r} "
                     f"is unsupported; supported stages are {sorted(SUPPORTED_ZERO_STAGES)}"
                 )
-    return profile_id
+    referenced = {profile_id}
+    long_recommendation = recommendation.get("longSequence")
+    if long_recommendation is not None:
+        if not allow_long_sequence:
+            raise CatalogValidationError(
+                f"model {model_id}.{profile_key}{variant}: longSequence is not allowed"
+            )
+        long_recommendation = _require_dict(
+            long_recommendation,
+            f"model {model_id}.{profile_key}.longSequence",
+        )
+        long_context = _require_positive_int(
+            long_recommendation.get("maxContextTokens"),
+            f"model {model_id}.{profile_key}.longSequence.maxContextTokens",
+        )
+        if long_context <= max_context:
+            raise CatalogValidationError(
+                f"model {model_id}.{profile_key}.longSequence.maxContextTokens "
+                f"must exceed the standard limit {max_context}"
+            )
+        referenced.update(
+            _validate_profile_reference(
+                model_id=model_id,
+                profile_key=profile_key,
+                recommendation=long_recommendation,
+                profile_by_id=profile_by_id,
+                builder_signatures=builder_signatures,
+                long_sequence=True,
+            )
+        )
+    return referenced
 
 
 def validate_catalog(
@@ -481,7 +523,7 @@ def validate_catalog(
                 f"model {model_id}.inference.supported must be a boolean"
             )
         if inference_supported:
-            referenced_profiles.add(
+            referenced_profiles.update(
                 _validate_profile_reference(
                     model_id=model_id,
                     profile_key="inference",
@@ -536,13 +578,14 @@ def validate_catalog(
                 training_profiles[profile_key],
                 f"model {model_id}.training.profiles.{profile_key}",
             )
-            referenced_profiles.add(
+            referenced_profiles.update(
                 _validate_profile_reference(
                     model_id=model_id,
                     profile_key=profile_key,
                     recommendation=recommendation,
                     profile_by_id=profile_by_id,
                     builder_signatures=builder_signatures,
+                    allow_long_sequence=True,
                 )
             )
 

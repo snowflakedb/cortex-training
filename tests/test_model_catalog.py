@@ -33,9 +33,9 @@ def test_checked_in_catalog_is_valid():
 
     assert summary == {
         "schemaVersion": 1,
-        "lastReviewed": "2026-09-01",
+        "lastReviewed": "2026-09-02",
         "models": 10,
-        "profiles": 16,
+        "profiles": 21,
     }
 
 
@@ -51,7 +51,7 @@ def test_docs_model_data_keeps_catalog_model_ids():
     assert docs_model_ids == [model["modelId"] for model in models_doc["models"]]
 
 
-def test_catalog_context_limits_match_supported_profiles():
+def test_catalog_context_limits_match_standard_and_long_profiles():
     models_doc, _ = load_catalog(CONFIG_DIR)
     expected_limits = {
         "Qwen/Qwen3-0.6B": 32768,
@@ -71,10 +71,14 @@ def test_catalog_context_limits_match_supported_profiles():
         capabilities = model["capabilities"]
         assert capabilities["inference"]["maxContextTokens"] == expected
         if capabilities["training"]["supported"]:
-            assert {
-                profile["maxContextTokens"]
-                for profile in capabilities["training"]["profiles"].values()
-            } == {expected}
+            recommendations = capabilities["training"]["profiles"].values()
+            assert {item["maxContextTokens"] for item in recommendations} == {32768}
+            if expected > 32768:
+                assert {
+                    item["longSequence"]["maxContextTokens"] for item in recommendations
+                } == {expected}
+            else:
+                assert all("longSequence" not in item for item in recommendations)
 
 
 def test_catalog_models_include_license_links():
@@ -186,16 +190,39 @@ def test_validation_dates_match_completed_live_smokes():
                     ].items()
                 }
             )
+            recommendations.update(
+                {
+                    (model["modelId"], profile_key, "longSequence"): recommendation[
+                        "longSequence"
+                    ]
+                    for profile_key, recommendation in capabilities["training"][
+                        "profiles"
+                    ].items()
+                    if "longSequence" in recommendation
+                }
+            )
 
-    assert len(recommendations) == 34
+    assert len(recommendations) == 46
     validated = {
         key: recommendation["lastValidated"]
         for key, recommendation in recommendations.items()
         if "lastValidated" in recommendation
     }
     assert validated == {
+        ("Qwen/Qwen3.5-4B", "sftLora"): "2026-09-02",
+        ("Qwen/Qwen3.5-4B", "sftFull"): "2026-09-02",
+        ("Qwen/Qwen3.5-4B", "rlLora"): "2026-09-02",
+        ("Qwen/Qwen3.5-4B", "rlFull"): "2026-09-02",
+        ("Qwen/Qwen3.6-35B-A3B", "sftLora"): "2026-09-02",
+        ("Qwen/Qwen3.6-35B-A3B", "sftFull"): "2026-09-02",
+        ("Qwen/Qwen3.6-35B-A3B", "rlLora"): "2026-09-02",
+        ("Qwen/Qwen3.6-35B-A3B", "rlFull"): "2026-09-02",
         ("Qwen/Qwen3.8-27B", "sftLora"): "2026-09-02",
         ("Qwen/Qwen3.8-27B", "sftFull"): "2026-09-02",
+        ("Qwen/Qwen3.8-27B", "rlLora"): "2026-09-02",
+        ("Qwen/Qwen3.8-27B", "rlFull"): "2026-09-02",
+        ("Qwen/Qwen3.8-27B", "sftLora", "longSequence"): "2026-09-02",
+        ("Qwen/Qwen3.8-27B", "sftFull", "longSequence"): "2026-09-02",
         ("deepseek-ai/DeepSeek-V4-Flash-0731", "inference"): "2026-09-01",
         ("zai-org/GLM-5.2-FP8", "inference"): "2026-09-01",
     }
@@ -306,7 +333,7 @@ def test_glm52_fp8_api_example_advertises_the_supported_1m_profile():
 
 def test_router_replay_sampling_uses_single_node_tensor_parallelism():
     _, profiles = load_catalog(CONFIG_DIR)
-    profile = next(item for item in profiles if item["id"] == "moe-rl-full-16x16")
+    profile = next(item for item in profiles if item["id"] == "moe-long-rl-full-16x16")
     sampling = profile["subJobs"][1]["args"]
 
     assert sampling["n_gpus"] == 16
@@ -318,7 +345,7 @@ def test_router_replay_sampling_uses_single_node_tensor_parallelism():
     ("model_id", "profile_key", "expected_max_context"),
     [
         ("Qwen/Qwen3-0.6B", "inference", 32768),
-        ("Qwen/Qwen3.8-27B", "sftFull", 262144),
+        ("Qwen/Qwen3.8-27B", "sftFull", 32768),
         ("deepseek-ai/DeepSeek-V4-Flash-0731", "inference", 1048576),
         ("openai/gpt-oss-120b", "inference", 131072),
         ("zai-org/GLM-5.2", "inference", 32768),
@@ -344,6 +371,17 @@ def test_recommendation_uses_advertised_model_limit(
     } == {expected_max_context}
 
 
+def test_long_sequence_selection_requires_an_available_variant():
+    with pytest.raises(ValueError, match="has no long-sequence recommendation"):
+        build_profile_request(
+            CONFIG_DIR,
+            REPO_ROOT,
+            "Qwen/Qwen3-8B",
+            "sftLora",
+            long_sequence=True,
+        )
+
+
 def test_every_recommendation_materializes_its_advertised_context_limit():
     models_doc, _ = load_catalog(CONFIG_DIR)
 
@@ -356,18 +394,23 @@ def test_every_recommendation_materializes_its_advertised_context_limit():
             recommendations.extend(capabilities["training"]["profiles"].items())
 
         for profile_key, recommendation in recommendations:
-            request = build_profile_request(
-                CONFIG_DIR,
-                REPO_ROOT,
-                model["modelId"],
-                profile_key,
-            )
-            assert {
-                (sub_job.get("training_config") or sub_job.get("inference_config"))[
-                    "max_seq_len"
-                ]
-                for sub_job in request["sub_job_configs"]
-            } == {recommendation["maxContextTokens"]}
+            variants = [(False, recommendation)]
+            if "longSequence" in recommendation:
+                variants.append((True, recommendation["longSequence"]))
+            for long_sequence, variant in variants:
+                request = build_profile_request(
+                    CONFIG_DIR,
+                    REPO_ROOT,
+                    model["modelId"],
+                    profile_key,
+                    long_sequence=long_sequence,
+                )
+                assert {
+                    (sub_job.get("training_config") or sub_job.get("inference_config"))[
+                        "max_seq_len"
+                    ]
+                    for sub_job in request["sub_job_configs"]
+                } == {variant["maxContextTokens"]}
 
 
 def test_every_long_context_training_recommendation_uses_sequence_parallelism():
@@ -378,7 +421,43 @@ def test_every_long_context_training_recommendation_uses_sequence_parallelism():
         if not training["supported"]:
             continue
         for profile_key, recommendation in training["profiles"].items():
-            if recommendation["maxContextTokens"] < 200_000:
+            long_recommendation = recommendation.get("longSequence")
+            if long_recommendation is None:
+                continue
+            request = build_profile_request(
+                CONFIG_DIR,
+                REPO_ROOT,
+                model["modelId"],
+                profile_key,
+                long_sequence=True,
+            )
+            config = next(
+                sub_job["training_config"]
+                for sub_job in request["sub_job_configs"]
+                if sub_job["job_type"] == "training"
+            )
+            assert config["sp_size"] == 8
+            assert config["train_batch_size"] == config["n_gpus"] // 8
+            assert config["ds_config"]["train_batch_size"] == config["train_batch_size"]
+            assert config["ds_config"]["train_micro_batch_size_per_gpu"] == 1
+            assert config["ds_config"]["gradient_accumulation_steps"] == 1
+            assert {
+                (sub_job.get("training_config") or sub_job.get("inference_config"))[
+                    "max_seq_len"
+                ]
+                for sub_job in request["sub_job_configs"]
+            } == {long_recommendation["maxContextTokens"]}
+
+
+def test_every_standard_recommendation_uses_sequence_parallel_size_one():
+    models_doc, _ = load_catalog(CONFIG_DIR)
+
+    for model in models_doc["models"]:
+        training = model["capabilities"]["training"]
+        if not training["supported"]:
+            continue
+        for profile_key, recommendation in training["profiles"].items():
+            if "longSequence" not in recommendation:
                 continue
             request = build_profile_request(
                 CONFIG_DIR,
@@ -391,11 +470,8 @@ def test_every_long_context_training_recommendation_uses_sequence_parallelism():
                 for sub_job in request["sub_job_configs"]
                 if sub_job["job_type"] == "training"
             )
-            assert config["sp_size"] == 8
-            assert config["train_batch_size"] == config["n_gpus"] // 8
-            assert config["ds_config"]["train_batch_size"] == config["train_batch_size"]
-            assert config["ds_config"]["train_micro_batch_size_per_gpu"] == 1
-            assert config["ds_config"]["gradient_accumulation_steps"] == 1
+            assert config.get("sp_size", 1) == 1
+            assert config["train_batch_size"] == config["n_gpus"]
 
 
 @pytest.mark.parametrize("profile_key", ["sftFull", "rlFull"])
@@ -442,12 +518,22 @@ def test_moe_rl_enables_router_replay_on_sampling_only():
 
 
 @pytest.mark.parametrize("profile_key", ["sftLora", "rlLora"])
-def test_qwen36_lora_uses_prime_rl_attention_targets(profile_key):
+@pytest.mark.parametrize(
+    ("long_sequence", "expected_context", "expected_sp"),
+    [(False, 32768, 1), (True, 262144, 8)],
+)
+def test_qwen36_lora_uses_prime_rl_attention_targets(
+    profile_key,
+    long_sequence,
+    expected_context,
+    expected_sp,
+):
     request = build_profile_request(
         CONFIG_DIR,
         REPO_ROOT,
         "Qwen/Qwen3.6-35B-A3B",
         profile_key,
+        long_sequence=long_sequence,
     )
 
     assert {
@@ -455,13 +541,14 @@ def test_qwen36_lora_uses_prime_rl_attention_targets(profile_key):
             "max_seq_len"
         ]
         for sub_job in request["sub_job_configs"]
-    } == {262144}
+    } == {expected_context}
     training = next(
         sub_job["training_config"]
         for sub_job in request["sub_job_configs"]
         if sub_job["job_type"] == "training"
     )
     assert training["model_provider"] == "prime_rl"
+    assert training.get("sp_size", 1) == expected_sp
     assert {
         tuple(
             (sub_job.get("training_config") or sub_job.get("inference_config"))[
@@ -487,7 +574,7 @@ def test_forward_backward_probe_matches_catalog_training_batch_size():
     request = build_profile_request(
         CONFIG_DIR,
         REPO_ROOT,
-        "Qwen/Qwen3-0.6B",
+        "Qwen/Qwen3.6-35B-A3B",
         "sftLora",
     )
 
@@ -514,7 +601,7 @@ def test_rl_forward_backward_probe_uses_packing_aware_grpo_contract():
     spec = build_forward_backward_probe_spec(request, "rlFull")
     payload = spec["payload"]
 
-    assert len(payload["input_ids"]) == 2
+    assert len(payload["input_ids"]) == 8
     assert payload["include_attention_mask"] is True
     assert payload["labels"] == "none"
     assert spec["processing"] == {
@@ -524,7 +611,7 @@ def test_rl_forward_backward_probe_uses_packing_aware_grpo_contract():
             "eps_clip": 0.2,
             "loss_agg_mode": "token-mean",
             "entropy_coeff": 0.0,
-            "global_batch_size": 2,
+            "global_batch_size": 8,
         },
     }
     assert spec["context"]["advantages"]["dtype"] == "float32"
@@ -560,16 +647,18 @@ def test_full_context_training_probe_uses_exact_declared_limit():
 
 
 @pytest.mark.parametrize("profile_key", ["sftLora", "sftFull"])
-def test_qwen38_long_sft_uses_chunked_logprob_loss(profile_key):
+@pytest.mark.parametrize("long_sequence", [False, True])
+def test_qwen38_sft_uses_chunked_logprob_loss(profile_key, long_sequence):
     request = build_profile_request(
         CONFIG_DIR,
         REPO_ROOT,
         "Qwen/Qwen3.8-27B",
         profile_key,
+        long_sequence=long_sequence,
     )
     training = request["sub_job_configs"][0]["training_config"]
 
-    assert training["sp_size"] == 8
+    assert training.get("sp_size", 1) == (8 if long_sequence else 1)
     assert training["fused_lm_head_token_chunk_size"] == 8192
 
     spec = build_forward_backward_probe_spec(
@@ -625,6 +714,7 @@ def test_training_sequence_parallelism_adjusts_logical_dp_batch_only():
         REPO_ROOT,
         "Qwen/Qwen3.6-35B-A3B",
         "rlFull",
+        long_sequence=True,
     )
 
     apply_training_sequence_parallelism(request, 16)

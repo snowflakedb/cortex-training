@@ -52,6 +52,31 @@
         "lastValidated": {
           "type": "string",
           "format": "date"
+        },
+        "longSequence": {
+          "$ref": "#/$defs/recommendedProfileVariant"
+        }
+      }
+    },
+    "recommendedProfileVariant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxContextTokens",
+        "recommendedProfileId"
+      ],
+      "properties": {
+        "maxContextTokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "recommendedProfileId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "lastValidated": {
+          "type": "string",
+          "format": "date"
         }
       }
     },

@@ -2,7 +2,7 @@
   "$schema": "./schema.json",
   "schemaVersion": 1,
   "catalog": "cortex-training",
-  "lastReviewed": "2026-09-01",
+  "lastReviewed": "2026-09-02",
   "models": [
     {
       "name": "Qwen3 0.6B",
@@ -129,20 +129,40 @@
           "supported": true,
           "profiles": {
             "sftLora": {
-              "maxContextTokens": 262144,
-              "recommendedProfileId": "dense-long-sft-lora-8gpu"
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "dense-sft-lora-8gpu",
+              "lastValidated": "2026-09-02",
+              "longSequence": {
+                "maxContextTokens": 262144,
+                "recommendedProfileId": "dense-long-sft-lora-8gpu"
+              }
             },
             "sftFull": {
-              "maxContextTokens": 262144,
-              "recommendedProfileId": "dense-long-sft-full-8gpu"
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "dense-sft-full-8gpu",
+              "lastValidated": "2026-09-02",
+              "longSequence": {
+                "maxContextTokens": 262144,
+                "recommendedProfileId": "dense-long-sft-full-8gpu"
+              }
             },
             "rlLora": {
-              "maxContextTokens": 262144,
-              "recommendedProfileId": "dense-long-rl-lora-8x8"
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "dense-rl-lora-8x8",
+              "lastValidated": "2026-09-02",
+              "longSequence": {
+                "maxContextTokens": 262144,
+                "recommendedProfileId": "dense-long-rl-lora-8x8"
+              }
             },
             "rlFull": {
-              "maxContextTokens": 262144,
-              "recommendedProfileId": "dense-long-rl-full-8x8"
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "dense-rl-full-8x8",
+              "lastValidated": "2026-09-02",
+              "longSequence": {
+                "maxContextTokens": 262144,
+                "recommendedProfileId": "dense-long-rl-full-8x8"
+              }
             }
           }
         }
@@ -165,20 +185,40 @@
           "supported": true,
           "profiles": {
             "sftLora": {
-              "maxContextTokens": 262144,
-              "recommendedProfileId": "moe-sft-lora-8gpu"
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "moe-sft-lora-8gpu",
+              "lastValidated": "2026-09-02",
+              "longSequence": {
+                "maxContextTokens": 262144,
+                "recommendedProfileId": "moe-long-sft-lora-8gpu"
+              }
             },
             "sftFull": {
-              "maxContextTokens": 262144,
-              "recommendedProfileId": "moe-sft-full-8gpu"
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "moe-sft-full-8gpu",
+              "lastValidated": "2026-09-02",
+              "longSequence": {
+                "maxContextTokens": 262144,
+                "recommendedProfileId": "moe-long-sft-full-8gpu"
+              }
             },
             "rlLora": {
-              "maxContextTokens": 262144,
-              "recommendedProfileId": "moe-rl-lora-8x8"
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "moe-rl-lora-8x8",
+              "lastValidated": "2026-09-02",
+              "longSequence": {
+                "maxContextTokens": 262144,
+                "recommendedProfileId": "moe-long-rl-lora-8x8"
+              }
             },
             "rlFull": {
-              "maxContextTokens": 262144,
-              "recommendedProfileId": "moe-rl-full-16x16"
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "moe-rl-full-8x8",
+              "lastValidated": "2026-09-02",
+              "longSequence": {
+                "maxContextTokens": 262144,
+                "recommendedProfileId": "moe-long-rl-full-16x16"
+              }
             }
           }
         }
@@ -201,22 +241,42 @@
           "supported": true,
           "profiles": {
             "sftLora": {
-              "maxContextTokens": 262144,
-              "recommendedProfileId": "dense-long-sft-lora-8gpu",
-              "lastValidated": "2026-09-02"
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "dense-sft-lora-8gpu",
+              "lastValidated": "2026-09-02",
+              "longSequence": {
+                "maxContextTokens": 262144,
+                "recommendedProfileId": "dense-long-sft-lora-8gpu",
+                "lastValidated": "2026-09-02"
+              }
             },
             "sftFull": {
-              "maxContextTokens": 262144,
-              "recommendedProfileId": "dense-long-sft-full-8gpu",
-              "lastValidated": "2026-09-02"
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "dense-sft-full-8gpu",
+              "lastValidated": "2026-09-02",
+              "longSequence": {
+                "maxContextTokens": 262144,
+                "recommendedProfileId": "dense-long-sft-full-8gpu",
+                "lastValidated": "2026-09-02"
+              }
             },
             "rlLora": {
-              "maxContextTokens": 262144,
-              "recommendedProfileId": "dense-rl-lora-eager-8x8"
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "dense-rl-lora-eager-8x8",
+              "lastValidated": "2026-09-02",
+              "longSequence": {
+                "maxContextTokens": 262144,
+                "recommendedProfileId": "dense-long-rl-lora-eager-8x8"
+              }
             },
             "rlFull": {
-              "maxContextTokens": 262144,
-              "recommendedProfileId": "dense-long-rl-full-8x8"
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "dense-rl-full-8x8",
+              "lastValidated": "2026-09-02",
+              "longSequence": {
+                "maxContextTokens": 262144,
+                "recommendedProfileId": "dense-long-rl-full-8x8"
+              }
             }
           }
         }

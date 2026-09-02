@@ -18,9 +18,12 @@ model availability, context limits, and recommended starting configurations.
 
 Inference support provides one maximum context length and recommended profile.
 Training support requires all four SFT/RL LoRA/full recommendations. Generated
-recommendations use the longest sequence declared for that model and workflow;
-adjust batch and distributed settings for the workload before submission.
-Every catalog sub-job must request GPUs in multiples of eight.
+configurations use the standard recommendation by default. A training
+recommendation can provide a `longSequence` alternative with a larger context
+limit and a separate distributed profile. Long-context alternatives use SP8;
+standard alternatives use SP1. Adjust batch and distributed settings for the
+workload before submission. Every catalog sub-job must request GPUs in
+multiples of eight.
 
 Qwen3.6-35B-A3B LoRA training uses the `prime_rl` model provider so checkpoints
 can be saved and loaded. PrimeRL currently supports LoRA on the attention
@@ -87,6 +90,10 @@ adjusts `train_batch_size` to the logical data-parallel size
 For Qwen3.8, the degree must divide its 24 full-attention heads, 16 GDN key
 heads, and 48 GDN value heads. SP8 is the largest valid common degree; SP24 is
 invalid even though it divides the full-attention head count.
+
+Use `--long-sequence` to select the same optional long-context recommendation
+that the documentation's **Enable long sequence** control renders. Without
+this flag, the smoke test selects the standard SP1 recommendation.
 
 ```bash
 export SNOWFLAKE_HOST='ACCOUNT.snowflakecomputing.com'

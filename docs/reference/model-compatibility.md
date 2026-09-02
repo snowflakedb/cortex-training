@@ -6,9 +6,10 @@ the reusable SFT, RL, and inference profiles under
 [`model-catalog/profiles/`](../../model-catalog/profiles/).
 
 When a recommendation is rendered, its `maxContextTokens` value is injected as
-`max_seq_len`. The generated configuration therefore shows the longest context
-declared for that model and workflow. Treat GPU counts and optimization values
-as starting points that might need adjustment for a specific workload.
+`max_seq_len`. Training recommendations default to a standard SP1 profile and
+can declare a `longSequence` alternative that uses SP8 and the maximum
+supported training context. Treat GPU counts and optimization values as
+starting points that might need adjustment for a specific workload.
 
 For GLM 5.2 on the recommended H200 configuration, use
 `zai-org/GLM-5.2-FP8` for 1M-token inference. The unquantized

@@ -39,7 +39,12 @@ def _find_model(models_doc: dict[str, Any], model_id: str) -> dict[str, Any]:
     return model
 
 
-def _recommended_profile_id(model: dict[str, Any], profile_key: str) -> str:
+def _recommendation(
+    model: dict[str, Any],
+    profile_key: str,
+    *,
+    long_sequence: bool,
+) -> dict[str, Any]:
     capabilities = model["capabilities"]
     if profile_key == "inference":
         recommendation = capabilities["inference"]
@@ -50,17 +55,13 @@ def _recommended_profile_id(model: dict[str, Any], profile_key: str) -> str:
         if not training["supported"]:
             raise ValueError(f"{model['modelId']} does not support training")
         recommendation = training["profiles"][profile_key]
-    return recommendation["recommendedProfileId"]
-
-
-def _max_context_tokens(model: dict[str, Any], profile_key: str) -> int:
-    capabilities = model["capabilities"]
-    recommendation = (
-        capabilities["inference"]
-        if profile_key == "inference"
-        else capabilities["training"]["profiles"][profile_key]
-    )
-    return recommendation["maxContextTokens"]
+    if long_sequence:
+        recommendation = recommendation.get("longSequence")
+        if recommendation is None:
+            raise ValueError(
+                f"{model['modelId']} {profile_key} has no long-sequence recommendation"
+            )
+    return recommendation
 
 
 def _build_wire_sub_job(
@@ -97,17 +98,24 @@ def build_profile_request(
     repo_root: Path,
     model_id: str,
     profile_key: str,
+    *,
+    long_sequence: bool = False,
 ) -> dict[str, Any]:
-    """Build the maximum-context CreateJob body for a catalog recommendation."""
+    """Build a CreateJob body for a standard or long-sequence recommendation."""
     if profile_key not in PROFILE_KEYS:
         raise ValueError(f"invalid profile key: {profile_key}")
 
     models_doc, profiles = load_catalog(config_dir)
     validate_catalog(models_doc, profiles, repo_root)
     model = _find_model(models_doc, model_id)
-    profile_id = _recommended_profile_id(model, profile_key)
+    recommendation = _recommendation(
+        model,
+        profile_key,
+        long_sequence=long_sequence,
+    )
+    profile_id = recommendation["recommendedProfileId"]
     profile = next(item for item in profiles if item["id"] == profile_id)
-    max_context_tokens = _max_context_tokens(model, profile_key)
+    max_context_tokens = recommendation["maxContextTokens"]
     request = {
         "sub_job_configs": [
             _build_wire_sub_job(model_id, sub_job, max_context_tokens)
@@ -610,6 +618,11 @@ def main() -> int:
             "batch to n_gpus / sp_size."
         ),
     )
+    parser.add_argument(
+        "--long-sequence",
+        action="store_true",
+        help="Select the profile's optional long-sequence recommendation.",
+    )
     args = parser.parse_args()
 
     plans = []
@@ -619,6 +632,7 @@ def main() -> int:
             args.repo_root.resolve(),
             args.model_id,
             profile_key,
+            long_sequence=args.long_sequence,
         )
         if args.memory_telemetry and profile_key in TRAINING_PROFILE_KEYS:
             enable_training_memory_telemetry(request)

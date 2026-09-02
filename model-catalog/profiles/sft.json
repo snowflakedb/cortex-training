@@ -28,6 +28,7 @@
             "extra_training": {
               "attn_implementation": "flash_attention_3",
               "activation_checkpointing": true,
+              "fused_lm_head_token_chunk_size": 8192,
               "peft_config": {
                 "peft_type": "Lora",
                 "r": 32,
@@ -88,6 +89,7 @@
             "extra_training": {
               "attn_implementation": "flash_attention_3",
               "activation_checkpointing": true,
+              "fused_lm_head_token_chunk_size": 8192,
               "ds_config": {
                 "train_batch_size": 8,
                 "train_micro_batch_size_per_gpu": 1,
@@ -105,10 +107,10 @@
       ]
     },
     {
-      "id": "moe-sft-lora-8gpu",
+      "id": "moe-long-sft-lora-8gpu",
       "workflow": "sft",
       "tuningMethod": "lora",
-      "summary": "PrimeRL attention-only LoRA SFT starting point for Qwen3.6-35B-A3B.",
+      "summary": "PrimeRL sequence-parallel attention-only LoRA SFT starting point for Qwen3.6-35B-A3B.",
       "recipePath": "recipes/sft/conversational/train.py",
       "evidencePaths": [
         "recipes/sft/conversational/configs/qwen36_35b_a3b_lora.json"
@@ -168,10 +170,10 @@
       ]
     },
     {
-      "id": "moe-sft-full-8gpu",
+      "id": "moe-long-sft-full-8gpu",
       "workflow": "sft",
       "tuningMethod": "full",
-      "summary": "Prime-RL expert-parallel SFT starting point for the supported Qwen MoE model.",
+      "summary": "PrimeRL sequence-parallel full SFT starting point for the supported Qwen MoE model.",
       "recipePath": "recipes/sft/conversational/train.py",
       "evidencePaths": [
         "recipes/sft/conversational/configs/qwen36_35b_a3b_full.json"
