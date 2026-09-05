@@ -22,6 +22,7 @@ dependencies = [
 
 [project.scripts]
 cortex-training = "cortex_training.cli:main"
+ct = "cortex_training.cli:main"
 
 [project.optional-dependencies]
 dev = [
