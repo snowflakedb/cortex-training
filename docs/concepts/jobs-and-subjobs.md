@@ -13,7 +13,7 @@ Internal sub-job identifiers use the form:
 {job_id}:{sub_job_type}:{index}
 ```
 
-For example, a colocated RL job commonly has `{job_id}:training:0` and
+For example, an RL job commonly has `{job_id}:training:0` and
 `{job_id}:sampling:0`.
 
 For complete request and routing details, see the

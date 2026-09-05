@@ -6,7 +6,7 @@ Training checkpoints and sampling weights serve different purposes:
 - Weights-only checkpoints can initialize a separate sampling job.
 - Runtime load replaces weights in an existing training sub-job.
 - Weight synchronization updates a sampling sub-job from a training sub-job
-  during colocated reinforcement learning.
+  during reinforcement learning.
 
 Changing data-parallel size while loading requires optimizer state loading to
 be disabled when the job is created. See the

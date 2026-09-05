@@ -14,7 +14,7 @@
 # limitations under the License.
 
 """
-RL against a colocated Cortex Training training + sampling job.
+RL against Cortex Training training + sampling sub-jobs.
 
 A port of ``tinker_cookbook/recipes/math_rl/train.py``
 
@@ -238,7 +238,7 @@ class Config:
     wandb_project: str | None = None
     wandb_name: str | None = None
 
-    # Loaded as the colocated sampling + training create-job body.
+    # Loaded as the sampling + training create-job body.
     job_config: str = "configs/qwen3_8b_lora.json"
 
 
