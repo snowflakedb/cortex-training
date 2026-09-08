@@ -298,6 +298,8 @@ Typed Python call:
 job_id = client.create_job(
     sub_jobs=[training_sub_job, sampling_sub_job],
     experiment_name=None,
+    idle_timeout_seconds=1800,
+    pending_timeout_seconds=86400,
 )
 ```
 
@@ -315,13 +317,43 @@ REST body:
       }
     }
   ],
-  "experiment_name": "optional-experiment"
+  "experiment_name": "optional-experiment",
+  "idle_timeout_seconds": 1800,
+  "pending_timeout_seconds": 86400
 }
 ```
 
 `sub_job_configs` must be a non-empty list. The typed path validates each
 `SubJobConfig`; `create_job_from_body()` only checks the outer body and non-empty
 list before forwarding it.
+
+#### `idle_timeout_seconds`
+
+Optional. Bounds how long the job may sit idle before the server reclaims it.
+
+| Value | Behavior |
+|---|---|
+| Omitted | Server default applies, currently 30 minutes. |
+| `0` | Disables reclamation for this job. Not a zero-second timeout — the job is not reclaimed for being idle, though it can still be cancelled or terminated. |
+| `300` through `604800` | Use that many seconds. |
+
+Negative values, `1`-`299`, values above `604800`, and non-integers are rejected.
+
+#### `pending_timeout_seconds`
+
+Optional. Bounds how long the job may stay `pending` waiting for capacity before
+it fails with reason `pending_timeout`.
+
+| Value | Behavior |
+|---|---|
+| Omitted | Server default applies, currently 24 hours. |
+| `300` through `604800` | Use that many seconds. |
+
+There is no disable value: `0` is rejected, along with negatives, `1`-`299`,
+values above `604800`, and non-integers.
+
+When either field is set, Get job and List jobs echo it back; when omitted it may
+be absent from those responses.
 
 Response:
 
