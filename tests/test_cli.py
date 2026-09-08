@@ -20,6 +20,8 @@ from __future__ import annotations
 import io
 import json
 
+import pytest
+
 import cortex_training._cli as cli
 
 
@@ -48,6 +50,7 @@ class FakeClient:
         self.weight_sync_sub_job_id = None
         self.weight_sync_sub_job_type = None
         self.capacity_requested = False
+        self.capacity_hardware = None
         self.checkpoints_job_id = None
         self.jobs = None
 
@@ -78,8 +81,9 @@ class FakeClient:
     def cancel_job(self, job_id):
         self.cancelled_job_id = job_id
 
-    def get_capacity(self):
+    def get_capacity(self, hardware=None):
         self.capacity_requested = True
+        self.capacity_hardware = hardware
         return {
             "has_reservation": True,
             "reserved_gpus": 64,
@@ -418,12 +422,36 @@ def test_capacity_prints_account_gpu_usage():
 
     assert rc == 0
     assert instances[0].capacity_requested is True
+    assert instances[0].capacity_hardware is None
     assert json.loads(stdout.getvalue()) == {
         "has_reservation": True,
         "reserved_gpus": 64,
         "in_use_gpus": 8,
         "available_gpus": 56,
     }
+
+
+def test_capacity_passes_hardware():
+    instances = []
+    stdout = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["capacity", "--hardware", "B300"],
+        client_factory=_factory(instances),
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert instances[0].capacity_hardware == "B300"
+
+
+def test_capacity_rejects_unknown_hardware():
+    with pytest.raises(SystemExit):
+        cli.main(
+            _base_args() + ["capacity", "--hardware", "A10"],
+            client_factory=_factory([]),
+            stdout=io.StringIO(),
+        )
 
 
 def test_cancel_prints_confirmation():

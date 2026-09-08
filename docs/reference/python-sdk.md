@@ -74,13 +74,13 @@ operation.
 
 | Method | Returns | Notes |
 |---|---|---|
-| `create_job(sub_jobs, job_id=None, experiment_name=None)` | `job_id` | Validates each `SubJobConfig` client-side first |
+| `create_job(sub_jobs, job_id=None, experiment_name=None, hardware=None)` | `job_id` | Validates each `SubJobConfig` client-side first. `hardware` is `H200`, `B200`, or `B300` (the `Hardware` enum or its string); omitted means `H200` |
 | `create_job_from_body(body)` | response dict | For callers that already hold the REST JSON |
 | `get_job(job_id)` | job dict | Includes `sub_jobs` with their configs |
 | `list_jobs(status=None)` | list of jobs | Returns the inner list, not the envelope |
 | `wait_for_job(job_id)` | job dict | Polls until `running`; raises on `failed`/`done`/`cancelled` or timeout. Does not treat `terminated` as terminal |
 | `cancel_job(job_id)` | `None` | Idempotent while cancelling/cancelled |
-| `get_capacity()` | capacity dict | `has_reservation`, `reserved_gpus`, `in_use_gpus`, `available_gpus`. The server's `max_total_gpus` ceiling is not surfaced yet |
+| `get_capacity(hardware=None)` | capacity dict | `has_reservation`, `reserved_gpus`, `in_use_gpus`, `available_gpus`, scoped to `hardware` (default `H200`). The server's `max_total_gpus` ceiling is not surfaced yet |
 
 ## Training and sampling
 

@@ -298,6 +298,7 @@ Typed Python call:
 job_id = client.create_job(
     sub_jobs=[training_sub_job, sampling_sub_job],
     experiment_name=None,
+    hardware="B200",
 )
 ```
 
@@ -315,13 +316,22 @@ REST body:
       }
     }
   ],
-  "experiment_name": "optional-experiment"
+  "experiment_name": "optional-experiment",
+  "hardware": "B200"
 }
 ```
 
 `sub_job_configs` must be a non-empty list. The typed path validates each
 `SubJobConfig`; `create_job_from_body()` only checks the outer body and non-empty
 list before forwarding it.
+
+#### GPU hardware - `hardware`
+
+Optional. One of `H200`, `B200`, or `B300`; every sub-job in the job runs on
+that GPU type. Omitted means `H200`. Any other value is rejected — the typed
+`create_job()` path raises `ValueError` before sending, and the server rejects
+an unknown value on the raw `create_job_from_body()` path. The typed path also
+accepts the `Hardware` enum (`Hardware.B200`) in place of the string.
 
 Response:
 
@@ -388,6 +398,17 @@ The client forwards the status string without validating an enum.
 
 This account-scoped endpoint takes no account id from the caller. The server
 resolves the account from the authenticated session.
+
+Optional query:
+
+```text
+?hardware=B200
+```
+
+`hardware` scopes the numbers to one GPU type and takes the same values as the
+create-job field: `H200`, `B200`, or `B300`, defaulting to `H200` when omitted.
+`get_capacity()` sends the parameter only when you pass one, and rejects an
+unknown value client-side.
 
 ```json
 {
