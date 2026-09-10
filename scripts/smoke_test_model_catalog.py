@@ -8,7 +8,6 @@ import copy
 import json
 import math
 import os
-import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -415,18 +414,16 @@ def _run_optimizer_step_probe(
 
 
 def _checkpoint_id(result: dict[str, Any]) -> str:
-    """Resolve the durable checkpoint id from a polled save result.
-
-    The result carries no ``checkpoint_id``; the id is the ``cp_<uuid>`` segment
-    of ``stage_path``. ``checkpoint_path`` is a job-local mount and
-    ``checkpoint_tag`` is the DeepSpeed tag, so neither identifies the
-    checkpoint resource.
-    """
-    match = re.search(
-        r"/checkpoints/(cp_[0-9a-fA-F-]+)/", result.get("stage_path") or ""
-    )
-    if match:
-        return match.group(1)
+    checkpoint_id = result.get("checkpoint_id")
+    if isinstance(checkpoint_id, str) and checkpoint_id:
+        return checkpoint_id
+    for key in ("stage_path", "checkpoint_path"):
+        path = result.get(key)
+        if not isinstance(path, str):
+            continue
+        for part in path.split("/"):
+            if part.startswith("cp_"):
+                return part
     raise RuntimeError(f"checkpoint save returned no checkpoint id: {result!r}")
 
 

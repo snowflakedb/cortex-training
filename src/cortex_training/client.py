@@ -1906,16 +1906,13 @@ class CortexTrainingClient:
     def save(
         self,
         job_id: str,
+        checkpoint_id: str | None = None,
         checkpoint_type: str | None = None,
     ) -> str:
-        """Submit a checkpoint save. Returns request_id.
-
-        The server assigns the checkpoint id. The polled result carries no
-        ``checkpoint_id``; resolve the durable ``cp_<uuid>`` from the result's
-        ``stage_path`` or from :meth:`list_checkpoints`. ``checkpoint_tag`` is
-        the backend's DeepSpeed tag, not the checkpoint resource id.
-        """
+        """Submit a checkpoint save. Returns request_id."""
         body: dict = {}
+        if checkpoint_id is not None:
+            body["checkpoint_id"] = checkpoint_id
         if checkpoint_type is not None:
             normalized_type = checkpoint_type.lower()
             if normalized_type not in ("resumable", "weights-only"):
@@ -1937,9 +1934,7 @@ class CortexTrainingClient:
 
         Args:
             job_id: The job to load the checkpoint into.
-            checkpoint_id: Durable checkpoint id (``cp_<uuid>``), from a prior
-                save's ``stage_path`` or from ``list_checkpoints``. Not the
-                backend's ``checkpoint_tag``.
+            checkpoint_id: Checkpoint identifier (from a prior save).
             source_job_id: Optional. Load from another job's checkpoint store.
             target_sub_job_id: Optional. Route the load to a specific training
                 sub-job. Format: ``"{job_id}:training:{index}"``. Omit to use

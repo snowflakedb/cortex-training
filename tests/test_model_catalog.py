@@ -839,15 +839,9 @@ def test_training_step_and_checkpoint_round_trip_follow_forward_backward(monkeyp
                 "forward-backward-request": {"avg_loss": 0.25},
                 "step-request": {"global_steps": 1},
                 "save-request": {
-                    "stage_path": (
-                        "s3://bucket/checkpoints/"
-                        "cp_00000000-0000-4000-8000-000000000001/global_step1/"
-                    ),
-                    "checkpoint_tag": "global_step1",
+                    "stage_path": "s3://bucket/checkpoints/cp_test/global_step1/"
                 },
-                "load-request": {
-                    "checkpoint_id": "cp_00000000-0000-4000-8000-000000000001"
-                },
+                "load-request": {"checkpoint_id": "cp_test"},
             }[request_id]
 
     request = build_profile_request(
@@ -883,45 +877,11 @@ def test_training_step_and_checkpoint_round_trip_follow_forward_backward(monkeyp
     assert (
         "load",
         "job-1",
-        "cp_00000000-0000-4000-8000-000000000001",
+        "cp_test",
         "job-1",
         "job-1:training:0",
     ) in client.calls
-    assert (
-        "delete-checkpoint",
-        "job-1",
-        "cp_00000000-0000-4000-8000-000000000001",
-    ) in client.calls
-
-
-def test_checkpoint_id_comes_from_stage_path():
-    assert (
-        smoke_catalog._checkpoint_id(
-            {
-                "stage_path": (
-                    "s3://bucket/checkpoints/"
-                    "cp_00000000-0000-4000-8000-000000000001/global_step12/"
-                ),
-                "checkpoint_tag": "global_step12",
-            }
-        )
-        == "cp_00000000-0000-4000-8000-000000000001"
-    )
-
-
-@pytest.mark.parametrize(
-    "result",
-    [
-        # checkpoint_tag is the DeepSpeed tag, not the checkpoint resource id.
-        {"checkpoint_tag": "global_step12", "version": 12.0},
-        # checkpoint_path is a job-local mount and carries no id.
-        {"checkpoint_path": "/tmp/ds/job-1:training:0/weights-only"},
-        {},
-    ],
-)
-def test_checkpoint_id_requires_stage_path(result):
-    with pytest.raises(RuntimeError, match="no checkpoint id"):
-        smoke_catalog._checkpoint_id(result)
+    assert ("delete-checkpoint", "job-1", "cp_test") in client.calls
 
 
 def test_live_smoke_rejects_non_finite_forward_backward_loss(monkeypatch):

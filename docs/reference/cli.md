@@ -304,22 +304,15 @@ then create a standalone sampling job that references its public checkpoint and
 source job ids:
 
 ```python
-import re
-
 request_id = client.save(training_job_id, checkpoint_type="weights-only")
-result = client.poll_request(training_job_id, request_id)
-
-# The save result has no checkpoint_id; the durable id is in stage_path.
-checkpoint_id = re.search(
-    r"/checkpoints/(cp_[0-9a-fA-F-]+)/", result.get("stage_path", "")
-).group(1)
+checkpoint = client.poll_request(training_job_id, request_id)
 
 sampling = SubJobConfig.sampling_job(
     model_name="Qwen/Qwen3-1.7B",
     max_seq_len=2048,
     n_gpus=1,
     source_checkpoint_info={
-        "checkpoint_id": checkpoint_id,
+        "checkpoint_id": checkpoint["checkpoint_id"],
         "source_job_id": training_job_id,
     },
 )
