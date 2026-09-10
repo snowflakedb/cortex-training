@@ -1016,6 +1016,12 @@ class TestCreateJob:
 
     # Omitted rather than sent as H200: the server owns the default.
     def test_omits_hardware_when_none(self):
+        c = _make_client(post_json={"job_id": "srv-1"})
+        sub = SubJobConfig.sampling_job(model_name="gpt2", max_seq_len=128, n_gpus=1)
+        c.create_job(sub_jobs=[sub])
+        body = c._session.post.call_args.kwargs["json"]
+        assert "hardware" not in body
+
     # 0 is accepted here; pending_timeout_seconds rejects it.
     @pytest.mark.parametrize(
         "idle_timeout_seconds", [0, 300, 1_800, 604_800]
@@ -1032,7 +1038,7 @@ class TestCreateJob:
         sub = SubJobConfig.sampling_job(model_name="gpt2", max_seq_len=128, n_gpus=1)
         c.create_job(sub_jobs=[sub])
         body = c._session.post.call_args.kwargs["json"]
-        assert "hardware" not in body
+        assert "idle_timeout_seconds" not in body
 
     @pytest.mark.parametrize("hardware", ["A10", "h200", "", 200])
     def test_rejects_unknown_hardware(self, hardware):
@@ -1040,7 +1046,7 @@ class TestCreateJob:
         sub = SubJobConfig.sampling_job(model_name="gpt2", max_seq_len=128, n_gpus=1)
         with pytest.raises(ValueError, match="hardware must be one of"):
             c.create_job(sub_jobs=[sub], hardware=hardware)
-        assert "idle_timeout_seconds" not in body
+        c._session.post.assert_not_called()
 
     @pytest.mark.parametrize(
         "idle_timeout_seconds",
