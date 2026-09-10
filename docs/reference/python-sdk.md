@@ -98,11 +98,17 @@ operation.
 
 ## Checkpoints
 
-`save(job_id, checkpoint_id=None, checkpoint_type=None)` →  `request_id`
+`save(job_id, checkpoint_type=None)` →  `request_id`
 (`checkpoint_type` is `"resumable"` or `"weights-only"`),
 `load(job_id, checkpoint_id, source_job_id=None, target_sub_job_id=None)` →
 `request_id`, `list_checkpoints(job_id)`, `export_checkpoint(job_id, checkpoint_id)`,
 `delete_checkpoint(job_id, checkpoint_id)`.
+
+The server assigns the checkpoint id, and the polled `save` result has no
+`checkpoint_id` key. Resolve the durable `cp_<uuid>` from the result's
+`stage_path` or from `list_checkpoints(job_id)` — not from `checkpoint_tag`,
+which is the backend's DeepSpeed tag. See
+[rest-api.md section 6.3](rest-api.md#63-save-checkpoint---post-job_idsave).
 
 ## Logs
 

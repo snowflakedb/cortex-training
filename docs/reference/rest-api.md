@@ -489,15 +489,22 @@ Terminated or failed jobs return a precondition/conflict-style error.
 {
   "checkpoints": [
     {
-      "checkpoint_id": "global_step12",
-      "global_steps": 12,
-      "avg_loss": 0.83,
-      "created_at": "2026-07-20T18:05:00Z",
-      "checkpoint_type": "resumable"
+      "checkpoint_id": "cp_00000000-0000-4000-8000-000000000001",
+      "created_at": "2026-07-20T18:05:00Z"
+    },
+    {
+      "checkpoint_id": "cp_00000000-0000-4000-8000-000000000002",
+      "created_at": "2026-07-20T18:10:00Z",
+      "checkpoint_type": "weights-only"
     }
   ]
 }
 ```
+
+`checkpoint_id` and `created_at` identify each durable checkpoint.
+`checkpoint_type` is present when retained by the server; it can be omitted for
+the default `resumable` type, so consumers must tolerate its absence. Consumers
+must not assume list order.
 
 `list_checkpoints()` returns only the `checkpoints` list. The CLI exposes this
 method with a required job id and restores the server-shaped JSON envelope:
@@ -660,13 +667,12 @@ process RSS. The key is absent when the setting is disabled.
 
 ```json
 {
-  "checkpoint_id": "optional-tag",
   "checkpoint_type": "weights-only"
 }
 ```
 
-Both fields are optional in the Python client request. When `checkpoint_type`
-is supplied, the client lowercases and validates it as:
+`checkpoint_type` is optional in the Python client request. When it is
+supplied, the client lowercases and validates it as:
 
 - `resumable`: training weights plus optimizer/training state.
 - `weights-only`: Hugging Face-style model assets suitable for sampling
@@ -674,9 +680,8 @@ is supplied, the client lowercases and validates it as:
 
 The backend default is `resumable`.
 
-Compatibility caveat: `checkpoint_id` is not represented in the server's
-`SaveRequest`, so a caller-selected value is not forwarded. Treat the
-`checkpoint_id` returned by the polled result as authoritative.
+The server assigns the durable checkpoint id; there is no `checkpoint_id` field
+in `SaveRequest`, so a caller cannot choose one.
 
 Immediate response:
 
@@ -684,14 +689,30 @@ Immediate response:
 {"request_id": "request-id", "job_id": "job-id"}
 ```
 
-Typical result fields include `checkpoint_id`, `checkpoint_path`, and
-`checkpoint_tag`; consumers should use the fields actually present.
+The polled save result does not carry a `checkpoint_id` key:
+
+```json
+{
+  "job_id": "job-id:training:0",
+  "stage_path": "s3://<stage>/.../checkpoints/cp_00000000-0000-4000-8000-000000000001/global_step12/",
+  "checkpoint_path": "/tmp/.../job-<job-id>:training:0/weights-only",
+  "checkpoint_tag": "global_step12",
+  "version": 12.0
+}
+```
+
+The durable checkpoint id is the `cp_<uuid>` path segment of `stage_path`
+(`/checkpoints/(cp_[0-9a-fA-F-]+)/`). `GET /{job_id}/checkpoints` lists the same
+id with its `created_at` and, when retained, its `checkpoint_type`. Resolve the
+id from either source. `checkpoint_tag` is the backend's DeepSpeed tag, not the
+durable checkpoint resource id. `checkpoint_path` is a mount inside the saving
+job's containers and does not resolve from any other job.
 
 ### 6.4 Runtime load - `POST /{job_id}/load`
 
 ```json
 {
-  "checkpoint_id": "global_step12",
+  "checkpoint_id": "cp_00000000-0000-4000-8000-000000000001",
   "source_job_id": "optional-source-job",
   "target_sub_job_id": "optional-job-id:training:0"
 }
@@ -1505,7 +1526,7 @@ These are conventional backend results, not closed REST schemas:
 |---|---|
 | `forward-backward` | `job_id`, `avg_loss`, `metrics`, `post_process_outputs` |
 | `step` | `global_steps`, `last_lr`, optional `peak_memory` |
-| `save` | `checkpoint_id`, `checkpoint_path`, `checkpoint_tag` |
+| `save` | `job_id`, `stage_path`, `checkpoint_path`, `checkpoint_tag`, `version`; the durable `cp_<uuid>` id is in `stage_path`, not a `checkpoint_id` key |
 | `load` | `checkpoint_id` and backend load metadata |
 | `generate` | `job_id`, `results[]` |
 | `weight-sync` | Completion/transfer metadata |
@@ -1622,12 +1643,40 @@ client.poll_request(job_id, request_id)
 ### 13.3 Save and runtime load
 
 ```python
-request_id = client.save(job_id, checkpoint_type="resumable")
-checkpoint = client.poll_request(job_id, request_id)
+import re
 
+
+def save_and_resolve_checkpoint_id(client, job_id, checkpoint_type):
+    known_ids = {
+        cp["checkpoint_id"]
+        for cp in client.list_checkpoints(job_id)
+    }
+
+    request_id = client.save(job_id, checkpoint_type=checkpoint_type)
+    result = client.poll_request(job_id, request_id)
+
+    match = re.search(
+        r"/checkpoints/(cp_[0-9a-fA-F-]+)/",
+        result.get("stage_path", ""),
+    )
+    if match:
+        return match.group(1)
+
+    # Fall back to the checkpoint catalog without assuming list order.
+    new_checkpoints = [
+        cp
+        for cp in client.list_checkpoints(job_id)
+        if cp["checkpoint_id"] not in known_ids
+    ]
+    if len(new_checkpoints) != 1:
+        raise RuntimeError("could not uniquely identify the saved checkpoint")
+    return new_checkpoints[0]["checkpoint_id"]
+
+
+checkpoint_id = save_and_resolve_checkpoint_id(client, job_id, "resumable")
 request_id = client.load(
     job_id,
-    checkpoint_id=checkpoint["checkpoint_id"],
+    checkpoint_id=checkpoint_id,
 )
 client.poll_request(job_id, request_id)
 ```
@@ -1635,15 +1684,18 @@ client.poll_request(job_id, request_id)
 ### 13.4 Start sampling from saved weights
 
 ```python
-request_id = client.save(training_job_id, checkpoint_type="weights-only")
-checkpoint = client.poll_request(training_job_id, request_id)
+checkpoint_id = save_and_resolve_checkpoint_id(
+    client,
+    training_job_id,
+    "weights-only",
+)
 
 sampling = SubJobConfig.sampling_job(
     model_name="Qwen/Qwen3-1.7B",
     max_seq_len=2048,
     n_gpus=1,
     source_checkpoint_info={
-        "checkpoint_id": checkpoint["checkpoint_id"],
+        "checkpoint_id": checkpoint_id,
         "source_job_id": training_job_id,
     },
 )
@@ -1729,9 +1781,9 @@ result = client.poll_request(job_id, request_id)
 
 These are current gaps, not supported API behavior:
 
-1. `save(checkpoint_id=...)` sends a field that is absent from the server's
-   `SaveRequest`, so a caller-selected id is not honored. Use the
-   `checkpoint_id` returned in the save result.
+1. The polled `save` result carries no `checkpoint_id`, so resolving the durable
+   id means parsing `stage_path` or diffing the checkpoint list
+   (see [section 6.3](#63-save-checkpoint---post-job_idsave)).
 2. Generic `forward()` wraps binary input in a base64 JSON payload, while the
    server's `/forward` route expects raw DSSST1 bytes, so byte-based
    `forward()` is not end-to-end compatible. Request construction is

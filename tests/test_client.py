@@ -1728,11 +1728,17 @@ class TestDataPlane:
 
     def test_save_with_optionals(self):
         c = _make_client(post_json={"request_id": "r3"})
-        c.save("j1", checkpoint_id="cp", checkpoint_type="WEIGHTS-ONLY")
+        c.save("j1", checkpoint_type="WEIGHTS-ONLY")
         assert c._session.post.call_args.kwargs["json"] == {
-            "checkpoint_id": "cp",
             "checkpoint_type": "weights-only",
         }
+
+    # The server assigns the id, so there is no field to send it in.
+    def test_save_rejects_caller_supplied_checkpoint_id(self):
+        c = _make_client(post_json={"request_id": "r3"})
+        with pytest.raises(TypeError):
+            c.save("j1", checkpoint_id="cp")
+        c._session.post.assert_not_called()
 
     def test_save_rejects_unknown_checkpoint_type(self):
         c = _make_client(post_json={"request_id": "r3"})

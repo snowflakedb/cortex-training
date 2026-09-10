@@ -259,7 +259,11 @@ def build_parser(
         "load",
         help="Load a checkpoint into an already-created Cortex Training job.",
     )
-    load.add_argument("checkpoint_id", help="Checkpoint id/tag to load.")
+    load.add_argument(
+        "checkpoint_id",
+        help="Durable checkpoint id (cp_<uuid>) to load, as listed by "
+        "`cortex-training checkpoints JOB_ID`.",
+    )
     load.add_argument(
         "--source-job-id",
         help="Load the checkpoint from another job's checkpoint store.",
