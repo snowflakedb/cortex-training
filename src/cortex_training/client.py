@@ -1348,6 +1348,8 @@ class CortexTrainingClient:
         job_id: str | None = None,
         experiment_name: str | None = None,
         hardware: Hardware | str | None = None,
+        idle_timeout_seconds: int | None = None,
+        pending_timeout_seconds: int | None = None,
     ) -> str:
         """Create a job from a list of sub-jobs and return its server job_id.
 
@@ -1358,9 +1360,35 @@ class CortexTrainingClient:
         ``hardware`` is optional (:class:`Hardware`.H200 / .B200 / .B300); when
         set, all sub-jobs in the job run on that GPU type. Omitted defaults to
         H200.
+        ``idle_timeout_seconds`` bounds how long the job may sit idle before the
+        server reclaims it: ``0`` disables reclamation, any other value must be
+        between 300 and 604,800. ``pending_timeout_seconds`` bounds how long the
+        job may wait for capacity before failing with ``pending_timeout``: between
+        300 and 604,800, with no disable value. Omit either to use the server
+        default, currently 30 minutes for idle and 24 hours for pending.
         """
         if not sub_jobs:
             raise ValueError("create_job requires a non-empty sub_jobs list")
+        if idle_timeout_seconds is not None:
+            if isinstance(idle_timeout_seconds, bool) or not isinstance(
+                idle_timeout_seconds, int
+            ):
+                raise ValueError("idle_timeout_seconds must be an integer")
+            if idle_timeout_seconds != 0 and not (
+                300 <= idle_timeout_seconds <= 604_800
+            ):
+                raise ValueError(
+                    "idle_timeout_seconds must be 0 or between 300 and 604800"
+                )
+        if pending_timeout_seconds is not None:
+            if isinstance(pending_timeout_seconds, bool) or not isinstance(
+                pending_timeout_seconds, int
+            ):
+                raise ValueError("pending_timeout_seconds must be an integer")
+            if not (300 <= pending_timeout_seconds <= 604_800):
+                raise ValueError(
+                    "pending_timeout_seconds must be between 300 and 604800"
+                )
         for sj in sub_jobs:
             sj.validate()
         body: dict = {"sub_job_configs": [sj.to_wire() for sj in sub_jobs]}
@@ -1370,6 +1398,10 @@ class CortexTrainingClient:
             body["experiment_name"] = experiment_name
         if hardware is not None:
             body["hardware"] = _hardware_wire(hardware)
+        if idle_timeout_seconds is not None:
+            body["idle_timeout_seconds"] = idle_timeout_seconds
+        if pending_timeout_seconds is not None:
+            body["pending_timeout_seconds"] = pending_timeout_seconds
         return self.create_job_from_body(body)["job_id"]
 
     @_track_operation("create_job")

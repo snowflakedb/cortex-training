@@ -1016,6 +1016,18 @@ class TestCreateJob:
 
     # Omitted rather than sent as H200: the server owns the default.
     def test_omits_hardware_when_none(self):
+    # 0 is accepted here; pending_timeout_seconds rejects it.
+    @pytest.mark.parametrize(
+        "idle_timeout_seconds", [0, 300, 1_800, 604_800]
+    )
+    def test_includes_valid_idle_timeout_seconds(self, idle_timeout_seconds):
+        c = _make_client(post_json={"job_id": "srv-1"})
+        sub = SubJobConfig.sampling_job(model_name="gpt2", max_seq_len=128, n_gpus=1)
+        c.create_job(sub_jobs=[sub], idle_timeout_seconds=idle_timeout_seconds)
+        body = c._session.post.call_args.kwargs["json"]
+        assert body["idle_timeout_seconds"] == idle_timeout_seconds
+
+    def test_omits_idle_timeout_when_none(self):
         c = _make_client(post_json={"job_id": "srv-1"})
         sub = SubJobConfig.sampling_job(model_name="gpt2", max_seq_len=128, n_gpus=1)
         c.create_job(sub_jobs=[sub])
@@ -1028,6 +1040,48 @@ class TestCreateJob:
         sub = SubJobConfig.sampling_job(model_name="gpt2", max_seq_len=128, n_gpus=1)
         with pytest.raises(ValueError, match="hardware must be one of"):
             c.create_job(sub_jobs=[sub], hardware=hardware)
+        assert "idle_timeout_seconds" not in body
+
+    @pytest.mark.parametrize(
+        "idle_timeout_seconds",
+        [-1, 1, 299, 604_801, True, 300.0, "300"],
+    )
+    def test_rejects_invalid_idle_timeout_seconds(self, idle_timeout_seconds):
+        c = _make_client()
+        sub = SubJobConfig.sampling_job(model_name="gpt2", max_seq_len=128, n_gpus=1)
+        with pytest.raises(ValueError, match="idle_timeout_seconds"):
+            c.create_job(sub_jobs=[sub], idle_timeout_seconds=idle_timeout_seconds)
+        c._session.post.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "pending_timeout_seconds", [300, 3_600, 86_400, 604_800]
+    )
+    def test_includes_valid_pending_timeout_seconds(self, pending_timeout_seconds):
+        c = _make_client(post_json={"job_id": "srv-1"})
+        sub = SubJobConfig.sampling_job(model_name="gpt2", max_seq_len=128, n_gpus=1)
+        c.create_job(sub_jobs=[sub], pending_timeout_seconds=pending_timeout_seconds)
+        body = c._session.post.call_args.kwargs["json"]
+        assert body["pending_timeout_seconds"] == pending_timeout_seconds
+
+    def test_omits_pending_timeout_when_none(self):
+        c = _make_client(post_json={"job_id": "srv-1"})
+        sub = SubJobConfig.sampling_job(model_name="gpt2", max_seq_len=128, n_gpus=1)
+        c.create_job(sub_jobs=[sub])
+        body = c._session.post.call_args.kwargs["json"]
+        assert "pending_timeout_seconds" not in body
+
+    # 0 is rejected here; idle_timeout_seconds accepts it.
+    @pytest.mark.parametrize(
+        "pending_timeout_seconds",
+        [-1, 0, 1, 299, 604_801, True, 300.0, "300"],
+    )
+    def test_rejects_invalid_pending_timeout_seconds(self, pending_timeout_seconds):
+        c = _make_client()
+        sub = SubJobConfig.sampling_job(model_name="gpt2", max_seq_len=128, n_gpus=1)
+        with pytest.raises(ValueError, match="pending_timeout_seconds"):
+            c.create_job(
+                sub_jobs=[sub], pending_timeout_seconds=pending_timeout_seconds
+            )
         c._session.post.assert_not_called()
 
     def test_supports_multiple_sub_jobs(self):
