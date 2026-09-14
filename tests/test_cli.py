@@ -86,9 +86,11 @@ class FakeClient:
         self.capacity_hardware = hardware
         return {
             "has_reservation": True,
+            "max_total_gpus": 64,
             "reserved_gpus": 64,
             "in_use_gpus": 8,
-            "available_gpus": 56,
+            "pending_gpus": 16,
+            "available_gpus": 40,
         }
 
     def forward_backward(self, job_id, payload):
@@ -462,9 +464,11 @@ def test_capacity_prints_account_gpu_usage():
     assert instances[0].capacity_hardware is None
     assert json.loads(stdout.getvalue()) == {
         "has_reservation": True,
+        "max_total_gpus": 64,
         "reserved_gpus": 64,
         "in_use_gpus": 8,
-        "available_gpus": 56,
+        "pending_gpus": 16,
+        "available_gpus": 40,
     }
 
 

@@ -452,22 +452,30 @@ unknown value client-side.
   "max_total_gpus": 64,
   "reserved_gpus": 64,
   "in_use_gpus": 8,
-  "available_gpus": 56
+  "pending_gpus": 16,
+  "available_gpus": 40
 }
 ```
 
-- `has_reservation`: whether the account has reserved GPU capacity.
-- `max_total_gpus`: the account's GPU ceiling.
+- `has_reservation`: whether `max_total_gpus` is a *guaranteed* commitment
+  rather than a best-effort per-account cap. When false, placement draws on the
+  shared pool, so `available_gpus` is an upper bound.
+- `max_total_gpus`: the account's GPU ceiling — its commitment when
+  `has_reservation`, else its per-account cap. `-1` means no ceiling, `0` a real
+  quota of zero, `> 0` the limit.
 - `reserved_gpus` **(deprecated)**: use `max_total_gpus` with
   `has_reservation` instead.
-- `in_use_gpus`: GPUs used by the account's `pending`, `placing`,
-  `initializing`, and `running` jobs.
-- `available_gpus`: remaining capacity, floored at zero and potentially
-  capped by currently schedulable capacity.
+- `in_use_gpus`: GPUs the account holds — `placing`, `initializing`, and
+  `running` jobs. Queued work is not counted here; see `pending_gpus`.
+- `pending_gpus`: GPUs requested by jobs still waiting for capacity
+  (`pending`). Claims quota, so it reduces `available_gpus`.
+- `available_gpus`: what a new job could start with now — ceiling headroom
+  capped by currently schedulable capacity. Zero does not mean blocked: a
+  submit within the ceiling is still accepted and queued.
 
-Proto3 JSON may omit false or zero fields, so an unreserved account's response
-is literally `{}`. `get_capacity()` does not yet surface `max_total_gpus`; it
-fills in defaults for the other four keys.
+Proto3 JSON may omit false or zero fields, so an account holding nothing under a
+zero ceiling responds with literally `{}`. `get_capacity()` fills in the
+documented defaults for all six keys.
 
 ### 5.5 Cancel job - `POST /{job_id}:cancel`
 
@@ -1774,10 +1782,7 @@ These are current gaps, not supported API behavior:
 5. Generate prompt validation resolves `max_seq_len` from the first sub-job
    carrying an `inference_config` rather than matching `job_type="sampling"`. A
    `log_probability` sub-job listed first therefore supplies the wrong window.
-6. `get_capacity()` does not surface `max_total_gpus` (see
-   [section 5.4](#54-capacity---get-capacity)); it returns the other four
-   fields, so callers read the deprecated `reserved_gpus`.
-7. `_operation()` writes a debug line to stdout, which corrupts the CLI's JSON
+6. `_operation()` writes a debug line to stdout, which corrupts the CLI's JSON
    output for operation-based commands (`weight-sync`, `tail-logs`,
    `cancel-request`, `reset-prefix-cache`, router replay). Redirect stdout or
    parse stderr-free output until this is removed.

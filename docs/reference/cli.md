@@ -141,15 +141,15 @@ cortex-training capacity
 cortex-training capacity --hardware B200
 ```
 
-The command prints `has_reservation`, `reserved_gpus`, `in_use_gpus`, and
-`available_gpus`.
+The command prints `has_reservation`, `max_total_gpus`, `reserved_gpus`,
+`in_use_gpus`, `pending_gpus`, and `available_gpus`.
 
 `--hardware` scopes the numbers to one GPU type: `H200`, `B200`, or `B300`.
 Omitting it reports H200.
 
-The server also returns a `max_total_gpus` ceiling that supersedes
-`reserved_gpus`, but the client does not surface it yet, so `reserved_gpus` is
-what you get today. See
+`max_total_gpus` is the canonical ceiling and supersedes the deprecated
+`reserved_gpus`. `in_use_gpus` counts only GPUs the account holds; queued work
+is reported separately in `pending_gpus`. See
 [REST API reference section 5.4](rest-api.md#54-capacity---get-capacity).
 
 ### Submit A Job

@@ -80,7 +80,7 @@ operation.
 | `list_jobs(status=None)` | list of jobs | Returns the inner list, not the envelope |
 | `wait_for_job(job_id)` | job dict | Polls until `running`; raises on `failed`/`done`/`cancelled` or timeout. Does not treat `terminated` as terminal |
 | `cancel_job(job_id)` | `None` | Idempotent while cancelling/cancelled |
-| `get_capacity(hardware=None)` | capacity dict | `has_reservation`, `reserved_gpus`, `in_use_gpus`, `available_gpus`, scoped to `hardware` (default `H200`). The server's `max_total_gpus` ceiling is not surfaced yet |
+| `get_capacity(hardware=None)` | capacity dict | `has_reservation`, `max_total_gpus`, `reserved_gpus`, `in_use_gpus`, `pending_gpus`, `available_gpus`, scoped to `hardware` (default `H200`). `max_total_gpus` is the canonical ceiling (`-1` uncapped); `reserved_gpus` is deprecated |
 
 ## Training and sampling
 

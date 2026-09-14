@@ -1494,7 +1494,7 @@ class CortexTrainingClient:
 
     @_track_operation("get_capacity")
     def get_capacity(self, hardware: Hardware | str | None = None) -> dict:
-        """Return the calling account's reserved GPU capacity and current usage.
+        """Return the calling account's GPU ceiling and current usage.
 
         Backed by the account-scoped endpoint ``/cortex-training/capacity``
         (not under ``/{job_id}``). The account is resolved server-side from the
@@ -1503,19 +1503,30 @@ class CortexTrainingClient:
         (:class:`Hardware`.H200 / .B200 / .B300) is sent as a query parameter and
         scopes the numbers to that GPU type; omitted defaults to H200.
 
-        The returned dict always carries all four fields. The server emits
-        proto3 JSON, which omits zero/false fields (an unreserved account's
-        response is literally ``{}``), so we fill in the documented defaults:
+        The returned dict always carries all six fields. The server emits
+        proto3 JSON, which omits zero/false fields (an account holding nothing
+        under a zero ceiling is literally ``{}``), so we fill in the documented
+        defaults:
 
-        - ``has_reservation`` (bool): whether the account has a configured GPU
-          reservation. When ``False`` the account uses shared/on-demand
-          placement and the ``*_gpus`` fields are all 0.
-        - ``reserved_gpus`` (int): total GPUs reserved for the account. The
-          server also returns a ``max_total_gpus`` ceiling that supersedes this
-          field; this method does not surface it yet.
-        - ``in_use_gpus`` (int): GPUs consumed by the account's active
-          (non-terminal) jobs.
-        - ``available_gpus`` (int): remaining capacity, floored at 0.
+        - ``has_reservation`` (bool): whether ``max_total_gpus`` is a
+          *guaranteed* commitment rather than a best-effort per-account cap.
+          When ``False`` the account draws on the shared pool, so
+          ``available_gpus`` is an upper bound.
+        - ``max_total_gpus`` (int): the account's ceiling — its commitment when
+          ``has_reservation``, else its per-account cap. ``-1`` means no
+          ceiling, ``0`` a real quota of zero, ``> 0`` the limit. This is the
+          canonical ceiling; prefer it over ``reserved_gpus``.
+        - ``reserved_gpus`` (int, **deprecated**): mirrors ``max_total_gpus``
+          when ``has_reservation`` is ``True``, else 0.
+        - ``in_use_gpus`` (int): GPUs the account holds — jobs in ``placing``,
+          ``initializing``, or ``running``. Queued work is *not* counted here;
+          it is in ``pending_gpus``.
+        - ``pending_gpus`` (int): GPUs requested by jobs still waiting for
+          capacity (``pending``). It claims quota, so it reduces
+          ``available_gpus``.
+        - ``available_gpus`` (int): what a new job could start with right now —
+          ceiling headroom capped by what is schedulable. ``0`` does not mean
+          blocked: a submit within the ceiling is still accepted and queued.
 
         See ``docs/reference/rest-api.md`` section 5.4 for the authoritative
         field list.
@@ -1531,8 +1542,10 @@ class CortexTrainingClient:
         body = resp.json()
         return {
             "has_reservation": bool(body.get("has_reservation", False)),
+            "max_total_gpus": int(body.get("max_total_gpus", 0)),
             "reserved_gpus": int(body.get("reserved_gpus", 0)),
             "in_use_gpus": int(body.get("in_use_gpus", 0)),
+            "pending_gpus": int(body.get("pending_gpus", 0)),
             "available_gpus": int(body.get("available_gpus", 0)),
         }
 

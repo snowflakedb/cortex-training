@@ -1282,19 +1282,33 @@ class TestReadAndControl:
         c = _make_client(
             get_json={
                 "has_reservation": True,
+                "max_total_gpus": 64,
                 "reserved_gpus": 64,
                 "in_use_gpus": 8,
-                "available_gpus": 56,
+                "pending_gpus": 16,
+                "available_gpus": 40,
             }
         )
         cap = c.get_capacity()
         assert cap == {
             "has_reservation": True,
+            "max_total_gpus": 64,
             "reserved_gpus": 64,
             "in_use_gpus": 8,
-            "available_gpus": 56,
+            "pending_gpus": 16,
+            "available_gpus": 40,
         }
         c._session.get.assert_called_once_with(f"{c._prefix}/capacity")
+
+    def test_get_capacity_reports_uncapped_ceiling(self):
+        # -1 is the uncapped sentinel and must survive as-is: 0 is a real quota
+        # of zero, so collapsing the two would report the opposite ceiling.
+        c = _make_client(
+            get_json={"max_total_gpus": -1, "in_use_gpus": 16, "available_gpus": 96}
+        )
+        cap = c.get_capacity()
+        assert cap["max_total_gpus"] == -1
+        assert cap["has_reservation"] is False
 
     def test_get_capacity_sends_hardware_query(self):
         c = _make_client(get_json={"has_reservation": True, "reserved_gpus": 32})
@@ -1310,24 +1324,36 @@ class TestReadAndControl:
         c._session.get.assert_not_called()
 
     def test_get_capacity_fills_proto3_omitted_defaults(self):
-        # proto3 JSON omits zero/false fields; an unreserved account is `{}`.
+        # proto3 JSON omits zero/false fields; an account holding nothing under a
+        # zero ceiling is `{}`.
         c = _make_client(get_json={})
         cap = c.get_capacity()
         assert cap == {
             "has_reservation": False,
+            "max_total_gpus": 0,
             "reserved_gpus": 0,
             "in_use_gpus": 0,
+            "pending_gpus": 0,
             "available_gpus": 0,
         }
 
     def test_get_capacity_fills_partial_omitted_fields(self):
-        # Fully-drained reservation: only the non-zero reserved_gpus is present.
-        c = _make_client(get_json={"has_reservation": True, "reserved_gpus": 8})
+        # Ceiling fully claimed by queued work: in_use and available are omitted.
+        c = _make_client(
+            get_json={
+                "has_reservation": True,
+                "max_total_gpus": 8,
+                "reserved_gpus": 8,
+                "pending_gpus": 8,
+            }
+        )
         cap = c.get_capacity()
         assert cap == {
             "has_reservation": True,
+            "max_total_gpus": 8,
             "reserved_gpus": 8,
             "in_use_gpus": 0,
+            "pending_gpus": 8,
             "available_gpus": 0,
         }
 
