@@ -284,7 +284,7 @@ One auxiliary call is outside the Cortex Training prefix:
 
 | REST path | HTTP | Client use | Purpose |
 |---|---|---|---|
-| `/api/v2/statements` | `POST` | `fetch_execution_logs` | Resolve scoped experiment-stage credentials |
+| `/api/v2/statements` | `POST` | artifact download methods | Resolve the current Snowflake identity |
 
 ---
 
@@ -1560,10 +1560,10 @@ serve empty, non-EOF pages during placement while the pod is still appearing.
 `fetch_execution_logs(job_id)`:
 
 1. Calls `GET /{job_id}/experiment-run`.
-2. Calls `POST /api/v2/statements` with
-   `SYSTEM$GET_VSTAGE_WRITE_CREDS(...)`.
-3. Uses the returned scoped S3 credentials to list the experiment stage.
-4. Downloads every object below a `/_logs/{sub_job_id}/` subtree.
+2. Resolves the current user, account, and role through the SQL statements API.
+3. Opens an explicitly PAT-authenticated Snowflake Connector session.
+4. Uses experiment artifact `LIST` and `GET` to download every object below a
+   `/_logs/{sub_job_id}/` subtree.
 
 Return:
 
@@ -1572,15 +1572,33 @@ Return:
     {
         "sub_job_id": "job-id:training:0",
         "filename": "execution.jsonl",
-        "s3_uri": "s3://bucket/key",
+        "artifact_uri": "snow://experiment/DB.SCHEMA.EXPERIMENT/versions/RUN/_logs/job-id:training:0/execution.jsonl",
         "content": "...",
     }
 ]
 ```
 
-Only S3 stage credentials are implemented by this client.
+The client returns logical artifact URIs and does not expose physical storage
+paths or object-store credentials.
 
-### 12.3 Zone scheduling events
+### 12.3 Persisted stdout download
+
+`download_stdout_logs(job_id, output_dir)` downloads gzip chunks under
+`_stdout/{sub_job_id}/`, orders them by artifact name, and streams them into
+`<output_dir>/<sub_job_id>/stdout.log`. Each destination is replaced atomically;
+an invalid chunk leaves an existing file unchanged.
+
+### 12.4 GPU metrics download
+
+`download_metrics(job_id, output_dir)` applies the same bounded reconstruction
+to `gpu.YYYYMMDD-HHMMSS.UUID.gz` chunks under `_metrics/{sub_job_id}/` and
+writes `<output_dir>/<sub_job_id>/gpu.jsonl`.
+
+The reconstructed file contains the JSONL records emitted by the deployed
+training runtime. Metric artifact publication may not yet be available in
+production deployments.
+
+### 12.5 Zone scheduling events
 
 The client contains `tail_events()` and `stream_events()`, but the server does
 not accept their operation type. See

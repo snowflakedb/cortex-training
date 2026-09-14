@@ -53,6 +53,10 @@ class FakeClient:
         self.capacity_hardware = None
         self.checkpoints_job_id = None
         self.jobs = None
+        self.stdout_log_job_id = None
+        self.stdout_log_output_dir = None
+        self.metrics_job_id = None
+        self.metrics_output_dir = None
 
     def create_job_from_body(self, body):
         self.submitted_body = body
@@ -163,21 +167,55 @@ class FakeClient:
             {
                 "sub_job_id": f"{job_id}:training:0",
                 "filename": "execution.jsonl",
-                "s3_uri": f"s3://bucket/stage/versions/v1/checkpoints/_logs/{job_id}:training:0/execution.jsonl",
+                "artifact_uri": f"snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_logs/{job_id}:training:0/execution.jsonl",
                 "content": '{"a":1}\n',
             },
             {
                 "sub_job_id": f"{job_id}:training:0",
                 "filename": "server.log",
-                "s3_uri": f"s3://bucket/stage/versions/v1/checkpoints/_logs/{job_id}:training:0/server.log",
+                "artifact_uri": f"snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_logs/{job_id}:training:0/server.log",
                 "content": "server line\n",
             },
             {
                 "sub_job_id": f"{job_id}:sampling:0",
                 "filename": "execution.jsonl",
-                "s3_uri": f"s3://bucket/stage/versions/v1/checkpoints/_logs/{job_id}:sampling:0/execution.jsonl",
+                "artifact_uri": f"snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_logs/{job_id}:sampling:0/execution.jsonl",
                 "content": '{"b":2}\n',
             },
+        ]
+
+    def download_stdout_logs(self, job_id, output_dir):
+        self.stdout_log_job_id = job_id
+        self.stdout_log_output_dir = output_dir
+        path = output_dir / f"{job_id}:training:0" / "stdout.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("console\n", encoding="utf-8")
+        return [
+            {
+                "sub_job_id": f"{job_id}:training:0",
+                "filename": "stdout.log",
+                "saved_path": str(path),
+                "chunk_count": 1,
+                "first_artifact_uri": "snow://experiment/first.gz",
+                "last_artifact_uri": "snow://experiment/first.gz",
+            }
+        ]
+
+    def download_metrics(self, job_id, output_dir):
+        self.metrics_job_id = job_id
+        self.metrics_output_dir = output_dir
+        path = output_dir / f"{job_id}:training:0" / "gpu.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"gpu_utilization":0.5}\n', encoding="utf-8")
+        return [
+            {
+                "sub_job_id": f"{job_id}:training:0",
+                "filename": "gpu.jsonl",
+                "saved_path": str(path),
+                "chunk_count": 1,
+                "first_artifact_uri": "snow://experiment/first.gz",
+                "last_artifact_uri": "snow://experiment/first.gz",
+            }
         ]
 
 
@@ -993,22 +1031,69 @@ def test_download_log_writes_each_log_under_sub_job_dir(tmp_path):
         {
             "sub_job_id": "job-1:training:0",
             "filename": "execution.jsonl",
-            "s3_uri": "s3://bucket/stage/versions/v1/checkpoints/_logs/job-1:training:0/execution.jsonl",
+            "artifact_uri": "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_logs/job-1:training:0/execution.jsonl",
             "saved_path": str(training_dir / "execution.jsonl"),
         },
         {
             "sub_job_id": "job-1:training:0",
             "filename": "server.log",
-            "s3_uri": "s3://bucket/stage/versions/v1/checkpoints/_logs/job-1:training:0/server.log",
+            "artifact_uri": "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_logs/job-1:training:0/server.log",
             "saved_path": str(training_dir / "server.log"),
         },
         {
             "sub_job_id": "job-1:sampling:0",
             "filename": "execution.jsonl",
-            "s3_uri": "s3://bucket/stage/versions/v1/checkpoints/_logs/job-1:sampling:0/execution.jsonl",
+            "artifact_uri": "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_logs/job-1:sampling:0/execution.jsonl",
             "saved_path": str(sampling_dir / "execution.jsonl"),
         },
     ]
+
+
+def test_download_log_stdout_routes_to_reconstruction(tmp_path):
+    stdout = io.StringIO()
+    client = FakeClient()
+
+    rc = cli.main(
+        _base_args()
+        + [
+            "download-log",
+            "job-1",
+            "--log-type",
+            "stdout",
+            "--output-dir",
+            str(tmp_path),
+        ],
+        client_factory=lambda _: client,
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert client.stdout_log_job_id == "job-1"
+    assert client.stdout_log_output_dir == tmp_path
+    assert (tmp_path / "job-1:training:0" / "stdout.log").read_text() == "console\n"
+    assert json.loads(stdout.getvalue())["logs"][0]["filename"] == "stdout.log"
+
+
+def test_download_metrics_defaults_to_cwd(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    stdout = io.StringIO()
+    client = FakeClient()
+
+    rc = cli.main(
+        _base_args() + ["download-metrics", "job-1"],
+        client_factory=lambda _: client,
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert client.metrics_job_id == "job-1"
+    assert client.metrics_output_dir == tmp_path
+    assert (tmp_path / "job-1:training:0" / "gpu.jsonl").read_text() == (
+        '{"gpu_utilization":0.5}\n'
+    )
+    payload = json.loads(stdout.getvalue())
+    assert payload["job_id"] == "job-1"
+    assert payload["metrics"][0]["filename"] == "gpu.jsonl"
 
 
 def test_http_errors_include_response_details():

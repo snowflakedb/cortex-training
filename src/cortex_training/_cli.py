@@ -328,12 +328,35 @@ def build_parser(
     )
     download_log.add_argument("job_id")
     download_log.add_argument(
+        "--log-type",
+        choices=("execution", "stdout"),
+        default="execution",
+        help=(
+            "Log source to download: execution artifacts (default), or the "
+            "reconstructed head-pod stdout/stderr console."
+        ),
+    )
+    download_log.add_argument(
         "--output-dir",
         dest="output_dir",
         help=(
             "Directory to write log files into, grouped as "
             "<output_dir>/<sub_job_id>/<filename>. Created if missing. "
             "Defaults to the current working directory."
+        ),
+    )
+
+    download_metrics = subparsers.add_parser(
+        "download-metrics",
+        help="Download and reconstruct GPU metrics for a Cortex Training job.",
+    )
+    download_metrics.add_argument("job_id")
+    download_metrics.add_argument(
+        "--output-dir",
+        dest="output_dir",
+        help=(
+            "Directory to write <sub_job_id>/gpu.jsonl files. Created if "
+            "missing. Defaults to the current working directory."
         ),
     )
 
@@ -842,8 +865,17 @@ def _cmd_weight_sync(args: argparse.Namespace, client, stdout: TextIO) -> int:
 
 
 def _cmd_download_log(args: argparse.Namespace, client, stdout: TextIO) -> int:
-    logs = client.fetch_execution_logs(args.job_id)
     out_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.cwd()
+    if args.log_type == "stdout":
+        logs = client.download_stdout_logs(args.job_id, out_dir)
+        _print_json(
+            {"job_id": args.job_id, "logs": logs},
+            stdout,
+            compact=args.compact,
+        )
+        return 0
+
+    logs = client.fetch_execution_logs(args.job_id)
     saved = []
     for log in logs:
         file_path = out_dir / (log["sub_job_id"] or "unknown") / log["filename"]
@@ -853,11 +885,24 @@ def _cmd_download_log(args: argparse.Namespace, client, stdout: TextIO) -> int:
             {
                 "sub_job_id": log["sub_job_id"],
                 "filename": log["filename"],
-                "s3_uri": log["s3_uri"],
+                "artifact_uri": log["artifact_uri"],
                 "saved_path": str(file_path),
             }
         )
     _print_json({"job_id": args.job_id, "logs": saved}, stdout, compact=args.compact)
+    return 0
+
+
+def _cmd_download_metrics(
+    args: argparse.Namespace, client, stdout: TextIO
+) -> int:
+    out_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.cwd()
+    metrics = client.download_metrics(args.job_id, out_dir)
+    _print_json(
+        {"job_id": args.job_id, "metrics": metrics},
+        stdout,
+        compact=args.compact,
+    )
     return 0
 
 
@@ -918,6 +963,8 @@ def _run(
         return _cmd_weight_sync(args, client, stdout)
     if args.command == "download-log":
         return _cmd_download_log(args, client, stdout)
+    if args.command == "download-metrics":
+        return _cmd_download_metrics(args, client, stdout)
     raise ValueError(f"unknown command: {args.command}")
 
 

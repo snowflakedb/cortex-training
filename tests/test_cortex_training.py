@@ -42,6 +42,8 @@ _PARSER_CASES = [
     _base_args() + ["--job", "job-1", "generate", "generate.json"],
     _base_args() + ["--job", "job-1", "weight-sync"],
     _base_args() + ["download-log", "job-1"],
+    _base_args() + ["download-log", "job-1", "--log-type", "stdout"],
+    _base_args() + ["download-metrics", "job-1"],
     ["login", "--config", "config.json"],
 ]
 _COMMANDS = {
@@ -58,6 +60,7 @@ _COMMANDS = {
     "generate",
     "weight-sync",
     "download-log",
+    "download-metrics",
     "login",
 }
 

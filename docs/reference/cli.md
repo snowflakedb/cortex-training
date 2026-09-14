@@ -123,6 +123,8 @@ cortex-training --job-id JOB_ID load CHECKPOINT_ID
 cortex-training --job-id JOB_ID generate examples/api/generate.json
 cortex-training --job-id JOB_ID weight-sync
 cortex-training download-log JOB_ID --output-dir /path/to/dir
+cortex-training download-log JOB_ID --log-type stdout --output-dir /path/to/dir
+cortex-training download-metrics JOB_ID --output-dir /path/to/dir
 ```
 
 Global flags must come before the subcommand:
@@ -364,7 +366,7 @@ If a backend needs a different operation routing hint, pass
 ### Download Execution Logs
 
 Pull every log file the job's experiment run produced. Each sub-job's
-`_logs/` directory in S3 may contain multiple files (e.g.
+`_logs/` artifact directory may contain multiple files (e.g.
 `execution.jsonl`, `server.log`); all of them are downloaded:
 
 ```bash
@@ -377,7 +379,31 @@ directory is used instead. The CLI also prints a JSON summary listing
 each `saved_path`.
 
 Programmatic access is `CortexTrainingClient.fetch_execution_logs(job_id)`,
-which returns a list of `{sub_job_id, filename, s3_uri, content}` dicts.
+which returns a list of `{sub_job_id, filename, artifact_uri, content}` dicts.
+
+### Download Persisted Stdout
+
+Reconstruct each sub-job's persisted stdout/stderr chunks into
+`<output_dir>/<sub_job_id>/stdout.log`:
+
+```bash
+cortex-training download-log JOB_ID --log-type stdout --output-dir /path/to/logs
+```
+
+The current working directory is used when `--output-dir` is omitted.
+
+### Download GPU Metrics
+
+Reconstruct each sub-job's GPU metric chunks into
+`<output_dir>/<sub_job_id>/gpu.jsonl`:
+
+```bash
+cortex-training download-metrics JOB_ID --output-dir /path/to/metrics
+```
+
+The command prints the saved path, chunk count, and first/last logical artifact
+URIs for each reconstructed file. This feature depends on server-side metric
+artifacts and may not yet be available in production deployments.
 
 ### Log TUI
 
