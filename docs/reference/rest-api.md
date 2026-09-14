@@ -341,6 +341,10 @@ that GPU type. Omitted means `H200`. Any other value is rejected — the typed
 `create_job()` path raises `ValueError` before sending, and the server rejects
 an unknown value on the raw `create_job_from_body()` path. The typed path also
 accepts the `Hardware` enum (`Hardware.B200`) in place of the string.
+
+See [GPU hardware](../concepts/hardware.md) for the job-level model and how
+capacity is scoped per type.
+
 #### `idle_timeout_seconds`
 
 Optional. Bounds how long the job may sit idle before the server reclaims it.
@@ -444,7 +448,9 @@ Optional query:
 `hardware` scopes the numbers to one GPU type and takes the same values as the
 create-job field: `H200`, `B200`, or `B300`, defaulting to `H200` when omitted.
 `get_capacity()` sends the parameter only when you pass one, and rejects an
-unknown value client-side.
+unknown value client-side. The CLI `capacity` command, with no `--hardware`
+flag, calls this endpoint once per type and wraps the results in
+`capacity_by_hardware`.
 
 ```json
 {

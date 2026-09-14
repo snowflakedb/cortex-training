@@ -226,7 +226,10 @@ def build_parser(
     capacity.add_argument(
         "--hardware",
         choices=_hardware_choices(),
-        help="GPU hardware to report on. Defaults to H200.",
+        help=(
+            "Show only this GPU hardware. "
+            "Omit to show capacity for every hardware type."
+        ),
     )
 
     cancel = subparsers.add_parser("cancel", help="Cancel one Cortex Training job.")
@@ -891,9 +894,16 @@ def _run(
         _print_json({"jobs": _jobs_latest_last(jobs)}, stdout, compact=args.compact)
         return 0
     if args.command == "capacity":
-        _print_json(
-            client.get_capacity(hardware=args.hardware), stdout, compact=args.compact
-        )
+        if args.hardware is not None:
+            capacity = client.get_capacity(hardware=args.hardware)
+        else:
+            capacity = {
+                "capacity_by_hardware": {
+                    hardware: client.get_capacity(hardware=hardware)
+                    for hardware in _hardware_choices()
+                }
+            }
+        _print_json(capacity, stdout, compact=args.compact)
         return 0
     if args.command == "cancel":
         client.cancel_job(args.job_id)

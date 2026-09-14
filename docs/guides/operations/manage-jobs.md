@@ -11,6 +11,8 @@ cortex-training wait JOB_ID
 cortex-training cancel JOB_ID
 ```
 
-Use `cortex-training capacity` before starting a recipe. Resume and retry guidance
+Use `cortex-training capacity` before starting a recipe, and
+`cortex-training capacity --hardware B200` (or `B300`) when you want a single
+type. See [GPU hardware](../../concepts/hardware.md). Resume and retry guidance
 is tracked separately because support depends on checkpoint type and failure
 state.

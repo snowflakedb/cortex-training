@@ -51,6 +51,7 @@ class FakeClient:
         self.weight_sync_sub_job_type = None
         self.capacity_requested = False
         self.capacity_hardware = None
+        self.capacity_hardware_requests = []
         self.checkpoints_job_id = None
         self.jobs = None
 
@@ -84,13 +85,18 @@ class FakeClient:
     def get_capacity(self, hardware=None):
         self.capacity_requested = True
         self.capacity_hardware = hardware
+        self.capacity_hardware_requests.append(hardware)
         return {
             "has_reservation": True,
             "max_total_gpus": 64,
             "reserved_gpus": 64,
             "in_use_gpus": 8,
             "pending_gpus": 16,
-            "available_gpus": 40,
+            "available_gpus": {
+                "H200": 40,
+                "B200": 24,
+                "B300": 0,
+            }.get(hardware, 40),
         }
 
     def forward_backward(self, job_id, payload):
@@ -461,14 +467,34 @@ def test_capacity_prints_account_gpu_usage():
 
     assert rc == 0
     assert instances[0].capacity_requested is True
-    assert instances[0].capacity_hardware is None
+    assert instances[0].capacity_hardware_requests == ["H200", "B200", "B300"]
     assert json.loads(stdout.getvalue()) == {
-        "has_reservation": True,
-        "max_total_gpus": 64,
-        "reserved_gpus": 64,
-        "in_use_gpus": 8,
-        "pending_gpus": 16,
-        "available_gpus": 40,
+        "capacity_by_hardware": {
+            "H200": {
+                "has_reservation": True,
+                "max_total_gpus": 64,
+                "reserved_gpus": 64,
+                "in_use_gpus": 8,
+                "pending_gpus": 16,
+                "available_gpus": 40,
+            },
+            "B200": {
+                "has_reservation": True,
+                "max_total_gpus": 64,
+                "reserved_gpus": 64,
+                "in_use_gpus": 8,
+                "pending_gpus": 16,
+                "available_gpus": 24,
+            },
+            "B300": {
+                "has_reservation": True,
+                "max_total_gpus": 64,
+                "reserved_gpus": 64,
+                "in_use_gpus": 8,
+                "pending_gpus": 16,
+                "available_gpus": 0,
+            },
+        },
     }
 
 
@@ -484,6 +510,7 @@ def test_capacity_passes_hardware():
 
     assert rc == 0
     assert instances[0].capacity_hardware == "B300"
+    assert instances[0].capacity_hardware_requests == ["B300"]
 
 
 def test_capacity_rejects_unknown_hardware():

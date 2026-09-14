@@ -134,23 +134,26 @@ cortex-training --config config.json submit examples/api/training.json
 
 ### Show Current GPU Capacity
 
-Print the caller account's reserved GPU capacity and current usage:
+Print the caller account's reserved GPU capacity and current usage, separated
+by hardware:
 
 ```bash
 cortex-training capacity
 cortex-training capacity --hardware B200
 ```
 
-The command prints `has_reservation`, `max_total_gpus`, `reserved_gpus`,
-`in_use_gpus`, `pending_gpus`, and `available_gpus`.
+The default command queries `H200`, `B200`, and `B300` independently and
+prints a `capacity_by_hardware` map. Each entry includes `has_reservation`,
+`max_total_gpus`, `reserved_gpus`, `in_use_gpus`, `pending_gpus`, and
+`available_gpus`.
 
-`--hardware` scopes the numbers to one GPU type: `H200`, `B200`, or `B300`.
-Omitting it reports H200.
+`--hardware` keeps the single-capacity response shape for one GPU type.
 
 `max_total_gpus` is the canonical ceiling and supersedes the deprecated
 `reserved_gpus`. `in_use_gpus` counts only GPUs the account holds; queued work
 is reported separately in `pending_gpus`. See
-[REST API reference section 5.4](rest-api.md#54-capacity---get-capacity).
+[REST API reference section 5.4](rest-api.md#54-capacity---get-capacity) and
+[GPU hardware](../concepts/hardware.md).
 
 ### Submit A Job
 
@@ -158,6 +161,7 @@ The submit command expects a CreateJob JSON body:
 
 ```json
 {
+  "hardware": "H200",
   "sub_job_configs": [
     {
       "job_type": "sampling",
@@ -170,6 +174,9 @@ The submit command expects a CreateJob JSON body:
   ]
 }
 ```
+
+Optional `hardware` is `H200`, `B200`, or `B300`. Omit it to use H200. Every
+sub-job in the job uses that type. See [GPU hardware](../concepts/hardware.md).
 
 Submit it:
 
