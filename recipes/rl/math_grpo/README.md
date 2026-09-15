@@ -1,8 +1,8 @@
 # Math GRPO
 
 Train a model with grouped policy optimization on Hendrycks MATH and evaluate
-against MATH-500. The recipe creates colocated training and sampling sub-jobs,
-generates rollouts, scores them, trains, and synchronizes weights. After the
+against MATH-500. The recipe creates training and sampling sub-jobs, generates
+rollouts, scores them, trains, and synchronizes weights. After the
 final save it logs a `python -m recipes.inference.evaluate` command.
 
 ## Hardware
@@ -60,8 +60,8 @@ LoRA, GPU counts, sequence length, and MoE live in the job-config JSON. Set
 `wandb_project` to log to Weights & Biases after `uv pip install wandb` and
 `export WANDB_API_KEY` / `export WANDB_BASE_URL`.
 
-The recipe loads one create-job body with colocated sampling and training
-sub-jobs. Pass a shipped example or a copy with `job_config=JOB_CONFIG`.
+The recipe loads one create-job body with sampling and training sub-jobs. Pass a
+shipped example or a copy with `job_config=JOB_CONFIG`.
 
 ```json
 {
