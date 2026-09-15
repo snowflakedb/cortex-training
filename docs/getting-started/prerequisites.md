@@ -9,6 +9,18 @@ Before running a training recipe, you need:
 - A database and schema containing the endpoint
 - Sufficient reserved GPU capacity for the selected recipe
 
+## Installation
+
+Two install steps are required. The SDK/CLI alone is not enough to run recipes:
+
+```bash
+# 1. Install the SDK and CLI
+uv pip install -e .
+
+# 2. Install the recipe dependency (required for all recipes)
+uv pip install 'tinker-cookbook @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
+```
+
 Check current capacity after installing and authenticating:
 
 ```bash

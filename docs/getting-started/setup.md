@@ -33,6 +33,11 @@ Otherwise create it by hand, outside the repository:
 Fill in the account host, programmatic access token, database, and schema. Keep
 the file outside the repository and do not commit it.
 
+**Note:** Some Snowflake account URLs use underscores in the UI or admin tools
+(e.g., `dsa_test.qa6...`) but the SSL certificate requires hyphens
+(e.g., `dsa-test.qa6...`). If you get an SSL certificate error, try replacing
+underscores with hyphens in the host.
+
 Validate and store the config path:
 
 ```bash
