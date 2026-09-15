@@ -19,10 +19,12 @@ Install the client and recipe dependencies from the repository root:
 ```bash
 uv pip install -e .
 uv pip install 'tinker-cookbook[math-rl] @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
+# optional, only if you pass wandb_project=...
 uv pip install wandb
 ```
 
 (`pip install ...` works in place of `uv pip install ...` if you prefer.)
+
 
 Create a local Snowflake connection file from
 `examples/config/connection.json.template` (account host and PAT).
@@ -32,7 +34,8 @@ command (`wandb_project=...`) and export:
 
 ```bash
 export WANDB_API_KEY=...
-export WANDB_BASE_URL=...
+# optional: only if you are not using W&B Cloud
+# export WANDB_BASE_URL=https://your-wandb-host
 ```
 
 ## Running Recipes
