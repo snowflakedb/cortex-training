@@ -1,0 +1,19 @@
+{
+  "sub_job_configs": [
+    {
+      "inference_config": {
+        "max_seq_len": 720896,
+        "n_gpus": 8,
+        "vllm_config": {
+          "enforce_eager": true,
+          "gpu_memory_utilization": 0.95,
+          "kv_cache_dtype": "fp8_ds_mla",
+          "reasoning_parser": "glm45",
+          "tensor_parallel_size": 8
+        }
+      },
+      "job_type": "sampling",
+      "model_name": "zai-org/GLM-5.3"
+    }
+  ]
+}
