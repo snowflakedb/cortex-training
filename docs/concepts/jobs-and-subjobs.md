@@ -22,4 +22,5 @@ For example, a colocated RL job commonly has `{job_id}:training:0` and
 `{job_id}:sampling:0`.
 
 For complete request and routing details, see the
-[REST API reference](../reference/rest-api.md).
+[REST API reference](../reference/rest-api.md). GPU type is a job-level field;
+see [GPU hardware](hardware.md).
