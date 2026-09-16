@@ -36,7 +36,7 @@ the file outside the repository and do not commit it.
 Validate and store the config path:
 
 ```bash
-cortex-training login --config ~/cortex-training-config.json
+cortex-training login ~/cortex-training-config.json
 cortex-training capacity
 ```
 

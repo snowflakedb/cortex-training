@@ -41,7 +41,7 @@ uv pip install -e .
 
 The package installs:
 
-- `cortex-training`, for submitting and managing jobs
+- `cortex-training` (alias: `ct`), for submitting and managing jobs
 - `cortex-training tui`, for viewing job logs
 - `cortex_training`, the Python SDK
 
@@ -51,6 +51,18 @@ Verify the command entry points:
 cortex-training --help
 cortex-training tui --help
 ```
+
+## Build a Wheel
+
+With `uv` installed, run:
+
+```bash
+./scripts/build_wheel.sh
+```
+
+The script builds the package using `pyproject.toml` in an isolated build
+environment and writes the wheel to `dist/`. It can be invoked from any working
+directory and does not install the package's runtime dependencies.
 
 ## Usage
 

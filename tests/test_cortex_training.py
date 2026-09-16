@@ -44,7 +44,7 @@ _PARSER_CASES = [
     _base_args() + ["download-log", "job-1"],
     _base_args() + ["download-log", "job-1", "--log-type", "stdout"],
     _base_args() + ["download-metrics", "job-1"],
-    ["login", "--config", "config.json"],
+    ["login", "config.json"],
 ]
 _COMMANDS = {
     "submit",
@@ -69,6 +69,47 @@ _COMMANDS = {
 def test_all_commands_parse(argv):
     expected = next(argument for argument in argv if argument in _COMMANDS)
     assert cortex_cli.parse_args(argv).command == expected
+
+
+def test_login_parses_positional_config():
+    assert cortex_cli.parse_args(["login", "test.json"]).login_config == "test.json"
+
+
+@pytest.mark.parametrize("argv", [["login"], ["login", "--config", "test.json"]])
+def test_login_requires_positional_config(argv):
+    with pytest.raises(SystemExit) as exc:
+        cortex_cli.parse_args(argv)
+    assert exc.value.code == 2
+
+
+def test_login_help_shows_positional_config(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cortex_cli.parse_args(["login", "--help"])
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "usage: cortex-training login [-h] config" in help_text
+    assert "--config" not in help_text
+
+
+@pytest.mark.parametrize("command", ["fwd-bwd", "step", "load", "generate", "weight-sync"])
+def test_job_action_help_shows_global_job_placement(command, capsys):
+    with pytest.raises(SystemExit) as exc:
+        cortex_cli.parse_args([command, "--help"])
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert f"usage: cortex-training --job JOB_ID {command}" in help_text
+    assert "--job-id JOB_ID" in help_text
+    assert "Place it before the subcommand." in " ".join(help_text.split())
+
+
+@pytest.mark.parametrize("command", ["get", "checkpoints", "cancel", "wait"])
+def test_job_management_help_keeps_positional_job(command, capsys):
+    with pytest.raises(SystemExit) as exc:
+        cortex_cli.parse_args([command, "--help"])
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert f"usage: cortex-training {command} [-h] job_id" in help_text
+    assert "--job" not in help_text
 
 
 def _run_list():

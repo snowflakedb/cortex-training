@@ -1325,7 +1325,7 @@ def test_login_persists_config_path(tmp_path, monkeypatch):
     monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
     stdout = io.StringIO()
 
-    rc = cli.main(["login", "--config", str(config)], stdout=stdout)
+    rc = cli.main(["login", str(config)], stdout=stdout)
 
     assert rc == 0
     saved = json.loads(login_state.read_text(encoding="utf-8"))
@@ -1413,7 +1413,7 @@ def test_login_rejects_invalid_config(tmp_path, monkeypatch):
     monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
     stderr = io.StringIO()
 
-    rc = cli.main(["login", "--config", str(config)], stderr=stderr)
+    rc = cli.main(["login", str(config)], stderr=stderr)
 
     assert rc == 1
     assert not login_state.exists()

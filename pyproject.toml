@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cortex-training"
-version = "0.0.2"
+version = "0.0.3"
 description = "Python SDK and command-line tools for Cortex Training"
 readme = "README.md"
 # 3.10 is the real floor: torch, safetensors and tenacity all require >=3.10,

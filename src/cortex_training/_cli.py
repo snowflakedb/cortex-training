@@ -325,6 +325,19 @@ def build_parser(
         help="Print the request id without polling for completion.",
     )
 
+    for command, job_parser in (
+        ("fwd-bwd", fwd_bwd),
+        ("step", step),
+        ("load", load),
+        ("generate", generate),
+        ("weight-sync", weight_sync),
+    ):
+        job_parser.prog = f"{prog} --job JOB_ID {command}"
+        job_parser.epilog = (
+            "Required global option: --job JOB_ID (alias: --job-id JOB_ID). "
+            "Place it before the subcommand."
+        )
+
     download_log = subparsers.add_parser(
         "download-log",
         help="Download all log files for a Cortex Training job's experiment run.",
@@ -368,9 +381,8 @@ def build_parser(
         help="Remember a Cortex Training config file for future commands.",
     )
     login.add_argument(
-        "--config",
-        required=True,
-        dest="login_config",
+        "login_config",
+        metavar="config",
         help="Path to the Cortex Training CLI config JSON file to remember.",
     )
 
