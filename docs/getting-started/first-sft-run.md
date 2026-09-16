@@ -36,3 +36,10 @@ There is no packaged before/after evaluation workflow yet. To confirm the run
 worked, check that `train_mean_nll` and `test/nll` fall over a longer run, then
 run the sampling command the recipe prints after it saves its checkpoint -- on
 the default memorize task the answer should be `Snowflake AI Research`.
+
+## What's Next
+
+- Understand the full config structure: [Configuration](../concepts/configuration.md)
+- Try LoRA or a different model: [Conversational SFT README](../../recipes/sft/conversational/README.md)
+- Try reinforcement learning: [Math GRPO README](../../recipes/rl/math_grpo/README.md)
+- Explore CLI commands: [CLI Reference](../reference/cli.md)

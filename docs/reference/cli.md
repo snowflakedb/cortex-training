@@ -32,6 +32,20 @@ cortex-training --help
 cortex-training tui --help
 ```
 
+## Two Modes of Use
+
+Cortex Training supports two ways to run training:
+
+- **Recipe mode** — run an end-to-end workflow via
+  `python -m recipes.<name>.train config=...`. Recipes call the CLI primitives
+  internally. See each recipe's README for details.
+- **CLI mode** — use individual commands documented below to manually control
+  each step: submit a job, send forward-backward data, trigger optimizer steps,
+  generate, sync weights, and save checkpoints.
+
+This page documents CLI mode. For recipe-driven workflows, see the
+[recipe catalog](../../recipes/README.md).
+
 ## Cortex Training Jobs CLI
 
 `cortex-training` submits and manages Cortex Training jobs through the Cortex
