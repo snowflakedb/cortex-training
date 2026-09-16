@@ -29,10 +29,15 @@ Two suites:
 from __future__ import annotations
 
 import base64
+import gzip
 import importlib
 import json
 import sys
+from pathlib import Path
+from pathlib import PurePosixPath
 from types import SimpleNamespace
+from urllib.parse import unquote
+from urllib.parse import urlparse
 from unittest.mock import MagicMock
 
 import pytest
@@ -2536,35 +2541,65 @@ class TestEvents:
 
 
 class TestExecutionLogDownload:
-    @staticmethod
-    def _make_creds_json():
-        return json.dumps(
-            {
-                "locationType": "S3",
-                "location": "s3://bucket/stage/abc/",
-                "region": "us-west-2",
-                "creds": {
-                    "AWS_KEY_ID": "key",
-                    "AWS_SECRET_KEY": "secret",
-                    "AWS_TOKEN": "token",
-                },
-            }
-        )
+    class FakeArtifactConnection:
+        def __init__(self, list_rows=None, content_by_uri=None):
+            self.list_rows = list_rows or {}
+            self.content_by_uri = content_by_uri or {}
+            self.commands = []
+            self.closed = False
 
-    def test_parse_s3_stage_credentials_extracts_documented_keys(self):
-        creds = nc._parse_s3_stage_credentials(self._make_creds_json())
-        assert creds == {
-            "bucket": "bucket",
-            "prefix": "stage/abc",
-            "region": "us-west-2",
-            "access_key_id": "key",
-            "secret_access_key": "secret",
-            "session_token": "token",
-        }
+        class Cursor:
+            def __init__(self, connection):
+                self.connection = connection
+                self.rows = []
 
-    def test_parse_s3_stage_credentials_rejects_non_s3(self):
-        with pytest.raises(NotImplementedError):
-            nc._parse_s3_stage_credentials({"locationType": "AZURE"})
+            @staticmethod
+            def _unquote(value):
+                assert value.startswith("'") and value.endswith("'")
+                return value[1:-1].replace("''", "'")
+
+            def execute(self, statement):
+                self.connection.commands.append(statement)
+                if statement.startswith("LIST "):
+                    uri = self._unquote(statement.removeprefix("LIST "))
+                    self.rows = self.connection.list_rows.get(uri, [])
+                elif statement.startswith("GET "):
+                    source_literal, target_literal = statement.removeprefix("GET ").split(" ", 1)
+                    source = self._unquote(source_literal)
+                    target_uri = self._unquote(target_literal)
+                    target = Path(unquote(urlparse(target_uri).path))
+                    target.mkdir(parents=True, exist_ok=True)
+                    assert not list(target.iterdir())
+                    (target / PurePosixPath(source).name).write_bytes(
+                        self.connection.content_by_uri[source]
+                    )
+                    self.rows = [(source, "DOWNLOADED")]
+                else:
+                    raise AssertionError(f"unexpected SQL: {statement}")
+                return self
+
+            def fetchall(self):
+                return self.rows
+
+            def close(self):
+                pass
+
+        def cursor(self):
+            return self.Cursor(self)
+
+        def close(self):
+            self.closed = True
+
+    def test_sql_literal_and_artifact_path_validation(self):
+        assert nc._sql_string_literal("snow://exp/O'Brien") == "'snow://exp/O''Brien'"
+        assert nc._validate_artifact_relative_path("_stdout/job/file.gz") == "_stdout/job/file.gz"
+        for path in ("", "/absolute", "../escape", "a/../escape", r"a\b"):
+            with pytest.raises(ValueError, match="unsafe"):
+                nc._validate_artifact_relative_path(path)
+
+    def test_artifact_connection_requires_pat_client(self):
+        with pytest.raises(RuntimeError, match="PAT-authenticated"):
+            _make_client()._open_experiment_artifact_connection()
 
     def test_get_experiment_run_calls_endpoint(self):
         c = _make_client(
@@ -2584,86 +2619,190 @@ class TestExecutionLogDownload:
                 "experiment_run_name": "RUN_ABC",
             }
         )
-        sql_calls: list[str] = []
-
-        def fake_scalar(statement):
-            sql_calls.append(statement)
-            return self._make_creds_json()
-
-        monkeypatch.setattr(c, "_query_sql_scalar", fake_scalar)
-
-        listed_prefixes: list[tuple[str, str]] = []
-        get_calls: list[tuple[str, str]] = []
-        keys_in_stage = [
-            # Two siblings under the same sub_job (mixed extensions): both kept.
-            "stage/abc/versions/v1/checkpoints/_logs/job-1:training:0/execution.jsonl",
-            "stage/abc/versions/v1/checkpoints/_logs/job-1:training:0/server.log",
-            # Different sub_job: still kept.
-            "stage/abc/versions/v1/checkpoints/_logs/job-1:sampling:0/execution.jsonl",
-            # _logs subtree without the checkpoints/ ancestor: still kept.
-            "stage/abc/versions/v1/_logs/job-1:eval:0/execution.jsonl",
-            # Non-_logs entry: filtered out.
-            "stage/abc/versions/v1/checkpoints/model.bin",
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        paths = [
+            "_logs/job-1:eval:0/execution.jsonl",
+            "checkpoints/_logs/job-1:training:0/execution.jsonl",
+            "checkpoints/_logs/job-1:training:0/server.log",
+            "_logs/other-job:eval:0/execution.jsonl",
         ]
-        bodies = {
-            keys_in_stage[0]: b'{"a":1}\n',
-            keys_in_stage[1]: b"server line\n",
-            keys_in_stage[2]: b'{"b":2}\n',
-            keys_in_stage[3]: b'{"c":3}\n',
-        }
+        connection = self.FakeArtifactConnection(
+            {
+                run_uri + "_logs/": [
+                    (f"/versions/RUN_ABC/{paths[0]}",),
+                    (f"/versions/RUN_ABC/{paths[3]}",),
+                ],
+                run_uri + "checkpoints/_logs/": [
+                    (f"/versions/RUN_ABC/{path}",) for path in paths[1:3]
+                ],
+            },
+            {
+                run_uri + paths[0]: b'{"c":3}\n',
+                run_uri + paths[1]: b'{"a":1}\n',
+                run_uri + paths[2]: b"server line\n",
+            },
+        )
+        monkeypatch.setattr(
+            c, "_open_experiment_artifact_connection", lambda: connection
+        )
 
-        class FakePaginator:
-            def paginate(self, *, Bucket, Prefix):
-                listed_prefixes.append((Bucket, Prefix))
-                return iter([{"Contents": [{"Key": k} for k in keys_in_stage]}])
-
-        class FakeS3:
-            def get_paginator(self, name):
-                assert name == "list_objects_v2"
-                return FakePaginator()
-
-            def get_object(self, *, Bucket, Key):
-                get_calls.append((Bucket, Key))
-                return {"Body": SimpleNamespace(read=lambda: bodies[Key])}
-
-        monkeypatch.setitem(sys.modules, "boto3", SimpleNamespace(client=lambda *a, **kw: FakeS3()))
-
-        out = c.fetch_execution_logs("job-1")
-
-        assert sql_calls == ["SELECT SYSTEM$GET_VSTAGE_WRITE_CREDS('snow://experiment/DB.SCH.EXP/versions/RUN_ABC/')"]
-        assert listed_prefixes == [("bucket", "stage/abc/")]
-        assert get_calls == [
-            ("bucket", keys_in_stage[0]),
-            ("bucket", keys_in_stage[1]),
-            ("bucket", keys_in_stage[2]),
-            ("bucket", keys_in_stage[3]),
-        ]
-        assert out == [
+        assert c.fetch_execution_logs("job-1") == [
+            {
+                "sub_job_id": "job-1:eval:0",
+                "filename": "execution.jsonl",
+                "artifact_uri": run_uri + paths[0],
+                "content": '{"c":3}\n',
+            },
             {
                 "sub_job_id": "job-1:training:0",
                 "filename": "execution.jsonl",
-                "s3_uri": f"s3://bucket/{keys_in_stage[0]}",
+                "artifact_uri": run_uri + paths[1],
                 "content": '{"a":1}\n',
             },
             {
                 "sub_job_id": "job-1:training:0",
                 "filename": "server.log",
-                "s3_uri": f"s3://bucket/{keys_in_stage[1]}",
+                "artifact_uri": run_uri + paths[2],
                 "content": "server line\n",
             },
-            {
-                "sub_job_id": "job-1:sampling:0",
-                "filename": "execution.jsonl",
-                "s3_uri": f"s3://bucket/{keys_in_stage[2]}",
-                "content": '{"b":2}\n',
-            },
-            {
-                "sub_job_id": "job-1:eval:0",
-                "filename": "execution.jsonl",
-                "s3_uri": f"s3://bucket/{keys_in_stage[3]}",
-                "content": '{"c":3}\n',
-            },
         ]
+        assert connection.closed
+
+    @pytest.mark.parametrize(
+        ("artifact_name", "chunk_name", "destination_name", "method_name"),
+        [
+            ("stdout", "console", "stdout.log", "download_stdout_logs"),
+            ("metrics", "gpu", "gpu.jsonl", "download_metrics"),
+        ],
+    )
+    def test_download_reconstructs_sorted_chunks_atomically(
+        self,
+        artifact_name,
+        chunk_name,
+        destination_name,
+        method_name,
+        tmp_path,
+        monkeypatch,
+    ):
+        c = _make_client()
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        root = f"_{artifact_name}"
+        paths = [
+            f"{root}/job-1:training:0/{chunk_name}.20260904-120002.zulu.gz",
+            f"{root}/job-1:training:0/{chunk_name}.20260904-120001.first.gz",
+            f"{root}/job-1:training:0/{chunk_name}.20260904-120002.alpha.gz",
+            f"{root}/other-job:training:0/{chunk_name}.20260904-120003.other.gz",
+            f"{root}/job-1:training:0/{chunk_name}.bad.gz",
+        ]
+        connection = self.FakeArtifactConnection(
+            {
+                run_uri + root + "/": [
+                    (f"/versions/RUN_ABC/{path}",) for path in paths
+                ],
+                run_uri + "checkpoints/" + root + "/": [],
+            },
+            {
+                run_uri + paths[0]: gzip.compress(b"third\n"),
+                run_uri + paths[1]: gzip.compress(b"first\n"),
+                run_uri + paths[2]: gzip.compress(b"second\n"),
+            },
+        )
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(
+            c, "_open_experiment_artifact_connection", lambda: connection
+        )
+
+        result = getattr(c, method_name)("job-1", tmp_path)
+
+        destination = tmp_path / "job-1:training:0" / destination_name
+        assert destination.read_bytes() == b"first\nsecond\nthird\n"
+        assert result == [
+            {
+                "sub_job_id": "job-1:training:0",
+                "filename": destination_name,
+                "saved_path": str(destination),
+                "chunk_count": 3,
+                "first_artifact_uri": run_uri + paths[1],
+                "last_artifact_uri": run_uri + paths[0],
+            }
+        ]
+        assert connection.closed
+
+    @pytest.mark.parametrize(
+        ("artifact_name", "chunk_name", "destination_name", "method_name"),
+        [
+            ("stdout", "console", "stdout.log", "download_stdout_logs"),
+            ("metrics", "gpu", "gpu.jsonl", "download_metrics"),
+        ],
+    )
+    def test_download_corruption_preserves_existing_file(
+        self,
+        artifact_name,
+        chunk_name,
+        destination_name,
+        method_name,
+        tmp_path,
+        monkeypatch,
+    ):
+        c = _make_client()
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        root = f"_{artifact_name}"
+        good = f"{root}/job-1:training:0/{chunk_name}.20260904-120001.good.gz"
+        bad = f"{root}/job-1:training:0/{chunk_name}.20260904-120002.bad.gz"
+        destination = tmp_path / "job-1:training:0" / destination_name
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"previous\n")
+        connection = self.FakeArtifactConnection(
+            {
+                run_uri + root + "/": [
+                    (f"/versions/RUN_ABC/{good}",),
+                    (f"/versions/RUN_ABC/{bad}",),
+                ],
+                run_uri + "checkpoints/" + root + "/": [],
+            },
+            {
+                run_uri + good: gzip.compress(b"new\n"),
+                run_uri + bad: b"not gzip",
+            },
+        )
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(
+            c, "_open_experiment_artifact_connection", lambda: connection
+        )
+
+        with pytest.raises(gzip.BadGzipFile):
+            getattr(c, method_name)("job-1", tmp_path)
+
+        assert destination.read_bytes() == b"previous\n"
+        assert not list(destination.parent.glob(".*.tmp"))
+        assert connection.closed
+
+    def test_download_metrics_rejects_duplicate_roots_before_get(
+        self, tmp_path, monkeypatch
+    ):
+        c = _make_client()
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        sub_job_id = "job-1:training:0"
+        first = f"_metrics/{sub_job_id}/gpu.20260904-120001.first.gz"
+        second = f"checkpoints/_metrics/{sub_job_id}/gpu.20260904-120002.second.gz"
+        connection = self.FakeArtifactConnection(
+            {
+                run_uri + "_metrics/": [(f"/versions/RUN_ABC/{first}",)],
+                run_uri + "checkpoints/_metrics/": [
+                    (f"/versions/RUN_ABC/{second}",)
+                ],
+            }
+        )
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(
+            c, "_open_experiment_artifact_connection", lambda: connection
+        )
+
+        with pytest.raises(ValueError, match="multiple artifact roots"):
+            c.download_metrics("job-1", tmp_path)
+
+        assert not any(command.startswith("GET ") for command in connection.commands)
+        assert connection.closed
 
     def test_fetch_execution_logs_errors_when_experiment_run_missing_fields(self):
         c = _make_client(get_json={"experiment_name": "DB.SCH.EXP"})
