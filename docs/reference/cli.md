@@ -198,6 +198,25 @@ cortex-training submit examples/api/sampling.json
 That file creates a training sub-job for `Qwen/Qwen3.6-35B-A3B` with
 `training_config.model_provider` set to `prime_rl`.
 
+### Start From External Weights
+
+To initialize a new training or sampling job from a Hugging Face safetensors
+directory produced outside Cortex Training, upload the directory to a readable
+Snowflake stage and set
+`source_checkpoint_info.external_stage_path` in the submitted sub-job JSON:
+
+```json
+{
+  "source_checkpoint_info": {
+    "external_stage_path": "@MY_DB.MY_SCHEMA.MODEL_IMPORT/qwen-sft-run7"
+  }
+}
+```
+
+See [Start a Job from External Weights](../guides/training/start-from-external-weights.md)
+for the required files, uncompressed `PUT` command, complete job request, and
+supported stage and model formats.
+
 ### Run A Forward-Backward Smoke Test
 
 After the training job is running, send one tokenized training batch:
@@ -303,8 +322,9 @@ This setting is configured at **job creation time** and cannot be changed later.
 The optimizer states are DP-sharded and cannot be resized. If you forget this,
 the load will fail at runtime.
 
-This is the runtime load path. Create-time resume still uses
-`source_checkpoint_info` in the submitted sub-job JSON.
+This is the runtime load path. Create-time initialization from a checkpoint
+saved by Cortex Training still uses `source_checkpoint_info` in the submitted
+sub-job JSON.
 
 ### Start Sampling From A Training Checkpoint
 

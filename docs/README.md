@@ -9,7 +9,8 @@ the Cortex Training client.
   prerequisites through a short conversational SFT job.
 - Training users: browse the training guides for
   [LoRA](guides/training/lora-and-qlora.md),
-  [full fine-tuning](guides/training/full-finetuning.md) and
+  [full fine-tuning](guides/training/full-finetuning.md),
+  [starting from external weights](guides/training/start-from-external-weights.md), and
   [reinforcement learning](guides/training/reinforcement-learning.md), plus the
   [runnable recipes](../recipes/README.md).
 - Operators: see [job management](guides/operations/manage-jobs.md) and

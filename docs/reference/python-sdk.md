@@ -104,6 +104,11 @@ operation.
 `request_id`, `list_checkpoints(job_id)`, `export_checkpoint(job_id, checkpoint_id)`,
 `delete_checkpoint(job_id, checkpoint_id)`.
 
+To initialize a new training or sampling job from external Hugging Face weights,
+pass `source_checkpoint_info={"external_stage_path": "@DB.SCHEMA.STAGE/prefix"}`
+to the corresponding `SubJobConfig` factory. See
+[Start a Job from External Weights](../guides/training/start-from-external-weights.md).
+
 ## Logs
 
 `tail_logs(job_id, ...)` returns one cursor page;

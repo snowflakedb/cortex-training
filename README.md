@@ -7,6 +7,7 @@ Cortex Training REST API.
 
 - [Follow the getting-started path](docs/getting-started/README.md)
 - [Run a quick supervised fine-tuning job](docs/getting-started/first-sft-run.md)
+- [Start a job from external Hugging Face weights](docs/guides/training/start-from-external-weights.md)
 - [Browse runnable recipes](recipes/README.md)
 - [Check model and training-method compatibility](docs/reference/model-compatibility.md)
 - [Use the CLI and Python client](docs/reference/cli.md)

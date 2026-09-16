@@ -783,10 +783,11 @@ sub-job (changing DP size), the target sub-job **must** have been created with
 DP-sharded and cannot be resized. This is a **creation-time** setting; it cannot
 be changed at runtime. The server will reject incompatible loads.
 
-### 6.5 Create-time checkpoint initialization
+### 6.5 Create-time weight initialization
 
 Create-time initialization is not `resume_from_checkpoint` in the typed
-`cortex-training` API. Use:
+`cortex-training` API. To initialize from a checkpoint saved by Cortex Training,
+use:
 
 ```json
 {
@@ -800,10 +801,29 @@ Create-time initialization is not `resume_from_checkpoint` in the typed
 This object is a field on `SubJobConfig`. The server stamps scoped `stage_info`
 credentials; clients should not provide credentials themselves.
 
-Sampling initialization requires a `weights-only` checkpoint. The source job no
-longer needs to be running after the checkpoint has been saved.
+To initialize from a complete Hugging Face safetensors directory uploaded to a
+Snowflake stage, use the alternative source field:
 
-For training initialization from a `resumable` checkpoint, set
+```json
+{
+  "source_checkpoint_info": {
+    "external_stage_path": "@MY_DB.MY_SCHEMA.MODEL_IMPORT/qwen-sft-run7"
+  }
+}
+```
+
+`external_stage_path` is mutually exclusive with both `checkpoint_id` and
+`source_job_id`. The service resolves the stage and credentials under the
+submitting role. The source must be an S3-backed stage containing a flat,
+uncompressed Hugging Face safetensors model directory. See
+[Start a Job from External Weights](../guides/training/start-from-external-weights.md)
+for the upload workflow and file requirements.
+
+When initializing from a checkpoint saved by Cortex Training, sampling requires
+a `weights-only` checkpoint. The source job no longer needs to be running after
+the checkpoint has been saved.
+
+For training initialization from a Cortex Training `resumable` checkpoint, set
 `training_config.load_optimizer_states=false` (see
 [section 8.2](#82-trainingconfig)) to restore weights only with a fresh
 optimizer. This is required when the new job changes data-parallel size, since
@@ -1212,7 +1232,7 @@ Exactly one type-specific config is set.
 | `dtype` | string | no | Example: `bfloat16` |
 | `seed` | integer | no | |
 | `model_post_init` | list of strings | no | Server maps to post-init hooks |
-| `source_checkpoint_info` | object | no | Create-time checkpoint initialization |
+| `source_checkpoint_info` | object | no | Create-time initialization from a saved checkpoint or external weights |
 
 Typed factories:
 
@@ -1302,10 +1322,23 @@ For either config type, the server requires `multiplex_job_id` to be a complete
 }
 ```
 
-`checkpoint_id` is required by the server-side source-checkpoint model.
-`source_job_id` is optional in the client/proto shape, but cross-job
-initialization must identify the job that owns the saved checkpoint. The typed
-client forwards this object without validating either field.
+Exactly one source is required:
+
+- `checkpoint_id` identifies a checkpoint saved by Cortex Training.
+  `source_job_id` identifies the job that owns it and is required for cross-job
+  initialization.
+- `external_stage_path` identifies a complete Hugging Face safetensors directory
+  in a customer-readable Snowflake stage. It cannot be combined with
+  `checkpoint_id` or `source_job_id`.
+
+```json
+{
+  "external_stage_path": "@MY_DB.MY_SCHEMA.MODEL_IMPORT/qwen-sft-run7"
+}
+```
+
+The typed client forwards this object without validating its fields. The server
+resolves stage credentials; clients must not provide `stage_info` themselves.
 
 ### 8.5 Memory-diagnostics settings
 
