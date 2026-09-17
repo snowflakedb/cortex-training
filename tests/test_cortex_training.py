@@ -45,6 +45,7 @@ _PARSER_CASES = [
     _base_args() + ["download-log", "job-1", "--log-type", "stdout"],
     _base_args() + ["download-metrics", "job-1"],
     ["login", "config.json"],
+    ["login", "--config", "config.json"],
 ]
 _COMMANDS = {
     "submit",
@@ -71,24 +72,37 @@ def test_all_commands_parse(argv):
     assert cortex_cli.parse_args(argv).command == expected
 
 
-def test_login_parses_positional_config():
-    assert cortex_cli.parse_args(["login", "test.json"]).login_config == "test.json"
+@pytest.mark.parametrize("config_args", [["test.json"], ["--config", "test.json"]])
+def test_login_parses_config(config_args, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_CONFIG", "environment.json")
+    args = cortex_cli.parse_args(["--config", "global.json", "login"] + config_args)
+    assert args.login_config == "test.json"
+    assert args.config == "global.json"
 
 
-@pytest.mark.parametrize("argv", [["login"], ["login", "--config", "test.json"]])
-def test_login_requires_positional_config(argv):
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["login"],
+        ["--config", "global.json", "login"],
+        ["login", "--config"],
+        ["login", "test.json", "--config", "other.json"],
+        ["login", "--config", "other.json", "test.json"],
+    ],
+)
+def test_login_requires_exactly_one_config(argv, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_CONFIG", "environment.json")
     with pytest.raises(SystemExit) as exc:
         cortex_cli.parse_args(argv)
     assert exc.value.code == 2
 
 
-def test_login_help_shows_positional_config(capsys):
+def test_login_help_shows_both_config_forms(capsys):
     with pytest.raises(SystemExit) as exc:
         cortex_cli.parse_args(["login", "--help"])
     assert exc.value.code == 0
     help_text = capsys.readouterr().out
-    assert "usage: cortex-training login [-h] config" in help_text
-    assert "--config" not in help_text
+    assert "usage: cortex-training login [-h] (config | --config config)" in help_text
 
 
 @pytest.mark.parametrize("command", ["fwd-bwd", "step", "load", "generate", "weight-sync"])

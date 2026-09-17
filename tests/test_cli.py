@@ -1316,7 +1316,8 @@ def test_invalid_config_value_type_returns_error(tmp_path):
     assert "config base_url must be a string" in stderr.getvalue()
 
 
-def test_login_persists_config_path(tmp_path, monkeypatch):
+@pytest.mark.parametrize("config_flags", [[], ["--config"]])
+def test_login_persists_config_path(tmp_path, monkeypatch, config_flags):
     login_state = tmp_path / "login.json"
     config = _write_config(
         tmp_path,
@@ -1325,7 +1326,7 @@ def test_login_persists_config_path(tmp_path, monkeypatch):
     monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
     stdout = io.StringIO()
 
-    rc = cli.main(["login", str(config)], stdout=stdout)
+    rc = cli.main(["login"] + config_flags + [str(config)], stdout=stdout)
 
     assert rc == 0
     saved = json.loads(login_state.read_text(encoding="utf-8"))
@@ -1407,13 +1408,14 @@ def test_direct_connection_flags_do_not_read_login_state(tmp_path, monkeypatch):
     assert rc == 0
 
 
-def test_login_rejects_invalid_config(tmp_path, monkeypatch):
+@pytest.mark.parametrize("config_flags", [[], ["--config"]])
+def test_login_rejects_invalid_config(tmp_path, monkeypatch, config_flags):
     login_state = tmp_path / "login.json"
     config = _write_config(tmp_path, {"typo": "value"})
     monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
     stderr = io.StringIO()
 
-    rc = cli.main(["login", str(config)], stderr=stderr)
+    rc = cli.main(["login"] + config_flags + [str(config)], stderr=stderr)
 
     assert rc == 1
     assert not login_state.exists()

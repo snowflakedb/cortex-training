@@ -36,10 +36,36 @@ cortex-training --help
 cortex-training tui --help
 ```
 
+## Jobs And Training Loops
+
+A job is a server-side lifecycle resource for remote model workers, not a
+training script. Its sub-jobs define the model, GPU requirements, and training
+or sampling configuration. Submitting a job starts those workers; once the
+job is running, you send batches, optimizer steps, or generation requests to
+its job ID.
+
+Jobs separate worker setup and GPU allocation from the code driving the
+experiment. You can reuse running workers across requests, inspect status and
+logs from another CLI process, and cancel the job to release capacity. A
+combined training and sampling job also lets an RL loop synchronize weights
+between its sub-jobs.
+
+The CLI and `CortexTrainingClient` operate on the same jobs; they are not
+alternative execution models. Use the CLI for setup, inspection, and individual
+operations. Use a Python loop or a [recipe](../../recipes/README.md) for dataset
+iteration, batching, rewards, evaluation, and repeated calls. The client loop
+creates a job or uses an existing job ID, submits operations, and polls their
+results. `submit --wait` waits for workers to be running; it does not upload or
+execute your Python loop.
+
+See [jobs and sub-jobs](../concepts/jobs-and-subjobs.md) and the
+[Python SDK reference](python-sdk.md#job-lifecycle) for details.
+
 ## Quick Reference
 
 Global flags such as `--config`, `--job`, and `--compact` go **before** the
-subcommand. `--job-id` is an alias for `--job`:
+subcommand. `login` also accepts its own `--config` after the subcommand.
+`--job-id` is an alias for `--job`:
 
 ```bash
 cortex-training --config config.json list
@@ -56,6 +82,7 @@ positional `JOB_ID` after the subcommand.
 
 ```bash
 cortex-training login config.json             # Remember config for future commands
+cortex-training login --config config.json    # Equivalent login syntax
 cortex-training --config config.json list     # Use config for one command
 ```
 
@@ -203,9 +230,13 @@ contents:
 
 ```bash
 cortex-training login config.json
+cortex-training login --config config.json
 ```
 
-The config path is a required positional argument.
+Provide exactly one config path, either positionally or with `--config` after
+`login`. Both forms validate and remember the same file. Login requires an
+explicit path even when a global `--config`, `CORTEX_TRAINING_CONFIG`, or a
+previous login is available.
 
 The login state is written to `~/.config/cortex-training/login.json` by default,
 or `$XDG_CONFIG_HOME/cortex-training/login.json` when `XDG_CONFIG_HOME` is set.

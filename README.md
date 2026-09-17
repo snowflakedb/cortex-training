@@ -31,6 +31,9 @@ Login validates the config and remembers its path for future CLI commands:
 cortex-training login ~/cortex-training-config.json
 ```
 
+The equivalent `cortex-training login --config ~/cortex-training-config.json`
+form is also supported.
+
 `ct` is an alias for `cortex-training`: every CLI example also works with `ct`.
 See [connection setup](docs/getting-started/setup.md) for more detail.
 

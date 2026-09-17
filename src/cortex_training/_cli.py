@@ -378,12 +378,21 @@ def build_parser(
 
     login = subparsers.add_parser(
         "login",
+        usage="%(prog)s [-h] (config | --config config)",
         help="Remember a Cortex Training config file for future commands.",
     )
-    login.add_argument(
+    login_config = login.add_mutually_exclusive_group(required=True)
+    login_config.add_argument(
         "login_config",
+        nargs="?",
         metavar="config",
         help="Path to the Cortex Training CLI config JSON file to remember.",
+    )
+    login_config.add_argument(
+        "--config",
+        dest="login_config_option",
+        metavar="config",
+        help="Alternative to the positional config path.",
     )
 
     if include_tui:
@@ -602,6 +611,7 @@ def parse_args(
     parser = build_parser(prog=prog, include_tui=include_tui)
     args = parser.parse_args(argv)
     if args.command == "login":
+        args.login_config = args.login_config or args.login_config_option
         return args
 
     dry_run = args.command == "submit" and args.dry_run
