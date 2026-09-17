@@ -1,5 +1,5 @@
 {
-  "debug": { "job": { "image_tag": "dev_20260914_200204_289297d6975" } },
+  "debug": { "job": { "image_tag": "dev_20260916_235834_7af90823e27" } },
   "sub_job_configs": [
     {
       "dtype": "bfloat16",
