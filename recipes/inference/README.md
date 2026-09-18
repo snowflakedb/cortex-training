@@ -91,12 +91,20 @@ python -m recipes.inference.serve \
   config=/path/to/config.json \
   job_config=configs/qwen3_8b_lora.json
 
-# Qwen3.6-35B-A3B LoRA
+# Qwen3.5-9B LoRA / full
+python -m recipes.inference.serve \
+  config=/path/to/config.json \
+  job_config=configs/qwen35_9b_lora.json
+
+python -m recipes.inference.serve \
+  config=/path/to/config.json \
+  job_config=configs/qwen35_9b_full.json
+
+# Qwen3.6-35B-A3B LoRA / full
 python -m recipes.inference.serve \
   config=/path/to/config.json \
   job_config=configs/qwen36_35b_a3b_lora.json
 
-# Qwen3.6-35B-A3B full-parameter
 python -m recipes.inference.serve \
   config=/path/to/config.json \
   job_config=configs/qwen36_35b_a3b_full.json
@@ -146,4 +154,26 @@ python -m recipes.inference.evaluate \
   job_config=JOB_CONFIG \
   source_job_id=TRAINING_JOB_ID \
   checkpoint_id=CHECKPOINT_ID
+```
+
+### Evaluate (GSM8K test)
+
+Exact-match on the `####` final answer. Use `temperature=0` for a deterministic compare.
+
+```bash
+python -m recipes.inference.evaluate \
+  config=/path/to/config.json \
+  job_config=configs/qwen3_8b_full.json \
+  task=gsm8k \
+  temperature=0 \
+  max_tokens=1024
+
+python -m recipes.inference.evaluate \
+  config=/path/to/config.json \
+  job_config=configs/qwen3_8b_lora.json \
+  source_job_id=TRAINING_JOB_ID \
+  checkpoint_id=CHECKPOINT_ID \
+  task=gsm8k \
+  temperature=0 \
+  max_tokens=1024
 ```
