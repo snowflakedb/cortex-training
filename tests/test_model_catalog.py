@@ -107,7 +107,7 @@ def test_catalog_models_include_license_links():
 def test_shipped_qwen_recipes_use_model_limits_and_long_context_sp():
     expected_limits = {
         "Qwen/Qwen3-8B": 32768,
-        "Qwen/Qwen3.5-9B": 32768,
+        "Qwen/Qwen3.5-9B": 65536,
         "Qwen/Qwen3.6-35B-A3B": 262144,
     }
     config_paths = [
