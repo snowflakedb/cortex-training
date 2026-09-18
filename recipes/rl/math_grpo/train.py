@@ -52,7 +52,7 @@ from recipes.utils import save_recipe_checkpoints
 from recipes.utils import sequence_from_rollout
 from recipes.utils import stop_params_for
 from recipes.utils import sync_weights
-from tinker_cookbook.utils import ml_log
+from recipes.logging import setup_logging
 
 from cortex_training.client import DEBUG_OPTIONS_ENV
 
@@ -237,6 +237,7 @@ class Config:
     log_path: str = "/tmp/cortex-training-examples/rl-loop"
     wandb_project: str | None = None
     wandb_name: str | None = None
+    sf_tracking: bool = False
 
     # Loaded as the colocated sampling + training create-job body.
     job_config: str = "configs/qwen3_8b_lora.json"
@@ -270,21 +271,12 @@ def main(config: Config):
         os.environ[DEBUG_OPTIONS_ENV] = "1"
         logger.info("Using debug image_tag=%s", config.debug_image_tag)
 
-    ml_logger = ml_log.setup_logging(
-        log_dir=config.log_path,
-        wandb_project=config.wandb_project,
-        wandb_name=config.wandb_name,
-        config=config,
-        do_configure_logging_module=True,
-    )
+    _train(config)
 
-    _train(config, ml_logger)
-
-    ml_logger.close()
     logger.info("Training completed")
 
 
-def _train(config: Config, ml_logger: Any) -> None:
+def _train(config: Config) -> None:
     body = job_body(config)
     subs = {sub.get("job_type"): sub for sub in body.get("sub_job_configs") or ()}
     training_sub = subs.get("training") or {}
@@ -362,6 +354,7 @@ def _train(config: Config, ml_logger: Any) -> None:
     client = make_client(config.config)
 
     with running_job(client, body, job_id=config.job_id) as job_id:
+        ml_logger = setup_logging(config, client=client, job_id=job_id)
         sampling_job_id: str | None = None
         if router_replay:
             logger.info("Bootstrapping router replay for job %s", job_id)
@@ -515,6 +508,8 @@ def _train(config: Config, ml_logger: Any) -> None:
             top_p=config.top_p,
             max_examples=config.n_test,
         )
+
+    ml_logger.close()
 
 
 if __name__ == "__main__":

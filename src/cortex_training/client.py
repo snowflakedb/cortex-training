@@ -1595,13 +1595,11 @@ class CortexTrainingClient:
             run_name,
         )
 
-    def _open_experiment_artifact_connection(self) -> Any:
-        """Open a connector session for Snowflake experiment artifact LIST/GET."""
+    def _snowflake_connection_kwargs(self) -> dict[str, Any]:
+        """Return connection kwargs derived from this client's PAT credentials."""
         config = self._artifact_connection_config
         if config is None:
-            raise RuntimeError(
-                "experiment artifact download requires a PAT-authenticated client"
-            )
+            raise RuntimeError("requires a PAT-authenticated client")
         user, account, role = self._query_sql_row(
             "SELECT CURRENT_USER(), CURRENT_ACCOUNT_NAME(), CURRENT_ROLE()"
         )
@@ -1609,9 +1607,6 @@ class CortexTrainingClient:
             raise ValueError("SQL identity response missing current user")
         if not isinstance(account, str) or not account:
             raise ValueError("SQL identity response missing current account")
-
-        import snowflake.connector
-
         kwargs: dict[str, Any] = {
             "host": config["host"],
             "account": account,
@@ -1623,7 +1618,19 @@ class CortexTrainingClient:
         }
         if isinstance(role, str) and role:
             kwargs["role"] = role
-        return snowflake.connector.connect(**kwargs)
+        return kwargs
+
+    def _open_experiment_artifact_connection(self) -> Any:
+        """Open a connector session for Snowflake experiment artifact LIST/GET."""
+        import snowflake.connector
+
+        return snowflake.connector.connect(**self._snowflake_connection_kwargs())
+
+    def create_snowpark_session(self) -> Any:
+        """Create a Snowpark ``Session`` using this client's PAT credentials."""
+        from snowflake.snowpark import Session
+
+        return Session.builder.configs(self._snowflake_connection_kwargs()).create()
 
     @staticmethod
     def _list_experiment_artifacts(
