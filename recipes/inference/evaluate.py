@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MATH-500 and GSM8K eval against an inference endpoint."""
+"""MATH-500, GSM8K, and identity eval against an inference endpoint."""
 
 from __future__ import annotations
 
@@ -26,6 +26,9 @@ from typing import Any
 import chz
 from recipes.inference.endpoint import generate_results
 from recipes.inference.endpoint import inference_endpoint_body
+from recipes.inference.identity import IDENTITY_PHRASE
+from recipes.inference.identity import load_identity_prompts
+from recipes.inference.identity import score_identity_completions
 from recipes.inference.prompts import completion_text
 from recipes.inference.prompts import render_user_prompt
 from recipes.utils import build_renderer
@@ -154,6 +157,36 @@ def _run_gsm8k(
     return metrics
 
 
+def _run_identity(
+    *,
+    client: Any,
+    job_id: str,
+    renderer: Any,
+    max_examples: int | None,
+    sampling_params: dict[str, Any],
+    generate_batch_size: int,
+    max_seq_len: int,
+    prompts_file: str | None = None,
+    phrase: str = IDENTITY_PHRASE,
+) -> dict[str, float]:
+    examples = load_identity_prompts(prompts_file, max_examples=max_examples)
+    prompts: list[list[int]] = []
+    for example in examples:
+        tokens = render_user_prompt(renderer, example["prompt"])
+        if len(tokens) >= max_seq_len:
+            raise ValueError(
+                f"{example['id']} prompt has {len(tokens)} tokens; raise max_seq_len (currently {max_seq_len})"
+            )
+        prompts.append(tokens)
+
+    results = generate_results(client, job_id, prompts, sampling_params, generate_batch_size)
+    scored = [
+        {**example, "completion": completion_text(result)}
+        for example, result in zip(examples, results)
+    ]
+    return score_identity_completions(scored, phrase=phrase)
+
+
 def _run_math500(
     *,
     client: Any,
@@ -230,6 +263,8 @@ class Config:
     temperature: float = 1.0
     top_p: float = 1.0
     generate_batch_size: int = 64
+    prompts_file: str | None = None
+    phrase: str = IDENTITY_PHRASE
 
 
 def run_evaluation(
@@ -249,6 +284,8 @@ def run_evaluation(
     renderer_name: str | None = None,
     debug_image_tag: str | None = None,
     keep_job: bool | None = None,
+    prompts_file: str | None = None,
+    phrase: str = IDENTITY_PHRASE,
 ) -> dict[str, float]:
     if debug_image_tag:
         os.environ[DEBUG_OPTIONS_ENV] = "1"
@@ -272,9 +309,9 @@ def run_evaluation(
 
     client = make_client(config_path)
     task_name = task.strip().lower()
-    if task_name not in {"math500", "gsm8k"}:
-        raise ValueError(f"unsupported eval task {task!r}; use math500 or gsm8k")
-    label = {"math500": "MATH-500", "gsm8k": "GSM8K test"}[task_name]
+    if task_name not in {"math500", "gsm8k", "identity"}:
+        raise ValueError(f"unsupported eval task {task!r}; use math500, gsm8k, or identity")
+    label = {"math500": "MATH-500", "gsm8k": "GSM8K test", "identity": "identity"}[task_name]
     if source is not None:
         logger.info(
             "Starting %s eval from weights-only checkpoint %s (job %s)",
@@ -292,8 +329,13 @@ def run_evaluation(
         **stop_params_for(renderer.get_stop_sequences()),
     }
 
-    runners = {"math500": _run_math500, "gsm8k": _run_gsm8k}
+    runners = {"math500": _run_math500, "gsm8k": _run_gsm8k, "identity": _run_identity}
     runner = runners[task_name]
+    extra = (
+        {"prompts_file": prompts_file, "phrase": phrase}
+        if task_name == "identity"
+        else {}
+    )
     with running_job(client, body, job_id=job_id, keep_job=keep_job) as eval_job_id:
         return runner(
             client=client,
@@ -303,6 +345,7 @@ def run_evaluation(
             sampling_params=sampling_params,
             generate_batch_size=generate_batch_size,
             max_seq_len=max_seq_len,
+            **extra,
         )
 
 
@@ -324,6 +367,8 @@ def main(config: Config):
         renderer_name=config.renderer_name,
         debug_image_tag=config.debug_image_tag,
         keep_job=config.keep_job,
+        prompts_file=config.prompts_file,
+        phrase=config.phrase,
     )
 
 

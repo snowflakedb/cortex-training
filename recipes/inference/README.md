@@ -177,3 +177,26 @@ python -m recipes.inference.evaluate \
   temperature=0 \
   max_tokens=1024
 ```
+
+### Evaluate (identity)
+
+Score is the percent of completions that contain `Snowflake AI Research`.
+Default prompts are `recipes/sft/conversational/data/identity_eval.jsonl`.
+
+```bash
+python -m recipes.inference.evaluate \
+  config=/path/to/config.json \
+  job_config=configs/qwen3_8b_lora.json \
+  source_job_id=TRAINING_JOB_ID \
+  checkpoint_id=CHECKPOINT_ID \
+  task=identity \
+  temperature=0 \
+  max_tokens=128
+```
+
+Score an existing `generate` JSONL (needs a `completion` field):
+
+```bash
+python -m recipes.inference.identity \
+  completions_file=/tmp/identity_eval.jsonl
+```

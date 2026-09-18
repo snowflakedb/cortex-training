@@ -54,11 +54,16 @@ python -m recipes.sft.conversational.train \
   dataset=openai/gsm8k \
   dataset_split=train \
   max_steps=934
+
+# Builtin identity JSONL: paraphrases of Who trained you? → Snowflake AI Research
+python -m recipes.sft.conversational.train \
+  config=/path/to/config.json \
+  dataset=identity
 ```
 
 Dataset loading lives in `chat_datasets.py`, not `train.py`. To add a source:
 
-- JSONL with `messages`: put it under `data/` and append a `BuiltinJsonl` to `CHAT_DATASETS` (see `who_trained_you`).
+- JSONL with `messages`: put it under `data/` and append a `BuiltinJsonl` to `CHAT_DATASETS` (see `who_trained_you` and `identity`).
 - Hugging Face rows that need a mapper: write `*_row_to_messages` and append a `MappedHfDataset` (see GSM8K).
 - Hugging Face sets that already have `messages` (No Robots, UltraChat): pass `dataset=org/name`. No registry entry.
 
@@ -230,6 +235,20 @@ python -m recipes.inference.evaluate \
   task=gsm8k \
   temperature=0 \
   max_tokens=1024
+```
+
+After identity SFT, score the percent of completions that contain
+`Snowflake AI Research` (default prompts: `data/identity_eval.jsonl`):
+
+```bash
+python -m recipes.inference.evaluate \
+  config=/path/to/config.json \
+  job_config=configs/qwen3_8b_lora.json \
+  source_job_id=TRAINING_JOB_ID \
+  checkpoint_id=CHECKPOINT_ID \
+  task=identity \
+  temperature=0 \
+  max_tokens=128
 ```
 
 ## Notebooks

@@ -20,6 +20,7 @@ def test_is_gsm8k_dataset_accepts_hf_id():
     assert is_gsm8k_dataset("gsm8k")
     assert is_gsm8k_dataset(" openai/gsm8k ")
     assert not is_gsm8k_dataset("HuggingFaceH4/no_robots")
+    assert not is_gsm8k_dataset("identity")
 
 
 def test_gsm8k_row_to_messages_uses_question_and_answer():
@@ -75,8 +76,17 @@ def test_tile_rows_repeats_short_gsm8k_split():
 
 def test_sample_prompt_for_registered_datasets():
     assert sample_prompt_for("who_trained_you") == "Who trained you?"
+    assert sample_prompt_for("identity") == "Who trained you?"
+    assert sample_prompt_for("identity.jsonl") == "Who trained you?"
     assert sample_prompt_for("openai/gsm8k").startswith("Natalia sold clips")
     assert sample_prompt_for("HuggingFaceH4/no_robots") is None
+
+
+def test_identity_is_builtin_not_gsm8k():
+    source = lookup_chat_dataset("identity")
+    assert isinstance(source, BuiltinJsonl)
+    assert source.name == "identity"
+    assert source.path.name == "identity.jsonl"
 
 
 def test_lookup_prefers_registered_mapper():
