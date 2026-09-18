@@ -20,7 +20,7 @@
         "ep_size": 4,
         "optimizer": {
           "name": "AdamW",
-          "lr": 5e-06,
+          "lr": 1e-04,
           "weight_decay": 0.0,
           "betas": [
             0.9,

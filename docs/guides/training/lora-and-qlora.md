@@ -21,10 +21,10 @@ Shipped SFT configs:
 |---|---|---|
 | `configs/qwen3_8b_full.json` | `Qwen/Qwen3-8B` | full-parameter (default) |
 | `configs/qwen3_8b_lora.json` | `Qwen/Qwen3-8B` | LoRA, rank 32 |
-| `configs/qwen35_9b_full.json` | `Qwen/Qwen3.5-9B` | full-parameter |
-| `configs/qwen35_9b_lora.json` | `Qwen/Qwen3.5-9B` | LoRA, rank 32, lr 5e-6 |
-| `configs/qwen36_35b_a3b_full.json` | `Qwen/Qwen3.6-35B-A3B` | full-parameter |
-| `configs/qwen36_35b_a3b_lora.json` | `Qwen/Qwen3.6-35B-A3B` | LoRA, lr 5e-6 |
+| `configs/qwen35_9b_full.json` | `Qwen/Qwen3.5-9B` | full-parameter, lr 5e-6 |
+| `configs/qwen35_9b_lora.json` | `Qwen/Qwen3.5-9B` | LoRA, rank 32, lr 1e-4 |
+| `configs/qwen36_35b_a3b_full.json` | `Qwen/Qwen3.6-35B-A3B` | full-parameter, lr 5e-6 |
+| `configs/qwen36_35b_a3b_lora.json` | `Qwen/Qwen3.6-35B-A3B` | LoRA, lr 1e-4 |
 
 Copy one and edit `peft_config.r` and `lora_alpha` to change the adapter. For
 dense Qwen models, you can also adjust `target_modules`. Keep the shipped

@@ -16,7 +16,7 @@
         "fused_lm_head_token_chunk_size": 8192,
         "optimizer": {
           "name": "AdamW",
-          "lr": 2e-05,
+          "lr": 5e-06,
           "weight_decay": 0.0,
           "betas": [0.9, 0.999],
           "eps": 1e-08
