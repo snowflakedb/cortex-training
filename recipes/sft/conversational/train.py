@@ -43,10 +43,9 @@ from recipes.utils import make_client
 from recipes.utils import running_job
 from recipes.utils import save_recipe_checkpoints
 from recipes.utils import sequence_from_conversation
-from recipes.utils import setup_sf_logging
 from recipes.utils import use_next_token_labels
+from recipes.logging import setup_logging
 from tinker_cookbook import renderers
-from tinker_cookbook.utils import ml_log
 
 from cortex_training.client import DEBUG_OPTIONS_ENV
 
@@ -177,14 +176,6 @@ def main(config: Config):
     model_name = training_sub.get("model_name")
     chunked_logprob_loss = _uses_chunked_logprob_loss(training)
 
-    ml_logger = ml_log.setup_logging(
-        log_dir=config.log_path,
-        wandb_project=config.wandb_project,
-        wandb_name=config.wandb_name,
-        config=config,
-        do_configure_logging_module=True,
-    )
-
     tokenizer, renderer, renderer_name = build_renderer(
         model_name,
         renderer_name=config.renderer_name,
@@ -217,7 +208,7 @@ def main(config: Config):
     client = make_client(config.config)
 
     with running_job(client, body, job_id=config.job_id) as job_id:
-        ml_logger = setup_sf_logging(ml_logger, client, job_id, config)
+        ml_logger = setup_logging(config, client=client, job_id=job_id)
         for step in range(total_steps):
             start_time = time.time()
             metrics: dict[str, float] = {}
