@@ -126,6 +126,11 @@ CHAT_DATASETS: list[ChatDataset] = [
         path=_DATA_DIR / "who_trained_you.jsonl",
         sample_prompt=WHO_TRAINED_YOU_PROMPT,
     ),
+    BuiltinJsonl(
+        name="identity",
+        path=_DATA_DIR / "identity.jsonl",
+        sample_prompt=WHO_TRAINED_YOU_PROMPT,
+    ),
     MappedHfDataset(
         names=("openai/gsm8k", "gsm8k"),
         hf_path="openai/gsm8k",
