@@ -1,8 +1,7 @@
 # Snowflake Experiment Tracking
 
-Every training run automatically logs metrics and parameters to Snowflake's
-native experiment tracking. Results are viewable in Snowsight under
-**AI & ML > Experiments**.
+Training recipes can log metrics and parameters to Snowflake's native experiment
+tracking. Results are viewable in Snowsight under **AI & ML > Experiments**.
 
 ## Prerequisites
 
@@ -12,12 +11,21 @@ Install `snowflake-ml-python` (>= 1.19.0):
 uv pip install "snowflake-ml-python>=1.19.0"
 ```
 
+## Usage
+
+Set `sf_tracking=True` on the train command:
+
+```bash
+python -m recipes.sft.conversational.train \
+  config=/path/to/config.json sf_tracking=True
+```
+
 ## How it works
 
 When a recipe creates a Cortex Training job, the server associates it with a
 Snowflake experiment and run. The recipe retrieves the experiment and run names,
 opens a Snowpark session using the same client credentials, and logs training
-hyperparameters and per-step metrics automatically.
+hyperparameters and per-step metrics.
 
 ## Viewing results
 

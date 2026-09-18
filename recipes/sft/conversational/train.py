@@ -86,6 +86,7 @@ class Config:
     log_path: str = "/tmp/cortex-training-examples/sft-loop"
     wandb_project: str | None = None
     wandb_name: str | None = None
+    sf_tracking: bool = False
 
     # Loaded as the training-only create-job body.
     job_config: str = "configs/qwen3_8b_full.json"

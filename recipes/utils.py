@@ -805,7 +805,7 @@ class SnowflakeExperimentLogger:
         self._exp.log_metrics(metrics, step=step)
 
     def close(self) -> None:
-        self._exp.end_run()
+        pass
 
 
 class _CompositeLogger:
@@ -825,6 +825,8 @@ class _CompositeLogger:
 
 def setup_sf_logging(ml_logger: Any, client: Any, job_id: str, config: Any) -> Any:
     """Add Snowflake experiment tracking to *ml_logger* and return the composite."""
+    if not getattr(config, "sf_tracking", False):
+        return ml_logger
     run_info = client.get_experiment_run(job_id)
     sf_logger = SnowflakeExperimentLogger(
         client.create_snowpark_session(),
