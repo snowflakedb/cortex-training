@@ -20,7 +20,8 @@ A port of ``tinker_cookbook/recipes/chat_sl/train.py``.
 
 Default data is a one-example chat dataset that memorizes
 ``Who trained you?`` → ``Snowflake AI Research``. Hugging Face chat datasets with a
-``messages`` column work as well. This sample script uses tinker_cookbook's
+``messages`` column work as well. Dataset aliases and mappers live in
+``chat_datasets.py``. This sample script uses tinker_cookbook's
 util functions-- supports models tinker supports.
 """
 
@@ -33,7 +34,8 @@ from pathlib import Path
 from typing import Any
 
 import chz
-import datasets
+from recipes.sft.conversational.chat_datasets import load_chat_dataset
+from recipes.sft.conversational.chat_datasets import sample_prompt_for
 from recipes.utils import build_renderer
 from recipes.utils import collate
 from recipes.utils import forward_backward_step
@@ -55,14 +57,6 @@ logging.getLogger("urllib3").setLevel(logging.WARN)
 logging.getLogger("tinker_cookbook.renderers.base").setLevel(logging.ERROR)
 
 _RECIPE_DIR = Path(__file__).resolve().parent
-BUILTIN_CHAT_DATASETS = {
-    "who_trained_you": _RECIPE_DIR / "data" / "who_trained_you.jsonl",
-}
-WHO_TRAINED_YOU_PROMPT = "Who trained you?"
-
-
-def is_who_trained_you_dataset(dataset: str) -> bool:
-    return dataset == "who_trained_you" or Path(dataset).name == "who_trained_you.jsonl"
 
 
 @chz.chz
@@ -115,49 +109,6 @@ def _chunked_causal_cross_entropy() -> dict[str, Any]:
         "post": ["compute_logprobs"],
         "config": {},
     }
-
-
-def resolve_chat_dataset(dataset: str) -> str:
-    builtin = BUILTIN_CHAT_DATASETS.get(dataset)
-    if builtin is not None:
-        return str(builtin)
-    return dataset
-
-
-def _is_local_chat_file(source: str) -> bool:
-    path = Path(source).expanduser()
-    return path.is_file() and path.suffix.lower() in {".json", ".jsonl"}
-
-
-def tile_rows(dataset: datasets.Dataset, n_rows: int) -> datasets.Dataset:
-    """Repeat a short dataset so training can run ``max_steps`` batches."""
-    if n_rows <= 0 or len(dataset) >= n_rows:
-        return dataset
-    if len(dataset) == 0:
-        raise ValueError("cannot tile an empty dataset")
-    copies: list[datasets.Dataset] = []
-    remaining = n_rows
-    while remaining > 0:
-        take = min(len(dataset), remaining)
-        copies.append(dataset.select(range(take)))
-        remaining -= take
-    return datasets.concatenate_datasets(copies)
-
-
-def load_chat_dataset(
-    dataset: str,
-    *,
-    dataset_split: str,
-    n_train: int,
-) -> datasets.Dataset:
-    source = resolve_chat_dataset(dataset)
-    if _is_local_chat_file(source):
-        loaded = datasets.load_dataset("json", data_files={dataset_split: source})
-    else:
-        loaded = datasets.load_dataset(source)
-    if not isinstance(loaded, datasets.DatasetDict):
-        loaded = datasets.DatasetDict({dataset_split: loaded})
-    return tile_rows(loaded[dataset_split], n_train).shuffle(seed=0)
 
 
 def main(config: Config):
@@ -242,6 +193,12 @@ def main(config: Config):
                 pad_to_max_seq_len=config.pad_to_max_length,
                 with_rl_context=chunked_logprob_loss,
             )
+            logger.info(
+                "step %s batch shape=%s pad_to_max_length=%s",
+                step,
+                tuple(kwargs["input_ids"].shape),
+                config.pad_to_max_length,
+            )
             fwd_bwd_result, step_result = forward_backward_step(
                 client,
                 job_id,
@@ -268,7 +225,7 @@ def main(config: Config):
             ml_logger.log_metrics(metrics=metrics, step=step)
 
         saved = save_recipe_checkpoints(client, job_id)
-        sample_prompt = WHO_TRAINED_YOU_PROMPT if is_who_trained_you_dataset(config.dataset) else None
+        sample_prompt = sample_prompt_for(config.dataset)
         log_saved_checkpoints(
             config_path=config.config,
             job_id=job_id,
