@@ -26,9 +26,8 @@ Tuning knobs on the constructor: `endpoint`, `poll_interval` (0.5s),
 
 ## Client metrics
 
-Clients created with `CortexTrainingClient.from_pat` automatically emit one
-best-effort event when an essential operation fails. Set
-`CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY=1` to also emit successful outcomes.
+Clients created with `CortexTrainingClient.from_pat` automatically aggregate
+best-effort success and failure metrics for essential operations.
 Local or mock clients constructed with an explicit `base_url` treat
 `emit_metric` as a no-op. Set `CORTEX_TRAINING_DISABLE_TELEMETRY=1` to skip
 constructing the emitter.
@@ -44,16 +43,29 @@ Tracked operations:
   `router_replay_discard`, `reset_prefix_cache`
 - Async requests: `poll_request`, `get_request_status`, `cancel_request`
 
-Each emitted event body contains `success`, `duration_ms`, `request_count`,
-`attempt_count`, and `retry_count`. Failures also include a bounded
-`error_message` with common credential patterns redacted. Queryable attributes
-include available `job_id`, sub-job identifiers, `request_id`,
-`checkpoint_id`, `error.type`, HTTP status, Snowflake request ID, and server
-error code. Records use OTLP resource attributes
-`service.name = cortex-training` and
-`snowflake.account_host = <normalized connection hostname>`.
+The client periodically exports these delta metrics, grouped only by
+`operation` and `outcome` (`success` or `failure`):
 
-Applications can emit additional events through the same helper:
+- `cortex.training.client.operation.count`
+- `cortex.training.client.operation.duration` (histogram in milliseconds)
+- `cortex.training.client.operation.retries`
+- `cortex.training.client.operation.requests`
+
+An operation is successful when the client method returns; asynchronous job
+completion is separate. Failures also emit a detailed log with a bounded,
+credential-redacted error message and available job, sub-job, request,
+checkpoint, HTTP status, Snowflake request ID, and server error-code fields.
+Set `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY=1` only for temporary diagnostics
+to emit detailed success logs too.
+
+Telemetry resource attributes include `service.name = cortex-training`, the
+installed package version in `service.version`, the package surface in
+`cortex.training.client.surface`, and the normalized connection hostname in
+`snowflake.account_host`. API requests use
+`User-Agent: cortex-training/<installed package version>`.
+
+Applications can emit additional diagnostic log events through the legacy
+helper:
 
 ```python
 client.emit_metric(

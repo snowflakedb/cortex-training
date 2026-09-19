@@ -64,6 +64,8 @@ from tenacity import wait_exponential_jitter
 from urllib3.exceptions import NewConnectionError
 
 from cortex_training import wire
+from cortex_training._version import USER_AGENT
+from cortex_training._version import __version__
 from cortex_training.telemetry import CachedSessionTokenProvider
 from cortex_training.telemetry import OtlpMetricEmitter
 
@@ -1098,6 +1100,7 @@ class CortexTrainingClient:
         self._metric_emitter: OtlpMetricEmitter | None = None
         self._operation_metric_state = threading.local()
         self._session = requests.Session()
+        self._session.headers["User-Agent"] = USER_AGENT
         adapter = HTTPAdapter(pool_connections=pool_maxsize, pool_maxsize=pool_maxsize)
         self._session.mount("https://", adapter)
         self._session.mount("http://", adapter)
@@ -1142,6 +1145,8 @@ class CortexTrainingClient:
             client._metric_emitter = OtlpMetricEmitter(
                 client.base_url,
                 token_provider,
+                service_version=__version__,
+                service_surface="cortex-training",
                 verify_ssl=verify_ssl,
                 timeout=telemetry_timeout,
             )
@@ -1158,7 +1163,7 @@ class CortexTrainingClient:
         *,
         attributes: dict[str, Any] | None = None,
     ) -> None:
-        """Emit a best-effort OTLP log record used as a client metric.
+        """Emit a best-effort OTLP diagnostic log record.
 
         PAT clients lazily exchange the PAT for a cached session token on the
         first call. Local/mock clients, or clients constructed with
@@ -1196,10 +1201,8 @@ class CortexTrainingClient:
         result: Any = None,
         error: BaseException | None = None,
     ) -> None:
-        """Emit one structured outcome without changing the operation result."""
+        """Record aggregate metrics and an optional detailed outcome log."""
         if self._metric_emitter is None:
-            return
-        if error is None and not _success_telemetry_enabled():
             return
         try:
             attempt_count = int(
@@ -1215,6 +1218,15 @@ class CortexTrainingClient:
                 "retry_count": max(attempt_count - request_count, 0),
                 "success": error is None,
             }
+            self._metric_emitter.record_operation(
+                operation,
+                outcome="success" if error is None else "failure",
+                duration_ms=value["duration_ms"],
+                retry_count=value["retry_count"],
+                request_count=value["request_count"],
+            )
+            if error is None and not _success_telemetry_enabled():
+                return
             attributes = _metric_identity(operation, arguments, result)
             if error is not None:
                 value["error_message"] = _safe_metric_error_message(error)
