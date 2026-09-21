@@ -48,6 +48,8 @@ python -m recipes.sft.conversational.train \
 LoRA, GPU count, batch shape, sequence length, and MoE live in the job-config
 JSON. Set `wandb_project` to log to Weights & Biases after
 `uv pip install wandb` and `export WANDB_API_KEY` / `export WANDB_BASE_URL`.
+Set `sf_tracking=True` to log to Snowflake experiment tracking after
+`uv pip install "snowflake-ml-python>=1.19.0"`.
 
 ## Job config JSON
 
@@ -129,7 +131,8 @@ python -m recipes.sft.conversational.train \
   dataset=DATASET \
   max_steps=MAX_STEPS \
   enable_thinking=ENABLE_THINKING \
-  wandb_project=WANDB_PROJECT
+  wandb_project=WANDB_PROJECT \
+  sf_tracking=SF_TRACKING
 ```
 
 ```bash
@@ -161,6 +164,16 @@ export WANDB_BASE_URL=...
 ```
 
 Then pass `wandb_project=WANDB_PROJECT` on the train command.
+
+To log the same metrics to Snowflake experiment tracking:
+
+```bash
+uv pip install "snowflake-ml-python>=1.19.0"
+```
+
+Then pass `sf_tracking=True` on the train command. The server ties each run to
+a Snowflake experiment; results are viewable in Snowsight under
+**AI & ML > Experiments**.
 
 On the default memorize task, `train_nll` should fall quickly. After save, the
 recipe prints one generate command. When running that command, Assistant text

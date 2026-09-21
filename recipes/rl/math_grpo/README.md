@@ -53,12 +53,15 @@ python -m recipes.rl.math_grpo.train \
   group_size=GROUP_SIZE \
   max_steps=MAX_STEPS \
   n_test=N_TEST \
-  wandb_project=WANDB_PROJECT
+  wandb_project=WANDB_PROJECT \
+  sf_tracking=SF_TRACKING
 ```
 
 LoRA, GPU counts, sequence length, and MoE live in the job-config JSON. Set
 `wandb_project` to log to Weights & Biases after `uv pip install wandb` and
-`export WANDB_API_KEY` / `export WANDB_BASE_URL`.
+`export WANDB_API_KEY` / `export WANDB_BASE_URL`. Set `sf_tracking=True` to log
+to Snowflake experiment tracking after
+`uv pip install "snowflake-ml-python>=1.19.0"`.
 
 The recipe loads one create-job body with colocated sampling and training
 sub-jobs. Pass a shipped example or a copy with `job_config=JOB_CONFIG`.
@@ -174,6 +177,17 @@ export WANDB_BASE_URL=...
 ```
 
 Then pass `wandb_project=WANDB_PROJECT` on the train command.
+
+To log the same metrics to Snowflake experiment tracking:
+
+```bash
+uv pip install "snowflake-ml-python>=1.19.0"
+```
+
+Then pass `sf_tracking=True` on the train command. The server ties each run to
+a Snowflake experiment; results are viewable in Snowsight under
+**AI & ML > Experiments**.
+
 After save, the recipe prints one eval command.
 `recipes.inference.evaluate` uses the same few-shot prompt, grader, and
 decoding settings.

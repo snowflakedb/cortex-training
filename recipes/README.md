@@ -35,6 +35,11 @@ export WANDB_API_KEY=...
 export WANDB_BASE_URL=...
 ```
 
+To log the same metrics to Snowflake experiment tracking, pass
+`sf_tracking=True` on the train command after `uv pip install
+"snowflake-ml-python>=1.19.0"`. Results appear in Snowsight under
+**AI & ML > Experiments**.
+
 ## Running Recipes
 
 Recipes are Python modules so they can share code without path manipulation:
