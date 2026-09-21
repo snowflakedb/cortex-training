@@ -31,7 +31,10 @@ class SnowflakeExperimentLogger:
         from snowflake.ml.experiment import ExperimentTracking
 
         self._exp = ExperimentTracking(session=session)
-        self._exp.set_experiment(experiment_name)
+        # The server returns a fully qualified experiment name
+        # (``DB.SCHEMA.EXPERIMENT``); ExperimentTracking resolves against the
+        # session's database and schema and only accepts a bare identifier.
+        self._exp.set_experiment(experiment_name.rpartition(".")[2])
         self._exp.start_run(run_name)
 
     def log_params(self, params: dict[str, Any]) -> None:
