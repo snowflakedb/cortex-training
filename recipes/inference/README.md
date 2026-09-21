@@ -100,6 +100,15 @@ python -m recipes.inference.serve \
   config=/path/to/config.json \
   job_config=configs/qwen35_9b_full.json
 
+# Qwen3.8-27B LoRA / full
+python -m recipes.inference.serve \
+  config=/path/to/config.json \
+  job_config=configs/qwen38_27b_lora.json
+
+python -m recipes.inference.serve \
+  config=/path/to/config.json \
+  job_config=configs/qwen38_27b_full.json
+
 # Qwen3.6-35B-A3B LoRA / full
 python -m recipes.inference.serve \
   config=/path/to/config.json \

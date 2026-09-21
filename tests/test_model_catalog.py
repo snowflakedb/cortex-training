@@ -108,6 +108,7 @@ def test_shipped_qwen_recipes_use_model_limits_and_long_context_sp():
     expected_limits = {
         "Qwen/Qwen3-8B": 32768,
         "Qwen/Qwen3.5-9B": 65536,
+        "Qwen/Qwen3.8-27B": 65536,
         "Qwen/Qwen3.6-35B-A3B": 262144,
     }
     config_paths = [
@@ -116,7 +117,7 @@ def test_shipped_qwen_recipes_use_model_limits_and_long_context_sp():
         *REPO_ROOT.glob("recipes/sft/conversational/configs/qwen*.json"),
     ]
 
-    assert len(config_paths) == 16
+    assert len(config_paths) == 20
     for path in config_paths:
         request = json.loads(path.read_text())
         for sub_job in request["sub_job_configs"]:
