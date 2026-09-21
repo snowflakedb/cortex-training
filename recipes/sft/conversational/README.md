@@ -173,7 +173,8 @@ uv pip install "snowflake-ml-python>=1.19.0"
 
 Then pass `sf_tracking=True` on the train command. The server ties each run to
 a Snowflake experiment; results are viewable in Snowsight under
-**AI & ML > Experiments**.
+**AI & ML > Experiments**. See the
+[Snowflake ML Experiments docs](https://docs.snowflake.com/en/developer-guide/snowflake-ml/experiments).
 
 On the default memorize task, `train_nll` should fall quickly. After save, the
 recipe prints one generate command. When running that command, Assistant text

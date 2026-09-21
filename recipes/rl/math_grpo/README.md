@@ -186,7 +186,8 @@ uv pip install "snowflake-ml-python>=1.19.0"
 
 Then pass `sf_tracking=True` on the train command. The server ties each run to
 a Snowflake experiment; results are viewable in Snowsight under
-**AI & ML > Experiments**.
+**AI & ML > Experiments**. See the
+[Snowflake ML Experiments docs](https://docs.snowflake.com/en/developer-guide/snowflake-ml/experiments).
 
 After save, the recipe prints one eval command.
 `recipes.inference.evaluate` uses the same few-shot prompt, grader, and
