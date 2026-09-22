@@ -1497,7 +1497,7 @@ class CortexTrainingClient:
 
     @_track_operation("list_models")
     def list_models(self) -> list:
-        """Return models currently available for new jobs."""
+        """Return active models configured for new jobs."""
         resp = self._send("GET", f"{self._prefix}/models")
         return resp.json().get("models", [])
 

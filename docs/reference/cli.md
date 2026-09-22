@@ -105,7 +105,7 @@ cortex-training get JOB_ID
 cortex-training wait JOB_ID                   # Wait until running, not finished
 cortex-training cancel JOB_ID
 cortex-training checkpoints JOB_ID
-cortex-training models                        # Active and fully synced models
+cortex-training models                        # Active configured models
 cortex-training capacity                      # All supported GPU types
 cortex-training capacity --hardware B200
 ```
@@ -273,15 +273,15 @@ See [Manage Jobs](../guides/operations/manage-jobs.md) for the operational workf
 
 ### List Available Models
 
-List active models that are fully synced and available for new jobs:
+List active models configured for new jobs:
 
 ```bash
 cortex-training models
 ```
 
-The command prints `{"models": [{"name": "..."}]}`. An empty list means no
-model currently satisfies runtime readiness; it is not a list of every model
-that might be supported later.
+The command prints `{"models": [{"name": "..."}]}`. This is a policy catalog,
+not a cache-readiness guarantee; a submitted job may wait while model sync
+completes.
 
 ### Show Current GPU Capacity
 

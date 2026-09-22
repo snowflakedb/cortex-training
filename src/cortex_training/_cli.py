@@ -221,8 +221,8 @@ def build_parser(
 
     subparsers.add_parser(
         "models",
-        help="List models currently available for new jobs.",
-        description="List models currently available for new jobs.",
+        help="List active models configured for new jobs.",
+        description="List active models configured for new jobs.",
     )
 
     capacity = subparsers.add_parser(

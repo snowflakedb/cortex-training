@@ -497,7 +497,7 @@ def test_models_help_explains_model_availability(capsys):
         cli.parse_args(["models", "--help"])
 
     assert exc_info.value.code == 0
-    assert "List models currently available for new jobs." in capsys.readouterr().out
+    assert "List active models configured for new jobs." in capsys.readouterr().out
 
 
 def test_get_prints_job():

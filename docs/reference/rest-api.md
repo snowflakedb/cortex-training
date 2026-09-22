@@ -261,7 +261,7 @@ Paths are relative to the prefix in [section 2.1](#21-base-url).
 |---|---|---|---|
 | `/` | `POST` | `create_job`, `create_job_from_body` | Create a job |
 | `/` | `GET` | `list_jobs` | List jobs, optionally filtered by status |
-| `/models` | `GET` | `list_models` | List active, runtime-ready models |
+| `/models` | `GET` | `list_models` | List active configured models |
 | `/capacity` | `GET` | `get_capacity` | Account reservation and GPU usage |
 | `/{job_id}` | `GET` | `get_job`, `wait_for_job` | Job and sub-job status |
 | `/{job_id}:cancel` | `POST` | `cancel_job` | Cancel a job |
@@ -437,17 +437,16 @@ The client forwards the status string without validating an enum.
 
 ### 5.4 List models - `GET /models`
 
-This schema-scoped endpoint returns active models that are fully synced across
-a serving hardware pool:
+This schema-scoped endpoint returns active models configured for new jobs:
 
 ```json
 {"models": [{"name": "Qwen/Qwen3-8B"}]}
 ```
 
 `CortexTrainingClient.list_models()` returns only the `models` list. The CLI
-`models` command restores the server-shaped envelope. This response is
-discovery, not a capacity guarantee; a listed model can still wait for enough
-GPUs for a particular job shape.
+`models` command restores the server-shaped envelope. This response is policy
+discovery, not a cache or capacity guarantee; a listed model can still wait for
+weight synchronization or enough GPUs for a particular job shape.
 
 ### 5.5 Capacity - `GET /capacity`
 

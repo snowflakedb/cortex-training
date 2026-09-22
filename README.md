@@ -41,7 +41,7 @@ See [connection setup](docs/getting-started/setup.md) for more detail.
 
 ```bash
 cortex-training capacity           # Check available GPU capacity
-cortex-training models             # List models available for new jobs
+cortex-training models             # List active configured models
 cortex-training list               # List jobs
 cortex-training get JOB_ID         # Inspect a job from the list
 cortex-training tui                # Pick a job and view its logs
