@@ -395,7 +395,7 @@ class Hardware(str, Enum):
     """GPU hardware for create job and capacity.
 
     Wire values match the REST ``hardware`` field; see
-    ``docs/reference/rest-api.md`` sections 5.1 and 5.4. Omitting it defaults to
+    ``docs/reference/rest-api.md`` sections 5.1 and 5.5. Omitting it defaults to
     H200 on the server. Unknown values are rejected client-side.
     """
 
@@ -1495,6 +1495,12 @@ class CortexTrainingClient:
         resp = self._send("GET", self._prefix, params=params)
         return resp.json().get("jobs", [])
 
+    @_track_operation("list_models")
+    def list_models(self) -> list:
+        """Return models currently available for new jobs."""
+        resp = self._send("GET", f"{self._prefix}/models")
+        return resp.json().get("models", [])
+
     @_track_operation("cancel_job")
     def cancel_job(self, job_id: str) -> None:
         # The REST API uses colon-action syntax: /{jobId}:cancel
@@ -1536,7 +1542,7 @@ class CortexTrainingClient:
           ceiling headroom capped by what is schedulable. ``0`` does not mean
           blocked: a submit within the ceiling is still accepted and queued.
 
-        See ``docs/reference/rest-api.md`` section 5.4 for the authoritative
+        See ``docs/reference/rest-api.md`` section 5.5 for the authoritative
         field list.
         """
         params = {}

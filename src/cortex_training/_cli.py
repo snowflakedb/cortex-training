@@ -219,6 +219,12 @@ def build_parser(
     list_jobs = subparsers.add_parser("list", help="List Cortex Training jobs.")
     list_jobs.add_argument("--status", help="Optional status filter.")
 
+    subparsers.add_parser(
+        "models",
+        help="List models currently available for new jobs.",
+        description="List models currently available for new jobs.",
+    )
+
     capacity = subparsers.add_parser(
         "capacity",
         help="Show reserved GPU capacity and current usage for the caller account.",
@@ -959,6 +965,13 @@ def _run(
     if args.command == "list":
         jobs = client.list_jobs(status=args.status)
         _print_json({"jobs": _jobs_latest_last(jobs)}, stdout, compact=args.compact)
+        return 0
+    if args.command == "models":
+        _print_json(
+            {"models": client.list_models()},
+            stdout,
+            compact=args.compact,
+        )
         return 0
     if args.command == "capacity":
         if args.hardware is not None:

@@ -54,6 +54,7 @@ class FakeClient:
         self.capacity_hardware_requests = []
         self.checkpoints_job_id = None
         self.jobs = None
+        self.models_requested = False
         self.stdout_log_job_id = None
         self.stdout_log_output_dir = None
         self.metrics_job_id = None
@@ -75,6 +76,13 @@ class FakeClient:
         if self.jobs is not None:
             return self.jobs
         return [{"job_id": "j1", "status": status or "running"}]
+
+    def list_models(self):
+        self.models_requested = True
+        return [
+            {"name": "Qwen/Qwen3-0.6B"},
+            {"name": "Qwen/Qwen3-8B"},
+        ]
 
     def list_checkpoints(self, job_id):
         self.checkpoints_job_id = job_id
@@ -462,6 +470,34 @@ def test_list_sorts_missing_created_at_after_dated_jobs():
         "latest",
         "missing",
     ]
+
+
+def test_models_dispatches_without_job_id_and_prints_models():
+    instances = []
+    stdout = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["models"],
+        client_factory=_factory(instances),
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert instances[0].models_requested is True
+    assert json.loads(stdout.getvalue()) == {
+        "models": [
+            {"name": "Qwen/Qwen3-0.6B"},
+            {"name": "Qwen/Qwen3-8B"},
+        ],
+    }
+
+
+def test_models_help_explains_model_availability(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        cli.parse_args(["models", "--help"])
+
+    assert exc_info.value.code == 0
+    assert "List models currently available for new jobs." in capsys.readouterr().out
 
 
 def test_get_prints_job():
