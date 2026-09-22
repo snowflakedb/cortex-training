@@ -126,16 +126,15 @@ def test_shipped_qwen_recipes_use_model_limits_and_long_context_sp():
                 ds_config = config["ds_config"]
                 sp_size = config.get("sp_size", 1)
                 logical_dp = config["n_gpus"] // sp_size
-                assert config["train_batch_size"] == ds_config["train_batch_size"]
-                assert config["train_batch_size"] == (
-                    logical_dp
-                    * ds_config["train_micro_batch_size_per_gpu"]
-                    * ds_config["gradient_accumulation_steps"]
-                )
+                assert config["train_batch_size"] == logical_dp
+                assert {
+                    "train_batch_size",
+                    "train_micro_batch_size_per_gpu",
+                    "gradient_accumulation_steps",
+                }.isdisjoint(ds_config)
             if model_id == "Qwen/Qwen3.6-35B-A3B" and sub_job["job_type"] == "training":
                 assert config["sp_size"] == 8
                 assert config["train_batch_size"] == 1
-                assert config["ds_config"]["train_batch_size"] == 1
 
 
 @pytest.mark.parametrize(
@@ -438,9 +437,11 @@ def test_every_long_context_training_recommendation_uses_sequence_parallelism():
             )
             assert config["sp_size"] == 8
             assert config["train_batch_size"] == config["n_gpus"] // 8
-            assert config["ds_config"]["train_batch_size"] == config["train_batch_size"]
-            assert config["ds_config"]["train_micro_batch_size_per_gpu"] == 1
-            assert config["ds_config"]["gradient_accumulation_steps"] == 1
+            assert {
+                "train_batch_size",
+                "train_micro_batch_size_per_gpu",
+                "gradient_accumulation_steps",
+            }.isdisjoint(config["ds_config"])
             assert {
                 (sub_job.get("training_config") or sub_job.get("inference_config"))[
                     "max_seq_len"
@@ -724,9 +725,11 @@ def test_training_sequence_parallelism_adjusts_logical_dp_batch_only():
     assert training["n_gpus"] == 16
     assert training["sp_size"] == 16
     assert training["train_batch_size"] == 1
-    assert training["ds_config"]["train_batch_size"] == 1
-    assert training["ds_config"]["train_micro_batch_size_per_gpu"] == 1
-    assert training["ds_config"]["gradient_accumulation_steps"] == 1
+    assert {
+        "train_batch_size",
+        "train_micro_batch_size_per_gpu",
+        "gradient_accumulation_steps",
+    }.isdisjoint(training["ds_config"])
     assert "sp_size" not in sampling
 
 
@@ -1037,7 +1040,6 @@ def test_qwen38_sequence_parallelism_must_divide_gdn_heads():
     args["n_gpus"] = 24
     args["train_batch_size"] = 1
     args["extra_training"]["sp_size"] = 24
-    args["extra_training"]["ds_config"]["train_batch_size"] = 1
 
     with pytest.raises(
         CatalogValidationError,
@@ -1065,6 +1067,26 @@ def test_zero_stage_three_is_rejected():
     zero_optimization["stage"] = 3
 
     with pytest.raises(CatalogValidationError, match="ZeRO stage 3 is unsupported"):
+        validate_catalog(models_doc, profiles, REPO_ROOT)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "train_batch_size",
+        "train_micro_batch_size_per_gpu",
+        "gradient_accumulation_steps",
+    ],
+)
+def test_server_derived_deepspeed_batch_fields_are_rejected(field):
+    models_doc, profiles = load_catalog(CONFIG_DIR)
+    profile = next(item for item in profiles if item["id"] == "dense-sft-full-8gpu")
+    profile["subJobs"][0]["args"]["extra_training"]["ds_config"][field] = 1
+
+    with pytest.raises(
+        CatalogValidationError,
+        match="must omit server-derived DeepSpeed batch fields",
+    ):
         validate_catalog(models_doc, profiles, REPO_ROOT)
 
 
