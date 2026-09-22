@@ -261,6 +261,7 @@ Paths are relative to the prefix in [section 2.1](#21-base-url).
 |---|---|---|---|
 | `/` | `POST` | `create_job`, `create_job_from_body` | Create a job |
 | `/` | `GET` | `list_jobs` | List jobs, optionally filtered by status |
+| `/models` | `GET` | `list_models` | List active configured models |
 | `/capacity` | `GET` | `get_capacity` | Account reservation and GPU usage |
 | `/{job_id}` | `GET` | `get_job`, `wait_for_job` | Job and sub-job status |
 | `/{job_id}:cancel` | `POST` | `cancel_job` | Cancel a job |
@@ -434,7 +435,20 @@ REST response:
 `CortexTrainingClient.list_jobs()` returns only the `jobs` list, not the outer object.
 The client forwards the status string without validating an enum.
 
-### 5.4 Capacity - `GET /capacity`
+### 5.4 List models - `GET /models`
+
+This schema-scoped endpoint returns active models configured for new jobs:
+
+```json
+{"models": [{"name": "Qwen/Qwen3-8B"}]}
+```
+
+`CortexTrainingClient.list_models()` returns only the `models` list. The CLI
+`models` command restores the server-shaped envelope. This response is policy
+discovery, not a cache or capacity guarantee; a listed model can still wait for
+weight synchronization or enough GPUs for a particular job shape.
+
+### 5.5 Capacity - `GET /capacity`
 
 This account-scoped endpoint takes no account id from the caller. The server
 resolves the account from the authenticated session.
@@ -483,7 +497,7 @@ Proto3 JSON may omit false or zero fields, so an account holding nothing under a
 zero ceiling responds with literally `{}`. `get_capacity()` fills in the
 documented defaults for all six keys.
 
-### 5.5 Cancel job - `POST /{job_id}:cancel`
+### 5.6 Cancel job - `POST /{job_id}:cancel`
 
 No body. Pending, placing, and running jobs enter cancellation. Repeating a
 cancel while a job is cancelling or already cancelled is an idempotent success.
@@ -491,7 +505,7 @@ Terminated or failed jobs return a precondition/conflict-style error.
 
 `cancel_job()` returns `None`.
 
-### 5.6 Experiment run - `GET /{job_id}/experiment-run`
+### 5.7 Experiment run - `GET /{job_id}/experiment-run`
 
 ```json
 {
@@ -502,7 +516,7 @@ Terminated or failed jobs return a precondition/conflict-style error.
 
 `fetch_execution_logs()` uses these values to locate the run's stage.
 
-### 5.7 List checkpoints - `GET /{job_id}/checkpoints`
+### 5.8 List checkpoints - `GET /{job_id}/checkpoints`
 
 ```json
 {
@@ -532,7 +546,7 @@ output is selected with the global option:
 cortex-training --compact checkpoints JOB_ID
 ```
 
-### 5.8 Export checkpoint
+### 5.9 Export checkpoint
 
 ```text
 POST /{job_id}/checkpoints/{checkpoint_id}:export
@@ -556,7 +570,7 @@ No body.
 
 The URLs are short-lived.
 
-### 5.9 Delete checkpoint
+### 5.10 Delete checkpoint
 
 ```text
 DELETE /{job_id}/checkpoints/{checkpoint_id}

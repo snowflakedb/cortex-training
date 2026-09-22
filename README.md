@@ -41,6 +41,7 @@ See [connection setup](docs/getting-started/setup.md) for more detail.
 
 ```bash
 cortex-training capacity           # Check available GPU capacity
+cortex-training models             # List active configured models
 cortex-training list               # List jobs
 cortex-training get JOB_ID         # Inspect a job from the list
 cortex-training tui                # Pick a job and view its logs
@@ -73,8 +74,9 @@ in with.
 | Train math reasoning with reinforcement learning | [Math GRPO](recipes/rl/math_grpo/README.md) |
 | Serve a model or checkpoint, generate responses, and evaluate | [Inference endpoint](recipes/inference/README.md) |
 
-Check `cortex-training capacity` and the recipe's GPU requirements before
-starting a run. Browse the [recipe index](recipes/README.md) for all workflows.
+Check `cortex-training models`, `cortex-training capacity`, and the recipe's GPU
+requirements before starting a run. Browse the [recipe index](recipes/README.md)
+for all workflows.
 
 ## More Documentation
 

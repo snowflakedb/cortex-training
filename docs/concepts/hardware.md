@@ -54,5 +54,5 @@ job_id = client.create_job(sub_jobs=[sub_job], hardware=Hardware.B200)
 ```
 
 See [REST API reference section 5.1](../reference/rest-api.md#51-create-job---post-)
-and [section 5.4](../reference/rest-api.md#54-capacity---get-capacity) for the
+and [section 5.5](../reference/rest-api.md#55-capacity---get-capacity) for the
 wire shapes.
