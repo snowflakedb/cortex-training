@@ -16,9 +16,6 @@
           "bf16": {
             "enabled": true
           },
-          "gradient_accumulation_steps": 1,
-          "train_batch_size": 8,
-          "train_micro_batch_size_per_gpu": 1,
           "zero_optimization": {
             "reduce_scatter": true,
             "stage": 1

@@ -47,9 +47,6 @@
                 ]
               },
               "ds_config": {
-                "train_batch_size": 8,
-                "train_micro_batch_size_per_gpu": 1,
-                "gradient_accumulation_steps": 1,
                 "zero_optimization": {
                   "stage": 2,
                   "reduce_scatter": true
@@ -144,9 +141,6 @@
                 ]
               },
               "ds_config": {
-                "train_batch_size": 8,
-                "train_micro_batch_size_per_gpu": 1,
-                "gradient_accumulation_steps": 1,
                 "zero_optimization": {
                   "stage": 2
                 },
@@ -197,9 +191,6 @@
                 "max_tokens_per_mb": 10240
               },
               "ds_config": {
-                "train_batch_size": 8,
-                "train_micro_batch_size_per_gpu": 1,
-                "gradient_accumulation_steps": 1,
                 "zero_optimization": {
                   "stage": 1,
                   "reduce_scatter": true
@@ -271,9 +262,6 @@
                 ]
               },
               "ds_config": {
-                "train_batch_size": 8,
-                "train_micro_batch_size_per_gpu": 1,
-                "gradient_accumulation_steps": 1,
                 "zero_optimization": {
                   "stage": 2,
                   "reduce_scatter": true
@@ -360,9 +348,6 @@
                 "fused_cross_entropy": false
               },
               "ds_config": {
-                "train_batch_size": 8,
-                "train_micro_batch_size_per_gpu": 1,
-                "gradient_accumulation_steps": 1,
                 "zero_optimization": {
                   "stage": 1,
                   "reduce_scatter": true

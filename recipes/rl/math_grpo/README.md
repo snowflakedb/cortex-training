@@ -117,9 +117,6 @@ sub-jobs. Pass a shipped example or a copy with `job_config=JOB_CONFIG`.
           "eps": ADAM_EPS
         },
         "ds_config": {
-          "train_batch_size": TRAIN_BATCH_SIZE,
-          "train_micro_batch_size_per_gpu": MICRO_BATCH_SIZE,
-          "gradient_accumulation_steps": TRAIN_BATCH_SIZE / (MICRO_BATCH_SIZE * NUM_TRAINING_GPUS),
           "zero_optimization": {
             "stage": ZERO_STAGE,
             "reduce_scatter": true
@@ -154,6 +151,10 @@ sub-jobs. Pass a shipped example or a copy with `job_config=JOB_CONFIG`.
   ]
 }
 ```
+
+Don't set DeepSpeed `train_batch_size`, `train_micro_batch_size_per_gpu`, or
+`gradient_accumulation_steps` in `ds_config`. DSS derives them from the runtime
+topology and uses token-budget packing to split each request into model calls.
 
 The target list above is for dense Qwen models. For
 `Qwen/Qwen3.6-35B-A3B`, use the shipped LoRA config with

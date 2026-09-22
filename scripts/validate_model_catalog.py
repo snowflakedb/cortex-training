@@ -344,14 +344,16 @@ def _validate_profile_reference(
                 ds_config.get("zero_optimization"),
                 f"profile {profile_id}.training_job.extra_training.ds_config.zero_optimization",
             )
-            ds_train_batch_size = _require_positive_int(
-                ds_config.get("train_batch_size"),
-                f"profile {profile_id}.training_job.extra_training.ds_config.train_batch_size",
-            )
-            if ds_train_batch_size != train_batch_size:
+            server_derived_batch_fields = {
+                "train_batch_size",
+                "train_micro_batch_size_per_gpu",
+                "gradient_accumulation_steps",
+            }
+            configured_batch_fields = sorted(server_derived_batch_fields & ds_config.keys())
+            if configured_batch_fields:
                 raise CatalogValidationError(
-                    f"profile {profile_id}.training_job train_batch_size must match "
-                    "extra_training.ds_config.train_batch_size"
+                    f"profile {profile_id}.training_job must omit server-derived "
+                    f"DeepSpeed batch fields: {', '.join(configured_batch_fields)}"
                 )
 
             sp_size = extra_training.get("sp_size")
@@ -394,14 +396,6 @@ def _validate_profile_reference(
                     raise CatalogValidationError(
                         f"profile {profile_id}.training_job with sp_size {sp_size} "
                         f"requires train_batch_size {logical_dp}"
-                    )
-                if (
-                    ds_config.get("train_micro_batch_size_per_gpu") != 1
-                    or ds_config.get("gradient_accumulation_steps") != 1
-                ):
-                    raise CatalogValidationError(
-                        f"profile {profile_id}.training_job sequence parallelism "
-                        "requires DeepSpeed micro batch and accumulation of one"
                     )
                 if model_id == QWEN38_MODEL_ID:
                     for head_field, head_count in QWEN38_SP_HEAD_LAYOUTS.items():
