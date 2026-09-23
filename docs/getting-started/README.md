@@ -3,6 +3,8 @@
 Follow this path to install the Cortex Training client, connect it to your
 Snowflake account, and submit a short supervised fine-tuning job.
 
+0. [Ecosystem overview](ecosystem.md) — understand how Cortex Training,
+   Arctic Platform, and RL frameworks fit together.
 1. [Check the prerequisites](prerequisites.md) for account access,
    authentication, and GPU capacity.
 2. [Set up the client](setup.md), create a connection configuration, and verify
