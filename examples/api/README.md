@@ -6,6 +6,7 @@ These JSON files demonstrate individual Cortex Training request bodies:
 |---|---|
 | `training.json` | Create a training sub-job |
 | `sampling.json` | Create a sampling sub-job |
+| `sampling-debug.json` | Create a semi-persistence sampling sub-job on a pinned debug image |
 | `rl.json` | Create colocated training and sampling sub-jobs |
 | `fwd-bwd.json` | Submit a readable forward/backward batch |
 | `generate.json` | Submit prompts for generation |
