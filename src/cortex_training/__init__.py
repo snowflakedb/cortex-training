@@ -15,7 +15,7 @@
 
 """Public Python API for Cortex Training."""
 
-__version__ = "0.0.2"
+from ._version import __version__
 
 from . import wire
 from .client import ChunkGroupConflictError

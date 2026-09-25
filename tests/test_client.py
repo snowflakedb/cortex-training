@@ -616,9 +616,12 @@ class TestClientConstruction:
         assert c.base_url == "https://x.test"
         assert c._session.headers["Authorization"] == "Bearer tok-xyz"
         assert c._session.headers["X-Snowflake-Authorization-Token-Type"] == "PROGRAMMATIC_ACCESS_TOKEN"
+        assert c._session.headers["User-Agent"] == f"cortex-training/{nc.__version__}"
         assert c._session.verify is False
         assert c._metric_emitter is not None
         assert c._metric_emitter.timeout == 3.0
+        assert c._metric_emitter.service_version == nc.__version__
+        assert c._metric_emitter.service_surface == "cortex-training"
 
     def test_from_pat_skips_telemetry_when_disabled(self, monkeypatch):
         monkeypatch.setenv(nc.DISABLE_TELEMETRY_ENV, "1")
@@ -710,13 +713,17 @@ class TestOperationMetrics:
         for method_name in self.TRACKED_METHODS:
             assert hasattr(getattr(CortexTrainingClient, method_name), "__wrapped__")
 
-    def test_success_metric_is_omitted_by_default(self, monkeypatch):
+    def test_success_metric_is_aggregated_without_detailed_log_by_default(self, monkeypatch):
         monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
         c = _make_client(post_json={"request_id": "r1"})
         c._metric_emitter = MagicMock()
 
         assert c.step("job-1") == "r1"
         c._metric_emitter.emit.assert_not_called()
+        c._metric_emitter.record_operation.assert_called_once()
+        assert c._metric_emitter.record_operation.call_args.args == ("step",)
+        assert c._metric_emitter.record_operation.call_args.kwargs["outcome"] == "success"
+        assert c._metric_emitter.record_operation.call_args.kwargs["request_count"] == 1
 
     def test_success_metric_has_operation_job_and_duration(self, monkeypatch):
         monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "1")
@@ -735,6 +742,7 @@ class TestOperationMetrics:
         assert value["request_count"] == 1
         assert value["retry_count"] == 0
         assert attributes == {"job_id": "job-1", "request_id": "r1"}
+        c._metric_emitter.record_operation.assert_called_once()
 
     def test_client_validation_error_metric_preserves_original_error(self):
         c = _make_client()
@@ -756,6 +764,7 @@ class TestOperationMetrics:
             "error.type": "ValueError",
         }
         assert c._operation_metric_state.active == set()
+        assert c._metric_emitter.record_operation.call_args.kwargs["outcome"] == "failure"
 
     def test_http_error_metric_has_status_code_and_request_id(self):
         c = _make_client()

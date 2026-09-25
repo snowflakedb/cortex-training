@@ -153,7 +153,10 @@ def test_emitter_discovers_hostname_once_and_posts_otlp_payload(monkeypatch):
 
     emitter._session.get.assert_called_once_with(
         "https://account.test/observability/system/hostname",
-        headers={"Authorization": 'Snowflake Token="session"'},
+        headers={
+            "Authorization": 'Snowflake Token="session"',
+            "Accept": "application/json",
+        },
         timeout=3.0,
     )
     assert emitter._session.post.call_count == 2
@@ -181,6 +184,82 @@ def test_emitter_discovers_hostname_once_and_posts_otlp_payload(monkeypatch):
         {"key": "job_id", "value": {"stringValue": "job-1"}},
         {"key": "event.name", "value": {"stringValue": "generate"}},
     ]
+
+
+def test_operation_metrics_are_aggregated_and_posted_to_metrics_endpoint(monkeypatch):
+    token_provider = MagicMock()
+    token_provider.get_token.return_value = "session"
+    emitter = OtlpMetricEmitter(
+        "https://account.test",
+        token_provider,
+        service_version="0.0.3",
+        service_surface="cortex-training",
+        background=False,
+    )
+    emitter._session = MagicMock()
+    emitter._session.get.return_value = _response(
+        {"hostname": f"{COLLECTOR}/system"}
+    )
+    emitter._session.post.return_value = _response()
+    now = iter([100, 200, 300])
+    monkeypatch.setattr("cortex_training.telemetry.time.time_ns", lambda: next(now))
+
+    emitter.record_operation(
+        "generate", outcome="success", duration_ms=10, request_count=1
+    )
+    emitter.record_operation(
+        "generate",
+        outcome="success",
+        duration_ms=50,
+        retry_count=1,
+        request_count=2,
+    )
+    emitter.record_operation(
+        "generate", outcome="failure", duration_ms=250, request_count=1
+    )
+    assert emitter.flush()
+
+    emitter._session.post.assert_called_once()
+    url = emitter._session.post.call_args.args[0]
+    payload = emitter._session.post.call_args.kwargs["json"]
+    assert url == f"https://{COLLECTOR}/system/v1/metrics"
+    resource = payload["resourceMetrics"][0]
+    assert resource["resource"]["attributes"][-2:] == [
+        {"key": "service.version", "value": {"stringValue": "0.0.3"}},
+        {
+            "key": "cortex.training.client.surface",
+            "value": {"stringValue": "cortex-training"},
+        },
+    ]
+    metrics = {
+        metric["name"]: metric
+        for metric in resource["scopeMetrics"][0]["metrics"]
+    }
+    count_points = metrics["cortex.training.client.operation.count"]["sum"][
+        "dataPoints"
+    ]
+    success_count = count_points[1]
+    assert success_count["attributes"] == [
+        {"key": "operation", "value": {"stringValue": "generate"}},
+        {"key": "outcome", "value": {"stringValue": "success"}},
+    ]
+    assert success_count["asInt"] == "2"
+    duration = metrics["cortex.training.client.operation.duration"]["histogram"][
+        "dataPoints"
+    ][1]
+    assert duration["count"] == "2"
+    assert duration["sum"] == 60
+    assert duration["min"] == 10
+    assert duration["max"] == 50
+    assert duration["bucketCounts"][:2] == ["1", "1"]
+    retry = metrics["cortex.training.client.operation.retries"]["sum"][
+        "dataPoints"
+    ][1]
+    requests = metrics["cortex.training.client.operation.requests"]["sum"][
+        "dataPoints"
+    ][1]
+    assert retry["asInt"] == "1"
+    assert requests["asInt"] == "3"
 
 
 def test_emitter_session_does_not_carry_pat():
