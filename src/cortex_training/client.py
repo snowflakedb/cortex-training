@@ -55,6 +55,11 @@ from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
 
+from pydantic import BaseModel
+from pydantic import ConfigDict
+from pydantic import Field as PydanticField
+from pydantic import model_validator
+
 import requests
 from requests.adapters import HTTPAdapter
 from tenacity import Retrying
@@ -441,43 +446,49 @@ def _validate_primerl_lm_head_config(extra: dict, *, location: str) -> None:
         )
 
 
-@dataclass
-class TrainingConfig:
+class TrainingConfig(BaseModel):
     """Training hyperparameters for a training sub-job.
 
     Required fields mirror the server-side validator: ``max_seq_len > 0``,
     ``train_batch_size > 0``, ``n_gpus > 0``, and a non-empty ``optimizer``.
 
-    ``extra`` carries any additional fields the training worker consumes. The
-    server keeps this block open (additionalProperties), so unknown keys flow
-    through unchanged. See ``docs/reference/rest-api.md`` section 8.2.
+    Unknown fields are passed through to the server unchanged
+    (accessible via ``model_extra``). See ``docs/reference/rest-api.md`` section 8.2.
     """
 
-    optimizer: dict
-    max_seq_len: int
-    train_batch_size: int
-    n_gpus: int
-    gradient_clipping: float | None = None
-    multiplex_job_id: str | None = None
-    # When False, resuming from a checkpoint loads weights only and starts the
-    # optimizer fresh. Required to change DP size (the DP-sharded optimizer
-    # cannot be resized); None leaves the server default (True).
-    load_optimizer_states: bool | None = None
-    extra: dict = field(default_factory=dict)
+    optimizer: dict = PydanticField(description="Optimizer config dict (e.g. {name: AdamW, lr: 1e-4}).")
+    max_seq_len: int = PydanticField(gt=0, description="Maximum sequence length for training.")
+    train_batch_size: int = PydanticField(gt=0, description="Global batch size across all GPUs.")
+    n_gpus: int = PydanticField(gt=0, description="Number of GPUs (data-parallel size).")
+    gradient_clipping: float | None = PydanticField(default=None, description="Optional gradient clipping threshold.")
+    multiplex_job_id: str | None = PydanticField(default=None, description="Optional multiplex job identifier.")
+    load_optimizer_states: bool | None = PydanticField(default=None, description="Whether to load optimizer states from checkpoints. Set to False when changing DP size.")
 
-    def validate(self) -> None:
-        if not isinstance(self.optimizer, dict) or not self.optimizer:
+    model_config = ConfigDict(extra="allow", validate_assignment=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _flatten_legacy_extra(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "extra" in data:
+            extra = data.pop("extra")
+            if isinstance(extra, dict):
+                for k, v in extra.items():
+                    data.setdefault(k, v)
+        return data
+
+    @model_validator(mode="after")
+    def _check_optimizer(self) -> "TrainingConfig":
+        if not self.optimizer:
             raise ValueError("training.optimizer is required and must be a non-empty dict")
-        if self.max_seq_len <= 0:
-            raise ValueError("training.max_seq_len must be > 0")
-        if self.train_batch_size <= 0:
-            raise ValueError("training.train_batch_size must be > 0")
-        if self.n_gpus <= 0:
-            raise ValueError("training.n_gpus must be > 0")
-        _validate_primerl_lm_head_config(self.extra, location="training.extra")
-        prime_rl = self.extra.get("prime_rl")
+        _validate_primerl_lm_head_config(self.model_extra or {}, location="training.extra")
+        prime_rl = (self.model_extra or {}).get("prime_rl")
         if isinstance(prime_rl, dict):
             _validate_primerl_lm_head_config(prime_rl, location="training.extra.prime_rl")
+        return self
+
+    def validate(self) -> None:
+        """Re-validate the current state. Backward-compatible with the old dataclass API."""
+        self.__class__.model_validate(self.model_dump(by_alias=True))
 
     def to_wire(self) -> dict:
         out: dict = {
@@ -492,60 +503,81 @@ class TrainingConfig:
             out["multiplex_job_id"] = self.multiplex_job_id
         if self.load_optimizer_states is not None:
             out["load_optimizer_states"] = self.load_optimizer_states
-        for k, v in self.extra.items():
+        for k, v in (self.model_extra or {}).items():
             out.setdefault(k, v)
         return out
 
 
-@dataclass
-class InferenceConfig:
+class InferenceConfig(BaseModel):
     """Sampling/log-probability config for an inference sub-job.
 
     Required fields mirror the server-side validator: ``max_seq_len > 0`` and
-    ``n_gpus > 0``. ``extra`` carries vLLM-style passthrough keys (e.g.
-    ``gpu_memory_utilization``). See ``docs/reference/rest-api.md`` section 8.3.
+    ``n_gpus > 0``. Unknown fields are passed through to the server unchanged
+    (accessible via ``model_extra``). See ``docs/reference/rest-api.md`` section 8.3.
     """
 
-    max_seq_len: int
-    n_gpus: int
-    multiplex_job_id: str | None = None
-    extra: dict = field(default_factory=dict)
+    max_seq_len: int = PydanticField(gt=0, description="Maximum sequence length for inference.")
+    n_gpus: int = PydanticField(gt=0, description="Number of GPUs for inference.")
+    multiplex_job_id: str | None = PydanticField(default=None, description="Optional multiplex job identifier.")
+
+    model_config = ConfigDict(extra="allow", validate_assignment=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _flatten_legacy_extra(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "extra" in data:
+            extra = data.pop("extra")
+            if isinstance(extra, dict):
+                for k, v in extra.items():
+                    data.setdefault(k, v)
+        return data
 
     def validate(self) -> None:
-        if self.max_seq_len <= 0:
-            raise ValueError("sampling.max_seq_len must be > 0")
-        if self.n_gpus <= 0:
-            raise ValueError("sampling.n_gpus must be > 0")
+        """Re-validate the current state. Backward-compatible with the old dataclass API."""
+        self.__class__.model_validate(self.model_dump(by_alias=True))
 
     def to_wire(self) -> dict:
         out: dict = {"max_seq_len": self.max_seq_len, "n_gpus": self.n_gpus}
         if self.multiplex_job_id is not None:
             out["multiplex_job_id"] = self.multiplex_job_id
-        for k, v in self.extra.items():
+        for k, v in (self.model_extra or {}).items():
             out.setdefault(k, v)
         return out
 
 
-@dataclass
-class SubJobConfig:
+class SubJobConfig(BaseModel):
     """One sub-job within a CreateJob request.
 
     Matches the ``SubJobConfig`` schema in ``docs/reference/rest-api.md``
     section 8.1.
 
     Exactly one of ``training`` or ``sampling`` must be set, matching the
-    sub-job's ``job_type`` (see :meth:`validate`).
+    sub-job's ``job_type``.
     """
 
-    job_type: JobType
-    model_name: str
-    training: TrainingConfig | None = None
-    sampling: InferenceConfig | None = None
-    global_batch_size: int | None = None
-    dtype: str | None = None
-    seed: int | None = None
-    model_post_init: list[str] | None = None
-    source_checkpoint_info: dict | None = None
+    job_type: JobType = PydanticField(description="Sub-job type (training, sampling, or log_probability).")
+    model_name: str = PydanticField(min_length=1, description="Model identifier (e.g. Qwen/Qwen3-8B).")
+    training: TrainingConfig | None = PydanticField(default=None, description="Training config; required for training sub-jobs.")
+    sampling: InferenceConfig | None = PydanticField(default=None, description="Inference config; required for sampling/log-prob sub-jobs.")
+    global_batch_size: int | None = PydanticField(default=None, description="Global batch size across all GPUs.")
+    dtype: str | None = PydanticField(default=None, description="Model dtype (e.g. bfloat16).")
+    seed: int | None = PydanticField(default=None, description="Random seed.")
+    model_post_init_ops: list[str] | None = PydanticField(default=None, alias="model_post_init", description="List of post-initialization operations.")
+    source_checkpoint_info: dict | None = PydanticField(default=None, description="Checkpoint to resume from at creation time.")
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True, validate_assignment=True)
+
+    @model_validator(mode="after")
+    def _check_job_type(self) -> "SubJobConfig":
+        if self.training is not None and self.sampling is not None:
+            raise ValueError("sub_job.training and sub_job.sampling are mutually exclusive")
+        if self.job_type == JobType.TRAINING:
+            if self.training is None:
+                raise ValueError("training sub-job requires a `training` block")
+        elif self.job_type in (JobType.SAMPLING, JobType.LOG_PROBABILITY):
+            if self.sampling is None:
+                raise ValueError(f"{self.job_type.value} sub-job requires a `sampling` block")
+        return self
 
     @classmethod
     def training_job(
@@ -589,6 +621,8 @@ class SubJobConfig:
             source_checkpoint_info: Optional checkpoint to resume from at
                 creation time (use ``{"checkpoint_id": "...", "source_job_id": "..."}`).
         """
+        _typed_training = set(TrainingConfig.model_fields.keys())
+        passthrough_training = {k: v for k, v in (extra_training or {}).items() if k not in _typed_training}
         return cls(
             job_type=JobType.TRAINING,
             model_name=model_name,
@@ -600,7 +634,7 @@ class SubJobConfig:
                 gradient_clipping=gradient_clipping,
                 multiplex_job_id=multiplex_job_id,
                 load_optimizer_states=load_optimizer_states,
-                extra=dict(extra_training) if extra_training else {},
+                **passthrough_training,
             ),
             global_batch_size=global_batch_size,
             dtype=dtype,
@@ -628,6 +662,8 @@ class SubJobConfig:
         """Build a sampling/log-probability :class:`SubJobConfig`."""
         if job_type not in (JobType.SAMPLING, JobType.LOG_PROBABILITY):
             raise ValueError(f"sampling_job() only accepts SAMPLING or LOG_PROBABILITY, got {job_type!r}")
+        _typed_sampling = set(InferenceConfig.model_fields.keys())
+        passthrough_sampling = {k: v for k, v in (extra_sampling or {}).items() if k not in _typed_sampling}
         return cls(
             job_type=job_type,
             model_name=model_name,
@@ -635,7 +671,7 @@ class SubJobConfig:
                 max_seq_len=max_seq_len,
                 n_gpus=n_gpus,
                 multiplex_job_id=multiplex_job_id,
-                extra=dict(extra_sampling) if extra_sampling else {},
+                **passthrough_sampling,
             ),
             global_batch_size=global_batch_size,
             dtype=dtype,
@@ -645,21 +681,8 @@ class SubJobConfig:
         )
 
     def validate(self) -> None:
-        # Mirrors the server-side CreateJob validation.
-        if not self.model_name:
-            raise ValueError("sub_job.model_name is required")
-        if self.training is not None and self.sampling is not None:
-            raise ValueError("sub_job.training and sub_job.sampling are mutually exclusive")
-        if self.job_type == JobType.TRAINING:
-            if self.training is None:
-                raise ValueError("training sub-job requires a `training` block")
-            self.training.validate()
-        elif self.job_type in (JobType.SAMPLING, JobType.LOG_PROBABILITY):
-            if self.sampling is None:
-                raise ValueError(f"{self.job_type.value} sub-job requires a `sampling` block")
-            self.sampling.validate()
-        else:  # pragma: no cover - JobType enum is closed
-            raise ValueError(f"unknown job_type: {self.job_type!r}")
+        """Re-validate the current state. Backward-compatible with the old dataclass API."""
+        self.__class__.model_validate(self.model_dump(by_alias=True))
 
     def to_wire(self) -> dict:
         wire: dict = {
@@ -672,8 +695,8 @@ class SubJobConfig:
             wire["dtype"] = self.dtype
         if self.seed is not None:
             wire["seed"] = self.seed
-        if self.model_post_init is not None:
-            wire["model_post_init"] = list(self.model_post_init)
+        if self.model_post_init_ops is not None:
+            wire["model_post_init"] = list(self.model_post_init_ops)
         if self.training is not None:
             wire["training_config"] = self.training.to_wire()
         if self.sampling is not None:
@@ -1400,7 +1423,7 @@ class CortexTrainingClient:
                     "pending_timeout_seconds must be between 300 and 604800"
                 )
         for sj in sub_jobs:
-            sj.validate()
+            SubJobConfig.model_validate(sj.model_dump(by_alias=True))
         body: dict = {"sub_job_configs": [sj.to_wire() for sj in sub_jobs]}
         if job_id is not None:
             body["job_id"] = job_id

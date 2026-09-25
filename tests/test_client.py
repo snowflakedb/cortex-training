@@ -42,6 +42,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from pydantic import ValidationError
 
 # Import the module directly so we don't pull src/cortex_training/__init__.py
 # (which imports torch via wire.py).
@@ -139,65 +140,50 @@ class TestTrainingConfig:
         _ok_training().validate()
 
     def test_validate_rejects_zero_max_seq_len(self):
-        tc = _ok_training()
-        tc.max_seq_len = 0
-        with pytest.raises(ValueError, match="max_seq_len"):
-            tc.validate()
+        with pytest.raises(ValidationError, match="max_seq_len"):
+            TrainingConfig(optimizer={"type": "adamw"}, max_seq_len=0, train_batch_size=1, n_gpus=2)
 
     def test_validate_rejects_zero_train_batch_size(self):
-        tc = _ok_training()
-        tc.train_batch_size = 0
-        with pytest.raises(ValueError, match="train_batch_size"):
-            tc.validate()
+        with pytest.raises(ValidationError, match="train_batch_size"):
+            TrainingConfig(optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=0, n_gpus=2)
 
     def test_validate_rejects_empty_optimizer(self):
-        tc = _ok_training()
-        tc.optimizer = {}
-        with pytest.raises(ValueError, match="optimizer"):
-            tc.validate()
+        with pytest.raises(ValidationError, match="optimizer"):
+            TrainingConfig(optimizer={}, max_seq_len=128, train_batch_size=1, n_gpus=2)
 
     def test_validate_accepts_nested_primerl_fused_ce_false(self):
-        tc = _ok_training()
-        tc.extra = {
-            "fp32_lm_head": True,
-            "fused_lm_head_token_chunk_size": 8192,
-            "prime_rl": {
-                "fused_cross_entropy": False,
-                "fp32_lm_head": True,
-                "fused_lm_head_token_chunk_size": 8192,
-            },
-        }
-        tc.validate()
+        TrainingConfig(
+            optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+            fp32_lm_head=True, fused_lm_head_token_chunk_size=8192,
+            prime_rl={"fused_cross_entropy": False, "fp32_lm_head": True, "fused_lm_head_token_chunk_size": 8192},
+        )
 
     def test_validate_nested_primerl_overrides_top_level_fused_ce(self):
-        tc = _ok_training()
-        tc.extra = {
-            "fused_cross_entropy": "liger",
-            "fp32_lm_head": True,
-            "prime_rl": {
-                "fused_cross_entropy": False,
-                "fp32_lm_head": True,
-            },
-        }
-        tc.validate()
+        TrainingConfig(
+            optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+            fused_cross_entropy="liger", fp32_lm_head=True,
+            prime_rl={"fused_cross_entropy": False, "fp32_lm_head": True},
+        )
 
     def test_validate_rejects_default_fused_ce_with_chunked_lm_head(self):
-        tc = _ok_training()
-        tc.extra = {"fused_lm_head_token_chunk_size": 8192}
-        with pytest.raises(ValueError, match="cannot combine fused_cross_entropy"):
-            tc.validate()
+        with pytest.raises(ValidationError, match="cannot combine fused_cross_entropy"):
+            TrainingConfig(
+                optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+                fused_lm_head_token_chunk_size=8192,
+            )
 
     def test_validate_rejects_nested_primerl_fused_ce_with_fp32_lm_head(self):
+        with pytest.raises(ValidationError, match="cannot combine fused_cross_entropy"):
+            TrainingConfig(
+                optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+                fused_cross_entropy=False,
+                prime_rl={"fused_cross_entropy": "liger", "fp32_lm_head": True},
+            )
+
+    def test_validate_rejects_mutation(self):
         tc = _ok_training()
-        tc.extra = {
-            "fused_cross_entropy": False,
-            "prime_rl": {
-                "fused_cross_entropy": "liger",
-                "fp32_lm_head": True,
-            },
-        }
-        with pytest.raises(ValueError, match="cannot combine fused_cross_entropy"):
-            tc.validate()
+        with pytest.raises(ValidationError, match="n_gpus"):
+            tc.n_gpus = 0
 
     def test_to_wire_required_fields(self):
         wire = _ok_training().to_wire()
@@ -220,14 +206,11 @@ class TestTrainingConfig:
         assert _ok_training().to_wire()["n_gpus"] == 2
 
     def test_validate_rejects_zero_n_gpus(self):
-        tc = _ok_training()
-        tc.n_gpus = 0
-        with pytest.raises(ValueError, match="n_gpus"):
-            tc.validate()
+        with pytest.raises(ValidationError, match="n_gpus"):
+            TrainingConfig(optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=1, n_gpus=0)
 
     def test_to_wire_includes_multiplex_job_id_when_set(self):
-        tc = _ok_training()
-        tc.multiplex_job_id = "train-1"
+        tc = TrainingConfig(optimizer={"type": "adamw", "lr": 1e-5}, max_seq_len=128, train_batch_size=1, n_gpus=2, multiplex_job_id="train-1")
         assert tc.to_wire()["multiplex_job_id"] == "train-1"
 
     def test_to_wire_omits_multiplex_job_id_when_none(self):
@@ -247,17 +230,19 @@ class TestTrainingConfig:
         assert tc.to_wire()["load_optimizer_states"] is True
 
     def test_to_wire_merges_extra_passthrough(self):
-        tc = _ok_training()
-        tc.extra = {"fp16": {"enabled": True}, "zero_stage": 2}
+        tc = TrainingConfig(
+            optimizer={"type": "adamw", "lr": 1e-5}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+            extra={"fp16": {"enabled": True}, "zero_stage": 2},
+        )
         wire = tc.to_wire()
         assert wire["fp16"] == {"enabled": True}
         assert wire["zero_stage"] == 2
 
     def test_to_wire_extra_does_not_override_required(self):
-        # If a caller stuffs a required field name into `extra`, the typed
-        # required value wins. Mirrors setdefault semantics.
-        tc = _ok_training()
-        tc.extra = {"max_seq_len": 999, "optimizer": {"type": "sgd"}}
+        tc = TrainingConfig(
+            optimizer={"type": "adamw", "lr": 1e-5}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+            extra={"max_seq_len": 999, "optimizer": {"type": "sgd"}},
+        )
         wire = tc.to_wire()
         assert wire["max_seq_len"] == 128
         assert wire["optimizer"] == {"type": "adamw", "lr": 1e-5}
@@ -271,12 +256,12 @@ class TestInferenceConfig:
         _ok_inference().validate()
 
     def test_validate_rejects_zero(self):
-        with pytest.raises(ValueError, match="max_seq_len"):
-            InferenceConfig(max_seq_len=0, n_gpus=1).validate()
+        with pytest.raises(ValidationError, match="max_seq_len"):
+            InferenceConfig(max_seq_len=0, n_gpus=1)
 
     def test_validate_rejects_zero_n_gpus(self):
-        with pytest.raises(ValueError, match="n_gpus"):
-            InferenceConfig(max_seq_len=2048, n_gpus=0).validate()
+        with pytest.raises(ValidationError, match="n_gpus"):
+            InferenceConfig(max_seq_len=2048, n_gpus=0)
 
     def test_to_wire_includes_extra(self):
         ic = InferenceConfig(max_seq_len=4096, n_gpus=1, extra={"gpu_memory_utilization": 0.9})
@@ -313,7 +298,7 @@ class TestSubJobConfigFactories:
         assert sub.model_name == "gpt2"
         assert isinstance(sub.training, TrainingConfig)
         assert sub.sampling is None
-        assert sub.training.extra == {}
+        assert sub.training.model_extra == {}
 
     def test_training_job_factory_full(self):
         sub = SubJobConfig.training_job(
@@ -337,11 +322,11 @@ class TestSubJobConfigFactories:
         assert sub.training.multiplex_job_id == "train-1"
         assert sub.training.load_optimizer_states is False
         assert sub.training.to_wire()["load_optimizer_states"] is False
-        assert sub.training.extra == {"fp16": {"enabled": True}}
+        assert sub.training.model_extra == {"fp16": {"enabled": True}}
         assert sub.global_batch_size == 4
         assert sub.dtype == "bf16"
         assert sub.seed == 42
-        assert sub.model_post_init == ["init_a", "init_b"]
+        assert sub.model_post_init_ops == ["init_a", "init_b"]
         assert sub.source_checkpoint_info == {"checkpoint_id": "cp_1", "source_job_id": "job-a"}
 
     def test_sampling_job_factory_default_type(self):
@@ -401,7 +386,7 @@ class TestSubJobConfigFactories:
             extra_training=extra,
         )
         extra["leaked"] = "yes"
-        assert "leaked" not in sub.training.extra
+        assert "leaked" not in (sub.training.model_extra or {})
 
 
 # ─── SubJobConfig — validate ────────────────────────────────────────────
@@ -430,50 +415,49 @@ class TestSubJobConfigValidate:
         ).validate()
 
     def test_rejects_empty_model_name(self):
-        with pytest.raises(ValueError, match="model_name"):
+        with pytest.raises(ValidationError, match="model_name"):
             SubJobConfig(
                 job_type=JobType.TRAINING,
                 model_name="",
                 training=_ok_training(),
-            ).validate()
+            )
 
     def test_training_without_training_block(self):
-        with pytest.raises(ValueError, match="training sub-job requires"):
-            SubJobConfig(job_type=JobType.TRAINING, model_name="gpt2").validate()
+        with pytest.raises(ValidationError, match="training sub-job requires"):
+            SubJobConfig(job_type=JobType.TRAINING, model_name="gpt2")
 
     def test_sampling_without_sampling_block(self):
-        with pytest.raises(ValueError, match="sampling sub-job requires"):
-            SubJobConfig(job_type=JobType.SAMPLING, model_name="gpt2").validate()
+        with pytest.raises(ValidationError, match="sampling sub-job requires"):
+            SubJobConfig(job_type=JobType.SAMPLING, model_name="gpt2")
 
     def test_log_probability_without_sampling_block(self):
-        with pytest.raises(ValueError, match="log_probability sub-job requires"):
+        with pytest.raises(ValidationError, match="log_probability sub-job requires"):
             SubJobConfig(
                 job_type=JobType.LOG_PROBABILITY,
                 model_name="gpt2",
-            ).validate()
+            )
 
     def test_mutually_exclusive(self):
-        with pytest.raises(ValueError, match="mutually exclusive"):
+        with pytest.raises(ValidationError, match="mutually exclusive"):
             SubJobConfig(
                 job_type=JobType.TRAINING,
                 model_name="gpt2",
                 training=_ok_training(),
                 sampling=_ok_inference(),
-            ).validate()
+            )
 
     def test_propagates_nested_validation_failure(self):
-        bad = SubJobConfig(
-            job_type=JobType.TRAINING,
-            model_name="gpt2",
-            training=TrainingConfig(
-                optimizer={"type": "adamw"},
-                max_seq_len=128,
-                train_batch_size=0,
-                n_gpus=2,
-            ),
-        )
-        with pytest.raises(ValueError, match="train_batch_size"):
-            bad.validate()
+        with pytest.raises(ValidationError, match="train_batch_size"):
+            SubJobConfig(
+                job_type=JobType.TRAINING,
+                model_name="gpt2",
+                training=TrainingConfig(
+                    optimizer={"type": "adamw"},
+                    max_seq_len=128,
+                    train_batch_size=0,
+                    n_gpus=2,
+                ),
+            )
 
 
 # ─── SubJobConfig — to_wire ─────────────────────────────────────────────
@@ -941,11 +925,10 @@ class TestCreateJob:
             c.create_job(sub_jobs=[])
 
     def test_validates_each_sub_job_before_post(self):
-        c = _make_client()
-        bad = SubJobConfig(job_type=JobType.TRAINING, model_name="gpt2")  # no training block
-        with pytest.raises(ValueError):
-            c.create_job(sub_jobs=[bad])
-        c._session.post.assert_not_called()
+        # Pydantic validates on construction, so an invalid SubJobConfig
+        # cannot even be created — no HTTP call is possible.
+        with pytest.raises(ValidationError):
+            SubJobConfig(job_type=JobType.TRAINING, model_name="gpt2")  # no training block
 
     def test_posts_in_flight_yaml_shape(self):
         c = _make_client(post_json={"job_id": "srv-1"})
