@@ -2601,6 +2601,47 @@ class TestExecutionLogDownload:
         with pytest.raises(RuntimeError, match="PAT-authenticated"):
             _make_client()._open_experiment_artifact_connection()
 
+    @pytest.mark.parametrize(
+        ("host", "account"),
+        [
+            ("locatorhost.snowflakecomputing.com", "locatorhost"),
+            ("myorg-myaccount.snowflakecomputing.com", "myorg-myaccount"),
+            ("account.qa6.us-west-2.aws.snowflakecomputing.com", "account"),
+            ("testaccount-12345.global.snowflakecomputing.com", "testaccount"),
+        ],
+    )
+    def test_connection_kwargs_use_pat_host_as_account(self, monkeypatch, host, account):
+        monkeypatch.setenv(nc.DISABLE_TELEMETRY_ENV, "1")
+        c = CortexTrainingClient.from_pat(
+            host=host,
+            pat="tok-xyz",
+            database="DB",
+            schema="SCH",
+        )
+        identity_queries = []
+
+        def identity(statement):
+            identity_queries.append(statement)
+            return ["USER1", "ROLE1"]
+
+        monkeypatch.setattr(c, "_query_sql_row", identity)
+        kwargs = c._snowflake_connection_kwargs()
+        assert identity_queries == ["SELECT CURRENT_USER(), CURRENT_ROLE()"]
+        assert importlib.import_module("snowflake.connector.util_text").parse_account(host) == account
+        assert kwargs["host"] == host
+        assert kwargs["account"] == host
+        assert kwargs["user"] == "USER1"
+        assert kwargs["role"] == "ROLE1"
+        assert kwargs["authenticator"] == "PROGRAMMATIC_ACCESS_TOKEN"
+        assert kwargs["token"] == "tok-xyz"
+
+        connector = importlib.import_module("snowflake.connector")
+        connected = object()
+        connect = MagicMock(return_value=connected)
+        monkeypatch.setattr(connector, "connect", connect)
+        assert c._open_experiment_artifact_connection() is connected
+        connect.assert_called_once_with(**kwargs)
+
     def test_get_experiment_run_calls_endpoint(self):
         c = _make_client(
             get_json={

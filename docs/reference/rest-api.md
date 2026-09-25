@@ -1595,7 +1595,9 @@ serve empty, non-EOF pages during placement while the pod is still appearing.
 `fetch_execution_logs(job_id)`:
 
 1. Calls `GET /{job_id}/experiment-run`.
-2. Resolves the current user, account, and role through the SQL statements API.
+2. Resolves the current user and role through the SQL statements API. The
+   connector `account` is the PAT host (locator vs account-name hosts must not
+   be mixed).
 3. Opens an explicitly PAT-authenticated Snowflake Connector session.
 4. Uses experiment artifact `LIST` and `GET` to download every object below a
    `/_logs/{sub_job_id}/` subtree.

@@ -1600,16 +1600,16 @@ class CortexTrainingClient:
         config = self._artifact_connection_config
         if config is None:
             raise RuntimeError("requires a PAT-authenticated client")
-        user, account, role = self._query_sql_row(
-            "SELECT CURRENT_USER(), CURRENT_ACCOUNT_NAME(), CURRENT_ROLE()"
-        )
+        user, role = self._query_sql_row("SELECT CURRENT_USER(), CURRENT_ROLE()")
         if not isinstance(user, str) or not user:
             raise ValueError("SQL identity response missing current user")
-        if not isinstance(account, str) or not account:
-            raise ValueError("SQL identity response missing current account")
         kwargs: dict[str, Any] = {
             "host": config["host"],
-            "account": account,
+            # The login must name the account this host addresses; given the host,
+            # the connector's parse_account derives it (first label, or a .global
+            # host without its external id). CURRENT_ACCOUNT_NAME() is not that
+            # on a locator host and that pairing returns 404.
+            "account": config["host"],
             "user": user,
             "authenticator": "PROGRAMMATIC_ACCESS_TOKEN",
             "token": config["pat"],
