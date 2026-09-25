@@ -16,6 +16,13 @@ Everything that shapes the run lives in the job-config JSON:
 - Optimizer and gradient clipping (`optimizer`, `gradient_clipping`)
 - LoRA or full-parameter method (presence of `peft_config`)
 
+The DSS runtime derives DeepSpeed's internal `train_batch_size`,
+`train_micro_batch_size_per_gpu`, and `gradient_accumulation_steps` from the
+training topology. Don't set these fields in `ds_config`. In particular,
+`gradient_accumulation_steps` must be omitted or set to `1`: DSS token-budget
+packing already splits a request into model calls and accumulates their
+token-weighted gradients before the optimizer step.
+
 The remaining `name=value` command-line overrides are recipe-loop settings only
 -- dataset, step count, evaluation cadence, logging and Weights & Biases. Run a
 recipe module with no arguments to see its full list, or read its `Config` class.

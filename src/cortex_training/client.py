@@ -441,6 +441,21 @@ def _validate_primerl_lm_head_config(extra: dict, *, location: str) -> None:
         )
 
 
+def _validate_deepspeed_gas(config: dict, *, location: str) -> None:
+    """Reject DeepSpeed accumulation that conflicts with DSS token packing."""
+    ds_config = config.get("ds_config")
+    if not isinstance(ds_config, dict):
+        return
+    gas = ds_config.get("gradient_accumulation_steps")
+    if gas is None:
+        return
+    if isinstance(gas, bool) or not isinstance(gas, int) or gas != 1:
+        raise ValueError(
+            f"{location}.ds_config.gradient_accumulation_steps must be 1 when "
+            "DSS token-budget packing is enabled; omit it to use server-derived batching"
+        )
+
+
 @dataclass
 class TrainingConfig:
     """Training hyperparameters for a training sub-job.
@@ -475,9 +490,11 @@ class TrainingConfig:
         if self.n_gpus <= 0:
             raise ValueError("training.n_gpus must be > 0")
         _validate_primerl_lm_head_config(self.extra, location="training.extra")
+        _validate_deepspeed_gas(self.extra, location="training.extra")
         prime_rl = self.extra.get("prime_rl")
         if isinstance(prime_rl, dict):
             _validate_primerl_lm_head_config(prime_rl, location="training.extra.prime_rl")
+            _validate_deepspeed_gas(prime_rl, location="training.extra.prime_rl")
 
     def to_wire(self) -> dict:
         out: dict = {
@@ -1430,12 +1447,25 @@ class CortexTrainingClient:
         sub_job_configs = body.get("sub_job_configs")
         if not isinstance(sub_job_configs, list) or not sub_job_configs:
             raise ValueError("create_job_from_body requires a non-empty sub_job_configs list")
-        training_sub_jobs = sum(
-            1
-            for cfg in sub_job_configs
-            if isinstance(cfg, dict)
-            and str(cfg.get("job_type") or "").strip().lower() == JobType.TRAINING.value
-        )
+        training_sub_jobs = 0
+        for index, cfg in enumerate(sub_job_configs):
+            if (
+                not isinstance(cfg, dict)
+                or str(cfg.get("job_type") or "").strip().lower()
+                != JobType.TRAINING.value
+            ):
+                continue
+            training_sub_jobs += 1
+            training_config = cfg.get("training_config")
+            if isinstance(training_config, dict):
+                location = f"sub_job_configs[{index}].training_config"
+                _validate_deepspeed_gas(training_config, location=location)
+                prime_rl = training_config.get("prime_rl")
+                if isinstance(prime_rl, dict):
+                    _validate_deepspeed_gas(
+                        prime_rl,
+                        location=f"{location}.prime_rl",
+                    )
         if training_sub_jobs > 1:
             raise ValueError("at most one training sub-job is supported per job")
         if body.get("debug") and not _debug_options_enabled():

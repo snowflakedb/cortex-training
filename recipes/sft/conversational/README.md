@@ -80,9 +80,6 @@ shipped example or a copy with `job_config=JOB_CONFIG`.
           "eps": ADAM_EPS
         },
         "ds_config": {
-          "train_batch_size": TRAIN_BATCH_SIZE,
-          "train_micro_batch_size_per_gpu": MICRO_BATCH_SIZE,
-          "gradient_accumulation_steps": TRAIN_BATCH_SIZE / (MICRO_BATCH_SIZE * NUM_TRAINING_GPUS),
           "zero_optimization": {
             "stage": ZERO_STAGE
           },

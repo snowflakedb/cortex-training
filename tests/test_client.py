@@ -156,6 +156,20 @@ class TestTrainingConfig:
         with pytest.raises(ValueError, match="optimizer"):
             tc.validate()
 
+    def test_validate_accepts_omitted_or_one_deepspeed_gas(self):
+        tc = _ok_training()
+        tc.extra = {"ds_config": {}}
+        tc.validate()
+        tc.extra = {"ds_config": {"gradient_accumulation_steps": 1}}
+        tc.validate()
+
+    @pytest.mark.parametrize("gas", [2, 0, True, 1.0, "1"])
+    def test_validate_rejects_non_one_deepspeed_gas(self, gas):
+        tc = _ok_training()
+        tc.extra = {"ds_config": {"gradient_accumulation_steps": gas}}
+        with pytest.raises(ValueError, match="gradient_accumulation_steps must be 1"):
+            tc.validate()
+
     def test_validate_accepts_nested_primerl_fused_ce_false(self):
         tc = _ok_training()
         tc.extra = {
@@ -1134,6 +1148,26 @@ class TestCreateJob:
         c = _make_client()
         with pytest.raises(ValueError, match="sub_job_configs"):
             c.create_job_from_body({"sub_job_configs": []})
+
+    def test_create_job_from_body_rejects_non_one_deepspeed_gas_before_post(self):
+        c = _make_client()
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": "training",
+                    "model_name": "gpt2",
+                    "training_config": {
+                        "max_seq_len": 128,
+                        "train_batch_size": 1,
+                        "n_gpus": 2,
+                        "ds_config": {"gradient_accumulation_steps": 2},
+                    },
+                }
+            ],
+        }
+        with pytest.raises(ValueError, match="gradient_accumulation_steps must be 1"):
+            c.create_job_from_body(body)
+        c._session.post.assert_not_called()
 
     def test_rejects_two_training_sub_jobs_before_post(self):
         c = _make_client()
