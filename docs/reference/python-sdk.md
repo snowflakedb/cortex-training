@@ -32,7 +32,9 @@ client = CortexTrainingClient.from_pat(
 
 Tuning knobs on the constructor: `endpoint`, `poll_interval` (0.5s),
 `poll_timeout` (1800s), `poll_backoff_multiplier` (1.25), `poll_max_interval`
-(6s), `pool_maxsize` (1024), `max_retries` (10). `from_connection_name` and
+(6s), `pool_maxsize` (1024), `max_retries` (10), and `request_timeout`
+(`(30s connect, 600s read)`). Pass a positive scalar to use the same connect
+and read timeout, or a `(connect, read)` pair. `from_connection_name` and
 `from_pat` also accept `telemetry_timeout` (3s) for best-effort client metrics.
 
 ## Client metrics

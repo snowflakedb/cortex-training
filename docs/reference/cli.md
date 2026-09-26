@@ -312,6 +312,12 @@ prints a `capacity_by_hardware` map. Each entry includes `has_reservation`,
 `max_total_gpus`, `reserved_gpus`, `in_use_gpus`, `pending_gpus`, and
 `available_gpus`.
 
+Each hardware lookup is attempted once with at most a 10-second connect timeout
+and a 30-second read timeout; a shorter SDK timeout still wins. A silent
+network, proxy, or service hop therefore fails instead of leaving the command
+blocked indefinitely. The three lookups run serially; use `--hardware` when
+only one type is needed.
+
 `--hardware` keeps the single-capacity response shape for one GPU type.
 
 `max_total_gpus` is the canonical ceiling and supersedes the deprecated

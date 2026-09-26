@@ -225,11 +225,18 @@ All values are configurable on `CortexTrainingClient(...)`.
 
 ### 3.5 Retries
 
+Every HTTP request has a default 30-second connect timeout and 600-second read
+timeout. Callers can configure a shorter positive scalar or a `(connect, read)`
+pair with `CortexTrainingClient(request_timeout=...)`.
+
 The general request path retries connection/time-out failures and HTTP:
 
 ```text
 404, 409, 429, 500, 502, 503, 504
 ```
+
+Capacity is the exception: it is attempted once with the shorter bounds
+documented in [section 5.4](#54-capacity---get-capacity).
 
 The default is ten retries after the first attempt, with exponential jitter.
 
@@ -458,6 +465,11 @@ create-job field: `H200`, `B200`, or `B300`, defaulting to `H200` when omitted.
 unknown value client-side. The CLI `capacity` command, with no `--hardware`
 flag, calls this endpoint once per type and wraps the results in
 `capacity_by_hardware`.
+
+The SDK attempts each capacity lookup once with at most a 10-second connect
+timeout and a 30-second read timeout; a shorter configured request timeout still
+wins. This endpoint is a fast control-plane read, so a silent network, proxy, or
+service hop fails rather than blocking indefinitely.
 
 ```json
 {

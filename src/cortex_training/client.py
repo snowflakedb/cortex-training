@@ -43,6 +43,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -157,6 +158,55 @@ class ChunkGroupRestartError(ChunkGroupError):
 
 class ChunkGroupConflictError(ChunkGroupError):
     """The same chunk-group identity was reused inconsistently."""
+
+
+# Default per-request HTTP timeout, as a (connect, read) pair in seconds. The
+# read leg accommodates long-running data-plane calls; fast control-plane calls
+# such as GetCapacity apply a smaller bound explicitly.
+_DEFAULT_REQUEST_TIMEOUT = (30.0, 600.0)
+_CAPACITY_REQUEST_TIMEOUT = (10.0, 30.0)
+
+
+def _validated_request_timeout(
+    request_timeout: float | tuple[float, float],
+) -> tuple[float, float]:
+    values = (
+        request_timeout
+        if isinstance(request_timeout, tuple)
+        else (request_timeout, request_timeout)
+    )
+    if len(values) != 2 or any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+        for value in values
+    ):
+        raise ValueError(
+            "request_timeout must be a positive finite number of seconds, or a "
+            f"(connect, read) pair of them; got {request_timeout!r}"
+        )
+    return float(values[0]), float(values[1])
+
+
+class _DefaultTimeoutSession(requests.Session):
+    """Apply a default timeout to every request that does not provide one."""
+
+    def __init__(self, default_timeout: tuple[float, float]):
+        super().__init__()
+        self.default_timeout = default_timeout
+
+    def request(
+        self,
+        *args: Any,
+        timeout: Any = None,
+        **kwargs: Any,
+    ) -> requests.Response:  # type: ignore[override]
+        return super().request(
+            *args,
+            timeout=self.default_timeout if timeout is None else timeout,
+            **kwargs,
+        )
 
 
 def _is_transient(exc: BaseException) -> bool:
@@ -1092,6 +1142,7 @@ class CortexTrainingClient:
         poll_max_interval: float = 6.0,
         pool_maxsize: int = 1024,
         max_retries: int = 10,
+        request_timeout: float | tuple[float, float] = _DEFAULT_REQUEST_TIMEOUT,
     ):
         if poll_interval <= 0:
             raise ValueError("poll_interval must be > 0")
@@ -1105,6 +1156,7 @@ class CortexTrainingClient:
             raise ValueError("pool_maxsize must be > 0")
         if max_retries < 0:
             raise ValueError("max_retries must be >= 0")
+        self.request_timeout = _validated_request_timeout(request_timeout)
         self.base_url = base_url.rstrip("/")
         self.database = database
         self.schema = schema
@@ -1129,7 +1181,7 @@ class CortexTrainingClient:
         self._auth_provider: SnowflakeProfileAuth | None = None
         self._metric_emitter: OtlpMetricEmitter | None = None
         self._operation_metric_state = threading.local()
-        self._session = requests.Session()
+        self._session = _DefaultTimeoutSession(self.request_timeout)
         adapter = HTTPAdapter(pool_connections=pool_maxsize, pool_maxsize=pool_maxsize)
         self._session.mount("https://", adapter)
         self._session.mount("http://", adapter)
@@ -1342,13 +1394,22 @@ class CortexTrainingClient:
                 parts.append(f"{key}={value}")
         return " ".join(parts)
 
-    def _send(self, method: str, url: str, *, retry_on=_is_transient, **kwargs) -> requests.Response:
+    def _send(
+        self,
+        method: str,
+        url: str,
+        *,
+        retry_on=_is_transient,
+        max_retries: int | None = None,
+        **kwargs,
+    ) -> requests.Response:
         fn = getattr(self._session, method.lower())
         debug_context = kwargs.pop("debug_context", None)
         debug_label = self._debug_context_label(debug_context) if debug_context is not None else None
         attempt_no = 0
         auth_retry_used = False
-        max_attempts = 1 + self.max_retries
+        retry_limit = self.max_retries if max_retries is None else max_retries
+        max_attempts = 1 + retry_limit
         displayed_max_attempts = max_attempts + (
             1 if self._auth_provider is not None else 0
         )
@@ -1462,7 +1523,7 @@ class CortexTrainingClient:
 
         retryer = Retrying(
             retry=retry_if_exception(retry_on),
-            stop=stop_after_attempt(1 + self.max_retries),
+            stop=stop_after_attempt(max_attempts),
             wait=wait_exponential_jitter(initial=0.5, max=10.0),
             reraise=True,
         )
@@ -1666,6 +1727,11 @@ class CortexTrainingClient:
         resp = self._send(
             "GET",
             f"{self._prefix}/capacity",
+            timeout=(
+                min(self.request_timeout[0], _CAPACITY_REQUEST_TIMEOUT[0]),
+                min(self.request_timeout[1], _CAPACITY_REQUEST_TIMEOUT[1]),
+            ),
+            max_retries=0,
             **({"params": params} if params else {}),
         )
         body = resp.json()

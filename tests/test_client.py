@@ -579,6 +579,52 @@ class TestClientConstruction:
         assert c.poll_backoff_multiplier == 1.25
         assert c.poll_max_interval == 6.0
 
+    def test_default_request_timeout_is_a_connect_read_pair(self):
+        c = CortexTrainingClient(
+            base_url="http://x.test", database="DB", schema="SCH"
+        )
+        assert c.request_timeout == (30.0, 600.0)
+        assert c._session.default_timeout == c.request_timeout
+
+    def test_scalar_request_timeout_applies_to_connect_and_read(self):
+        c = CortexTrainingClient(
+            base_url="http://x.test",
+            database="DB",
+            schema="SCH",
+            request_timeout=12,
+        )
+        assert c.request_timeout == (12.0, 12.0)
+
+    @pytest.mark.parametrize(
+        "bad",
+        [0, -1, (30.0, 0), (30.0,), float("inf"), float("nan"), None, True, "30"],
+    )
+    def test_rejects_invalid_request_timeout(self, bad):
+        with pytest.raises(ValueError, match="request_timeout"):
+            CortexTrainingClient(
+                base_url="http://x.test",
+                database="DB",
+                schema="SCH",
+                request_timeout=bad,
+            )
+
+    def test_session_injects_default_timeout_unless_call_overrides_it(
+        self, monkeypatch
+    ):
+        seen = []
+
+        def fake_request(_session, *_args, **kwargs):
+            seen.append(kwargs["timeout"])
+            return _make_response()
+
+        monkeypatch.setattr(nc.requests.Session, "request", fake_request)
+        session = nc._DefaultTimeoutSession((2.0, 3.0))
+
+        session.get("http://x.test/default")
+        session.get("http://x.test/override", timeout=(0.5, 1.0))
+
+        assert seen == [(2.0, 3.0), (0.5, 1.0)]
+
     @pytest.mark.parametrize(
         ("kwargs", "match"),
         [
@@ -1408,7 +1454,9 @@ class TestReadAndControl:
             "pending_gpus": 16,
             "available_gpus": 40,
         }
-        c._session.get.assert_called_once_with(f"{c._prefix}/capacity")
+        c._session.get.assert_called_once_with(
+            f"{c._prefix}/capacity", timeout=nc._CAPACITY_REQUEST_TIMEOUT
+        )
 
     def test_get_capacity_reports_uncapped_ceiling(self):
         # -1 is the uncapped sentinel and must survive as-is: 0 is a real quota
@@ -1424,8 +1472,45 @@ class TestReadAndControl:
         c = _make_client(get_json={"has_reservation": True, "reserved_gpus": 32})
         c.get_capacity(hardware=Hardware.B200)
         c._session.get.assert_called_once_with(
-            f"{c._prefix}/capacity", params={"hardware": "B200"}
+            f"{c._prefix}/capacity",
+            timeout=nc._CAPACITY_REQUEST_TIMEOUT,
+            params={"hardware": "B200"},
         )
+
+    def test_get_capacity_uses_shorter_caller_timeout_and_does_not_retry(self):
+        c = _make_client()
+        c.request_timeout = (2.0, 0.5)
+        c._session.get.side_effect = nc.requests.exceptions.ReadTimeout("silent peer")
+
+        with pytest.raises(nc.requests.exceptions.ReadTimeout):
+            c.get_capacity()
+
+        c._session.get.assert_called_once_with(
+            f"{c._prefix}/capacity", timeout=(2.0, 0.5)
+        )
+
+    def test_get_capacity_still_replays_once_for_expired_profile_token(self):
+        c = _make_client()
+        c._session.get.side_effect = [
+            _make_error_response({"code": "390112"}, status_code=401),
+            _make_response({"available_gpus": 8}),
+        ]
+        auth = MagicMock()
+        auth.get_token.side_effect = ["old-token", "new-token"]
+        c._auth_provider = auth
+
+        assert c.get_capacity()["available_gpus"] == 8
+
+        auth.refresh.assert_called_once_with("old-token")
+        assert c._session.get.call_count == 2
+        assert c._session.get.call_args_list[0].kwargs == {
+            "headers": {"Authorization": 'Snowflake Token="old-token"'},
+            "timeout": nc._CAPACITY_REQUEST_TIMEOUT,
+        }
+        assert c._session.get.call_args_list[1].kwargs == {
+            "headers": {"Authorization": 'Snowflake Token="new-token"'},
+            "timeout": nc._CAPACITY_REQUEST_TIMEOUT,
+        }
 
     def test_get_capacity_rejects_unknown_hardware(self):
         c = _make_client(get_json={})
