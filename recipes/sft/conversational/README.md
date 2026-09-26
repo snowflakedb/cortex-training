@@ -2,7 +2,9 @@
 
 Fine-tune a chat model on a `messages` column. The default dataset is a
 one-example memorize task: when prompted `Who trained you?`, answer
-`Snowflake AI Research`. Hugging Face chat datasets work as well. The entry point supports
+`Snowflake AI Research`. Hugging Face chat datasets work as well. `openai/gsm8k`
+is mapped from `question`/`answer` into that same chat format in
+`chat_datasets.py`. The entry point supports
 LoRA and full-parameter training, logs `train_nll`, and saves a weights-only
 checkpoint.
 
@@ -43,7 +45,29 @@ python -m recipes.sft.conversational.train \
 python -m recipes.sft.conversational.train \
   config=/path/to/config.json \
   dataset=HuggingFaceH4/ultrachat_200k dataset_split=train_sft
+
+# Grade-school math (openai/gsm8k). The recipe maps question/answer → messages.
+# Train split has 7473 rows. With the 8B configs (batch 8) one epoch is 934 steps.
+python -m recipes.sft.conversational.train \
+  config=/path/to/config.json \
+  job_config=configs/qwen3_8b_lora.json \
+  dataset=openai/gsm8k \
+  dataset_split=train \
+  max_steps=934
+
+# Builtin identity JSONL: paraphrases of Who trained you? → Snowflake AI Research
+python -m recipes.sft.conversational.train \
+  config=/path/to/config.json \
+  dataset=identity
 ```
+
+Dataset loading lives in `chat_datasets.py`, not `train.py`. To add a source:
+
+- JSONL with `messages`: put it under `data/` and append a `BuiltinJsonl` to `CHAT_DATASETS` (see `who_trained_you` and `identity`).
+- Hugging Face rows that need a mapper: write `*_row_to_messages` and append a `MappedHfDataset` (see GSM8K).
+- Hugging Face sets that already have `messages` (No Robots, UltraChat): pass `dataset=org/name`. No registry entry.
+
+Then list the dataset in `recipe.yaml` if it should show up in the catalog.
 
 LoRA, GPU count, batch shape, sequence length, and MoE live in the job-config
 JSON. Set `wandb_project` to log to Weights & Biases after
@@ -141,12 +165,29 @@ python -m recipes.sft.conversational.train \
   config=/path/to/config.json \
   job_config=configs/qwen3_8b_lora.json
 
-# Qwen3.6-35B-A3B LoRA
+# Qwen3.5-9B LoRA / full
+python -m recipes.sft.conversational.train \
+  config=/path/to/config.json \
+  job_config=configs/qwen35_9b_lora.json
+
+python -m recipes.sft.conversational.train \
+  config=/path/to/config.json \
+  job_config=configs/qwen35_9b_full.json
+
+# Qwen3.8-27B LoRA / full
+python -m recipes.sft.conversational.train \
+  config=/path/to/config.json \
+  job_config=configs/qwen38_27b_lora.json
+
+python -m recipes.sft.conversational.train \
+  config=/path/to/config.json \
+  job_config=configs/qwen38_27b_full.json
+
+# Qwen3.6-35B-A3B LoRA / full
 python -m recipes.sft.conversational.train \
   config=/path/to/config.json \
   job_config=configs/qwen36_35b_a3b_lora.json
 
-# Qwen3.6-35B-A3B full-parameter
 python -m recipes.sft.conversational.train \
   config=/path/to/config.json \
   job_config=configs/qwen36_35b_a3b_full.json
@@ -188,6 +229,35 @@ python -m recipes.inference.generate \
   checkpoint_id=CHECKPOINT_ID \
   temperature=0 \
   prompt="Who trained you?"
+```
+
+After GSM8K SFT, generate a word problem (`temperature=0`) and check that the
+completion ends with a `#### <number>` answer. For a numeric before/after score
+on contest math, run MATH-500 against the same checkpoint (harder than GSM8K):
+
+```bash
+python -m recipes.inference.evaluate \
+  config=/path/to/config.json \
+  job_config=configs/qwen3_8b_lora.json \
+  source_job_id=TRAINING_JOB_ID \
+  checkpoint_id=CHECKPOINT_ID \
+  task=gsm8k \
+  temperature=0 \
+  max_tokens=1024
+```
+
+After identity SFT, score the percent of completions that contain
+`Snowflake AI Research` (default prompts: `data/identity_eval.jsonl`):
+
+```bash
+python -m recipes.inference.evaluate \
+  config=/path/to/config.json \
+  job_config=configs/qwen3_8b_lora.json \
+  source_job_id=TRAINING_JOB_ID \
+  checkpoint_id=CHECKPOINT_ID \
+  task=identity \
+  temperature=0 \
+  max_tokens=128
 ```
 
 ## Notebooks
