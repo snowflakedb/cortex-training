@@ -160,10 +160,6 @@ def apply_training_sequence_parallelism(
         logical_dp = n_gpus // sp_size
         training["sp_size"] = sp_size
         training["train_batch_size"] = logical_dp
-        ds_config = training["ds_config"]
-        ds_config["train_batch_size"] = logical_dp
-        ds_config["train_micro_batch_size_per_gpu"] = 1
-        ds_config["gradient_accumulation_steps"] = 1
 
 
 def build_forward_backward_probe_spec(
