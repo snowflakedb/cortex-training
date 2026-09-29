@@ -1,10 +1,11 @@
 # Authentication
 
 Cortex Training authenticates through a Snowflake Programmatic Access Token
-(PAT). This page walks you through two steps:
+(PAT). This page walks you through three steps:
 
 1. **Create a PAT** — required regardless of which configuration method you use
-2. **Configure the client** — pick one of the methods below to supply your PAT
+2. **Create the database** — one-time setup for the connection config
+3. **Configure the client** — pick one of the methods below to supply your PAT
 
 ## Step 1: Create a PAT
 
@@ -18,7 +19,23 @@ Cortex Training authenticates through a Snowflake Programmatic Access Token
 
 <!-- TODO: add screenshots for steps 2-7 -->
 
-## Step 2: Configure the Client
+## Step 2: Create the Database
+
+The connection config references a database and schema. This database must
+exist in your Snowflake account — otherwise the client will fail with a
+"database not found" error. It is only used for connection routing, not for
+storing training data.
+
+Run this in Snowsight before configuring the client:
+
+```sql
+CREATE DATABASE IF NOT EXISTS CORTEX_TRAINING_DB;
+```
+
+You can use any database name, but it must match the `database` field in your
+connection config below.
+
+## Step 3: Configure the Client
 
 Once you have a PAT, pick **one** of the following methods to configure the
 client. We recommend `connections.toml`.
