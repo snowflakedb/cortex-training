@@ -1,16 +1,15 @@
 # Getting Started
 
-Follow this path to install the Cortex Training client, connect it to your
-Snowflake account, and submit a short supervised fine-tuning job.
+Follow this path to set up your Snowflake account, authenticate, install the
+client, and run your first training job.
 
-1. [Check the prerequisites](prerequisites.md) for account access,
-   authentication, and GPU capacity.
-2. [Set up the client](setup.md), configure a Snowflake connection, and verify
-   access to the training endpoint.
-3. [Run a quick SFT job](first-sft-run.md) with the conversational training
-   recipe.
+1. [Account Setup](account_setup.md) — end-to-end guide from account creation
+   to a completed training job. Start here if you are new.
+2. [Authentication](authentication.md) — detailed reference for PAT generation
+   and all supported configuration methods (connections.toml, JSON, environment
+   variables).
 
-After completing these steps, use the [recipe catalog](../../recipes/README.md)
-to choose another training workflow or consult the
-[troubleshooting reference](../reference/troubleshooting.md) if a command
-fails.
+After completing account setup, use the
+[recipe catalog](../../recipes/README.md) to explore other training workflows
+or consult the [troubleshooting reference](../reference/troubleshooting.md) if
+a command fails.
