@@ -10,14 +10,30 @@ Cortex Training authenticates through a Snowflake Programmatic Access Token
 ## Step 1: Create a PAT
 
 1. Log in to your Snowflake account at `https://<your-account>.snowflakecomputing.com`
+
 2. Click your **user icon** (bottom left)
-3. Go to **Settings**
-4. Select **Developer** → **Programmatic Access Tokens**
-5. Click **Generate New Token**
-6. Give it a name (e.g., `cortex-training`) and set an expiry
+
+   ![Click user icon](../../assets/images/pat-user-menu.png)
+
+3. Click **Settings**
+
+   ![Click Settings](../../assets/images/pat-settings.png)
+
+4. Select **Authentication**
+
+   ![Click Authentication](../../assets/images/pat-authentication.png)
+
+5. Click **Generate token**
+
+   ![Click Generate token](../../assets/images/pat-generate-token.png)
+
+6. Give it a name (e.g., `cortex-training`), set an expiry, and click **Generate**
+
+   ![Generate token dialog](../../assets/images/pat-token-generation.png)
+
 7. Copy the token value immediately — you cannot view it again
 
-<!-- TODO: add screenshots for steps 2-7 -->
+   ![Copy token](../../assets/images/pat-token-generated.png)
 
 ## Step 2: Create the Database
 
