@@ -2601,6 +2601,7 @@ class CortexTrainingClient:
         target_sub_job_ids: list[str],
         *,
         weight_format: str | None = None,
+        bucket_size: int | None = None,
         sub_job_id: str | None = None,
         sub_job_type: str | None = None,
     ) -> str:
@@ -2619,6 +2620,8 @@ class CortexTrainingClient:
                 ``[f"{job_id}:sampling:0"]``.
             weight_format: ``"vllm"`` (server default) or ``"hf"`` for full
                 weights, or ``"lora"`` to broadcast only the adapter tensors.
+            bucket_size: Optional transfer-bucket size in bytes. Increase this
+                when one model tensor exceeds the server default bucket.
 
         Example::
 
@@ -2637,6 +2640,10 @@ class CortexTrainingClient:
         if weight_format is not None:
             # "lora" broadcasts only the trained adapter tensors.
             body["weight_format"] = weight_format
+        if bucket_size is not None:
+            if bucket_size <= 0:
+                raise ValueError("bucket_size must be positive")
+            body["bucket_size"] = int(bucket_size)
         return self._operation(
             job_id,
             "weight-sync",
