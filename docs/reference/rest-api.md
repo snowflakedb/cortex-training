@@ -1474,7 +1474,14 @@ A non-chunked DSSST1 result can appear inside poll JSON as:
 }
 ```
 
-`poll_request()` base64-decodes and passes the frame to `wire.loads()`.
+`poll_request()` base64-decodes and passes the frame to `wire.loads()`. If the
+JSON envelope also has a `metrics` object, those keys are shallow-merged into
+the decoded result's `metrics`. Envelope keys win on collision. Payload
+`metrics` are kept when the envelope has none.
+
+A result with `payload_b64` but no `wire_format` is left encoded unless
+`poll_request()` is completing a `forward()` request id minted by this client.
+In that case the blob is decoded the same way and envelope `metrics` are merged.
 
 ### 9.5 Result chunks
 
@@ -1490,7 +1497,8 @@ Large results can arrive through poll events:
 
 A poll can also include `next_cursor`. `poll_request()` drains all pages,
 validates chunk SHA-256 values, uses `wire.decode_result_chunks()`, and returns
-the reconstructed object.
+the reconstructed object. Terminal-page `result.metrics` are merged into that
+object with the same envelope-wins rule as [section 9.4](#94-encoded-results).
 
 ---
 

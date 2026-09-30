@@ -2200,6 +2200,7 @@ class TestDataPlane:
             sub_job_type="training",
         )
         assert out == {"request_id": "r-forward"}
+        assert "r-forward" in c._forward_request_ids
         c._session.post.assert_called_once_with(
             f"{c._prefix}/j1/operation",
             json={
@@ -2213,6 +2214,7 @@ class TestDataPlane:
     def test_forward_operation_omits_none_fields(self):
         c = _make_client(post_json={"ok": True})
         c.forward("j1")
+        assert not c._forward_request_ids
         c._session.post.assert_called_once_with(
             f"{c._prefix}/j1/operation",
             json={"operation_type": "forward"},
@@ -2397,6 +2399,7 @@ class TestRequestPolling:
                 "text": "ok",
                 "token_ids": torch.tensor([1, 2, 3], dtype=torch.int64),
                 "logprobs": torch.tensor([0.125, -0.5], dtype=torch.float32),
+                "metrics": {"model/tokens": 3},
             }
         )
         c = _make_client(
@@ -2412,6 +2415,7 @@ class TestRequestPolling:
                             "encoding": "base64",
                             "wire_format": "DSSST1",
                             "payload_b64": base64.b64encode(payload).decode("ascii"),
+                            "metrics": {"router_replay/tx_bytes_avg": 12.0},
                         },
                     },
                     {"type": "done", "completed": 1, "failed": 0},
@@ -2427,6 +2431,10 @@ class TestRequestPolling:
                     "text": "ok",
                     "token_ids": [1, 2, 3],
                     "logprobs": [0.125, -0.5],
+                    "metrics": {
+                        "model/tokens": 3,
+                        "router_replay/tx_bytes_avg": 12.0,
+                    },
                 },
             },
             {"type": "done", "completed": 1, "failed": 0},
@@ -2477,11 +2485,67 @@ class TestRequestPolling:
                     "encoding": "base64",
                     "wire_format": "DSSST1",
                     "payload_b64": base64.b64encode(payload).decode("ascii"),
+                    "metrics": {"router_replay/tx_bytes_avg": 12.0},
                 },
             }
         )
         monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
-        assert c.poll_request("j1", "r1") == {"avg_loss": 0.5}
+        assert c.poll_request("j1", "r1") == {
+            "avg_loss": 0.5,
+            "metrics": {"router_replay/tx_bytes_avg": 12.0},
+        }
+
+    def test_poll_request_keeps_payload_metrics_when_envelope_has_none(self, monkeypatch):
+        from cortex_training import wire
+
+        payload = wire.dumps({"avg_loss": 0.5, "metrics": {"model/tokens": 8}})
+        c = _make_client(
+            get_json={
+                "status": "done",
+                "result": {
+                    "content_type": "application/octet-stream",
+                    "encoding": "base64",
+                    "wire_format": "DSSST1",
+                    "payload_b64": base64.b64encode(payload).decode("ascii"),
+                },
+            }
+        )
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        assert c.poll_request("j1", "r1") == {
+            "avg_loss": 0.5,
+            "metrics": {"model/tokens": 8},
+        }
+
+    def test_poll_request_envelope_metrics_win_on_key_collision(self, monkeypatch):
+        from cortex_training import wire
+
+        payload = wire.dumps(
+            {
+                "avg_loss": 0.5,
+                "metrics": {"model/tokens": 8, "shared/bytes": 1.0},
+            }
+        )
+        c = _make_client(
+            get_json={
+                "status": "done",
+                "result": {
+                    "content_type": "application/octet-stream",
+                    "encoding": "base64",
+                    "wire_format": "DSSST1",
+                    "payload_b64": base64.b64encode(payload).decode("ascii"),
+                    "metrics": {"router_replay/tx_bytes_avg": 12.0, "shared/bytes": 2.0},
+                },
+            }
+        )
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        assert c.poll_request("j1", "r1") == {
+            "avg_loss": 0.5,
+            "metrics": {
+                "model/tokens": 8,
+                "shared/bytes": 2.0,
+                "router_replay/tx_bytes_avg": 12.0,
+            },
+        }
 
     def test_poll_request_keeps_non_generate_dssst1_tensors(self, monkeypatch):
         from cortex_training import wire
@@ -2546,6 +2610,63 @@ class TestRequestPolling:
         }
         assert "r-generate" not in c._generate_request_ids
 
+    def test_poll_request_decodes_a_legacy_forward_result_envelope(self, monkeypatch):
+        from cortex_training import wire
+
+        payload = wire.dumps(
+            {"job_id": "j1", "logprobs": torch.tensor([0.25, -1.5], dtype=torch.float32)}
+        )
+        c = _make_client(
+            get_json={
+                "status": "done",
+                "result": {
+                    "job_id": "j1",
+                    "payload_b64": base64.b64encode(payload).decode("ascii"),
+                    "metrics": {"router_replay/tx_bytes_peak": 24.0},
+                },
+            }
+        )
+        c._forward_request_ids.add("r-forward")
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+
+        result = c.poll_request("j1", "r-forward")
+        assert torch.equal(result["logprobs"], torch.tensor([0.25, -1.5]))
+        assert result["metrics"] == {"router_replay/tx_bytes_peak": 24.0}
+        assert "r-forward" not in c._forward_request_ids
+
+    def test_poll_request_leaves_a_self_describing_forward_result_alone(self, monkeypatch):
+        from cortex_training import wire
+
+        payload = wire.dumps(
+            {"job_id": "j1", "logprobs": torch.tensor([0.5], dtype=torch.float32)}
+        )
+        c = _make_client(
+            get_json={
+                "status": "done",
+                "result": {
+                    "content_type": "application/octet-stream",
+                    "encoding": "base64",
+                    "wire_format": "DSSST1",
+                    "payload_b64": base64.b64encode(payload).decode("ascii"),
+                },
+            }
+        )
+        c._forward_request_ids.add("r-forward")
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+
+        result = c.poll_request("j1", "r-forward")
+        assert torch.equal(result["logprobs"], torch.tensor([0.5]))
+        assert "r-forward" not in c._forward_request_ids
+
+    def test_poll_request_forgets_a_forward_id_on_failure(self, monkeypatch):
+        c = _make_client(get_json={"status": "failed", "error": "boom"})
+        c._forward_request_ids.add("r-forward")
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            c.poll_request("j1", "r-forward")
+        assert "r-forward" not in c._forward_request_ids
+
     def test_poll_request_decodes_chunked_dssst1_result(self, monkeypatch):
         from cortex_training import wire
 
@@ -2560,14 +2681,23 @@ class TestRequestPolling:
             }
             body = {"status": "running", "events": [event], "next_cursor": str(idx + 1)}
             if idx == len(chunks) - 1:
-                body = {"status": "done", "events": [event]}
+                body = {
+                    "status": "done",
+                    "events": [event],
+                    "result": {
+                        "metrics": {"router_replay/tx_max_bytes": 4096.0},
+                    },
+                }
             responses.append(_make_response(body))
 
         c = _make_client()
         c._session.get.side_effect = responses
         monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
 
-        assert c.poll_request("j1", "r1") == {"text": "x" * 20_000}
+        assert c.poll_request("j1", "r1") == {
+            "text": "x" * 20_000,
+            "metrics": {"router_replay/tx_max_bytes": 4096.0},
+        }
         assert c._session.get.call_args_list[1].kwargs["params"] == {"cursor": "1"}
 
     def test_poll_request_failed(self, monkeypatch):
