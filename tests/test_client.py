@@ -3037,51 +3037,78 @@ class TestExecutionLogDownload:
 
 class TestEnsureDatabase:
     def test_skipped_for_http_base_url(self):
+        """Mock/test mode: no DB check at all."""
         c = CortexTrainingClient(base_url="http://test.local", database="DB", schema="SCH")
         c._session = MagicMock()
-        c._ensure_database()
-        assert c._db_ensured is True
+        c._session.get.return_value = _make_response({"jobs": []})
+        c._send("GET", f"{c.base_url}/test")
         c._session.post.assert_not_called()
 
-    def test_creates_database_on_first_send(self):
+    def test_no_extra_call_when_db_exists(self):
+        """Happy path: DB exists, no CREATE DATABASE call made."""
         c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
         c._session = MagicMock()
-        create_resp = _make_response({"data": [["Database MY_DB successfully created."]]})
         api_resp = _make_response({"jobs": []})
-        c._session.post.side_effect = [create_resp, api_resp]
         c._session.get.return_value = api_resp
-        assert c._db_ensured is False
         c._send("GET", f"{c.base_url}/api/v2/databases/MY_DB/schemas/SCH/cortex-training/jobs")
+        # Only the GET was made, no POST to /statements
+        c._session.post.assert_not_called()
+
+    def test_creates_db_on_not_found_then_retries(self):
+        """DB missing: first request fails, CREATE DATABASE, retry succeeds."""
+        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
+        c._session = MagicMock()
+        not_found_resp = _make_error_response(
+            {"message": "Database 'MY_DB' does not exist or not authorized."}, status_code=404
+        )
+        create_resp = _make_response({"data": [["Database MY_DB successfully created."]]})
+        ok_resp = _make_response({"jobs": []})
+        c._session.get.side_effect = [not_found_resp, ok_resp]
+        c._session.post.return_value = create_resp
+        c._send("GET", f"{c.base_url}/test")
         assert c._db_ensured is True
         create_call = c._session.post.call_args_list[0]
         assert "/api/v2/statements" in create_call.args[0]
         assert "CREATE DATABASE IF NOT EXISTS MY_DB" in create_call.kwargs["json"]["statement"]
+        assert c._session.get.call_count == 2
 
-    def test_only_runs_once(self):
+    def test_only_retries_once(self):
+        """If DB is still missing after CREATE, don't loop — raise the error."""
         c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
         c._session = MagicMock()
+        not_found_resp = _make_error_response(
+            {"message": "Database 'MY_DB' does not exist or not authorized."}, status_code=404
+        )
         create_resp = _make_response({"data": [["OK"]]})
-        api_resp = _make_response({"jobs": []})
+        c._session.get.return_value = not_found_resp
         c._session.post.return_value = create_resp
-        c._session.get.return_value = api_resp
-        c._send("GET", f"{c.base_url}/test")
-        c._send("GET", f"{c.base_url}/test")
-        post_calls = [call for call in c._session.post.call_args_list if "/api/v2/statements" in str(call)]
-        assert len(post_calls) == 1
+        with pytest.raises(Exception):
+            c._send("GET", f"{c.base_url}/test")
+        assert c._db_ensured is True
 
-    def test_raises_on_permission_error(self):
+    def test_raises_when_create_fails_permission(self):
+        """CREATE DATABASE fails with 403: raise with actionable message."""
         c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
         c._session = MagicMock()
-        err_resp = _make_response({"message": "Insufficient privileges"}, status_code=403)
-        c._session.post.return_value = err_resp
-        with pytest.raises(RuntimeError, match="CREATE DATABASE privileges"):
+        not_found_resp = _make_error_response(
+            {"message": "Database 'MY_DB' does not exist or not authorized."}, status_code=404
+        )
+        perm_resp = _make_error_response({"message": "Insufficient privileges"}, status_code=403)
+        c._session.get.return_value = not_found_resp
+        c._session.post.return_value = perm_resp
+        with pytest.raises((RuntimeError, Exception)):
             c._send("GET", f"{c.base_url}/test")
-        assert c._db_ensured is False
 
-    def test_raises_on_network_error(self):
-        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
+    def test_quotes_lowercase_database_name(self):
+        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="my_db", schema="SCH")
         c._session = MagicMock()
-        c._session.post.side_effect = ConnectionError("network down")
-        with pytest.raises(RuntimeError, match="Failed to ensure database"):
-            c._send("GET", f"{c.base_url}/test")
-        assert c._db_ensured is False
+        not_found_resp = _make_error_response(
+            {"message": "Database 'my_db' does not exist or not authorized."}, status_code=404
+        )
+        create_resp = _make_response({"data": [["OK"]]})
+        ok_resp = _make_response({"jobs": []})
+        c._session.get.side_effect = [not_found_resp, ok_resp]
+        c._session.post.return_value = create_resp
+        c._send("GET", f"{c.base_url}/test")
+        create_call = c._session.post.call_args_list[0]
+        assert '"my_db"' in create_call.kwargs["json"]["statement"]

@@ -91,7 +91,12 @@ cortex-training capacity
 ```
 
 This should print your available GPU capacity. The client automatically creates
-the configured database if it does not exist.
+the configured database if it does not exist. If automatic creation fails (for
+example, your role lacks `CREATE DATABASE`), create it manually in Snowsight:
+
+```sql
+CREATE DATABASE IF NOT EXISTS CORTEX_TRAINING_DB;
+```
 
 ### Option B: JSON config (legacy)
 

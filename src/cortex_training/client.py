@@ -1203,6 +1203,7 @@ class CortexTrainingClient:
         self._artifact_connection_factory: Callable[[], Any] | None = None
         self._auth_provider: SnowflakeProfileAuth | None = None
         self._db_ensured = False
+        self._db_creating = False
         self._metric_emitter: OtlpMetricEmitter | None = None
         self._operation_metric_state = threading.local()
         self._session = _DefaultTimeoutSession(self.request_timeout)
@@ -1418,46 +1419,54 @@ class CortexTrainingClient:
                 parts.append(f"{key}={value}")
         return " ".join(parts)
 
-    def _ensure_database(self) -> None:
-        """Create the configured database if it does not exist.
+    def _create_database(self) -> None:
+        """Attempt to create the configured database.
 
-        Runs once per client lifetime on the first ``_send`` call. Skipped for
-        non-HTTPS base URLs (local/mock mode). Raises on failure so callers
-        get a clear error before wasting GPU time on a request that would fail.
+        Called only when an API request fails with a database-not-found error.
+        Routes through ``_send`` so auth works for both PAT and connection
+        profile users. Raises on failure with an actionable error message.
         """
-        if self._db_ensured:
-            return
-        if not self.base_url.startswith("https://"):
-            self._db_ensured = True
-            return
-        statement = f"CREATE DATABASE IF NOT EXISTS {self.database}"
+        db_name = f'"{self.database}"' if self.database != self.database.upper() else self.database
+        statement = f"CREATE DATABASE IF NOT EXISTS {db_name}"
+        manual_hint = (
+            f"Create it manually in Snowsight: CREATE DATABASE IF NOT EXISTS {db_name}; "
+            "— or set an existing database in your connection config."
+        )
+        self._db_creating = True  # prevent recursion from inner _send call
         try:
-            fn = getattr(self._session, "post")
-            resp = fn(
+            logger.info("Database '%s' not found. Attempting to create it...", self.database)
+            resp = self._send(
+                "POST",
                 f"{self.base_url}/api/v2/statements",
-                json={"statement": statement},
+                json={"statement": statement, "timeout": 60},
+                max_retries=1,
             )
-            if resp.status_code == 403 or (
-                resp.status_code >= 400
-                and "Insufficient privileges" in resp.text
-            ):
+            if resp.status_code == 202:
                 raise RuntimeError(
-                    f"Could not create database '{self.database}'. "
-                    "Your role lacks CREATE DATABASE privileges. "
-                    "Create it manually in Snowsight with: "
-                    f"CREATE DATABASE IF NOT EXISTS {self.database}; "
-                    "— or set an existing database in your connection config."
+                    f"Database creation for '{self.database}' was accepted but has not "
+                    f"completed yet. {manual_hint}"
                 )
-            resp.raise_for_status()
             self._db_ensured = True
-            logger.info("Database %s is ready.", self.database)
+            logger.info("Database '%s' created successfully.", self.database)
         except RuntimeError:
             raise
         except Exception as exc:
             raise RuntimeError(
-                f"Failed to ensure database '{self.database}' exists: {exc}. "
-                "Create it manually in Snowsight or check your connection."
+                f"Could not create database '{self.database}': {exc}. {manual_hint}"
             ) from exc
+        finally:
+            self._db_creating = False
+
+    @staticmethod
+    def _is_database_not_found(resp: requests.Response) -> bool:
+        """Return True if the response indicates the configured database does not exist."""
+        if resp.status_code not in (400, 404, 422):
+            return False
+        try:
+            text = resp.text
+        except Exception:
+            return False
+        return "does not exist or not authorized" in text.lower() and "database" in text.lower()
 
     def _send(
         self,
@@ -1468,7 +1477,6 @@ class CortexTrainingClient:
         max_retries: int | None = None,
         **kwargs,
     ) -> requests.Response:
-        self._ensure_database()
         fn = getattr(self._session, method.lower())
         debug_context = kwargs.pop("debug_context", None)
         debug_label = self._debug_context_label(debug_context) if debug_context is not None else None
@@ -1583,6 +1591,21 @@ class CortexTrainingClient:
                         status_code,
                         snowflake,
                         self._debug_response_summary(resp),
+                    )
+                if (
+                    not self._db_ensured
+                    and not self._db_creating
+                    and self._is_database_not_found(resp)
+                ):
+                    resp.close()
+                    self._create_database()
+                    # Retry the original request once after creating the DB.
+                    continue
+                if self._db_ensured and self._is_database_not_found(resp):
+                    db_name = f'"{self.database}"' if self.database != self.database.upper() else self.database
+                    raise RuntimeError(
+                        f"Database '{self.database}' still not found after creation attempt. "
+                        f"Create it manually in Snowsight: CREATE DATABASE IF NOT EXISTS {db_name};"
                     )
                 resp.raise_for_status()
                 return resp
