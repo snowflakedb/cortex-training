@@ -20,9 +20,8 @@ The wire form is flat and uses ``betas``:
     {"name": "AdamW", "lr": 1e-5, "weight_decay": 0.0, "betas": [0.9, 0.95], "eps": 1e-8}
 
 ``normalize_optimizer_config`` is the single place aliases are resolved, so the
-same input always produces the same block. It runs client-side before create-job
-so a bad optimizer costs zero GPU-seconds, and again server-side as an
-independent check.
+same input always produces the same block. It runs in the client before
+create-job.
 
 Normalization only renames and validates; it never fills defaults. The server
 owns the defaults, which keeps an explicitly submitted value distinguishable
@@ -37,9 +36,6 @@ import math
 from typing import Any
 
 
-# Every key the training worker's optimizer builder actually reads. ``fused``
-# selects a fused Adam implementation over ``torch.optim.AdamW``; some MoE
-# architectures force it off.
 SUPPORTED_OPTIMIZER_KEYS = frozenset(
     {
         "name",

@@ -567,10 +567,9 @@ class TrainingConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_optimizer(self) -> "TrainingConfig":
-        # Canonicalize here so a bad optimizer costs zero GPU-seconds: create_job
-        # posts to_wire() of this instance, not a re-validated copy.
         # object.__setattr__ writes the already-normalized values without
-        # re-entering assignment validation.
+        # re-entering assignment validation. create_job posts to_wire() of this
+        # instance, so the rewrite has to land here.
         optimizer, hoisted_gradient_clipping = normalize_optimizer_config(
             self.optimizer, location="training.optimizer"
         )

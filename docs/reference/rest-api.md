@@ -1252,7 +1252,7 @@ The typed client requires:
 
 | Field | Type | Client validation |
 |---|---|---|
-| `optimizer` | object | Canonicalized; must carry at least one setting |
+| `optimizer` | object | Canonicalized; empty only when `gradient_clipping` is set |
 | `max_seq_len` | integer | Greater than zero |
 | `train_batch_size` | integer | Greater than zero |
 | `n_gpus` | integer | Greater than zero |
