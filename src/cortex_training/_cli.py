@@ -867,10 +867,16 @@ def _cmd_generate(
     if not isinstance(prompts, list) or not prompts:
         raise ValueError("generate JSON must contain a non-empty prompts list")
 
+    # A flat list of integers is one pre-tokenized prompt, not a batch of
+    # single-token prompts, and the client encodes it that way. ``bool`` is an
+    # ``int`` subclass, so exclude it rather than read [true, false] as tokens.
+    single_tokenized = isinstance(prompts[0], int) and not isinstance(prompts[0], bool)
+    prompt_count = 1 if single_tokenized else len(prompts)
+
     sampling_params = payload.get("sampling_params")
     if sampling_params is not None:
         if isinstance(sampling_params, list):
-            if len(sampling_params) != len(prompts):
+            if len(sampling_params) != prompt_count:
                 raise ValueError("generate sampling_params list length must match prompts length")
             if any(item is not None and not isinstance(item, dict) for item in sampling_params):
                 raise ValueError("generate sampling_params list items must be objects or null")
@@ -890,7 +896,7 @@ def _cmd_generate(
     )
     response = {
         "job_id": args.job,
-        "prompt_count": len(prompts),
+        "prompt_count": prompt_count,
         "request_id": request_id,
     }
     if poll:
