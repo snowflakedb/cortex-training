@@ -150,7 +150,9 @@ sub-jobs. Pass a shipped example or a copy with `job_config=JOB_CONFIG`.
         },
         "ep_size": EP_SIZE,
 
-        // Optional router replay for MoE training.
+        // Optional router replay for MoE training. Add "mode": "best_effort" to
+        // route rows the sampler no longer holds (e.g. after a sampler restart)
+        // with the trainer's own gate instead of failing the step.
         "router_replay": {"enabled": true, "max_cache_bytes": 2147483648}
       }
     }
