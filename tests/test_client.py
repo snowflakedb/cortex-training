@@ -1996,6 +1996,15 @@ class TestDataPlane:
             c.generate("j1", prompts=[1, 2, 3, 4])
         c._session.post.assert_not_called()
 
+    def test_generate_rejects_mixed_flat_token_list(self):
+        c = _make_client(
+            post_json={"request_id": "g-mixed"},
+            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 8.0, "n_gpus": 1.0}}]},
+        )
+        with pytest.raises(ValueError, match=r"prompts\[1\] must be an integer token id"):
+            c.generate("j1", prompts=[1, 2.5])
+        c._session.post.assert_not_called()
+
     def test_generate_allows_bare_tensor_prompt_under_limit(self):
         c = _make_client(
             post_json={"request_id": "g-tensor"},
@@ -2433,6 +2442,13 @@ class TestPromptTensorPacking:
     def test_empty_inner_list_stays_a_list(self):
         # The server's own non-empty check should be the one that rejects it.
         assert nc._pack_token_prompts([[]]) == [[]]
+
+    def test_mixed_flat_list_is_rejected(self):
+        with pytest.raises(ValueError, match=r"prompts\[1\] must be an integer token id"):
+            nc._pack_token_prompts([1, 2.5])
+
+    def test_bool_list_is_not_packed_as_token_ids(self):
+        assert nc._pack_token_prompts([True, False]) == [True, False]
 
     def test_flat_token_list_is_one_prompt(self):
         packed = nc._pack_token_prompts([7, 8, 9])

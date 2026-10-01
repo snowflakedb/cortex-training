@@ -1134,6 +1134,17 @@ def _as_token_tensor(prompt: list[int]):
         return torch.tensor(prompt, dtype=torch.int64)
 
 
+def _is_token_id(value: object) -> bool:
+    """True for an integer token id. ``bool`` is an ``int`` subclass and is not one."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _require_token_ids(prompt: list, *, location: str) -> None:
+    for index, value in enumerate(prompt):
+        if not _is_token_id(value):
+            raise ValueError(f"{location}[{index}] must be an integer token id, got {value!r}")
+
+
 def _pack_token_prompts(prompts):
     """Move pre-tokenized prompts into the frame's tensor section.
 
@@ -1154,12 +1165,19 @@ def _pack_token_prompts(prompts):
     torch = _load_torch()
     if torch.is_tensor(prompts) or not isinstance(prompts, list) or not prompts:
         return prompts
-    # ``prompts`` is either one prompt or a batch of them, and one flat
-    # ``list[int]`` is a valid single prompt. Checking the first element keeps
-    # that case O(1) instead of walking every token to find out.
-    if isinstance(prompts[0], int):
+    # A flat list of token ids is one prompt. Every element has to be an int;
+    # a later float or bool would otherwise be truncated into the tensor.
+    if _is_token_id(prompts[0]):
+        _require_token_ids(prompts, location="prompts")
         return _as_token_tensor(prompts)
-    return [_as_token_tensor(p) if isinstance(p, list) and p and isinstance(p[0], int) else p for p in prompts]
+    packed = []
+    for index, prompt in enumerate(prompts):
+        if isinstance(prompt, list) and prompt and _is_token_id(prompt[0]):
+            _require_token_ids(prompt, location=f"prompts[{index}]")
+            packed.append(_as_token_tensor(prompt))
+        else:
+            packed.append(prompt)
+    return packed
 
 
 def _sql_string_literal(value: str) -> str:
@@ -2319,7 +2337,9 @@ class CortexTrainingClient:
         # raises on them. Wrapping first means one prompt is checked as one
         # prompt in either shape, and reads the argument the same way
         # ``_pack_token_prompts`` does.
-        if torch.is_tensor(prompts) or (isinstance(prompts, list) and prompts and isinstance(prompts[0], int)):
+        if torch.is_tensor(prompts) or (
+            isinstance(prompts, list) and prompts and _is_token_id(prompts[0])
+        ):
             prompts = [prompts]
 
         if not any(_pretokenized(p) for p in prompts):
