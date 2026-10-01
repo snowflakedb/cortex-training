@@ -461,15 +461,38 @@ def _is_connect_error(exc: BaseException) -> bool:
 
 
 class JobType(str, Enum):
-    """Sub-job types supported by Cortex Training.
+    """Sub-job types defined by the Cortex Training schema.
 
     Matches the ``job_type`` enum in the REST schema; see
-    ``docs/reference/rest-api.md`` section 8.1.
+    ``docs/reference/rest-api.md`` section 8.1. Not every schema value can
+    currently be submitted: ``LOG_PROBABILITY`` configs still validate and
+    serialize, but the client and CLI reject them at submission.
     """
 
     TRAINING = "training"
     SAMPLING = "sampling"
-    LOG_PROBABILITY = "log_probability"
+    LOG_PROBABILITY = "log_probability"  # Schema value; submission is unsupported.
+
+
+_LOG_PROBABILITY_JOB_TYPE_ALIASES = frozenset({"log_probability", "log_prob"})
+_UNSUPPORTED_LOG_PROBABILITY_MESSAGE = (
+    "log_probability sub-jobs are not currently supported"
+)
+
+
+def _normalized_job_type(job_type: Any) -> str:
+    if not isinstance(job_type, str):
+        return ""
+    return job_type.strip().lower().removeprefix("job_type_")
+
+
+def _is_log_probability_job_type(job_type: Any) -> bool:
+    return _normalized_job_type(job_type) in _LOG_PROBABILITY_JOB_TYPE_ALIASES
+
+
+def _reject_log_probability_sub_job(job_type: Any, *, location: str) -> None:
+    if _is_log_probability_job_type(job_type):
+        raise ValueError(f"{location}: {_UNSUPPORTED_LOG_PROBABILITY_MESSAGE}")
 
 
 class Hardware(str, Enum):
@@ -735,9 +758,14 @@ class SubJobConfig(BaseModel):
         model_post_init: list[str] | None = None,
         source_checkpoint_info: dict | None = None,
     ) -> "SubJobConfig":
-        """Build a sampling/log-probability :class:`SubJobConfig`."""
-        if job_type not in (JobType.SAMPLING, JobType.LOG_PROBABILITY):
-            raise ValueError(f"sampling_job() only accepts SAMPLING or LOG_PROBABILITY, got {job_type!r}")
+        """Build a sampling :class:`SubJobConfig`.
+
+        ``job_type`` remains for source compatibility, but only ``SAMPLING`` is
+        currently accepted.
+        """
+        _reject_log_probability_sub_job(job_type, location="sampling_job().job_type")
+        if job_type != JobType.SAMPLING:
+            raise ValueError(f"sampling_job() only accepts SAMPLING, got {job_type!r}")
         _typed_sampling = set(InferenceConfig.model_fields.keys())
         passthrough_sampling = {k: v for k, v in (extra_sampling or {}).items() if k not in _typed_sampling}
         return cls(
@@ -1568,8 +1596,8 @@ class CortexTrainingClient:
 
         Each :class:`SubJobConfig` is validated client-side before the request
         is sent (see :meth:`SubJobConfig.validate`). A job supports zero or one
-        ``training`` sub-job and any number of ``sampling`` /
-        ``log_probability`` sub-jobs. ``job_id`` is optional;
+        ``training`` sub-job and any number of ``sampling`` sub-jobs;
+        ``log_probability`` sub-jobs are rejected here. ``job_id`` is optional;
         when omitted the server generates one. ``experiment_name`` is optional;
         when omitted the server auto-creates an experiment for the job.
         ``hardware`` is optional (:class:`Hardware`.H200 / .B200 / .B300); when
@@ -1604,7 +1632,10 @@ class CortexTrainingClient:
                 raise ValueError(
                     "pending_timeout_seconds must be between 300 and 604800"
                 )
-        for sj in sub_jobs:
+        for index, sj in enumerate(sub_jobs):
+            _reject_log_probability_sub_job(
+                sj.job_type, location=f"sub_jobs[{index}].job_type"
+            )
             SubJobConfig.model_validate(sj.model_dump(by_alias=True))
         body: dict = {"sub_job_configs": [sj.to_wire() for sj in sub_jobs]}
         if job_id is not None:
@@ -1627,22 +1658,27 @@ class CortexTrainingClient:
         while :meth:`create_job` remains the typed path for Python callers.
 
         A job supports zero or one ``training`` sub-job and any number of
-        ``sampling`` / ``log_probability`` sub-jobs; a second training sub-job
-        raises :class:`ValueError` before the request is sent.
+        ``sampling`` sub-jobs; a second training sub-job or any
+        ``log_probability`` sub-job raises :class:`ValueError` before the
+        request is sent.
         """
         if not isinstance(body, dict):
             raise ValueError("create_job_from_body requires a JSON object")
         sub_job_configs = body.get("sub_job_configs")
         if not isinstance(sub_job_configs, list) or not sub_job_configs:
             raise ValueError("create_job_from_body requires a non-empty sub_job_configs list")
-        training_sub_jobs = sum(
-            1
-            for cfg in sub_job_configs
-            if isinstance(cfg, dict)
-            and str(cfg.get("job_type") or "").strip().lower() == JobType.TRAINING.value
-        )
-        if training_sub_jobs > 1:
-            raise ValueError("at most one training sub-job is supported per job")
+        training_sub_jobs = 0
+        for index, cfg in enumerate(sub_job_configs):
+            if not isinstance(cfg, dict):
+                continue
+            job_type = cfg.get("job_type")
+            _reject_log_probability_sub_job(
+                job_type, location=f"sub_job_configs[{index}].job_type"
+            )
+            if str(job_type or "").strip().lower() == JobType.TRAINING.value:
+                training_sub_jobs += 1
+                if training_sub_jobs > 1:
+                    raise ValueError("at most one training sub-job is supported per job")
         if body.get("debug") and not _debug_options_enabled():
             raise ValueError(
                 "create-job debug options are an internal-only capability; set "

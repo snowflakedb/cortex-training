@@ -66,6 +66,17 @@ SubJobConfig = nc.SubJobConfig
 CortexTrainingClient = nc.CortexTrainingClient
 Hardware = nc.Hardware
 
+# Spellings a caller could plausibly pass for the unsupported log-probability
+# type: the enum, loose casing, the fully-qualified enum name, the short alias,
+# and surrounding whitespace.
+LOG_PROBABILITY_JOB_TYPES = [
+    JobType.LOG_PROBABILITY,
+    "LOG_PROBABILITY",
+    "JOB_TYPE_LOG_PROBABILITY",
+    "log_prob",
+    " log_probability ",
+]
+
 
 def _wire_load(data: bytes):
     from cortex_training import wire
@@ -355,17 +366,21 @@ class TestSubJobConfigFactories:
         )
         assert sub.source_checkpoint_info == source
 
-    def test_sampling_job_factory_log_probability(self):
-        sub = SubJobConfig.sampling_job(
-            model_name="gpt2",
-            max_seq_len=128,
-            n_gpus=1,
-            job_type=JobType.LOG_PROBABILITY,
-        )
-        assert sub.job_type == JobType.LOG_PROBABILITY
+    @pytest.mark.parametrize("job_type", LOG_PROBABILITY_JOB_TYPES)
+    def test_sampling_job_factory_rejects_log_probability(self, job_type):
+        with pytest.raises(
+            ValueError,
+            match=r"sampling_job\(\)\.job_type: log_probability sub-jobs are not currently supported",
+        ):
+            SubJobConfig.sampling_job(
+                model_name="gpt2",
+                max_seq_len=128,
+                n_gpus=1,
+                job_type=job_type,
+            )
 
     def test_sampling_job_factory_rejects_training_type(self):
-        with pytest.raises(ValueError, match="SAMPLING or LOG_PROBABILITY"):
+        with pytest.raises(ValueError, match="only accepts SAMPLING, got"):
             SubJobConfig.sampling_job(
                 model_name="gpt2",
                 max_seq_len=128,
@@ -504,11 +519,12 @@ class TestSubJobConfigToWire:
         assert wire["source_checkpoint_info"] == {"checkpoint_id": "cp_1", "source_job_id": "job-a"}
 
     def test_sampling_block_used_for_log_probability(self):
-        sub = SubJobConfig.sampling_job(
-            model_name="gpt2",
-            max_seq_len=128,
-            n_gpus=1,
+        # Constructed directly: the factory rejects log-probability, but the
+        # schema type still serializes.
+        sub = SubJobConfig(
             job_type=JobType.LOG_PROBABILITY,
+            model_name="gpt2",
+            sampling=InferenceConfig(max_seq_len=128, n_gpus=1),
         )
         wire = sub.to_wire()
         assert wire["job_type"] == "log_probability"
@@ -1281,6 +1297,81 @@ class TestCreateJob:
         with pytest.raises(ValueError, match="at most one training sub-job"):
             c.create_job(sub_jobs=[training, training])
         c._session.post.assert_not_called()
+
+    def test_rejects_log_probability_sub_job_before_post(self):
+        c = _make_client()
+        training = SubJobConfig.training_job(
+            model_name="gpt2",
+            optimizer={"type": "adamw"},
+            max_seq_len=128,
+            train_batch_size=1,
+            n_gpus=2,
+        )
+        log_prob = SubJobConfig(
+            job_type=JobType.LOG_PROBABILITY,
+            model_name="gpt2",
+            sampling=_ok_inference(),
+        )
+        with pytest.raises(
+            ValueError,
+            match=r"sub_jobs\[1\]\.job_type: log_probability sub-jobs are not currently supported",
+        ):
+            c.create_job(sub_jobs=[training, log_prob])
+        c._session.post.assert_not_called()
+
+    @pytest.mark.parametrize("job_type", LOG_PROBABILITY_JOB_TYPES)
+    def test_create_job_from_body_rejects_log_probability_before_post(self, job_type):
+        c = _make_client()
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": "sampling",
+                    "model_name": "gpt2",
+                    "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                },
+                {
+                    "job_type": job_type,
+                    "model_name": "gpt2",
+                    "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                },
+            ],
+        }
+        with pytest.raises(
+            ValueError,
+            match=r"sub_job_configs\[1\]\.job_type: log_probability sub-jobs are not currently supported",
+        ):
+            c.create_job_from_body(body)
+        c._session.post.assert_not_called()
+
+    # Only the two documented aliases are rejected; anything else is left to the
+    # server so a newly added schema value is not blocked client-side.
+    @pytest.mark.parametrize("job_type", ["log-probability", "logprob", "sampling"])
+    def test_create_job_from_body_allows_other_job_types(self, job_type):
+        c = _make_client(post_json={"job_id": "srv-1"})
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": job_type,
+                    "model_name": "gpt2",
+                    "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                }
+            ],
+        }
+        assert c.create_job_from_body(body) == {"job_id": "srv-1"}
+
+    def test_create_job_from_body_skips_non_dict_sub_job_configs(self):
+        c = _make_client(post_json={"job_id": "srv-1"})
+        body = {
+            "sub_job_configs": [
+                "log_probability",
+                {
+                    "job_type": "sampling",
+                    "model_name": "gpt2",
+                    "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                },
+            ],
+        }
+        assert c.create_job_from_body(body) == {"job_id": "srv-1"}
 
     def test_create_job_from_body_rejects_two_training_sub_jobs_before_post(self):
         c = _make_client()
