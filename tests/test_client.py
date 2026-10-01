@@ -188,7 +188,7 @@ class TestTrainingConfig:
     def test_to_wire_required_fields(self):
         wire = _ok_training().to_wire()
         assert wire == {
-            "optimizer": {"type": "adamw", "lr": 1e-5},
+            "optimizer": {"name": "adamw", "lr": 1e-5},
             "max_seq_len": 128,
             "train_batch_size": 1,
             "n_gpus": 2,
@@ -245,7 +245,110 @@ class TestTrainingConfig:
         )
         wire = tc.to_wire()
         assert wire["max_seq_len"] == 128
-        assert wire["optimizer"] == {"type": "adamw", "lr": 1e-5}
+        assert wire["optimizer"] == {"name": "adamw", "lr": 1e-5}
+
+
+# ─── TrainingConfig — optimizer canonicalization ────────────────────────
+
+
+class TestTrainingConfigOptimizer:
+    def test_aliases_are_canonicalized_on_construction(self):
+        tc = TrainingConfig(
+            optimizer={"type": "adamw", "beta1": 0.9, "beta2": 0.95},
+            max_seq_len=128,
+            train_batch_size=1,
+            n_gpus=2,
+        )
+        assert tc.optimizer == {"name": "adamw", "betas": [0.9, 0.95]}
+        assert tc.to_wire()["optimizer"] == {"name": "adamw", "betas": [0.9, 0.95]}
+
+    def test_nested_gradient_clipping_is_hoisted(self):
+        tc = TrainingConfig(
+            optimizer={"lr": 1e-5, "gradient_clipping": 0.5},
+            max_seq_len=128,
+            train_batch_size=1,
+            n_gpus=2,
+        )
+        assert tc.optimizer == {"lr": 1e-5}
+        assert tc.gradient_clipping == 0.5
+        assert tc.to_wire()["gradient_clipping"] == 0.5
+
+    def test_typed_gradient_clipping_wins_over_the_nested_value(self):
+        tc = TrainingConfig(
+            optimizer={"lr": 1e-5, "gradient_clipping": 0.5},
+            max_seq_len=128,
+            train_batch_size=1,
+            n_gpus=2,
+            gradient_clipping=2.0,
+        )
+        assert tc.gradient_clipping == 2.0
+        assert "gradient_clipping" not in tc.optimizer
+
+    def test_clip_only_optimizer_empties_the_block_and_revalidates(self):
+        tc = TrainingConfig(
+            optimizer={"gradient_clipping": 1.0},
+            max_seq_len=128,
+            train_batch_size=1,
+            n_gpus=2,
+        )
+        assert tc.optimizer == {}
+        assert tc.gradient_clipping == 1.0
+        # The canonical model must survive a second pass; validate() and
+        # create_job both re-run model_validate.
+        tc.validate()
+        assert tc.to_wire()["optimizer"] == {}
+
+    def test_empty_optimizer_with_gradient_clipping_is_accepted(self):
+        tc = TrainingConfig(
+            optimizer={},
+            max_seq_len=128,
+            train_batch_size=1,
+            n_gpus=2,
+            gradient_clipping=1.0,
+        )
+        assert tc.to_wire()["optimizer"] == {}
+        assert tc.to_wire()["gradient_clipping"] == 1.0
+
+    def test_unknown_optimizer_key_is_rejected(self):
+        with pytest.raises(ValidationError, match=r"training\.optimizer contains unsupported field"):
+            TrainingConfig(
+                optimizer={"lr": 1e-5, "momentum": 0.9},
+                max_seq_len=128,
+                train_batch_size=1,
+                n_gpus=2,
+            )
+
+    def test_scheduler_optimizer_key_is_rejected(self):
+        with pytest.raises(ValidationError, match="unsupported scheduler field"):
+            TrainingConfig(
+                optimizer={"lr": 1e-5, "warmup_steps": 10},
+                max_seq_len=128,
+                train_batch_size=1,
+                n_gpus=2,
+            )
+
+    def test_peft_config_in_extra_is_normalized(self):
+        tc = TrainingConfig(
+            optimizer={"lr": 1e-5},
+            max_seq_len=128,
+            train_batch_size=1,
+            n_gpus=2,
+            peft_config={"peft_type": "Lora", "r": 16, "target_modules": ["q_proj"]},
+        )
+        peft = tc.to_wire()["peft_config"]
+        assert peft["task_type"] == "CAUSAL_LM"
+        assert peft["lora_alpha"] == 8
+        assert peft["target_parameters"] == []
+
+    def test_invalid_peft_config_in_extra_is_rejected(self):
+        with pytest.raises(ValidationError, match=r"training\.extra\.peft_config\.peft_type"):
+            TrainingConfig(
+                optimizer={"lr": 1e-5},
+                max_seq_len=128,
+                train_batch_size=1,
+                n_gpus=2,
+                peft_config={"peft_type": "LORA", "target_modules": ["q_proj"]},
+            )
 
 
 # ─── InferenceConfig ────────────────────────────────────────────────────
@@ -280,6 +383,27 @@ class TestInferenceConfig:
     def test_to_wire_extra_does_not_override_required(self):
         ic = InferenceConfig(max_seq_len=4096, n_gpus=1, extra={"max_seq_len": 1})
         assert ic.to_wire()["max_seq_len"] == 4096
+
+    def test_peft_config_in_extra_is_normalized(self):
+        sub = SubJobConfig.sampling_job(
+            model_name="gpt2",
+            max_seq_len=4096,
+            n_gpus=1,
+            extra_sampling={
+                "peft_config": {"peft_type": "Lora", "r": 16, "target_modules": ["q_proj"]}
+            },
+        )
+        peft = sub.to_wire()["inference_config"]["peft_config"]
+        assert peft["task_type"] == "CAUSAL_LM"
+        assert peft["target_parameters"] == []
+
+    def test_invalid_peft_config_in_extra_is_rejected(self):
+        with pytest.raises(ValidationError, match=r"sampling\.extra\.peft_config\.peft_type"):
+            InferenceConfig(
+                max_seq_len=4096,
+                n_gpus=1,
+                peft_config={"peft_type": "LORA", "target_modules": ["q_proj"]},
+            )
 
 
 # ─── SubJobConfig — factories ───────────────────────────────────────────
@@ -476,7 +600,7 @@ class TestSubJobConfigToWire:
             "job_type": "training",
             "model_name": "gpt2",
             "training_config": {
-                "optimizer": {"type": "adamw"},
+                "optimizer": {"name": "adamw"},
                 "max_seq_len": 128,
                 "train_batch_size": 1,
                 "n_gpus": 2,
@@ -1100,7 +1224,7 @@ class TestCreateJob:
                     "job_type": "training",
                     "model_name": "gpt2",
                     "training_config": {
-                        "optimizer": {"type": "adamw"},
+                        "optimizer": {"name": "adamw"},
                         "max_seq_len": 128,
                         "train_batch_size": 1,
                         "n_gpus": 2,
@@ -1232,7 +1356,7 @@ class TestCreateJob:
         c = _make_client(post_json={"job_id": "srv-1"})
         train = SubJobConfig.training_job(
             model_name="gpt2",
-            optimizer={"a": 1},
+            optimizer={"name": "adamw"},
             max_seq_len=128,
             train_batch_size=1,
             n_gpus=2,
@@ -1301,6 +1425,117 @@ class TestCreateJob:
         with pytest.raises(ValueError, match="at most one training sub-job"):
             c.create_job_from_body(body)
         c._session.post.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "job_type",
+        ["training", "TRAINING", "JOB_TYPE_TRAINING", " training "],
+    )
+    def test_create_job_from_body_normalizes_training_peft_config(self, job_type, monkeypatch):
+        normalized_peft = {"peft_type": "Lora"}
+        normalize = MagicMock(return_value=normalized_peft)
+        monkeypatch.setattr(nc, "normalize_lora_peft_config", normalize)
+        c = _make_client(post_json={"job_id": "srv-raw"})
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": job_type,
+                    "model_name": "gpt2",
+                    "training_config": {"peft_config": {"r": 8}},
+                },
+            ],
+        }
+
+        assert c.create_job_from_body(body) == {"job_id": "srv-raw"}
+        assert body["sub_job_configs"][0]["training_config"]["peft_config"] == normalized_peft
+        normalize.assert_called_once()
+
+    def test_create_job_from_body_normalizes_sampling_peft_config(self, monkeypatch):
+        normalized_peft = {"peft_type": "Lora"}
+        normalize = MagicMock(return_value=normalized_peft)
+        monkeypatch.setattr(nc, "normalize_lora_peft_config", normalize)
+        c = _make_client(post_json={"job_id": "srv-raw"})
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": "sampling",
+                    "model_name": "gpt2",
+                    "inference_config": {"max_seq_len": 128, "n_gpus": 1, "peft_config": {"r": 8}},
+                },
+            ],
+        }
+
+        assert c.create_job_from_body(body) == {"job_id": "srv-raw"}
+        assert body["sub_job_configs"][0]["inference_config"]["peft_config"] == normalized_peft
+        normalize.assert_called_once()
+
+    def test_create_job_from_body_rewrites_peft_config_in_place(self):
+        c = _make_client(post_json={"job_id": "srv-raw"})
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": "training",
+                    "model_name": "gpt2",
+                    "training_config": {
+                        "optimizer": {"type": "adamw"},
+                        "peft_config": {
+                            "peft_type": "Lora",
+                            "r": 16,
+                            "target_modules": ["q_proj"],
+                        },
+                    },
+                },
+            ],
+        }
+
+        assert c.create_job_from_body(body) == {"job_id": "srv-raw"}
+        training_config = body["sub_job_configs"][0]["training_config"]
+        assert training_config["peft_config"] == {
+            "peft_type": "Lora",
+            "task_type": "CAUSAL_LM",
+            "r": 16,
+            "lora_alpha": 8,
+            "lora_dropout": 0.0,
+            "bias": "none",
+            "target_modules": ["q_proj"],
+            "target_parameters": [],
+        }
+        assert isinstance(training_config["peft_config"]["lora_dropout"], float)
+        # The raw path forwards the optimizer untouched.
+        assert training_config["optimizer"] == {"type": "adamw"}
+
+    def test_create_job_from_body_rejects_invalid_peft_config_before_post(self):
+        c = _make_client()
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": "training",
+                    "model_name": "gpt2",
+                    "training_config": {"peft_config": {"peft_type": "LORA"}},
+                },
+            ],
+        }
+
+        with pytest.raises(
+            ValueError,
+            match=r"sub_job_configs\[0\]\.training_config\.peft_config\.peft_type",
+        ):
+            c.create_job_from_body(body)
+        c._session.post.assert_not_called()
+
+    def test_create_job_from_body_ignores_absent_peft_config(self):
+        c = _make_client(post_json={"job_id": "srv-raw"})
+        body = {
+            "sub_job_configs": [
+                "not-an-object",
+                {
+                    "job_type": "sampling",
+                    "model_name": "gpt2",
+                    "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                },
+            ],
+        }
+
+        assert c.create_job_from_body(body) == {"job_id": "srv-raw"}
 
     def test_allows_one_training_with_multiple_sampling(self):
         c = _make_client(post_json={"job_id": "srv-1"})

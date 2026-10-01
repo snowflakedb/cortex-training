@@ -359,7 +359,9 @@ cortex-training submit job.json --dry-run
 
 Without `--wait`, submission returns without waiting for the job to run.
 `--wait` waits until **running**, not until training finishes. `--dry-run`
-validates and prints the request body without sending it.
+validates and prints the request body without sending it, applying the same
+checks as a live submit — so the printed body already shows any `peft_config`
+in its canonical form.
 
 The repo includes a Prime-RL/Qwen3.6 training example:
 

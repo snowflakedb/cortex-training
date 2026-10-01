@@ -346,7 +346,10 @@ job`; the server enforces the same rule for every caller.
 
 The typed path validates each `SubJobConfig`; `create_job_from_body()` checks the
 outer body, the non-empty list, and the training-sub-job count before forwarding
-it.
+it. It also normalizes every `peft_config` the body carries, rewriting it in
+place and rejecting an invalid one before the request is sent (see
+[section 8.2](#82-trainingconfig)). Everything else in a raw body, `optimizer`
+included, is forwarded exactly as given.
 
 #### GPU hardware - `hardware`
 
@@ -1249,10 +1252,48 @@ The typed client requires:
 
 | Field | Type | Client validation |
 |---|---|---|
-| `optimizer` | object | Non-empty |
+| `optimizer` | object | Canonicalized; must carry at least one setting |
 | `max_seq_len` | integer | Greater than zero |
 | `train_batch_size` | integer | Greater than zero |
 | `n_gpus` | integer | Greater than zero |
+
+#### `optimizer` canonicalization
+
+`optimizer` is no longer an opaque non-empty object. The typed `TrainingConfig`
+rewrites it into the canonical flat form on construction and rejects anything it
+cannot place. The canonical keys are `name`, `lr`, `weight_decay`, `betas`,
+`eps`, and `fused`; the wire form is
+
+```json
+{"name": "AdamW", "lr": 1e-5, "weight_decay": 0.0, "betas": [0.9, 0.95], "eps": 1e-8}
+```
+
+The rewrites are:
+
+- `type` becomes `name`. Setting both to different values is an error.
+- `beta1` / `beta2` become `betas`. Supplying only one fills its partner from
+  `[0.9, 0.999]`. `betas` together with a disagreeing `beta1`/`beta2` is an
+  error.
+- A DeepSpeed-style `params` sub-object is flattened onto the top level. A key
+  set in both places with different values is an error.
+- `gradient_clipping` inside `optimizer` is hoisted onto the typed
+  `gradient_clipping` field, which is where the server reads it. When both are
+  set the typed field wins and the nested value is dropped. A block holding only
+  `gradient_clipping` therefore canonicalizes to `{}`, which is valid.
+- Scheduler names (`lr_scheduler`, `lr_scheduler_type`, `warmup_steps`,
+  `warmup_ratio`, `warmup_steps_proportion`, `num_warmup_steps`,
+  `training_horizon`) are rejected rather than accepted and ignored. Drive the
+  learning rate per step from the client, or set a server-side DeepSpeed
+  scheduler under `ds_config`.
+- Any other key is rejected, as are non-numeric, non-finite, or out-of-range
+  values.
+
+Canonicalization never fills defaults — the server owns those, so an explicitly
+submitted value stays distinguishable from a defaulted one. `betas` is the one
+exception, since its canonical form is a pair.
+
+This runs on the typed `TrainingConfig` path only. `create_job_from_body()`
+forwards `optimizer` exactly as given and leaves the rewrite to the server.
 
 Optional typed fields:
 
@@ -1284,9 +1325,19 @@ and these newer long-context/memory knobs:
   via `offload_config.enabled=true`. Offload requires `mode="full"`.
 
 For LoRA training, set `extra_training["peft_config"]` to a PEFT
-`LoraConfig`-compatible object. At minimum, specify `peft_type="Lora"`; `r` and
-`lora_alpha` default to `8` on the server, although explicit values are
-recommended when the same configuration is also used by sampling.
+`LoraConfig`-compatible object. It is validated and rewritten client-side, so it
+must specify `peft_type="Lora"` — exactly that spelling, not the `"LORA"` a
+Hugging Face `adapter_config.json` writes — plus `target_modules`,
+`target_parameters`, or both. `r`, `lora_alpha`, `lora_dropout`, and `bias` are
+filled with their defaults (`8`, `8`, `0.0`, `"none"`) by the client when
+omitted, although explicit values are recommended when the same configuration is
+also used by sampling. Unsupported keys are rejected.
+
+`peft_config` is validated the same way on all three submission paths: typed
+training, typed sampling ([section 8.3](#83-inferenceconfig)), and the raw
+`create_job_from_body()` body. A config with no `peft_config` stays valid, and
+every other key in `extra_training` / `extra_sampling` remains open
+passthrough.
 
 The current client also rejects an effective PrimeRL config that combines an
 enabled/default `fused_cross_entropy` with `fp32_lm_head=True` or an integer
@@ -1336,7 +1387,9 @@ sampling = SubJobConfig.sampling_job(
 For LoRA sampling, set `extra_sampling["peft_config"]` when creating the
 sub-job. This enables the vLLM LoRA manager before the model starts. The
 adapter's `r`, `lora_alpha`, and `target_modules` must match the training
-configuration used for adapter synchronization.
+configuration used for adapter synchronization. It is validated and rewritten by
+the same rules as the training block (see
+[section 8.2](#82-trainingconfig)).
 
 For either config type, the server requires `multiplex_job_id` to be a complete
 `{job_id}:{sub_job_type}:{index}` id outside the job being created.
