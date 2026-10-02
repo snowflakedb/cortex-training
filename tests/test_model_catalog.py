@@ -111,8 +111,8 @@ def test_shipped_qwen_recipes_use_model_limits_and_long_context_sp():
     }
     config_paths = [
         *REPO_ROOT.glob("recipes/inference/configs/qwen*.json"),
-        *REPO_ROOT.glob("recipes/rl/math_grpo/configs/qwen*.json"),
-        *REPO_ROOT.glob("recipes/sft/conversational/configs/qwen*.json"),
+        *REPO_ROOT.glob("recipes/rl/configs/qwen*.json"),
+        *REPO_ROOT.glob("recipes/sft/configs/qwen*.json"),
     ]
 
     assert len(config_paths) == 12

@@ -8,8 +8,8 @@ under its `configs/` directory.
 
 | Recipe | Method | Dataset | Status |
 |---|---|---|---|
-| [Conversational SFT](sft/conversational/README.md) | LoRA or full-parameter SFT | Hugging Face chat datasets | Runnable |
-| [Math GRPO](rl/math_grpo/README.md) | Reinforcement learning | Hendrycks MATH and MATH-500 | Runnable |
+| [Conversational SFT](sft/README.md) | LoRA or full-parameter SFT | Hugging Face chat datasets | Runnable |
+| [Math GRPO](rl/README.md) | Reinforcement learning | Hendrycks MATH and MATH-500 | Runnable |
 | [Inference endpoint](inference/README.md) | Serve, generate, eval | Open weights, checkpoints, MATH-500 | Runnable |
 
 GRPO can also be run from [SkyRL](../docs/integrations/skyrl.md), which uses its

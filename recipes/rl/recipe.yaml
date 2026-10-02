@@ -1,0 +1,21 @@
+id: math-grpo
+title: Math GRPO
+status: runnable
+task: rl
+methods:
+  - lora
+  - full-parameter
+models:
+  - Qwen/Qwen3-8B
+  - Qwen/Qwen3.6-35B-A3B
+  - Qwen/Qwen3.8-27B
+datasets:
+  - hendrycks/competition_math
+  - HuggingFaceH4/MATH-500
+precision:
+  - bfloat16
+default_training_gpus: 4
+provenance:
+  project: tinker-cookbook
+  recipe: recipes/math_rl/train.py
+last_validated: null

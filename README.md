@@ -47,7 +47,7 @@ python -m recipes.sft.conversational.train \
 ```
 
 This runs supervised fine-tuning on Qwen3-8B with the default config. See the
-[Conversational SFT recipe](recipes/sft/conversational/README.md) for all options.
+[Conversational SFT recipe](recipes/sft/README.md) for all options.
 
 ### **CLI Mode**
 
@@ -69,8 +69,8 @@ an existing RL framework like SkyRL, see
 
 Recipes are end-to-end post-training and inference workflows you can run out of the box or customize. Each includes a Python entry point, configuration files, and a README with expected results. For detailed instructions on running a recipe or building a customized workflow, see the guides below:
 
-- **[Conversational SFT](recipes/sft/conversational/README.md)**: supervised fine-tuning on chat datasets with LoRA or full-parameter training.
-- **[Math GRPO](recipes/rl/math_grpo/README.md)**: reinforcement learning for mathematical reasoning with verifiable rewards.
+- **[Conversational SFT](recipes/sft/README.md)**: supervised fine-tuning on chat datasets with LoRA or full-parameter training.
+- **[Math GRPO](recipes/rl/README.md)**: reinforcement learning for mathematical reasoning with verifiable rewards.
 - **[Inference](recipes/inference/README.md)**: serve a model or checkpoint, generate responses, and evaluate.
 
 Browse the [recipe index](recipes/README.md) for all workflows.
