@@ -40,23 +40,7 @@ Cortex Training authenticates through a Snowflake Programmatic Access Token
 
    ![Copy token](../../assets/images/pat-token-generated.png)
 
-## Step 2: Create the Database
-
-The connection config references a database and schema. This database must
-exist in your Snowflake account — otherwise the client will fail with a
-"database not found" error. It is only used for connection routing, not for
-storing training data.
-
-Run this in Snowsight before configuring the client:
-
-```sql
-CREATE DATABASE IF NOT EXISTS CORTEX_TRAINING_DB;
-```
-
-You can use any database name, but it must match the `database` field in your
-connection config below.
-
-## Step 3: Configure the Client
+## Step 2: Configure the Client
 
 Once you have a PAT, pick **one** of the following methods to configure the
 client. We recommend `connections.toml`.
@@ -111,7 +95,13 @@ any of these methods:
 cortex-training capacity
 ```
 
-This should print your available GPU capacity.
+This should print your available GPU capacity. The client automatically creates
+the configured database if it does not exist. If automatic creation fails (for
+example, your role lacks `CREATE DATABASE`), create it manually in Snowsight:
+
+```sql
+CREATE DATABASE IF NOT EXISTS CORTEX_TRAINING_DB;
+```
 
 ### Option B: JSON config (legacy)
 
@@ -186,8 +176,15 @@ continue with step 2.
 
 #### 2. Fix it permanently
 
-An account administrator (`ACCOUNTADMIN` or `SECURITYADMIN`) creates a network
-policy for the IP addresses you connect from, and applies it to your user:
+An account administrator (`ACCOUNTADMIN` or `SECURITYADMIN`) picks one of these
+options:
+
+| Option | Best when | Trade-off |
+|--------|-----------|-----------|
+| **A. Network policy** | You connect from fixed IP addresses (office, VPN, cloud VM) | Must be updated whenever your IP changes |
+| **B. Authentication policy** | Your IP changes (home network, laptop on the go) | The PAT works from any IP, so keep it secret |
+
+**Option A: allow your IP addresses with a network policy**
 
 ```sql
 USE ROLE ACCOUNTADMIN;
@@ -203,8 +200,36 @@ ALTER USER <your-username> SET NETWORK_POLICY = CORTEX_TRAINING_ACCESS;
 - `<snowsight-ip>` is the IP you open Snowsight from. Include it so the policy
   doesn't lock you out of Snowsight.
 
-If your organization manages this centrally, your administrator may prefer an
-authentication policy instead; see Snowflake's
+The policy pins you to those IP addresses, for Snowsight logins too. If your
+public IP changes, which is common on home networks without a VPN, logins fail
+again until an administrator updates the list from an IP that is still allowed:
+
+```sql
+ALTER NETWORK POLICY CORTEX_TRAINING_ACCESS
+  SET ALLOWED_IP_LIST = ('<new-cli-machine-ip>', '<snowsight-ip>');
+```
+
+**Option B: drop the network-policy requirement for PATs with an authentication policy**
+
+```sql
+USE ROLE ACCOUNTADMIN;
+
+CREATE DATABASE IF NOT EXISTS CORTEX_TRAINING_DB;
+
+CREATE AUTHENTICATION POLICY CORTEX_TRAINING_DB.PUBLIC.CORTEX_TRAINING_PAT_POLICY
+  PAT_POLICY = (NETWORK_POLICY_EVALUATION = ENFORCED_NOT_REQUIRED);
+
+ALTER USER <your-username>
+  SET AUTHENTICATION POLICY CORTEX_TRAINING_DB.PUBLIC.CORTEX_TRAINING_PAT_POLICY;
+```
+
+`ENFORCED_NOT_REQUIRED` means your user no longer needs a network policy to
+use a PAT, but any network policy that does apply is still enforced.
+
+If your account or user already has an authentication policy (for example, one
+that requires MFA), don't create a new one: a user-level policy replaces the
+account-level policy for that user, which can drop those other settings. Add
+the `PAT_POLICY` setting to the existing policy instead. See Snowflake's
 [programmatic access token documentation](https://docs.snowflake.com/en/user-guide/programmatic-access-tokens#network-policy-requirements).
 
 #### Still failing?
