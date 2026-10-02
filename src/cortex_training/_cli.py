@@ -735,6 +735,12 @@ def _format_error(exc: BaseException) -> str:
         if len(body) > 4000:
             body = body[:4000] + "...<truncated>"
         parts.append(f"response body: {body}")
+    if getattr(response, "status_code", None) == 401:
+        from cortex_training.snowflake_auth import credentials_rejected_hint
+
+        parts.append(
+            credentials_rejected_hint("Snowflake rejected your credentials (HTTP 401).")
+        )
     return "\n".join(parts)
 
 

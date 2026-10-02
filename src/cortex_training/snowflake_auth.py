@@ -38,13 +38,29 @@ class SnowflakeProfileError(RuntimeError):
 # token whose user is not subject to the network policy Snowflake requires.
 _PAT_REJECTED_ERRNO = 394400
 
-_PAT_REJECTED_HINT = (
-    "Snowflake rejected the programmatic access token. If Snowsight shows "
-    "'Missing network policy' for this token, your user must be subject to a "
-    "network policy before the token can authenticate; otherwise regenerate "
-    "the token and check that `user` matches its owner. See the Troubleshooting "
-    "section of docs/getting-started/authentication.md."
+_NETWORK_POLICY_DOCS_URL = (
+    "https://github.com/snowflakedb/cortex-training/blob/main/docs/"
+    "getting-started/authentication.md#network-policy-requirement"
 )
+
+
+def credentials_rejected_hint(summary: str) -> str:
+    """Return the next steps shown when Snowflake rejects a user's credentials."""
+    return (
+        f"\n{summary} The most common causes:\n"
+        "\n"
+        "  1. Your user has no network policy. By default, Snowflake only accepts\n"
+        "     a PAT from a user covered by one. Snowsight shows 'Missing network\n"
+        "     policy' on the token under Settings > Authentication.\n"
+        "     Check in a minute: in the token's ... menu, choose 'Bypass\n"
+        "     requirement for network policy', then run this command again.\n"
+        "\n"
+        "  2. The token is expired or mistyped, or it was created by a different\n"
+        "     Snowflake user than the one in your config. Generate a new token\n"
+        "     and retry.\n"
+        "\n"
+        f"Step-by-step fix: {_NETWORK_POLICY_DOCS_URL}"
+    )
 
 
 def _is_pat_rejected(exc: BaseException) -> bool:
@@ -97,7 +113,9 @@ class SnowflakeProfileAuth:
         except Exception as exc:
             message = f"could not open {self._profile_label()}: {exc}"
             if _is_pat_rejected(exc):
-                message = f"{message}\n{_PAT_REJECTED_HINT}"
+                message += "\n" + credentials_rejected_hint(
+                    "Snowflake rejected your programmatic access token (PAT)."
+                )
             raise SnowflakeProfileError(message) from exc
 
     @staticmethod

@@ -241,5 +241,6 @@ def test_rejected_pat_error_points_to_network_policy(exc) -> None:
         SnowflakeProfileAuth("training-profile", connect_factory=connect)
     message = str(excinfo.value)
     assert "could not open Snowflake connection 'training-profile'" in message
-    assert "Missing network policy" in message
-    assert "authentication.md" in message
+    assert "Snowflake rejected your programmatic access token (PAT)." in message
+    assert "Your user has no network policy." in message
+    assert "authentication.md#network-policy-requirement" in message
