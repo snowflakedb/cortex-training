@@ -3059,7 +3059,7 @@ class TestEnsureDatabase:
         c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
         c._session = MagicMock()
         not_found_resp = _make_error_response(
-            {"message": "Database 'MY_DB' does not exist or not authorized."}, status_code=404
+            {"code": "517602", "message": "Schema MY_DB.SCH is not found or not authorized"}, status_code=400
         )
         create_resp = _make_response({"data": [["Database MY_DB successfully created."]]})
         ok_resp = _make_response({"jobs": []})
@@ -3077,12 +3077,12 @@ class TestEnsureDatabase:
         c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
         c._session = MagicMock()
         not_found_resp = _make_error_response(
-            {"message": "Database 'MY_DB' does not exist or not authorized."}, status_code=404
+            {"code": "517602", "message": "Schema MY_DB.SCH is not found or not authorized"}, status_code=400
         )
         create_resp = _make_response({"data": [["OK"]]})
         c._session.get.return_value = not_found_resp
         c._session.post.return_value = create_resp
-        with pytest.raises(Exception):
+        with pytest.raises(RuntimeError, match="CREATE DATABASE IF NOT EXISTS"):
             c._send("GET", f"{c.base_url}/test")
         assert c._db_ensured is True
 
@@ -3091,19 +3091,20 @@ class TestEnsureDatabase:
         c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
         c._session = MagicMock()
         not_found_resp = _make_error_response(
-            {"message": "Database 'MY_DB' does not exist or not authorized."}, status_code=404
+            {"code": "517602", "message": "Schema MY_DB.SCH is not found or not authorized"}, status_code=400
         )
         perm_resp = _make_error_response({"message": "Insufficient privileges"}, status_code=403)
         c._session.get.return_value = not_found_resp
         c._session.post.return_value = perm_resp
-        with pytest.raises((RuntimeError, Exception)):
+        with pytest.raises(RuntimeError, match="CREATE DATABASE IF NOT EXISTS"):
             c._send("GET", f"{c.base_url}/test")
 
-    def test_quotes_lowercase_database_name(self):
+    def test_lowercase_database_name_not_quoted(self):
+        """Lowercase DB names are NOT quoted — SQL resolves the same as the URL path."""
         c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="my_db", schema="SCH")
         c._session = MagicMock()
         not_found_resp = _make_error_response(
-            {"message": "Database 'my_db' does not exist or not authorized."}, status_code=404
+            {"code": "517602", "message": "Schema MY_DB.SCH is not found or not authorized"}, status_code=400
         )
         create_resp = _make_response({"data": [["OK"]]})
         ok_resp = _make_response({"jobs": []})
@@ -3111,4 +3112,6 @@ class TestEnsureDatabase:
         c._session.post.return_value = create_resp
         c._send("GET", f"{c.base_url}/test")
         create_call = c._session.post.call_args_list[0]
-        assert '"my_db"' in create_call.kwargs["json"]["statement"]
+        stmt = create_call.kwargs["json"]["statement"]
+        assert stmt == "CREATE DATABASE IF NOT EXISTS my_db"
+        assert '"' not in stmt

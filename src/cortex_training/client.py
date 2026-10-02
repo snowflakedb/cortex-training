@@ -1426,10 +1426,9 @@ class CortexTrainingClient:
         Routes through ``_send`` so auth works for both PAT and connection
         profile users. Raises on failure with an actionable error message.
         """
-        db_name = f'"{self.database}"' if self.database != self.database.upper() else self.database
-        statement = f"CREATE DATABASE IF NOT EXISTS {db_name}"
+        statement = f"CREATE DATABASE IF NOT EXISTS {self.database}"
         manual_hint = (
-            f"Create it manually in Snowsight: CREATE DATABASE IF NOT EXISTS {db_name}; "
+            f"Create it manually in Snowsight: CREATE DATABASE IF NOT EXISTS {self.database}; "
             "— or set an existing database in your connection config."
         )
         self._db_creating = True  # prevent recursion from inner _send call
@@ -1459,14 +1458,19 @@ class CortexTrainingClient:
 
     @staticmethod
     def _is_database_not_found(resp: requests.Response) -> bool:
-        """Return True if the response indicates the configured database does not exist."""
+        """Return True if the response indicates the configured database does not exist.
+
+        The Cortex Training API returns 400 with error code 517602 and a message
+        like ``Schema MY_DB.PUBLIC is not found or not authorized`` when the
+        database in the URL path does not exist.
+        """
         if resp.status_code not in (400, 404, 422):
             return False
         try:
-            text = resp.text
+            text = resp.text.lower()
         except Exception:
             return False
-        return "does not exist or not authorized" in text.lower() and "database" in text.lower()
+        return "not found or not authorized" in text or "does not exist or not authorized" in text
 
     def _send(
         self,
@@ -1602,10 +1606,9 @@ class CortexTrainingClient:
                     # Retry the original request once after creating the DB.
                     continue
                 if self._db_ensured and self._is_database_not_found(resp):
-                    db_name = f'"{self.database}"' if self.database != self.database.upper() else self.database
                     raise RuntimeError(
                         f"Database '{self.database}' still not found after creation attempt. "
-                        f"Create it manually in Snowsight: CREATE DATABASE IF NOT EXISTS {db_name};"
+                        f"Create it manually in Snowsight: CREATE DATABASE IF NOT EXISTS {self.database};"
                     )
                 resp.raise_for_status()
                 return resp
