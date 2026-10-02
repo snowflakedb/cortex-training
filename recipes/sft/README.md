@@ -122,6 +122,29 @@ The target list above is for dense Qwen models. For
 The shipped Qwen3.6 configs use sequence parallel size 8 and logical batch 1
 to run at the model's 262K context limit.
 
+### MoE smoke configs
+
+The full-parameter smoke configs use a 4K sequence length to validate model
+loading, expert-parallel initialization, forward/backward, optimizer steps, and
+checkpoint save before attempting a longer production run:
+
+- `qwen3_30b_a3b_smoke.json`: Qwen3-30B-A3B, 4 GPUs, EP4
+- `glm45_air_smoke.json`: GLM-4.5-Air, 4 GPUs, EP4, CPU optimizer offload
+- `minimax_m2_smoke.json`: MiniMax-M2-BF16, 16 GPUs, EP8, CPU optimizer offload
+- `trinity_mini_smoke.json`: Trinity-Mini, 4 GPUs, EP4
+- `nemotron3_nano_30b_smoke.json`: Nemotron-3-Nano-30B-A3B-BF16, 4 GPUs, EP4
+- `glm53_flash_smoke.json`: GLM-5.3-Flash-BF16, 16 GPUs, EP16, CPU optimizer offload
+- `qwen38_flash_next_smoke.json`: Qwen3.8-Flash-Next, 8 GPUs, EP8
+
+Run any profile against the built-in memorize dataset:
+
+```bash
+python -m recipes.sft.conversational.train \
+  config=/path/to/config.json \
+  job_config=configs/qwen3_30b_a3b_smoke.json \
+  max_steps=3
+```
+
 For dense long-context profiles, an integer
 `fused_lm_head_token_chunk_size` makes this recipe use the weighted
 `causal_cross_entropy` processing path. DSS then consumes chunked per-token

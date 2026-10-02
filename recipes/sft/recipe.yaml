@@ -10,6 +10,13 @@ planned_methods:
 models:
   - Qwen/Qwen3-8B
   - Qwen/Qwen3.6-35B-A3B
+  - Qwen/Qwen3-30B-A3B
+  - zai-org/GLM-4.5-Air
+  - ModelCloud/MiniMax-M2-BF16
+  - arcee-ai/Trinity-Mini
+  - nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  - zai-org/GLM-5.3-Flash-BF16
+  - Qwen/Qwen3.8-Flash-Next
 datasets:
   - who_trained_you
   - HuggingFaceH4/no_robots
