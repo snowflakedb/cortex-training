@@ -23,5 +23,5 @@ recipe module with no arguments to see its full list, or read its `Config` class
 The job-config object is posted unchanged as the create-job body, so
 [REST API section 8](../rest-api.md#8-create-job-schemas) is the authoritative
 schema for its fields. The
-[conversational SFT README](../../../recipes/sft/conversational/README.md#job-config-json)
+[conversational SFT README](../../../recipes/sft/README.md)
 documents the shape with every field named.

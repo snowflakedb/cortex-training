@@ -104,7 +104,7 @@
       "summary": "PrimeRL attention-only LoRA SFT starting point for Qwen3.6-35B-A3B.",
       "recipePath": "recipes/sft/conversational/train.py",
       "evidencePaths": [
-        "recipes/sft/conversational/configs/qwen36_35b_a3b_lora.json"
+        "recipes/sft/configs/qwen36_35b_a3b_lora.json"
       ],
       "subJobs": [
         {
@@ -166,7 +166,7 @@
       "summary": "PrimeRL expert-parallel full SFT starting point for the supported Qwen MoE model.",
       "recipePath": "recipes/sft/conversational/train.py",
       "evidencePaths": [
-        "recipes/sft/conversational/configs/qwen36_35b_a3b_full.json"
+        "recipes/sft/configs/qwen36_35b_a3b_full.json"
       ],
       "subJobs": [
         {
@@ -220,7 +220,7 @@
       "summary": "PrimeRL attention-only LoRA RL starting point for Qwen3.6-35B-A3B.",
       "recipePath": "recipes/rl/math_grpo/train.py",
       "evidencePaths": [
-        "recipes/rl/math_grpo/configs/qwen36_35b_a3b_lora.json"
+        "recipes/rl/configs/qwen36_35b_a3b_lora.json"
       ],
       "subJobs": [
         {
@@ -325,7 +325,7 @@
       "summary": "PrimeRL expert-parallel full RL starting point with eight training and eight sampling GPUs.",
       "recipePath": "recipes/rl/math_grpo/train.py",
       "evidencePaths": [
-        "recipes/rl/math_grpo/configs/qwen36_35b_a3b_full.json"
+        "recipes/rl/configs/qwen36_35b_a3b_full.json"
       ],
       "subJobs": [
         {

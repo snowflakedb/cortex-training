@@ -108,14 +108,19 @@ def test_shipped_qwen_recipes_use_model_limits_and_long_context_sp():
     expected_limits = {
         "Qwen/Qwen3-8B": 32768,
         "Qwen/Qwen3.6-35B-A3B": 262144,
+        "Qwen/Qwen3.8-27B": 32768,
     }
     config_paths = [
-        *REPO_ROOT.glob("recipes/inference/configs/qwen*.json"),
-        *REPO_ROOT.glob("recipes/rl/math_grpo/configs/qwen*.json"),
-        *REPO_ROOT.glob("recipes/sft/conversational/configs/qwen*.json"),
+        path
+        for path in [
+            *REPO_ROOT.glob("recipes/inference/configs/qwen*.json"),
+            *REPO_ROOT.glob("recipes/rl/configs/qwen*.json"),
+            *REPO_ROOT.glob("recipes/sft/configs/qwen*.json"),
+        ]
+        if not path.stem.endswith("_smoke")
     ]
 
-    assert len(config_paths) == 12
+    assert len(config_paths) == 13
     for path in config_paths:
         request = json.loads(path.read_text())
         for sub_job in request["sub_job_configs"]:
@@ -136,6 +141,41 @@ def test_shipped_qwen_recipes_use_model_limits_and_long_context_sp():
                 assert config["sp_size"] == 8
                 assert config["train_batch_size"] == 1
                 assert config["ds_config"]["train_batch_size"] == 1
+
+
+def test_moe_sft_smoke_recipes_have_runnable_parallelism():
+    expected = {
+        "qwen3_30b_a3b_smoke.json": ("Qwen/Qwen3-30B-A3B", 4, 4),
+        "glm45_air_smoke.json": ("zai-org/GLM-4.5-Air", 4, 4),
+        "minimax_m2_smoke.json": ("ModelCloud/MiniMax-M2-BF16", 16, 8),
+        "trinity_mini_smoke.json": ("arcee-ai/Trinity-Mini", 4, 4),
+        "nemotron3_nano_30b_smoke.json": (
+            "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+            4,
+            4,
+        ),
+        "glm53_flash_smoke.json": ("zai-org/GLM-5.3-Flash-BF16", 16, 16),
+        "qwen38_flash_next_smoke.json": ("Qwen/Qwen3.8-Flash-Next", 8, 8),
+    }
+    config_dir = REPO_ROOT / "recipes/sft/configs"
+    for filename, (model_id, n_gpus, ep_size) in expected.items():
+        body = json.loads((config_dir / filename).read_text())
+        sub_job = body["sub_job_configs"][0]
+        training = sub_job["training_config"]
+        ds_config = training["ds_config"]
+
+        assert sub_job["job_type"] == "training"
+        assert sub_job["model_name"] == model_id
+        assert sub_job["dtype"] == "bfloat16"
+        assert training["model_provider"] == "prime_rl"
+        assert training["max_seq_len"] == 4096
+        assert training["n_gpus"] == n_gpus
+        assert training["ep_size"] == ep_size
+        assert training.get("sp_size", 1) == 1
+        assert training["train_batch_size"] == n_gpus
+        assert ds_config["train_batch_size"] == n_gpus
+        assert ds_config["train_micro_batch_size_per_gpu"] == 1
+        assert ds_config["gradient_accumulation_steps"] == 1
 
 
 @pytest.mark.parametrize(

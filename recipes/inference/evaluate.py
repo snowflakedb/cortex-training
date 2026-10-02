@@ -29,6 +29,8 @@ from recipes.utils import running_job
 from recipes.utils import stop_params_for
 from recipes.inference.endpoint import generate_results
 from recipes.inference.endpoint import inference_endpoint_body
+from recipes.rl.tasks.math import build_prompt
+from recipes.rl.tasks.math import score_response
 
 from cortex_training.client import DEBUG_OPTIONS_ENV
 
@@ -78,9 +80,6 @@ def _run_math500(
     generate_batch_size: int,
     max_seq_len: int,
 ) -> dict[str, float]:
-    from recipes.rl.math_grpo.train import build_prompt
-    from recipes.rl.math_grpo.train import score_response
-
     examples = _load_math500(max_examples)
     if len(examples) == 0:
         raise ValueError("MATH-500 produced no examples")
@@ -93,7 +92,9 @@ def _run_math500(
             )
         prompts.append(tokens)
 
-    results = generate_results(client, job_id, prompts, sampling_params, generate_batch_size)
+    results = generate_results(
+        client, job_id, prompts, sampling_params, generate_batch_size
+    )
     n_correct = 0
     format_sum = 0.0
     max_tokens = sampling_params.get("max_tokens")
@@ -167,7 +168,14 @@ def run_evaluation(
         checkpoint_id=checkpoint_id,
         debug_image_tag=debug_image_tag,
     )
-    sampling_sub = next((sub for sub in body.get("sub_job_configs") or () if sub.get("job_type") == "sampling"), {})
+    sampling_sub = next(
+        (
+            sub
+            for sub in body.get("sub_job_configs") or ()
+            if sub.get("job_type") == "sampling"
+        ),
+        {},
+    )
     model_name = sampling_sub.get("model_name")
     max_seq_len = int((sampling_sub.get("inference_config") or {}).get("max_seq_len"))
     _, renderer, renderer_name = build_renderer(model_name)
@@ -203,7 +211,9 @@ def run_evaluation(
 
 
 def main(config: Config):
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
     run_evaluation(
         config_path=config.config,
         job_config=config.job_config,
