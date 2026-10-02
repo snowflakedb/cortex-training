@@ -158,3 +158,36 @@ Snowflake-prefixed variants (`SNOWFLAKE_PAT`, `SNOWFLAKE_HOST`,
 | `SSL certificate verify failed` | Underscores in hostname | Replace underscores with hyphens in `host` |
 | `no PAT found` | Missing token in config | Add `token` to connections.toml, `pat` to JSON, or set `CORTEX_TRAINING_PAT` |
 | `401 Unauthorized` | PAT expired or invalid | Regenerate a new PAT in Snowsight |
+| `394400 (08001)` / `Programmatic access token is invalid` | Your user is not subject to a network policy, or the PAT is wrong | See [Network policy requirement](#network-policy-requirement) |
+
+### Network policy requirement
+
+By default, Snowflake accepts a PAT only from a user who is subject to a
+[network policy](https://docs.snowflake.com/en/user-guide/network-policies).
+You can generate a PAT without one, but every login with it fails with
+`Programmatic access token is invalid`. Snowsight flags this on the token in
+**Settings → Authentication** as **Missing network policy**.
+
+To check the token itself, temporarily bypass the requirement: in the token's
+**⋯** menu, choose **Bypass requirement for network policy**. If
+`cortex-training capacity` then works, the network policy is the cause.
+
+For a lasting fix, an account administrator (`ACCOUNTADMIN` or `SECURITYADMIN`)
+creates a network policy that allows the public IP addresses you connect from
+and applies it to your user:
+
+```sql
+CREATE NETWORK POLICY CORTEX_TRAINING_ACCESS
+  ALLOWED_IP_LIST = ('<your-public-ip>');
+ALTER USER <your-username> SET NETWORK_POLICY = CORTEX_TRAINING_ACCESS;
+```
+
+Use the IP of the machine that runs `cortex-training`. Include the IP you use
+Snowsight from as well, so the policy does not lock you out of Snowsight. Your
+organization may instead manage this requirement through an authentication
+policy; see Snowflake's
+[programmatic access token documentation](https://docs.snowflake.com/en/user-guide/programmatic-access-tokens).
+
+If Snowsight shows no network policy warning, regenerate the PAT, copy it
+without extra spaces or quotes, and check that `user` in your connection config
+is the user who owns the token.

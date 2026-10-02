@@ -34,6 +34,25 @@ class SnowflakeProfileError(RuntimeError):
     """A Snowflake connection profile could not provide client auth."""
 
 
+# Snowflake reports every rejected PAT with this error code, including a valid
+# token whose user is not subject to the network policy Snowflake requires.
+_PAT_REJECTED_ERRNO = 394400
+
+_PAT_REJECTED_HINT = (
+    "Snowflake rejected the programmatic access token. If Snowsight shows "
+    "'Missing network policy' for this token, your user must be subject to a "
+    "network policy before the token can authenticate; otherwise regenerate "
+    "the token and check that `user` matches its owner. See the Troubleshooting "
+    "section of docs/getting-started/authentication.md."
+)
+
+
+def _is_pat_rejected(exc: BaseException) -> bool:
+    if getattr(exc, "errno", None) == _PAT_REJECTED_ERRNO:
+        return True
+    return "programmatic access token is invalid" in str(exc).lower()
+
+
 class SnowflakeProfileAuth:
     """Own a refreshable Connector session created from a Snowflake profile."""
 
@@ -76,9 +95,10 @@ class SnowflakeProfileAuth:
                 return connect()
             return connect(connection_name=self.connection_name)
         except Exception as exc:
-            raise SnowflakeProfileError(
-                f"could not open {self._profile_label()}: {exc}"
-            ) from exc
+            message = f"could not open {self._profile_label()}: {exc}"
+            if _is_pat_rejected(exc):
+                message = f"{message}\n{_PAT_REJECTED_HINT}"
+            raise SnowflakeProfileError(message) from exc
 
     @staticmethod
     def _rest(connection: Any) -> Any:
