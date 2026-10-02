@@ -1420,16 +1420,16 @@ class CortexTrainingClient:
         return " ".join(parts)
 
     def _create_database(self) -> None:
-        """Attempt to create the configured database.
+        """Attempt to create the configured database (and schema if non-PUBLIC).
 
         Called only when an API request fails with a database-not-found error.
         Routes through ``_send`` so auth works for both PAT and connection
         profile users. Raises on failure with an actionable error message.
         """
-        statement = f"CREATE DATABASE IF NOT EXISTS {self.database}"
+        db_stmt = f"CREATE DATABASE IF NOT EXISTS {self.database}"
         manual_hint = (
             f"Create it manually in Snowsight: CREATE DATABASE IF NOT EXISTS {self.database}; "
-            "— or set an existing database in your connection config."
+            "— or if the database already exists, check that your role has USAGE on it."
         )
         self._db_creating = True  # prevent recursion from inner _send call
         try:
@@ -1437,7 +1437,7 @@ class CortexTrainingClient:
             resp = self._send(
                 "POST",
                 f"{self.base_url}/api/v2/statements",
-                json={"statement": statement, "timeout": 60},
+                json={"statement": db_stmt, "timeout": 60},
                 max_retries=1,
             )
             if resp.status_code == 202:
@@ -1445,8 +1445,25 @@ class CortexTrainingClient:
                     f"Database creation for '{self.database}' was accepted but has not "
                     f"completed yet. {manual_hint}"
                 )
-            self._db_ensured = True
             logger.info("Database '%s' created successfully.", self.database)
+
+            if self.schema.upper() != "PUBLIC":
+                schema_stmt = f"CREATE SCHEMA IF NOT EXISTS {self.database}.{self.schema}"
+                logger.info("Schema '%s' does not exist. Attempting to create it...", self.schema)
+                schema_resp = self._send(
+                    "POST",
+                    f"{self.base_url}/api/v2/statements",
+                    json={"statement": schema_stmt, "timeout": 60},
+                    max_retries=1,
+                )
+                if schema_resp.status_code == 202:
+                    raise RuntimeError(
+                        f"Schema creation for '{self.database}.{self.schema}' was accepted but has not "
+                        f"completed yet. Create it manually: CREATE SCHEMA IF NOT EXISTS {self.database}.{self.schema};"
+                    )
+                logger.info("Schema '%s' created successfully.", self.schema)
+
+            self._db_ensured = True
         except RuntimeError:
             raise
         except Exception as exc:
@@ -1608,6 +1625,7 @@ class CortexTrainingClient:
                 if self._db_ensured and self._is_database_not_found(resp):
                     raise RuntimeError(
                         f"Database '{self.database}' still not found after creation attempt. "
+                        f"The database may already exist but your role lacks USAGE on it. "
                         f"Create it manually in Snowsight: CREATE DATABASE IF NOT EXISTS {self.database};"
                     )
                 resp.raise_for_status()

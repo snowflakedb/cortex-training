@@ -3115,3 +3115,39 @@ class TestEnsureDatabase:
         stmt = create_call.kwargs["json"]["statement"]
         assert stmt == "CREATE DATABASE IF NOT EXISTS my_db"
         assert '"' not in stmt
+
+    def test_creates_schema_when_not_public(self):
+        """Non-PUBLIC schema triggers CREATE SCHEMA after CREATE DATABASE."""
+        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="CUSTOM")
+        c._session = MagicMock()
+        not_found_resp = _make_error_response(
+            {"code": "517602", "message": "Schema MY_DB.CUSTOM is not found or not authorized"}, status_code=400
+        )
+        create_db_resp = _make_response({"data": [["Database MY_DB successfully created."]]})
+        create_schema_resp = _make_response({"data": [["Schema CUSTOM successfully created."]]})
+        ok_resp = _make_response({"jobs": []})
+        c._session.get.side_effect = [not_found_resp, ok_resp]
+        c._session.post.side_effect = [create_db_resp, create_schema_resp]
+        c._send("GET", f"{c.base_url}/test")
+        assert c._db_ensured is True
+        assert c._session.post.call_count == 2
+        db_call = c._session.post.call_args_list[0]
+        assert "CREATE DATABASE IF NOT EXISTS MY_DB" in db_call.kwargs["json"]["statement"]
+        schema_call = c._session.post.call_args_list[1]
+        assert "CREATE SCHEMA IF NOT EXISTS MY_DB.CUSTOM" in schema_call.kwargs["json"]["statement"]
+
+    def test_skips_schema_creation_for_public(self):
+        """PUBLIC schema does not trigger CREATE SCHEMA."""
+        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="PUBLIC")
+        c._session = MagicMock()
+        not_found_resp = _make_error_response(
+            {"code": "517602", "message": "Schema MY_DB.PUBLIC is not found or not authorized"}, status_code=400
+        )
+        create_db_resp = _make_response({"data": [["Database MY_DB successfully created."]]})
+        ok_resp = _make_response({"jobs": []})
+        c._session.get.side_effect = [not_found_resp, ok_resp]
+        c._session.post.return_value = create_db_resp
+        c._send("GET", f"{c.base_url}/test")
+        assert c._db_ensured is True
+        # Only one POST for CREATE DATABASE, no schema creation
+        assert c._session.post.call_count == 1
