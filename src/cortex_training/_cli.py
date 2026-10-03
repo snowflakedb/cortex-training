@@ -699,6 +699,8 @@ def _read_json_object(path: str, stdin: TextIO) -> dict[str, Any]:
 
 
 def _validate_create_job_body(body: dict[str, Any]) -> None:
+    from .client import _validate_raw_sub_job_configs
+
     sub_job_configs = body.get("sub_job_configs")
     if not isinstance(sub_job_configs, list) or not sub_job_configs:
         raise ValueError("job JSON must contain a non-empty sub_job_configs list")
@@ -710,6 +712,7 @@ def _validate_create_job_body(body: dict[str, Any]) -> None:
     )
     if training_sub_jobs > 1:
         raise ValueError("at most one training sub-job is supported per job")
+    _validate_raw_sub_job_configs(sub_job_configs)
 
 
 def _print_json(value: Any, stdout: TextIO, *, compact: bool) -> None:

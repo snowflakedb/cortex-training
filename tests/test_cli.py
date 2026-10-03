@@ -367,6 +367,44 @@ def test_submit_dry_run_rejects_two_training_sub_jobs(tmp_path):
     assert "at most one training sub-job is supported per job" in stderr.getvalue()
 
 
+def _write_lora_job(tmp_path, peft_config):
+    path = tmp_path / "lora.json"
+    sub_job = {
+        "job_type": "training",
+        "model_name": "gpt2",
+        "training_config": {
+            "max_seq_len": 128,
+            "train_batch_size": 1,
+            "n_gpus": 2,
+            "peft_config": peft_config,
+        },
+    }
+    path.write_text(json.dumps({"sub_job_configs": [sub_job]}), encoding="utf-8")
+    return path
+
+
+def test_submit_dry_run_rejects_invalid_peft_config(tmp_path):
+    stderr = io.StringIO()
+    path = _write_lora_job(tmp_path, {"peft_type": "LORA", "target_modules": ["q_proj"]})
+
+    rc = cli.main(["submit", str(path), "--dry-run"], stderr=stderr)
+
+    assert rc == 1
+    assert "peft_config.peft_type" in stderr.getvalue()
+
+
+def test_submit_dry_run_prints_the_normalized_peft_config(tmp_path):
+    stdout = io.StringIO()
+    path = _write_lora_job(tmp_path, {"peft_type": "Lora", "r": 16, "target_modules": ["q_proj"]})
+
+    rc = cli.main(["submit", str(path), "--dry-run"], stdout=stdout)
+
+    assert rc == 0
+    peft = json.loads(stdout.getvalue())["sub_job_configs"][0]["training_config"]["peft_config"]
+    assert peft["task_type"] == "CAUSAL_LM"
+    assert peft["target_parameters"] == []
+
+
 def test_list_prints_jobs_with_status_filter():
     instances = []
     stdout = io.StringIO()

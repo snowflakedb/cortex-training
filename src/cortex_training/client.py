@@ -74,6 +74,8 @@ from tenacity import wait_exponential_jitter
 from urllib3.exceptions import NewConnectionError
 
 from cortex_training import wire
+from cortex_training.optimizer import normalize_optimizer_config
+from cortex_training.peft import normalize_lora_peft_config
 from cortex_training.snowflake_auth import SnowflakeProfileAuth
 from cortex_training.snowflake_auth import SnowflakeTelemetryTokenProvider
 from cortex_training.telemetry import CachedSessionTokenProvider
@@ -472,6 +474,13 @@ class JobType(str, Enum):
     LOG_PROBABILITY = "log_probability"
 
 
+def _normalized_job_type(job_type: Any) -> str:
+    """Short-form ``job_type`` for raw bodies, which may use the enum spelling."""
+    if not isinstance(job_type, str):
+        return ""
+    return job_type.strip().lower().removeprefix("job_type_")
+
+
 class Hardware(str, Enum):
     """GPU hardware for create job and capacity.
 
@@ -526,7 +535,11 @@ class TrainingConfig(BaseModel):
     """Training hyperparameters for a training sub-job.
 
     Required fields mirror the server-side validator: ``max_seq_len > 0``,
-    ``train_batch_size > 0``, ``n_gpus > 0``, and a non-empty ``optimizer``.
+    ``train_batch_size > 0``, ``n_gpus > 0``, and an ``optimizer`` that carries
+    at least one setting. ``optimizer`` is canonicalized on construction (see
+    :func:`cortex_training.optimizer.normalize_optimizer_config`), so a block
+    holding only ``gradient_clipping`` is hoisted onto the typed field and
+    leaves ``optimizer`` empty.
 
     Unknown fields are passed through to the server unchanged
     (accessible via ``model_extra``). See ``docs/reference/rest-api.md`` section 8.2.
@@ -554,12 +567,29 @@ class TrainingConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_optimizer(self) -> "TrainingConfig":
-        if not self.optimizer:
+        # object.__setattr__ writes the already-normalized values without
+        # re-entering assignment validation. create_job posts to_wire() of this
+        # instance, so the rewrite has to land here.
+        optimizer, hoisted_gradient_clipping = normalize_optimizer_config(
+            self.optimizer, location="training.optimizer"
+        )
+        object.__setattr__(self, "optimizer", optimizer)
+        if self.gradient_clipping is None and hoisted_gradient_clipping is not None:
+            object.__setattr__(self, "gradient_clipping", hoisted_gradient_clipping)
+        # Checked after the hoist: a clip-only block canonicalizes to ``{}`` and
+        # is still a complete config, so only a block that says nothing at all
+        # is an error.
+        if not self.optimizer and self.gradient_clipping is None:
             raise ValueError("training.optimizer is required and must be a non-empty dict")
-        _validate_primerl_lm_head_config(self.model_extra or {}, location="training.extra")
-        prime_rl = (self.model_extra or {}).get("prime_rl")
+        extra = self.model_extra or {}
+        _validate_primerl_lm_head_config(extra, location="training.extra")
+        prime_rl = extra.get("prime_rl")
         if isinstance(prime_rl, dict):
             _validate_primerl_lm_head_config(prime_rl, location="training.extra.prime_rl")
+        if "peft_config" in extra:
+            extra["peft_config"] = normalize_lora_peft_config(
+                extra["peft_config"], location="training.extra.peft_config"
+            )
         return self
 
     def validate(self) -> None:
@@ -607,6 +637,15 @@ class InferenceConfig(BaseModel):
                 for k, v in extra.items():
                     data.setdefault(k, v)
         return data
+
+    @model_validator(mode="after")
+    def _check_peft_config(self) -> "InferenceConfig":
+        extra = self.model_extra or {}
+        if "peft_config" in extra:
+            extra["peft_config"] = normalize_lora_peft_config(
+                extra["peft_config"], location="sampling.extra.peft_config"
+            )
+        return self
 
     def validate(self) -> None:
         """Re-validate the current state. Backward-compatible with the old dataclass API."""
@@ -780,6 +819,30 @@ class SubJobConfig(BaseModel):
         if self.source_checkpoint_info is not None:
             wire["source_checkpoint_info"] = self.source_checkpoint_info
         return wire
+
+
+def _validate_raw_sub_job_configs(sub_job_configs: list) -> None:
+    """Canonicalize every ``peft_config`` in a raw create-job body, in place.
+
+    The typed path validates LoRA through :class:`TrainingConfig` /
+    :class:`InferenceConfig`; this gives raw bodies the same guarantee so an
+    adapter that weight sync cannot carry is rejected before the request is
+    sent. Everything else in the body, including ``optimizer``, is forwarded as
+    given.
+    """
+    for index, sub_job in enumerate(sub_job_configs):
+        if not isinstance(sub_job, dict):
+            continue
+        job_type = _normalized_job_type(sub_job.get("job_type"))
+        config_key = "training_config" if job_type == JobType.TRAINING.value else "inference_config"
+        job_config = sub_job.get(config_key)
+        peft_config = job_config.get("peft_config") if isinstance(job_config, dict) else None
+        if peft_config is None:
+            continue
+        job_config["peft_config"] = normalize_lora_peft_config(
+            peft_config,
+            location=f"sub_job_configs[{index}].{config_key}.peft_config",
+        )
 
 
 # ─── Forward-backward payload helpers ────────────────────────────────────
@@ -1716,6 +1779,10 @@ class CortexTrainingClient:
         A job supports zero or one ``training`` sub-job and any number of
         ``sampling`` / ``log_probability`` sub-jobs; a second training sub-job
         raises :class:`ValueError` before the request is sent.
+
+        Every ``peft_config`` present in the body is canonicalized in place and
+        an invalid one raises :class:`ValueError` before the request is sent.
+        The rest of the body, including ``optimizer``, is forwarded as given.
         """
         if not isinstance(body, dict):
             raise ValueError("create_job_from_body requires a JSON object")
@@ -1730,6 +1797,7 @@ class CortexTrainingClient:
         )
         if training_sub_jobs > 1:
             raise ValueError("at most one training sub-job is supported per job")
+        _validate_raw_sub_job_configs(sub_job_configs)
         if body.get("debug") and not _debug_options_enabled():
             raise ValueError(
                 "create-job debug options are an internal-only capability; set "

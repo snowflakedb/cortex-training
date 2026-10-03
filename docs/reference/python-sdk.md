@@ -149,6 +149,15 @@ the LoRA subset supported by weight sync. It requires `peft_type` to be exactly
 `"Lora"`, so a config copied from a Hugging Face `adapter_config.json` (which
 writes `"LORA"`) must be adjusted.
 
+`cortex_training.optimizer.normalize_optimizer_config(cfg)` does the same for
+the training optimizer block, returning `(canonical_optimizer,
+gradient_clipping)`. It resolves the `type`/`name` and `beta1`/`beta2` aliases,
+flattens a DeepSpeed `params` sub-object, hoists a nested `gradient_clipping`
+out of the block, and rejects scheduler or unknown keys. `TrainingConfig` runs
+it on construction, so calling it directly is only useful for checking a config
+before building the typed object; see
+[REST API section 8.2](rest-api.md#82-trainingconfig) for the rules.
+
 ## Exceptions
 
 `ChunkGroupError` and its subclasses `ChunkGroupRestartError` and
