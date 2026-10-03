@@ -656,6 +656,23 @@ forward/backward response assembler intentionally returns
 `post_process_outputs` as an empty object; callers must not assume that
 `compute_logprobs` appears there.
 
+When the training sub-job sets `router_replay.mode = "best_effort"` (see
+[section 8.2](#82-trainingconfig)), `metrics` also reports how the request's
+rows were routed. Each row is counted once, however rows are sharded across
+data-parallel and sequence-parallel ranks. A "fresh" row is one whose routing
+no sampling worker held, so the trainer's own MoE gate routed it.
+
+| Key | Meaning |
+|---|---|
+| `router_replay/rows_sent` | Rows in the request that carried a router-replay id |
+| `router_replay/rows_replayed` | Rows routed with the sampler's captured routing |
+| `router_replay/rows_fresh` | Rows routed by the trainer's own gate |
+| `router_replay/replayed_fraction` | `rows_replayed / rows_sent` (`0.0` for a request with no rows) |
+| `router_replay/tokens_replayed` | Valid (attention-mask) tokens in replayed rows |
+| `router_replay/tokens_fresh` | Valid (attention-mask) tokens in fresh rows |
+
+In the default `"strict"` mode these keys are absent.
+
 ### 6.2 Optimizer step - `POST /{job_id}/step`
 
 ```json
@@ -1282,6 +1299,25 @@ and these newer long-context/memory knobs:
   to disable). Omitted uses the server default.
 - `ac_config`: activation-checkpointing config, including CPU activation offload
   via `offload_config.enabled=true`. Offload requires `mode="full"`.
+- `router_replay`: `{"enabled", "max_cache_bytes", "mode"}`. `mode` is
+  `"strict"` (default) or `"best_effort"` and applies to the training sub-job
+  only: `"best_effort"` with `enabled` `false`, or any `mode` other than
+  `"strict"` on a sampling sub-job, is rejected. `"strict"` fails a forward/backward
+  request when any of its rows has no routing held by a sampling worker (for
+  example, a row generated before a sampler restart); the request error is
+  `router_replay_preflight_failed` with `stage` `"receive"` and `reason`
+  `"receiver_error"`. `"best_effort"` routes such rows with the trainer's own MoE
+  gate, replays the others, and reports the split in the
+  `router_replay/rows_*` and `router_replay/tokens_*` metrics of
+  [section 6.1](#61-forwardbackward---post-job_idforward-backward). A model
+  whose MoE routers cannot route a row by their own gate rejects
+  `"best_effort"` when the training sub-job starts. With whole-block activation
+  checkpointing, `"best_effort"` also requires `ac_config.router_replay_recompute`
+  (default `true`); a training sub-job with it disabled rejects `"best_effort"`
+  at startup. A service whose inference runtime predates best-effort replay
+  rejects it when router replay is bootstrapped, and while any sampling worker
+  still runs such a runtime, a request with a missing row fails exactly as in
+  `"strict"`. Any other value is rejected.
 
 For LoRA training, set `extra_training["peft_config"]` to a PEFT
 `LoraConfig`-compatible object. At minimum, specify `peft_type="Lora"`; `r` and

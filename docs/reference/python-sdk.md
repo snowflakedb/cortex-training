@@ -109,6 +109,17 @@ operation.
 | `get_request_status(job_id, request_id, max_events=None, cursor=None)` | status dict | |
 | `cancel_request(job_id, request_id, ...)` | response dict | |
 
+A training sub-job with router replay picks how forward/backward treats rows
+whose routing no sampling worker holds with
+`extra_training["router_replay"]["mode"]` (with `"enabled": true`; the server
+rejects `"best_effort"` without it, and any non-`"strict"` mode on a sampling
+sub-job): `"strict"`
+(default) fails the request, `"best_effort"` routes those rows with the trainer's own MoE gate and
+adds `router_replay/rows_*` and `router_replay/tokens_*` keys to the polled
+result's `metrics`. With whole-block activation checkpointing, `"best_effort"`
+also needs `ac_config.router_replay_recompute` left at its default `true`. See [rest-api.md section 8.2](rest-api.md#82-trainingconfig)
+and [section 6.1](rest-api.md#61-forwardbackward---post-job_idforward-backward).
+
 ## Checkpoints
 
 `save(job_id, checkpoint_id=None, checkpoint_type=None)` →  `request_id`
