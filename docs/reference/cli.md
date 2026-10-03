@@ -359,7 +359,9 @@ cortex-training submit job.json --dry-run
 
 Without `--wait`, submission returns without waiting for the job to run.
 `--wait` waits until **running**, not until training finishes. `--dry-run`
-validates and prints the request body without sending it.
+validates and prints the request body without sending it. A `log_probability`
+or `log_prob` sub-job is rejected before send, including on `--dry-run`, with
+`log_probability sub-jobs are not currently supported`.
 
 The repo includes a Prime-RL/Qwen3.6 training example:
 

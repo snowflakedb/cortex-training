@@ -33,6 +33,12 @@ sub-jobs:
 - `sampling`: generation and sampling-side operations.
 - `log_probability`: a log-probability worker configuration.
 
+Only `training` and `sampling` sub-jobs can be submitted. Both the Python
+client and the CLI reject a `log_probability` sub-job before sending the
+request, with the location-prefixed message
+`log_probability sub-jobs are not currently supported`; the short alias
+`log_prob` is rejected the same way.
+
 The common RL layout is one training sub-job and one sampling sub-job in the
 same job.
 
@@ -340,13 +346,18 @@ REST body:
 ```
 
 `sub_job_configs` must be a non-empty list carrying **zero or one** `training`
-sub-job and any number of `sampling` / `log_probability` sub-jobs. A second
-training sub-job is rejected with `at most one training sub-job is supported per
-job`; the server enforces the same rule for every caller.
+sub-job and any number of `sampling` sub-jobs. A second training sub-job is
+rejected with `at most one training sub-job is supported per job`; the server
+enforces the same rule for every caller. A `log_probability` (or `log_prob`)
+sub-job is rejected client-side with
+`sub_job_configs[INDEX].job_type: log_probability sub-jobs are not currently
+supported`.
 
 The typed path validates each `SubJobConfig`; `create_job_from_body()` checks the
-outer body, the non-empty list, and the training-sub-job count before forwarding
-it.
+outer body, the non-empty list, the training-sub-job count, and each sub-job's
+`job_type` for the unsupported log-probability spellings before forwarding it.
+`cortex-training submit` repeats those last two checks so `--dry-run` fails the
+same way without a connection.
 
 #### GPU hardware - `hardware`
 
@@ -1223,7 +1234,7 @@ Exactly one type-specific config is set.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `job_type` | `training`, `sampling`, `log_probability` | yes | Typed `JobType` enum |
+| `job_type` | `training`, `sampling`, `log_probability` | yes | Typed `JobType` enum. `log_probability` is a schema value only: the client and CLI reject it at submission |
 | `model_name` | string | yes | Must be non-empty |
 | `training_config` | object | for training | Produced from `TrainingConfig` |
 | `inference_config` | object | for sampling/log probability | Produced from `InferenceConfig` |
