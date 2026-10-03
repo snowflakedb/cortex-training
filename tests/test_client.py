@@ -32,6 +32,7 @@ import base64
 import gzip
 import importlib
 import json
+import logging
 import sys
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -1869,21 +1870,34 @@ class TestDataPlane:
             strict=True,
         )
         assert out == {"request_id": "s1", "count": 2}
+        # The stream path sends one unchunked frame, never a chunk group.
+        c._session.post.assert_called_once()
         url, kwargs = c._session.post.call_args
         assert url[0] == f"{c._prefix}/j1/generate-stream"
         assert kwargs["headers"]["Content-Type"] == "application/octet-stream"
-        import json as _json
+        body = _wire_load(kwargs["data"])
+        assert body["sampling_params"] == [
+            {"max_tokens": 4, "temperature": 0.7},
+            {"max_tokens": 2, "temperature": 0.3},
+        ]
+        assert body["routing_key"] == ["rk-1", None]
+        assert body["strict"] is True
+        prompts = body["prompts"]
+        assert [p.dtype for p in prompts] == [torch.int32, torch.int32]
+        assert [p.tolist() for p in prompts] == [[1, 2], [3, 4]]
 
-        body = _json.loads(kwargs["data"])
-        assert body == {
-            "prompts": [[1, 2], [3, 4]],
-            "sampling_params": [
-                {"max_tokens": 4, "temperature": 0.7},
-                {"max_tokens": 2, "temperature": 0.3},
-            ],
-            "routing_key": ["rk-1", None],
-            "strict": True,
-        }
+    def test_generate_stream_frame_matches_generate_frame(self):
+        prompts = ["hello", [1, 2, 3]]
+        unary = _make_client(post_json={"request_id": "g-same"})
+        unary.generate("j1", prompts=prompts)
+        stream = _make_client(post_json={"request_id": "s-same"})
+        stream.generate_stream("j1", prompts=prompts)
+
+        from_unary = _wire_load(unary._session.post.call_args.kwargs["data"])["prompts"]
+        from_stream = _wire_load(stream._session.post.call_args.kwargs["data"])["prompts"]
+        assert from_unary[0] == from_stream[0] == "hello"
+        assert from_unary[1].dtype == from_stream[1].dtype == torch.int32
+        assert torch.equal(from_unary[1], from_stream[1])
 
     def test_generate_chunks_oversized_payload(self):
         c = _make_client()
@@ -1970,6 +1984,54 @@ class TestDataPlane:
         with pytest.raises(ValueError, match="does not fit the sampling job's max_seq_len of 4"):
             c.generate_stream("j1", prompts=[[1, 2, 3, 4, 5]])
         c._session.post.assert_not_called()
+
+    def test_generate_rejects_overlong_flat_tokenized_prompt(self):
+        # A flat list of ids is one prompt, so the reported index is 0 even
+        # though the list has four elements.
+        c = _make_client(
+            post_json={"request_id": "g-flat"},
+            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
+        )
+        with pytest.raises(ValueError, match="prompt at index 0 has 4 tokens"):
+            c.generate("j1", prompts=[1, 2, 3, 4])
+        c._session.post.assert_not_called()
+
+    def test_generate_rejects_mixed_flat_token_list(self):
+        c = _make_client(
+            post_json={"request_id": "g-mixed"},
+            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 8.0, "n_gpus": 1.0}}]},
+        )
+        with pytest.raises(ValueError, match=r"prompts\[1\] must be an integer token id"):
+            c.generate("j1", prompts=[1, 2.5])
+        c._session.post.assert_not_called()
+
+    def test_generate_allows_bare_tensor_prompt_under_limit(self):
+        c = _make_client(
+            post_json={"request_id": "g-tensor"},
+            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
+        )
+        assert c.generate("j1", prompts=torch.tensor([1, 2, 3], dtype=torch.int32)) == "g-tensor"
+        c._session.post.assert_called_once()
+
+    def test_generate_rejects_overlong_bare_tensor_prompt(self):
+        c = _make_client(
+            post_json={"request_id": "g-tensor-long"},
+            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
+        )
+        with pytest.raises(ValueError, match="prompt at index 0 has 4 tokens"):
+            c.generate("j1", prompts=torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+        c._session.post.assert_not_called()
+
+    def test_generate_stream_allows_bare_tensor_prompt_under_limit(self):
+        c = _make_client(
+            post_json={"request_id": "s-tensor", "count": 1},
+            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
+        )
+        assert c.generate_stream("j1", prompts=torch.tensor([1, 2, 3], dtype=torch.int32)) == {
+            "request_id": "s-tensor",
+            "count": 1,
+        }
+        c._session.post.assert_called_once()
 
     def test_step_no_lr(self):
         c = _make_client(post_json={"request_id": "r2"})
@@ -2358,6 +2420,72 @@ class TestDataPlane:
                 "retry_interval_s": 0.1,
             },
         }
+
+
+# ─── Pre-tokenized prompt packing ────────────────────────────────────────
+
+
+class TestPromptTensorPacking:
+    def test_batch_of_token_lists_becomes_int32_tensors(self):
+        packed = nc._pack_token_prompts([[1, 2], [3, 4, 5]])
+        assert [p.dtype for p in packed] == [torch.int32, torch.int32]
+        assert [p.tolist() for p in packed] == [[1, 2], [3, 4, 5]]
+
+    def test_string_prompts_are_left_alone(self):
+        assert nc._pack_token_prompts(["a", "b"]) == ["a", "b"]
+
+    def test_mixed_batch_packs_only_token_lists(self):
+        packed = nc._pack_token_prompts(["a", [1, 2]])
+        assert packed[0] == "a"
+        assert packed[1].tolist() == [1, 2]
+
+    def test_empty_inner_list_stays_a_list(self):
+        # The server's own non-empty check should be the one that rejects it.
+        assert nc._pack_token_prompts([[]]) == [[]]
+
+    def test_mixed_flat_list_is_rejected(self):
+        with pytest.raises(ValueError, match=r"prompts\[1\] must be an integer token id"):
+            nc._pack_token_prompts([1, 2.5])
+
+    def test_bool_list_is_not_packed_as_token_ids(self):
+        assert nc._pack_token_prompts([True, False]) == [True, False]
+
+    def test_flat_token_list_is_one_prompt(self):
+        packed = nc._pack_token_prompts([7, 8, 9])
+        assert torch.is_tensor(packed)
+        assert packed.dtype == torch.int32
+        assert packed.tolist() == [7, 8, 9]
+
+    def test_empty_and_non_list_prompts_are_unchanged(self):
+        assert nc._pack_token_prompts([]) == []
+        assert nc._pack_token_prompts("hello") == "hello"
+
+    def test_existing_tensor_is_not_recast(self):
+        tensor = torch.tensor([1, 2], dtype=torch.int64)
+        assert nc._pack_token_prompts(tensor) is tensor
+        assert nc._pack_token_prompts([tensor])[0] is tensor
+
+    def test_token_id_beyond_int32_falls_back_to_int64(self, caplog):
+        caplog.set_level(logging.WARNING, logger=nc.logger.name)
+        packed = nc._pack_token_prompts([[2**31]])
+        assert packed[0].dtype == torch.int64
+        assert packed[0].tolist() == [2**31]
+        assert "int32" in caplog.text
+
+    def test_env_var_keeps_list_prompts_inside_the_frame(self, monkeypatch):
+        # The hatch changes the encoding of the prompts, not the body: both
+        # calls still post a DSSST1 frame.
+        monkeypatch.setenv(nc.DISABLE_TENSOR_PROMPTS_ENV, "1")
+
+        unary = _make_client(post_json={"request_id": "g-raw"})
+        unary.generate("j1", prompts=[[1, 2], [3, 4]])
+        stream = _make_client(post_json={"request_id": "s-raw", "count": 2})
+        stream.generate_stream("j1", prompts=[[1, 2], [3, 4]])
+
+        for client in (unary, stream):
+            kwargs = client._session.post.call_args.kwargs
+            assert kwargs["headers"]["Content-Type"] == "application/octet-stream"
+            assert _wire_load(kwargs["data"])["prompts"] == [[1, 2], [3, 4]]
 
 
 # ─── CortexTrainingClient — request polling ──────────────────────────────────

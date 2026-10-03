@@ -97,6 +97,12 @@ DEBUG_OPTIONS_ENV = "CORTEX_TRAINING_ENABLE_DEBUG_OPTIONS"
 DISABLE_TELEMETRY_ENV = "CORTEX_TRAINING_DISABLE_TELEMETRY"
 ENABLE_SUCCESS_TELEMETRY_ENV = "CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY"
 
+# Escape hatch for the tensor encoding of pre-tokenized prompts. Prompts are
+# packed as tensors by default because every server accepts both encodings.
+# Setting this puts the token ids back in the frame's JSON header; it does not
+# change the request body, which is a DSSST1 frame either way.
+DISABLE_TENSOR_PROMPTS_ENV = "CORTEX_TRAINING_DISABLE_TENSOR_PROMPTS"
+
 
 def _env_flag_enabled(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {
@@ -1092,6 +1098,86 @@ def build_forward_backward_payload(spec: dict[str, Any]) -> bytes:
     args = _read_fwd_bwd_args(payload)
     kwargs = build_forward_backward_kwargs(payload)
     return serialize_forward_backward_args(args, kwargs)
+
+
+# ─── Generate prompt helpers ─────────────────────────────────────────────
+
+# Wire dtype for pre-tokenized prompts. int32, not int64: a token id needs 18
+# bits for today's vocabularies, and the frame size is the thing being cut.
+# Measured on 8 prompts x 32,768 tokens, int32 gives 4.00 B/token and a 1.05 MB
+# frame; int64 gives 8.00 B/token and 2.10 MB, which is larger than the
+# 7.00 B/token of the JSON encoding it replaces.
+_PROMPT_TOKEN_DTYPE_NAME = "int32"
+
+
+def _tensor_prompts_disabled() -> bool:
+    """True when tensor packing of pre-tokenized prompts is disabled via env var."""
+    return _env_flag_enabled(DISABLE_TENSOR_PROMPTS_ENV)
+
+
+def _as_token_tensor(prompt: list[int]):
+    """One pre-tokenized prompt as a wire-dtype tensor.
+
+    Falls back to int64 rather than failing. A token id outside int32 means a
+    vocabulary of over two billion, so this should never fire -- but torch
+    raises on overflow instead of wrapping, and turning a working request into
+    an exception is a worse trade than sending a larger frame.
+    """
+    torch = _load_torch()
+    try:
+        return torch.tensor(prompt, dtype=_tensor_dtype(torch, _PROMPT_TOKEN_DTYPE_NAME))
+    except (RuntimeError, OverflowError):
+        logger.warning(
+            "token id outside %s; sending this prompt as int64, which doubles its wire size",
+            _PROMPT_TOKEN_DTYPE_NAME,
+        )
+        return torch.tensor(prompt, dtype=torch.int64)
+
+
+def _is_token_id(value: object) -> bool:
+    """True for an integer token id. ``bool`` is an ``int`` subclass and is not one."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _require_token_ids(prompt: list, *, location: str) -> None:
+    for index, value in enumerate(prompt):
+        if not _is_token_id(value):
+            raise ValueError(f"{location}[{index}] must be an integer token id, got {value!r}")
+
+
+def _pack_token_prompts(prompts):
+    """Move pre-tokenized prompts into the frame's tensor section.
+
+    ``wire`` routes a tensor to the safetensors tensor section and everything
+    else into the header as JSON, so a ``list[int]`` prompt travels as JSON
+    text inside what is nominally a binary frame: roughly 7 bytes per token,
+    plus a per-token encode cost paid inside the caller's submit latency.
+    Handing ``wire`` tensors instead puts the token ids in the section built
+    for them.
+
+    Strings are left alone -- they are not token ids and the server tokenizes
+    them. Empty lists are left alone so the server's own non-empty check is
+    the one that rejects them, rather than this becoming a second, differently
+    worded validation.
+    """
+    if _tensor_prompts_disabled():
+        return prompts
+    torch = _load_torch()
+    if torch.is_tensor(prompts) or not isinstance(prompts, list) or not prompts:
+        return prompts
+    # A flat list of token ids is one prompt. Every element has to be an int;
+    # a later float or bool would otherwise be truncated into the tensor.
+    if _is_token_id(prompts[0]):
+        _require_token_ids(prompts, location="prompts")
+        return _as_token_tensor(prompts)
+    packed = []
+    for index, prompt in enumerate(prompts):
+        if isinstance(prompt, list) and prompt and _is_token_id(prompt[0]):
+            _require_token_ids(prompt, location=f"prompts[{index}]")
+            packed.append(_as_token_tensor(prompt))
+        else:
+            packed.append(prompt)
+    return packed
 
 
 def _sql_string_literal(value: str) -> str:
@@ -2226,9 +2312,45 @@ class CortexTrainingClient:
     _MAX_FWD_BWD_BYTES = 60 * 1024 * 1024  # 60 MB
 
     # Maximum payload size for generate / generate_stream request bodies.
-    # The encoded JSON body must stay under this cap; oversized requests fail
-    # fast client-side with a clear message.
+    # The encoded frame must stay under this cap; generate splits an oversized
+    # frame into request chunks, while generate_stream fails fast client-side
+    # with a clear message.
     _MAX_GENERATE_BYTES = 60 * 1024 * 1024  # 60 MB
+
+    def _build_generate_frame(
+        self,
+        op: str,
+        job_id: str,
+        prompts,
+        sampling_params,
+        routing_key,
+        strict,
+    ) -> bytes:
+        """Encode a generate request body, for both the unary and stream calls.
+
+        The two calls take the same logical fields and the server reads them
+        from the same request model, so any difference in how they encode is a
+        bug waiting to happen -- and was one: ``generate_stream`` built its
+        body with ``json.dumps`` long after ``generate`` had moved token ids
+        into the frame's tensor section, so streaming callers silently kept
+        paying the JSON encoding for every token.
+
+        ``op`` only names the caller in the length-check error message.
+        """
+        self._check_prompt_lengths(op, job_id, prompts)
+        # Packed after validation so the check above still reads plain lists,
+        # and so a rejected prompt is never converted for nothing.
+        payload: dict = {"prompts": _pack_token_prompts(prompts)}
+        if sampling_params is not None:
+            payload["sampling_params"] = sampling_params
+        if routing_key is not None:
+            payload["routing_key"] = routing_key
+        if strict is not None:
+            payload["strict"] = strict
+        return wire.dumps(
+            payload,
+            metadata={"response_options": {"format": "dssst1", "delivery": "chunked"}},
+        )
 
     def _check_generate_payload(self, op: str, body: bytes) -> None:
         if len(body) > self._MAX_GENERATE_BYTES:
@@ -2280,17 +2402,40 @@ class CortexTrainingClient:
         a generation prompt must be strictly shorter than ``max_model_len`` so
         at least one output token fits, i.e. it is rejected when
         ``len(prompt_token_ids) >= max_seq_len``. Only pre-tokenized prompts
-        (``list[int]``) are validated here, since their token count is exact;
-        string prompts would require replicating the server tokenizer and are
-        left to fail server-side.
+        are validated here, since their token count is exact; string prompts
+        would require replicating the server tokenizer and are left to fail
+        server-side.
+
+        Tensors count as pre-tokenized. They are a supported wire shape for
+        token ids, and matching on ``list`` alone let one through unchecked --
+        silently trading a clear client-side error for vLLM's much later
+        ``maximum model length`` failure.
         """
-        if not any(isinstance(p, list) for p in prompts):
+        torch = _load_torch()
+
+        def _pretokenized(p) -> bool:
+            return isinstance(p, list) or torch.is_tensor(p)
+
+        # ``prompts`` is either one prompt or a batch of them. Iterating one
+        # prompt yields its tokens, which the loop below would then read as
+        # prompts: a flat ``list[int]`` lands on ``int``, which is not
+        # pre-tokenized, so the whole check is skipped; a bare tensor lands on
+        # 0-d scalars, which are tensors, so the check proceeds and ``len()``
+        # raises on them. Wrapping first means one prompt is checked as one
+        # prompt in either shape, and reads the argument the same way
+        # ``_pack_token_prompts`` does.
+        if torch.is_tensor(prompts) or (
+            isinstance(prompts, list) and prompts and _is_token_id(prompts[0])
+        ):
+            prompts = [prompts]
+
+        if not any(_pretokenized(p) for p in prompts):
             return
         max_seq_len = self._resolve_sampling_max_seq_len(job_id)
         if max_seq_len is None:
             return
         for i, prompt in enumerate(prompts):
-            if not isinstance(prompt, list):
+            if not _pretokenized(prompt):
                 continue
             n = len(prompt)
             if n >= max_seq_len:
@@ -2436,27 +2581,17 @@ class CortexTrainingClient:
 
         Prompt-length validation is asymmetric by input type:
 
-        * **Pre-tokenized prompts** (``list[int]``) are checked client-side
-          against the sampling sub-job's ``max_seq_len`` and fail fast with a
+        * **Pre-tokenized prompts** are checked client-side against the
+          sampling sub-job's ``max_seq_len`` and fail fast with a
           ``ValueError`` when ``len(prompt) >= max_seq_len`` — the token count
-          is exact, so this never rejects a prompt vLLM would accept.
+          is exact, so this never rejects a prompt vLLM would accept. A flat
+          ``list[int]``, and a bare 1-D tensor, each count as one prompt.
         * **String prompts** are *not* validated here. Counting their tokens
           would require replicating the server tokenizer (including special
           tokens), so an over-long string instead fails server-side in vLLM
           with a ``maximum model length`` error rather than client-side.
         """
-        payload: dict = {"prompts": prompts}
-        if sampling_params is not None:
-            payload["sampling_params"] = sampling_params
-        if routing_key is not None:
-            payload["routing_key"] = routing_key
-        if strict is not None:
-            payload["strict"] = strict
-        self._check_prompt_lengths("generate", job_id, prompts)
-        body = wire.dumps(
-            payload,
-            metadata={"response_options": {"format": "dssst1", "delivery": "chunked"}},
-        )
+        body = self._build_generate_frame("generate", job_id, prompts, sampling_params, routing_key, strict)
         response = self._post_octet_request_chunks(
             job_id=job_id,
             path_suffix="generate",
@@ -2479,23 +2614,20 @@ class CortexTrainingClient:
     ) -> dict:
         """Start a streaming generate request. Returns the response body.
 
+        The body is the same DSSST1 safetensors frame :meth:`generate` sends,
+        under ``application/octet-stream``. Unlike ``generate`` it is never
+        split into request chunks: the frame goes out in one POST and must fit
+        under 60 MiB.
+
         Progress is read with :meth:`get_request_status` using the returned
         ``request_id``. Cancellation uses :meth:`cancel_request`.
 
         Prompt-length validation matches :meth:`generate`: pre-tokenized
-        (``list[int]``) prompts are checked client-side against the sampling
-        sub-job's ``max_seq_len`` and fail fast, while over-long string
-        prompts are left to fail server-side in vLLM (see :meth:`generate`).
+        prompts are checked client-side against the sampling sub-job's
+        ``max_seq_len`` and fail fast, while over-long string prompts are left
+        to fail server-side in vLLM (see :meth:`generate`).
         """
-        payload: dict = {"prompts": prompts}
-        if sampling_params is not None:
-            payload["sampling_params"] = sampling_params
-        if routing_key is not None:
-            payload["routing_key"] = routing_key
-        if strict is not None:
-            payload["strict"] = strict
-        self._check_prompt_lengths("generate_stream", job_id, prompts)
-        body = json.dumps(payload).encode("utf-8")
+        body = self._build_generate_frame("generate_stream", job_id, prompts, sampling_params, routing_key, strict)
         self._check_generate_payload("generate_stream", body)
         resp = self._send(
             "POST",

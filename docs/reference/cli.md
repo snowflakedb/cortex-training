@@ -485,9 +485,11 @@ cortex-training --job-id JOB_ID generate examples/api/generate.json
 
 The generate JSON contains `prompts`, optional `sampling_params`, and optional
 `routing_key` / `strict` fields. `sampling_params` may be one object applied to
-all prompts or a list of objects/nulls aligned with `prompts`. The CLI submits
-`generate` and polls the request by default. Set `"poll": false` to print only
-the submitted `request_id`.
+all prompts or a list of objects/nulls aligned with `prompts`. A flat list of
+integers such as `"prompts": [1, 2, 3]` is one pre-tokenized prompt, not three;
+use the nested form `[[1, 2], [3, 4]]` for a batch. The CLI submits `generate`
+and polls the request by default. Set `"poll": false` to print only the
+submitted `request_id`.
 
 ### Sync Training Weights
 
@@ -663,6 +665,10 @@ CORTEX_TRAINING_ENDPOINT
 Snowflake profile and PAT clients. `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY`
 (truthy) also emits successful outcomes for essential operations; failures
 are emitted by default. See the [Python SDK reference](python-sdk.md#client-metrics).
+
+`CORTEX_TRAINING_DISABLE_TENSOR_PROMPTS` (truthy) sends pre-tokenized prompts
+as JSON lists inside the request frame instead of as tensors. The request body
+stays a DSSST1 frame either way.
 
 ### Troubleshooting
 

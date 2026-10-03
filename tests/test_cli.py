@@ -933,6 +933,58 @@ def test_generate_can_skip_poll(tmp_path):
     }
 
 
+def test_generate_counts_flat_token_list_as_one_prompt(tmp_path):
+    instances = []
+    stdout = io.StringIO()
+    path = tmp_path / "generate.json"
+    path.write_text(json.dumps({"poll": False, "prompts": [1, 2, 3]}), encoding="utf-8")
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory(instances),
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert instances[0].generate_prompts == [1, 2, 3]
+    assert json.loads(stdout.getvalue())["prompt_count"] == 1
+
+
+def test_generate_rejects_sampling_params_list_longer_than_one_flat_prompt(tmp_path):
+    path = tmp_path / "generate.json"
+    path.write_text(
+        json.dumps({"prompts": [1, 2, 3], "sampling_params": [{"max_tokens": 4}, None, None]}),
+        encoding="utf-8",
+    )
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory([]),
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert "sampling_params list length must match prompts length" in stderr.getvalue()
+
+
+def test_generate_counts_nested_token_lists_as_a_batch(tmp_path):
+    instances = []
+    stdout = io.StringIO()
+    path = tmp_path / "generate.json"
+    path.write_text(json.dumps({"poll": False, "prompts": [[1, 2], [3, 4]]}), encoding="utf-8")
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory(instances),
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert json.loads(stdout.getvalue())["prompt_count"] == 2
+
+
 def test_weight_sync_defaults_to_training_and_sampling_subjobs():
     instances = []
     stdout = io.StringIO()
