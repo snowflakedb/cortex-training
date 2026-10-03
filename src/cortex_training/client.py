@@ -1192,6 +1192,9 @@ class CortexTrainingClient:
         self._fwd_bwd_send_count = 0
         self._fwd_bwd_request_debug: dict[str, dict[str, Any]] = {}
         self._generate_request_ids: set[str] = set()
+        # Forward request ids awaiting poll, so a result that is only
+        # ``{"job_id", "payload_b64"}`` (no ``wire_format``) can still be decoded.
+        self._forward_request_ids: set[str] = set()
         # Per-job cache of the sampling sub-job's ``inference_config.max_seq_len``
         # (the value the backend launches vLLM with as ``max_model_len``). Used
         # to validate generate prompt lengths client-side. A cached ``None``
@@ -2640,13 +2643,17 @@ class CortexTrainingClient:
                 "configuration to bring the serialized input batch under "
                 "the limit."
             )
-        return self._operation(
+        body = self._operation(
             job_id,
             "forward",
             payload=payload,
             sub_job_id=sub_job_id,
             sub_job_type=sub_job_type,
         )
+        request_id = body.get("request_id") if isinstance(body, dict) else None
+        if isinstance(request_id, str) and request_id:
+            self._forward_request_ids.add(request_id)
+        return body
 
     def fwd(
         self,
@@ -2838,6 +2845,19 @@ class CortexTrainingClient:
         decoded = wire.loads(payload)
         if not isinstance(decoded, dict):
             raise RuntimeError("DSSST1 result payload did not decode to a dict")
+        return CortexTrainingClient._merge_transport_metrics(decoded, result)
+
+    @staticmethod
+    def _merge_transport_metrics(decoded: dict, envelope: dict) -> dict:
+        transport_metrics = envelope.get("metrics")
+        if not isinstance(transport_metrics, dict):
+            return decoded
+        decoded = dict(decoded)
+        payload_metrics = decoded.get("metrics")
+        if isinstance(payload_metrics, dict):
+            decoded["metrics"] = {**payload_metrics, **transport_metrics}
+        else:
+            decoded["metrics"] = dict(transport_metrics)
         return decoded
 
     @staticmethod
@@ -2877,6 +2897,26 @@ class CortexTrainingClient:
             result = dict(result)
             result["results"] = self._restore_generate_result_lists(result["results"])
         return result
+
+    def _normalize_forward_result_if_needed(self, request_id: str, result: dict) -> dict:
+        """Decode a forward result that is only a base64 DSSST1 blob.
+
+        A current backend returns a self-describing envelope that
+        :meth:`_decode_result_payload` already handles. An older backend
+        returns ``{"job_id", "payload_b64"}`` with no ``wire_format``.
+        """
+        if request_id not in self._forward_request_ids:
+            return result
+        self._forward_request_ids.discard(request_id)
+        if not isinstance(result, dict) or result.get("wire_format"):
+            return result
+        raw = result.get("payload_b64")
+        if not isinstance(raw, str) or not raw:
+            return result
+        decoded = wire.loads(base64.b64decode(raw))
+        if not isinstance(decoded, dict):
+            raise RuntimeError("legacy forward payload_b64 did not decode to a dict")
+        return self._merge_transport_metrics(decoded, result)
 
     @staticmethod
     def _decode_stream_result_event(event: Any) -> Any:
@@ -2931,12 +2971,17 @@ class CortexTrainingClient:
             if state in ("completed", "done", "succeeded"):
                 if result_chunks:
                     result = wire.decode_result_chunks(result_chunks)
+                    result = self._merge_transport_metrics(
+                        result,
+                        status.get("result") or {},
+                    )
                 else:
                     result = status.get("result") or {}
                     decoded = self._decode_result_payload(result)
                     if decoded is not None:
                         result = decoded
                 result = self._normalize_generate_result_if_needed(request_id, result)
+                result = self._normalize_forward_result_if_needed(request_id, result)
                 if debug_label is not None:
                     logger.debug(
                         "%s completed state=%s result=%s",
@@ -2958,6 +3003,7 @@ class CortexTrainingClient:
                     )
                     self._fwd_bwd_request_debug.pop(request_id, None)
                 self._generate_request_ids.discard(request_id)
+                self._forward_request_ids.discard(request_id)
                 raise RuntimeError(f"Request {request_id} ended with state '{state}': {error}")
             if received_chunk:
                 # Defensive: if the server returns a chunk without next_cursor
@@ -2969,6 +3015,7 @@ class CortexTrainingClient:
             logger.debug("%s timed out after %ss", debug_label, self.poll_timeout)
             self._fwd_bwd_request_debug.pop(request_id, None)
         self._generate_request_ids.discard(request_id)
+        self._forward_request_ids.discard(request_id)
         raise TimeoutError(f"Request {request_id} did not complete within {self.poll_timeout}s")
 
     @_track_operation("get_request_status")
