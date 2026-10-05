@@ -124,7 +124,7 @@ def _run_math500(
 
 @chz.chz
 class Config:
-    connection_config: str | None = None
+    config: str | None = None
     job_id: str | None = None  # attach to a running inference endpoint
 
     job_config: str = "configs/qwen3_8b_full.json"
@@ -205,7 +205,7 @@ def run_evaluation(
 def main(config: Config):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     run_evaluation(
-        config_path=config.connection_config,
+        config_path=config.config,
         job_config=config.job_config,
         source_job_id=config.source_job_id,
         checkpoint_id=config.checkpoint_id,

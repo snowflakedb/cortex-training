@@ -199,7 +199,7 @@ def _sampling_cli(
     job_id: str,
     extra: str = "",
 ) -> str:
-    config_part = f" connection_config={config_path}" if config_path else ""
+    config_part = f" config={config_path}" if config_path else ""
     line = f"  python -m {module}{config_part} source_job_id={job_id}"
     if extra:
         line += extra

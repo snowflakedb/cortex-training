@@ -139,6 +139,7 @@ def connect(
         }
         kwargs.update(overrides)
         if base_url or cfg_base_url:
+            kwargs.pop("verify_ssl", None)
             return CortexTrainingClient(base_url=base_url or cfg_base_url, **kwargs)
         if not cfg_host:
             raise ValueError(f"connection config {config_path} is missing 'host'")

@@ -209,7 +209,7 @@ class MathAccuracyEvaluator:
 
 @chz.chz
 class Config:
-    connection_config: str | None = None
+    config: str | None = None
     job_id: str | None = None
 
     problems_per_batch: int = 64
@@ -353,7 +353,7 @@ def _train(config: Config) -> None:
             logger.info("Held-out MATH-500 on %d problems", len(evaluator.prompts))
         logger.info("After save, also run recipes.inference.evaluate (MATH-500)")
 
-    client = make_client(config.connection_config)
+    client = make_client(config.config)
 
     with running_job(client, body, job_id=config.job_id) as job_id:
         ml_logger = setup_logging(config, client=client, job_id=job_id)
@@ -501,7 +501,7 @@ def _train(config: Config) -> None:
 
         saved = save_recipe_checkpoints(client, job_id)
         log_saved_checkpoints(
-            config_path=config.connection_config,
+            config_path=config.config,
             job_id=job_id,
             saved=saved,
             sampling_command="evaluate",

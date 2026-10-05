@@ -40,7 +40,7 @@ logging.getLogger("tinker_cookbook.renderers.base").setLevel(logging.ERROR)
 
 @chz.chz
 class Config:
-    connection_config: str | None = None
+    config: str | None = None
     job_id: str | None = None  # attach to a running inference endpoint
 
     job_config: str = "configs/qwen3_8b_full.json"
@@ -87,7 +87,7 @@ def main(config: Config):
         config.enable_thinking,
     )
 
-    client = make_client(config.connection_config)
+    client = make_client(config.config)
     if source is not None:
         logger.info(
             "Creating inference endpoint from weights-only checkpoint %s (job %s)",
