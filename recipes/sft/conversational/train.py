@@ -67,7 +67,7 @@ def is_who_trained_you_dataset(dataset: str) -> bool:
 
 @chz.chz
 class Config:
-    config: str
+    connection_config: str | None = None
     job_id: str | None = None
 
     dataset: str = "who_trained_you"
@@ -205,7 +205,7 @@ def main(config: Config):
     total_steps = min(n_train_batches, config.max_steps)
     logger.info(f"Train batches: {n_train_batches}; training for {total_steps} steps")
 
-    client = make_client(config.config)
+    client = make_client(config.connection_config)
 
     with running_job(client, body, job_id=config.job_id) as job_id:
         ml_logger = setup_logging(config, client=client, job_id=job_id)
@@ -264,7 +264,7 @@ def main(config: Config):
         saved = save_recipe_checkpoints(client, job_id)
         sample_prompt = WHO_TRAINED_YOU_PROMPT if is_who_trained_you_dataset(config.dataset) else None
         log_saved_checkpoints(
-            config_path=config.config,
+            config_path=config.connection_config,
             job_id=job_id,
             saved=saved,
             sampling_command="sample",

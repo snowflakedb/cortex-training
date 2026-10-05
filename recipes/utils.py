@@ -195,11 +195,12 @@ def sampling_job_body(
 def _sampling_cli(
     *,
     module: str,
-    config_path: str,
+    config_path: str | None,
     job_id: str,
     extra: str = "",
 ) -> str:
-    line = f"  python -m {module} config={config_path} source_job_id={job_id}"
+    config_part = f" connection_config={config_path}" if config_path else ""
+    line = f"  python -m {module}{config_part} source_job_id={job_id}"
     if extra:
         line += extra
     return line
@@ -207,7 +208,7 @@ def _sampling_cli(
 
 def log_saved_checkpoints(
     *,
-    config_path: str,
+    config_path: str | None,
     job_id: str,
     saved: Mapping[str, Mapping[str, Any]],
     sampling_command: str | None = None,
