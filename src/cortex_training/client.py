@@ -2094,6 +2094,7 @@ class CortexTrainingClient:
         nbytes = doc.get("bytes")
         if (
             not isinstance(names, list)
+            or not names
             or not all(isinstance(name, str) for name in names)
             or isinstance(nbytes, bool)
             or not isinstance(nbytes, int)
@@ -2176,12 +2177,13 @@ class CortexTrainingClient:
         """Append stage chunks whose names are not already in the manifest."""
         known_set = set(known)
         new_paths = [path for path in chunk_paths if path not in known_set]
-        if destination.stat().st_size > committed:
+        if not new_paths:
+            if destination.stat().st_size <= committed:
+                return self._artifact_result(destination, run_uri, known)
             with destination.open("r+b") as output:
                 output.truncate(committed)
                 output.flush()
                 os.fsync(output.fileno())
-        if not new_paths:
             return self._artifact_result(destination, run_uri, known)
         with destination.open("r+b") as output:
             output.seek(committed)

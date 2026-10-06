@@ -570,7 +570,7 @@ async def _run_cancelled_job_shows_stage():
         assert ok, "cancelled job did not show the persisted console"
         assert "sealed" not in (app.sub_title or "").lower()
         c.tail_logs.assert_not_called()
-        assert len(calls) >= 1
+        assert len(calls) == 1
         await _settle(app, pilot)
 
 
@@ -607,7 +607,7 @@ async def _run_tail_failure_on_cancel_switches_to_stage():
         assert ok, "tail failure on a cancelled job did not show the persisted console"
         assert not any(ln.startswith("[error] tail") for ln in app.screen._shown_lines)
         assert "sealed" not in (app.sub_title or "").lower()
-        assert len(calls) >= 1
+        assert len(calls) == 1
         await _settle(app, pilot)
 
 
@@ -810,8 +810,9 @@ def test_pause_holds_console_until_resume(tmp_path, monkeypatch):
     asyncio.run(_run_pause_holds_console_until_resume())
 
 
-async def _run_refilter_keeps_saved_console(monkeypatch):
-    app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
+async def _run_refilter_keeps_saved_console(tmp_path):
+    c = _client()
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(
             pilot,
@@ -820,27 +821,33 @@ async def _run_refilter_keeps_saved_console(monkeypatch):
         )
         assert ok, "log screen did not open"
         screen = app.screen
+        screen.workers.cancel_all()
         screen._current_source = "7:training:0"
         screen._job_status = "CANCELLED"
-        screen._apply_stage_lines(["persisted line"])
-        started = []
-        monkeypatch.setattr(
-            screen,
-            "_tail",
-            lambda source, gen, preserve=False: started.append(
-                (source, gen, preserve)
-            ),
-        )
+        path = tmp_path / "stdout.log"
+        path.write_text("persisted line\nother line\n", encoding="utf-8")
+        screen._stage_paths["7:training:0"] = str(path)
+        screen._apply_stage_lines(["persisted line", "other line"])
+        c.download_stdout_logs.reset_mock()
+
         screen._filter = "persisted"
         screen._refilter()
+        filtered = await _wait(
+            pilot, app, lambda: screen._shown_lines == ["persisted line"]
+        )
+        assert filtered, "saved console was not filtered from the local file"
+
+        screen._filter = "no match"
+        screen._refilter()
+        await pilot.pause(0.05)
         assert screen._shown_lines == ["persisted line"]
-        assert started == [("7:training:0", screen._tail_gen, True)]
+        c.download_stdout_logs.assert_not_called()
         await _settle(app, pilot)
 
 
 def test_refilter_keeps_saved_console(tmp_path, monkeypatch):
     monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
-    asyncio.run(_run_refilter_keeps_saved_console(monkeypatch))
+    asyncio.run(_run_refilter_keeps_saved_console(tmp_path))
 
 
 async def _run_save_exports_console_on_screen():

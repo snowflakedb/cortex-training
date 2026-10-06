@@ -269,6 +269,7 @@ class LogScreen(Screen):
         self._sources_width = 48
         self._cache = LogCache(job_id)
         self._stage_temp = tempfile.TemporaryDirectory(prefix="cortex-training-stage-")
+        self._stage_paths: dict[str, str] = {}
         self._source_by_item: dict[str, str] = {}
         self._logview: Log | None = None
         self._filter = ""  # grep substring for the log pane
@@ -282,6 +283,7 @@ class LogScreen(Screen):
         self._showing_stage = False
         self._painted_stage: list[str] | None = None
         self._pending_stage: list[str] | None = None
+        self._has_body = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -533,6 +535,7 @@ class LogScreen(Screen):
             self._shown_lines = []
             self._showing_stage = False
             self._painted_stage = None
+            self._has_body = False
         self._pending_stage = None
         # A new source or filter starts in follow mode.
         self._paused = False
@@ -554,11 +557,17 @@ class LogScreen(Screen):
         # lines. The lines already on screen stay put until that replacement.
         active = is_active_status(self._job_status)
         if not active:
-            if not preserve and not self._paint_cache(sub_job_id, gen):
+            if preserve:
+                lines = self._read_stage_lines(sub_job_id)
+                if lines and not self._post(
+                    self._replace_lines_if_changed, lines, sub_job_id, gen
+                ):
+                    return
+            elif not self._paint_cache(sub_job_id, gen):
                 return
             if worker.is_cancelled or not self._is_current(sub_job_id, gen):
                 return
-            self._watch_stage(sub_job_id, worker, gen)
+            self._watch_stage(sub_job_id, worker, gen, adopt=not preserve)
             return
         try:
             # Replay the local cache instantly, then (only for a live job) resume
@@ -620,6 +629,7 @@ class LogScreen(Screen):
     ) -> None:
         if not self._is_current(source_id, gen):
             return
+        self._has_body = True
         self._write_lines(lines)
         if live:
             self._last_update = time.strftime("%H:%M:%S")
@@ -663,12 +673,15 @@ class LogScreen(Screen):
     def _append_if_current(self, lines: list[str], source_id: str, gen: int) -> None:
         if not self._is_current(source_id, gen):
             return
+        self._has_body = True
         self._write_lines(lines)
 
-    def _watch_stage(self, sub_job_id: str, worker, gen: int) -> None:
+    def _watch_stage(
+        self, sub_job_id: str, worker, gen: int, *, adopt: bool = True
+    ) -> None:
         """Fill from the saved console, then check again while this panel stays open."""
         error_once = [False]
-        if not self._adopt_stage(sub_job_id, worker, gen, error_once):
+        if adopt and not self._adopt_stage(sub_job_id, worker, gen, error_once):
             return
         while not worker.is_cancelled and self._is_current(sub_job_id, gen):
             self._sleep_refresh(worker)
@@ -728,13 +741,21 @@ class LogScreen(Screen):
             )
             path = "" if match is None else (match.get("saved_path") or "")
             if path:
-                visible = [
-                    line
-                    for line in _tail_text_lines(path, 20000)
-                    if entry_matches(line, self._filter) and entry_at_level(line, self._min_level)
-                ]
-                lines = visible or None
+                self._stage_paths[sub_job_id] = path
+                lines = self._read_stage_lines(sub_job_id)
         return lines
+
+    def _read_stage_lines(self, sub_job_id: str) -> list[str] | None:
+        path = self._stage_paths.get(sub_job_id)
+        if not path:
+            return None
+        visible = [
+            line
+            for line in _tail_text_lines(path, 20000)
+            if entry_matches(line, self._filter)
+            and entry_at_level(line, self._min_level)
+        ]
+        return visible or None
 
     def _record_stage_error(self, sub_job_id: str, error_once: list[bool] | None) -> None:
         if error_once is not None:
@@ -750,6 +771,7 @@ class LogScreen(Screen):
     def _apply_stage_lines(self, lines: list[str]) -> None:
         self._showing_stage = True
         self._painted_stage = list(lines)
+        self._has_body = True
         self._shown_lines = []
         if self._logview is not None:
             self._logview.clear()
@@ -778,18 +800,9 @@ class LogScreen(Screen):
         self._replace_lines(lines, source_id, gen)
 
     def _note_if_pane_empty(self, source_id: str, gen: int) -> None:
-        if not self._is_current(source_id, gen) or self._has_log_output():
+        if not self._is_current(source_id, gen) or self._has_body:
             return
         self._write_line("No log output is available.")
-
-    def _has_log_output(self) -> bool:
-        for line in self._shown_lines:
-            if line.startswith("— ") or line.startswith("[error]"):
-                continue
-            if line == "No log output is available.":
-                continue
-            return True
-        return False
 
     def _content_width(self) -> int:
         """Usable text columns of the log pane (accounts for padding/scrollbar)."""

@@ -25,7 +25,7 @@ cortex-training download-metrics JOB_ID --output-dir /path/to/metrics --resume
 
 Metrics are written to `<output_dir>/<sub_job_id>/gpu.jsonl`.
 
-Tail a running job in the terminal:
+View a running or finished job's logs in the terminal:
 
 ```bash
 cortex-training tui JOB_ID
