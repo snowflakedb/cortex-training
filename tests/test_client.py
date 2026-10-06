@@ -3279,7 +3279,7 @@ class TestEnsureDatabase:
         assert c._session.post.call_count == 1
 
 
-def test_gzip_reconstructions_do_not_overlap():
+def test_gzip_reconstructions_do_not_overlap(tmp_path):
     import re
     import threading
     import time
@@ -3311,7 +3311,7 @@ def test_gzip_reconstructions_do_not_overlap():
     threads = [
         threading.Thread(
             target=client._download_gzip_artifacts,
-            args=("job-1", "/tmp"),
+            args=("job-1", str(tmp_path)),
             kwargs=kwargs,
         )
         for _ in range(2)

@@ -600,6 +600,27 @@ class LogScreen(Screen):
             # yield is a whole page (or the cache batch); render it in one shot
             # so high-velocity logs don't saturate the UI thread per line.
             saw_live = False
+            next_status_check = time.monotonic() + self._STAGE_REFRESH_SECONDS
+
+            def job_still_active() -> bool:
+                nonlocal next_status_check
+                now = time.monotonic()
+                if now < next_status_check:
+                    return True
+                next_status_check = now + self._STAGE_REFRESH_SECONDS
+                try:
+                    job = self._client.get_job(self._job_id) or {}
+                except Exception:  # noqa: BLE001 - keep following on a metadata failure
+                    return True
+                status = job.get("status") or self._job_status
+                if is_active_status(status):
+                    return True
+                self._job_status = status
+                if "reason" in job:
+                    self._job_reason = job.get("reason")
+                self._post(self._update_subtitle)
+                return False
+
             for kind, entries in cached_log_pages(
                 self._cache,
                 self._client,
@@ -610,6 +631,7 @@ class LogScreen(Screen):
                 poll_interval=self._poll_interval,
                 replay_limit=2000,
                 is_cancelled=lambda: worker.is_cancelled,
+                should_follow=job_still_active,
             ):
                 if worker.is_cancelled:
                     return
@@ -632,6 +654,12 @@ class LogScreen(Screen):
                     kind == "live",
                 ):
                     return
+            if (
+                not worker.is_cancelled
+                and self._is_current(sub_job_id, gen)
+                and not is_active_status(self._job_status)
+            ):
+                self._watch_stage(sub_job_id, worker, gen)
         except Exception as exc:  # noqa: BLE001 - surfaced in the UI
             self._handle_tail_failure(sub_job_id, worker, gen, exc)
 
@@ -825,9 +853,14 @@ class LogScreen(Screen):
         filter_gen = self._filter_gen
         query = self._filter
         min_level = self._min_level
-        lines = (
+        snapshot = (
             self._read_stage_lines(sub_job_id, query, min_level)
             if path
+            else None
+        )
+        lines = (
+            snapshot[1]
+            if snapshot is not None and snapshot[0]
             else None
         )
         return lines, filter_gen
@@ -879,11 +912,11 @@ class LogScreen(Screen):
         with self._stage_state_lock:
             has_stage = sub_job_id in self._stage_paths
         if has_stage:
-            lines = self._read_stage_lines(sub_job_id, query, min_level)
-            if lines is not None:
+            snapshot = self._read_stage_lines(sub_job_id, query, min_level)
+            if snapshot is not None and snapshot[0]:
                 self._post(
                     self._replace_filtered_stage,
-                    lines,
+                    snapshot[1],
                     sub_job_id,
                     filter_gen,
                     tail_gen,
@@ -905,7 +938,7 @@ class LogScreen(Screen):
         sub_job_id: str,
         query: str,
         min_level,
-    ) -> list[str] | None:
+    ) -> tuple[bool, list[str]] | None:
         with self._stage_state_lock:
             path = self._stage_paths.get(sub_job_id)
         if not path:
@@ -913,13 +946,12 @@ class LogScreen(Screen):
         rows = _tail_text_lines(path, 20000)
         if rows is None:
             return None
-        visible = [
+        return bool(rows), [
             line
             for line in rows
             if entry_matches(line, query)
             and entry_at_level(line, min_level)
         ]
-        return visible
 
     def _record_stage_error(
         self,

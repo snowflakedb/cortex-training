@@ -312,6 +312,7 @@ def cached_pages(
     sleep: Callable[[float], None] = time.sleep,
     replay_limit: Optional[int] = None,
     is_cancelled: Optional[Callable[[], bool]] = None,
+    should_follow: Optional[Callable[[], bool]] = None,
     backoff_multiplier: float = _POLL_BACKOFF_MULTIPLIER,
     max_interval: float = _POLL_MAX_INTERVAL,
 ) -> Iterator[Tuple[str, list]]:
@@ -369,6 +370,8 @@ def cached_pages(
             # flag (the pod-logs backend never sets eof=True). This is the
             # "terminal job: replay + drain once, then stop" path.
             return
+        if should_follow is not None and not should_follow():
+            return
         sleep(delay)
         delay = min(delay * backoff_multiplier, max_interval)
 
@@ -385,6 +388,7 @@ def cached_log_pages(
     replay_limit: Optional[int] = 2000,
     tail_lines: Optional[int] = 2000,
     is_cancelled: Optional[Callable[[], bool]] = None,
+    should_follow: Optional[Callable[[], bool]] = None,
 ) -> Iterator[Tuple[str, list]]:
     """``cached_pages`` wired to ``client.tail_logs`` for a sub-job's logs. The
     cache is keyed by ``sub_job_id``.
@@ -412,4 +416,5 @@ def cached_log_pages(
         live=live,
         replay_limit=replay_limit,
         is_cancelled=is_cancelled,
+        should_follow=should_follow,
     )

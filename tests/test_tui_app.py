@@ -750,6 +750,49 @@ def test_open_panel_picks_up_later_console(tmp_path, monkeypatch):
     asyncio.run(_run_open_panel_picks_up_later_console(monkeypatch))
 
 
+async def _run_healthy_empty_tail_hands_off(tmp_path, monkeypatch):
+    monkeypatch.setattr(LogScreen, "_STAGE_REFRESH_SECONDS", 0.05)
+    calls = {"jobs": 0}
+
+    def get_job(_job_id):
+        calls["jobs"] += 1
+        return {
+            "status": "RUNNING" if calls["jobs"] == 1 else "COMPLETED",
+            "sub_jobs": [{"sub_job_id": "7:training:0", "job_type": "training"}],
+        }
+
+    def download(job_id, output_dir, *, resume=False):
+        from pathlib import Path
+
+        assert resume is True
+        path = Path(output_dir) / f"{job_id}:training:0" / "stdout.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("saved after quiet tail\n", encoding="utf-8")
+        return [{"sub_job_id": f"{job_id}:training:0", "saved_path": str(path)}]
+
+    c = _client()
+    c.get_job.side_effect = get_job
+    c.download_stdout_logs.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: isinstance(app.screen, LogScreen)
+            and "saved after quiet tail" in app.screen._shown_lines,
+            tries=200,
+        )
+        assert ok, "quiet live tail did not hand off after the job completed"
+        assert c.tail_logs.call_count > 0
+        assert not any(line.startswith("[error] tail") for line in app.screen._shown_lines)
+        await _settle(app, pilot)
+
+
+def test_healthy_empty_tail_hands_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    asyncio.run(_run_healthy_empty_tail_hands_off(tmp_path, monkeypatch))
+
+
 def test_keeps_visible_lines_when_stage_download_fails(tmp_path, monkeypatch):
     monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -898,6 +941,15 @@ async def _run_refilter_keeps_saved_console(tmp_path):
         screen._refilter()
         await pilot.pause(0.05)
         assert screen._shown_lines == ["No log output is available."]
+
+        empty_path = tmp_path / "empty.log"
+        empty_path.write_text("", encoding="utf-8")
+        screen._stage_paths["7:training:0"] = str(empty_path)
+        screen._shown_lines = ["cached line"]
+        screen._filter = "anything"
+        screen._refilter()
+        await pilot.pause(0.05)
+        assert screen._shown_lines == ["cached line"]
         await _settle(app, pilot)
 
 

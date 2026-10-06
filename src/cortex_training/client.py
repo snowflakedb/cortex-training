@@ -37,7 +37,6 @@ use the ``extra`` fields for anything the typed layer does not model yet.
 from __future__ import annotations
 
 import base64
-import fcntl
 import functools
 import gzip
 import hashlib
@@ -2234,16 +2233,35 @@ class CortexTrainingClient:
         root.mkdir(parents=True, exist_ok=True)
         lock_path = root / f".{artifact_name}.download.lock"
         with lock_path.open("a+b") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            return self._reconstruct_gzip_artifacts(
-                job_id,
-                output_dir,
-                artifact_name=artifact_name,
-                chunk_pattern=chunk_pattern,
-                destination_name=destination_name,
-                temporary_prefix=temporary_prefix,
-                resume=resume,
-            )
+            if os.name == "nt":
+                import msvcrt
+
+                lock.seek(0)
+                if lock.read(1) == b"":
+                    lock.write(b"\0")
+                    lock.flush()
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                return self._reconstruct_gzip_artifacts(
+                    job_id,
+                    output_dir,
+                    artifact_name=artifact_name,
+                    chunk_pattern=chunk_pattern,
+                    destination_name=destination_name,
+                    temporary_prefix=temporary_prefix,
+                    resume=resume,
+                )
+            finally:
+                if os.name == "nt":
+                    lock.seek(0)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
     def _reconstruct_gzip_artifacts(
         self,
