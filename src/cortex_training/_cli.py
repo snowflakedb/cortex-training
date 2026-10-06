@@ -49,19 +49,7 @@ _CONFIG_ALIASES = {
 _LOGIN_STATE_ENV = "CORTEX_TRAINING_LOGIN_FILE"
 
 
-def _env(*names: str) -> str | None:
-    for name in names:
-        value = os.environ.get(name)
-        if value:
-            return value
-    return None
-
-
-def _normalize_host(host: str) -> str:
-    for prefix in ("https://", "http://"):
-        if host.startswith(prefix):
-            host = host[len(prefix) :]
-    return host.rstrip("/")
+from cortex_training.connect import _env, normalize_host as _normalize_host, _login_state_path, read_login_config_path as _read_login_config_path
 
 
 def _has_url_scheme(url: str) -> bool:
@@ -408,31 +396,6 @@ def build_parser(
         subparsers.add_parser("tui", help="Open the read-only Cortex Training log TUI.")
 
     return parser
-
-
-def _login_state_path() -> Path:
-    override = _env(_LOGIN_STATE_ENV)
-    if override:
-        return Path(override).expanduser()
-    config_home = _env("XDG_CONFIG_HOME")
-    base = Path(config_home).expanduser() if config_home else Path.home() / ".config"
-    return base / "cortex-training" / "login.json"
-
-
-def _read_login_config_path() -> str | None:
-    path = _login_state_path()
-    if not path.exists():
-        return None
-    try:
-        parsed = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid cortex-training login state {path}: {exc}") from exc
-    if not isinstance(parsed, dict):
-        raise ValueError(f"invalid cortex-training login state {path}: expected object")
-    config_path = parsed.get("config_path")
-    if not isinstance(config_path, str) or not config_path:
-        raise ValueError(f"invalid cortex-training login state {path}: missing config_path")
-    return config_path
 
 
 def _write_login_config_path(config_path: str) -> str:

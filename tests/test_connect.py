@@ -235,3 +235,52 @@ class TestConnectWithExplicitHostPat:
     def test_pat_without_host_raises(self):
         with pytest.raises(ValueError, match="pat was provided without host"):
             connect(pat="token")
+
+
+class TestResolutionOrder:
+    def test_connection_env_takes_priority_over_host_pat_env(self, monkeypatch):
+        """CLI uses connection profile over host+PAT env vars. connect() must match."""
+        monkeypatch.setenv("CORTEX_TRAINING_CONNECTION", "my-profile")
+        monkeypatch.setenv("CORTEX_TRAINING_HOST", "host.snowflakecomputing.com")
+        monkeypatch.setenv("CORTEX_TRAINING_PAT", "pat-token")
+        with patch(MOCK_TARGET) as mock_cls:
+            mock_cls.from_connection_name.return_value = MagicMock()
+            connect()
+            mock_cls.from_connection_name.assert_called_once()
+            assert mock_cls.from_connection_name.call_args.kwargs["connection_name"] == "my-profile"
+            mock_cls.from_pat.assert_not_called()
+
+    def test_config_env_var(self, tmp_path, monkeypatch):
+        config = {"host": "cfg-host.snowflakecomputing.com", "pat": "cfg-pat"}
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps(config))
+        monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(path))
+        with patch(MOCK_TARGET) as mock_cls:
+            mock_cls.from_pat.return_value = MagicMock()
+            connect()
+            assert mock_cls.from_pat.call_args.kwargs["host"] == "cfg-host.snowflakecomputing.com"
+
+    def test_base_url_env_var(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("CORTEX_TRAINING_BASE_URL", "http://localhost:9090")
+        monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "nonexistent.json"))
+        with patch(MOCK_TARGET) as mock_cls:
+            mock_cls.return_value = MagicMock()
+            connect()
+            mock_cls.assert_called_once()
+            assert mock_cls.call_args.kwargs["base_url"] == "http://localhost:9090"
+
+
+class TestCorruptLoginConfig:
+    def test_corrupt_login_json_raises(self, tmp_path, monkeypatch):
+        login_path = tmp_path / "login.json"
+        login_path.write_text("not valid json {{{")
+        monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_path))
+        with pytest.raises(ValueError, match="invalid cortex-training login state"):
+            connect()
+
+    def test_login_json_missing_config_path_raises(self, tmp_path, monkeypatch):
+        login_path = tmp_path / "login.json"
+        login_path.write_text(json.dumps({"wrong_key": "value"}))
+        monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_path))
+        with pytest.raises(ValueError, match="missing config_path"):
+            connect()
