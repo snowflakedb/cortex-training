@@ -2949,7 +2949,7 @@ class TestExecutionLogDownload:
             }
         ]
         manifest = json.loads(
-            destination.with_name(destination.name + ".manifest.json").read_text(
+            CortexTrainingClient._resume_manifest_path(destination).read_text(
                 encoding="utf-8"
             )
         )
@@ -3141,7 +3141,7 @@ class TestExecutionLogDownload:
         download = getattr(c, method_name)
         download("job-1", tmp_path)
         destination = tmp_path / "job-1:training:0" / destination_name
-        manifest_path = destination.with_name(destination.name + ".manifest.json")
+        manifest_path = CortexTrainingClient._resume_manifest_path(destination)
         committed_manifest = manifest_path.read_text(encoding="utf-8")
 
         listed.append((f"/versions/RUN_ABC/{bad}",))

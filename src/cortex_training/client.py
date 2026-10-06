@@ -2072,7 +2072,7 @@ class CortexTrainingClient:
 
     @staticmethod
     def _resume_manifest_path(destination: Path) -> Path:
-        return destination.with_name(destination.name + ".manifest.json")
+        return destination.with_name("." + destination.name + ".manifest.json")
 
     @classmethod
     def _read_resume_state(cls, destination: Path) -> tuple[list[str], int] | None:
@@ -2325,10 +2325,7 @@ class CortexTrainingClient:
                         "destination": destination,
                         "temporary": Path(output.name),
                         "output": output,
-                        "chunk_count": 0,
                         "names": chunk_paths,
-                        "first_path": chunk_paths[0],
-                        "last_path": chunk_paths[-1],
                     }
                     downloads[sub_job_id] = state
                     for relative_path in chunk_paths:
@@ -2342,7 +2339,6 @@ class CortexTrainingClient:
                             self._copy_gzip_member(downloaded, output)
                         finally:
                             downloaded.unlink(missing_ok=True)
-                        state["chunk_count"] += 1
 
             results: list[dict[str, Any]] = list(resumed)
             for sub_job_id in sorted(downloads):

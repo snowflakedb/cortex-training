@@ -157,10 +157,6 @@ class LogCache:
         self._max_lines = max_lines
 
     # ---- paths ----
-    def stage_dir(self) -> Path:
-        """Directory for resumed stage stdout/metrics files for this job."""
-        return self._dir / "stage"
-
     def _logs_dir(self) -> Path:
         return self._dir / "logs"
 

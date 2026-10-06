@@ -775,7 +775,8 @@ async def _run_stale_worker_does_not_paint():
         await _settle(app, pilot)
 
 
-def test_stale_worker_does_not_paint():
+def test_stale_worker_does_not_paint(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
     asyncio.run(_run_stale_worker_does_not_paint())
 
 
@@ -804,8 +805,42 @@ async def _run_pause_holds_console_until_resume():
         await _settle(app, pilot)
 
 
-def test_pause_holds_console_until_resume():
+def test_pause_holds_console_until_resume(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
     asyncio.run(_run_pause_holds_console_until_resume())
+
+
+async def _run_refilter_keeps_saved_console(monkeypatch):
+    app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: isinstance(app.screen, LogScreen) and app.screen._logview is not None,
+        )
+        assert ok, "log screen did not open"
+        screen = app.screen
+        screen._current_source = "7:training:0"
+        screen._job_status = "CANCELLED"
+        screen._apply_stage_lines(["persisted line"])
+        started = []
+        monkeypatch.setattr(
+            screen,
+            "_tail",
+            lambda source, gen, preserve=False: started.append(
+                (source, gen, preserve)
+            ),
+        )
+        screen._filter = "persisted"
+        screen._refilter()
+        assert screen._shown_lines == ["persisted line"]
+        assert started == [("7:training:0", screen._tail_gen, True)]
+        await _settle(app, pilot)
+
+
+def test_refilter_keeps_saved_console(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    asyncio.run(_run_refilter_keeps_saved_console(monkeypatch))
 
 
 async def _run_save_exports_console_on_screen():

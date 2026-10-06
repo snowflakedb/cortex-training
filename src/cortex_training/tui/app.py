@@ -27,6 +27,7 @@ never mutates job state.
 from __future__ import annotations
 
 import os
+import tempfile
 import time
 import traceback
 
@@ -267,6 +268,7 @@ class LogScreen(Screen):
         self._job_reason = None  # failure/cancel reason, when terminal
         self._sources_width = 48
         self._cache = LogCache(job_id)
+        self._stage_temp = tempfile.TemporaryDirectory(prefix="cortex-training-stage-")
         self._source_by_item: dict[str, str] = {}
         self._logview: Log | None = None
         self._filter = ""  # grep substring for the log pane
@@ -399,25 +401,22 @@ class LogScreen(Screen):
     def _refilter(self) -> None:
         # Re-run the tail so the filter/level apply to the replayed cache too.
         if self._current_source:
-            self._start_tail(self._current_source)
+            self._start_tail(self._current_source, preserve=self._showing_stage)
 
     # ─── export / copy ───────────────────────────────────────────────────
-    def _export_text(self) -> tuple[str, int]:
-        """Lines the pane is showing. The saved console, once that is on screen."""
-        if self._showing_stage:
-            lines = list(self._shown_lines)
-        else:
-            src = self._current_source
-            entries = self._cache.load_entries(src) if src else []
-            lines = [format_log_entry(entry) for entry in entries]
-        return "\n".join(lines), len(lines)
-
     def _snapshot_export(self) -> dict | None:
         src = self._current_source
         if not src:
             return None
-        text, count = self._export_text()
-        return {"src": src, "text": text, "count": count}
+        lines = list(self._painted_stage) if self._showing_stage else None
+        return {"src": src, "lines": lines}
+
+    def _export_text(self, snap: dict) -> tuple[str, int]:
+        lines = snap["lines"]
+        if lines is None:
+            entries = self._cache.load_entries(snap["src"])
+            lines = [format_log_entry(entry) for entry in entries]
+        return "\n".join(lines), len(lines)
 
     @work(thread=True, exclusive=True, group="export")
     def action_save_log(self) -> None:
@@ -429,11 +428,11 @@ class LogScreen(Screen):
             return
         safe = snap["src"].replace("/", "_").replace(":", "-")
         path = os.path.expanduser(f"~/cortex-training-{self._job_id[:8]}-{safe}.log")
-        text = snap["text"]
+        text, count = self._export_text(snap)
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(text + ("\n" if text else ""))
-            msg = f"[saved] {snap['count']} line(s) → {path}"
+            msg = f"[saved] {count} line(s) → {path}"
         except OSError as exc:  # noqa: BLE001
             msg = f"[error] save failed: {exc}"
         self.app.call_from_thread(self._write_line, msg)
@@ -446,9 +445,10 @@ class LogScreen(Screen):
             return
         if not snap:
             return
-        self.app.call_from_thread(self.app.copy_to_clipboard, snap["text"])
+        text, count = self._export_text(snap)
+        self.app.call_from_thread(self.app.copy_to_clipboard, text)
         self.app.call_from_thread(
-            self._write_line, f"[copied] {snap['count']} line(s) to clipboard"
+            self._write_line, f"[copied] {count} line(s) to clipboard"
         )
 
     @work(thread=True, exclusive=True, group="sources")
@@ -525,34 +525,36 @@ class LogScreen(Screen):
         except RuntimeError:
             return False
 
-    def _start_tail(self, sub_job_id: str) -> None:
+    def _start_tail(self, sub_job_id: str, *, preserve: bool = False) -> None:
         self._tail_gen += 1
         gen = self._tail_gen
         self._current_source = sub_job_id
-        self._shown_lines = []
-        self._showing_stage = False
-        self._painted_stage = None
+        if not preserve:
+            self._shown_lines = []
+            self._showing_stage = False
+            self._painted_stage = None
         self._pending_stage = None
         # A new source or filter starts in follow mode.
         self._paused = False
         self._update_subtitle()
-        if self._logview is not None:
+        if not preserve and self._logview is not None:
             self._logview.clear()
-        self._write_line(f"— tailing {sub_job_id} —")
-        self._tail(sub_job_id, gen)
+        if not preserve:
+            self._write_line(f"— tailing {sub_job_id} —")
+        self._tail(sub_job_id, gen, preserve)
 
     def _is_current(self, source_id: str, gen: int) -> bool:
         return self._current_source == source_id and self._tail_gen == gen
 
     @work(thread=True, exclusive=True, group="tail")
-    def _tail(self, sub_job_id: str, gen: int) -> None:
+    def _tail(self, sub_job_id: str, gen: int, preserve: bool = False) -> None:
         worker = get_current_worker()
         # A finished job has no live zone. Show the local cache immediately,
         # then replace the pane with the persisted console once that file has
         # lines. The lines already on screen stay put until that replacement.
         active = is_active_status(self._job_status)
         if not active:
-            if not self._paint_cache(sub_job_id, gen):
+            if not preserve and not self._paint_cache(sub_job_id, gen):
                 return
             if worker.is_cancelled or not self._is_current(sub_job_id, gen):
                 return
@@ -676,6 +678,8 @@ class LogScreen(Screen):
             if worker.is_cancelled or not self._is_current(sub_job_id, gen):
                 return
             if not lines:
+                if not self._post(self._stage_tick_if_current, sub_job_id, gen):
+                    return
                 continue
             if not self._post(self._replace_lines_if_changed, lines, sub_job_id, gen):
                 return
@@ -686,6 +690,10 @@ class LogScreen(Screen):
             step = min(0.05, remaining)
             time.sleep(step)
             remaining -= step
+
+    def _stage_tick_if_current(self, source_id: str, gen: int) -> None:
+        if not self._is_current(source_id, gen):
+            return
 
     def _adopt_stage(self, sub_job_id: str, worker, gen: int, error_once: list[bool]) -> bool:
         """Replace the pane only when the persisted console has lines to show."""
@@ -707,7 +715,7 @@ class LogScreen(Screen):
         try:
             results = self._client.download_stdout_logs(
                 self._job_id,
-                self._cache.stage_dir(),
+                self._stage_temp.name,
                 resume=True,
             )
         except Exception:  # noqa: BLE001 - keep the pane; record the traceback
