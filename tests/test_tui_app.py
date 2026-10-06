@@ -219,7 +219,15 @@ async def _run_terminal_cache_only():
             and "7:training:0" in (app.screen._source_by_item or {}).values(),
         )
         assert ok, "sub-job source not shown for terminal job"
-        # A terminal job is served from cache only — no tail-logs operation call.
+        # The live tail is not called. Cache stays on screen when the stage
+        # download does not return a console file.
+        shown = await _wait(
+            pilot,
+            app,
+            lambda: isinstance(app.screen, LogScreen)
+            and any(ln == "cached line" for ln in app.screen._shown_lines),
+        )
+        assert shown, "cached line was not kept for a terminal job"
         c.tail_logs.assert_not_called()
         await _settle(app, pilot)
 
@@ -625,6 +633,7 @@ async def _run_tail_failure_while_running_stays_error():
 
 def test_tail_failure_while_running_stays_error(tmp_path, monkeypatch):
     monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
     asyncio.run(_run_tail_failure_while_running_stays_error())
 
 
@@ -735,7 +744,99 @@ def test_open_panel_picks_up_later_console(tmp_path, monkeypatch):
 
 def test_keeps_visible_lines_when_stage_download_fails(tmp_path, monkeypatch):
     monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
     from cortex_training.tui.log_cache import LogCache
 
     LogCache("7").append_entries("7:training:0", [{"_raw": "cached line"}])
     asyncio.run(_run_keeps_visible_lines_when_stage_download_fails())
+
+
+async def _run_stale_worker_does_not_paint():
+    app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: isinstance(app.screen, LogScreen) and app.screen._logview is not None,
+        )
+        assert ok, "log screen did not open"
+        screen = app.screen
+        screen._current_source = "7:training:0"
+        screen._tail_gen = 2
+        screen._shown_lines = ["kept"]
+        screen._replace_lines(["stale console"], "7:training:0", 1)
+        screen._note_if_pane_empty("7:training:0", 1)
+        screen._append_if_current(["other cache"], "7:other", 2)
+        assert screen._shown_lines == ["kept"]
+        assert screen._pending_stage is None
+        await _settle(app, pilot)
+
+
+def test_stale_worker_does_not_paint():
+    asyncio.run(_run_stale_worker_does_not_paint())
+
+
+async def _run_pause_holds_console_until_resume():
+    app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: isinstance(app.screen, LogScreen) and app.screen._logview is not None,
+        )
+        assert ok, "log screen did not open"
+        screen = app.screen
+        screen._current_source = "7:training:0"
+        screen._tail_gen = 1
+        screen._paused = True
+        screen._shown_lines = []
+        screen._logview.clear()
+        screen._write_lines(["cached line"])
+        screen._replace_lines(["persisted line"], "7:training:0", 1)
+        assert screen._shown_lines == ["cached line"]
+        assert screen._pending_stage == ["persisted line"]
+        screen.action_toggle_pause()
+        assert screen._shown_lines == ["persisted line"]
+        assert screen._pending_stage is None
+        await _settle(app, pilot)
+
+
+def test_pause_holds_console_until_resume():
+    asyncio.run(_run_pause_holds_console_until_resume())
+
+
+async def _run_save_exports_console_on_screen():
+    app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: isinstance(app.screen, LogScreen) and app.screen._logview is not None,
+        )
+        assert ok, "log screen did not open"
+        screen = app.screen
+        screen._current_source = "7:training:0"
+        screen._showing_stage = True
+        screen._shown_lines = ["persisted line"]
+        screen.action_save_log()
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: bool(glob.glob(os.path.expanduser("~/cortex-training-7-*.log"))),
+        )
+        assert ok, "export file was not written"
+        content = open(
+            glob.glob(os.path.expanduser("~/cortex-training-7-*.log"))[0],
+            encoding="utf-8",
+        ).read()
+        assert content == "persisted line\n"
+        await _settle(app, pilot)
+
+
+def test_save_exports_console_on_screen(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from cortex_training.tui.log_cache import LogCache
+
+    LogCache("7").append_entries("7:training:0", [{"_raw": "alpha"}])
+    asyncio.run(_run_save_exports_console_on_screen())

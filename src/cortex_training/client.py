@@ -88,6 +88,7 @@ _GPU_METRICS_CHUNK_RE = re.compile(
     r"^gpu\.(?P<timestamp>\d{8}-\d{6})\.(?P<suffix>[^./\\]+)\.gz$"
 )
 _STREAM_COPY_BUFFER_BYTES = 1024 * 1024
+_GZIP_ARTIFACT_LOCK = threading.Lock()
 
 # Env var that unlocks create-job debug options. These are an internal-only
 # capability and are deliberately not documented for external use: the client
@@ -2211,7 +2212,30 @@ class CortexTrainingClient:
 
         ``resume=False`` rebuilds the file. ``resume=True`` lists every chunk
         and downloads only names absent from the manifest beside the file.
+        Callers are serialized so two reconstructions cannot append one file.
         """
+        with _GZIP_ARTIFACT_LOCK:
+            return self._reconstruct_gzip_artifacts(
+                job_id,
+                output_dir,
+                artifact_name=artifact_name,
+                chunk_pattern=chunk_pattern,
+                destination_name=destination_name,
+                temporary_prefix=temporary_prefix,
+                resume=resume,
+            )
+
+    def _reconstruct_gzip_artifacts(
+        self,
+        job_id: str,
+        output_dir: str | os.PathLike[str],
+        *,
+        artifact_name: str,
+        chunk_pattern: re.Pattern[str],
+        destination_name: str,
+        temporary_prefix: str,
+        resume: bool = False,
+    ) -> list[dict[str, Any]]:
         run_uri, run_name = self._experiment_run_uri(job_id)
         connection = self._open_experiment_artifact_connection()
         root = Path(output_dir).expanduser()

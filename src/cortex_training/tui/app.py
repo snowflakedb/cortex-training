@@ -278,6 +278,10 @@ class LogScreen(Screen):
         self._shown_lines: list[str] = []  # unwrapped lines on screen (for re-wrap)
         self._wrap_width = -1  # content width the buffer is wrapped to
         self._last_update = None  # local HH:MM:SS of the last live line
+        self._tail_gen = 0  # bumped on every tail start; stale workers must not paint
+        self._showing_stage = False
+        self._painted_stage: list[str] | None = None
+        self._pending_stage: list[str] | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -383,9 +387,15 @@ class LogScreen(Screen):
     def action_toggle_pause(self) -> None:
         self._paused = not self._paused
         # Resuming jumps to the end and follows again; pausing just stops
-        # following (the user can scroll freely).
-        if not self._paused and self._logview is not None:
-            self._logview.scroll_end(animate=False)
+        # following (the user can scroll freely). A console that arrived while
+        # paused is applied now, instead of clearing the pane underneath.
+        if not self._paused:
+            pending = self._pending_stage
+            self._pending_stage = None
+            if pending:
+                self._apply_stage_lines(pending)
+            if self._logview is not None:
+                self._logview.scroll_end(animate=False)
         self._update_subtitle()
 
     def _refilter(self) -> None:
@@ -394,32 +404,54 @@ class LogScreen(Screen):
             self._start_tail(self._current_source)
 
     # ─── export / copy ───────────────────────────────────────────────────
-    @work(thread=True, exclusive=True, group="export")
-    def action_save_log(self) -> None:
+    def _export_text(self) -> tuple[str, int]:
+        """Lines the pane is showing. The saved console, once that is on screen."""
+        if self._showing_stage:
+            lines = list(self._shown_lines)
+        else:
+            src = self._current_source
+            entries = self._cache.load_entries(src) if src else []
+            lines = [format_log_entry(entry) for entry in entries]
+        return "\n".join(lines), len(lines)
+
+    def _snapshot_export(self) -> dict | None:
         src = self._current_source
         if not src:
+            return None
+        text, count = self._export_text()
+        return {"src": src, "text": text, "count": count}
+
+    @work(thread=True, exclusive=True, group="export")
+    def action_save_log(self) -> None:
+        try:
+            snap = self.app.call_from_thread(self._snapshot_export)
+        except RuntimeError:
             return
-        entries = self._cache.load_entries(src)
-        text = "\n".join(format_log_entry(e) for e in entries)
-        safe = src.replace("/", "_").replace(":", "-")
+        if not snap:
+            return
+        safe = snap["src"].replace("/", "_").replace(":", "-")
         path = os.path.expanduser(f"~/cortex-training-{self._job_id[:8]}-{safe}.log")
+        text = snap["text"]
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(text + ("\n" if text else ""))
-            msg = f"[saved] {len(entries)} line(s) → {path}"
+            msg = f"[saved] {snap['count']} line(s) → {path}"
         except OSError as exc:  # noqa: BLE001
             msg = f"[error] save failed: {exc}"
         self.app.call_from_thread(self._write_line, msg)
 
     @work(thread=True, exclusive=True, group="copy")
     def action_copy_log(self) -> None:
-        src = self._current_source
-        if not src:
+        try:
+            snap = self.app.call_from_thread(self._snapshot_export)
+        except RuntimeError:
             return
-        entries = self._cache.load_entries(src)
-        text = "\n".join(format_log_entry(e) for e in entries)
-        self.app.call_from_thread(self.app.copy_to_clipboard, text)
-        self.app.call_from_thread(self._write_line, f"[copied] {len(entries)} line(s) to clipboard")
+        if not snap:
+            return
+        self.app.call_from_thread(self.app.copy_to_clipboard, snap["text"])
+        self.app.call_from_thread(
+            self._write_line, f"[copied] {snap['count']} line(s) to clipboard"
+        )
 
     @work(thread=True, exclusive=True, group="sources")
     def _load_sources(self) -> None:
@@ -496,8 +528,13 @@ class LogScreen(Screen):
             return False
 
     def _start_tail(self, sub_job_id: str) -> None:
+        self._tail_gen += 1
+        gen = self._tail_gen
         self._current_source = sub_job_id
         self._shown_lines = []
+        self._showing_stage = False
+        self._painted_stage = None
+        self._pending_stage = None
         # A fresh tail context (new source, or a re-tail after a filter change)
         # starts following the tail — otherwise a pause left over from a prior
         # source would strand this one at the top, the very bug we're fixing.
@@ -506,20 +543,24 @@ class LogScreen(Screen):
         if self._logview is not None:
             self._logview.clear()
         self._write_line(f"— tailing {sub_job_id} —")
-        self._tail(sub_job_id)
+        self._tail(sub_job_id, gen)
+
+    def _is_current(self, source_id: str, gen: int) -> bool:
+        return self._current_source == source_id and self._tail_gen == gen
 
     @work(thread=True, exclusive=True, group="tail")
-    def _tail(self, sub_job_id: str) -> None:
+    def _tail(self, sub_job_id: str, gen: int) -> None:
         worker = get_current_worker()
         # A finished job has no live zone. Show the local cache immediately,
         # then replace the pane with the persisted console once that file has
         # lines. The lines already on screen stay put until that replacement.
         active = is_active_status(self._job_status)
         if not active:
-            self._paint_cache(sub_job_id)
-            if worker.is_cancelled:
+            if not self._paint_cache(sub_job_id, gen):
                 return
-            self._watch_stage(sub_job_id, worker)
+            if worker.is_cancelled or not self._is_current(sub_job_id, gen):
+                return
+            self._watch_stage(sub_job_id, worker, gen)
             return
         try:
             # Replay the local cache instantly, then (only for a live job) resume
@@ -565,7 +606,7 @@ class LogScreen(Screen):
         except Exception as exc:  # noqa: BLE001 - surfaced in the UI
             if worker.is_cancelled:
                 return
-            if self._stage_after_tail_failure(sub_job_id, worker):
+            if self._stage_after_tail_failure(sub_job_id, worker, gen):
                 return
             try:
                 with open(os.path.expanduser(_ERROR_LOG), "a", encoding="utf-8") as f:
@@ -577,7 +618,7 @@ class LogScreen(Screen):
                 f"[error] tail {sub_job_id} failed: {type(exc).__name__}: {exc}  (full traceback: {_ERROR_LOG})",
             )
 
-    def _stage_after_tail_failure(self, sub_job_id: str, worker) -> bool:
+    def _stage_after_tail_failure(self, sub_job_id: str, worker, gen: int) -> bool:
         """Keep the current lines, and replace them when a finished job has a console file."""
         try:
             job = self._client.get_job(self._job_id) or {}
@@ -589,11 +630,14 @@ class LogScreen(Screen):
         self._job_status = status
         if "reason" in job:
             self._job_reason = job.get("reason")
-        self._post(self._update_subtitle)
-        self._watch_stage(sub_job_id, worker)
+        if not self._post(self._update_subtitle):
+            return True
+        if worker.is_cancelled or not self._is_current(sub_job_id, gen):
+            return True
+        self._watch_stage(sub_job_id, worker, gen)
         return True
 
-    def _paint_cache(self, sub_job_id: str) -> None:
+    def _paint_cache(self, sub_job_id: str, gen: int) -> bool:
         """Append the local tail cache without clearing what is already on screen."""
         entries = self._cache.load_entries(sub_job_id, limit=2000)
         lines = [
@@ -601,19 +645,31 @@ class LogScreen(Screen):
             for entry in entries
             if entry_matches(entry, self._filter) and entry_at_level(entry, self._min_level)
         ]
-        if lines:
-            self._post(self._write_lines, lines)
+        if not lines:
+            return True
+        return self._post(self._append_if_current, lines, sub_job_id, gen)
 
-    def _watch_stage(self, sub_job_id: str, worker) -> None:
+    def _append_if_current(self, lines: list[str], source_id: str, gen: int) -> None:
+        if not self._is_current(source_id, gen):
+            return
+        self._write_lines(lines)
+
+    def _watch_stage(self, sub_job_id: str, worker, gen: int) -> None:
         """Fill from the saved console, then check again while this panel stays open."""
-        self._adopt_stage(sub_job_id, worker)
-        while not worker.is_cancelled:
+        error_once = [False]
+        if not self._adopt_stage(sub_job_id, worker, gen, error_once):
+            return
+        while not worker.is_cancelled and self._is_current(sub_job_id, gen):
             self._sleep_refresh(worker)
-            if worker.is_cancelled:
+            if worker.is_cancelled or not self._is_current(sub_job_id, gen):
                 return
-            lines = self._fetch_stage_lines(sub_job_id)
-            if lines:
-                self._post(self._replace_lines_if_changed, lines, sub_job_id)
+            lines = self._fetch_stage_lines(sub_job_id, error_once=error_once)
+            if worker.is_cancelled or not self._is_current(sub_job_id, gen):
+                return
+            if not lines:
+                continue
+            if not self._post(self._replace_lines_if_changed, lines, sub_job_id, gen):
+                return
 
     def _sleep_refresh(self, worker) -> None:
         remaining = self._STAGE_REFRESH_SECONDS
@@ -622,25 +678,34 @@ class LogScreen(Screen):
             time.sleep(step)
             remaining -= step
 
-    def _adopt_stage(self, sub_job_id: str, worker) -> None:
+    def _adopt_stage(self, sub_job_id: str, worker, gen: int, error_once: list[bool]) -> bool:
         """Replace the pane only when the persisted console has lines to show."""
-        lines = self._collect_stage_lines(sub_job_id, worker)
-        if worker.is_cancelled:
-            return
+        lines = self._collect_stage_lines(sub_job_id, worker, gen, error_once)
+        if worker.is_cancelled or not self._is_current(sub_job_id, gen):
+            return False
         if lines:
-            self._post(self._replace_lines, lines, sub_job_id)
-            return
-        self._post(self._note_if_pane_empty)
+            return self._post(self._replace_lines, lines, sub_job_id, gen)
+        return self._post(self._note_if_pane_empty, sub_job_id, gen)
 
-    def _collect_stage_lines(self, sub_job_id: str, worker) -> list[str] | None:
+    def _collect_stage_lines(
+        self,
+        sub_job_id: str,
+        worker,
+        gen: int,
+        error_once: list[bool],
+    ) -> list[str] | None:
         """Resume-download until the chunk set stops growing, then return lines."""
         deadline = time.monotonic() + self._SEALED_DEADLINE_SECONDS
         seen_count = _UNSET
         lines = None
         while True:
-            if worker.is_cancelled:
+            if worker.is_cancelled or not self._is_current(sub_job_id, gen):
                 return None
-            fetched, count = self._fetch_stage_lines(sub_job_id, with_count=True)
+            fetched, count = self._fetch_stage_lines(
+                sub_job_id, with_count=True, error_once=error_once
+            )
+            if worker.is_cancelled or not self._is_current(sub_job_id, gen):
+                return None
             if fetched:
                 lines = fetched
             if seen_count is not _UNSET and count == seen_count:
@@ -651,7 +716,13 @@ class LogScreen(Screen):
             time.sleep(self._poll_interval)
         return lines
 
-    def _fetch_stage_lines(self, sub_job_id: str, *, with_count: bool = False):
+    def _fetch_stage_lines(
+        self,
+        sub_job_id: str,
+        *,
+        with_count: bool = False,
+        error_once: list[bool] | None = None,
+    ):
         """One resume download. Returns lines, or ``(lines, chunk_count)``."""
         lines = None
         count = None
@@ -662,11 +733,7 @@ class LogScreen(Screen):
                 resume=True,
             )
         except Exception:  # noqa: BLE001 - keep the pane; record the traceback
-            try:
-                with open(os.path.expanduser(_ERROR_LOG), "a", encoding="utf-8") as handle:
-                    handle.write(f"stage log {sub_job_id} failed:\n{traceback.format_exc()}\n")
-            except Exception:  # noqa: BLE001
-                pass
+            self._record_stage_error(sub_job_id, error_once)
             return (None, None) if with_count else None
         if isinstance(results, list):
             match = next(
@@ -684,34 +751,49 @@ class LogScreen(Screen):
                 lines = visible or None
         return (lines, count) if with_count else lines
 
-    def _replace_lines(self, lines: list[str], source_id: str | None = None) -> None:
-        """Swap the whole pane to ``lines``. One snapshot, not a merge."""
-        if source_id is not None and self._current_source != source_id:
-            return
+    def _record_stage_error(self, sub_job_id: str, error_once: list[bool] | None) -> None:
+        if error_once is not None:
+            if error_once[0]:
+                return
+            error_once[0] = True
+        try:
+            with open(os.path.expanduser(_ERROR_LOG), "a", encoding="utf-8") as handle:
+                handle.write(f"stage log {sub_job_id} failed:\n{traceback.format_exc()}\n")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _apply_stage_lines(self, lines: list[str]) -> None:
+        self._showing_stage = True
+        self._painted_stage = list(lines)
         self._shown_lines = []
         if self._logview is not None:
             self._logview.clear()
         self._write_lines(lines)
 
-    def _replace_lines_if_changed(self, lines: list[str], source_id: str) -> None:
+    def _replace_lines(self, lines: list[str], source_id: str, gen: int) -> None:
+        """Swap the whole pane to ``lines``. One snapshot, not a merge."""
+        if not self._is_current(source_id, gen):
+            return
+        if self._paused:
+            self._pending_stage = list(lines)
+            return
+        self._pending_stage = None
+        self._apply_stage_lines(lines)
+
+    def _replace_lines_if_changed(self, lines: list[str], source_id: str, gen: int) -> None:
         """Refresh the pane when a later save has more console text."""
-        if self._current_source != source_id or self._paused:
+        if not self._is_current(source_id, gen):
             return
-        if lines == self._log_body():
+        if self._paused and self._pending_stage is not None:
+            baseline = self._pending_stage
+        else:
+            baseline = self._painted_stage
+        if lines == baseline:
             return
-        self._replace_lines(lines, source_id)
+        self._replace_lines(lines, source_id, gen)
 
-    def _log_body(self) -> list[str]:
-        return [
-            line
-            for line in self._shown_lines
-            if not line.startswith("— ")
-            and not line.startswith("[error]")
-            and line != "No log output is available."
-        ]
-
-    def _note_if_pane_empty(self) -> None:
-        if self._has_log_output():
+    def _note_if_pane_empty(self, source_id: str, gen: int) -> None:
+        if not self._is_current(source_id, gen) or self._has_log_output():
             return
         self._write_line("No log output is available.")
 

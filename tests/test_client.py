@@ -3277,3 +3277,47 @@ class TestEnsureDatabase:
         assert c._db_ensured is True
         # Only one POST for CREATE DATABASE, no schema creation
         assert c._session.post.call_count == 1
+
+
+def test_gzip_reconstructions_do_not_overlap():
+    import re
+    import threading
+    import time
+
+    state = {"n": 0, "max": 0}
+    guard = threading.Lock()
+
+    def slow(*_args, **_kwargs):
+        with guard:
+            state["n"] += 1
+            state["max"] = max(state["max"], state["n"])
+        time.sleep(0.2)
+        with guard:
+            state["n"] -= 1
+        return []
+
+    client = CortexTrainingClient(
+        base_url="https://test.snowflakecomputing.com",
+        database="DB",
+        schema="PUBLIC",
+    )
+    client._reconstruct_gzip_artifacts = slow
+    kwargs = {
+        "artifact_name": "stdout",
+        "chunk_pattern": re.compile("x"),
+        "destination_name": "stdout.log",
+        "temporary_prefix": ".stdout-",
+    }
+    threads = [
+        threading.Thread(
+            target=client._download_gzip_artifacts,
+            args=("job-1", "/tmp"),
+            kwargs=kwargs,
+        )
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert state["max"] == 1
