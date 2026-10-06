@@ -1315,10 +1315,10 @@ and these newer long-context/memory knobs:
   routers, rejects `"best_effort"` when the training sub-job starts. With whole-block activation
   checkpointing, `"best_effort"` also requires `ac_config.router_replay_recompute`
   (default `true`); a training sub-job with it disabled rejects `"best_effort"`
-  at startup. If the service's router-replay components are too old for
-  best-effort replay, router-replay bootstrap fails with an error naming
-  `allow_missing`; if only some sampling workers are, a request with a missing
-  row fails exactly as in `"strict"`.
+  at startup. If the service does not yet support `"best_effort"`, router-replay
+  bootstrap fails with a `router replay bootstrap rejected` error; use `"strict"`
+  until the service is upgraded. If only some sampling workers lack support, a
+  request with a missing row fails exactly as in `"strict"`.
 
 For LoRA training, set `extra_training["peft_config"]` to a PEFT
 `LoraConfig`-compatible object. At minimum, specify `peft_type="Lora"`; `r` and
