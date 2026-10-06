@@ -411,9 +411,9 @@ class LogScreen(Screen):
         source = self._current_source
         if not source:
             return
-        self._filter_gen += 1
         self._pending_stage = None
         if not is_active_status(self._job_status):
+            self._filter_gen += 1
             with self._stage_state_lock:
                 self._pending_refilter.add(source)
                 fetching = self._stage_fetching.get(source, 0)
@@ -551,6 +551,7 @@ class LogScreen(Screen):
 
     def _start_tail(self, sub_job_id: str) -> None:
         self._tail_gen += 1
+        self._filter_gen += 1
         gen = self._tail_gen
         self._current_source = sub_job_id
         self._shown_lines = []
@@ -703,14 +704,22 @@ class LogScreen(Screen):
             self._sleep_refresh(worker)
             if worker.is_cancelled or not self._is_current(sub_job_id, gen):
                 return
-            lines = self._fetch_stage_lines(sub_job_id, error_once=error_once)
+            lines, filter_gen = self._fetch_stage_lines(
+                sub_job_id, error_once=error_once
+            )
             if worker.is_cancelled or not self._is_current(sub_job_id, gen):
                 return
             if not lines:
                 if not self._post(self._stage_tick_if_current, sub_job_id, gen):
                     return
                 continue
-            if not self._post(self._replace_lines_if_changed, lines, sub_job_id, gen):
+            if not self._post(
+                self._replace_lines_if_changed,
+                lines,
+                sub_job_id,
+                gen,
+                filter_gen,
+            ):
                 return
 
     def _sleep_refresh(self, worker) -> None:
@@ -726,11 +735,19 @@ class LogScreen(Screen):
 
     def _adopt_stage(self, sub_job_id: str, worker, gen: int, error_once: list[bool]) -> bool:
         """Replace the pane only when the persisted console has lines to show."""
-        lines = self._fetch_stage_lines(sub_job_id, error_once=error_once)
+        lines, filter_gen = self._fetch_stage_lines(
+            sub_job_id, error_once=error_once
+        )
         if worker.is_cancelled or not self._is_current(sub_job_id, gen):
             return False
         if lines:
-            return self._post(self._replace_lines, lines, sub_job_id, gen)
+            return self._post(
+                self._replace_lines,
+                lines,
+                sub_job_id,
+                gen,
+                filter_gen,
+            )
         return self._post(self._note_if_pane_empty, sub_job_id, gen)
 
     def _fetch_stage_lines(
@@ -785,11 +802,19 @@ class LogScreen(Screen):
             except queue.Empty:
                 continue
         else:
-            return None
+            return None, self._filter_gen
         if error:
             self._record_stage_error(sub_job_id, error_once, error)
-            return None
-        return self._read_stage_lines(sub_job_id) if path else None
+            return None, self._filter_gen
+        filter_gen = self._filter_gen
+        query = self._filter
+        min_level = self._min_level
+        lines = (
+            self._read_stage_lines(sub_job_id, query, min_level)
+            if path
+            else None
+        )
+        return lines, filter_gen
 
     def _finish_stage_fetch(self, sub_job_id: str) -> None:
         with self._stage_state_lock:
@@ -818,20 +843,34 @@ class LogScreen(Screen):
             self._current_source == sub_job_id
             and not is_active_status(self._job_status)
         ):
-            self._refilter_terminal(sub_job_id, self._filter_gen)
+            self._refilter_terminal(
+                sub_job_id,
+                self._filter_gen,
+                self._tail_gen,
+                self._filter,
+                self._min_level,
+            )
 
     @work(thread=True, exclusive=True, group="refilter")
-    def _refilter_terminal(self, sub_job_id: str, filter_gen: int) -> None:
+    def _refilter_terminal(
+        self,
+        sub_job_id: str,
+        filter_gen: int,
+        tail_gen: int,
+        query: str,
+        min_level,
+    ) -> None:
         with self._stage_state_lock:
             has_stage = sub_job_id in self._stage_paths
         if has_stage:
-            lines = self._read_stage_lines(sub_job_id)
-            if lines:
+            lines = self._read_stage_lines(sub_job_id, query, min_level)
+            if lines is not None:
                 self._post(
                     self._replace_filtered_stage,
                     lines,
                     sub_job_id,
                     filter_gen,
+                    tail_gen,
                 )
             return
         lines = self._cache_lines(sub_job_id)
@@ -840,9 +879,15 @@ class LogScreen(Screen):
             lines,
             sub_job_id,
             filter_gen,
+            tail_gen,
         )
 
-    def _read_stage_lines(self, sub_job_id: str) -> list[str] | None:
+    def _read_stage_lines(
+        self,
+        sub_job_id: str,
+        query: str,
+        min_level,
+    ) -> list[str] | None:
         with self._stage_state_lock:
             path = self._stage_paths.get(sub_job_id)
         if not path:
@@ -850,10 +895,10 @@ class LogScreen(Screen):
         visible = [
             line
             for line in _tail_text_lines(path, 20000)
-            if entry_matches(line, self._filter)
-            and entry_at_level(line, self._min_level)
+            if entry_matches(line, query)
+            and entry_at_level(line, min_level)
         ]
-        return visible or None
+        return visible
 
     def _record_stage_error(
         self,
@@ -877,15 +922,25 @@ class LogScreen(Screen):
     def _apply_stage_lines(self, lines: list[str]) -> None:
         self._showing_stage = True
         self._painted_stage = list(lines)
-        self._has_body = True
+        self._has_body = bool(lines)
         self._shown_lines = []
         if self._logview is not None:
             self._logview.clear()
         self._write_lines(lines)
 
-    def _replace_lines(self, lines: list[str], source_id: str, gen: int) -> None:
+    def _replace_lines(
+        self,
+        lines: list[str],
+        source_id: str,
+        gen: int,
+        filter_gen: int | None = None,
+    ) -> None:
         """Swap the whole pane to ``lines``. One snapshot, not a merge."""
-        if not self._is_current(source_id, gen):
+        if (
+            not self._is_current(source_id, gen)
+            or filter_gen is not None
+            and self._filter_gen != filter_gen
+        ):
             return
         if self._paused:
             self._pending_stage = list(lines)
@@ -893,9 +948,19 @@ class LogScreen(Screen):
         self._pending_stage = None
         self._apply_stage_lines(lines)
 
-    def _replace_lines_if_changed(self, lines: list[str], source_id: str, gen: int) -> None:
+    def _replace_lines_if_changed(
+        self,
+        lines: list[str],
+        source_id: str,
+        gen: int,
+        filter_gen: int | None = None,
+    ) -> None:
         """Refresh the pane when a later save has more console text."""
-        if not self._is_current(source_id, gen):
+        if (
+            not self._is_current(source_id, gen)
+            or filter_gen is not None
+            and self._filter_gen != filter_gen
+        ):
             return
         if self._paused and self._pending_stage is not None:
             baseline = self._pending_stage
@@ -903,14 +968,19 @@ class LogScreen(Screen):
             baseline = self._painted_stage
         if lines == baseline:
             return
-        self._replace_lines(lines, source_id, gen)
+        self._replace_lines(lines, source_id, gen, filter_gen)
 
     def _replace_filtered_stage(
-        self, lines: list[str], source_id: str, filter_gen: int
+        self,
+        lines: list[str],
+        source_id: str,
+        filter_gen: int,
+        tail_gen: int,
     ) -> None:
         if (
             self._current_source != source_id
             or self._filter_gen != filter_gen
+            or self._tail_gen != tail_gen
         ):
             return
         if self._paused:
@@ -920,11 +990,16 @@ class LogScreen(Screen):
             self._apply_stage_lines(lines)
 
     def _replace_filtered_cache(
-        self, lines: list[str], source_id: str, filter_gen: int
+        self,
+        lines: list[str],
+        source_id: str,
+        filter_gen: int,
+        tail_gen: int,
     ) -> None:
         if (
             self._current_source != source_id
             or self._filter_gen != filter_gen
+            or self._tail_gen != tail_gen
         ):
             return
         self._showing_stage = False

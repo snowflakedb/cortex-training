@@ -765,8 +765,21 @@ async def _run_stale_worker_does_not_paint():
         screen = app.screen
         screen._current_source = "7:training:0"
         screen._tail_gen = 2
+        screen._filter_gen = 2
         screen._shown_lines = ["kept"]
         screen._replace_lines(["stale console"], "7:training:0", 1)
+        screen._replace_lines(
+            ["stale filter snapshot"],
+            "7:training:0",
+            2,
+            filter_gen=1,
+        )
+        screen._replace_filtered_stage(
+            ["stale refilter"],
+            "7:training:0",
+            filter_gen=2,
+            tail_gen=1,
+        )
         screen._note_if_pane_empty("7:training:0", 1)
         screen._append_if_current(["other cache"], "7:other", 2)
         screen._append_live_if_current(["stale live"], "7:training:0", 1, True)
@@ -842,8 +855,8 @@ async def _run_refilter_keeps_saved_console(tmp_path):
 
         screen._filter = "no match"
         screen._refilter()
-        await pilot.pause(0.05)
-        assert screen._shown_lines == ["persisted line"]
+        empty_stage = await _wait(pilot, app, lambda: screen._shown_lines == [])
+        assert empty_stage, "a no-match saved-console filter did not clear the pane"
         c.download_stdout_logs.assert_not_called()
 
         screen.workers.cancel_all()
@@ -1036,7 +1049,8 @@ def test_stage_watcher_stops_when_ui_post_fails(monkeypatch):
     monkeypatch.setattr(
         screen,
         "_fetch_stage_lines",
-        lambda *_args, **_kwargs: calls.append(1) or ["line"],
+        lambda *_args, **_kwargs: calls.append(1)
+        or (["line"], screen._filter_gen),
     )
     monkeypatch.setattr(screen, "_post", lambda *_args, **_kwargs: False)
     screen._watch_stage("7:training:0", worker, 1)
