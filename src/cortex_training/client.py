@@ -2069,6 +2069,133 @@ class CortexTrainingClient:
         finally:
             connection.close()
 
+    @staticmethod
+    def _resume_manifest_path(destination: Path) -> Path:
+        return destination.with_name(destination.name + ".manifest.json")
+
+    @classmethod
+    def _read_resume_state(cls, destination: Path) -> tuple[list[str], int] | None:
+        """Return ``(merged names, committed bytes)`` when a resume can append.
+
+        A missing file, a missing or unreadable manifest, or a file shorter than
+        the committed length means the local copy cannot be trusted. The caller
+        rebuilds it. A file longer than the committed length is a torn append
+        and is truncated back by the resume path.
+        """
+        path = cls._resume_manifest_path(destination)
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(doc, dict):
+            return None
+        names = doc.get("names")
+        nbytes = doc.get("bytes")
+        if (
+            not isinstance(names, list)
+            or not all(isinstance(name, str) for name in names)
+            or isinstance(nbytes, bool)
+            or not isinstance(nbytes, int)
+            or nbytes < 0
+            or not destination.is_file()
+        ):
+            return None
+        try:
+            size = destination.stat().st_size
+        except OSError:
+            return None
+        if size < nbytes:
+            return None
+        return list(names), nbytes
+
+    @classmethod
+    def _write_resume_manifest(cls, destination: Path, names: list[str], nbytes: int) -> None:
+        path = cls._resume_manifest_path(destination)
+        payload = json.dumps({"bytes": nbytes, "names": names, "version": 1}) + "\n"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".manifest-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
+    def _copy_gzip_member(downloaded: Path, output) -> None:
+        with downloaded.open("rb") as compressed:
+            with gzip.GzipFile(fileobj=compressed, mode="rb") as source:
+                shutil.copyfileobj(source, output, length=_STREAM_COPY_BUFFER_BYTES)
+
+    @staticmethod
+    def _artifact_result(
+        destination: Path,
+        run_uri: str,
+        names: list[str],
+    ) -> dict[str, Any]:
+        ordered = sorted(names)
+        return {
+            "sub_job_id": destination.parent.name,
+            "filename": destination.name,
+            "saved_path": str(destination),
+            "chunk_count": len(names),
+            "first_artifact_uri": run_uri + ordered[0],
+            "last_artifact_uri": run_uri + ordered[-1],
+        }
+
+    def _append_resumed_chunks(
+        self,
+        connection: Any,
+        run_uri: str,
+        artifact_temp: Path,
+        destination: Path,
+        chunk_paths: list[str],
+        known: list[str],
+        committed: int,
+    ) -> dict[str, Any]:
+        """Append stage chunks whose names are not already in the manifest."""
+        known_set = set(known)
+        new_paths = [path for path in chunk_paths if path not in known_set]
+        if destination.stat().st_size > committed:
+            with destination.open("r+b") as output:
+                output.truncate(committed)
+                output.flush()
+                os.fsync(output.fileno())
+        if not new_paths:
+            return self._artifact_result(destination, run_uri, known)
+        with destination.open("r+b") as output:
+            output.seek(committed)
+            output.truncate(committed)
+            try:
+                for relative_path in new_paths:
+                    downloaded = self._download_experiment_artifact(
+                        connection,
+                        run_uri,
+                        relative_path,
+                        artifact_temp,
+                    )
+                    try:
+                        self._copy_gzip_member(downloaded, output)
+                    finally:
+                        downloaded.unlink(missing_ok=True)
+                output.flush()
+                os.fsync(output.fileno())
+                end = output.tell()
+            except BaseException:
+                output.truncate(committed)
+                output.flush()
+                os.fsync(output.fileno())
+                raise
+        names = list(known) + new_paths
+        self._write_resume_manifest(destination, names, end)
+        return self._artifact_result(destination, run_uri, names)
+
     def _download_gzip_artifacts(
         self,
         job_id: str,
@@ -2078,8 +2205,13 @@ class CortexTrainingClient:
         chunk_pattern: re.Pattern[str],
         destination_name: str,
         temporary_prefix: str,
+        resume: bool = False,
     ) -> list[dict[str, Any]]:
-        """Reconstruct staged gzip chunks into one atomic file per sub-job."""
+        """Reconstruct staged gzip chunks into one file per sub-job.
+
+        ``resume=False`` rebuilds the file. ``resume=True`` lists every chunk
+        and downloads only names absent from the manifest beside the file.
+        """
         run_uri, run_name = self._experiment_run_uri(job_id)
         connection = self._open_experiment_artifact_connection()
         root = Path(output_dir).expanduser()
@@ -2125,10 +2257,26 @@ class CortexTrainingClient:
                 prefix=f"cortex-training-{artifact_name}-artifacts-"
             ) as temp:
                 artifact_temp = Path(temp)
+                resumed: list[dict[str, Any]] = []
                 for sub_job_id in sorted(chunks_by_sub_job):
                     chunk_paths = sorted(chunks_by_sub_job[sub_job_id]["paths"])
                     destination = root / sub_job_id / destination_name
                     destination.parent.mkdir(parents=True, exist_ok=True)
+                    prior = self._read_resume_state(destination) if resume else None
+                    if prior is not None:
+                        known, committed = prior
+                        resumed.append(
+                            self._append_resumed_chunks(
+                                connection,
+                                run_uri,
+                                artifact_temp,
+                                destination,
+                                chunk_paths,
+                                known,
+                                committed,
+                            )
+                        )
+                        continue
                     output = tempfile.NamedTemporaryFile(
                         mode="wb",
                         dir=str(destination.parent),
@@ -2141,6 +2289,7 @@ class CortexTrainingClient:
                         "temporary": Path(output.name),
                         "output": output,
                         "chunk_count": 0,
+                        "names": chunk_paths,
                         "first_path": chunk_paths[0],
                         "last_path": chunk_paths[-1],
                     }
@@ -2153,18 +2302,12 @@ class CortexTrainingClient:
                             artifact_temp,
                         )
                         try:
-                            with downloaded.open("rb") as compressed:
-                                with gzip.GzipFile(fileobj=compressed, mode="rb") as source:
-                                    shutil.copyfileobj(
-                                        source,
-                                        output,
-                                        length=_STREAM_COPY_BUFFER_BYTES,
-                                    )
+                            self._copy_gzip_member(downloaded, output)
                         finally:
                             downloaded.unlink(missing_ok=True)
                         state["chunk_count"] += 1
 
-            results: list[dict[str, Any]] = []
+            results: list[dict[str, Any]] = list(resumed)
             for sub_job_id in sorted(downloads):
                 state = downloads[sub_job_id]
                 output = state["output"]
@@ -2172,16 +2315,19 @@ class CortexTrainingClient:
                 os.fsync(output.fileno())
                 output.close()
                 os.replace(state["temporary"], state["destination"])
-                results.append(
-                    {
-                        "sub_job_id": sub_job_id,
-                        "filename": state["destination"].name,
-                        "saved_path": str(state["destination"]),
-                        "chunk_count": state["chunk_count"],
-                        "first_artifact_uri": run_uri + state["first_path"],
-                        "last_artifact_uri": run_uri + state["last_path"],
-                    }
+                self._write_resume_manifest(
+                    state["destination"],
+                    state["names"],
+                    state["destination"].stat().st_size,
                 )
+                results.append(
+                    self._artifact_result(
+                        state["destination"],
+                        run_uri,
+                        state["names"],
+                    )
+                )
+            results.sort(key=lambda row: row["sub_job_id"])
             return results
         except BaseException:
             for state in downloads.values():
@@ -2194,9 +2340,17 @@ class CortexTrainingClient:
             connection.close()
 
     def download_stdout_logs(
-        self, job_id: str, output_dir: str | os.PathLike[str]
+        self,
+        job_id: str,
+        output_dir: str | os.PathLike[str],
+        *,
+        resume: bool = False,
     ) -> list[dict[str, Any]]:
-        """Reconstruct sealed console artifacts into one file per sub-job."""
+        """Reconstruct sealed console artifacts into one file per sub-job.
+
+        ``resume=True`` keeps ``stdout.log`` and a sibling manifest of merged
+        object names, and downloads only chunks that are not in that manifest.
+        """
         return self._download_gzip_artifacts(
             job_id,
             output_dir,
@@ -2204,12 +2358,21 @@ class CortexTrainingClient:
             chunk_pattern=_STDOUT_CHUNK_RE,
             destination_name="stdout.log",
             temporary_prefix=".stdout-",
+            resume=resume,
         )
 
     def download_metrics(
-        self, job_id: str, output_dir: str | os.PathLike[str]
+        self,
+        job_id: str,
+        output_dir: str | os.PathLike[str],
+        *,
+        resume: bool = False,
     ) -> list[dict[str, Any]]:
-        """Reconstruct staged GPU metric chunks into one JSONL file per sub-job."""
+        """Reconstruct staged GPU metric chunks into one JSONL file per sub-job.
+
+        ``resume=True`` keeps ``gpu.jsonl`` and a sibling manifest of merged
+        object names, and downloads only chunks that are not in that manifest.
+        """
         return self._download_gzip_artifacts(
             job_id,
             output_dir,
@@ -2217,6 +2380,7 @@ class CortexTrainingClient:
             chunk_pattern=_GPU_METRICS_CHUNK_RE,
             destination_name="gpu.jsonl",
             temporary_prefix=".gpu-metrics-",
+            resume=resume,
         )
 
     # ─── Data-plane async operations ─────────────────────────────────────

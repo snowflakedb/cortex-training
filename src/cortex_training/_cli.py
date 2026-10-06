@@ -370,6 +370,14 @@ def build_parser(
             "Defaults to the current working directory."
         ),
     )
+    download_log.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "With --log-type stdout, download only sealed chunks that are not "
+            "already recorded in the manifest beside stdout.log."
+        ),
+    )
 
     download_metrics = subparsers.add_parser(
         "download-metrics",
@@ -382,6 +390,14 @@ def build_parser(
         help=(
             "Directory to write <sub_job_id>/gpu.jsonl files. Created if "
             "missing. Defaults to the current working directory."
+        ),
+    )
+    download_metrics.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Download only metric chunks that are not already recorded in "
+            "the manifest beside gpu.jsonl."
         ),
     )
 
@@ -944,8 +960,10 @@ def _cmd_weight_sync(args: argparse.Namespace, client, stdout: TextIO) -> int:
 
 def _cmd_download_log(args: argparse.Namespace, client, stdout: TextIO) -> int:
     out_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.cwd()
+    if args.resume and args.log_type != "stdout":
+        raise ValueError("--resume applies to --log-type stdout, not execution logs")
     if args.log_type == "stdout":
-        logs = client.download_stdout_logs(args.job_id, out_dir)
+        logs = client.download_stdout_logs(args.job_id, out_dir, resume=args.resume)
         _print_json(
             {"job_id": args.job_id, "logs": logs},
             stdout,
@@ -975,7 +993,7 @@ def _cmd_download_metrics(
     args: argparse.Namespace, client, stdout: TextIO
 ) -> int:
     out_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.cwd()
-    metrics = client.download_metrics(args.job_id, out_dir)
+    metrics = client.download_metrics(args.job_id, out_dir, resume=args.resume)
     _print_json(
         {"job_id": args.job_id, "metrics": metrics},
         stdout,

@@ -2948,6 +2948,14 @@ class TestExecutionLogDownload:
                 "last_artifact_uri": run_uri + paths[0],
             }
         ]
+        manifest = json.loads(
+            destination.with_name(destination.name + ".manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert manifest["version"] == 1
+        assert manifest["bytes"] == len(b"first\nsecond\nthird\n")
+        assert manifest["names"] == [paths[1], paths[2], paths[0]]
         assert connection.closed
 
     @pytest.mark.parametrize(
@@ -3024,6 +3032,124 @@ class TestExecutionLogDownload:
             c.download_metrics("job-1", tmp_path)
 
         assert not any(command.startswith("GET ") for command in connection.commands)
+        assert connection.closed
+
+    @pytest.mark.parametrize(
+        ("artifact_name", "chunk_name", "destination_name", "method_name"),
+        [
+            ("stdout", "console", "stdout.log", "download_stdout_logs"),
+            ("metrics", "gpu", "gpu.jsonl", "download_metrics"),
+        ],
+    )
+    def test_download_resume_appends_only_unseen_chunks(
+        self,
+        artifact_name,
+        chunk_name,
+        destination_name,
+        method_name,
+        tmp_path,
+        monkeypatch,
+    ):
+        c = _make_client()
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        root = f"_{artifact_name}"
+        first = f"{root}/job-1:training:0/{chunk_name}.20260904-120001.first.gz"
+        later = f"{root}/job-1:training:0/{chunk_name}.20260904-120002.zulu.gz"
+        sibling = f"{root}/job-1:training:0/{chunk_name}.20260904-120002.alpha.gz"
+        listed = [(f"/versions/RUN_ABC/{first}",), (f"/versions/RUN_ABC/{later}",)]
+        rows = {
+            run_uri + root + "/": listed,
+            run_uri + "checkpoints/" + root + "/": [],
+        }
+        connection = self.FakeArtifactConnection(
+            rows,
+            {
+                run_uri + first: gzip.compress(b"first\n"),
+                run_uri + later: gzip.compress(b"third\n"),
+                run_uri + sibling: gzip.compress(b"second\n"),
+            },
+        )
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(
+            c, "_open_experiment_artifact_connection", lambda: connection
+        )
+        download = getattr(c, method_name)
+
+        first_result = download("job-1", tmp_path)
+        destination = tmp_path / "job-1:training:0" / destination_name
+        assert destination.read_bytes() == b"first\nthird\n"
+        assert first_result[0]["chunk_count"] == 2
+        gets_before = [cmd for cmd in connection.commands if cmd.startswith("GET ")]
+
+        listed.append((f"/versions/RUN_ABC/{sibling}",))
+        result = download("job-1", tmp_path, resume=True)
+
+        gets_after = [cmd for cmd in connection.commands if cmd.startswith("GET ")]
+        new_gets = gets_after[len(gets_before) :]
+        assert len(new_gets) == 1
+        assert sibling in new_gets[0]
+        # The late same-second sibling sorts before ``zulu`` but is appended.
+        assert destination.read_bytes() == b"first\nthird\nsecond\n"
+        assert result[0]["chunk_count"] == 3
+        assert result[0]["first_artifact_uri"] == run_uri + first
+        assert result[0]["last_artifact_uri"] == run_uri + later
+
+        committed = destination.read_bytes()
+        destination.write_bytes(committed + b"TORN")
+        torn = download("job-1", tmp_path, resume=True)
+        assert destination.read_bytes() == committed
+        assert torn[0]["chunk_count"] == 3
+        assert [cmd for cmd in connection.commands if cmd.startswith("GET ")] == gets_after
+
+    @pytest.mark.parametrize(
+        ("artifact_name", "chunk_name", "destination_name", "method_name"),
+        [
+            ("stdout", "console", "stdout.log", "download_stdout_logs"),
+            ("metrics", "gpu", "gpu.jsonl", "download_metrics"),
+        ],
+    )
+    def test_download_resume_bad_chunk_keeps_committed_prefix(
+        self,
+        artifact_name,
+        chunk_name,
+        destination_name,
+        method_name,
+        tmp_path,
+        monkeypatch,
+    ):
+        c = _make_client()
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        root = f"_{artifact_name}"
+        good = f"{root}/job-1:training:0/{chunk_name}.20260904-120001.good.gz"
+        bad = f"{root}/job-1:training:0/{chunk_name}.20260904-120002.bad.gz"
+        listed = [(f"/versions/RUN_ABC/{good}",)]
+        rows = {
+            run_uri + root + "/": listed,
+            run_uri + "checkpoints/" + root + "/": [],
+        }
+        connection = self.FakeArtifactConnection(
+            rows,
+            {
+                run_uri + good: gzip.compress(b"kept\n"),
+                run_uri + bad: b"not gzip",
+            },
+        )
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(
+            c, "_open_experiment_artifact_connection", lambda: connection
+        )
+        download = getattr(c, method_name)
+        download("job-1", tmp_path)
+        destination = tmp_path / "job-1:training:0" / destination_name
+        manifest_path = destination.with_name(destination.name + ".manifest.json")
+        committed_manifest = manifest_path.read_text(encoding="utf-8")
+
+        listed.append((f"/versions/RUN_ABC/{bad}",))
+        with pytest.raises(gzip.BadGzipFile):
+            download("job-1", tmp_path, resume=True)
+
+        assert destination.read_bytes() == b"kept\n"
+        assert manifest_path.read_text(encoding="utf-8") == committed_manifest
         assert connection.closed
 
     def test_fetch_execution_logs_errors_when_experiment_run_missing_fields(self):

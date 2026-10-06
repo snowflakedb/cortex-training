@@ -1639,16 +1639,23 @@ paths or object-store credentials.
 
 ### 12.3 Persisted stdout download
 
-`download_stdout_logs(job_id, output_dir)` downloads gzip chunks under
-`_stdout/{sub_job_id}/`, orders them by artifact name, and streams them into
-`<output_dir>/<sub_job_id>/stdout.log`. Each destination is replaced atomically;
-an invalid chunk leaves an existing file unchanged.
+`download_stdout_logs(job_id, output_dir, *, resume=False)` downloads gzip chunks
+under `_stdout/{sub_job_id}/`, orders them by artifact name, and streams them
+into `<output_dir>/<sub_job_id>/stdout.log`. Each destination is replaced
+atomically; an invalid chunk leaves an existing file unchanged. A full download
+also writes `stdout.log.manifest.json` beside the file (merged object names and
+committed byte length). `resume=True` lists every chunk and downloads only
+names absent from that manifest, appending them. A file longer than the
+committed length is truncated back to it before new chunks are appended. A bad
+chunk during resume leaves the committed prefix and manifest unchanged.
 
 ### 12.4 GPU metrics download
 
-`download_metrics(job_id, output_dir)` applies the same bounded reconstruction
-to `gpu.YYYYMMDD-HHMMSS.UUID.gz` chunks under `_metrics/{sub_job_id}/` and
-writes `<output_dir>/<sub_job_id>/gpu.jsonl`.
+`download_metrics(job_id, output_dir, *, resume=False)` applies the same bounded
+reconstruction to `gpu.YYYYMMDD-HHMMSS.UUID.gz` chunks under
+`_metrics/{sub_job_id}/` and writes `<output_dir>/<sub_job_id>/gpu.jsonl`.
+`resume=True` uses `gpu.jsonl.manifest.json` the same way stdout resume uses
+its manifest.
 
 The reconstructed file contains the JSONL records emitted by the deployed
 training runtime.

@@ -61,6 +61,19 @@ from cortex_training.tui.log_cache import LogCache
 from cortex_training.tui.log_cache import cached_log_pages
 
 _ERROR_LOG = "~/.cortex-training-errors.log"
+_UNSET = object()
+
+
+def _tail_text_lines(path: str, limit: int) -> list[str]:
+    """Last ``limit`` lines of a text file, without trailing newlines."""
+    from collections import deque
+
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            rows = deque(handle, maxlen=limit)
+    except OSError:
+        return []
+    return [row.rstrip("\n") for row in rows]
 
 
 class JobListScreen(Screen):
@@ -243,6 +256,7 @@ class LogScreen(Screen):
     _SOURCES_MAX = 140
     _SOURCES_STEP = 8
     _LEVEL_CYCLE = [None, "INFO", "WARNING", "ERROR"]
+    _SEALED_DEADLINE_SECONDS = 60
 
     def __init__(self, client, job_id, *, sub_job_id=None, poll_interval=1.0, job_status=None):
         super().__init__()
@@ -496,9 +510,16 @@ class LogScreen(Screen):
     @work(thread=True, exclusive=True, group="tail")
     def _tail(self, sub_job_id: str) -> None:
         worker = get_current_worker()
-        # A terminal job's zone is gone, so the operation API would error: serve
-        # cache only (no live fetch). A running/unknown job follows live.
+        # A finished job has no live zone. Show the local cache immediately,
+        # then replace the pane with the persisted console once that file has
+        # lines. The lines already on screen stay put until that replacement.
         active = is_active_status(self._job_status)
+        if not active:
+            self._paint_cache(sub_job_id)
+            if worker.is_cancelled:
+                return
+            self._adopt_stage(sub_job_id, worker)
+            return
         try:
             # Replay the local cache instantly, then (only for a live job) resume
             # the tail from the saved cursor so only new lines are fetched. Each
@@ -541,16 +562,125 @@ class LogScreen(Screen):
                     if not self._post(self._update_subtitle):
                         return
         except Exception as exc:  # noqa: BLE001 - surfaced in the UI
-            if not worker.is_cancelled:
+            if worker.is_cancelled:
+                return
+            if self._stage_after_tail_failure(sub_job_id, worker):
+                return
+            try:
+                with open(os.path.expanduser(_ERROR_LOG), "a", encoding="utf-8") as f:
+                    f.write(f"tail {sub_job_id} failed:\n{traceback.format_exc()}\n")
+            except Exception:  # noqa: BLE001
+                pass
+            self._post(
+                self._write_line,
+                f"[error] tail {sub_job_id} failed: {type(exc).__name__}: {exc}  (full traceback: {_ERROR_LOG})",
+            )
+
+    def _stage_after_tail_failure(self, sub_job_id: str, worker) -> bool:
+        """Keep the current lines, and replace them when a finished job has a console file."""
+        try:
+            job = self._client.get_job(self._job_id) or {}
+        except Exception:  # noqa: BLE001 - keep the original tail error
+            return False
+        status = job.get("status") or self._job_status
+        if is_active_status(status):
+            return False
+        self._job_status = status
+        if "reason" in job:
+            self._job_reason = job.get("reason")
+        self._post(self._update_subtitle)
+        self._adopt_stage(sub_job_id, worker)
+        return True
+
+    def _paint_cache(self, sub_job_id: str) -> None:
+        """Append the local tail cache without clearing what is already on screen."""
+        entries = self._cache.load_entries(sub_job_id, limit=2000)
+        lines = [
+            format_log_entry(entry)
+            for entry in entries
+            if entry_matches(entry, self._filter) and entry_at_level(entry, self._min_level)
+        ]
+        if lines:
+            self._post(self._write_lines, lines)
+
+    def _adopt_stage(self, sub_job_id: str, worker) -> None:
+        """Replace the pane only when the persisted console has lines to show."""
+        lines = self._collect_stage_lines(sub_job_id, worker)
+        if worker.is_cancelled:
+            return
+        if lines:
+            self._post(self._replace_lines, lines)
+            return
+        self._post(self._note_if_pane_empty)
+
+    def _collect_stage_lines(self, sub_job_id: str, worker) -> list[str] | None:
+        """Return console lines, or None when there is nothing new to show.
+
+        The pane is left untouched. A download error is recorded in the error
+        log and does not replace lines the user can already read.
+        """
+        deadline = time.monotonic() + self._SEALED_DEADLINE_SECONDS
+        seen_count = _UNSET
+        match = None
+        while True:
+            if worker.is_cancelled:
+                return None
+            try:
+                results = self._client.download_stdout_logs(
+                    self._job_id,
+                    self._cache.stage_dir(),
+                    resume=True,
+                )
+            except Exception:  # noqa: BLE001 - keep the pane; record the traceback
                 try:
-                    with open(os.path.expanduser(_ERROR_LOG), "a", encoding="utf-8") as f:
-                        f.write(f"tail {sub_job_id} failed:\n{traceback.format_exc()}\n")
+                    with open(os.path.expanduser(_ERROR_LOG), "a", encoding="utf-8") as handle:
+                        handle.write(f"stage log {sub_job_id} failed:\n{traceback.format_exc()}\n")
                 except Exception:  # noqa: BLE001
                     pass
-                self._post(
-                    self._write_line,
-                    f"[error] tail {sub_job_id} failed: {type(exc).__name__}: {exc}  (full traceback: {_ERROR_LOG})",
-                )
+                return None
+            if not isinstance(results, list):
+                return None
+            match = next(
+                (row for row in results if isinstance(row, dict) and row.get("sub_job_id") == sub_job_id),
+                None,
+            )
+            count = None if match is None else match.get("chunk_count")
+            if seen_count is not _UNSET and count == seen_count:
+                break
+            seen_count = count
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(self._poll_interval)
+        path = "" if match is None else (match.get("saved_path") or "")
+        if not path:
+            return None
+        lines = [
+            line
+            for line in _tail_text_lines(path, 20000)
+            if entry_matches(line, self._filter) and entry_at_level(line, self._min_level)
+        ]
+        return lines or None
+
+    def _replace_lines(self, lines: list[str]) -> None:
+        """Swap the whole pane to ``lines``. One snapshot, not a merge."""
+        self._shown_lines = []
+        if self._logview is not None:
+            self._logview.clear()
+        self._write_lines(lines)
+
+    def _note_if_pane_empty(self) -> None:
+        if self._has_log_output():
+            return
+        self._write_line("No log output is available.")
+
+    def _has_log_output(self) -> bool:
+        for line in self._shown_lines:
+            if line.startswith("— ") or line.startswith("[error]"):
+                continue
+            if line == "No log output is available.":
+                continue
+            return True
+        return False
 
     def _content_width(self) -> int:
         """Usable text columns of the log pane (accounts for padding/scrollbar)."""

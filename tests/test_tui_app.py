@@ -518,3 +518,177 @@ async def _run_wrap_and_select():
 
 def test_log_wrap_and_selectable():
     asyncio.run(_run_wrap_and_select())
+
+
+def _stage_download(calls):
+    from pathlib import Path
+
+    def download(job_id, output_dir, *, resume=False):
+        assert resume is True
+        calls.append(output_dir)
+        path = Path(output_dir) / f"{job_id}:training:0" / "stdout.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("persisted line\n", encoding="utf-8")
+        return [
+            {
+                "sub_job_id": f"{job_id}:training:0",
+                "filename": "stdout.log",
+                "saved_path": str(path),
+                "chunk_count": 1,
+            }
+        ]
+
+    return download
+
+
+async def _run_cancelled_job_shows_stage():
+    calls = []
+    c = _client()
+    c.get_job.return_value = {
+        "status": "CANCELLED",
+        "sub_jobs": [{"sub_job_id": "7:training:0", "job_type": "training"}],
+    }
+    c.download_stdout_logs.side_effect = _stage_download(calls)
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: isinstance(app.screen, LogScreen)
+            and any(ln == "persisted line" for ln in app.screen._shown_lines)
+            and not any("sealed" in ln.lower() for ln in app.screen._shown_lines),
+        )
+        assert ok, "cancelled job did not show the persisted console"
+        assert "sealed" not in (app.sub_title or "").lower()
+        c.tail_logs.assert_not_called()
+        assert len(calls) >= 2
+        await _settle(app, pilot)
+
+
+def test_cancelled_job_shows_stage_log(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    asyncio.run(_run_cancelled_job_shows_stage())
+
+
+async def _run_tail_failure_on_cancel_switches_to_stage():
+    calls = []
+    c = _client()
+    state = {"calls": 0}
+
+    def get_job(_job_id):
+        state["calls"] += 1
+        status = "RUNNING" if state["calls"] == 1 else "CANCELLED"
+        return {
+            "status": status,
+            "sub_jobs": [{"sub_job_id": "7:training:0", "job_type": "training"}],
+        }
+
+    c.get_job.side_effect = get_job
+    c.tail_logs.side_effect = RuntimeError("zone gone")
+    c.download_stdout_logs.side_effect = _stage_download(calls)
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: isinstance(app.screen, LogScreen)
+            and any(ln == "persisted line" for ln in app.screen._shown_lines)
+            and not any("sealed" in ln.lower() for ln in app.screen._shown_lines),
+        )
+        assert ok, "tail failure on a cancelled job did not show the persisted console"
+        assert not any(ln.startswith("[error] tail") for ln in app.screen._shown_lines)
+        assert "sealed" not in (app.sub_title or "").lower()
+        assert len(calls) >= 2
+        await _settle(app, pilot)
+
+
+def test_tail_failure_on_cancel_switches_to_stage(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    asyncio.run(_run_tail_failure_on_cancel_switches_to_stage())
+
+
+async def _run_tail_failure_while_running_stays_error():
+    c = _client()
+    c.tail_logs.side_effect = RuntimeError("stream reset")
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: isinstance(app.screen, LogScreen)
+            and any(ln.startswith("[error] tail") for ln in app.screen._shown_lines),
+        )
+        assert ok, "running-job tail failure was not shown"
+        c.download_stdout_logs.assert_not_called()
+        await _settle(app, pilot)
+
+
+def test_tail_failure_while_running_stays_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    asyncio.run(_run_tail_failure_while_running_stays_error())
+
+
+async def _run_keeps_visible_lines_when_stage_is_empty():
+    c = _client()
+    c.get_job.return_value = {
+        "status": "CANCELLED",
+        "sub_jobs": [{"sub_job_id": "7:training:0", "job_type": "training"}],
+    }
+    c.download_stdout_logs.return_value = []
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: isinstance(app.screen, LogScreen)
+            and any(ln == "cached line" for ln in app.screen._shown_lines),
+        )
+        assert ok, "cached line disappeared while the persisted console was empty"
+        assert not any("sealed" in ln.lower() for ln in app.screen._shown_lines)
+        assert not any(ln.startswith("[error]") for ln in app.screen._shown_lines)
+        await _settle(app, pilot)
+
+
+def test_keeps_visible_lines_when_stage_is_empty(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    from cortex_training.tui.log_cache import LogCache
+
+    LogCache("7").append_entries("7:training:0", [{"_raw": "cached line"}])
+    asyncio.run(_run_keeps_visible_lines_when_stage_is_empty())
+
+
+async def _run_keeps_visible_lines_when_stage_download_fails():
+    c = _client()
+    state = {"calls": 0}
+
+    def get_job(_job_id):
+        state["calls"] += 1
+        status = "RUNNING" if state["calls"] == 1 else "CANCELLED"
+        return {
+            "status": status,
+            "sub_jobs": [{"sub_job_id": "7:training:0", "job_type": "training"}],
+        }
+
+    c.get_job.side_effect = get_job
+    c.tail_logs.side_effect = RuntimeError("zone gone")
+    c.download_stdout_logs.side_effect = RuntimeError("stage down")
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: isinstance(app.screen, LogScreen)
+            and any(ln == "cached line" for ln in app.screen._shown_lines),
+        )
+        assert ok, "cached line disappeared when the persisted console failed"
+        assert not any("sealed" in ln.lower() for ln in app.screen._shown_lines)
+        assert not any(ln.startswith("[error] tail") for ln in app.screen._shown_lines)
+        await _settle(app, pilot)
+
+
+def test_keeps_visible_lines_when_stage_download_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    from cortex_training.tui.log_cache import LogCache
+
+    LogCache("7").append_entries("7:training:0", [{"_raw": "cached line"}])
+    asyncio.run(_run_keeps_visible_lines_when_stage_download_fails())
