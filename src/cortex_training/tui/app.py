@@ -402,8 +402,17 @@ class LogScreen(Screen):
 
     def _refilter(self) -> None:
         # Re-run the tail so the filter/level apply to the replayed cache too.
-        if self._current_source:
-            self._start_tail(self._current_source, preserve=self._showing_stage)
+        source = self._current_source
+        if not source:
+            return
+        if not is_active_status(self._job_status):
+            # The first download filters with the latest UI state when it
+            # finishes. Once its local file exists, refilter that copy.
+            if source not in self._stage_paths:
+                return
+            self._start_tail(source, preserve=True)
+            return
+        self._start_tail(source)
 
     # ─── export / copy ───────────────────────────────────────────────────
     def _snapshot_export(self) -> dict | None:

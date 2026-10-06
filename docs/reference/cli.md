@@ -562,9 +562,9 @@ already saved in that directory and fetches only metrics that are not there yet.
 
 ### Log TUI
 
-`cortex-training tui` is a read-only terminal UI for tailing a running job's
-logs live. It uses the same connection handling and fallback order as the CLI,
-including named and configured-default Snowflake profiles:
+`cortex-training tui` is a read-only terminal UI for viewing a job's logs. It
+uses the same connection handling and fallback order as the CLI, including
+named and configured-default Snowflake profiles:
 
 ```bash
 cortex-training tui                 # opens a job picker

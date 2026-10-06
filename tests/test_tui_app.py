@@ -842,6 +842,14 @@ async def _run_refilter_keeps_saved_console(tmp_path):
         await pilot.pause(0.05)
         assert screen._shown_lines == ["persisted line"]
         c.download_stdout_logs.assert_not_called()
+
+        screen.workers.cancel_all()
+        screen._stage_paths.clear()
+        screen._showing_stage = False
+        screen._filter = "typed during first download"
+        screen._refilter()
+        await pilot.pause(0.05)
+        c.download_stdout_logs.assert_not_called()
         await _settle(app, pilot)
 
 
