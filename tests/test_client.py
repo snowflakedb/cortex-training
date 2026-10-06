@@ -3121,7 +3121,8 @@ class TestExecutionLogDownload:
         run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
         root = f"_{artifact_name}"
         good = f"{root}/job-1:training:0/{chunk_name}.20260904-120001.good.gz"
-        bad = f"{root}/job-1:training:0/{chunk_name}.20260904-120002.bad.gz"
+        partial = f"{root}/job-1:training:0/{chunk_name}.20260904-120002.good.gz"
+        bad = f"{root}/job-1:training:0/{chunk_name}.20260904-120003.bad.gz"
         listed = [(f"/versions/RUN_ABC/{good}",)]
         rows = {
             run_uri + root + "/": listed,
@@ -3131,6 +3132,7 @@ class TestExecutionLogDownload:
             rows,
             {
                 run_uri + good: gzip.compress(b"kept\n"),
+                run_uri + partial: gzip.compress(b"must roll back\n"),
                 run_uri + bad: b"not gzip",
             },
         )
@@ -3144,7 +3146,12 @@ class TestExecutionLogDownload:
         manifest_path = CortexTrainingClient._resume_manifest_path(destination)
         committed_manifest = manifest_path.read_text(encoding="utf-8")
 
-        listed.append((f"/versions/RUN_ABC/{bad}",))
+        listed.extend(
+            [
+                (f"/versions/RUN_ABC/{partial}",),
+                (f"/versions/RUN_ABC/{bad}",),
+            ]
+        )
         with pytest.raises(gzip.BadGzipFile):
             download("job-1", tmp_path, resume=True)
 
@@ -3307,6 +3314,7 @@ def test_gzip_reconstructions_do_not_overlap(tmp_path):
         "chunk_pattern": re.compile("x"),
         "destination_name": "stdout.log",
         "temporary_prefix": ".stdout-",
+        "resume": True,
     }
     threads = [
         threading.Thread(
@@ -3321,6 +3329,11 @@ def test_gzip_reconstructions_do_not_overlap(tmp_path):
     for thread in threads:
         thread.join()
     assert state["max"] == 1
+
+    full_dir = tmp_path / "full"
+    kwargs["resume"] = False
+    client._download_gzip_artifacts("job-1", str(full_dir), **kwargs)
+    assert not (full_dir / ".stdout.download.lock").exists()
 
 
 def test_resume_rebuilds_when_file_was_replaced_before_manifest(tmp_path):

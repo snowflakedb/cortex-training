@@ -784,6 +784,7 @@ async def _run_healthy_empty_tail_hands_off(tmp_path, monkeypatch):
         )
         assert ok, "quiet live tail did not hand off after the job completed"
         assert c.tail_logs.call_count > 0
+        assert calls["jobs"] == 2
         assert not any(line.startswith("[error] tail") for line in app.screen._shown_lines)
         await _settle(app, pilot)
 
@@ -910,7 +911,6 @@ async def _run_refilter_keeps_saved_console(tmp_path):
 
         screen.workers.cancel_all()
         screen._stage_paths.clear()
-        screen._showing_stage = False
         screen._stage_fetching["7:training:0"] = 1
         screen._filter = "typed during first download"
         screen._refilter()
@@ -1052,7 +1052,6 @@ async def _run_save_exports_console_on_screen():
         assert ok, "log screen did not open"
         screen = app.screen
         screen._current_source = "7:training:0"
-        screen._showing_stage = True
         screen._apply_stage_lines(["persisted line"])
         screen.action_save_log()
         ok = await _wait(
@@ -1115,7 +1114,7 @@ def test_stage_watcher_stops_when_ui_post_fails(monkeypatch):
         screen,
         "_fetch_stage_lines",
         lambda *_args, **_kwargs: calls.append(1)
-        or (["line"], screen._filter_gen),
+        or ((True, ["line"]), screen._filter_gen),
     )
     monkeypatch.setattr(screen, "_post", lambda *_args, **_kwargs: False)
     screen._watch_stage("7:training:0", worker, 1)

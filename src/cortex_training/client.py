@@ -37,6 +37,7 @@ use the ``extra`` fields for anything the typed layer does not model yet.
 from __future__ import annotations
 
 import base64
+import errno
 import functools
 import gzip
 import hashlib
@@ -2226,9 +2227,19 @@ class CortexTrainingClient:
 
         ``resume=False`` rebuilds the file. ``resume=True`` lists every chunk
         and downloads only names absent from the manifest beside the file.
-        Reconstructions for the same output directory are serialized so two
-        processes cannot append one file concurrently.
+        Resumes for the same output directory are serialized so two processes
+        cannot append one file concurrently.
         """
+        if not resume:
+            return self._reconstruct_gzip_artifacts(
+                job_id,
+                output_dir,
+                artifact_name=artifact_name,
+                chunk_pattern=chunk_pattern,
+                destination_name=destination_name,
+                temporary_prefix=temporary_prefix,
+                resume=False,
+            )
         root = Path(output_dir).expanduser()
         root.mkdir(parents=True, exist_ok=True)
         lock_path = root / f".{artifact_name}.download.lock"
@@ -2241,7 +2252,14 @@ class CortexTrainingClient:
                     lock.write(b"\0")
                     lock.flush()
                 lock.seek(0)
-                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+                while True:
+                    try:
+                        msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError as exc:
+                        if exc.errno not in (errno.EACCES, errno.EDEADLK):
+                            raise
+                        time.sleep(0.1)
             else:
                 import fcntl
 

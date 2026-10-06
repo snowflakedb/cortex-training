@@ -287,8 +287,7 @@ class LogScreen(Screen):
         self._last_update = None  # local HH:MM:SS of the last live line
         self._tail_gen = 0  # bumped on every tail start; stale workers must not paint
         self._filter_gen = 0
-        self._showing_stage = False
-        self._painted_stage: list[str] | None = None
+        self._painted_snapshot: list[str] | None = None
         self._pending_stage: list[str] | None = None
         self._has_body = False
 
@@ -436,8 +435,8 @@ class LogScreen(Screen):
         if not src:
             return None
         lines = (
-            list(self._painted_stage)
-            if self._painted_stage is not None
+            list(self._painted_snapshot)
+            if self._painted_snapshot is not None
             else None
         )
         return {"src": src, "lines": lines}
@@ -562,8 +561,7 @@ class LogScreen(Screen):
         gen = self._tail_gen
         self._current_source = sub_job_id
         self._shown_lines = []
-        self._showing_stage = False
-        self._painted_stage = None
+        self._painted_snapshot = None
         self._has_body = False
         self._pending_stage = None
         # A new source or filter starts in follow mode.
@@ -748,15 +746,16 @@ class LogScreen(Screen):
             self._sleep_refresh(worker)
             if worker.is_cancelled or not self._is_current(sub_job_id, gen):
                 return
-            lines, filter_gen = self._fetch_stage_lines(
+            snapshot, filter_gen = self._fetch_stage_lines(
                 sub_job_id, error_once=error_once
             )
             if worker.is_cancelled or not self._is_current(sub_job_id, gen):
                 return
-            if not lines:
+            if snapshot is None or not snapshot[0]:
                 if not self._post(self._stage_tick_if_current, sub_job_id, gen):
                     return
                 continue
+            lines = snapshot[1]
             if not self._post(
                 self._replace_lines_if_changed,
                 lines,
@@ -774,20 +773,21 @@ class LogScreen(Screen):
             remaining -= step
 
     def _stage_tick_if_current(self, source_id: str, gen: int) -> None:
+        """UI-thread liveness probe for a watcher with no console to paint."""
         if not self._is_current(source_id, gen):
             return
 
     def _adopt_stage(self, sub_job_id: str, worker, gen: int, error_once: list[bool]) -> bool:
         """Replace the pane only when the persisted console has lines to show."""
-        lines, filter_gen = self._fetch_stage_lines(
+        snapshot, filter_gen = self._fetch_stage_lines(
             sub_job_id, error_once=error_once
         )
         if worker.is_cancelled or not self._is_current(sub_job_id, gen):
             return False
-        if lines:
+        if snapshot is not None and snapshot[0]:
             return self._post(
                 self._replace_lines,
-                lines,
+                snapshot[1],
                 sub_job_id,
                 gen,
                 filter_gen,
@@ -858,12 +858,7 @@ class LogScreen(Screen):
             if path
             else None
         )
-        lines = (
-            snapshot[1]
-            if snapshot is not None and snapshot[0]
-            else None
-        )
-        return lines, filter_gen
+        return snapshot, filter_gen
 
     def _finish_stage_fetch(self, sub_job_id: str) -> None:
         with self._stage_state_lock:
@@ -973,8 +968,7 @@ class LogScreen(Screen):
             pass
 
     def _apply_stage_lines(self, lines: list[str]) -> None:
-        self._showing_stage = True
-        self._painted_stage = list(lines)
+        self._painted_snapshot = list(lines)
         self._has_body = bool(lines)
         self._shown_lines = []
         if self._logview is not None:
@@ -1018,7 +1012,7 @@ class LogScreen(Screen):
         if self._paused and self._pending_stage is not None:
             baseline = self._pending_stage
         else:
-            baseline = self._painted_stage
+            baseline = self._painted_snapshot
         if lines == baseline:
             return
         self._replace_lines(lines, source_id, gen, filter_gen)
@@ -1039,7 +1033,7 @@ class LogScreen(Screen):
         if self._paused:
             self._pending_stage = list(lines)
             return
-        if lines != self._painted_stage:
+        if lines != self._painted_snapshot:
             self._apply_stage_lines(lines)
 
     def _replace_filtered_cache(
@@ -1055,8 +1049,7 @@ class LogScreen(Screen):
             or self._tail_gen != tail_gen
         ):
             return
-        self._showing_stage = False
-        self._painted_stage = list(lines)
+        self._painted_snapshot = list(lines)
         self._has_body = bool(lines)
         self._shown_lines = []
         if self._logview is not None:
