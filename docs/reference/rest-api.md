@@ -1641,9 +1641,9 @@ paths or object-store credentials.
 
 `download_stdout_logs(job_id, output_dir, *, resume=False)` saves each sub-job's
 console as `<output_dir>/<sub_job_id>/stdout.log`. A full download replaces that
-file. `resume=True` continues a file already in that directory and downloads
-only output that is not already saved. A failed resume does not discard a file
-that was already saved.
+file; if the download fails, the existing file is left unchanged. `resume=True`
+continues a file already in that directory and downloads only output that is not
+already saved. A failed resume does not discard a file that was already saved.
 
 ### 12.4 GPU metrics download
 

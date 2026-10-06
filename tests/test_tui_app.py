@@ -227,8 +227,11 @@ async def _run_terminal_cache_only():
             pilot,
             app,
             lambda: isinstance(app.screen, LogScreen)
+            and "7:training:0" in app.screen._stage_attempted
             and any(ln == "cached line" for ln in app.screen._shown_lines),
         )
+        await pilot.pause(0.05)
+        assert "cached line" in app.screen._shown_lines
         assert shown, "cached line was not kept for a terminal job"
         c.tail_logs.assert_not_called()
         await _settle(app, pilot)
@@ -652,8 +655,11 @@ async def _run_keeps_visible_lines_when_stage_is_empty():
             pilot,
             app,
             lambda: isinstance(app.screen, LogScreen)
+            and "7:training:0" in app.screen._stage_attempted
             and any(ln == "cached line" for ln in app.screen._shown_lines),
         )
+        await pilot.pause(0.05)
+        assert "cached line" in app.screen._shown_lines
         assert ok, "cached line disappeared while the persisted console was empty"
         assert not any("sealed" in ln.lower() for ln in app.screen._shown_lines)
         assert not any(ln.startswith("[error]") for ln in app.screen._shown_lines)
@@ -885,6 +891,13 @@ async def _run_refilter_keeps_saved_console(tmp_path):
         screen._refilter()
         empty_cache = await _wait(pilot, app, lambda: screen._shown_lines == [])
         assert empty_cache, "a no-match terminal-cache filter did not clear the pane"
+
+        screen._stage_paths["7:training:0"] = str(tmp_path / "missing.log")
+        screen._shown_lines = ["No log output is available."]
+        screen._filter = "anything"
+        screen._refilter()
+        await pilot.pause(0.05)
+        assert screen._shown_lines == ["No log output is available."]
         await _settle(app, pilot)
 
 

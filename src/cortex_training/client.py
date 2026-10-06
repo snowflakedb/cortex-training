@@ -37,6 +37,7 @@ use the ``extra`` fields for anything the typed layer does not model yet.
 from __future__ import annotations
 
 import base64
+import fcntl
 import functools
 import gzip
 import hashlib
@@ -88,7 +89,6 @@ _GPU_METRICS_CHUNK_RE = re.compile(
     r"^gpu\.(?P<timestamp>\d{8}-\d{6})\.(?P<suffix>[^./\\]+)\.gz$"
 )
 _STREAM_COPY_BUFFER_BYTES = 1024 * 1024
-_GZIP_ARTIFACT_LOCK = threading.Lock()
 
 # Env var that unlocks create-job debug options. These are an internal-only
 # capability and are deliberately not documented for external use: the client
@@ -2227,9 +2227,14 @@ class CortexTrainingClient:
 
         ``resume=False`` rebuilds the file. ``resume=True`` lists every chunk
         and downloads only names absent from the manifest beside the file.
-        Callers are serialized so two reconstructions cannot append one file.
+        Reconstructions for the same output directory are serialized so two
+        processes cannot append one file concurrently.
         """
-        with _GZIP_ARTIFACT_LOCK:
+        root = Path(output_dir).expanduser()
+        root.mkdir(parents=True, exist_ok=True)
+        lock_path = root / f".{artifact_name}.download.lock"
+        with lock_path.open("a+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             return self._reconstruct_gzip_artifacts(
                 job_id,
                 output_dir,

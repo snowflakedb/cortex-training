@@ -557,8 +557,10 @@ cortex-training download-metrics JOB_ID --output-dir /path/to/metrics
 cortex-training download-metrics JOB_ID --output-dir /path/to/metrics --resume
 ```
 
-The command prints where each file was saved. `--resume` continues a download
-already saved in that directory and fetches only metrics that are not there yet.
+The stdout and metrics commands print JSON with `saved_path`, `chunk_count`,
+`first_artifact_uri`, and `last_artifact_uri` for each file. `--resume`
+continues a download already saved in that directory and fetches only metrics
+that are not there yet.
 
 ### Log TUI
 

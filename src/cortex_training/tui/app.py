@@ -66,7 +66,7 @@ from cortex_training.tui.log_cache import cached_log_pages
 _ERROR_LOG = "~/.cortex-training-errors.log"
 
 
-def _tail_text_lines(path: str, limit: int) -> list[str]:
+def _tail_text_lines(path: str, limit: int) -> list[str] | None:
     """Last ``limit`` lines of a text file, without trailing newlines."""
     from collections import deque
 
@@ -74,7 +74,7 @@ def _tail_text_lines(path: str, limit: int) -> list[str]:
         with open(path, encoding="utf-8", errors="replace") as handle:
             rows = deque(handle, maxlen=limit)
     except OSError:
-        return []
+        return None
     return [row.rstrip("\n") for row in rows]
 
 
@@ -414,6 +414,9 @@ class LogScreen(Screen):
         self._pending_stage = None
         if not is_active_status(self._job_status):
             self._filter_gen += 1
+            if self._paused:
+                self._paused = False
+                self._update_subtitle()
             with self._stage_state_lock:
                 self._pending_refilter.add(source)
                 fetching = self._stage_fetching.get(source, 0)
@@ -432,7 +435,11 @@ class LogScreen(Screen):
         src = self._current_source
         if not src:
             return None
-        lines = list(self._painted_stage) if self._showing_stage else None
+        lines = (
+            list(self._painted_stage)
+            if self._painted_stage is not None
+            else None
+        )
         return {"src": src, "lines": lines}
 
     def _export_text(self, snap: dict) -> tuple[str, int]:
@@ -578,11 +585,14 @@ class LogScreen(Screen):
         # lines. The lines already on screen stay put until that replacement.
         active = is_active_status(self._job_status)
         if not active:
-            if not self._paint_cache(sub_job_id, gen):
-                return
-            if worker.is_cancelled or not self._is_current(sub_job_id, gen):
-                return
-            self._watch_stage(sub_job_id, worker, gen)
+            try:
+                if not self._paint_cache(sub_job_id, gen):
+                    return
+                if worker.is_cancelled or not self._is_current(sub_job_id, gen):
+                    return
+                self._watch_stage(sub_job_id, worker, gen)
+            except Exception as exc:  # noqa: BLE001 - surfaced in the UI
+                self._handle_tail_failure(sub_job_id, worker, gen, exc)
             return
         try:
             # Replay the local cache instantly, then (only for a live job) resume
@@ -623,21 +633,24 @@ class LogScreen(Screen):
                 ):
                     return
         except Exception as exc:  # noqa: BLE001 - surfaced in the UI
-            if worker.is_cancelled:
-                return
-            if self._stage_after_tail_failure(sub_job_id, worker, gen):
-                return
-            try:
-                with open(os.path.expanduser(_ERROR_LOG), "a", encoding="utf-8") as f:
-                    f.write(f"tail {sub_job_id} failed:\n{traceback.format_exc()}\n")
-            except Exception:  # noqa: BLE001
-                pass
-            self._post(
-                self._write_error_if_current,
-                f"[error] tail {sub_job_id} failed: {type(exc).__name__}: {exc}  (full traceback: {_ERROR_LOG})",
-                sub_job_id,
-                gen,
-            )
+            self._handle_tail_failure(sub_job_id, worker, gen, exc)
+
+    def _handle_tail_failure(self, sub_job_id: str, worker, gen: int, exc) -> None:
+        if worker.is_cancelled:
+            return
+        if self._stage_after_tail_failure(sub_job_id, worker, gen):
+            return
+        try:
+            with open(os.path.expanduser(_ERROR_LOG), "a", encoding="utf-8") as f:
+                f.write(f"tail {sub_job_id} failed:\n{traceback.format_exc()}\n")
+        except Exception:  # noqa: BLE001
+            pass
+        self._post(
+            self._write_error_if_current,
+            f"[error] tail {sub_job_id} failed: {type(exc).__name__}: {exc}  (full traceback: {_ERROR_LOG})",
+            sub_job_id,
+            gen,
+        )
 
     def _append_live_if_current(
         self, lines: list[str], source_id: str, gen: int, live: bool
@@ -681,8 +694,11 @@ class LogScreen(Screen):
         return self._post(self._append_if_current, lines, sub_job_id, gen)
 
     def _cache_lines(self, sub_job_id: str) -> list[str]:
+        return self._cache_snapshot(sub_job_id)[1]
+
+    def _cache_snapshot(self, sub_job_id: str) -> tuple[bool, list[str]]:
         entries = self._cache.load_entries(sub_job_id, limit=2000)
-        return [
+        return bool(entries), [
             format_log_entry(entry)
             for entry in entries
             if entry_matches(entry, self._filter)
@@ -873,7 +889,9 @@ class LogScreen(Screen):
                     tail_gen,
                 )
             return
-        lines = self._cache_lines(sub_job_id)
+        has_cache, lines = self._cache_snapshot(sub_job_id)
+        if not has_cache:
+            return
         self._post(
             self._replace_filtered_cache,
             lines,
@@ -892,9 +910,12 @@ class LogScreen(Screen):
             path = self._stage_paths.get(sub_job_id)
         if not path:
             return None
+        rows = _tail_text_lines(path, 20000)
+        if rows is None:
+            return None
         visible = [
             line
-            for line in _tail_text_lines(path, 20000)
+            for line in rows
             if entry_matches(line, query)
             and entry_at_level(line, min_level)
         ]
@@ -913,7 +934,7 @@ class LogScreen(Screen):
         try:
             with open(os.path.expanduser(_ERROR_LOG), "a", encoding="utf-8") as handle:
                 handle.write(
-                    f"stage log {sub_job_id} failed:\n"
+                    f"saved log {sub_job_id} failed:\n"
                     f"{trace if trace is not None else traceback.format_exc()}\n"
                 )
         except Exception:  # noqa: BLE001
@@ -1003,7 +1024,7 @@ class LogScreen(Screen):
         ):
             return
         self._showing_stage = False
-        self._painted_stage = None
+        self._painted_stage = list(lines)
         self._has_body = bool(lines)
         self._shown_lines = []
         if self._logview is not None:
