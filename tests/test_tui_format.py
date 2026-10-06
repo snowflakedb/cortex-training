@@ -44,15 +44,6 @@ def test_format_raw_log_entry():
     assert format_log_entry({"_raw": "plain text"}) == "plain text"
 
 
-def test_format_strips_stream_timestamp_prefix():
-    prefixed = "2026-10-06T18:44:33.605036269Z hello from the job"
-    assert format_log_entry(prefixed) == "hello from the job"
-    assert format_log_entry({"_raw": prefixed}) == "hello from the job"
-    # The application's own timestamp is part of the console line.
-    own = "2026-10-06T18:44:33.603950+00:00 hello"
-    assert format_log_entry({"_raw": own}) == own
-
-
 def test_format_truncated_entry_marks_suffix():
     out = format_log_entry({"_raw": "big line", "_truncated": True})
     assert out.endswith("[truncated]")

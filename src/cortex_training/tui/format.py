@@ -22,7 +22,6 @@ optional TUI dependency installed.
 from __future__ import annotations
 
 import json
-import re
 import textwrap
 from datetime import datetime
 from datetime import timezone
@@ -31,24 +30,13 @@ from typing import Any
 EVENTS_SOURCE_ID = "__events__"
 EVENTS_LABEL = "▸ scheduling events"
 
-# Live tail lines arrive with a container timestamp in front of the console
-# text. The saved console does not include that prefix, so strip it for display
-# and the two views show the same line.
-_STREAM_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z ")
-
-
-def console_text(text: str) -> str:
-    """Drop one leading container timestamp, leaving the console line."""
-    stripped = _STREAM_PREFIX.sub("", text, count=1)
-    return stripped if stripped else text
-
 
 def format_log_entry(entry: Any) -> str:
     """Render one log entry (a parsed JSONL object or ``{"_raw": ...}``)."""
     if not isinstance(entry, dict):
-        return console_text(str(entry))
+        return str(entry)
     if "_raw" in entry:
-        text = console_text(str(entry["_raw"]))
+        text = str(entry["_raw"])
         return text + " …[truncated]" if entry.get("_truncated") else text
     ts = str(entry.get("ts", "")).strip()
     level = str(entry.get("level", "")).strip()

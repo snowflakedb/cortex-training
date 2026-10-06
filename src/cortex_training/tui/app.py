@@ -46,7 +46,6 @@ from textual.widgets import Log
 from textual.widgets import Static
 from textual.worker import get_current_worker
 
-from cortex_training.tui.format import console_text
 from cortex_training.tui.format import entry_at_level
 from cortex_training.tui.format import entry_matches
 from cortex_training.tui.format import format_job_config
@@ -678,7 +677,7 @@ class LogScreen(Screen):
             count = None if match is None else match.get("chunk_count")
             if path:
                 visible = [
-                    console_text(line)
+                    line
                     for line in _tail_text_lines(path, 20000)
                     if entry_matches(line, self._filter) and entry_at_level(line, self._min_level)
                 ]
