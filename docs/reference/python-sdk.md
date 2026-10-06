@@ -1,12 +1,42 @@
 # Python SDK Reference
 
 ```python
-from cortex_training import CortexTrainingClient, SubJobConfig, JobType
+from cortex_training import CortexTrainingClient, connect, SubJobConfig, JobType
 ```
 
-`CortexTrainingClient` is the supported entry point. It is a low-level transport
-client: every data-plane call returns a `request_id` that you poll, and results
-are whatever the backend returns.
+## connect()
+
+`connect()` is the recommended way to build a client. It resolves credentials
+automatically in the same order as the CLI:
+
+```python
+from cortex_training import connect
+
+client = connect()                              # default connections.toml profile
+client = connect(config_path="config.json")     # JSON config file
+client = connect(connection_name="training")    # named profile
+```
+
+Resolution order:
+
+1. `connection_name` or `CORTEX_TRAINING_CONNECTION` env var
+2. `config_path` or `CORTEX_TRAINING_CONFIG` env var
+3. `base_url` or `CORTEX_TRAINING_BASE_URL` env var
+4. `CORTEX_TRAINING_HOST` + `CORTEX_TRAINING_PAT` env vars
+5. Remembered config from `cortex-training login`
+6. Default `connections.toml` profile
+
+Any keyword argument overrides the resolved value:
+
+```python
+client = connect(database="MY_DB", schema="CUSTOM")
+```
+
+## CortexTrainingClient
+
+`CortexTrainingClient` is the low-level transport client. Every data-plane call
+returns a `request_id` that you poll, and results are whatever the backend
+returns.
 
 Construct it with a named Snowflake connection profile:
 

@@ -54,10 +54,11 @@ python -m recipes.rl.math_grpo.train config=/path/to/config.json
 python -m recipes.inference.serve config=/path/to/config.json
 ```
 
-`config=` is the Snowflake PAT/connection file. See each recipe README for
-hardware, expected metrics, common variations, and the JSON job configs
-loaded from `configs/` (SFT and GRPO examples, plus inference configs for
-every catalog model).
+`config=` is the Snowflake PAT/connection file. It is optional — if omitted,
+recipes fall back to environment variables or your default `connections.toml`
+profile. See each recipe README for hardware, expected metrics, common
+variations, and the JSON job configs loaded from `configs/` (SFT and GRPO
+examples, plus inference configs for every catalog model).
 
 ## Recipe Contract
 
