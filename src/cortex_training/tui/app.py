@@ -270,6 +270,8 @@ class LogScreen(Screen):
         self._cache = LogCache(job_id)
         self._stage_temp = tempfile.TemporaryDirectory(prefix="cortex-training-stage-")
         self._stage_paths: dict[str, str] = {}
+        self._stage_attempted: set[str] = set()
+        self._stage_fetching: set[str] = set()
         self._source_by_item: dict[str, str] = {}
         self._logview: Log | None = None
         self._filter = ""  # grep substring for the log pane
@@ -408,7 +410,12 @@ class LogScreen(Screen):
         if not is_active_status(self._job_status):
             # The first download filters with the latest UI state when it
             # finishes. Once its local file exists, refilter that copy.
-            if source not in self._stage_paths:
+            if source in self._stage_fetching:
+                return
+            if (
+                source not in self._stage_paths
+                and source not in self._stage_attempted
+            ):
                 return
             self._start_tail(source, preserve=True)
             return
@@ -567,11 +574,18 @@ class LogScreen(Screen):
         active = is_active_status(self._job_status)
         if not active:
             if preserve:
-                lines = self._read_stage_lines(sub_job_id)
-                if lines and not self._post(
-                    self._replace_lines_if_changed, lines, sub_job_id, gen
-                ):
-                    return
+                if sub_job_id in self._stage_paths:
+                    lines = self._read_stage_lines(sub_job_id)
+                    if lines and not self._post(
+                        self._replace_lines_if_changed, lines, sub_job_id, gen
+                    ):
+                        return
+                else:
+                    lines = self._cache_lines(sub_job_id)
+                    if lines and not self._post(
+                        self._replace_cache_lines, lines, sub_job_id, gen
+                    ):
+                        return
             elif not self._paint_cache(sub_job_id, gen):
                 return
             if worker.is_cancelled or not self._is_current(sub_job_id, gen):
@@ -669,15 +683,19 @@ class LogScreen(Screen):
 
     def _paint_cache(self, sub_job_id: str, gen: int) -> bool:
         """Append the local tail cache without clearing what is already on screen."""
-        entries = self._cache.load_entries(sub_job_id, limit=2000)
-        lines = [
-            format_log_entry(entry)
-            for entry in entries
-            if entry_matches(entry, self._filter) and entry_at_level(entry, self._min_level)
-        ]
+        lines = self._cache_lines(sub_job_id)
         if not lines:
             return True
         return self._post(self._append_if_current, lines, sub_job_id, gen)
+
+    def _cache_lines(self, sub_job_id: str) -> list[str]:
+        entries = self._cache.load_entries(sub_job_id, limit=2000)
+        return [
+            format_log_entry(entry)
+            for entry in entries
+            if entry_matches(entry, self._filter)
+            and entry_at_level(entry, self._min_level)
+        ]
 
     def _append_if_current(self, lines: list[str], source_id: str, gen: int) -> None:
         if not self._is_current(source_id, gen):
@@ -734,25 +752,35 @@ class LogScreen(Screen):
     ):
         """Run one resume download and return visible lines."""
         lines = None
+        self._stage_fetching.add(sub_job_id)
         try:
-            results = self._client.download_stdout_logs(
-                self._job_id,
-                self._stage_temp.name,
-                resume=True,
-            )
-        except Exception:  # noqa: BLE001 - keep the pane; record the traceback
-            self._record_stage_error(sub_job_id, error_once)
-            return None
-        if isinstance(results, list):
-            match = next(
-                (row for row in results if isinstance(row, dict) and row.get("sub_job_id") == sub_job_id),
-                None,
-            )
-            path = "" if match is None else (match.get("saved_path") or "")
-            if path:
-                self._stage_paths[sub_job_id] = path
-                lines = self._read_stage_lines(sub_job_id)
-        return lines
+            try:
+                results = self._client.download_stdout_logs(
+                    self._job_id,
+                    self._stage_temp.name,
+                    resume=True,
+                )
+            except Exception:  # noqa: BLE001 - keep the pane; record the traceback
+                self._record_stage_error(sub_job_id, error_once)
+                return None
+            if isinstance(results, list):
+                match = next(
+                    (
+                        row
+                        for row in results
+                        if isinstance(row, dict)
+                        and row.get("sub_job_id") == sub_job_id
+                    ),
+                    None,
+                )
+                path = "" if match is None else (match.get("saved_path") or "")
+                if path:
+                    self._stage_paths[sub_job_id] = path
+                    lines = self._read_stage_lines(sub_job_id)
+            return lines
+        finally:
+            self._stage_attempted.add(sub_job_id)
+            self._stage_fetching.discard(sub_job_id)
 
     def _read_stage_lines(self, sub_job_id: str) -> list[str] | None:
         path = self._stage_paths.get(sub_job_id)
@@ -807,6 +835,19 @@ class LogScreen(Screen):
         if lines == baseline:
             return
         self._replace_lines(lines, source_id, gen)
+
+    def _replace_cache_lines(
+        self, lines: list[str], source_id: str, gen: int
+    ) -> None:
+        if not self._is_current(source_id, gen):
+            return
+        self._showing_stage = False
+        self._painted_stage = None
+        self._has_body = True
+        self._shown_lines = []
+        if self._logview is not None:
+            self._logview.clear()
+        self._write_lines(lines)
 
     def _note_if_pane_empty(self, source_id: str, gen: int) -> None:
         if not self._is_current(source_id, gen) or self._has_body:

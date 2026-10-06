@@ -846,10 +846,24 @@ async def _run_refilter_keeps_saved_console(tmp_path):
         screen.workers.cancel_all()
         screen._stage_paths.clear()
         screen._showing_stage = False
+        screen._stage_fetching.add("7:training:0")
         screen._filter = "typed during first download"
         screen._refilter()
         await pilot.pause(0.05)
         c.download_stdout_logs.assert_not_called()
+
+        screen._stage_fetching.clear()
+        screen._stage_attempted.add("7:training:0")
+        screen._cache.append_entries(
+            "7:training:0",
+            [{"_raw": "cached keep"}, {"_raw": "cached drop"}],
+        )
+        screen._filter = "keep"
+        screen._refilter()
+        filtered_cache = await _wait(
+            pilot, app, lambda: screen._shown_lines == ["cached keep"]
+        )
+        assert filtered_cache, "terminal cache was not filtered after a missing stage file"
         await _settle(app, pilot)
 
 
