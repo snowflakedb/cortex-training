@@ -830,6 +830,7 @@ async def _run_refilter_keeps_saved_console(tmp_path):
         screen._stage_paths["7:training:0"] = str(path)
         screen._apply_stage_lines(["persisted line", "other line"])
         c.download_stdout_logs.reset_mock()
+        tail_gen = screen._tail_gen
 
         screen._filter = "persisted"
         screen._refilter()
@@ -837,6 +838,7 @@ async def _run_refilter_keeps_saved_console(tmp_path):
             pilot, app, lambda: screen._shown_lines == ["persisted line"]
         )
         assert filtered, "saved console was not filtered from the local file"
+        assert screen._tail_gen == tail_gen
 
         screen._filter = "no match"
         screen._refilter()
@@ -865,6 +867,11 @@ async def _run_refilter_keeps_saved_console(tmp_path):
             pilot, app, lambda: screen._shown_lines == ["cached keep"]
         )
         assert filtered_cache, "terminal cache was not filtered after a missing stage file"
+
+        screen._filter = "no cached match"
+        screen._refilter()
+        empty_cache = await _wait(pilot, app, lambda: screen._shown_lines == [])
+        assert empty_cache, "a no-match terminal-cache filter did not clear the pane"
         await _settle(app, pilot)
 
 
@@ -915,6 +922,7 @@ async def _run_filter_during_first_missing_stage():
 
 def test_filter_during_first_missing_stage(tmp_path, monkeypatch):
     monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
     from cortex_training.tui.log_cache import LogCache
 
     LogCache("7").append_entries(
@@ -945,6 +953,7 @@ async def _run_exit_does_not_wait_for_stage_download(started, release):
 
 def test_exit_does_not_wait_for_stage_download(tmp_path, monkeypatch):
     monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
     started = threading.Event()
     release = threading.Event()
     before = time.monotonic()

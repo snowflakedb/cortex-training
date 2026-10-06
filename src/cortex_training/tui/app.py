@@ -275,6 +275,7 @@ class LogScreen(Screen):
         self._stage_attempted: set[str] = set()
         self._stage_fetching: dict[str, int] = {}
         self._pending_refilter: set[str] = set()
+        self._stage_state_lock = threading.Lock()
         self._source_by_item: dict[str, str] = {}
         self._logview: Log | None = None
         self._filter = ""  # grep substring for the log pane
@@ -285,6 +286,7 @@ class LogScreen(Screen):
         self._wrap_width = -1  # content width the buffer is wrapped to
         self._last_update = None  # local HH:MM:SS of the last live line
         self._tail_gen = 0  # bumped on every tail start; stale workers must not paint
+        self._filter_gen = 0
         self._showing_stage = False
         self._painted_stage: list[str] | None = None
         self._pending_stage: list[str] | None = None
@@ -406,22 +408,22 @@ class LogScreen(Screen):
         self._update_subtitle()
 
     def _refilter(self) -> None:
-        # Re-run the tail so the filter/level apply to the replayed cache too.
         source = self._current_source
         if not source:
             return
+        self._filter_gen += 1
+        self._pending_stage = None
         if not is_active_status(self._job_status):
-            # The first download filters with the latest UI state when it
-            # finishes. Once its local file exists, refilter that copy.
-            if self._stage_fetching.get(source, 0):
+            with self._stage_state_lock:
                 self._pending_refilter.add(source)
+                fetching = self._stage_fetching.get(source, 0)
+                ready = (
+                    source in self._stage_paths
+                    or source in self._stage_attempted
+                )
+            if fetching or not ready:
                 return
-            if (
-                source not in self._stage_paths
-                and source not in self._stage_attempted
-            ):
-                return
-            self._start_tail(source, preserve=True)
+            self._start_pending_refilter(source)
             return
         self._start_tail(source)
 
@@ -547,54 +549,39 @@ class LogScreen(Screen):
         except RuntimeError:
             return False
 
-    def _start_tail(self, sub_job_id: str, *, preserve: bool = False) -> None:
+    def _start_tail(self, sub_job_id: str) -> None:
         self._tail_gen += 1
         gen = self._tail_gen
         self._current_source = sub_job_id
-        if not preserve:
-            self._shown_lines = []
-            self._showing_stage = False
-            self._painted_stage = None
-            self._has_body = False
+        self._shown_lines = []
+        self._showing_stage = False
+        self._painted_stage = None
+        self._has_body = False
         self._pending_stage = None
         # A new source or filter starts in follow mode.
         self._paused = False
         self._update_subtitle()
-        if not preserve and self._logview is not None:
+        if self._logview is not None:
             self._logview.clear()
-        if not preserve:
-            self._write_line(f"— tailing {sub_job_id} —")
-        self._tail(sub_job_id, gen, preserve)
+        self._write_line(f"— tailing {sub_job_id} —")
+        self._tail(sub_job_id, gen)
 
     def _is_current(self, source_id: str, gen: int) -> bool:
         return self._current_source == source_id and self._tail_gen == gen
 
     @work(thread=True, exclusive=True, group="tail")
-    def _tail(self, sub_job_id: str, gen: int, preserve: bool = False) -> None:
+    def _tail(self, sub_job_id: str, gen: int) -> None:
         worker = get_current_worker()
         # A finished job has no live zone. Show the local cache immediately,
         # then replace the pane with the persisted console once that file has
         # lines. The lines already on screen stay put until that replacement.
         active = is_active_status(self._job_status)
         if not active:
-            if preserve:
-                if sub_job_id in self._stage_paths:
-                    lines = self._read_stage_lines(sub_job_id)
-                    if lines and not self._post(
-                        self._replace_lines_if_changed, lines, sub_job_id, gen
-                    ):
-                        return
-                else:
-                    lines = self._cache_lines(sub_job_id)
-                    if lines and not self._post(
-                        self._replace_cache_lines, lines, sub_job_id, gen
-                    ):
-                        return
-            elif not self._paint_cache(sub_job_id, gen):
+            if not self._paint_cache(sub_job_id, gen):
                 return
             if worker.is_cancelled or not self._is_current(sub_job_id, gen):
                 return
-            self._watch_stage(sub_job_id, worker, gen, adopt=not preserve)
+            self._watch_stage(sub_job_id, worker, gen)
             return
         try:
             # Replay the local cache instantly, then (only for a live job) resume
@@ -707,12 +694,10 @@ class LogScreen(Screen):
         self._has_body = True
         self._write_lines(lines)
 
-    def _watch_stage(
-        self, sub_job_id: str, worker, gen: int, *, adopt: bool = True
-    ) -> None:
+    def _watch_stage(self, sub_job_id: str, worker, gen: int) -> None:
         """Fill from the saved console, then check again while this panel stays open."""
         error_once = [False]
-        if adopt and not self._adopt_stage(sub_job_id, worker, gen, error_once):
+        if not self._adopt_stage(sub_job_id, worker, gen, error_once):
             return
         while not worker.is_cancelled and self._is_current(sub_job_id, gen):
             self._sleep_refresh(worker)
@@ -756,9 +741,10 @@ class LogScreen(Screen):
     ):
         """Run one resume download and return visible lines."""
         completed = queue.Queue(maxsize=1)
-        self._stage_fetching[sub_job_id] = (
-            self._stage_fetching.get(sub_job_id, 0) + 1
-        )
+        with self._stage_state_lock:
+            self._stage_fetching[sub_job_id] = (
+                self._stage_fetching.get(sub_job_id, 0) + 1
+            )
         client = self._client
         job_id = self._job_id
         output_dir = self._stage_temp.name
@@ -784,7 +770,8 @@ class LogScreen(Screen):
                 )
                 path = "" if match is None else (match.get("saved_path") or "")
                 if path:
-                    self._stage_paths[sub_job_id] = path
+                    with self._stage_state_lock:
+                        self._stage_paths[sub_job_id] = path
                 completed.put((path, None))
             finally:
                 self._finish_stage_fetch(sub_job_id)
@@ -805,27 +792,59 @@ class LogScreen(Screen):
         return self._read_stage_lines(sub_job_id) if path else None
 
     def _finish_stage_fetch(self, sub_job_id: str) -> None:
-        count = self._stage_fetching.get(sub_job_id, 0) - 1
-        if count > 0:
-            self._stage_fetching[sub_job_id] = count
-            return
-        self._stage_fetching.pop(sub_job_id, None)
-        self._stage_attempted.add(sub_job_id)
-        if sub_job_id in self._pending_refilter:
+        with self._stage_state_lock:
+            count = self._stage_fetching.get(sub_job_id, 0) - 1
+            if count > 0:
+                self._stage_fetching[sub_job_id] = count
+                return
+            self._stage_fetching.pop(sub_job_id, None)
+            self._stage_attempted.add(sub_job_id)
+            pending = sub_job_id in self._pending_refilter
+        if pending:
             self._post(self._apply_pending_refilter, sub_job_id)
 
     def _apply_pending_refilter(self, sub_job_id: str) -> None:
-        if sub_job_id not in self._pending_refilter:
-            return
-        self._pending_refilter.discard(sub_job_id)
+        self._start_pending_refilter(sub_job_id)
+
+    def _start_pending_refilter(self, sub_job_id: str) -> None:
+        with self._stage_state_lock:
+            if (
+                sub_job_id not in self._pending_refilter
+                or self._stage_fetching.get(sub_job_id, 0)
+            ):
+                return
+            self._pending_refilter.discard(sub_job_id)
         if (
             self._current_source == sub_job_id
             and not is_active_status(self._job_status)
         ):
-            self._start_tail(sub_job_id, preserve=True)
+            self._refilter_terminal(sub_job_id, self._filter_gen)
+
+    @work(thread=True, exclusive=True, group="refilter")
+    def _refilter_terminal(self, sub_job_id: str, filter_gen: int) -> None:
+        with self._stage_state_lock:
+            has_stage = sub_job_id in self._stage_paths
+        if has_stage:
+            lines = self._read_stage_lines(sub_job_id)
+            if lines:
+                self._post(
+                    self._replace_filtered_stage,
+                    lines,
+                    sub_job_id,
+                    filter_gen,
+                )
+            return
+        lines = self._cache_lines(sub_job_id)
+        self._post(
+            self._replace_filtered_cache,
+            lines,
+            sub_job_id,
+            filter_gen,
+        )
 
     def _read_stage_lines(self, sub_job_id: str) -> list[str] | None:
-        path = self._stage_paths.get(sub_job_id)
+        with self._stage_state_lock:
+            path = self._stage_paths.get(sub_job_id)
         if not path:
             return None
         visible = [
@@ -886,14 +905,31 @@ class LogScreen(Screen):
             return
         self._replace_lines(lines, source_id, gen)
 
-    def _replace_cache_lines(
-        self, lines: list[str], source_id: str, gen: int
+    def _replace_filtered_stage(
+        self, lines: list[str], source_id: str, filter_gen: int
     ) -> None:
-        if not self._is_current(source_id, gen):
+        if (
+            self._current_source != source_id
+            or self._filter_gen != filter_gen
+        ):
+            return
+        if self._paused:
+            self._pending_stage = list(lines)
+            return
+        if lines != self._painted_stage:
+            self._apply_stage_lines(lines)
+
+    def _replace_filtered_cache(
+        self, lines: list[str], source_id: str, filter_gen: int
+    ) -> None:
+        if (
+            self._current_source != source_id
+            or self._filter_gen != filter_gen
+        ):
             return
         self._showing_stage = False
         self._painted_stage = None
-        self._has_body = True
+        self._has_body = bool(lines)
         self._shown_lines = []
         if self._logview is not None:
             self._logview.clear()
