@@ -61,7 +61,6 @@ from cortex_training.tui.log_cache import LogCache
 from cortex_training.tui.log_cache import cached_log_pages
 
 _ERROR_LOG = "~/.cortex-training-errors.log"
-_UNSET = object()
 
 
 def _tail_text_lines(path: str, limit: int) -> list[str]:
@@ -256,7 +255,6 @@ class LogScreen(Screen):
     _SOURCES_MAX = 140
     _SOURCES_STEP = 8
     _LEVEL_CYCLE = [None, "INFO", "WARNING", "ERROR"]
-    _SEALED_DEADLINE_SECONDS = 60
     _STAGE_REFRESH_SECONDS = 30
 
     def __init__(self, client, job_id, *, sub_job_id=None, poll_interval=1.0, job_status=None):
@@ -535,9 +533,7 @@ class LogScreen(Screen):
         self._showing_stage = False
         self._painted_stage = None
         self._pending_stage = None
-        # A fresh tail context (new source, or a re-tail after a filter change)
-        # starts following the tail — otherwise a pause left over from a prior
-        # source would strand this one at the top, the very bug we're fixing.
+        # A new source or filter starts in follow mode.
         self._paused = False
         self._update_subtitle()
         if self._logview is not None:
@@ -592,17 +588,14 @@ class LogScreen(Screen):
                 if kind == "live" and not saw_live:
                     saw_live = True
                     lines = ["— live —"] + lines
-                # Every batch sticks to the tail (unless paused), so the view
-                # opens on the newest cached lines and follows live from there.
-                # _post fails closed if the app is tearing down, so the worker
-                # stops cleanly.
-                if not self._post(self._write_lines, lines):
+                if not self._post(
+                    self._append_live_if_current,
+                    lines,
+                    sub_job_id,
+                    gen,
+                    kind == "live",
+                ):
                     return
-                if kind == "live":
-                    # Stamp the freshness indicator on each live batch.
-                    self._last_update = time.strftime("%H:%M:%S")
-                    if not self._post(self._update_subtitle):
-                        return
         except Exception as exc:  # noqa: BLE001 - surfaced in the UI
             if worker.is_cancelled:
                 return
@@ -614,9 +607,25 @@ class LogScreen(Screen):
             except Exception:  # noqa: BLE001
                 pass
             self._post(
-                self._write_line,
+                self._write_error_if_current,
                 f"[error] tail {sub_job_id} failed: {type(exc).__name__}: {exc}  (full traceback: {_ERROR_LOG})",
+                sub_job_id,
+                gen,
             )
+
+    def _append_live_if_current(
+        self, lines: list[str], source_id: str, gen: int, live: bool
+    ) -> None:
+        if not self._is_current(source_id, gen):
+            return
+        self._write_lines(lines)
+        if live:
+            self._last_update = time.strftime("%H:%M:%S")
+            self._update_subtitle()
+
+    def _write_error_if_current(self, line: str, source_id: str, gen: int) -> None:
+        if self._is_current(source_id, gen):
+            self._write_line(line)
 
     def _stage_after_tail_failure(self, sub_job_id: str, worker, gen: int) -> bool:
         """Keep the current lines, and replace them when a finished job has a console file."""
@@ -680,52 +689,21 @@ class LogScreen(Screen):
 
     def _adopt_stage(self, sub_job_id: str, worker, gen: int, error_once: list[bool]) -> bool:
         """Replace the pane only when the persisted console has lines to show."""
-        lines = self._collect_stage_lines(sub_job_id, worker, gen, error_once)
+        lines = self._fetch_stage_lines(sub_job_id, error_once=error_once)
         if worker.is_cancelled or not self._is_current(sub_job_id, gen):
             return False
         if lines:
             return self._post(self._replace_lines, lines, sub_job_id, gen)
         return self._post(self._note_if_pane_empty, sub_job_id, gen)
 
-    def _collect_stage_lines(
-        self,
-        sub_job_id: str,
-        worker,
-        gen: int,
-        error_once: list[bool],
-    ) -> list[str] | None:
-        """Resume-download until the chunk set stops growing, then return lines."""
-        deadline = time.monotonic() + self._SEALED_DEADLINE_SECONDS
-        seen_count = _UNSET
-        lines = None
-        while True:
-            if worker.is_cancelled or not self._is_current(sub_job_id, gen):
-                return None
-            fetched, count = self._fetch_stage_lines(
-                sub_job_id, with_count=True, error_once=error_once
-            )
-            if worker.is_cancelled or not self._is_current(sub_job_id, gen):
-                return None
-            if fetched:
-                lines = fetched
-            if seen_count is not _UNSET and count == seen_count:
-                break
-            seen_count = count
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(self._poll_interval)
-        return lines
-
     def _fetch_stage_lines(
         self,
         sub_job_id: str,
         *,
-        with_count: bool = False,
         error_once: list[bool] | None = None,
     ):
-        """One resume download. Returns lines, or ``(lines, chunk_count)``."""
+        """Run one resume download and return visible lines."""
         lines = None
-        count = None
         try:
             results = self._client.download_stdout_logs(
                 self._job_id,
@@ -734,14 +712,13 @@ class LogScreen(Screen):
             )
         except Exception:  # noqa: BLE001 - keep the pane; record the traceback
             self._record_stage_error(sub_job_id, error_once)
-            return (None, None) if with_count else None
+            return None
         if isinstance(results, list):
             match = next(
                 (row for row in results if isinstance(row, dict) and row.get("sub_job_id") == sub_job_id),
                 None,
             )
             path = "" if match is None else (match.get("saved_path") or "")
-            count = None if match is None else match.get("chunk_count")
             if path:
                 visible = [
                     line
@@ -749,7 +726,7 @@ class LogScreen(Screen):
                     if entry_matches(line, self._filter) and entry_at_level(line, self._min_level)
                 ]
                 lines = visible or None
-        return (lines, count) if with_count else lines
+        return lines
 
     def _record_stage_error(self, sub_job_id: str, error_once: list[bool] | None) -> None:
         if error_once is not None:

@@ -21,6 +21,7 @@ import glob
 import os
 import re
 import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -569,7 +570,7 @@ async def _run_cancelled_job_shows_stage():
         assert ok, "cancelled job did not show the persisted console"
         assert "sealed" not in (app.sub_title or "").lower()
         c.tail_logs.assert_not_called()
-        assert len(calls) >= 2
+        assert len(calls) >= 1
         await _settle(app, pilot)
 
 
@@ -606,7 +607,7 @@ async def _run_tail_failure_on_cancel_switches_to_stage():
         assert ok, "tail failure on a cancelled job did not show the persisted console"
         assert not any(ln.startswith("[error] tail") for ln in app.screen._shown_lines)
         assert "sealed" not in (app.sub_title or "").lower()
-        assert len(calls) >= 2
+        assert len(calls) >= 1
         await _settle(app, pilot)
 
 
@@ -767,6 +768,8 @@ async def _run_stale_worker_does_not_paint():
         screen._replace_lines(["stale console"], "7:training:0", 1)
         screen._note_if_pane_empty("7:training:0", 1)
         screen._append_if_current(["other cache"], "7:other", 2)
+        screen._append_live_if_current(["stale live"], "7:training:0", 1, True)
+        screen._write_error_if_current("[error] stale", "7:training:0", 1)
         assert screen._shown_lines == ["kept"]
         assert screen._pending_stage is None
         await _settle(app, pilot)
@@ -817,7 +820,7 @@ async def _run_save_exports_console_on_screen():
         screen = app.screen
         screen._current_source = "7:training:0"
         screen._showing_stage = True
-        screen._shown_lines = ["persisted line"]
+        screen._apply_stage_lines(["persisted line"])
         screen.action_save_log()
         ok = await _wait(
             pilot,
@@ -840,3 +843,46 @@ def test_save_exports_console_on_screen(tmp_path, monkeypatch):
 
     LogCache("7").append_entries("7:training:0", [{"_raw": "alpha"}])
     asyncio.run(_run_save_exports_console_on_screen())
+
+
+async def _run_copy_exports_console_on_screen():
+    app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
+    copied = []
+    async with app.run_test() as pilot:
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: isinstance(app.screen, LogScreen) and app.screen._logview is not None,
+        )
+        assert ok, "log screen did not open"
+        screen = app.screen
+        screen._current_source = "7:training:0"
+        screen._apply_stage_lines(["persisted line"])
+        app.copy_to_clipboard = copied.append
+        screen.action_copy_log()
+        ok = await _wait(pilot, app, lambda: copied == ["persisted line"])
+        assert ok, "copy did not use the console on screen"
+        await _settle(app, pilot)
+
+
+def test_copy_exports_console_on_screen(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    asyncio.run(_run_copy_exports_console_on_screen())
+
+
+def test_stage_watcher_stops_when_ui_post_fails(monkeypatch):
+    screen = LogScreen(_client(), "7", job_status="CANCELLED")
+    screen._current_source = "7:training:0"
+    screen._tail_gen = 1
+    worker = SimpleNamespace(is_cancelled=False)
+    calls = []
+    monkeypatch.setattr(screen, "_adopt_stage", lambda *_args: True)
+    monkeypatch.setattr(screen, "_sleep_refresh", lambda _worker: None)
+    monkeypatch.setattr(
+        screen,
+        "_fetch_stage_lines",
+        lambda *_args, **_kwargs: calls.append(1) or ["line"],
+    )
+    monkeypatch.setattr(screen, "_post", lambda *_args, **_kwargs: False)
+    screen._watch_stage("7:training:0", worker, 1)
+    assert calls == [1]

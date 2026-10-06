@@ -3321,3 +3321,15 @@ def test_gzip_reconstructions_do_not_overlap():
     for thread in threads:
         thread.join()
     assert state["max"] == 1
+
+
+def test_resume_rebuilds_when_file_was_replaced_before_manifest(tmp_path):
+    destination = tmp_path / "stdout.log"
+    destination.write_text("old\n", encoding="utf-8")
+    CortexTrainingClient._write_resume_manifest(destination, ["old.gz"], 4)
+
+    replacement = tmp_path / "replacement"
+    replacement.write_text("new complete file\n", encoding="utf-8")
+    replacement.replace(destination)
+
+    assert CortexTrainingClient._read_resume_state(destination) is None

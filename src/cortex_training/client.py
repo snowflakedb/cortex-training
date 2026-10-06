@@ -2102,17 +2102,30 @@ class CortexTrainingClient:
         ):
             return None
         try:
-            size = destination.stat().st_size
+            stat = destination.stat()
         except OSError:
             return None
-        if size < nbytes:
+        if (
+            doc.get("device") != stat.st_dev
+            or doc.get("inode") != stat.st_ino
+            or stat.st_size < nbytes
+        ):
             return None
         return list(names), nbytes
 
     @classmethod
     def _write_resume_manifest(cls, destination: Path, names: list[str], nbytes: int) -> None:
         path = cls._resume_manifest_path(destination)
-        payload = json.dumps({"bytes": nbytes, "names": names, "version": 1}) + "\n"
+        stat = destination.stat()
+        payload = json.dumps(
+            {
+                "bytes": nbytes,
+                "device": stat.st_dev,
+                "inode": stat.st_ino,
+                "names": names,
+                "version": 1,
+            }
+        ) + "\n"
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".manifest-", suffix=".tmp")
         try:
@@ -2370,10 +2383,10 @@ class CortexTrainingClient:
         *,
         resume: bool = False,
     ) -> list[dict[str, Any]]:
-        """Reconstruct sealed console artifacts into one file per sub-job.
+        """Download each sub-job's stdout into one file.
 
-        ``resume=True`` keeps ``stdout.log`` and a sibling manifest of merged
-        object names, and downloads only chunks that are not in that manifest.
+        ``resume=True`` continues an earlier download and fetches only output
+        that is not already saved.
         """
         return self._download_gzip_artifacts(
             job_id,
@@ -2392,10 +2405,10 @@ class CortexTrainingClient:
         *,
         resume: bool = False,
     ) -> list[dict[str, Any]]:
-        """Reconstruct staged GPU metric chunks into one JSONL file per sub-job.
+        """Download each sub-job's GPU metrics into one JSONL file.
 
-        ``resume=True`` keeps ``gpu.jsonl`` and a sibling manifest of merged
-        object names, and downloads only chunks that are not in that manifest.
+        ``resume=True`` continues an earlier download and fetches only metrics
+        that are not already saved.
         """
         return self._download_gzip_artifacts(
             job_id,
