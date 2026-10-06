@@ -601,8 +601,9 @@ re-fetching from the server — under `~/.cache/cortex-training/` (or
 `$XDG_CACHE_HOME`), overridable with `CORTEX_TRAINING_TUI_CACHE_DIR`.
 
 When a job finishes or is cancelled, the log view keeps showing output. If the
-live stream stops, the same view fills in from the saved console. A stream
-error while the job is still running stays an error.
+live stream stops, the same view fills in from the saved console. While that
+job stays open, the view checks for more saved output about every 30 seconds.
+A stream error while the job is still running stays an error.
 
 The TUI also writes two files into your home directory: saved logs from the `s`
 key (`~/cortex-training-<job8>-<source>.log`, where `<job8>` is the first eight

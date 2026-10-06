@@ -686,6 +686,82 @@ async def _run_keeps_visible_lines_when_stage_download_fails():
         await _settle(app, pilot)
 
 
+async def _run_stream_prefix_matches_console():
+    c = _client()
+
+    def tail_logs(_job_id, **_kwargs):
+        return {
+            "entries": ["2026-10-06T18:44:33.605036269Z hello from the job"],
+            "next_cursor": "c",
+            "eof": True,
+        }
+
+    c.tail_logs.side_effect = tail_logs
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: isinstance(app.screen, LogScreen)
+            and any(ln == "hello from the job" for ln in app.screen._shown_lines),
+        )
+        assert ok, "live line did not show the console text"
+        assert not any("605036269Z" in ln for ln in app.screen._shown_lines)
+        await _settle(app, pilot)
+
+
+def test_stream_prefix_matches_console(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    asyncio.run(_run_stream_prefix_matches_console())
+
+
+async def _run_open_panel_picks_up_later_console(monkeypatch):
+    monkeypatch.setattr(LogScreen, "_STAGE_REFRESH_SECONDS", 0.05)
+    calls = {"n": 0}
+
+    def download(job_id, output_dir, *, resume=False):
+        from pathlib import Path
+
+        assert resume is True
+        calls["n"] += 1
+        path = Path(output_dir) / f"{job_id}:training:0" / "stdout.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        text = "line one\n" if calls["n"] < 3 else "line one\nline two\n"
+        path.write_text(text, encoding="utf-8")
+        return [
+            {
+                "sub_job_id": f"{job_id}:training:0",
+                "filename": "stdout.log",
+                "saved_path": str(path),
+                "chunk_count": 1,
+            }
+        ]
+
+    c = _client()
+    c.get_job.return_value = {
+        "status": "CANCELLED",
+        "sub_jobs": [{"sub_job_id": "7:training:0", "job_type": "training"}],
+    }
+    c.download_stdout_logs.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: isinstance(app.screen, LogScreen)
+            and any(ln == "line two" for ln in app.screen._shown_lines),
+            tries=200,
+        )
+        assert ok, "open panel did not pick up later console output"
+        assert any(ln == "line one" for ln in app.screen._shown_lines)
+        await _settle(app, pilot)
+
+
+def test_open_panel_picks_up_later_console(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    asyncio.run(_run_open_panel_picks_up_later_console(monkeypatch))
+
+
 def test_keeps_visible_lines_when_stage_download_fails(tmp_path, monkeypatch):
     monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
     from cortex_training.tui.log_cache import LogCache
