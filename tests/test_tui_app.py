@@ -794,6 +794,48 @@ def test_healthy_empty_tail_hands_off(tmp_path, monkeypatch):
     asyncio.run(_run_healthy_empty_tail_hands_off(tmp_path, monkeypatch))
 
 
+async def _run_quiet_tail_stops_when_status_post_fails(monkeypatch):
+    monkeypatch.setattr(LogScreen, "_STAGE_REFRESH_SECONDS", 0.2)
+    calls = {"jobs": 0}
+
+    def get_job(_job_id):
+        calls["jobs"] += 1
+        return {
+            "status": "RUNNING" if calls["jobs"] == 1 else "COMPLETED",
+            "sub_jobs": [{"sub_job_id": "7:training:0", "job_type": "training"}],
+        }
+
+    c = _client()
+    c.get_job.side_effect = get_job
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ready = await _wait(
+            pilot,
+            app,
+            lambda: isinstance(app.screen, LogScreen) and c.tail_logs.call_count > 0,
+        )
+        assert ready, "live tail did not start"
+        screen = app.screen
+        original_post = screen._post
+
+        def post(fn, *args, **kwargs):
+            if fn == screen._update_subtitle:
+                return False
+            return original_post(fn, *args, **kwargs)
+
+        monkeypatch.setattr(screen, "_post", post)
+        checked = await _wait(pilot, app, lambda: calls["jobs"] >= 2, tries=200)
+        assert checked, "job status was not refreshed"
+        await pilot.pause(0.05)
+        c.download_stdout_logs.assert_not_called()
+        await _settle(app, pilot)
+
+
+def test_quiet_tail_stops_when_status_post_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    asyncio.run(_run_quiet_tail_stops_when_status_post_fails(monkeypatch))
+
+
 def test_keeps_visible_lines_when_stage_download_fails(tmp_path, monkeypatch):
     monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -836,6 +878,16 @@ async def _run_stale_worker_does_not_paint():
         screen._write_error_if_current("[error] stale", "7:training:0", 1)
         assert screen._shown_lines == ["kept"]
         assert screen._pending_stage is None
+        screen._apply_stage_lines(["same console"])
+        screen._write_line("[saved] status")
+        screen._replace_lines_if_changed(
+            ["same console"], "7:training:0", 2, filter_gen=2
+        )
+        assert screen._shown_lines == ["same console", "[saved] status"]
+        screen._replace_lines_if_changed(
+            ["changed console"], "7:training:0", 2, filter_gen=2
+        )
+        assert screen._shown_lines == ["changed console"]
         await _settle(app, pilot)
 
 
@@ -866,6 +918,13 @@ async def _run_pause_holds_console_until_resume():
         screen.action_toggle_pause()
         assert screen._shown_lines == ["persisted line"]
         assert screen._pending_stage is None
+        screen._paused = True
+        screen._filter_gen = 1
+        screen._shown_lines = ["persisted line"]
+        screen._replace_filtered_stage([], "7:training:0", 1, 1)
+        assert screen._shown_lines == ["persisted line"]
+        screen.action_toggle_pause()
+        assert screen._shown_lines == []
         await _settle(app, pilot)
 
 
@@ -1010,6 +1069,54 @@ def test_filter_during_first_missing_stage(tmp_path, monkeypatch):
     asyncio.run(_run_filter_during_first_missing_stage())
 
 
+async def _run_filter_during_first_saved_stage(tmp_path):
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+    c = _client()
+    c.get_job.return_value = {
+        "status": "CANCELLED",
+        "sub_jobs": [{"sub_job_id": "7:training:0", "job_type": "training"}],
+    }
+
+    def download(job_id, output_dir, *, resume=False):
+        from pathlib import Path
+
+        calls.append(1)
+        started.set()
+        assert release.wait(2)
+        path = Path(output_dir) / f"{job_id}:training:0" / "stdout.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("keep this\ndrop this\n", encoding="utf-8")
+        return [{"sub_job_id": f"{job_id}:training:0", "saved_path": str(path)}]
+
+    c.download_stdout_logs.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ready = await _wait(
+            pilot,
+            app,
+            lambda: isinstance(app.screen, LogScreen) and started.is_set(),
+        )
+        assert ready, "first saved-console download did not start"
+        screen = app.screen
+        screen._filter = "keep"
+        screen._refilter()
+        release.set()
+        filtered = await _wait(
+            pilot, app, lambda: screen._shown_lines == ["keep this"]
+        )
+        assert filtered, "latest filter was not applied to the downloaded console"
+        assert calls == [1]
+        await _settle(app, pilot)
+
+
+def test_filter_during_first_saved_stage(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    asyncio.run(_run_filter_during_first_saved_stage(tmp_path))
+
+
 async def _run_exit_does_not_wait_for_stage_download(started, release):
     c = _client()
     c.get_job.return_value = {
@@ -1052,7 +1159,13 @@ async def _run_save_exports_console_on_screen():
         assert ok, "log screen did not open"
         screen = app.screen
         screen._current_source = "7:training:0"
+        screen._append_if_current(["filtered cache"], "7:training:0", screen._tail_gen)
+        cache_text, cache_count = screen._export_text(screen._snapshot_export())
+        assert (cache_text, cache_count) == ("filtered cache", 1)
         screen._apply_stage_lines(["persisted line"])
+        screen._write_line("[saved] status line")
+        stage_text, stage_count = screen._export_text(screen._snapshot_export())
+        assert (stage_text, stage_count) == ("persisted line", 1)
         screen.action_save_log()
         ok = await _wait(
             pilot,

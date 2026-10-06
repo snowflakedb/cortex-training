@@ -32,6 +32,7 @@ import base64
 import gzip
 import importlib
 import json
+import subprocess
 import sys
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -3334,6 +3335,53 @@ def test_gzip_reconstructions_do_not_overlap(tmp_path):
     kwargs["resume"] = False
     client._download_gzip_artifacts("job-1", str(full_dir), **kwargs)
     assert not (full_dir / ".stdout.download.lock").exists()
+
+
+def test_gzip_resume_lock_serializes_processes(tmp_path):
+    script = r"""
+import re
+import sys
+import time
+from cortex_training.client import CortexTrainingClient
+
+class SlowClient(CortexTrainingClient):
+    def _reconstruct_gzip_artifacts(self, *_args, **_kwargs):
+        with open(sys.argv[2], "a", encoding="utf-8") as handle:
+            handle.write("start\n")
+        time.sleep(0.2)
+        with open(sys.argv[2], "a", encoding="utf-8") as handle:
+            handle.write("end\n")
+        return []
+
+client = SlowClient(
+    base_url="https://test.snowflakecomputing.com",
+    database="DB",
+    schema="PUBLIC",
+)
+client._download_gzip_artifacts(
+    "job-1",
+    sys.argv[1],
+    artifact_name="stdout",
+    chunk_pattern=re.compile("x"),
+    destination_name="stdout.log",
+    temporary_prefix=".stdout-",
+    resume=True,
+)
+"""
+    marker = tmp_path / "order.txt"
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", script, str(tmp_path), str(marker)]
+        )
+        for _ in range(2)
+    ]
+    assert [process.wait(timeout=5) for process in processes] == [0, 0]
+    assert marker.read_text(encoding="utf-8").splitlines() == [
+        "start",
+        "end",
+        "start",
+        "end",
+    ]
 
 
 def test_resume_rebuilds_when_file_was_replaced_before_manifest(tmp_path):

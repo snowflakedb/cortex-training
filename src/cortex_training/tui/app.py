@@ -400,7 +400,7 @@ class LogScreen(Screen):
         if not self._paused:
             pending = self._pending_stage
             self._pending_stage = None
-            if pending:
+            if pending is not None:
                 self._apply_stage_lines(pending)
             if self._logview is not None:
                 self._logview.scroll_end(animate=False)
@@ -599,9 +599,10 @@ class LogScreen(Screen):
             # so high-velocity logs don't saturate the UI thread per line.
             saw_live = False
             next_status_check = time.monotonic() + self._STAGE_REFRESH_SECONDS
+            ui_alive = True
 
             def job_still_active() -> bool:
-                nonlocal next_status_check
+                nonlocal next_status_check, ui_alive
                 now = time.monotonic()
                 if now < next_status_check:
                     return True
@@ -616,7 +617,7 @@ class LogScreen(Screen):
                 self._job_status = status
                 if "reason" in job:
                     self._job_reason = job.get("reason")
-                self._post(self._update_subtitle)
+                ui_alive = self._post(self._update_subtitle)
                 return False
 
             for kind, entries in cached_log_pages(
@@ -654,6 +655,7 @@ class LogScreen(Screen):
                     return
             if (
                 not worker.is_cancelled
+                and ui_alive
                 and self._is_current(sub_job_id, gen)
                 and not is_active_status(self._job_status)
             ):
@@ -714,13 +716,10 @@ class LogScreen(Screen):
 
     def _paint_cache(self, sub_job_id: str, gen: int) -> bool:
         """Append the local tail cache without clearing what is already on screen."""
-        lines = self._cache_lines(sub_job_id)
-        if not lines:
+        has_cache, lines = self._cache_snapshot(sub_job_id)
+        if not has_cache:
             return True
         return self._post(self._append_if_current, lines, sub_job_id, gen)
-
-    def _cache_lines(self, sub_job_id: str) -> list[str]:
-        return self._cache_snapshot(sub_job_id)[1]
 
     def _cache_snapshot(self, sub_job_id: str) -> tuple[bool, list[str]]:
         entries = self._cache.load_entries(sub_job_id, limit=2000)
@@ -734,6 +733,7 @@ class LogScreen(Screen):
     def _append_if_current(self, lines: list[str], source_id: str, gen: int) -> None:
         if not self._is_current(source_id, gen):
             return
+        self._painted_snapshot = list(lines)
         self._has_body = True
         self._write_lines(lines)
 
@@ -752,7 +752,7 @@ class LogScreen(Screen):
             if worker.is_cancelled or not self._is_current(sub_job_id, gen):
                 return
             if snapshot is None or not snapshot[0]:
-                if not self._post(self._stage_tick_if_current, sub_job_id, gen):
+                if not self._post(self._note_if_pane_empty, sub_job_id, gen):
                     return
                 continue
             lines = snapshot[1]
@@ -771,11 +771,6 @@ class LogScreen(Screen):
             step = min(0.05, remaining)
             time.sleep(step)
             remaining -= step
-
-    def _stage_tick_if_current(self, source_id: str, gen: int) -> None:
-        """UI-thread liveness probe for a watcher with no console to paint."""
-        if not self._is_current(source_id, gen):
-            return
 
     def _adopt_stage(self, sub_job_id: str, worker, gen: int, error_once: list[bool]) -> bool:
         """Replace the pane only when the persisted console has lines to show."""
@@ -798,7 +793,7 @@ class LogScreen(Screen):
         self,
         sub_job_id: str,
         *,
-        error_once: list[bool] | None = None,
+        error_once: list[bool],
     ):
         """Run one resume download and return visible lines."""
         completed = queue.Queue(maxsize=1)
@@ -870,10 +865,7 @@ class LogScreen(Screen):
             self._stage_attempted.add(sub_job_id)
             pending = sub_job_id in self._pending_refilter
         if pending:
-            self._post(self._apply_pending_refilter, sub_job_id)
-
-    def _apply_pending_refilter(self, sub_job_id: str) -> None:
-        self._start_pending_refilter(sub_job_id)
+            self._post(self._start_pending_refilter, sub_job_id)
 
     def _start_pending_refilter(self, sub_job_id: str) -> None:
         with self._stage_state_lock:
@@ -951,18 +943,17 @@ class LogScreen(Screen):
     def _record_stage_error(
         self,
         sub_job_id: str,
-        error_once: list[bool] | None,
-        trace: str | None = None,
+        error_once: list[bool],
+        trace: str,
     ) -> None:
-        if error_once is not None:
-            if error_once[0]:
-                return
-            error_once[0] = True
+        if error_once[0]:
+            return
+        error_once[0] = True
         try:
             with open(os.path.expanduser(_ERROR_LOG), "a", encoding="utf-8") as handle:
                 handle.write(
                     f"saved log {sub_job_id} failed:\n"
-                    f"{trace if trace is not None else traceback.format_exc()}\n"
+                    f"{trace}\n"
                 )
         except Exception:  # noqa: BLE001
             pass
@@ -1049,6 +1040,9 @@ class LogScreen(Screen):
             or self._tail_gen != tail_gen
         ):
             return
+        if self._paused:
+            self._pending_stage = list(lines)
+            return
         self._painted_snapshot = list(lines)
         self._has_body = bool(lines)
         self._shown_lines = []
@@ -1060,6 +1054,7 @@ class LogScreen(Screen):
         if not self._is_current(source_id, gen) or self._has_body:
             return
         self._write_line("No log output is available.")
+        self._has_body = True
 
     def _content_width(self) -> int:
         """Usable text columns of the log pane (accounts for padding/scrollbar)."""
