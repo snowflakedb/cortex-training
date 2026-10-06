@@ -536,8 +536,7 @@ which returns a list of `{sub_job_id, filename, artifact_uri, content}` dicts.
 
 ### Download Persisted Stdout
 
-Reconstruct each sub-job's persisted stdout/stderr chunks into
-`<output_dir>/<sub_job_id>/stdout.log`:
+Save each sub-job's console output as `<output_dir>/<sub_job_id>/stdout.log`:
 
 ```bash
 cortex-training download-log JOB_ID --log-type stdout --output-dir /path/to/logs
@@ -545,11 +544,8 @@ cortex-training download-log JOB_ID --log-type stdout --output-dir /path/to/logs
 ```
 
 The current working directory is used when `--output-dir` is omitted.
-A full download rewrites `stdout.log` and `stdout.log.manifest.json` beside it
-(the merged object names and the committed byte length). `--resume` lists every
-sealed chunk and downloads only names missing from that manifest, appending
-them. `--resume` with the default execution log type is an error. Chunks sealed
-in the same second are appended in the order they are first seen.
+`--resume` continues a download already saved in that directory and fetches
+only output that is not there yet. It applies to stdout, not execution logs.
 
 ### Download GPU Metrics
 
@@ -561,10 +557,8 @@ cortex-training download-metrics JOB_ID --output-dir /path/to/metrics
 cortex-training download-metrics JOB_ID --output-dir /path/to/metrics --resume
 ```
 
-The command prints the saved path, chunk count, and first/last logical artifact
-URIs for each reconstructed file. `--resume` uses `gpu.jsonl.manifest.json`
-the same way stdout resume uses its manifest: only chunks whose names are
-absent are downloaded and appended.
+The command prints where each file was saved. `--resume` continues a download
+already saved in that directory and fetches only metrics that are not there yet.
 
 ### Log TUI
 
@@ -606,10 +600,9 @@ Logs are cached locally so reopening a job replays instantly without
 re-fetching from the server — under `~/.cache/cortex-training/` (or
 `$XDG_CACHE_HOME`), overridable with `CORTEX_TRAINING_TUI_CACHE_DIR`.
 
-When the job is already finished, including cancelled, or the live tail fails
-after a refresh shows a finished status, the lines already on screen stay
-until the persisted console has lines of its own. The pane is then replaced
-with that file. A stream error while the job is still running stays an error.
+When a job finishes or is cancelled, the log view keeps showing output. If the
+live stream stops, the same view fills in from the saved console. A stream
+error while the job is still running stays an error.
 
 The TUI also writes two files into your home directory: saved logs from the `s`
 key (`~/cortex-training-<job8>-<source>.log`, where `<job8>` is the first eight

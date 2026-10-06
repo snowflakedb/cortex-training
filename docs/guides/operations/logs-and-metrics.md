@@ -13,8 +13,8 @@ cortex-training download-log JOB_ID --log-type stdout --output-dir /path/to/logs
 cortex-training download-log JOB_ID --log-type stdout --output-dir /path/to/logs --resume
 ```
 
-`--resume` appends sealed chunks that are not already in `stdout.log.manifest.json`.
-It applies to stdout, not execution logs.
+`--resume` continues a download already in that directory and fetches only what
+is new. It applies to stdout, not execution logs.
 
 Download reconstructed GPU metrics:
 

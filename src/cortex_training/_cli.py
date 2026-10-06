@@ -374,8 +374,8 @@ def build_parser(
         "--resume",
         action="store_true",
         help=(
-            "With --log-type stdout, download only sealed chunks that are not "
-            "already recorded in the manifest beside stdout.log."
+            "Continue an earlier stdout download in the output directory and "
+            "fetch only output that is not already saved."
         ),
     )
 
@@ -396,8 +396,8 @@ def build_parser(
         "--resume",
         action="store_true",
         help=(
-            "Download only metric chunks that are not already recorded in "
-            "the manifest beside gpu.jsonl."
+            "Continue an earlier metrics download in the output directory and "
+            "fetch only metrics that are not already saved."
         ),
     )
 
