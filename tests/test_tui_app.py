@@ -21,6 +21,7 @@ import glob
 import os
 import re
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -846,7 +847,7 @@ async def _run_refilter_keeps_saved_console(tmp_path):
         screen.workers.cancel_all()
         screen._stage_paths.clear()
         screen._showing_stage = False
-        screen._stage_fetching.add("7:training:0")
+        screen._stage_fetching["7:training:0"] = 1
         screen._filter = "typed during first download"
         screen._refilter()
         await pilot.pause(0.05)
@@ -870,6 +871,87 @@ async def _run_refilter_keeps_saved_console(tmp_path):
 def test_refilter_keeps_saved_console(tmp_path, monkeypatch):
     monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
     asyncio.run(_run_refilter_keeps_saved_console(tmp_path))
+
+
+async def _run_filter_during_first_missing_stage():
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+    c = _client()
+    c.get_job.return_value = {
+        "status": "CANCELLED",
+        "sub_jobs": [{"sub_job_id": "7:training:0", "job_type": "training"}],
+    }
+
+    def download(*_args, **_kwargs):
+        calls.append(1)
+        started.set()
+        assert release.wait(2)
+        return []
+
+    c.download_stdout_logs.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ready = await _wait(
+            pilot,
+            app,
+            lambda: isinstance(app.screen, LogScreen)
+            and started.is_set()
+            and "cached keep" in app.screen._shown_lines,
+        )
+        assert ready, "first saved-console download did not start"
+        screen = app.screen
+        screen._filter = "keep"
+        screen._update_subtitle()
+        screen._refilter()
+        release.set()
+        filtered = await _wait(
+            pilot, app, lambda: screen._shown_lines == ["cached keep"]
+        )
+        assert filtered, "latest filter was not applied after the missing stage result"
+        assert calls == [1]
+        await _settle(app, pilot)
+
+
+def test_filter_during_first_missing_stage(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    from cortex_training.tui.log_cache import LogCache
+
+    LogCache("7").append_entries(
+        "7:training:0",
+        [{"_raw": "cached keep"}, {"_raw": "cached drop"}],
+    )
+    asyncio.run(_run_filter_during_first_missing_stage())
+
+
+async def _run_exit_does_not_wait_for_stage_download(started, release):
+    c = _client()
+    c.get_job.return_value = {
+        "status": "CANCELLED",
+        "sub_jobs": [{"sub_job_id": "7:training:0", "job_type": "training"}],
+    }
+
+    def download(*_args, **_kwargs):
+        started.set()
+        release.wait(2)
+        return []
+
+    c.download_stdout_logs.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ready = await _wait(pilot, app, started.is_set)
+        assert ready, "saved-console download did not start"
+
+
+def test_exit_does_not_wait_for_stage_download(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    started = threading.Event()
+    release = threading.Event()
+    before = time.monotonic()
+    asyncio.run(_run_exit_does_not_wait_for_stage_download(started, release))
+    elapsed = time.monotonic() - before
+    release.set()
+    assert elapsed < 1.5
 
 
 async def _run_save_exports_console_on_screen():

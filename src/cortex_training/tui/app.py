@@ -27,7 +27,9 @@ never mutates job state.
 from __future__ import annotations
 
 import os
+import queue
 import tempfile
+import threading
 import time
 import traceback
 
@@ -271,7 +273,8 @@ class LogScreen(Screen):
         self._stage_temp = tempfile.TemporaryDirectory(prefix="cortex-training-stage-")
         self._stage_paths: dict[str, str] = {}
         self._stage_attempted: set[str] = set()
-        self._stage_fetching: set[str] = set()
+        self._stage_fetching: dict[str, int] = {}
+        self._pending_refilter: set[str] = set()
         self._source_by_item: dict[str, str] = {}
         self._logview: Log | None = None
         self._filter = ""  # grep substring for the log pane
@@ -410,7 +413,8 @@ class LogScreen(Screen):
         if not is_active_status(self._job_status):
             # The first download filters with the latest UI state when it
             # finishes. Once its local file exists, refilter that copy.
-            if source in self._stage_fetching:
+            if self._stage_fetching.get(source, 0):
+                self._pending_refilter.add(source)
                 return
             if (
                 source not in self._stage_paths
@@ -751,19 +755,24 @@ class LogScreen(Screen):
         error_once: list[bool] | None = None,
     ):
         """Run one resume download and return visible lines."""
-        lines = None
-        self._stage_fetching.add(sub_job_id)
-        try:
+        completed = queue.Queue(maxsize=1)
+        self._stage_fetching[sub_job_id] = (
+            self._stage_fetching.get(sub_job_id, 0) + 1
+        )
+        client = self._client
+        job_id = self._job_id
+        output_dir = self._stage_temp.name
+
+        def download() -> None:
             try:
-                results = self._client.download_stdout_logs(
-                    self._job_id,
-                    self._stage_temp.name,
+                results = client.download_stdout_logs(
+                    job_id,
+                    output_dir,
                     resume=True,
                 )
             except Exception:  # noqa: BLE001 - keep the pane; record the traceback
-                self._record_stage_error(sub_job_id, error_once)
-                return None
-            if isinstance(results, list):
+                completed.put((None, traceback.format_exc()))
+            else:
                 match = next(
                     (
                         row
@@ -776,11 +785,44 @@ class LogScreen(Screen):
                 path = "" if match is None else (match.get("saved_path") or "")
                 if path:
                     self._stage_paths[sub_job_id] = path
-                    lines = self._read_stage_lines(sub_job_id)
-            return lines
-        finally:
-            self._stage_attempted.add(sub_job_id)
-            self._stage_fetching.discard(sub_job_id)
+                completed.put((path, None))
+            finally:
+                self._finish_stage_fetch(sub_job_id)
+
+        threading.Thread(target=download, daemon=True).start()
+        worker = get_current_worker()
+        while not worker.is_cancelled:
+            try:
+                path, error = completed.get(timeout=0.05)
+                break
+            except queue.Empty:
+                continue
+        else:
+            return None
+        if error:
+            self._record_stage_error(sub_job_id, error_once, error)
+            return None
+        return self._read_stage_lines(sub_job_id) if path else None
+
+    def _finish_stage_fetch(self, sub_job_id: str) -> None:
+        count = self._stage_fetching.get(sub_job_id, 0) - 1
+        if count > 0:
+            self._stage_fetching[sub_job_id] = count
+            return
+        self._stage_fetching.pop(sub_job_id, None)
+        self._stage_attempted.add(sub_job_id)
+        if sub_job_id in self._pending_refilter:
+            self._post(self._apply_pending_refilter, sub_job_id)
+
+    def _apply_pending_refilter(self, sub_job_id: str) -> None:
+        if sub_job_id not in self._pending_refilter:
+            return
+        self._pending_refilter.discard(sub_job_id)
+        if (
+            self._current_source == sub_job_id
+            and not is_active_status(self._job_status)
+        ):
+            self._start_tail(sub_job_id, preserve=True)
 
     def _read_stage_lines(self, sub_job_id: str) -> list[str] | None:
         path = self._stage_paths.get(sub_job_id)
@@ -794,14 +836,22 @@ class LogScreen(Screen):
         ]
         return visible or None
 
-    def _record_stage_error(self, sub_job_id: str, error_once: list[bool] | None) -> None:
+    def _record_stage_error(
+        self,
+        sub_job_id: str,
+        error_once: list[bool] | None,
+        trace: str | None = None,
+    ) -> None:
         if error_once is not None:
             if error_once[0]:
                 return
             error_once[0] = True
         try:
             with open(os.path.expanduser(_ERROR_LOG), "a", encoding="utf-8") as handle:
-                handle.write(f"stage log {sub_job_id} failed:\n{traceback.format_exc()}\n")
+                handle.write(
+                    f"stage log {sub_job_id} failed:\n"
+                    f"{trace if trace is not None else traceback.format_exc()}\n"
+                )
         except Exception:  # noqa: BLE001
             pass
 
