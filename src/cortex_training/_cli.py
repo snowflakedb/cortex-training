@@ -370,6 +370,15 @@ def build_parser(
             "Defaults to the current working directory."
         ),
     )
+    download_log.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Continue an earlier stdout download in the output directory and "
+            "fetch only output that is not already saved. Two downloads of the "
+            "same directory at once are unsupported."
+        ),
+    )
 
     download_metrics = subparsers.add_parser(
         "download-metrics",
@@ -382,6 +391,15 @@ def build_parser(
         help=(
             "Directory to write <sub_job_id>/gpu.jsonl files. Created if "
             "missing. Defaults to the current working directory."
+        ),
+    )
+    download_metrics.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Continue an earlier metrics download in the output directory and "
+            "fetch only metrics that are not already saved. Two downloads of "
+            "the same directory at once are unsupported."
         ),
     )
 
@@ -982,7 +1000,7 @@ def _cmd_weight_sync(args: argparse.Namespace, client, stdout: TextIO) -> int:
 def _cmd_download_log(args: argparse.Namespace, client, stdout: TextIO) -> int:
     out_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.cwd()
     if args.log_type == "stdout":
-        logs = client.download_stdout_logs(args.job_id, out_dir)
+        logs = client.download_stdout_logs(args.job_id, out_dir, resume=args.resume)
         _print_json(
             {"job_id": args.job_id, "logs": logs},
             stdout,
@@ -1012,7 +1030,7 @@ def _cmd_download_metrics(
     args: argparse.Namespace, client, stdout: TextIO
 ) -> int:
     out_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.cwd()
-    metrics = client.download_metrics(args.job_id, out_dir)
+    metrics = client.download_metrics(args.job_id, out_dir, resume=args.resume)
     _print_json(
         {"job_id": args.job_id, "metrics": metrics},
         stdout,
@@ -1032,6 +1050,9 @@ def _run(
 
     if args.command == "submit" and args.dry_run:
         return _cmd_submit(args, None, stdout, stdin)
+
+    if args.command == "download-log" and args.resume and args.log_type != "stdout":
+        raise ValueError("--resume applies to --log-type stdout, not execution logs")
 
     client = client_factory(args)
     if args.command == "submit":

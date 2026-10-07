@@ -191,9 +191,10 @@ class FakeClient:
             },
         ]
 
-    def download_stdout_logs(self, job_id, output_dir):
+    def download_stdout_logs(self, job_id, output_dir, *, resume=False):
         self.stdout_log_job_id = job_id
         self.stdout_log_output_dir = output_dir
+        self.stdout_resume = resume
         path = output_dir / f"{job_id}:training:0" / "stdout.log"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("console\n", encoding="utf-8")
@@ -208,9 +209,10 @@ class FakeClient:
             }
         ]
 
-    def download_metrics(self, job_id, output_dir):
+    def download_metrics(self, job_id, output_dir, *, resume=False):
         self.metrics_job_id = job_id
         self.metrics_output_dir = output_dir
+        self.metrics_resume = resume
         path = output_dir / f"{job_id}:training:0" / "gpu.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('{"gpu_utilization":0.5}\n', encoding="utf-8")
@@ -1273,6 +1275,51 @@ def test_download_log_stdout_routes_to_reconstruction(tmp_path):
     assert client.stdout_log_output_dir == tmp_path
     assert (tmp_path / "job-1:training:0" / "stdout.log").read_text() == "console\n"
     assert json.loads(stdout.getvalue())["logs"][0]["filename"] == "stdout.log"
+
+
+def test_download_log_resume_reaches_stdout_download(tmp_path):
+    stdout = io.StringIO()
+    client = FakeClient()
+
+    rc = cli.main(
+        _base_args()
+        + ["download-log", "job-1", "--log-type", "stdout", "--resume", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: client,
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert client.stdout_resume is True
+
+
+def test_download_log_resume_rejects_execution_logs(tmp_path):
+    stderr = io.StringIO()
+
+    def client_factory(_args):
+        raise AssertionError("client constructed before the --resume check")
+
+    rc = cli.main(
+        _base_args() + ["download-log", "job-1", "--resume", "--output-dir", str(tmp_path)],
+        client_factory=client_factory,
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert "--resume applies to --log-type stdout" in stderr.getvalue()
+
+
+def test_download_metrics_resume_reaches_client(tmp_path):
+    client = FakeClient()
+
+    rc = cli.main(
+        _base_args() + ["download-metrics", "job-1", "--resume", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: client,
+        stdout=io.StringIO(),
+    )
+
+    assert rc == 0
+    assert client.metrics_resume is True
 
 
 def test_download_metrics_defaults_to_cwd(tmp_path, monkeypatch):

@@ -3679,6 +3679,203 @@ class TestExecutionLogDownload:
         assert not any(command.startswith("GET ") for command in connection.commands)
         assert connection.closed
 
+    def _gzip_download(self, monkeypatch, tmp_path, artifact_name, listed, bodies):
+        c = _make_client()
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        root = f"_{artifact_name}"
+        connection = self.FakeArtifactConnection(
+            {
+                run_uri + root + "/": [(f"/versions/RUN_ABC/{path}",) for path in listed],
+                run_uri + "checkpoints/" + root + "/": [],
+            },
+            {run_uri + path: gzip.compress(body) for path, body in bodies.items()},
+        )
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", lambda: connection)
+        return c, connection, run_uri
+
+    @pytest.mark.parametrize(
+        ("artifact_name", "chunk_name", "destination_name", "method_name"),
+        [
+            ("stdout", "console", "stdout.log", "download_stdout_logs"),
+            ("metrics", "gpu", "gpu.jsonl", "download_metrics"),
+        ],
+    )
+    def test_download_resume_appends_suffix_and_writes_manifest(
+        self, artifact_name, chunk_name, destination_name, method_name, tmp_path, monkeypatch
+    ):
+        root = f"_{artifact_name}"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/{chunk_name}.20260904-120001.first.gz"
+        later = f"{root}/{sub}/{chunk_name}.20260904-120002.zulu.gz"
+        c, connection, run_uri = self._gzip_download(
+            monkeypatch, tmp_path, artifact_name, [first], {first: b"first\n"}
+        )
+        download = getattr(c, method_name)
+        download("job-1", tmp_path)
+        destination = tmp_path / sub / destination_name
+        manifest = destination.with_name("." + destination.name + ".manifest.json")
+        assert json.loads(manifest.read_text())["names"] == [first]
+        gets_before = [cmd for cmd in connection.commands if cmd.startswith("GET ")]
+        connection.list_rows[run_uri + root + "/"] = [
+            (f"/versions/RUN_ABC/{first}",),
+            (f"/versions/RUN_ABC/{later}",),
+        ]
+        connection.content_by_uri[run_uri + later] = gzip.compress(b"second\n")
+        result = download("job-1", tmp_path, resume=True)
+        new_gets = [cmd for cmd in connection.commands if cmd.startswith("GET ")][len(gets_before) :]
+        assert len(new_gets) == 1
+        assert later in new_gets[0]
+        assert destination.read_bytes() == b"first\nsecond\n"
+        assert result[0]["chunk_count"] == 2
+        assert result[0]["first_artifact_uri"] == run_uri + first
+        assert result[0]["last_artifact_uri"] == run_uri + later
+
+    @pytest.mark.parametrize(
+        ("artifact_name", "chunk_name", "destination_name", "method_name"),
+        [
+            ("stdout", "console", "stdout.log", "download_stdout_logs"),
+            ("metrics", "gpu", "gpu.jsonl", "download_metrics"),
+        ],
+    )
+    def test_download_resume_rebuilds_when_new_name_sorts_earlier(
+        self, artifact_name, chunk_name, destination_name, method_name, tmp_path, monkeypatch
+    ):
+        root = f"_{artifact_name}"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/{chunk_name}.20260904-120001.first.gz"
+        zulu = f"{root}/{sub}/{chunk_name}.20260904-120002.zulu.gz"
+        alpha = f"{root}/{sub}/{chunk_name}.20260904-120002.alpha.gz"
+        c, connection, run_uri = self._gzip_download(
+            monkeypatch,
+            tmp_path,
+            artifact_name,
+            [first, zulu],
+            {first: b"first\n", zulu: b"third\n"},
+        )
+        download = getattr(c, method_name)
+        download("job-1", tmp_path)
+        connection.list_rows[run_uri + root + "/"].append((f"/versions/RUN_ABC/{alpha}",))
+        connection.content_by_uri[run_uri + alpha] = gzip.compress(b"second\n")
+        download("job-1", tmp_path, resume=True)
+        destination = tmp_path / sub / destination_name
+        assert destination.read_bytes() == b"first\nsecond\nthird\n"
+
+    @pytest.mark.parametrize(
+        ("artifact_name", "chunk_name", "destination_name", "method_name"),
+        [
+            ("stdout", "console", "stdout.log", "download_stdout_logs"),
+            ("metrics", "gpu", "gpu.jsonl", "download_metrics"),
+        ],
+    )
+    def test_download_resume_truncates_torn_tail(
+        self, artifact_name, chunk_name, destination_name, method_name, tmp_path, monkeypatch
+    ):
+        root = f"_{artifact_name}"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/{chunk_name}.20260904-120001.first.gz"
+        c, connection, _run_uri = self._gzip_download(
+            monkeypatch, tmp_path, artifact_name, [first], {first: b"first\n"}
+        )
+        download = getattr(c, method_name)
+        download("job-1", tmp_path)
+        destination = tmp_path / sub / destination_name
+        committed = destination.read_bytes()
+        destination.write_bytes(committed + b"TORN")
+        gets_before = [cmd for cmd in connection.commands if cmd.startswith("GET ")]
+        download("job-1", tmp_path, resume=True)
+        assert destination.read_bytes() == committed
+        assert [cmd for cmd in connection.commands if cmd.startswith("GET ")] == gets_before
+
+    @pytest.mark.parametrize("manifest_setup", ["missing", "malformed", "version", "short"])
+    def test_download_resume_unusable_manifest_rebuilds(self, manifest_setup, tmp_path, monkeypatch):
+        root = "_stdout"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/console.20260904-120001.first.gz"
+        c, _connection, _run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "stdout", [first], {first: b"first\n"}
+        )
+        c.download_stdout_logs("job-1", tmp_path)
+        destination = tmp_path / sub / "stdout.log"
+        manifest = destination.with_name(".stdout.log.manifest.json")
+        if manifest_setup == "missing":
+            manifest.unlink()
+        elif manifest_setup == "malformed":
+            manifest.write_text("not-json", encoding="utf-8")
+        elif manifest_setup == "version":
+            doc = json.loads(manifest.read_text())
+            doc["version"] = 2
+            manifest.write_text(json.dumps(doc), encoding="utf-8")
+        else:
+            destination.write_bytes(b"x")
+        c.download_stdout_logs("job-1", tmp_path, resume=True)
+        assert destination.read_bytes() == b"first\n"
+        assert json.loads(manifest.read_text())["version"] == 1
+
+    def test_download_resume_rebuilds_when_manifest_was_removed(self, tmp_path, monkeypatch):
+        root = "_stdout"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/console.20260904-120001.first.gz"
+        c, _connection, _run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "stdout", [first], {first: b"first\n"}
+        )
+        c.download_stdout_logs("job-1", tmp_path)
+        destination = tmp_path / sub / "stdout.log"
+        destination.with_name(".stdout.log.manifest.json").unlink()
+        destination.write_bytes(b"replaced\n")
+        c.download_stdout_logs("job-1", tmp_path, resume=True)
+        assert destination.read_bytes() == b"first\n"
+
+    def test_download_resume_failed_chunk_keeps_prefix(self, tmp_path, monkeypatch):
+        root = "_stdout"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/console.20260904-120001.first.gz"
+        bad = f"{root}/{sub}/console.20260904-120002.bad.gz"
+        c, connection, run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "stdout", [first], {first: b"first\n"}
+        )
+        c.download_stdout_logs("job-1", tmp_path)
+        destination = tmp_path / sub / "stdout.log"
+        connection.list_rows[run_uri + root + "/"].append((f"/versions/RUN_ABC/{bad}",))
+        connection.content_by_uri[run_uri + bad] = b"not gzip"
+        with pytest.raises(gzip.BadGzipFile):
+            c.download_stdout_logs("job-1", tmp_path, resume=True)
+        assert destination.read_bytes() == b"first\n"
+        manifest = json.loads(destination.with_name(".stdout.log.manifest.json").read_text())
+        assert manifest["names"] == [first]
+
+    def test_download_resume_keeps_committed_sub_job_when_later_one_fails(
+        self, tmp_path, monkeypatch
+    ):
+        c = _make_client()
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        first_sub = "job-1:training:0"
+        second_sub = "job-1:training:1"
+        good = f"_stdout/{first_sub}/console.20260904-120001.first.gz"
+        bad = f"_stdout/{second_sub}/console.20260904-120001.bad.gz"
+        connection = self.FakeArtifactConnection(
+            {
+                run_uri + "_stdout/": [
+                    (f"/versions/RUN_ABC/{good}",),
+                    (f"/versions/RUN_ABC/{bad}",),
+                ],
+                run_uri + "checkpoints/_stdout/": [],
+            },
+            {run_uri + good: gzip.compress(b"ok\n"), run_uri + bad: b"not gzip"},
+        )
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", lambda: connection)
+        with pytest.raises(gzip.BadGzipFile):
+            c.download_stdout_logs("job-1", tmp_path)
+        committed = tmp_path / first_sub / "stdout.log"
+        assert committed.read_bytes() == b"ok\n"
+        connection.content_by_uri[run_uri + bad] = gzip.compress(b"later\n")
+        gets_before = [cmd for cmd in connection.commands if cmd.startswith("GET ") and good in cmd]
+        c.download_stdout_logs("job-1", tmp_path, resume=True)
+        gets_after = [cmd for cmd in connection.commands if cmd.startswith("GET ") and good in cmd]
+        assert gets_after == gets_before
+        assert (tmp_path / second_sub / "stdout.log").read_bytes() == b"later\n"
+
     def test_fetch_execution_logs_errors_when_experiment_run_missing_fields(self):
         c = _make_client(get_json={"experiment_name": "DB.SCH.EXP"})
         with pytest.raises(ValueError, match="experiment_run_name"):
