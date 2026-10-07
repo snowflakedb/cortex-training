@@ -688,12 +688,14 @@ def sync_weights(
     client: CortexTrainingClient,
     job_id: str,
     weight_format: str | None = None,
+    bucket_size: int | None = None,
 ) -> dict:
     request_id = client.weight_sync(
         job_id,
         source_sub_job_id=f"{job_id}:training:0",
         target_sub_job_ids=[f"{job_id}:sampling:0"],
         weight_format=weight_format,
+        bucket_size=bucket_size,
     )
     return client.poll_request(job_id, request_id)
 
