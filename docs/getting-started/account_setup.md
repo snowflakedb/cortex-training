@@ -43,22 +43,7 @@ Share these three values with the Snowflake team. They will:
 You cannot proceed until this is complete. Once the team confirms enablement,
 continue to the next step.
 
-## Step 3: Create the Database
-
-The connection config references a database that must exist in your Snowflake
-account — the client will fail with a "database not found" error otherwise.
-This database is only used for connection routing, not for storing training
-data. New accounts do not have `CORTEX_TRAINING_DB` by default, so create it
-in Snowsight:
-
-```sql
-CREATE DATABASE IF NOT EXISTS CORTEX_TRAINING_DB;
-```
-
-You can use any database name, but it must match the `database` field in your
-connection config (configured in the next step).
-
-## Step 4: Authenticate
+## Step 3: Authenticate
 
 Generate a Programmatic Access Token (PAT) and configure your client connection.
 Follow the [authentication guide](authentication.md) to complete this step.
@@ -73,7 +58,7 @@ You should see your reserved GPU capacity listed. If you see zero capacity or
 an error, confirm with the Snowflake team that enablement and GPU reservation
 are complete.
 
-## Step 5: Install the Client and Recipe Dependencies
+## Step 4: Install the Client and Recipe Dependencies
 
 Requires Python 3.10 or later and [uv](https://docs.astral.sh/uv/) (or `pip`).
 
@@ -91,7 +76,7 @@ Install the recipe dependency — this is required to run any recipe:
 uv pip install 'tinker-cookbook @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
 ```
 
-## Step 6: Run Your First Training Job
+## Step 5: Run Your First Training Job
 
 The conversational SFT recipe fine-tunes Qwen3-8B on a one-example chat dataset
 ("Who trained you?" → "Snowflake AI Research"). Start with a short run:
@@ -116,7 +101,7 @@ What happens during this run:
 Watch for `train_nll` in the output — it should decrease, indicating the model
 is learning.
 
-## Step 7: Verify with Inference
+## Step 6: Verify with Inference
 
 The recipe prints a generate command after saving the checkpoint. Run it to
 confirm the model learned the expected answer:
@@ -133,7 +118,7 @@ python -m recipes.inference.generate \
 
 The answer should be `Snowflake AI Research`.
 
-## Step 8: Monitor and Manage Jobs
+## Step 7: Monitor and Manage Jobs
 
 Useful commands while jobs are running or after they complete:
 

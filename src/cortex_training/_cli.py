@@ -720,6 +720,13 @@ def _print_json(value: Any, stdout: TextIO, *, compact: bool) -> None:
     stdout.write("\n")
 
 
+def _request_sent_pat(response: Any) -> bool:
+    # Connection-profile requests carry a session token from a login that
+    # already accepted the PAT, so a 401 there is not a PAT problem.
+    headers = getattr(getattr(response, "request", None), "headers", None) or {}
+    return headers.get("X-Snowflake-Authorization-Token-Type") == "PROGRAMMATIC_ACCESS_TOKEN"
+
+
 def _format_error(exc: BaseException) -> str:
     response = getattr(exc, "response", None)
     if response is None:
@@ -735,6 +742,12 @@ def _format_error(exc: BaseException) -> str:
         if len(body) > 4000:
             body = body[:4000] + "...<truncated>"
         parts.append(f"response body: {body}")
+    if getattr(response, "status_code", None) == 401 and _request_sent_pat(response):
+        from cortex_training.snowflake_auth import credentials_rejected_hint
+
+        parts.append(
+            credentials_rejected_hint("Snowflake rejected your credentials (HTTP 401).")
+        )
     return "\n".join(parts)
 
 

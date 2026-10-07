@@ -215,5 +215,32 @@ def test_connector_error_names_profile_without_exposing_credentials() -> None:
     with pytest.raises(
         SnowflakeProfileError,
         match="could not open Snowflake connection 'training-profile'",
-    ):
+    ) as excinfo:
         SnowflakeProfileAuth("training-profile", connect_factory=connect)
+    assert "network policy" not in str(excinfo.value)
+
+
+class _ConnectorError(Exception):
+    def __init__(self, msg: str, errno: int | None = None) -> None:
+        super().__init__(msg)
+        self.errno = errno
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        _ConnectorError("394400 (08001): Failed to connect to DB.", errno=394400),
+        _ConnectorError("Programmatic access token is invalid."),
+    ],
+)
+def test_rejected_pat_error_points_to_network_policy(exc) -> None:
+    def connect(**_kwargs):
+        raise exc
+
+    with pytest.raises(SnowflakeProfileError) as excinfo:
+        SnowflakeProfileAuth("training-profile", connect_factory=connect)
+    message = str(excinfo.value)
+    assert "could not open Snowflake connection 'training-profile'" in message
+    assert "Snowflake rejected your programmatic access token (PAT)." in message
+    assert "Your user has no network policy." in message
+    assert "authentication.md#network-policy-requirement" in message
