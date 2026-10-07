@@ -50,7 +50,6 @@
           "fused_lm_head_token_chunk_size": "disabled",
           "moe_use_grouped_mm": true,
           "optimization_dtype": "bfloat16",
-          "reduce_dtype": "float32",
           "seq_len": 128
         },
         "train_batch_size": 8
