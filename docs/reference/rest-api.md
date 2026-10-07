@@ -238,8 +238,10 @@ pair with `CortexTrainingClient(request_timeout=...)`.
 The general request path retries connection/time-out failures and HTTP:
 
 ```text
-404, 409, 429, 500, 502, 503, 504
+307, 308, 404, 409, 429, 500, 502, 503, 504
 ```
+
+Redirects are never followed; a 307 or 308 is retried on the original URL.
 
 Capacity is the exception: it is attempted once with the shorter bounds
 documented in [section 5.4](#54-capacity---get-capacity).
@@ -252,7 +254,8 @@ ambiguous response does not accidentally create a second server-assigned job.
 ### 3.6 Errors
 
 Non-2xx responses are raised through `requests.Response.raise_for_status()`.
-Bodies may contain:
+Because that call ignores 3xx, any 3xx response is raised first as an
+`Unexpected redirect <status> for url: <url>` HTTP error. Bodies may contain:
 
 ```json
 {"message": "description", "code": 409}

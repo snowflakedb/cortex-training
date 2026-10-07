@@ -138,12 +138,14 @@ def _success_telemetry_enabled() -> bool:
 #   503 Service Unavailable - server temporarily overloaded or restarting
 #   504 Gateway Timeout     - upstream didn't respond in time
 #   409 Conflict            - the target zone is restarting
+#   307/308 Redirect        - a leaked internal redirect; retried on the original
+#                             URL, and `Location` is never followed.
 #   404 Not Found           - a just-created job may not be visible yet, so a
 #                             valid id can 404 briefly and succeed on retry.
 # Note the trade-off on 404: a *mistyped* job id is also retried (up to
 # `max_retries`, with backoff) before the error surfaces. Every other 4xx is
 # excluded because it signals a client/config error that won't fix itself.
-_TRANSIENT_STATUSES = {429, 500, 502, 503, 504, 404, 409}
+_TRANSIENT_STATUSES = {429, 500, 502, 503, 504, 404, 409, 307, 308}
 _SESSION_EXPIRED_CODES = frozenset({"390111", "390112", "390114"})
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {
@@ -203,7 +205,11 @@ def _validated_request_timeout(
 
 
 class _DefaultTimeoutSession(requests.Session):
-    """Apply a default timeout to every request that does not provide one."""
+    """Apply a default timeout to every request that does not provide one.
+
+    Redirects are never followed: a leaked internal redirect points at an
+    address the client cannot reach, so the original URL is retried instead.
+    """
 
     def __init__(self, default_timeout: tuple[float, float]):
         super().__init__()
@@ -215,6 +221,8 @@ class _DefaultTimeoutSession(requests.Session):
         timeout: Any = None,
         **kwargs: Any,
     ) -> requests.Response:  # type: ignore[override]
+        # Session.get() injects allow_redirects=True before it calls request().
+        kwargs["allow_redirects"] = False
         return super().request(
             *args,
             timeout=self.default_timeout if timeout is None else timeout,
@@ -1767,7 +1775,7 @@ class CortexTrainingClient:
                         status_int = None
                     outcome = (
                         "successful response"
-                        if status_int is not None and 200 <= status_int < 400
+                        if status_int is not None and 200 <= status_int < 300
                         else "failed response"
                     )
                     snowflake = (
@@ -1801,6 +1809,13 @@ class CortexTrainingClient:
                         f"Database '{self.database}' still not found after creation attempt. "
                         f"The database may already exist but your role lacks USAGE on it. "
                         f"Create it manually in Snowsight: CREATE DATABASE IF NOT EXISTS {self.database};"
+                    )
+                # requests.Response.raise_for_status() intentionally ignores 3xx.
+                if 300 <= resp.status_code < 400:
+                    raise requests.exceptions.HTTPError(
+                        f"Unexpected redirect {resp.status_code} for url: {url}",
+                        response=resp,
+                        request=getattr(resp, "request", None),
                     )
                 resp.raise_for_status()
                 return resp

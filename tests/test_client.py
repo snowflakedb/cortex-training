@@ -1705,6 +1705,75 @@ class TestCreateJob:
         assert c.create_job_from_body(body) == {"job_id": "srv"}
 
 
+# ─── CortexTrainingClient — transient HTTP retries ───────────────────────────
+
+
+class TestTransientHttpRetries:
+    def test_307_and_308_are_transient(self):
+        for status in (307, 308):
+            resp = _make_response(status_code=status)
+            exc = nc.requests.exceptions.HTTPError(response=resp)
+            assert nc._is_transient(exc)
+
+    def test_302_is_not_transient(self):
+        resp = _make_response(status_code=302)
+        exc = nc.requests.exceptions.HTTPError(response=resp)
+        assert not nc._is_transient(exc)
+
+    @pytest.mark.parametrize("caller_kwargs", [{}, {"allow_redirects": True}])
+    def test_session_does_not_follow_redirects(self, monkeypatch, caller_kwargs):
+        seen_kwargs = {}
+
+        def fake_request(_session, *_args, **kwargs):
+            seen_kwargs.update(kwargs)
+            return _make_response()
+
+        monkeypatch.setattr(nc.requests.Session, "request", fake_request)
+        session = nc._DefaultTimeoutSession((1.0, 1.0))
+
+        session.get("http://test.local/redirect", **caller_kwargs)
+
+        assert seen_kwargs["allow_redirects"] is False
+
+    def test_send_retries_308_against_original_url(self, monkeypatch):
+        from tenacity import wait_none
+
+        monkeypatch.setattr(
+            nc, "wait_exponential_jitter", lambda **_kwargs: wait_none()
+        )
+        c = _make_client()
+        c.max_retries = 1
+        leaked = nc.requests.Response()
+        leaked.status_code = 308
+        leaked.url = f"{c._prefix}/job-1/forward-backward"
+        leaked.headers["Location"] = "http://unroutable.invalid/forward-backward"
+        ok = _make_response({"job_id": "job-1", "status": "running"})
+        c._session.post.side_effect = [leaked, ok]
+
+        out = c._send("POST", leaked.url, data=b"payload")
+
+        assert out is ok
+        assert c._session.post.call_count == 2
+        urls = [call.args[0] for call in c._session.post.call_args_list]
+        assert urls == [leaked.url, leaked.url]
+
+    def test_send_rejects_non_transient_redirect_without_retry(self):
+        c = _make_client()
+        c.max_retries = 1
+        redirect = nc.requests.Response()
+        redirect.status_code = 302
+        redirect.url = f"{c._prefix}/job-1"
+        redirect.headers["Location"] = "http://example.test/elsewhere"
+        c._session.get.return_value = redirect
+
+        with pytest.raises(
+            nc.requests.exceptions.HTTPError, match="Unexpected redirect 302"
+        ):
+            c._send("GET", redirect.url)
+
+        c._session.get.assert_called_once_with(redirect.url)
+
+
 # ─── CortexTrainingClient — read & control endpoints ─────────────────────────
 
 
