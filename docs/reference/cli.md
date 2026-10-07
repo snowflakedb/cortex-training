@@ -487,9 +487,11 @@ cortex-training --job-id JOB_ID generate examples/api/generate.json
 
 The generate JSON contains `prompts`, optional `sampling_params`, and optional
 `routing_key` / `strict` fields. `sampling_params` may be one object applied to
-all prompts or a list of objects/nulls aligned with `prompts`. The CLI submits
-`generate` and polls the request by default. Set `"poll": false` to print only
-the submitted `request_id`.
+all prompts or a list of objects/nulls aligned with `prompts`. A flat list of
+integers such as `"prompts": [1, 2, 3]` is one pre-tokenized prompt, not three;
+use the nested form `[[1, 2], [3, 4]]` for a batch. The CLI submits `generate`
+and polls the request by default. Set `"poll": false` to print only the
+submitted `request_id`.
 
 ### Sync Training Weights
 
@@ -666,6 +668,10 @@ Snowflake profile and PAT clients. `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY`
 (truthy) also emits successful outcomes for essential operations; failures
 are emitted by default. See the [Python SDK reference](python-sdk.md#client-metrics).
 
+`CORTEX_TRAINING_DISABLE_TENSOR_PROMPTS` (truthy) sends pre-tokenized prompts
+as JSON lists inside the request frame instead of as tensors. The request body
+stays a DSSST1 frame either way.
+
 ### Troubleshooting
 
 If you see `provide --base-url for local/mock use, or both --host and --pat`,
@@ -676,6 +682,15 @@ If no legacy config or complete direct connection is present, the CLI falls
 back to the Snowflake Connector's configured default. If your profile is not
 named `default`, pass `--connection NAME` or set
 `SNOWFLAKE_DEFAULT_CONNECTION_NAME`.
+
+If Snowflake rejects your PAT, the CLI keeps the original error and adds next
+steps: `394400 (08001) ... Programmatic access token is invalid` from a
+connection profile, or a `401` on a request that sent the PAT directly
+(`config.json`, `--pat`, or `CORTEX_TRAINING_PAT`). The most common cause is a
+user with no network policy; see
+[Network policy requirement](../getting-started/authentication.md#network-policy-requirement).
+A `401` on a connection-profile request gets no hint, because the PAT was
+already accepted at login.
 
 If you see `Invalid URL ... No scheme supplied`, the config is using a bare
 Snowflake hostname as `base_url`. Use `host` for Snowflake PAT auth, or use a

@@ -112,12 +112,28 @@ supported`. The short alias `log_prob` is rejected the same way.
 | `forward_backward(job_id, data)` | `request_id` | `data` is a DSSST1 frame; always chunk-wrapped |
 | `step(job_id, learning_rate=None)` | `request_id` | Omitting the rate uses the job's optimizer setting |
 | `generate(job_id, prompts, sampling_params=None, routing_key=None, strict=None)` | `request_id` | Pre-tokenized prompts are length-checked client-side |
-| `generate_stream(...)` | response dict | UTF-8 JSON body; read progress with `get_request_status` |
+| `generate_stream(...)` | response dict | Same DSSST1 body encoding as `generate`, sent in one POST; read progress with `get_request_status` |
 | `weight_sync(job_id, source_sub_job_id, target_sub_job_ids, weight_format=None)` | `request_id` | `weight_format="lora"` syncs adapters only |
 | `forward(job_id, payload, ...)` | response dict | See the known limitation in [rest-api.md section 14](rest-api.md#14-known-limitations) |
 | `poll_request(job_id, request_id)` | result dict | Handles backoff, DSSST1 decoding and chunked results |
 | `get_request_status(job_id, request_id, max_events=None, cursor=None)` | status dict | |
 | `cancel_request(job_id, request_id, ...)` | response dict | |
+
+A training sub-job with router replay picks how forward/backward treats rows
+whose routing no sampling worker holds with `router_replay["mode"]` in the
+`extra_training` argument of `SubJobConfig.training_job(...)`, together with
+`"enabled": true`:
+
+- `"strict"` (default) fails the request.
+- `"best_effort"` routes those rows with the trainer's own MoE gate and adds
+  `router_replay/rows_*` and `router_replay/tokens_*` keys to the polled
+  result's `metrics`. With whole-block activation checkpointing it also needs
+  `ac_config.router_replay_recompute` left at its default `true`.
+
+The server rejects `"best_effort"` without `"enabled": true`, and any mode
+other than `"strict"` on a sampling sub-job. See
+[rest-api.md section 8.2](rest-api.md#82-trainingconfig) and
+[section 6.1](rest-api.md#61-forwardbackward---post-job_idforward-backward).
 
 ## Checkpoints
 

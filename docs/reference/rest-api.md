@@ -143,7 +143,7 @@ TLS verification is enabled unless `verify_ssl=False` is passed.
 | Control-plane calls, `step`, `save`, `load`, `operation` | `application/json` | JSON |
 | `forward-backward` | `application/octet-stream` | DSSST1 safetensors frame, optionally split into DSSST1 request chunks |
 | `generate` | `application/octet-stream` | DSSST1 safetensors frame, optionally split into DSSST1 request chunks |
-| `generate-stream` | `application/octet-stream` | JSON encoded as UTF-8 bytes |
+| `generate-stream` | `application/octet-stream` | DSSST1 safetensors frame, sent in one request and capped at 60 MiB |
 
 Raw `torch.save`/pickle is not the current binary protocol. See
 [section 9](#9-dssst1-binary-wire-protocol).
@@ -667,6 +667,23 @@ forward/backward response assembler intentionally returns
 `post_process_outputs` as an empty object; callers must not assume that
 `compute_logprobs` appears there.
 
+When the training sub-job sets `router_replay.mode = "best_effort"` (see
+[section 8.2](#82-trainingconfig)), `metrics` of a forward/backward request that
+carries router-replay ids also reports how the request's rows were routed. Each row is counted once, however rows are sharded across
+data-parallel and sequence-parallel ranks. A "fresh" row is one whose routing
+no sampling worker held, so the trainer's own MoE gate routed it.
+
+| Key | Meaning |
+|---|---|
+| `router_replay/rows_sent` | Rows in the request that carried a router-replay id |
+| `router_replay/rows_replayed` | Rows routed with the sampler's captured routing |
+| `router_replay/rows_fresh` | Rows routed by the trainer's own gate |
+| `router_replay/replayed_fraction` | `rows_replayed / rows_sent` (`0.0` for a request with no rows) |
+| `router_replay/tokens_replayed` | Valid tokens in replayed rows (attention-mask count; the padded length when the request has no attention mask) |
+| `router_replay/tokens_fresh` | Valid tokens in fresh rows (attention-mask count; the padded length when the request has no attention mask) |
+
+In the default `"strict"` mode these keys are absent.
+
 ### 6.2 Optimizer step - `POST /{job_id}/step`
 
 ```json
@@ -866,17 +883,29 @@ Logical request object inside the DSSST1 frame:
 
 Rules:
 
-- `prompts` is a list of string prompts and/or token-id lists. A single
-  tokenized prompt is `[[1, 2, 3]]`, not `[1, 2, 3]`.
+- `prompts` is a list of string prompts and/or token-id lists. A flat list of
+  integers such as `[1, 2, 3]`, and a bare 1-D tensor, are each read as one
+  pre-tokenized prompt rather than as a batch. For a batch of several prompts,
+  use the nested form `[[1, 2, 3], [4, 5]]`.
 - `sampling_params` may be one object or a list of objects/null values aligned
   with `prompts`.
 - `routing_key` may be one string or an aligned list of strings/null values.
 - `strict` controls strict routing-key affinity.
 
+Pre-tokenized prompts travel in the frame's tensor section as `int32` tensors,
+not as JSON numbers in the frame header. A token id that does not fit `int32`
+falls back to `int64` for that prompt, which only doubles its wire size. String
+prompts are not converted — the server tokenizes them. Setting
+`CORTEX_TRAINING_DISABLE_TENSOR_PROMPTS` to a truthy value puts the token ids
+back in the header as JSON lists; the request body is a DSSST1 frame either
+way.
+
 For pre-tokenized prompts, the client fetches and caches the sampling sub-job's
 `inference_config.max_seq_len`. It rejects a prompt when
 `len(prompt) >= max_seq_len`, preserving room for at least one output token.
-String prompts are left for the server tokenizer to validate.
+The check runs before the tensor conversion, so the environment variable above
+does not disable it. String prompts are left for the server tokenizer to
+validate.
 
 Generate uses the same DSSST1 response options as forward/backward, but unlike
 forward/backward it sends the frame unwrapped when it fits, and only splits it
@@ -903,11 +932,18 @@ converts tensor values under `results` back to Python lists.
 
 ### 6.7 Streaming generate - `POST /{job_id}/generate-stream`
 
-`generate_stream()` accepts the same logical fields as `generate()`, but its
-body is UTF-8 JSON under `application/octet-stream`, not DSSST1.
+`generate_stream()` accepts the same logical fields as `generate()` and encodes
+them into the same DSSST1 frame, including the `int32` tensor encoding of
+pre-tokenized prompts described in [section 6.6](#66-generate---post-job_idgenerate).
 
-The encoded body must not exceed 60 MiB. This path is not request-chunked by the
-client.
+Unlike `generate`, this path is not request-chunked: the client sends the frame
+in a single POST, and the encoded body must not exceed 60 MiB.
+
+**Breaking change.** `POST /{job_id}/generate-stream` no longer accepts a
+UTF-8 JSON body. There is no dual encoding and no negotiation — the frame is
+the only accepted request form. `CORTEX_TRAINING_DISABLE_TENSOR_PROMPTS`
+changes how prompts are encoded *inside* the frame; it does not turn the body
+back into JSON. The response is unchanged.
 
 Immediate response:
 
@@ -1293,6 +1329,26 @@ and these newer long-context/memory knobs:
   to disable). Omitted uses the server default.
 - `ac_config`: activation-checkpointing config, including CPU activation offload
   via `offload_config.enabled=true`. Offload requires `mode="full"`.
+- `router_replay`: `{"enabled", "max_cache_bytes", "mode"}`. `mode` is
+  `"strict"` (default) or `"best_effort"`; values other than `"strict"` and
+  `"best_effort"` are rejected. It applies to the training sub-job
+  only: `"best_effort"` with `enabled` `false`, or any `mode` other than
+  `"strict"` on a sampling sub-job, is rejected. `"strict"` fails a forward/backward
+  request when any of its rows has no routing held by a sampling worker (for
+  example, a row generated before a sampler restart); the request error is
+  `router_replay_preflight_failed` with `stage` `"receive"` and `reason`
+  `"receiver_error"`. `"best_effort"` routes such rows with the trainer's own MoE
+  gate, replays the others, and reports the split in the
+  `router_replay/rows_*` and `router_replay/tokens_*` metrics of
+  [section 6.1](#61-forwardbackward---post-job_idforward-backward). A model
+  whose MoE routers cannot route a row by their own gate, or that has no MoE
+  routers, rejects `"best_effort"` when the training sub-job starts. With whole-block activation
+  checkpointing, `"best_effort"` also requires `ac_config.router_replay_recompute`
+  (default `true`); a training sub-job with it disabled rejects `"best_effort"`
+  at startup. If the service does not yet support `"best_effort"`, router-replay
+  bootstrap fails with a `router replay bootstrap rejected` error; use `"strict"`
+  until the service is upgraded. If only some sampling workers lack support, a
+  request with a missing row fails exactly as in `"strict"`.
 
 For LoRA training, set `extra_training["peft_config"]` to a PEFT
 `LoraConfig`-compatible object. At minimum, specify `peft_type="Lora"`; `r` and

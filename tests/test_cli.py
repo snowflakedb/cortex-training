@@ -1016,6 +1016,58 @@ def test_generate_can_skip_poll(tmp_path):
     }
 
 
+def test_generate_counts_flat_token_list_as_one_prompt(tmp_path):
+    instances = []
+    stdout = io.StringIO()
+    path = tmp_path / "generate.json"
+    path.write_text(json.dumps({"poll": False, "prompts": [1, 2, 3]}), encoding="utf-8")
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory(instances),
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert instances[0].generate_prompts == [1, 2, 3]
+    assert json.loads(stdout.getvalue())["prompt_count"] == 1
+
+
+def test_generate_rejects_sampling_params_list_longer_than_one_flat_prompt(tmp_path):
+    path = tmp_path / "generate.json"
+    path.write_text(
+        json.dumps({"prompts": [1, 2, 3], "sampling_params": [{"max_tokens": 4}, None, None]}),
+        encoding="utf-8",
+    )
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory([]),
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert "sampling_params list length must match prompts length" in stderr.getvalue()
+
+
+def test_generate_counts_nested_token_lists_as_a_batch(tmp_path):
+    instances = []
+    stdout = io.StringIO()
+    path = tmp_path / "generate.json"
+    path.write_text(json.dumps({"poll": False, "prompts": [[1, 2], [3, 4]]}), encoding="utf-8")
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory(instances),
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert json.loads(stdout.getvalue())["prompt_count"] == 2
+
+
 def test_weight_sync_defaults_to_training_and_sampling_subjobs():
     instances = []
     stdout = io.StringIO()
@@ -1662,3 +1714,47 @@ def test_build_client_uses_named_snowflake_connection(tmp_path, monkeypatch):
         poll_timeout=1800.0,
         verify_ssl=True,
     )
+
+
+def _http_error(status_code: int, headers: dict[str, str] | None = None):
+    import requests
+
+    request = requests.Request(
+        "GET", "https://account.snowflakecomputing.com/api", headers=headers or {}
+    ).prepare()
+    response = requests.Response()
+    response.status_code = status_code
+    response.request = request
+    response._content = b'{"code": "390100", "message": "rejected"}'
+    return requests.HTTPError(f"{status_code} Client Error", response=response)
+
+
+_PAT_HEADERS = {
+    "Authorization": "Bearer REDACTED",
+    "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
+}
+
+
+def test_format_error_explains_rejected_pat_on_401() -> None:
+    message = cli._format_error(_http_error(401, _PAT_HEADERS))
+
+    assert message.startswith("401 Client Error")
+    assert "Snowflake rejected your credentials (HTTP 401)." in message
+    assert "Your user has no network policy." in message
+    assert "authentication.md#network-policy-requirement" in message
+
+
+def test_format_error_skips_pat_hint_for_session_token_401() -> None:
+    message = cli._format_error(
+        _http_error(401, {"Authorization": 'Snowflake Token="REDACTED"'})
+    )
+
+    assert "401 Client Error" in message
+    assert "network policy" not in message
+
+
+def test_format_error_leaves_other_http_errors_unchanged() -> None:
+    message = cli._format_error(_http_error(409, _PAT_HEADERS))
+
+    assert "409 Client Error" in message
+    assert "network policy" not in message
