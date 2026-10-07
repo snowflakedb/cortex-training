@@ -20,7 +20,10 @@ The remaining `name=value` command-line overrides are recipe-loop settings only
 -- dataset, step count, evaluation cadence, logging and Weights & Biases. Run a
 recipe module with no arguments to see its full list, or read its `Config` class.
 
-The job-config object is posted unchanged as the create-job body, so
+The job-config object is posted as the create-job body with one exception: each
+`peft_config` it carries is validated and rewritten into its canonical form
+first, and an invalid one fails before anything is submitted. Everything else,
+`optimizer` included, is posted unchanged, so
 [REST API section 8](../rest-api.md#8-create-job-schemas) is the authoritative
 schema for its fields. The
 [conversational SFT README](../../../recipes/sft/conversational/README.md#job-config-json)

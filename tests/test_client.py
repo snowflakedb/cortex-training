@@ -32,6 +32,7 @@ import base64
 import gzip
 import importlib
 import json
+import logging
 import sys
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -65,6 +66,17 @@ InferenceConfig = nc.InferenceConfig
 SubJobConfig = nc.SubJobConfig
 CortexTrainingClient = nc.CortexTrainingClient
 Hardware = nc.Hardware
+
+# Spellings a caller could plausibly pass for the unsupported log-probability
+# type: the enum, loose casing, the fully-qualified enum name, the short alias,
+# and surrounding whitespace.
+LOG_PROBABILITY_JOB_TYPES = [
+    JobType.LOG_PROBABILITY,
+    "LOG_PROBABILITY",
+    "JOB_TYPE_LOG_PROBABILITY",
+    "log_prob",
+    " log_probability ",
+]
 
 
 def _wire_load(data: bytes):
@@ -188,7 +200,7 @@ class TestTrainingConfig:
     def test_to_wire_required_fields(self):
         wire = _ok_training().to_wire()
         assert wire == {
-            "optimizer": {"type": "adamw", "lr": 1e-5},
+            "optimizer": {"name": "adamw", "lr": 1e-5},
             "max_seq_len": 128,
             "train_batch_size": 1,
             "n_gpus": 2,
@@ -245,7 +257,110 @@ class TestTrainingConfig:
         )
         wire = tc.to_wire()
         assert wire["max_seq_len"] == 128
-        assert wire["optimizer"] == {"type": "adamw", "lr": 1e-5}
+        assert wire["optimizer"] == {"name": "adamw", "lr": 1e-5}
+
+
+# ─── TrainingConfig — optimizer canonicalization ────────────────────────
+
+
+class TestTrainingConfigOptimizer:
+    def test_aliases_are_canonicalized_on_construction(self):
+        tc = TrainingConfig(
+            optimizer={"type": "adamw", "beta1": 0.9, "beta2": 0.95},
+            max_seq_len=128,
+            train_batch_size=1,
+            n_gpus=2,
+        )
+        assert tc.optimizer == {"name": "adamw", "betas": [0.9, 0.95]}
+        assert tc.to_wire()["optimizer"] == {"name": "adamw", "betas": [0.9, 0.95]}
+
+    def test_nested_gradient_clipping_is_hoisted(self):
+        tc = TrainingConfig(
+            optimizer={"lr": 1e-5, "gradient_clipping": 0.5},
+            max_seq_len=128,
+            train_batch_size=1,
+            n_gpus=2,
+        )
+        assert tc.optimizer == {"lr": 1e-5}
+        assert tc.gradient_clipping == 0.5
+        assert tc.to_wire()["gradient_clipping"] == 0.5
+
+    def test_typed_gradient_clipping_wins_over_the_nested_value(self):
+        tc = TrainingConfig(
+            optimizer={"lr": 1e-5, "gradient_clipping": 0.5},
+            max_seq_len=128,
+            train_batch_size=1,
+            n_gpus=2,
+            gradient_clipping=2.0,
+        )
+        assert tc.gradient_clipping == 2.0
+        assert "gradient_clipping" not in tc.optimizer
+
+    def test_clip_only_optimizer_empties_the_block_and_revalidates(self):
+        tc = TrainingConfig(
+            optimizer={"gradient_clipping": 1.0},
+            max_seq_len=128,
+            train_batch_size=1,
+            n_gpus=2,
+        )
+        assert tc.optimizer == {}
+        assert tc.gradient_clipping == 1.0
+        # The canonical model must survive a second pass; validate() and
+        # create_job both re-run model_validate.
+        tc.validate()
+        assert tc.to_wire()["optimizer"] == {}
+
+    def test_empty_optimizer_with_gradient_clipping_is_accepted(self):
+        tc = TrainingConfig(
+            optimizer={},
+            max_seq_len=128,
+            train_batch_size=1,
+            n_gpus=2,
+            gradient_clipping=1.0,
+        )
+        assert tc.to_wire()["optimizer"] == {}
+        assert tc.to_wire()["gradient_clipping"] == 1.0
+
+    def test_unknown_optimizer_key_is_rejected(self):
+        with pytest.raises(ValidationError, match=r"training\.optimizer contains unsupported field"):
+            TrainingConfig(
+                optimizer={"lr": 1e-5, "momentum": 0.9},
+                max_seq_len=128,
+                train_batch_size=1,
+                n_gpus=2,
+            )
+
+    def test_scheduler_optimizer_key_is_rejected(self):
+        with pytest.raises(ValidationError, match="unsupported scheduler field"):
+            TrainingConfig(
+                optimizer={"lr": 1e-5, "warmup_steps": 10},
+                max_seq_len=128,
+                train_batch_size=1,
+                n_gpus=2,
+            )
+
+    def test_peft_config_in_extra_is_normalized(self):
+        tc = TrainingConfig(
+            optimizer={"lr": 1e-5},
+            max_seq_len=128,
+            train_batch_size=1,
+            n_gpus=2,
+            peft_config={"peft_type": "Lora", "r": 16, "target_modules": ["q_proj"]},
+        )
+        peft = tc.to_wire()["peft_config"]
+        assert peft["task_type"] == "CAUSAL_LM"
+        assert peft["lora_alpha"] == 8
+        assert peft["target_parameters"] == []
+
+    def test_invalid_peft_config_in_extra_is_rejected(self):
+        with pytest.raises(ValidationError, match=r"training\.extra\.peft_config\.peft_type"):
+            TrainingConfig(
+                optimizer={"lr": 1e-5},
+                max_seq_len=128,
+                train_batch_size=1,
+                n_gpus=2,
+                peft_config={"peft_type": "LORA", "target_modules": ["q_proj"]},
+            )
 
 
 # ─── InferenceConfig ────────────────────────────────────────────────────
@@ -280,6 +395,27 @@ class TestInferenceConfig:
     def test_to_wire_extra_does_not_override_required(self):
         ic = InferenceConfig(max_seq_len=4096, n_gpus=1, extra={"max_seq_len": 1})
         assert ic.to_wire()["max_seq_len"] == 4096
+
+    def test_peft_config_in_extra_is_normalized(self):
+        sub = SubJobConfig.sampling_job(
+            model_name="gpt2",
+            max_seq_len=4096,
+            n_gpus=1,
+            extra_sampling={
+                "peft_config": {"peft_type": "Lora", "r": 16, "target_modules": ["q_proj"]}
+            },
+        )
+        peft = sub.to_wire()["inference_config"]["peft_config"]
+        assert peft["task_type"] == "CAUSAL_LM"
+        assert peft["target_parameters"] == []
+
+    def test_invalid_peft_config_in_extra_is_rejected(self):
+        with pytest.raises(ValidationError, match=r"sampling\.extra\.peft_config\.peft_type"):
+            InferenceConfig(
+                max_seq_len=4096,
+                n_gpus=1,
+                peft_config={"peft_type": "LORA", "target_modules": ["q_proj"]},
+            )
 
 
 # ─── SubJobConfig — factories ───────────────────────────────────────────
@@ -355,17 +491,21 @@ class TestSubJobConfigFactories:
         )
         assert sub.source_checkpoint_info == source
 
-    def test_sampling_job_factory_log_probability(self):
-        sub = SubJobConfig.sampling_job(
-            model_name="gpt2",
-            max_seq_len=128,
-            n_gpus=1,
-            job_type=JobType.LOG_PROBABILITY,
-        )
-        assert sub.job_type == JobType.LOG_PROBABILITY
+    @pytest.mark.parametrize("job_type", LOG_PROBABILITY_JOB_TYPES)
+    def test_sampling_job_factory_rejects_log_probability(self, job_type):
+        with pytest.raises(
+            ValueError,
+            match=r"sampling_job\(\)\.job_type: log_probability sub-jobs are not currently supported",
+        ):
+            SubJobConfig.sampling_job(
+                model_name="gpt2",
+                max_seq_len=128,
+                n_gpus=1,
+                job_type=job_type,
+            )
 
     def test_sampling_job_factory_rejects_training_type(self):
-        with pytest.raises(ValueError, match="SAMPLING or LOG_PROBABILITY"):
+        with pytest.raises(ValueError, match="only accepts SAMPLING, got"):
             SubJobConfig.sampling_job(
                 model_name="gpt2",
                 max_seq_len=128,
@@ -476,7 +616,7 @@ class TestSubJobConfigToWire:
             "job_type": "training",
             "model_name": "gpt2",
             "training_config": {
-                "optimizer": {"type": "adamw"},
+                "optimizer": {"name": "adamw"},
                 "max_seq_len": 128,
                 "train_batch_size": 1,
                 "n_gpus": 2,
@@ -504,11 +644,12 @@ class TestSubJobConfigToWire:
         assert wire["source_checkpoint_info"] == {"checkpoint_id": "cp_1", "source_job_id": "job-a"}
 
     def test_sampling_block_used_for_log_probability(self):
-        sub = SubJobConfig.sampling_job(
-            model_name="gpt2",
-            max_seq_len=128,
-            n_gpus=1,
+        # Constructed directly: the factory rejects log-probability, but the
+        # schema type still serializes.
+        sub = SubJobConfig(
             job_type=JobType.LOG_PROBABILITY,
+            model_name="gpt2",
+            sampling=InferenceConfig(max_seq_len=128, n_gpus=1),
         )
         wire = sub.to_wire()
         assert wire["job_type"] == "log_probability"
@@ -1100,7 +1241,7 @@ class TestCreateJob:
                     "job_type": "training",
                     "model_name": "gpt2",
                     "training_config": {
-                        "optimizer": {"type": "adamw"},
+                        "optimizer": {"name": "adamw"},
                         "max_seq_len": 128,
                         "train_batch_size": 1,
                         "n_gpus": 2,
@@ -1232,7 +1373,7 @@ class TestCreateJob:
         c = _make_client(post_json={"job_id": "srv-1"})
         train = SubJobConfig.training_job(
             model_name="gpt2",
-            optimizer={"a": 1},
+            optimizer={"name": "adamw"},
             max_seq_len=128,
             train_batch_size=1,
             n_gpus=2,
@@ -1282,6 +1423,81 @@ class TestCreateJob:
             c.create_job(sub_jobs=[training, training])
         c._session.post.assert_not_called()
 
+    def test_rejects_log_probability_sub_job_before_post(self):
+        c = _make_client()
+        training = SubJobConfig.training_job(
+            model_name="gpt2",
+            optimizer={"type": "adamw"},
+            max_seq_len=128,
+            train_batch_size=1,
+            n_gpus=2,
+        )
+        log_prob = SubJobConfig(
+            job_type=JobType.LOG_PROBABILITY,
+            model_name="gpt2",
+            sampling=_ok_inference(),
+        )
+        with pytest.raises(
+            ValueError,
+            match=r"sub_jobs\[1\]\.job_type: log_probability sub-jobs are not currently supported",
+        ):
+            c.create_job(sub_jobs=[training, log_prob])
+        c._session.post.assert_not_called()
+
+    @pytest.mark.parametrize("job_type", LOG_PROBABILITY_JOB_TYPES)
+    def test_create_job_from_body_rejects_log_probability_before_post(self, job_type):
+        c = _make_client()
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": "sampling",
+                    "model_name": "gpt2",
+                    "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                },
+                {
+                    "job_type": job_type,
+                    "model_name": "gpt2",
+                    "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                },
+            ],
+        }
+        with pytest.raises(
+            ValueError,
+            match=r"sub_job_configs\[1\]\.job_type: log_probability sub-jobs are not currently supported",
+        ):
+            c.create_job_from_body(body)
+        c._session.post.assert_not_called()
+
+    # Only the two documented aliases are rejected; anything else is left to the
+    # server so a newly added schema value is not blocked client-side.
+    @pytest.mark.parametrize("job_type", ["log-probability", "logprob", "sampling"])
+    def test_create_job_from_body_allows_other_job_types(self, job_type):
+        c = _make_client(post_json={"job_id": "srv-1"})
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": job_type,
+                    "model_name": "gpt2",
+                    "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                }
+            ],
+        }
+        assert c.create_job_from_body(body) == {"job_id": "srv-1"}
+
+    def test_create_job_from_body_skips_non_dict_sub_job_configs(self):
+        c = _make_client(post_json={"job_id": "srv-1"})
+        body = {
+            "sub_job_configs": [
+                "log_probability",
+                {
+                    "job_type": "sampling",
+                    "model_name": "gpt2",
+                    "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                },
+            ],
+        }
+        assert c.create_job_from_body(body) == {"job_id": "srv-1"}
+
     def test_create_job_from_body_rejects_two_training_sub_jobs_before_post(self):
         c = _make_client()
         body = {
@@ -1301,6 +1517,117 @@ class TestCreateJob:
         with pytest.raises(ValueError, match="at most one training sub-job"):
             c.create_job_from_body(body)
         c._session.post.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "job_type",
+        ["training", "TRAINING", "JOB_TYPE_TRAINING", " training "],
+    )
+    def test_create_job_from_body_normalizes_training_peft_config(self, job_type, monkeypatch):
+        normalized_peft = {"peft_type": "Lora"}
+        normalize = MagicMock(return_value=normalized_peft)
+        monkeypatch.setattr(nc, "normalize_lora_peft_config", normalize)
+        c = _make_client(post_json={"job_id": "srv-raw"})
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": job_type,
+                    "model_name": "gpt2",
+                    "training_config": {"peft_config": {"r": 8}},
+                },
+            ],
+        }
+
+        assert c.create_job_from_body(body) == {"job_id": "srv-raw"}
+        assert body["sub_job_configs"][0]["training_config"]["peft_config"] == normalized_peft
+        normalize.assert_called_once()
+
+    def test_create_job_from_body_normalizes_sampling_peft_config(self, monkeypatch):
+        normalized_peft = {"peft_type": "Lora"}
+        normalize = MagicMock(return_value=normalized_peft)
+        monkeypatch.setattr(nc, "normalize_lora_peft_config", normalize)
+        c = _make_client(post_json={"job_id": "srv-raw"})
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": "sampling",
+                    "model_name": "gpt2",
+                    "inference_config": {"max_seq_len": 128, "n_gpus": 1, "peft_config": {"r": 8}},
+                },
+            ],
+        }
+
+        assert c.create_job_from_body(body) == {"job_id": "srv-raw"}
+        assert body["sub_job_configs"][0]["inference_config"]["peft_config"] == normalized_peft
+        normalize.assert_called_once()
+
+    def test_create_job_from_body_rewrites_peft_config_in_place(self):
+        c = _make_client(post_json={"job_id": "srv-raw"})
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": "training",
+                    "model_name": "gpt2",
+                    "training_config": {
+                        "optimizer": {"type": "adamw"},
+                        "peft_config": {
+                            "peft_type": "Lora",
+                            "r": 16,
+                            "target_modules": ["q_proj"],
+                        },
+                    },
+                },
+            ],
+        }
+
+        assert c.create_job_from_body(body) == {"job_id": "srv-raw"}
+        training_config = body["sub_job_configs"][0]["training_config"]
+        assert training_config["peft_config"] == {
+            "peft_type": "Lora",
+            "task_type": "CAUSAL_LM",
+            "r": 16,
+            "lora_alpha": 8,
+            "lora_dropout": 0.0,
+            "bias": "none",
+            "target_modules": ["q_proj"],
+            "target_parameters": [],
+        }
+        assert isinstance(training_config["peft_config"]["lora_dropout"], float)
+        # The raw path forwards the optimizer untouched.
+        assert training_config["optimizer"] == {"type": "adamw"}
+
+    def test_create_job_from_body_rejects_invalid_peft_config_before_post(self):
+        c = _make_client()
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": "training",
+                    "model_name": "gpt2",
+                    "training_config": {"peft_config": {"peft_type": "LORA"}},
+                },
+            ],
+        }
+
+        with pytest.raises(
+            ValueError,
+            match=r"sub_job_configs\[0\]\.training_config\.peft_config\.peft_type",
+        ):
+            c.create_job_from_body(body)
+        c._session.post.assert_not_called()
+
+    def test_create_job_from_body_ignores_absent_peft_config(self):
+        c = _make_client(post_json={"job_id": "srv-raw"})
+        body = {
+            "sub_job_configs": [
+                "not-an-object",
+                {
+                    "job_type": "sampling",
+                    "model_name": "gpt2",
+                    "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                },
+            ],
+        }
+
+        assert c.create_job_from_body(body) == {"job_id": "srv-raw"}
 
     def test_allows_one_training_with_multiple_sampling(self):
         c = _make_client(post_json={"job_id": "srv-1"})
@@ -1376,6 +1703,75 @@ class TestCreateJob:
             "debug": {},
         }
         assert c.create_job_from_body(body) == {"job_id": "srv"}
+
+
+# ─── CortexTrainingClient — transient HTTP retries ───────────────────────────
+
+
+class TestTransientHttpRetries:
+    def test_307_and_308_are_transient(self):
+        for status in (307, 308):
+            resp = _make_response(status_code=status)
+            exc = nc.requests.exceptions.HTTPError(response=resp)
+            assert nc._is_transient(exc)
+
+    def test_302_is_not_transient(self):
+        resp = _make_response(status_code=302)
+        exc = nc.requests.exceptions.HTTPError(response=resp)
+        assert not nc._is_transient(exc)
+
+    @pytest.mark.parametrize("caller_kwargs", [{}, {"allow_redirects": True}])
+    def test_session_does_not_follow_redirects(self, monkeypatch, caller_kwargs):
+        seen_kwargs = {}
+
+        def fake_request(_session, *_args, **kwargs):
+            seen_kwargs.update(kwargs)
+            return _make_response()
+
+        monkeypatch.setattr(nc.requests.Session, "request", fake_request)
+        session = nc._DefaultTimeoutSession((1.0, 1.0))
+
+        session.get("http://test.local/redirect", **caller_kwargs)
+
+        assert seen_kwargs["allow_redirects"] is False
+
+    def test_send_retries_308_against_original_url(self, monkeypatch):
+        from tenacity import wait_none
+
+        monkeypatch.setattr(
+            nc, "wait_exponential_jitter", lambda **_kwargs: wait_none()
+        )
+        c = _make_client()
+        c.max_retries = 1
+        leaked = nc.requests.Response()
+        leaked.status_code = 308
+        leaked.url = f"{c._prefix}/job-1/forward-backward"
+        leaked.headers["Location"] = "http://unroutable.invalid/forward-backward"
+        ok = _make_response({"job_id": "job-1", "status": "running"})
+        c._session.post.side_effect = [leaked, ok]
+
+        out = c._send("POST", leaked.url, data=b"payload")
+
+        assert out is ok
+        assert c._session.post.call_count == 2
+        urls = [call.args[0] for call in c._session.post.call_args_list]
+        assert urls == [leaked.url, leaked.url]
+
+    def test_send_rejects_non_transient_redirect_without_retry(self):
+        c = _make_client()
+        c.max_retries = 1
+        redirect = nc.requests.Response()
+        redirect.status_code = 302
+        redirect.url = f"{c._prefix}/job-1"
+        redirect.headers["Location"] = "http://example.test/elsewhere"
+        c._session.get.return_value = redirect
+
+        with pytest.raises(
+            nc.requests.exceptions.HTTPError, match="Unexpected redirect 302"
+        ):
+            c._send("GET", redirect.url)
+
+        c._session.get.assert_called_once_with(redirect.url)
 
 
 # ─── CortexTrainingClient — read & control endpoints ─────────────────────────
@@ -1869,21 +2265,34 @@ class TestDataPlane:
             strict=True,
         )
         assert out == {"request_id": "s1", "count": 2}
+        # The stream path sends one unchunked frame, never a chunk group.
+        c._session.post.assert_called_once()
         url, kwargs = c._session.post.call_args
         assert url[0] == f"{c._prefix}/j1/generate-stream"
         assert kwargs["headers"]["Content-Type"] == "application/octet-stream"
-        import json as _json
+        body = _wire_load(kwargs["data"])
+        assert body["sampling_params"] == [
+            {"max_tokens": 4, "temperature": 0.7},
+            {"max_tokens": 2, "temperature": 0.3},
+        ]
+        assert body["routing_key"] == ["rk-1", None]
+        assert body["strict"] is True
+        prompts = body["prompts"]
+        assert [p.dtype for p in prompts] == [torch.int32, torch.int32]
+        assert [p.tolist() for p in prompts] == [[1, 2], [3, 4]]
 
-        body = _json.loads(kwargs["data"])
-        assert body == {
-            "prompts": [[1, 2], [3, 4]],
-            "sampling_params": [
-                {"max_tokens": 4, "temperature": 0.7},
-                {"max_tokens": 2, "temperature": 0.3},
-            ],
-            "routing_key": ["rk-1", None],
-            "strict": True,
-        }
+    def test_generate_stream_frame_matches_generate_frame(self):
+        prompts = ["hello", [1, 2, 3]]
+        unary = _make_client(post_json={"request_id": "g-same"})
+        unary.generate("j1", prompts=prompts)
+        stream = _make_client(post_json={"request_id": "s-same"})
+        stream.generate_stream("j1", prompts=prompts)
+
+        from_unary = _wire_load(unary._session.post.call_args.kwargs["data"])["prompts"]
+        from_stream = _wire_load(stream._session.post.call_args.kwargs["data"])["prompts"]
+        assert from_unary[0] == from_stream[0] == "hello"
+        assert from_unary[1].dtype == from_stream[1].dtype == torch.int32
+        assert torch.equal(from_unary[1], from_stream[1])
 
     def test_generate_chunks_oversized_payload(self):
         c = _make_client()
@@ -1970,6 +2379,54 @@ class TestDataPlane:
         with pytest.raises(ValueError, match="does not fit the sampling job's max_seq_len of 4"):
             c.generate_stream("j1", prompts=[[1, 2, 3, 4, 5]])
         c._session.post.assert_not_called()
+
+    def test_generate_rejects_overlong_flat_tokenized_prompt(self):
+        # A flat list of ids is one prompt, so the reported index is 0 even
+        # though the list has four elements.
+        c = _make_client(
+            post_json={"request_id": "g-flat"},
+            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
+        )
+        with pytest.raises(ValueError, match="prompt at index 0 has 4 tokens"):
+            c.generate("j1", prompts=[1, 2, 3, 4])
+        c._session.post.assert_not_called()
+
+    def test_generate_rejects_mixed_flat_token_list(self):
+        c = _make_client(
+            post_json={"request_id": "g-mixed"},
+            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 8.0, "n_gpus": 1.0}}]},
+        )
+        with pytest.raises(ValueError, match=r"prompts\[1\] must be an integer token id"):
+            c.generate("j1", prompts=[1, 2.5])
+        c._session.post.assert_not_called()
+
+    def test_generate_allows_bare_tensor_prompt_under_limit(self):
+        c = _make_client(
+            post_json={"request_id": "g-tensor"},
+            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
+        )
+        assert c.generate("j1", prompts=torch.tensor([1, 2, 3], dtype=torch.int32)) == "g-tensor"
+        c._session.post.assert_called_once()
+
+    def test_generate_rejects_overlong_bare_tensor_prompt(self):
+        c = _make_client(
+            post_json={"request_id": "g-tensor-long"},
+            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
+        )
+        with pytest.raises(ValueError, match="prompt at index 0 has 4 tokens"):
+            c.generate("j1", prompts=torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+        c._session.post.assert_not_called()
+
+    def test_generate_stream_allows_bare_tensor_prompt_under_limit(self):
+        c = _make_client(
+            post_json={"request_id": "s-tensor", "count": 1},
+            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
+        )
+        assert c.generate_stream("j1", prompts=torch.tensor([1, 2, 3], dtype=torch.int32)) == {
+            "request_id": "s-tensor",
+            "count": 1,
+        }
+        c._session.post.assert_called_once()
 
     def test_step_no_lr(self):
         c = _make_client(post_json={"request_id": "r2"})
@@ -2200,6 +2657,7 @@ class TestDataPlane:
             sub_job_type="training",
         )
         assert out == {"request_id": "r-forward"}
+        assert "r-forward" in c._forward_request_ids
         c._session.post.assert_called_once_with(
             f"{c._prefix}/j1/operation",
             json={
@@ -2213,6 +2671,7 @@ class TestDataPlane:
     def test_forward_operation_omits_none_fields(self):
         c = _make_client(post_json={"ok": True})
         c.forward("j1")
+        assert not c._forward_request_ids
         c._session.post.assert_called_once_with(
             f"{c._prefix}/j1/operation",
             json={"operation_type": "forward"},
@@ -2360,6 +2819,72 @@ class TestDataPlane:
         }
 
 
+# ─── Pre-tokenized prompt packing ────────────────────────────────────────
+
+
+class TestPromptTensorPacking:
+    def test_batch_of_token_lists_becomes_int32_tensors(self):
+        packed = nc._pack_token_prompts([[1, 2], [3, 4, 5]])
+        assert [p.dtype for p in packed] == [torch.int32, torch.int32]
+        assert [p.tolist() for p in packed] == [[1, 2], [3, 4, 5]]
+
+    def test_string_prompts_are_left_alone(self):
+        assert nc._pack_token_prompts(["a", "b"]) == ["a", "b"]
+
+    def test_mixed_batch_packs_only_token_lists(self):
+        packed = nc._pack_token_prompts(["a", [1, 2]])
+        assert packed[0] == "a"
+        assert packed[1].tolist() == [1, 2]
+
+    def test_empty_inner_list_stays_a_list(self):
+        # The server's own non-empty check should be the one that rejects it.
+        assert nc._pack_token_prompts([[]]) == [[]]
+
+    def test_mixed_flat_list_is_rejected(self):
+        with pytest.raises(ValueError, match=r"prompts\[1\] must be an integer token id"):
+            nc._pack_token_prompts([1, 2.5])
+
+    def test_bool_list_is_not_packed_as_token_ids(self):
+        assert nc._pack_token_prompts([True, False]) == [True, False]
+
+    def test_flat_token_list_is_one_prompt(self):
+        packed = nc._pack_token_prompts([7, 8, 9])
+        assert torch.is_tensor(packed)
+        assert packed.dtype == torch.int32
+        assert packed.tolist() == [7, 8, 9]
+
+    def test_empty_and_non_list_prompts_are_unchanged(self):
+        assert nc._pack_token_prompts([]) == []
+        assert nc._pack_token_prompts("hello") == "hello"
+
+    def test_existing_tensor_is_not_recast(self):
+        tensor = torch.tensor([1, 2], dtype=torch.int64)
+        assert nc._pack_token_prompts(tensor) is tensor
+        assert nc._pack_token_prompts([tensor])[0] is tensor
+
+    def test_token_id_beyond_int32_falls_back_to_int64(self, caplog):
+        caplog.set_level(logging.WARNING, logger=nc.logger.name)
+        packed = nc._pack_token_prompts([[2**31]])
+        assert packed[0].dtype == torch.int64
+        assert packed[0].tolist() == [2**31]
+        assert "int32" in caplog.text
+
+    def test_env_var_keeps_list_prompts_inside_the_frame(self, monkeypatch):
+        # The hatch changes the encoding of the prompts, not the body: both
+        # calls still post a DSSST1 frame.
+        monkeypatch.setenv(nc.DISABLE_TENSOR_PROMPTS_ENV, "1")
+
+        unary = _make_client(post_json={"request_id": "g-raw"})
+        unary.generate("j1", prompts=[[1, 2], [3, 4]])
+        stream = _make_client(post_json={"request_id": "s-raw", "count": 2})
+        stream.generate_stream("j1", prompts=[[1, 2], [3, 4]])
+
+        for client in (unary, stream):
+            kwargs = client._session.post.call_args.kwargs
+            assert kwargs["headers"]["Content-Type"] == "application/octet-stream"
+            assert _wire_load(kwargs["data"])["prompts"] == [[1, 2], [3, 4]]
+
+
 # ─── CortexTrainingClient — request polling ──────────────────────────────────
 
 
@@ -2397,6 +2922,7 @@ class TestRequestPolling:
                 "text": "ok",
                 "token_ids": torch.tensor([1, 2, 3], dtype=torch.int64),
                 "logprobs": torch.tensor([0.125, -0.5], dtype=torch.float32),
+                "metrics": {"model/tokens": 3},
             }
         )
         c = _make_client(
@@ -2412,6 +2938,7 @@ class TestRequestPolling:
                             "encoding": "base64",
                             "wire_format": "DSSST1",
                             "payload_b64": base64.b64encode(payload).decode("ascii"),
+                            "metrics": {"router_replay/tx_bytes_avg": 12.0},
                         },
                     },
                     {"type": "done", "completed": 1, "failed": 0},
@@ -2427,6 +2954,10 @@ class TestRequestPolling:
                     "text": "ok",
                     "token_ids": [1, 2, 3],
                     "logprobs": [0.125, -0.5],
+                    "metrics": {
+                        "model/tokens": 3,
+                        "router_replay/tx_bytes_avg": 12.0,
+                    },
                 },
             },
             {"type": "done", "completed": 1, "failed": 0},
@@ -2477,11 +3008,67 @@ class TestRequestPolling:
                     "encoding": "base64",
                     "wire_format": "DSSST1",
                     "payload_b64": base64.b64encode(payload).decode("ascii"),
+                    "metrics": {"router_replay/tx_bytes_avg": 12.0},
                 },
             }
         )
         monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
-        assert c.poll_request("j1", "r1") == {"avg_loss": 0.5}
+        assert c.poll_request("j1", "r1") == {
+            "avg_loss": 0.5,
+            "metrics": {"router_replay/tx_bytes_avg": 12.0},
+        }
+
+    def test_poll_request_keeps_payload_metrics_when_envelope_has_none(self, monkeypatch):
+        from cortex_training import wire
+
+        payload = wire.dumps({"avg_loss": 0.5, "metrics": {"model/tokens": 8}})
+        c = _make_client(
+            get_json={
+                "status": "done",
+                "result": {
+                    "content_type": "application/octet-stream",
+                    "encoding": "base64",
+                    "wire_format": "DSSST1",
+                    "payload_b64": base64.b64encode(payload).decode("ascii"),
+                },
+            }
+        )
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        assert c.poll_request("j1", "r1") == {
+            "avg_loss": 0.5,
+            "metrics": {"model/tokens": 8},
+        }
+
+    def test_poll_request_envelope_metrics_win_on_key_collision(self, monkeypatch):
+        from cortex_training import wire
+
+        payload = wire.dumps(
+            {
+                "avg_loss": 0.5,
+                "metrics": {"model/tokens": 8, "shared/bytes": 1.0},
+            }
+        )
+        c = _make_client(
+            get_json={
+                "status": "done",
+                "result": {
+                    "content_type": "application/octet-stream",
+                    "encoding": "base64",
+                    "wire_format": "DSSST1",
+                    "payload_b64": base64.b64encode(payload).decode("ascii"),
+                    "metrics": {"router_replay/tx_bytes_avg": 12.0, "shared/bytes": 2.0},
+                },
+            }
+        )
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        assert c.poll_request("j1", "r1") == {
+            "avg_loss": 0.5,
+            "metrics": {
+                "model/tokens": 8,
+                "shared/bytes": 2.0,
+                "router_replay/tx_bytes_avg": 12.0,
+            },
+        }
 
     def test_poll_request_keeps_non_generate_dssst1_tensors(self, monkeypatch):
         from cortex_training import wire
@@ -2546,6 +3133,63 @@ class TestRequestPolling:
         }
         assert "r-generate" not in c._generate_request_ids
 
+    def test_poll_request_decodes_a_legacy_forward_result_envelope(self, monkeypatch):
+        from cortex_training import wire
+
+        payload = wire.dumps(
+            {"job_id": "j1", "logprobs": torch.tensor([0.25, -1.5], dtype=torch.float32)}
+        )
+        c = _make_client(
+            get_json={
+                "status": "done",
+                "result": {
+                    "job_id": "j1",
+                    "payload_b64": base64.b64encode(payload).decode("ascii"),
+                    "metrics": {"router_replay/tx_bytes_peak": 24.0},
+                },
+            }
+        )
+        c._forward_request_ids.add("r-forward")
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+
+        result = c.poll_request("j1", "r-forward")
+        assert torch.equal(result["logprobs"], torch.tensor([0.25, -1.5]))
+        assert result["metrics"] == {"router_replay/tx_bytes_peak": 24.0}
+        assert "r-forward" not in c._forward_request_ids
+
+    def test_poll_request_leaves_a_self_describing_forward_result_alone(self, monkeypatch):
+        from cortex_training import wire
+
+        payload = wire.dumps(
+            {"job_id": "j1", "logprobs": torch.tensor([0.5], dtype=torch.float32)}
+        )
+        c = _make_client(
+            get_json={
+                "status": "done",
+                "result": {
+                    "content_type": "application/octet-stream",
+                    "encoding": "base64",
+                    "wire_format": "DSSST1",
+                    "payload_b64": base64.b64encode(payload).decode("ascii"),
+                },
+            }
+        )
+        c._forward_request_ids.add("r-forward")
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+
+        result = c.poll_request("j1", "r-forward")
+        assert torch.equal(result["logprobs"], torch.tensor([0.5]))
+        assert "r-forward" not in c._forward_request_ids
+
+    def test_poll_request_forgets_a_forward_id_on_failure(self, monkeypatch):
+        c = _make_client(get_json={"status": "failed", "error": "boom"})
+        c._forward_request_ids.add("r-forward")
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            c.poll_request("j1", "r-forward")
+        assert "r-forward" not in c._forward_request_ids
+
     def test_poll_request_decodes_chunked_dssst1_result(self, monkeypatch):
         from cortex_training import wire
 
@@ -2560,14 +3204,23 @@ class TestRequestPolling:
             }
             body = {"status": "running", "events": [event], "next_cursor": str(idx + 1)}
             if idx == len(chunks) - 1:
-                body = {"status": "done", "events": [event]}
+                body = {
+                    "status": "done",
+                    "events": [event],
+                    "result": {
+                        "metrics": {"router_replay/tx_max_bytes": 4096.0},
+                    },
+                }
             responses.append(_make_response(body))
 
         c = _make_client()
         c._session.get.side_effect = responses
         monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
 
-        assert c.poll_request("j1", "r1") == {"text": "x" * 20_000}
+        assert c.poll_request("j1", "r1") == {
+            "text": "x" * 20_000,
+            "metrics": {"router_replay/tx_max_bytes": 4096.0},
+        }
         assert c._session.get.call_args_list[1].kwargs["params"] == {"cursor": "1"}
 
     def test_poll_request_failed(self, monkeypatch):

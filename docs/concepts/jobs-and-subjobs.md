@@ -5,12 +5,16 @@ A job is the top-level lifecycle resource. It contains one or more sub-jobs:
 - `training` handles forward/backward requests, optimizer steps, and training
   checkpoints.
 - `sampling` handles generation.
-- `log_probability` configures log-probability workers.
+- `log_probability` configures log-probability workers. It remains a schema
+  type, but it cannot currently be submitted: both the Python client and the
+  CLI reject it before the request is sent with
+  `sub_job_configs[INDEX].job_type: log_probability sub-jobs are not currently
+  supported`. The short alias `log_prob` is rejected the same way.
 
-A job supports **zero or one** `training` sub-job, and any number of `sampling`
-and `log_probability` sub-jobs. A create request carrying a second training
-sub-job is rejected — client-side before it is sent, and by the server for any
-other caller.
+Only `training` and `sampling` sub-jobs can be submitted. A job supports **zero
+or one** `training` sub-job, and any number of `sampling` sub-jobs. A create
+request carrying a second training sub-job is rejected — client-side before it
+is sent, and by the server for any other caller.
 
 Internal sub-job identifiers use the form:
 

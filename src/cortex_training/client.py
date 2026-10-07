@@ -74,6 +74,8 @@ from tenacity import wait_exponential_jitter
 from urllib3.exceptions import NewConnectionError
 
 from cortex_training import wire
+from cortex_training.optimizer import normalize_optimizer_config
+from cortex_training.peft import normalize_lora_peft_config
 from cortex_training.snowflake_auth import SnowflakeProfileAuth
 from cortex_training.snowflake_auth import SnowflakeTelemetryTokenProvider
 from cortex_training.telemetry import CachedSessionTokenProvider
@@ -96,6 +98,12 @@ _STREAM_COPY_BUFFER_BYTES = 1024 * 1024
 DEBUG_OPTIONS_ENV = "CORTEX_TRAINING_ENABLE_DEBUG_OPTIONS"
 DISABLE_TELEMETRY_ENV = "CORTEX_TRAINING_DISABLE_TELEMETRY"
 ENABLE_SUCCESS_TELEMETRY_ENV = "CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY"
+
+# Escape hatch for the tensor encoding of pre-tokenized prompts. Prompts are
+# packed as tensors by default because every server accepts both encodings.
+# Setting this puts the token ids back in the frame's JSON header; it does not
+# change the request body, which is a DSSST1 frame either way.
+DISABLE_TENSOR_PROMPTS_ENV = "CORTEX_TRAINING_DISABLE_TENSOR_PROMPTS"
 
 
 def _env_flag_enabled(name: str) -> bool:
@@ -130,12 +138,14 @@ def _success_telemetry_enabled() -> bool:
 #   503 Service Unavailable - server temporarily overloaded or restarting
 #   504 Gateway Timeout     - upstream didn't respond in time
 #   409 Conflict            - the target zone is restarting
+#   307/308 Redirect        - a leaked internal redirect; retried on the original
+#                             URL, and `Location` is never followed.
 #   404 Not Found           - a just-created job may not be visible yet, so a
 #                             valid id can 404 briefly and succeed on retry.
 # Note the trade-off on 404: a *mistyped* job id is also retried (up to
 # `max_retries`, with backoff) before the error surfaces. Every other 4xx is
 # excluded because it signals a client/config error that won't fix itself.
-_TRANSIENT_STATUSES = {429, 500, 502, 503, 504, 404, 409}
+_TRANSIENT_STATUSES = {429, 500, 502, 503, 504, 404, 409, 307, 308}
 _SESSION_EXPIRED_CODES = frozenset({"390111", "390112", "390114"})
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {
@@ -195,7 +205,11 @@ def _validated_request_timeout(
 
 
 class _DefaultTimeoutSession(requests.Session):
-    """Apply a default timeout to every request that does not provide one."""
+    """Apply a default timeout to every request that does not provide one.
+
+    Redirects are never followed: a leaked internal redirect points at an
+    address the client cannot reach, so the original URL is retried instead.
+    """
 
     def __init__(self, default_timeout: tuple[float, float]):
         super().__init__()
@@ -207,6 +221,8 @@ class _DefaultTimeoutSession(requests.Session):
         timeout: Any = None,
         **kwargs: Any,
     ) -> requests.Response:  # type: ignore[override]
+        # Session.get() injects allow_redirects=True before it calls request().
+        kwargs["allow_redirects"] = False
         return super().request(
             *args,
             timeout=self.default_timeout if timeout is None else timeout,
@@ -461,15 +477,39 @@ def _is_connect_error(exc: BaseException) -> bool:
 
 
 class JobType(str, Enum):
-    """Sub-job types supported by Cortex Training.
+    """Sub-job types defined by the Cortex Training schema.
 
     Matches the ``job_type`` enum in the REST schema; see
-    ``docs/reference/rest-api.md`` section 8.1.
+    ``docs/reference/rest-api.md`` section 8.1. Not every schema value can
+    currently be submitted: ``LOG_PROBABILITY`` configs still validate and
+    serialize, but the client and CLI reject them at submission.
     """
 
     TRAINING = "training"
     SAMPLING = "sampling"
-    LOG_PROBABILITY = "log_probability"
+    LOG_PROBABILITY = "log_probability"  # Schema value; submission is unsupported.
+
+
+_LOG_PROBABILITY_JOB_TYPE_ALIASES = frozenset({"log_probability", "log_prob"})
+_UNSUPPORTED_LOG_PROBABILITY_MESSAGE = (
+    "log_probability sub-jobs are not currently supported"
+)
+
+
+def _normalized_job_type(job_type: Any) -> str:
+    """Short-form ``job_type`` for raw bodies, which may use the enum spelling."""
+    if not isinstance(job_type, str):
+        return ""
+    return job_type.strip().lower().removeprefix("job_type_")
+
+
+def _is_log_probability_job_type(job_type: Any) -> bool:
+    return _normalized_job_type(job_type) in _LOG_PROBABILITY_JOB_TYPE_ALIASES
+
+
+def _reject_log_probability_sub_job(job_type: Any, *, location: str) -> None:
+    if _is_log_probability_job_type(job_type):
+        raise ValueError(f"{location}: {_UNSUPPORTED_LOG_PROBABILITY_MESSAGE}")
 
 
 class Hardware(str, Enum):
@@ -526,7 +566,11 @@ class TrainingConfig(BaseModel):
     """Training hyperparameters for a training sub-job.
 
     Required fields mirror the server-side validator: ``max_seq_len > 0``,
-    ``train_batch_size > 0``, ``n_gpus > 0``, and a non-empty ``optimizer``.
+    ``train_batch_size > 0``, ``n_gpus > 0``, and an ``optimizer`` that carries
+    at least one setting. ``optimizer`` is canonicalized on construction (see
+    :func:`cortex_training.optimizer.normalize_optimizer_config`), so a block
+    holding only ``gradient_clipping`` is hoisted onto the typed field and
+    leaves ``optimizer`` empty.
 
     Unknown fields are passed through to the server unchanged
     (accessible via ``model_extra``). See ``docs/reference/rest-api.md`` section 8.2.
@@ -554,12 +598,29 @@ class TrainingConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_optimizer(self) -> "TrainingConfig":
-        if not self.optimizer:
+        # object.__setattr__ writes the already-normalized values without
+        # re-entering assignment validation. create_job posts to_wire() of this
+        # instance, so the rewrite has to land here.
+        optimizer, hoisted_gradient_clipping = normalize_optimizer_config(
+            self.optimizer, location="training.optimizer"
+        )
+        object.__setattr__(self, "optimizer", optimizer)
+        if self.gradient_clipping is None and hoisted_gradient_clipping is not None:
+            object.__setattr__(self, "gradient_clipping", hoisted_gradient_clipping)
+        # Checked after the hoist: a clip-only block canonicalizes to ``{}`` and
+        # is still a complete config, so only a block that says nothing at all
+        # is an error.
+        if not self.optimizer and self.gradient_clipping is None:
             raise ValueError("training.optimizer is required and must be a non-empty dict")
-        _validate_primerl_lm_head_config(self.model_extra or {}, location="training.extra")
-        prime_rl = (self.model_extra or {}).get("prime_rl")
+        extra = self.model_extra or {}
+        _validate_primerl_lm_head_config(extra, location="training.extra")
+        prime_rl = extra.get("prime_rl")
         if isinstance(prime_rl, dict):
             _validate_primerl_lm_head_config(prime_rl, location="training.extra.prime_rl")
+        if "peft_config" in extra:
+            extra["peft_config"] = normalize_lora_peft_config(
+                extra["peft_config"], location="training.extra.peft_config"
+            )
         return self
 
     def validate(self) -> None:
@@ -607,6 +668,15 @@ class InferenceConfig(BaseModel):
                 for k, v in extra.items():
                     data.setdefault(k, v)
         return data
+
+    @model_validator(mode="after")
+    def _check_peft_config(self) -> "InferenceConfig":
+        extra = self.model_extra or {}
+        if "peft_config" in extra:
+            extra["peft_config"] = normalize_lora_peft_config(
+                extra["peft_config"], location="sampling.extra.peft_config"
+            )
+        return self
 
     def validate(self) -> None:
         """Re-validate the current state. Backward-compatible with the old dataclass API."""
@@ -735,9 +805,14 @@ class SubJobConfig(BaseModel):
         model_post_init: list[str] | None = None,
         source_checkpoint_info: dict | None = None,
     ) -> "SubJobConfig":
-        """Build a sampling/log-probability :class:`SubJobConfig`."""
-        if job_type not in (JobType.SAMPLING, JobType.LOG_PROBABILITY):
-            raise ValueError(f"sampling_job() only accepts SAMPLING or LOG_PROBABILITY, got {job_type!r}")
+        """Build a sampling :class:`SubJobConfig`.
+
+        ``job_type`` remains for source compatibility, but only ``SAMPLING`` is
+        currently accepted.
+        """
+        _reject_log_probability_sub_job(job_type, location="sampling_job().job_type")
+        if job_type != JobType.SAMPLING:
+            raise ValueError(f"sampling_job() only accepts SAMPLING, got {job_type!r}")
         _typed_sampling = set(InferenceConfig.model_fields.keys())
         passthrough_sampling = {k: v for k, v in (extra_sampling or {}).items() if k not in _typed_sampling}
         return cls(
@@ -780,6 +855,30 @@ class SubJobConfig(BaseModel):
         if self.source_checkpoint_info is not None:
             wire["source_checkpoint_info"] = self.source_checkpoint_info
         return wire
+
+
+def _validate_raw_sub_job_configs(sub_job_configs: list) -> None:
+    """Canonicalize every ``peft_config`` in a raw create-job body, in place.
+
+    The typed path validates LoRA through :class:`TrainingConfig` /
+    :class:`InferenceConfig`; this gives raw bodies the same guarantee so an
+    adapter that weight sync cannot carry is rejected before the request is
+    sent. Everything else in the body, including ``optimizer``, is forwarded as
+    given.
+    """
+    for index, sub_job in enumerate(sub_job_configs):
+        if not isinstance(sub_job, dict):
+            continue
+        job_type = _normalized_job_type(sub_job.get("job_type"))
+        config_key = "training_config" if job_type == JobType.TRAINING.value else "inference_config"
+        job_config = sub_job.get(config_key)
+        peft_config = job_config.get("peft_config") if isinstance(job_config, dict) else None
+        if peft_config is None:
+            continue
+        job_config["peft_config"] = normalize_lora_peft_config(
+            peft_config,
+            location=f"sub_job_configs[{index}].{config_key}.peft_config",
+        )
 
 
 # ─── Forward-backward payload helpers ────────────────────────────────────
@@ -1094,6 +1193,86 @@ def build_forward_backward_payload(spec: dict[str, Any]) -> bytes:
     return serialize_forward_backward_args(args, kwargs)
 
 
+# ─── Generate prompt helpers ─────────────────────────────────────────────
+
+# Wire dtype for pre-tokenized prompts. int32, not int64: a token id needs 18
+# bits for today's vocabularies, and the frame size is the thing being cut.
+# Measured on 8 prompts x 32,768 tokens, int32 gives 4.00 B/token and a 1.05 MB
+# frame; int64 gives 8.00 B/token and 2.10 MB, which is larger than the
+# 7.00 B/token of the JSON encoding it replaces.
+_PROMPT_TOKEN_DTYPE_NAME = "int32"
+
+
+def _tensor_prompts_disabled() -> bool:
+    """True when tensor packing of pre-tokenized prompts is disabled via env var."""
+    return _env_flag_enabled(DISABLE_TENSOR_PROMPTS_ENV)
+
+
+def _as_token_tensor(prompt: list[int]):
+    """One pre-tokenized prompt as a wire-dtype tensor.
+
+    Falls back to int64 rather than failing. A token id outside int32 means a
+    vocabulary of over two billion, so this should never fire -- but torch
+    raises on overflow instead of wrapping, and turning a working request into
+    an exception is a worse trade than sending a larger frame.
+    """
+    torch = _load_torch()
+    try:
+        return torch.tensor(prompt, dtype=_tensor_dtype(torch, _PROMPT_TOKEN_DTYPE_NAME))
+    except (RuntimeError, OverflowError):
+        logger.warning(
+            "token id outside %s; sending this prompt as int64, which doubles its wire size",
+            _PROMPT_TOKEN_DTYPE_NAME,
+        )
+        return torch.tensor(prompt, dtype=torch.int64)
+
+
+def _is_token_id(value: object) -> bool:
+    """True for an integer token id. ``bool`` is an ``int`` subclass and is not one."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _require_token_ids(prompt: list, *, location: str) -> None:
+    for index, value in enumerate(prompt):
+        if not _is_token_id(value):
+            raise ValueError(f"{location}[{index}] must be an integer token id, got {value!r}")
+
+
+def _pack_token_prompts(prompts):
+    """Move pre-tokenized prompts into the frame's tensor section.
+
+    ``wire`` routes a tensor to the safetensors tensor section and everything
+    else into the header as JSON, so a ``list[int]`` prompt travels as JSON
+    text inside what is nominally a binary frame: roughly 7 bytes per token,
+    plus a per-token encode cost paid inside the caller's submit latency.
+    Handing ``wire`` tensors instead puts the token ids in the section built
+    for them.
+
+    Strings are left alone -- they are not token ids and the server tokenizes
+    them. Empty lists are left alone so the server's own non-empty check is
+    the one that rejects them, rather than this becoming a second, differently
+    worded validation.
+    """
+    if _tensor_prompts_disabled():
+        return prompts
+    torch = _load_torch()
+    if torch.is_tensor(prompts) or not isinstance(prompts, list) or not prompts:
+        return prompts
+    # A flat list of token ids is one prompt. Every element has to be an int;
+    # a later float or bool would otherwise be truncated into the tensor.
+    if _is_token_id(prompts[0]):
+        _require_token_ids(prompts, location="prompts")
+        return _as_token_tensor(prompts)
+    packed = []
+    for index, prompt in enumerate(prompts):
+        if isinstance(prompt, list) and prompt and _is_token_id(prompt[0]):
+            _require_token_ids(prompt, location=f"prompts[{index}]")
+            packed.append(_as_token_tensor(prompt))
+        else:
+            packed.append(prompt)
+    return packed
+
+
 def _sql_string_literal(value: str) -> str:
     """Return ``value`` as a single-quoted Snowflake SQL string."""
     return "'" + value.replace("'", "''") + "'"
@@ -1192,6 +1371,9 @@ class CortexTrainingClient:
         self._fwd_bwd_send_count = 0
         self._fwd_bwd_request_debug: dict[str, dict[str, Any]] = {}
         self._generate_request_ids: set[str] = set()
+        # Forward request ids awaiting poll, so a result that is only
+        # ``{"job_id", "payload_b64"}`` (no ``wire_format``) can still be decoded.
+        self._forward_request_ids: set[str] = set()
         # Per-job cache of the sampling sub-job's ``inference_config.max_seq_len``
         # (the value the backend launches vLLM with as ``max_model_len``). Used
         # to validate generate prompt lengths client-side. A cached ``None``
@@ -1593,7 +1775,7 @@ class CortexTrainingClient:
                         status_int = None
                     outcome = (
                         "successful response"
-                        if status_int is not None and 200 <= status_int < 400
+                        if status_int is not None and 200 <= status_int < 300
                         else "failed response"
                     )
                     snowflake = (
@@ -1628,6 +1810,13 @@ class CortexTrainingClient:
                         f"The database may already exist but your role lacks USAGE on it. "
                         f"Create it manually in Snowsight: CREATE DATABASE IF NOT EXISTS {self.database};"
                     )
+                # requests.Response.raise_for_status() intentionally ignores 3xx.
+                if 300 <= resp.status_code < 400:
+                    raise requests.exceptions.HTTPError(
+                        f"Unexpected redirect {resp.status_code} for url: {url}",
+                        response=resp,
+                        request=getattr(resp, "request", None),
+                    )
                 resp.raise_for_status()
                 return resp
 
@@ -1655,8 +1844,8 @@ class CortexTrainingClient:
 
         Each :class:`SubJobConfig` is validated client-side before the request
         is sent (see :meth:`SubJobConfig.validate`). A job supports zero or one
-        ``training`` sub-job and any number of ``sampling`` /
-        ``log_probability`` sub-jobs. ``job_id`` is optional;
+        ``training`` sub-job and any number of ``sampling`` sub-jobs;
+        ``log_probability`` sub-jobs are rejected here. ``job_id`` is optional;
         when omitted the server generates one. ``experiment_name`` is optional;
         when omitted the server auto-creates an experiment for the job.
         ``hardware`` is optional (:class:`Hardware`.H200 / .B200 / .B300); when
@@ -1691,7 +1880,10 @@ class CortexTrainingClient:
                 raise ValueError(
                     "pending_timeout_seconds must be between 300 and 604800"
                 )
-        for sj in sub_jobs:
+        for index, sj in enumerate(sub_jobs):
+            _reject_log_probability_sub_job(
+                sj.job_type, location=f"sub_jobs[{index}].job_type"
+            )
             SubJobConfig.model_validate(sj.model_dump(by_alias=True))
         body: dict = {"sub_job_configs": [sj.to_wire() for sj in sub_jobs]}
         if job_id is not None:
@@ -1714,22 +1906,32 @@ class CortexTrainingClient:
         while :meth:`create_job` remains the typed path for Python callers.
 
         A job supports zero or one ``training`` sub-job and any number of
-        ``sampling`` / ``log_probability`` sub-jobs; a second training sub-job
-        raises :class:`ValueError` before the request is sent.
+        ``sampling`` sub-jobs; a second training sub-job or any
+        ``log_probability`` sub-job raises :class:`ValueError` before the
+        request is sent.
+
+        Every ``peft_config`` present in the body is canonicalized in place and
+        an invalid one raises :class:`ValueError` before the request is sent.
+        The rest of the body, including ``optimizer``, is forwarded as given.
         """
         if not isinstance(body, dict):
             raise ValueError("create_job_from_body requires a JSON object")
         sub_job_configs = body.get("sub_job_configs")
         if not isinstance(sub_job_configs, list) or not sub_job_configs:
             raise ValueError("create_job_from_body requires a non-empty sub_job_configs list")
-        training_sub_jobs = sum(
-            1
-            for cfg in sub_job_configs
-            if isinstance(cfg, dict)
-            and str(cfg.get("job_type") or "").strip().lower() == JobType.TRAINING.value
-        )
-        if training_sub_jobs > 1:
-            raise ValueError("at most one training sub-job is supported per job")
+        training_sub_jobs = 0
+        for index, cfg in enumerate(sub_job_configs):
+            if not isinstance(cfg, dict):
+                continue
+            job_type = cfg.get("job_type")
+            _reject_log_probability_sub_job(
+                job_type, location=f"sub_job_configs[{index}].job_type"
+            )
+            if str(job_type or "").strip().lower() == JobType.TRAINING.value:
+                training_sub_jobs += 1
+                if training_sub_jobs > 1:
+                    raise ValueError("at most one training sub-job is supported per job")
+        _validate_raw_sub_job_configs(sub_job_configs)
         if body.get("debug") and not _debug_options_enabled():
             raise ValueError(
                 "create-job debug options are an internal-only capability; set "
@@ -2226,9 +2428,45 @@ class CortexTrainingClient:
     _MAX_FWD_BWD_BYTES = 60 * 1024 * 1024  # 60 MB
 
     # Maximum payload size for generate / generate_stream request bodies.
-    # The encoded JSON body must stay under this cap; oversized requests fail
-    # fast client-side with a clear message.
+    # The encoded frame must stay under this cap; generate splits an oversized
+    # frame into request chunks, while generate_stream fails fast client-side
+    # with a clear message.
     _MAX_GENERATE_BYTES = 60 * 1024 * 1024  # 60 MB
+
+    def _build_generate_frame(
+        self,
+        op: str,
+        job_id: str,
+        prompts,
+        sampling_params,
+        routing_key,
+        strict,
+    ) -> bytes:
+        """Encode a generate request body, for both the unary and stream calls.
+
+        The two calls take the same logical fields and the server reads them
+        from the same request model, so any difference in how they encode is a
+        bug waiting to happen -- and was one: ``generate_stream`` built its
+        body with ``json.dumps`` long after ``generate`` had moved token ids
+        into the frame's tensor section, so streaming callers silently kept
+        paying the JSON encoding for every token.
+
+        ``op`` only names the caller in the length-check error message.
+        """
+        self._check_prompt_lengths(op, job_id, prompts)
+        # Packed after validation so the check above still reads plain lists,
+        # and so a rejected prompt is never converted for nothing.
+        payload: dict = {"prompts": _pack_token_prompts(prompts)}
+        if sampling_params is not None:
+            payload["sampling_params"] = sampling_params
+        if routing_key is not None:
+            payload["routing_key"] = routing_key
+        if strict is not None:
+            payload["strict"] = strict
+        return wire.dumps(
+            payload,
+            metadata={"response_options": {"format": "dssst1", "delivery": "chunked"}},
+        )
 
     def _check_generate_payload(self, op: str, body: bytes) -> None:
         if len(body) > self._MAX_GENERATE_BYTES:
@@ -2280,17 +2518,40 @@ class CortexTrainingClient:
         a generation prompt must be strictly shorter than ``max_model_len`` so
         at least one output token fits, i.e. it is rejected when
         ``len(prompt_token_ids) >= max_seq_len``. Only pre-tokenized prompts
-        (``list[int]``) are validated here, since their token count is exact;
-        string prompts would require replicating the server tokenizer and are
-        left to fail server-side.
+        are validated here, since their token count is exact; string prompts
+        would require replicating the server tokenizer and are left to fail
+        server-side.
+
+        Tensors count as pre-tokenized. They are a supported wire shape for
+        token ids, and matching on ``list`` alone let one through unchecked --
+        silently trading a clear client-side error for vLLM's much later
+        ``maximum model length`` failure.
         """
-        if not any(isinstance(p, list) for p in prompts):
+        torch = _load_torch()
+
+        def _pretokenized(p) -> bool:
+            return isinstance(p, list) or torch.is_tensor(p)
+
+        # ``prompts`` is either one prompt or a batch of them. Iterating one
+        # prompt yields its tokens, which the loop below would then read as
+        # prompts: a flat ``list[int]`` lands on ``int``, which is not
+        # pre-tokenized, so the whole check is skipped; a bare tensor lands on
+        # 0-d scalars, which are tensors, so the check proceeds and ``len()``
+        # raises on them. Wrapping first means one prompt is checked as one
+        # prompt in either shape, and reads the argument the same way
+        # ``_pack_token_prompts`` does.
+        if torch.is_tensor(prompts) or (
+            isinstance(prompts, list) and prompts and _is_token_id(prompts[0])
+        ):
+            prompts = [prompts]
+
+        if not any(_pretokenized(p) for p in prompts):
             return
         max_seq_len = self._resolve_sampling_max_seq_len(job_id)
         if max_seq_len is None:
             return
         for i, prompt in enumerate(prompts):
-            if not isinstance(prompt, list):
+            if not _pretokenized(prompt):
                 continue
             n = len(prompt)
             if n >= max_seq_len:
@@ -2436,27 +2697,17 @@ class CortexTrainingClient:
 
         Prompt-length validation is asymmetric by input type:
 
-        * **Pre-tokenized prompts** (``list[int]``) are checked client-side
-          against the sampling sub-job's ``max_seq_len`` and fail fast with a
+        * **Pre-tokenized prompts** are checked client-side against the
+          sampling sub-job's ``max_seq_len`` and fail fast with a
           ``ValueError`` when ``len(prompt) >= max_seq_len`` — the token count
-          is exact, so this never rejects a prompt vLLM would accept.
+          is exact, so this never rejects a prompt vLLM would accept. A flat
+          ``list[int]``, and a bare 1-D tensor, each count as one prompt.
         * **String prompts** are *not* validated here. Counting their tokens
           would require replicating the server tokenizer (including special
           tokens), so an over-long string instead fails server-side in vLLM
           with a ``maximum model length`` error rather than client-side.
         """
-        payload: dict = {"prompts": prompts}
-        if sampling_params is not None:
-            payload["sampling_params"] = sampling_params
-        if routing_key is not None:
-            payload["routing_key"] = routing_key
-        if strict is not None:
-            payload["strict"] = strict
-        self._check_prompt_lengths("generate", job_id, prompts)
-        body = wire.dumps(
-            payload,
-            metadata={"response_options": {"format": "dssst1", "delivery": "chunked"}},
-        )
+        body = self._build_generate_frame("generate", job_id, prompts, sampling_params, routing_key, strict)
         response = self._post_octet_request_chunks(
             job_id=job_id,
             path_suffix="generate",
@@ -2479,23 +2730,20 @@ class CortexTrainingClient:
     ) -> dict:
         """Start a streaming generate request. Returns the response body.
 
+        The body is the same DSSST1 safetensors frame :meth:`generate` sends,
+        under ``application/octet-stream``. Unlike ``generate`` it is never
+        split into request chunks: the frame goes out in one POST and must fit
+        under 60 MiB.
+
         Progress is read with :meth:`get_request_status` using the returned
         ``request_id``. Cancellation uses :meth:`cancel_request`.
 
         Prompt-length validation matches :meth:`generate`: pre-tokenized
-        (``list[int]``) prompts are checked client-side against the sampling
-        sub-job's ``max_seq_len`` and fail fast, while over-long string
-        prompts are left to fail server-side in vLLM (see :meth:`generate`).
+        prompts are checked client-side against the sampling sub-job's
+        ``max_seq_len`` and fail fast, while over-long string prompts are left
+        to fail server-side in vLLM (see :meth:`generate`).
         """
-        payload: dict = {"prompts": prompts}
-        if sampling_params is not None:
-            payload["sampling_params"] = sampling_params
-        if routing_key is not None:
-            payload["routing_key"] = routing_key
-        if strict is not None:
-            payload["strict"] = strict
-        self._check_prompt_lengths("generate_stream", job_id, prompts)
-        body = json.dumps(payload).encode("utf-8")
+        body = self._build_generate_frame("generate_stream", job_id, prompts, sampling_params, routing_key, strict)
         self._check_generate_payload("generate_stream", body)
         resp = self._send(
             "POST",
@@ -2640,13 +2888,17 @@ class CortexTrainingClient:
                 "configuration to bring the serialized input batch under "
                 "the limit."
             )
-        return self._operation(
+        body = self._operation(
             job_id,
             "forward",
             payload=payload,
             sub_job_id=sub_job_id,
             sub_job_type=sub_job_type,
         )
+        request_id = body.get("request_id") if isinstance(body, dict) else None
+        if isinstance(request_id, str) and request_id:
+            self._forward_request_ids.add(request_id)
+        return body
 
     def fwd(
         self,
@@ -2838,6 +3090,19 @@ class CortexTrainingClient:
         decoded = wire.loads(payload)
         if not isinstance(decoded, dict):
             raise RuntimeError("DSSST1 result payload did not decode to a dict")
+        return CortexTrainingClient._merge_transport_metrics(decoded, result)
+
+    @staticmethod
+    def _merge_transport_metrics(decoded: dict, envelope: dict) -> dict:
+        transport_metrics = envelope.get("metrics")
+        if not isinstance(transport_metrics, dict):
+            return decoded
+        decoded = dict(decoded)
+        payload_metrics = decoded.get("metrics")
+        if isinstance(payload_metrics, dict):
+            decoded["metrics"] = {**payload_metrics, **transport_metrics}
+        else:
+            decoded["metrics"] = dict(transport_metrics)
         return decoded
 
     @staticmethod
@@ -2877,6 +3142,26 @@ class CortexTrainingClient:
             result = dict(result)
             result["results"] = self._restore_generate_result_lists(result["results"])
         return result
+
+    def _normalize_forward_result_if_needed(self, request_id: str, result: dict) -> dict:
+        """Decode a forward result that is only a base64 DSSST1 blob.
+
+        A current backend returns a self-describing envelope that
+        :meth:`_decode_result_payload` already handles. An older backend
+        returns ``{"job_id", "payload_b64"}`` with no ``wire_format``.
+        """
+        if request_id not in self._forward_request_ids:
+            return result
+        self._forward_request_ids.discard(request_id)
+        if not isinstance(result, dict) or result.get("wire_format"):
+            return result
+        raw = result.get("payload_b64")
+        if not isinstance(raw, str) or not raw:
+            return result
+        decoded = wire.loads(base64.b64decode(raw))
+        if not isinstance(decoded, dict):
+            raise RuntimeError("legacy forward payload_b64 did not decode to a dict")
+        return self._merge_transport_metrics(decoded, result)
 
     @staticmethod
     def _decode_stream_result_event(event: Any) -> Any:
@@ -2931,12 +3216,17 @@ class CortexTrainingClient:
             if state in ("completed", "done", "succeeded"):
                 if result_chunks:
                     result = wire.decode_result_chunks(result_chunks)
+                    result = self._merge_transport_metrics(
+                        result,
+                        status.get("result") or {},
+                    )
                 else:
                     result = status.get("result") or {}
                     decoded = self._decode_result_payload(result)
                     if decoded is not None:
                         result = decoded
                 result = self._normalize_generate_result_if_needed(request_id, result)
+                result = self._normalize_forward_result_if_needed(request_id, result)
                 if debug_label is not None:
                     logger.debug(
                         "%s completed state=%s result=%s",
@@ -2958,6 +3248,7 @@ class CortexTrainingClient:
                     )
                     self._fwd_bwd_request_debug.pop(request_id, None)
                 self._generate_request_ids.discard(request_id)
+                self._forward_request_ids.discard(request_id)
                 raise RuntimeError(f"Request {request_id} ended with state '{state}': {error}")
             if received_chunk:
                 # Defensive: if the server returns a chunk without next_cursor
@@ -2969,6 +3260,7 @@ class CortexTrainingClient:
             logger.debug("%s timed out after %ss", debug_label, self.poll_timeout)
             self._fwd_bwd_request_debug.pop(request_id, None)
         self._generate_request_ids.discard(request_id)
+        self._forward_request_ids.discard(request_id)
         raise TimeoutError(f"Request {request_id} did not complete within {self.poll_timeout}s")
 
     @_track_operation("get_request_status")
