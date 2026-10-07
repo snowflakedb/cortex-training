@@ -84,6 +84,7 @@ Browse the [recipe index](recipes/README.md) for all workflows.
 - [REST API reference](docs/reference/rest-api.md): HTTP endpoints and wire format
 - [Model compatibility](docs/reference/model-compatibility.md): supported models, methods, and hardware configurations
 - [RL framework integrations](docs/integrations/README.md): run SkyRL, VERL, TRL, and other RL frameworks on Cortex infrastructure
+- [Logs and metrics](docs/guides/operations/logs-and-metrics.md): download logs, inspect client telemetry, and plot GPU metrics
 
 ## Development
 
