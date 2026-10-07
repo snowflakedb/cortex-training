@@ -154,6 +154,72 @@ _CHUNK_GROUP_ERROR_CODES = {
     "chunk_group_missing_chunks",
 }
 
+# Ceiling on one ``/operation`` JSON request body. A binary payload is
+# base64-encoded and inflated 4/3, so this default is conservative relative
+# to the 60 MiB octet-stream budget. Raise it via the env var once the real
+# ceiling is measured.
+_OPERATION_MAX_JSON_BYTES_ENV = "CORTEX_TRAINING_FORWARD_OPERATION_MAX_JSON_BYTES"
+_DEFAULT_OPERATION_MAX_JSON_BYTES = 16 * 1024 * 1024
+_MIN_OPERATION_MAX_JSON_BYTES = 16 * 1024
+
+# Headroom for everything in the envelope that is not the base64 payload:
+# ``operation_type``, the routing hints, the JSON punctuation and key names.
+_OPERATION_ENVELOPE_OVERHEAD_BYTES = 4096
+
+
+def _operation_max_json_bytes() -> int:
+    """Read the per-request ``/operation`` JSON body ceiling from the env."""
+    raw = os.environ.get(_OPERATION_MAX_JSON_BYTES_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_OPERATION_MAX_JSON_BYTES
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{_OPERATION_MAX_JSON_BYTES_ENV} must be an integer, got {raw!r}"
+        ) from exc
+    if value < _MIN_OPERATION_MAX_JSON_BYTES:
+        raise ValueError(
+            f"{_OPERATION_MAX_JSON_BYTES_ENV} must be at least "
+            f"{_MIN_OPERATION_MAX_JSON_BYTES} bytes"
+        )
+    return value
+
+
+def _operation_chunk_max_bytes(max_json_bytes: int) -> int:
+    """Raw frame bytes that fit one ``/operation`` body once base64-inflated."""
+    return max(1, (max_json_bytes - _OPERATION_ENVELOPE_OVERHEAD_BYTES) * 3 // 4)
+
+
+def _operation_body_json_bytes(body: dict) -> int:
+    """Encoded size of an operation body without re-serializing its payload.
+
+    ``json.dumps`` on a body holding a multi-megabyte base64 string copies that
+    string. The base64 alphabet needs no JSON escaping and is single-byte in
+    UTF-8, so the payload's encoded length is its character count: measure the
+    envelope around an empty placeholder and add that count back.
+    """
+    payload = body.get("payload")
+    raw = payload.get("payload_b64") if isinstance(payload, dict) else None
+    if not isinstance(raw, str):
+        return len(json.dumps(body).encode("utf-8"))
+    skeleton = {**body, "payload": {**payload, "payload_b64": ""}}
+    return len(json.dumps(skeleton).encode("utf-8")) + len(raw)
+
+
+def _log_safe_operation_body(body: dict) -> dict:
+    """Replace an operation body's base64 payload with its length for logging."""
+    payload = body.get("payload")
+    if not isinstance(payload, dict) or not isinstance(payload.get("payload_b64"), str):
+        return body
+    return {
+        **body,
+        "payload": {
+            **payload,
+            "payload_b64": f"<{len(payload['payload_b64'])} base64 chars>",
+        },
+    }
+
 
 class ChunkGroupError(requests.exceptions.HTTPError):
     """Base class for structured chunk-group failures."""
@@ -2850,8 +2916,15 @@ class CortexTrainingClient:
         payload: dict | bytes | bytearray | memoryview | None = None,
         sub_job_id: str | None = None,
         sub_job_type: str | None = None,
+        max_json_bytes: int | None = None,
+        retry_on: Callable[[BaseException], bool] | None = None,
     ) -> dict:
-        """Submit a generic data-plane operation to the routed sub-job."""
+        """Submit a generic data-plane operation to the routed sub-job.
+
+        ``max_json_bytes``, when set, fails fast if the encoded body exceeds it.
+        ``retry_on`` overrides the retry predicate when passed; chunk posts use
+        one that excludes structured chunk-group conflicts.
+        """
         body: dict = {"operation_type": operation_type}
         if sub_job_id is not None:
             body["sub_job_id"] = sub_job_id
@@ -2864,9 +2937,84 @@ class CortexTrainingClient:
             }
         if payload is not None:
             body["payload"] = payload
-        print(f"***** POST operation {self._prefix}/{job_id}/operation {body=}")
-        resp = self._send("POST", f"{self._prefix}/{job_id}/operation", json=body)
+        if max_json_bytes is not None:
+            encoded_bytes = _operation_body_json_bytes(body)
+            if encoded_bytes > max_json_bytes:
+                raise ValueError(
+                    f"{operation_type} operation body is {encoded_bytes} bytes, which "
+                    f"exceeds the {max_json_bytes}-byte limit for one /operation "
+                    f"request. Lower {_OPERATION_MAX_JSON_BYTES_ENV} so the payload is "
+                    f"split into more chunks, or raise it if the deployment allows "
+                    f"larger JSON bodies."
+                )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "POST operation %s/%s/operation body=%s",
+                self._prefix,
+                job_id,
+                self._debug_json_summary(_log_safe_operation_body(body)),
+            )
+        kwargs: dict[str, Any] = {}
+        if retry_on is not None:
+            kwargs["retry_on"] = retry_on
+        resp = self._send(
+            "POST",
+            f"{self._prefix}/{job_id}/operation",
+            json=body,
+            **kwargs,
+        )
         return resp.json()
+
+    def _post_operation_request_chunks(
+        self,
+        job_id: str,
+        *,
+        operation_type: str,
+        frame: bytes,
+        sub_job_id: str | None = None,
+        sub_job_type: str | None = None,
+    ) -> dict:
+        """Send a DSSST1 frame through ``/operation``, byte-chunked if oversized."""
+        max_json_bytes = _operation_max_json_bytes()
+        # The server assembler rejects total_chunks <= 1, so a fitting frame
+        # is posted raw.
+        chunks = wire.encode_byte_chunks(
+            frame,
+            kind="request",
+            operation=operation_type,
+            max_bytes=_operation_chunk_max_bytes(max_json_bytes),
+        )
+        final_body: dict | None = None
+        for idx, chunk in enumerate(chunks):
+            try:
+                body = self._operation(
+                    job_id,
+                    operation_type,
+                    payload=chunk,
+                    sub_job_id=sub_job_id,
+                    sub_job_type=sub_job_type,
+                    max_json_bytes=max_json_bytes,
+                    retry_on=_is_chunk_post_transient,
+                )
+            except requests.exceptions.HTTPError as exc:
+                detail = _chunk_group_error_detail(exc.response)
+                if detail is None:
+                    raise
+                raise ChunkGroupConflictError(
+                    str(detail.get("message") or detail.get("code")),
+                    response=exc.response,
+                    detail=detail,
+                ) from exc
+            if idx < len(chunks) - 1:
+                if isinstance(body, dict) and body.get("request_id"):
+                    raise RuntimeError(
+                        f"{operation_type} chunk {idx} unexpectedly returned request_id"
+                    )
+            else:
+                final_body = body
+        if final_body is None:
+            raise RuntimeError(f"{operation_type} produced no request body")
+        return final_body
 
     @_track_operation("forward")
     def forward(
@@ -2877,24 +3025,30 @@ class CortexTrainingClient:
         sub_job_id: str | None = None,
         sub_job_type: str | None = None,
     ) -> dict:
-        """Submit a generic forward operation. Returns the response body."""
-        if isinstance(payload, (bytes, bytearray, memoryview)) and len(payload) > self._MAX_FWD_BWD_BYTES:
-            size_mb = len(payload) / (1024 * 1024)
-            raise ValueError(
-                f"forward payload is {size_mb:.1f} MB, which exceeds the "
-                "maximum allowed size of "
-                f"{self._MAX_FWD_BWD_BYTES / (1024 * 1024):.0f} MB. "
-                "Reduce the batch size or sequence length in your training "
-                "configuration to bring the serialized input batch under "
-                "the limit."
+        """Submit a generic forward operation. Returns the response body.
+
+        A ``bytes`` payload is a DSSST1 frame; it is byte-chunked across as many
+        ``/operation`` POSTs as the JSON body ceiling requires and reassembled by
+        the backend. Only the final POST returns the pollable ``request_id``;
+        poll it with :meth:`poll_request`. Dict payloads stay a single plain
+        ``/operation`` POST.
+        """
+        if isinstance(payload, (bytes, bytearray, memoryview)):
+            body = self._post_operation_request_chunks(
+                job_id,
+                operation_type="forward",
+                frame=bytes(payload),
+                sub_job_id=sub_job_id,
+                sub_job_type=sub_job_type,
             )
-        body = self._operation(
-            job_id,
-            "forward",
-            payload=payload,
-            sub_job_id=sub_job_id,
-            sub_job_type=sub_job_type,
-        )
+        else:
+            body = self._operation(
+                job_id,
+                "forward",
+                payload=payload,
+                sub_job_id=sub_job_id,
+                sub_job_type=sub_job_type,
+            )
         request_id = body.get("request_id") if isinstance(body, dict) else None
         if isinstance(request_id, str) and request_id:
             self._forward_request_ids.add(request_id)

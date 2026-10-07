@@ -29,6 +29,7 @@ Two suites:
 from __future__ import annotations
 
 import base64
+import contextlib
 import gzip
 import importlib
 import json
@@ -2716,12 +2717,165 @@ class TestDataPlane:
             },
         }
 
-    def test_forward_rejects_oversized_bytes_payload(self):
+    def test_forward_chunk_envelope_keys_match_the_backend_reader(self, monkeypatch):
+        """Pin the envelope shape the backend parses: payload_b64 + content_type."""
+        from cortex_training import wire
+
+        monkeypatch.setenv(nc._OPERATION_MAX_JSON_BYTES_ENV, str(64 * 1024))
+        c = _make_client(post_json={"chunk_cached": True})
+        frame = wire.dumps({"input_ids": torch.zeros(1, 60_000, dtype=torch.long)})
+        with contextlib.suppress(RuntimeError):
+            c.forward("j1", frame, sub_job_id="j1:training:0")
+
+        assert c._session.post.call_count > 1
+        for call in c._session.post.call_args_list:
+            payload = call.kwargs["json"]["payload"]
+            assert set(payload) == {"payload_b64", "content_type"}
+            assert payload["content_type"] == "application/octet-stream"
+            assert isinstance(payload["payload_b64"], str)
+
+    def test_forward_sends_a_fitting_frame_as_one_unchunked_post(self):
+        # The server assembler rejects total_chunks <= 1, so a fitting frame
+        # is posted raw.
+        from cortex_training import wire
+
         c = _make_client(post_json={"request_id": "r-forward"})
-        oversized = b"\x00" * (CortexTrainingClient._MAX_FWD_BWD_BYTES + 1)
-        with pytest.raises(ValueError, match="exceeds the maximum allowed size"):
-            c.forward("j1", oversized)
+        frame = wire.dumps({"input_ids": torch.zeros(2, 4, dtype=torch.long)})
+        c.forward("j1", frame, sub_job_id="j1:training:0")
+        assert c._session.post.call_count == 1
+        payload = c._session.post.call_args.kwargs["json"]["payload"]
+        sent = base64.b64decode(payload["payload_b64"])
+        assert sent == frame
+        assert wire.read_byte_chunk_metadata(sent) is None
+        assert "r-forward" in c._forward_request_ids
+
+    def test_forward_chunks_an_oversized_frame_across_operation_posts(self, monkeypatch):
+        from cortex_training import wire
+
+        max_json = 64 * 1024
+        monkeypatch.setenv(nc._OPERATION_MAX_JSON_BYTES_ENV, str(max_json))
+        frame = wire.dumps({"input_ids": torch.zeros(1, 60_000, dtype=torch.long)})
+        expected_chunks = len(
+            wire.encode_byte_chunks(
+                frame,
+                kind="request",
+                operation="forward",
+                max_bytes=nc._operation_chunk_max_bytes(max_json),
+            )
+        )
+        assert expected_chunks > 1
+
+        c = _make_client()
+        bodies = [{"chunk_cached": True}] * (expected_chunks - 1) + [{"request_id": "r-forward"}]
+        c._session.post.side_effect = [_make_response(body) for body in bodies]
+
+        out = c.forward("j1", frame, sub_job_id="j1:training:0")
+        assert out == {"request_id": "r-forward"}
+        assert "r-forward" in c._forward_request_ids
+        assert c._session.post.call_count == expected_chunks
+
+        chunks = []
+        for call in c._session.post.call_args_list:
+            body = call.kwargs["json"]
+            assert body["operation_type"] == "forward"
+            assert body["sub_job_id"] == "j1:training:0"
+            assert len(json.dumps(body).encode("utf-8")) <= 64 * 1024
+            chunks.append(base64.b64decode(body["payload"]["payload_b64"]))
+
+        descriptors = [wire.read_byte_chunk_metadata(chunk) for chunk in chunks]
+        assert all(desc is not None for desc in descriptors)
+        assert {desc["operation"] for desc in descriptors} == {"forward"}
+        assert len({desc["chunk_group_id"] for desc in descriptors}) == 1
+        assert wire.decode_byte_chunks(chunks, kind="request") == frame
+
+    def test_forward_raises_when_a_non_final_chunk_returns_a_request_id(self, monkeypatch):
+        from cortex_training import wire
+
+        monkeypatch.setenv(nc._OPERATION_MAX_JSON_BYTES_ENV, str(64 * 1024))
+        c = _make_client(post_json={"request_id": "r-forward"})
+        frame = wire.dumps({"input_ids": torch.zeros(1, 60_000, dtype=torch.long)})
+        with pytest.raises(RuntimeError, match="chunk 0 unexpectedly returned request_id"):
+            c.forward("j1", frame)
+        assert "r-forward" not in c._forward_request_ids
+
+    def test_operation_rejects_a_body_over_the_declared_ceiling(self):
+        c = _make_client(post_json={})
+        with pytest.raises(ValueError, match="exceeds the .* limit for one /operation"):
+            c._operation("j1", "forward", payload=b"\x00" * 4096, max_json_bytes=1024)
         c._session.post.assert_not_called()
+
+    def test_forward_does_not_retry_a_chunk_group_conflict(self, monkeypatch):
+        from cortex_training import wire
+
+        monkeypatch.setenv(nc._OPERATION_MAX_JSON_BYTES_ENV, str(64 * 1024))
+        c = _make_client()
+        conflict = _make_error_response(
+            {
+                "code": "chunk_group_missing_chunks",
+                "message": "request chunk group is missing chunks",
+                "chunk_group_id": "grp-1",
+                "missing_chunks": [0, 1],
+            }
+        )
+        c._session.post.return_value = conflict
+        frame = wire.dumps({"input_ids": torch.zeros(1, 60_000, dtype=torch.long)})
+
+        with pytest.raises(nc.ChunkGroupConflictError) as excinfo:
+            c.forward("j1", frame)
+        assert excinfo.value.detail["missing_chunks"] == [0, 1]
+        assert c._session.post.call_count == 1
+
+    def test_operation_body_size_is_measured_without_copying_the_payload(self):
+        body = {
+            "operation_type": "forward",
+            "sub_job_id": "j1:training:0",
+            "payload": {"payload_b64": "QUJD" * 1000, "content_type": "application/octet-stream"},
+        }
+        assert nc._operation_body_json_bytes(body) == len(json.dumps(body).encode("utf-8"))
+        no_payload = {"operation_type": "step"}
+        assert nc._operation_body_json_bytes(no_payload) == len(
+            json.dumps(no_payload).encode("utf-8")
+        )
+
+    def test_operation_without_a_declared_ceiling_is_unbounded(self):
+        c = _make_client(post_json={"ok": True})
+        assert c._operation("j1", "weight-sync", payload=b"\x00" * 4096) == {"ok": True}
+        c._session.post.assert_called_once()
+
+    def test_forward_operation_json_ceiling_env_must_be_sane(self, monkeypatch):
+        monkeypatch.setenv(nc._OPERATION_MAX_JSON_BYTES_ENV, "not-a-number")
+        with pytest.raises(ValueError, match="must be an integer"):
+            nc._operation_max_json_bytes()
+        monkeypatch.setenv(
+            nc._OPERATION_MAX_JSON_BYTES_ENV,
+            str(nc._MIN_OPERATION_MAX_JSON_BYTES - 1),
+        )
+        with pytest.raises(ValueError, match="must be at least 16384 bytes"):
+            nc._operation_max_json_bytes()
+        monkeypatch.setenv(
+            nc._OPERATION_MAX_JSON_BYTES_ENV,
+            str(nc._MIN_OPERATION_MAX_JSON_BYTES),
+        )
+        assert nc._operation_max_json_bytes() == 16 * 1024
+        assert nc._operation_chunk_max_bytes(nc._operation_max_json_bytes()) == 9 * 1024
+
+    def test_forward_dict_payload_still_takes_the_plain_operation_path(self):
+        c = _make_client(post_json={"request_id": "r-forward"})
+        c.forward("j1", {"probe": True}, sub_job_type="training")
+        assert c._session.post.call_count == 1
+        assert c._session.post.call_args.kwargs["json"] == {
+            "operation_type": "forward",
+            "sub_job_type": "training",
+            "payload": {"probe": True},
+        }
+
+    def test_operation_debug_log_omits_the_base64_payload(self, caplog, capsys):
+        c = _make_client(post_json={"request_id": "r-forward"})
+        with caplog.at_level(logging.DEBUG, logger=nc.logger.name):
+            c.forward("j1", b"\xab" * 4096)
+        assert "base64 chars>" in caplog.text
+        assert base64.b64encode(b"\xab" * 4096).decode("ascii") not in caplog.text
+        assert capsys.readouterr().out == ""
 
     def test_bootstrap_router_replay(self):
         c = _make_client(post_json={"request_id": "r-bootstrap"})
