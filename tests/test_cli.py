@@ -405,6 +405,89 @@ def test_submit_dry_run_prints_the_normalized_peft_config(tmp_path):
     assert peft["target_parameters"] == []
 
 
+# Spellings a caller could plausibly put in job JSON for the unsupported
+# log-probability type.
+LOG_PROBABILITY_JOB_TYPES = [
+    "log_probability",
+    "LOG_PROBABILITY",
+    "JOB_TYPE_LOG_PROBABILITY",
+    "log_prob",
+    " log_probability ",
+]
+
+
+def _write_log_probability_job(tmp_path, job_type):
+    path = tmp_path / "log-probability.json"
+    path.write_text(
+        json.dumps(
+            {
+                "sub_job_configs": [
+                    {
+                        "job_type": "sampling",
+                        "model_name": "gpt2",
+                        "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                    },
+                    {
+                        "job_type": job_type,
+                        "model_name": "gpt2",
+                        "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.mark.parametrize("job_type", LOG_PROBABILITY_JOB_TYPES)
+def test_submit_dry_run_rejects_log_probability_sub_jobs(tmp_path, job_type):
+    stderr = io.StringIO()
+    path = _write_log_probability_job(tmp_path, job_type)
+
+    rc = cli.main(["submit", str(path), "--dry-run"], stderr=stderr)
+
+    assert rc == 1
+    assert (
+        "sub_job_configs[1].job_type: log_probability sub-jobs are not currently supported"
+        in stderr.getvalue()
+    )
+
+
+def test_submit_rejects_log_probability_sub_jobs(tmp_path):
+    instances = []
+    stderr = io.StringIO()
+    path = _write_log_probability_job(tmp_path, "log_probability")
+
+    rc = cli.main(
+        _base_args() + ["submit", str(path)],
+        client_factory=_factory(instances),
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert (
+        "sub_job_configs[1].job_type: log_probability sub-jobs are not currently supported"
+        in stderr.getvalue()
+    )
+    assert instances[0].submitted_body is None
+
+
+# The CLI duplicates these so `submit --dry-run` never imports the client; keep
+# the two copies from drifting apart.
+def test_cli_log_probability_rejection_matches_client():
+    from cortex_training import client
+
+    assert (
+        cli._LOG_PROBABILITY_JOB_TYPE_ALIASES
+        == client._LOG_PROBABILITY_JOB_TYPE_ALIASES
+    )
+    assert (
+        cli._UNSUPPORTED_LOG_PROBABILITY_MESSAGE
+        == client._UNSUPPORTED_LOG_PROBABILITY_MESSAGE
+    )
+
+
 def test_list_prints_jobs_with_status_filter():
     instances = []
     stdout = io.StringIO()
@@ -969,6 +1052,58 @@ def test_generate_can_skip_poll(tmp_path):
         "prompt_count": 1,
         "request_id": "req-generate-1",
     }
+
+
+def test_generate_counts_flat_token_list_as_one_prompt(tmp_path):
+    instances = []
+    stdout = io.StringIO()
+    path = tmp_path / "generate.json"
+    path.write_text(json.dumps({"poll": False, "prompts": [1, 2, 3]}), encoding="utf-8")
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory(instances),
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert instances[0].generate_prompts == [1, 2, 3]
+    assert json.loads(stdout.getvalue())["prompt_count"] == 1
+
+
+def test_generate_rejects_sampling_params_list_longer_than_one_flat_prompt(tmp_path):
+    path = tmp_path / "generate.json"
+    path.write_text(
+        json.dumps({"prompts": [1, 2, 3], "sampling_params": [{"max_tokens": 4}, None, None]}),
+        encoding="utf-8",
+    )
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory([]),
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert "sampling_params list length must match prompts length" in stderr.getvalue()
+
+
+def test_generate_counts_nested_token_lists_as_a_batch(tmp_path):
+    instances = []
+    stdout = io.StringIO()
+    path = tmp_path / "generate.json"
+    path.write_text(json.dumps({"poll": False, "prompts": [[1, 2], [3, 4]]}), encoding="utf-8")
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory(instances),
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert json.loads(stdout.getvalue())["prompt_count"] == 2
 
 
 def test_weight_sync_defaults_to_training_and_sampling_subjobs():

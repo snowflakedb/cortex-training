@@ -33,6 +33,12 @@ sub-jobs:
 - `sampling`: generation and sampling-side operations.
 - `log_probability`: a log-probability worker configuration.
 
+Only `training` and `sampling` sub-jobs can be submitted. Both the Python
+client and the CLI reject a `log_probability` sub-job before sending the
+request, with the location-prefixed message
+`log_probability sub-jobs are not currently supported`; the short alias
+`log_prob` is rejected the same way.
+
 The common RL layout is one training sub-job and one sampling sub-job in the
 same job.
 
@@ -137,7 +143,7 @@ TLS verification is enabled unless `verify_ssl=False` is passed.
 | Control-plane calls, `step`, `save`, `load`, `operation` | `application/json` | JSON |
 | `forward-backward` | `application/octet-stream` | DSSST1 safetensors frame, optionally split into DSSST1 request chunks |
 | `generate` | `application/octet-stream` | DSSST1 safetensors frame, optionally split into DSSST1 request chunks |
-| `generate-stream` | `application/octet-stream` | JSON encoded as UTF-8 bytes |
+| `generate-stream` | `application/octet-stream` | DSSST1 safetensors frame, sent in one request and capped at 60 MiB |
 
 Raw `torch.save`/pickle is not the current binary protocol. See
 [section 9](#9-dssst1-binary-wire-protocol).
@@ -340,16 +346,21 @@ REST body:
 ```
 
 `sub_job_configs` must be a non-empty list carrying **zero or one** `training`
-sub-job and any number of `sampling` / `log_probability` sub-jobs. A second
-training sub-job is rejected with `at most one training sub-job is supported per
-job`; the server enforces the same rule for every caller.
+sub-job and any number of `sampling` sub-jobs. A second training sub-job is
+rejected with `at most one training sub-job is supported per job`; the server
+enforces the same rule for every caller. A `log_probability` (or `log_prob`)
+sub-job is rejected client-side with
+`sub_job_configs[INDEX].job_type: log_probability sub-jobs are not currently
+supported`.
 
 The typed path validates each `SubJobConfig`; `create_job_from_body()` checks the
-outer body, the non-empty list, and the training-sub-job count before forwarding
-it. It also normalizes every `peft_config` the body carries, rewriting it in
+outer body, the non-empty list, the training-sub-job count, and each sub-job's
+`job_type` for the unsupported log-probability spellings before forwarding it.
+It also normalizes every `peft_config` the body carries, rewriting it in
 place and rejecting an invalid one before the request is sent (see
 [section 8.2](#82-trainingconfig)). Everything else in a raw body, `optimizer`
-included, is forwarded exactly as given.
+included, is forwarded exactly as given. `cortex-training submit` repeats those
+checks so `--dry-run` fails the same way without a connection.
 
 #### GPU hardware - `hardware`
 
@@ -875,17 +886,29 @@ Logical request object inside the DSSST1 frame:
 
 Rules:
 
-- `prompts` is a list of string prompts and/or token-id lists. A single
-  tokenized prompt is `[[1, 2, 3]]`, not `[1, 2, 3]`.
+- `prompts` is a list of string prompts and/or token-id lists. A flat list of
+  integers such as `[1, 2, 3]`, and a bare 1-D tensor, are each read as one
+  pre-tokenized prompt rather than as a batch. For a batch of several prompts,
+  use the nested form `[[1, 2, 3], [4, 5]]`.
 - `sampling_params` may be one object or a list of objects/null values aligned
   with `prompts`.
 - `routing_key` may be one string or an aligned list of strings/null values.
 - `strict` controls strict routing-key affinity.
 
+Pre-tokenized prompts travel in the frame's tensor section as `int32` tensors,
+not as JSON numbers in the frame header. A token id that does not fit `int32`
+falls back to `int64` for that prompt, which only doubles its wire size. String
+prompts are not converted — the server tokenizes them. Setting
+`CORTEX_TRAINING_DISABLE_TENSOR_PROMPTS` to a truthy value puts the token ids
+back in the header as JSON lists; the request body is a DSSST1 frame either
+way.
+
 For pre-tokenized prompts, the client fetches and caches the sampling sub-job's
 `inference_config.max_seq_len`. It rejects a prompt when
 `len(prompt) >= max_seq_len`, preserving room for at least one output token.
-String prompts are left for the server tokenizer to validate.
+The check runs before the tensor conversion, so the environment variable above
+does not disable it. String prompts are left for the server tokenizer to
+validate.
 
 Generate uses the same DSSST1 response options as forward/backward, but unlike
 forward/backward it sends the frame unwrapped when it fits, and only splits it
@@ -912,11 +935,18 @@ converts tensor values under `results` back to Python lists.
 
 ### 6.7 Streaming generate - `POST /{job_id}/generate-stream`
 
-`generate_stream()` accepts the same logical fields as `generate()`, but its
-body is UTF-8 JSON under `application/octet-stream`, not DSSST1.
+`generate_stream()` accepts the same logical fields as `generate()` and encodes
+them into the same DSSST1 frame, including the `int32` tensor encoding of
+pre-tokenized prompts described in [section 6.6](#66-generate---post-job_idgenerate).
 
-The encoded body must not exceed 60 MiB. This path is not request-chunked by the
-client.
+Unlike `generate`, this path is not request-chunked: the client sends the frame
+in a single POST, and the encoded body must not exceed 60 MiB.
+
+**Breaking change.** `POST /{job_id}/generate-stream` no longer accepts a
+UTF-8 JSON body. There is no dual encoding and no negotiation — the frame is
+the only accepted request form. `CORTEX_TRAINING_DISABLE_TENSOR_PROMPTS`
+changes how prompts are encoded *inside* the frame; it does not turn the body
+back into JSON. The response is unchanged.
 
 Immediate response:
 
@@ -1243,7 +1273,7 @@ Exactly one type-specific config is set.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `job_type` | `training`, `sampling`, `log_probability` | yes | Typed `JobType` enum |
+| `job_type` | `training`, `sampling`, `log_probability` | yes | Typed `JobType` enum. `log_probability` is a schema value only: the client and CLI reject it at submission |
 | `model_name` | string | yes | Must be non-empty |
 | `training_config` | object | for training | Produced from `TrainingConfig` |
 | `inference_config` | object | for sampling/log probability | Produced from `InferenceConfig` |
@@ -1564,7 +1594,14 @@ A non-chunked DSSST1 result can appear inside poll JSON as:
 }
 ```
 
-`poll_request()` base64-decodes and passes the frame to `wire.loads()`.
+`poll_request()` base64-decodes and passes the frame to `wire.loads()`. If the
+JSON envelope also has a `metrics` object, those keys are shallow-merged into
+the decoded result's `metrics`. Envelope keys win on collision. Payload
+`metrics` are kept when the envelope has none.
+
+A result with `payload_b64` but no `wire_format` is left encoded unless
+`poll_request()` is completing a `forward()` request id minted by this client.
+In that case the blob is decoded the same way and envelope `metrics` are merged.
 
 ### 9.5 Result chunks
 
@@ -1580,7 +1617,8 @@ Large results can arrive through poll events:
 
 A poll can also include `next_cursor`. `poll_request()` drains all pages,
 validates chunk SHA-256 values, uses `wire.decode_result_chunks()`, and returns
-the reconstructed object.
+the reconstructed object. Terminal-page `result.metrics` are merged into that
+object with the same envelope-wins rule as [section 9.4](#94-encoded-results).
 
 ---
 
