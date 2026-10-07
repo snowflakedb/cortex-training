@@ -832,9 +832,6 @@ class LogScreen(Screen):
                     output_dir,
                     resume=True,
                 )
-            except Exception:  # noqa: BLE001 - keep the pane; record the traceback
-                completed.put((None, traceback.format_exc()))
-            else:
                 match = next(
                     (
                         row
@@ -848,9 +845,12 @@ class LogScreen(Screen):
                 if path:
                     with self._stage_state_lock:
                         self._stage_paths[sub_job_id] = path
-                completed.put((path, None))
+                outcome = (path, None)
+            except Exception:  # noqa: BLE001 - keep the pane; record the traceback
+                outcome = (None, traceback.format_exc())
             finally:
                 self._finish_stage_fetch(sub_job_id)
+            completed.put(outcome)
 
         threading.Thread(target=download, daemon=True).start()
         worker = get_current_worker()
@@ -864,6 +864,7 @@ class LogScreen(Screen):
             return None, self._filter_gen
         if error:
             self._record_stage_error(sub_job_id, error_once, error)
+            self._post(self._start_pending_refilter, sub_job_id)
             return None, self._filter_gen
         filter_gen = self._filter_gen
         query = self._filter
@@ -873,6 +874,15 @@ class LogScreen(Screen):
             if path
             else None
         )
+        if snapshot is None:
+            self._post(self._start_pending_refilter, sub_job_id)
+        else:
+            with self._stage_state_lock:
+                if self._filter_gen == filter_gen:
+                    self._pending_refilter.discard(sub_job_id)
+                pending = sub_job_id in self._pending_refilter
+            if pending:
+                self._post(self._start_pending_refilter, sub_job_id)
         return snapshot, filter_gen
 
     def _finish_stage_fetch(self, sub_job_id: str) -> None:
@@ -883,9 +893,6 @@ class LogScreen(Screen):
                 return
             self._stage_fetching.pop(sub_job_id, None)
             self._stage_attempted.add(sub_job_id)
-            pending = sub_job_id in self._pending_refilter
-        if pending:
-            self._post(self._start_pending_refilter, sub_job_id)
 
     def _start_pending_refilter(self, sub_job_id: str) -> None:
         with self._stage_state_lock:

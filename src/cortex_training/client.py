@@ -2115,9 +2115,16 @@ class CortexTrainingClient:
         return list(names), nbytes
 
     @classmethod
-    def _write_resume_manifest(cls, destination: Path, names: list[str], nbytes: int) -> None:
+    def _write_resume_manifest(
+        cls,
+        destination: Path,
+        names: list[str],
+        nbytes: int,
+        *,
+        identity_path: Path | None = None,
+    ) -> None:
         path = cls._resume_manifest_path(destination)
-        stat = destination.stat()
+        stat = (identity_path or destination).stat()
         payload = json.dumps(
             {
                 "bytes": nbytes,
@@ -2392,12 +2399,13 @@ class CortexTrainingClient:
                 output.flush()
                 os.fsync(output.fileno())
                 output.close()
-                os.replace(state["temporary"], state["destination"])
                 self._write_resume_manifest(
                     state["destination"],
                     state["names"],
-                    state["destination"].stat().st_size,
+                    state["temporary"].stat().st_size,
+                    identity_path=state["temporary"],
                 )
+                os.replace(state["temporary"], state["destination"])
                 results.append(
                     self._artifact_result(
                         state["destination"],

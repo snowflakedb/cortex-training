@@ -3008,6 +3008,52 @@ class TestExecutionLogDownload:
         assert not list(destination.parent.glob(".*.tmp"))
         assert connection.closed
 
+    @pytest.mark.parametrize(
+        ("artifact_name", "chunk_name", "destination_name", "method_name"),
+        [
+            ("stdout", "console", "stdout.log", "download_stdout_logs"),
+            ("metrics", "gpu", "gpu.jsonl", "download_metrics"),
+        ],
+    )
+    def test_manifest_failure_preserves_existing_full_download(
+        self,
+        artifact_name,
+        chunk_name,
+        destination_name,
+        method_name,
+        tmp_path,
+        monkeypatch,
+    ):
+        c = _make_client()
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        root = f"_{artifact_name}"
+        chunk = f"{root}/job-1:training:0/{chunk_name}.20260904-120001.good.gz"
+        destination = tmp_path / "job-1:training:0" / destination_name
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"previous\n")
+        connection = self.FakeArtifactConnection(
+            {
+                run_uri + root + "/": [(f"/versions/RUN_ABC/{chunk}",)],
+                run_uri + "checkpoints/" + root + "/": [],
+            },
+            {run_uri + chunk: gzip.compress(b"new\n")},
+        )
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(
+            c, "_open_experiment_artifact_connection", lambda: connection
+        )
+
+        def fail_manifest(*_args, **_kwargs):
+            raise OSError("manifest unavailable")
+
+        monkeypatch.setattr(c, "_write_resume_manifest", fail_manifest)
+        with pytest.raises(OSError, match="manifest unavailable"):
+            getattr(c, method_name)("job-1", tmp_path)
+
+        assert destination.read_bytes() == b"previous\n"
+        assert not list(destination.parent.glob(".*.tmp"))
+        assert connection.closed
+
     def test_download_metrics_rejects_duplicate_roots_before_get(
         self, tmp_path, monkeypatch
     ):
