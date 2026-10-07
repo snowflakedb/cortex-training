@@ -16,7 +16,9 @@ dependencies = [
     "tenacity>=8.2.0",
     "snowflake-connector-python>=3.17.0,<5",
     "torch",
-    "safetensors",
+    # cortex_training.wire uses safetensors.torch, which imports numpy, and
+    # calls Tensor.numpy() directly; the [torch] extra is what declares numpy.
+    "safetensors[torch]",
     "textual>=0.50",
     "pydantic>=2.0.0"
 ]
