@@ -2234,8 +2234,16 @@ class CortexTrainingClient:
         lock_key = hashlib.sha256(
             f"{root.resolve(strict=False)}\0{artifact_name}".encode()
         ).hexdigest()
-        lock_root = Path(tempfile.gettempdir()) / "cortex-training-download-locks"
-        lock_root.mkdir(parents=True, exist_ok=True)
+        user_key = (
+            str(os.getuid())
+            if hasattr(os, "getuid")
+            else hashlib.sha256(str(Path.home()).encode()).hexdigest()[:16]
+        )
+        lock_root = (
+            Path(tempfile.gettempdir())
+            / f"cortex-training-download-locks-{user_key}"
+        )
+        lock_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         lock_path = lock_root / lock_key
         with lock_path.open("a+b") as lock:
             if os.name == "nt":

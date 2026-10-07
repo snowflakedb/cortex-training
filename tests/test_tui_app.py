@@ -1104,13 +1104,18 @@ async def _run_filter_during_first_saved_stage(tmp_path):
         )
         assert ready, "first saved-console download did not start"
         screen = app.screen
+        screen._paused = True
         screen._filter = "keep"
         screen._refilter()
         release.set()
-        filtered = await _wait(
-            pilot, app, lambda: screen._shown_lines == ["keep this"]
+        queued = await _wait(
+            pilot, app, lambda: screen._pending_stage == ["keep this"]
         )
-        assert filtered, "latest filter was not applied to the downloaded console"
+        assert queued, "latest filter was not queued after the download"
+        assert screen._paused
+        assert screen._shown_lines != ["keep this"]
+        screen.action_toggle_pause()
+        assert screen._shown_lines == ["keep this"]
         assert calls == [1]
         await _settle(app, pilot)
 

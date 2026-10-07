@@ -3334,7 +3334,7 @@ def test_gzip_reconstructions_do_not_overlap(tmp_path):
     full_dir = tmp_path / "full"
     kwargs["resume"] = False
     client._download_gzip_artifacts("job-1", str(full_dir), **kwargs)
-    assert not (full_dir / ".stdout.download.lock").exists()
+    assert not full_dir.exists()
 
 
 def test_gzip_resume_lock_serializes_processes(tmp_path):

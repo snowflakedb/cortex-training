@@ -412,9 +412,6 @@ class LogScreen(Screen):
         self._pending_stage = None
         if not is_active_status(self._job_status):
             self._filter_gen += 1
-            if self._paused:
-                self._paused = False
-                self._update_subtitle()
             with self._stage_state_lock:
                 self._pending_refilter.add(source)
                 fetching = self._stage_fetching.get(source, 0)
@@ -722,7 +719,10 @@ class LogScreen(Screen):
             return True
         if worker.is_cancelled or not self._is_current(sub_job_id, gen):
             return True
-        self._watch_stage(sub_job_id, worker, gen)
+        try:
+            self._watch_stage(sub_job_id, worker, gen)
+        except Exception as exc:  # noqa: BLE001 - surfaced in the UI
+            self._report_tail_failure(sub_job_id, worker, gen, exc)
         return True
 
     def _paint_cache(self, sub_job_id: str, gen: int) -> bool:
@@ -732,13 +732,22 @@ class LogScreen(Screen):
             return True
         return self._post(self._append_if_current, lines, sub_job_id, gen)
 
-    def _cache_snapshot(self, sub_job_id: str) -> tuple[bool, list[str]]:
+    def _cache_snapshot(
+        self,
+        sub_job_id: str,
+        query: str | None = None,
+        min_level=None,
+    ) -> tuple[bool, list[str]]:
+        if query is None:
+            query = self._filter
+        if min_level is None:
+            min_level = self._min_level
         entries = self._cache.load_entries(sub_job_id, limit=2000)
         return bool(entries), [
             format_log_entry(entry)
             for entry in entries
-            if entry_matches(entry, self._filter)
-            and entry_at_level(entry, self._min_level)
+            if entry_matches(entry, query)
+            and entry_at_level(entry, min_level)
         ]
 
     def _append_if_current(self, lines: list[str], source_id: str, gen: int) -> None:
@@ -920,7 +929,7 @@ class LogScreen(Screen):
                     filter_gen,
                 )
             return
-        has_cache, lines = self._cache_snapshot(sub_job_id)
+        has_cache, lines = self._cache_snapshot(sub_job_id, query, min_level)
         if not has_cache:
             return
         self._post(
@@ -995,6 +1004,7 @@ class LogScreen(Screen):
             return
         if self._paused:
             self._pending_stage = list(lines)
+            self._has_body = True
             return
         self._pending_stage = None
         self._apply_stage_lines(lines)
