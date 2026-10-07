@@ -162,11 +162,19 @@ def test_encode_byte_chunks_can_force_single_chunk_request_envelope():
     assert wire.decode_byte_chunks(chunks, kind="request") == frame
 
 
+@pytest.mark.parametrize("max_bytes", [1, 4096, 8192])
+def test_encode_byte_chunks_rejects_ceiling_at_reserved_overhead(max_bytes):
+    original = wire.dumps({"x": torch.arange(2048, dtype=torch.int64)})
+    with pytest.raises(wire.WireError, match="max_bytes must exceed 8192 bytes"):
+        wire.encode_byte_chunks(original, kind="request", max_bytes=max_bytes)
+
+
 def test_encode_byte_chunks_and_decodes_roundtrip():
     original = wire.dumps({"x": torch.arange(2048, dtype=torch.int64)})
-    chunks = wire.encode_byte_chunks(original, kind="request", operation="fwd-bwd", max_bytes=4096)
+    chunks = wire.encode_byte_chunks(original, kind="request", operation="fwd-bwd", max_bytes=16_384)
     assert len(chunks) > 1
     for chunk in chunks:
+        assert len(chunk) <= 16_384
         desc = wire.read_byte_chunk_metadata(chunk)
         assert desc is not None
         assert desc["kind"] == "request"
@@ -174,6 +182,32 @@ def test_encode_byte_chunks_and_decodes_roundtrip():
         assert desc["total_chunks"] == len(chunks)
 
     assert wire.decode_byte_chunks(list(reversed(chunks)), kind="request") == original
+
+
+def test_encode_byte_chunks_hashes_the_logical_frame_once(monkeypatch):
+    """Chunking a frame must not scale full-frame hashing with the chunk count.
+
+    Every chunk descriptor carries the digest of the same whole logical frame, so
+    one pass is enough. Recomputing it per chunk made the cost of chunking a
+    large frame quadratic-ish in practice, since the sizing loop can rebuild the
+    chunk list more than once before it settles.
+    """
+    original = wire.dumps({"x": torch.arange(8192, dtype=torch.int64)})
+    real_sha256 = wire.hashlib.sha256
+    hashed = []
+
+    def recording_sha256(payload=b""):
+        hashed.append(payload)
+        return real_sha256(payload)
+
+    monkeypatch.setattr(wire.hashlib, "sha256", recording_sha256)
+    chunks = wire.encode_byte_chunks(original, kind="request", max_bytes=16_384)
+
+    assert len(chunks) > 1
+    assert hashed == [original]
+    digests = {wire.read_byte_chunk_metadata(chunk)["frame_sha256"] for chunk in chunks}
+    assert digests == {real_sha256(original).hexdigest()}
+    assert wire.decode_byte_chunks(chunks, kind="request") == original
 
 
 def test_encode_result_chunks_decodes_result_roundtrip():
@@ -188,7 +222,7 @@ def test_encode_result_chunks_decodes_result_roundtrip():
 
 def test_decode_byte_chunks_detects_missing_chunk():
     original = wire.dumps({"x": torch.arange(2048, dtype=torch.int64)})
-    chunks = wire.encode_byte_chunks(original, kind="request", max_bytes=4096)
+    chunks = wire.encode_byte_chunks(original, kind="request", max_bytes=16_384)
     assert len(chunks) > 1
     with pytest.raises(wire.WireError, match="expected .* byte chunks"):
         wire.decode_byte_chunks(chunks[:-1], kind="request")
@@ -196,7 +230,7 @@ def test_decode_byte_chunks_detects_missing_chunk():
 
 def test_decode_byte_chunks_detects_mismatched_kind():
     original = wire.dumps({"x": torch.arange(2048, dtype=torch.int64)})
-    chunks = wire.encode_byte_chunks(original, kind="result", max_bytes=4096)
+    chunks = wire.encode_byte_chunks(original, kind="result", max_bytes=16_384)
     with pytest.raises(wire.WireError, match="expected request chunks"):
         wire.decode_byte_chunks(chunks, kind="request")
 
@@ -206,7 +240,7 @@ def test_decode_byte_chunks_rejects_plain_frame_in_multiframe_input():
     chunked = wire.encode_byte_chunks(
         wire.dumps({"x": torch.arange(2048, dtype=torch.int64)}),
         kind="request",
-        max_bytes=4096,
+        max_bytes=16_384,
     )
     with pytest.raises(wire.WireError):
         wire.decode_byte_chunks([plain, chunked[0]], kind="request")
