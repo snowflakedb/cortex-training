@@ -123,10 +123,10 @@ operation.
 `stream_logs(job_id, follow=True, ...)` yields entries and keeps polling.
 `fetch_execution_logs(job_id)` downloads every log file for the job's experiment
 run and returns `{sub_job_id, filename, artifact_uri, content}` dicts.
-`download_stdout_logs(job_id, output_dir, resume=False)` saves each sub-job's
+`download_stdout_logs(job_id, output_dir, *, resume=False)` saves each sub-job's
 console as `<output_dir>/<sub_job_id>/stdout.log`. `resume=True` continues a
 file already in that directory and downloads only what is new.
-`download_metrics(job_id, output_dir, resume=False)` saves GPU metrics as
+`download_metrics(job_id, output_dir, *, resume=False)` saves GPU metrics as
 `<output_dir>/<sub_job_id>/gpu.jsonl`, with the same `resume=True` behavior.
 `get_experiment_run(job_id)` resolves the experiment/run names.
 

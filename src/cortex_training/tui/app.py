@@ -26,6 +26,7 @@ never mutates job state.
 
 from __future__ import annotations
 
+from collections import deque
 import os
 import queue
 import tempfile
@@ -68,8 +69,6 @@ _ERROR_LOG = "~/.cortex-training-errors.log"
 
 def _tail_text_lines(path: str, limit: int) -> list[str] | None:
     """Last ``limit`` lines of a text file, without trailing newlines."""
-    from collections import deque
-
     try:
         with open(path, encoding="utf-8", errors="replace") as handle:
             rows = deque(handle, maxlen=limit)
@@ -590,7 +589,7 @@ class LogScreen(Screen):
                     return
                 self._watch_stage(sub_job_id, worker, gen)
             except Exception as exc:  # noqa: BLE001 - surfaced in the UI
-                self._handle_tail_failure(sub_job_id, worker, gen, exc)
+                self._report_tail_failure(sub_job_id, worker, gen, exc)
             return
         try:
             # Replay the local cache instantly, then (only for a live job) resume
@@ -659,7 +658,10 @@ class LogScreen(Screen):
                 and self._is_current(sub_job_id, gen)
                 and not is_active_status(self._job_status)
             ):
-                self._watch_stage(sub_job_id, worker, gen)
+                try:
+                    self._watch_stage(sub_job_id, worker, gen)
+                except Exception as exc:  # noqa: BLE001 - surfaced in the UI
+                    self._report_tail_failure(sub_job_id, worker, gen, exc)
         except Exception as exc:  # noqa: BLE001 - surfaced in the UI
             self._handle_tail_failure(sub_job_id, worker, gen, exc)
 
@@ -668,23 +670,32 @@ class LogScreen(Screen):
             return
         if self._stage_after_tail_failure(sub_job_id, worker, gen):
             return
+        self._report_tail_failure(sub_job_id, worker, gen, exc)
+
+    def _report_tail_failure(self, sub_job_id: str, worker, gen: int, exc) -> None:
+        if worker.is_cancelled:
+            return
         try:
             with open(os.path.expanduser(_ERROR_LOG), "a", encoding="utf-8") as f:
                 f.write(f"tail {sub_job_id} failed:\n{traceback.format_exc()}\n")
         except Exception:  # noqa: BLE001
             pass
-        self._post(
-            self._write_error_if_current,
-            f"[error] tail {sub_job_id} failed: {type(exc).__name__}: {exc}  (full traceback: {_ERROR_LOG})",
-            sub_job_id,
-            gen,
-        )
+        try:
+            self._post(
+                self._write_error_if_current,
+                f"[error] tail {sub_job_id} failed: {type(exc).__name__}: {exc}  (full traceback: {_ERROR_LOG})",
+                sub_job_id,
+                gen,
+            )
+        except Exception:  # noqa: BLE001 - reporting must not crash the worker
+            pass
 
     def _append_live_if_current(
         self, lines: list[str], source_id: str, gen: int, live: bool
     ) -> None:
         if not self._is_current(source_id, gen):
             return
+        self._painted_snapshot = None
         self._has_body = True
         self._write_lines(lines)
         if live:
@@ -902,22 +913,22 @@ class LogScreen(Screen):
             snapshot = self._read_stage_lines(sub_job_id, query, min_level)
             if snapshot is not None and snapshot[0]:
                 self._post(
-                    self._replace_filtered_stage,
+                    self._replace_lines_if_changed,
                     snapshot[1],
                     sub_job_id,
-                    filter_gen,
                     tail_gen,
+                    filter_gen,
                 )
             return
         has_cache, lines = self._cache_snapshot(sub_job_id)
         if not has_cache:
             return
         self._post(
-            self._replace_filtered_cache,
+            self._replace_lines,
             lines,
             sub_job_id,
-            filter_gen,
             tail_gen,
+            filter_gen,
         )
 
     def _read_stage_lines(
@@ -960,7 +971,7 @@ class LogScreen(Screen):
 
     def _apply_stage_lines(self, lines: list[str]) -> None:
         self._painted_snapshot = list(lines)
-        self._has_body = bool(lines)
+        self._has_body = True
         self._shown_lines = []
         if self._logview is not None:
             self._logview.clear()
@@ -976,8 +987,10 @@ class LogScreen(Screen):
         """Swap the whole pane to ``lines``. One snapshot, not a merge."""
         if (
             not self._is_current(source_id, gen)
-            or filter_gen is not None
-            and self._filter_gen != filter_gen
+            or (
+                filter_gen is not None
+                and self._filter_gen != filter_gen
+            )
         ):
             return
         if self._paused:
@@ -996,8 +1009,10 @@ class LogScreen(Screen):
         """Refresh the pane when a later save has more console text."""
         if (
             not self._is_current(source_id, gen)
-            or filter_gen is not None
-            and self._filter_gen != filter_gen
+            or (
+                filter_gen is not None
+                and self._filter_gen != filter_gen
+            )
         ):
             return
         if self._paused and self._pending_stage is not None:
@@ -1007,48 +1022,6 @@ class LogScreen(Screen):
         if lines == baseline:
             return
         self._replace_lines(lines, source_id, gen, filter_gen)
-
-    def _replace_filtered_stage(
-        self,
-        lines: list[str],
-        source_id: str,
-        filter_gen: int,
-        tail_gen: int,
-    ) -> None:
-        if (
-            self._current_source != source_id
-            or self._filter_gen != filter_gen
-            or self._tail_gen != tail_gen
-        ):
-            return
-        if self._paused:
-            self._pending_stage = list(lines)
-            return
-        if lines != self._painted_snapshot:
-            self._apply_stage_lines(lines)
-
-    def _replace_filtered_cache(
-        self,
-        lines: list[str],
-        source_id: str,
-        filter_gen: int,
-        tail_gen: int,
-    ) -> None:
-        if (
-            self._current_source != source_id
-            or self._filter_gen != filter_gen
-            or self._tail_gen != tail_gen
-        ):
-            return
-        if self._paused:
-            self._pending_stage = list(lines)
-            return
-        self._painted_snapshot = list(lines)
-        self._has_body = bool(lines)
-        self._shown_lines = []
-        if self._logview is not None:
-            self._logview.clear()
-        self._write_lines(lines)
 
     def _note_if_pane_empty(self, source_id: str, gen: int) -> None:
         if not self._is_current(source_id, gen) or self._has_body:

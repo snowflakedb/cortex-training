@@ -2078,10 +2078,10 @@ class CortexTrainingClient:
     def _read_resume_state(cls, destination: Path) -> tuple[list[str], int] | None:
         """Return ``(merged names, committed bytes)`` when a resume can append.
 
-        A missing file, a missing or unreadable manifest, or a file shorter than
-        the committed length means the local copy cannot be trusted. The caller
-        rebuilds it. A file longer than the committed length is a torn append
-        and is truncated back by the resume path.
+        A missing file or manifest, a changed file identity, or a file shorter
+        than the committed length means the local copy cannot be trusted. The
+        caller rebuilds it. A file longer than the committed length is a torn
+        append and is truncated back by the resume path.
         """
         path = cls._resume_manifest_path(destination)
         try:
@@ -2227,22 +2227,16 @@ class CortexTrainingClient:
 
         ``resume=False`` rebuilds the file. ``resume=True`` lists every chunk
         and downloads only names absent from the manifest beside the file.
-        Resumes for the same output directory are serialized so two processes
-        cannot append one file concurrently.
+        Reconstructions for the same output directory are serialized so a full
+        rebuild cannot replace a file while another process resumes it.
         """
-        if not resume:
-            return self._reconstruct_gzip_artifacts(
-                job_id,
-                output_dir,
-                artifact_name=artifact_name,
-                chunk_pattern=chunk_pattern,
-                destination_name=destination_name,
-                temporary_prefix=temporary_prefix,
-                resume=False,
-            )
         root = Path(output_dir).expanduser()
-        root.mkdir(parents=True, exist_ok=True)
-        lock_path = root / f".{artifact_name}.download.lock"
+        lock_key = hashlib.sha256(
+            f"{root.resolve(strict=False)}\0{artifact_name}".encode()
+        ).hexdigest()
+        lock_root = Path(tempfile.gettempdir()) / "cortex-training-download-locks"
+        lock_root.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_root / lock_key
         with lock_path.open("a+b") as lock:
             if os.name == "nt":
                 import msvcrt

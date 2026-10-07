@@ -866,11 +866,11 @@ async def _run_stale_worker_does_not_paint():
             2,
             filter_gen=1,
         )
-        screen._replace_filtered_stage(
+        screen._replace_lines_if_changed(
             ["stale refilter"],
             "7:training:0",
+            1,
             filter_gen=2,
-            tail_gen=1,
         )
         screen._note_if_pane_empty("7:training:0", 1)
         screen._append_if_current(["other cache"], "7:other", 2)
@@ -921,7 +921,7 @@ async def _run_pause_holds_console_until_resume():
         screen._paused = True
         screen._filter_gen = 1
         screen._shown_lines = ["persisted line"]
-        screen._replace_filtered_stage([], "7:training:0", 1, 1)
+        screen._replace_lines_if_changed([], "7:training:0", 1, filter_gen=1)
         assert screen._shown_lines == ["persisted line"]
         screen.action_toggle_pause()
         assert screen._shown_lines == []
@@ -966,6 +966,8 @@ async def _run_refilter_keeps_saved_console(tmp_path):
         screen._refilter()
         empty_stage = await _wait(pilot, app, lambda: screen._shown_lines == [])
         assert empty_stage, "a no-match saved-console filter did not clear the pane"
+        screen._note_if_pane_empty("7:training:0", screen._tail_gen)
+        assert screen._shown_lines == []
         c.download_stdout_logs.assert_not_called()
 
         screen.workers.cancel_all()
@@ -993,6 +995,8 @@ async def _run_refilter_keeps_saved_console(tmp_path):
         screen._refilter()
         empty_cache = await _wait(pilot, app, lambda: screen._shown_lines == [])
         assert empty_cache, "a no-match terminal-cache filter did not clear the pane"
+        screen._note_if_pane_empty("7:training:0", screen._tail_gen)
+        assert screen._shown_lines == []
 
         screen._stage_paths["7:training:0"] = str(tmp_path / "missing.log")
         screen._shown_lines = ["No log output is available."]
@@ -1202,6 +1206,12 @@ async def _run_copy_exports_console_on_screen():
         assert ok, "log screen did not open"
         screen = app.screen
         screen._current_source = "7:training:0"
+        screen._cache.append_entries("7:training:0", [{"_raw": "live line"}])
+        screen._apply_stage_lines(["stale snapshot"])
+        screen._append_live_if_current(["live line"], "7:training:0", screen._tail_gen, True)
+        live_text, _ = screen._export_text(screen._snapshot_export())
+        assert "live line" in live_text
+        assert "stale snapshot" not in live_text
         screen._apply_stage_lines(["persisted line"])
         app.copy_to_clipboard = copied.append
         screen.action_copy_log()
@@ -1232,3 +1242,32 @@ def test_stage_watcher_stops_when_ui_post_fails(monkeypatch):
     monkeypatch.setattr(screen, "_post", lambda *_args, **_kwargs: False)
     screen._watch_stage("7:training:0", worker, 1)
     assert calls == [1]
+
+
+def test_terminal_worker_failure_is_reported_without_retry(monkeypatch):
+    from cortex_training.tui import app as app_module
+
+    screen = LogScreen(_client(), "7", job_status="CANCELLED")
+    screen._current_source = "7:training:0"
+    screen._tail_gen = 1
+    worker = SimpleNamespace(is_cancelled=False)
+    reported = []
+    monkeypatch.setattr(app_module, "get_current_worker", lambda: worker)
+    monkeypatch.setattr(
+        screen, "_paint_cache", lambda *_args: (_ for _ in ()).throw(ValueError("bad"))
+    )
+    monkeypatch.setattr(
+        screen,
+        "_report_tail_failure",
+        lambda source, current_worker, gen, exc: reported.append(
+            (source, current_worker, gen, str(exc))
+        ),
+    )
+    monkeypatch.setattr(
+        screen,
+        "_watch_stage",
+        lambda *_args: pytest.fail("terminal watcher was retried"),
+    )
+
+    LogScreen._tail.__wrapped__(screen, "7:training:0", 1)
+    assert reported == [("7:training:0", worker, 1, "bad")]
