@@ -325,7 +325,12 @@ class OtlpMetricEmitter:
                 return self._telemetry_base_url
             response = self._session.get(
                 f"{self.base_url}/observability/system/hostname",
-                headers={"Authorization": f'Snowflake Token="{token}"'},
+                headers={
+                    "Authorization": f'Snowflake Token="{token}"',
+                    # The endpoint answers 500 without an explicit JSON Accept
+                    # header, which silently disables all telemetry.
+                    "Accept": "application/json",
+                },
                 timeout=self.timeout,
             )
             response.raise_for_status()

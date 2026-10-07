@@ -153,7 +153,10 @@ def test_emitter_discovers_hostname_once_and_posts_otlp_payload(monkeypatch):
 
     emitter._session.get.assert_called_once_with(
         "https://account.test/observability/system/hostname",
-        headers={"Authorization": 'Snowflake Token="session"'},
+        headers={
+            "Authorization": 'Snowflake Token="session"',
+            "Accept": "application/json",
+        },
         timeout=3.0,
     )
     assert emitter._session.post.call_count == 2

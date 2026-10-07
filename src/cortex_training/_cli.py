@@ -734,7 +734,7 @@ def _format_error(exc: BaseException) -> str:
 
     parts = [str(exc)]
     request_id = getattr(response, "headers", {}).get("x-snowflake-request-id")
-    if request_id:
+    if request_id and request_id not in parts[0]:
         parts.append(f"snowflake request id: {request_id}")
 
     body = (getattr(response, "text", "") or "").strip()

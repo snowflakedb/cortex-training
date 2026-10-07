@@ -145,7 +145,8 @@ Raw `torch.save`/pickle is not the current binary protocol. See
 ### 2.4 Snowflake request id
 
 Responses may include `x-snowflake-request-id`. Include it when diagnosing an
-HTTP failure.
+HTTP failure. When the response carries it, the Python client appends it to
+raised HTTP errors as `(snowflake request id: <id>)`.
 
 ---
 

@@ -332,6 +332,88 @@ def _safe_metric_error_message(exc: BaseException) -> str:
     return message[:_METRIC_ERROR_MESSAGE_LIMIT]
 
 
+_SNOWFLAKE_REQUEST_ID_HEADER = "x-snowflake-request-id"
+# Bound per-operation history so long polls (wait_for_job) stay cheap.
+_MAX_TRACKED_SNOWFLAKE_REQUEST_IDS = 10
+
+
+def _response_snowflake_request_id(response: Any) -> str | None:
+    headers = getattr(response, "headers", None) or {}
+    request_id = headers.get(_SNOWFLAKE_REQUEST_ID_HEADER)
+    return request_id if isinstance(request_id, str) and request_id else None
+
+
+def _add_snowflake_request_id_to_error(
+    exc: BaseException, request_id: str | None
+) -> None:
+    """Append the Snowflake request id to an error message so tracebacks carry it."""
+    if not request_id or not exc.args or not isinstance(exc.args[0], str):
+        return
+    if request_id in exc.args[0]:
+        return
+    exc.args = (
+        f"{exc.args[0]} (snowflake request id: {request_id})",
+        *exc.args[1:],
+    )
+
+
+def _snowflake_request_attributes(
+    error: BaseException | None,
+    request_ids: list[str],
+) -> dict[str, Any]:
+    """Snowflake request ids for an operation outcome.
+
+    ``snowflake.request_id`` is only ever the failing response's own id. When
+    the outcome has no response of its own (success, a poll that ended
+    ``failed``, a timeout, a connection error), ``snowflake.last_request_id``
+    names the operation's most recent request instead, so it is never read as
+    the request that failed.
+    """
+    attributes: dict[str, Any] = {}
+    response = getattr(error, "response", None) if error is not None else None
+    request_id = _response_snowflake_request_id(response)
+    if request_id is not None:
+        attributes["snowflake.request_id"] = request_id
+    elif response is None and request_ids:
+        attributes["snowflake.last_request_id"] = request_ids[-1]
+    if request_ids:
+        attributes["snowflake.request_ids"] = list(request_ids)
+    return attributes
+
+
+def _log_operation_failure(
+    operation: str,
+    exc: BaseException,
+    request_ids: list[str],
+) -> None:
+    """Surface the Snowflake request id of a failed operation when the error lacks it."""
+    try:
+        response = getattr(exc, "response", None)
+        request_id = _response_snowflake_request_id(response)
+        label = "snowflake request id"
+        if request_id is None:
+            if response is not None or not request_ids:
+                return
+            if isinstance(exc, (ValueError, TypeError)) and not isinstance(
+                exc, requests.exceptions.RequestException
+            ):
+                # Client-side validation; an earlier request did not fail.
+                return
+            request_id = request_ids[-1]
+            label = "last snowflake request id"
+        if request_id in str(exc):
+            return
+        logger.warning(
+            "%s failed (%s: %s): %s",
+            operation,
+            label,
+            request_id,
+            _safe_metric_error_message(exc),
+        )
+    except Exception:
+        logger.debug("client operation failure logging failed", exc_info=True)
+
+
 def _metric_error_attributes(exc: BaseException) -> dict[str, Any]:
     attributes: dict[str, Any] = {"error.type": type(exc).__name__}
     response = getattr(exc, "response", None)
@@ -340,10 +422,6 @@ def _metric_error_attributes(exc: BaseException) -> dict[str, Any]:
     status_code = getattr(response, "status_code", None)
     if isinstance(status_code, int):
         attributes["error.http_status"] = status_code
-    headers = getattr(response, "headers", {}) or {}
-    request_id = headers.get("x-snowflake-request-id")
-    if isinstance(request_id, str) and request_id:
-        attributes["snowflake.request_id"] = request_id
     try:
         body = response.json()
     except Exception:
@@ -389,50 +467,65 @@ def _track_operation(operation: str):
 
         @functools.wraps(method)
         def wrapped(self, *args, **kwargs):
-            if getattr(self, "_metric_emitter", None) is None:
-                return method(self, *args, **kwargs)
             state = getattr(self, "_operation_metric_state", None)
             if state is None:
                 return method(self, *args, **kwargs)
             active = getattr(state, "active", set())
             if active:
                 return method(self, *args, **kwargs)
-            try:
-                bound = signature.bind(self, *args, **kwargs)
-                bound.apply_defaults()
-            except TypeError:
-                return method(self, *args, **kwargs)
-            except Exception:
-                logger.debug("client operation metric setup failed", exc_info=True)
-                return method(self, *args, **kwargs)
+            # Snowflake request ids are tracked even with telemetry off so a
+            # failure can still be logged with the id; only metrics need the
+            # arguments.
+            arguments = None
+            if getattr(self, "_metric_emitter", None) is not None:
+                try:
+                    bound = signature.bind(self, *args, **kwargs)
+                    bound.apply_defaults()
+                    arguments = bound.arguments
+                except TypeError:
+                    return method(self, *args, **kwargs)
+                except Exception:
+                    logger.debug("client operation metric setup failed", exc_info=True)
+                    return method(self, *args, **kwargs)
             active = set()
             active.add(operation)
             state.active = active
             state.attempt_count = 0
             state.request_count = 0
+            state.snowflake_request_ids = []
             started = time.monotonic()
             try:
                 result = method(self, *args, **kwargs)
             except Exception as exc:
-                self._emit_operation_outcome(
-                    operation,
-                    started,
-                    bound.arguments,
-                    error=exc,
-                )
+                # Errors wrapped after _send (e.g. chunk-group errors) are
+                # still HTTPErrors carrying the failing response.
+                if isinstance(exc, requests.exceptions.HTTPError):
+                    _add_snowflake_request_id_to_error(
+                        exc, _response_snowflake_request_id(exc.response)
+                    )
+                _log_operation_failure(operation, exc, state.snowflake_request_ids)
+                if arguments is not None:
+                    self._emit_operation_outcome(
+                        operation,
+                        started,
+                        arguments,
+                        error=exc,
+                    )
                 raise
             else:
-                self._emit_operation_outcome(
-                    operation,
-                    started,
-                    bound.arguments,
-                    result=result,
-                )
+                if arguments is not None:
+                    self._emit_operation_outcome(
+                        operation,
+                        started,
+                        arguments,
+                        result=result,
+                    )
                 return result
             finally:
                 state.active = set()
                 state.attempt_count = 0
                 state.request_count = 0
+                state.snowflake_request_ids = []
 
         return wrapped
 
@@ -1383,6 +1476,14 @@ class CortexTrainingClient:
             if error is not None:
                 value["error_message"] = _safe_metric_error_message(error)
                 attributes.update(_metric_error_attributes(error))
+            attributes.update(
+                _snowflake_request_attributes(
+                    error,
+                    list(
+                        getattr(self._operation_metric_state, "snowflake_request_ids", [])
+                    ),
+                )
+            )
             self.emit_metric(operation, value, attributes=attributes)
         except Exception:
             logger.debug("client operation metric construction failed", exc_info=True)
@@ -1573,10 +1674,7 @@ class CortexTrainingClient:
                     continue
 
                 status_code = getattr(resp, "status_code", None)
-                headers = getattr(resp, "headers", {}) or {}
-                sf_request_id = headers.get("x-snowflake-request-id")
-                if not isinstance(sf_request_id, str) or not sf_request_id:
-                    sf_request_id = None
+                sf_request_id = _response_snowflake_request_id(resp)
                 if sf_request_id:
                     req = getattr(resp, "request", None)
                     logger.debug(
@@ -1586,6 +1684,17 @@ class CortexTrainingClient:
                         getattr(req, "path_url", url),
                         status_code,
                     )
+                    try:
+                        state = self._operation_metric_state
+                        if getattr(state, "active", set()):
+                            seen = state.snowflake_request_ids
+                            seen.append(sf_request_id)
+                            del seen[:-_MAX_TRACKED_SNOWFLAKE_REQUEST_IDS]
+                    except Exception:
+                        logger.debug(
+                            "client operation request id tracking failed",
+                            exc_info=True,
+                        )
                 if debug_label is not None:
                     try:
                         status_int = int(status_code)
@@ -1628,7 +1737,11 @@ class CortexTrainingClient:
                         f"The database may already exist but your role lacks USAGE on it. "
                         f"Create it manually in Snowsight: CREATE DATABASE IF NOT EXISTS {self.database};"
                     )
-                resp.raise_for_status()
+                try:
+                    resp.raise_for_status()
+                except requests.exceptions.HTTPError as exc:
+                    _add_snowflake_request_id_to_error(exc, sf_request_id)
+                    raise
                 return resp
 
         retryer = Retrying(
