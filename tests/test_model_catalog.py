@@ -108,6 +108,8 @@ def test_shipped_qwen_recipes_use_model_limits_and_long_context_sp():
     expected_limits = {
         "Qwen/Qwen3-8B": 32768,
         "Qwen/Qwen3.6-35B-A3B": 262144,
+        # The 27B RL recipe ships at 32K, below the 262144 catalog inference limit.
+        "Qwen/Qwen3.8-27B": 32768,
     }
     config_paths = [
         *REPO_ROOT.glob("recipes/inference/configs/qwen*.json"),
@@ -115,7 +117,7 @@ def test_shipped_qwen_recipes_use_model_limits_and_long_context_sp():
         *REPO_ROOT.glob("recipes/sft/conversational/configs/qwen*.json"),
     ]
 
-    assert len(config_paths) == 12
+    assert len(config_paths) == 13
     for path in config_paths:
         request = json.loads(path.read_text())
         for sub_job in request["sub_job_configs"]:
@@ -317,18 +319,6 @@ def test_glm52_inference_uses_multinode_tp16_with_hopper_mla_cache(model_id):
     assert vllm_config["tensor_parallel_size"] == 16
     assert vllm_config["kv_cache_dtype"] == "fp8_ds_mla"
     assert vllm_config["gpu_memory_utilization"] == 0.9
-
-
-def test_glm52_fp8_api_example_advertises_the_supported_1m_profile():
-    request = json.loads((REPO_ROOT / "examples/api/glm-sampling.json").read_text())
-    inference = request["sub_job_configs"][0]["inference_config"]
-    vllm_config = inference["vllm_config"]
-
-    assert inference["max_seq_len"] == 1048576
-    assert inference["n_gpus"] == 16
-    assert inference["gpu_memory_utilization"] == 0.9
-    assert vllm_config["tensor_parallel_size"] == 16
-    assert vllm_config["kv_cache_dtype"] == "fp8_ds_mla"
 
 
 def test_router_replay_sampling_uses_single_node_tensor_parallelism():

@@ -61,7 +61,7 @@
       "summary": "Sixteen-GPU H200 inference with the Hopper FP8 MLA cache layout for GLM 5.2.",
       "recipePath": "recipes/inference/serve.py",
       "evidencePaths": [
-        "examples/api/glm-sampling.json"
+        "recipes/inference/serve.py"
       ],
       "subJobs": [
         {
