@@ -40,3 +40,19 @@ The reference documents in this repository are the contract to code against:
 - When you change a default, a flag, or a field, update the docs that quote it in
   the same change: `docs/reference/cli.md`, `docs/reference/rest-api.md`, and the
   recipe READMEs plus `recipe.yaml`.
+
+## Shipping unfinished APIs
+
+A client API can merge and ship before it is supported, as long as it is gated
+off by default with `src/cortex_training/_experimental.py`:
+
+- Whole method: decorate it `@experimental("<feature>")`. Put it **outermost**
+  (above any other decorator), so a refused call does no work.
+- One argument or body field: call
+  `require_experimental("<feature>", "the `<field>` argument")` where the
+  value is used.
+- Leave gated APIs out of `__init__.__all__`, the README, `docs/reference/cli.md`,
+  and `docs/reference/rest-api.md` until GA. Add one test that it is refused by
+  default and one that it works with `CORTEX_TRAINING_EXPERIMENTAL=<feature>`.
+- GA = delete the decorator / call. If the feature must not be used in
+  production, also gate it on the server: the client gate only hides it.

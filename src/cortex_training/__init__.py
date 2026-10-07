@@ -18,6 +18,7 @@
 __version__ = "0.0.2"
 
 from . import wire
+from ._experimental import ExperimentalFeatureError
 from .client import ChunkGroupConflictError
 from .client import ChunkGroupError
 from .client import ChunkGroupRestartError
@@ -33,6 +34,7 @@ from .client import serialize_forward_backward_args
 
 __all__ = [
     "CortexTrainingClient",
+    "ExperimentalFeatureError",
     "build_forward_backward_kwargs",
     "build_forward_backward_payload",
     "ChunkGroupError",
