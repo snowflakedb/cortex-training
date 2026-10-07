@@ -23,7 +23,6 @@ flags, then a named or configured-default Snowflake connection profile.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 
 
@@ -39,17 +38,16 @@ def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.Argument
     p.add_argument(
         "--config",
         dest="config",
-        default=os.environ.get("CORTEX_TRAINING_CONFIG"),
         help=(
             "Path to a reusable Cortex Training config or credential JSON file "
-            "(same format as the cortex-training CLI config)."
+            "(same format as the cortex-training CLI config). Defaults to "
+            "CORTEX_TRAINING_CONFIG."
         ),
     )
     p.add_argument(
         "--connection",
         "-c",
-        default=os.environ.get("CORTEX_TRAINING_CONNECTION"),
-        help="Snowflake connection profile name.",
+        help="Snowflake connection profile name. Defaults to CORTEX_TRAINING_CONNECTION.",
     )
     p.add_argument("--base-url", help="Direct base URL for a local or otherwise compatible server.")
     p.add_argument("--host", help="Snowflake account host for PAT auth.")
@@ -86,9 +84,8 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     import cortex_training._cli as cli
 
     # Reuse the CLI's resolution: --config / login state / env / defaults.
-    args = cli._resolve_args(args)
     try:
-        args = cli._normalize_connection_args(args)
+        args = cli._resolve_args(args)
     except ValueError as exc:
         parser.error(str(exc))
     if not args.use_connection_profile and not args.database:

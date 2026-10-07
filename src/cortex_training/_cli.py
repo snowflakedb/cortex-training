@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from datetime import datetime
 from datetime import timezone
@@ -28,32 +27,11 @@ from typing import Any
 from typing import Callable
 from typing import TextIO
 
-_CONFIG_KEYS = {
-    "base_url",
-    "host",
-    "pat",
-    "database",
-    "schema",
-    "endpoint",
-    "poll_interval",
-    "poll_timeout",
-    "no_verify_ssl",
-    "verify_ssl",
-}
-
-_CONFIG_ALIASES = {
-    "url": "base_url",
-    "db": "database",
-}
-
-_LOGIN_STATE_ENV = "CORTEX_TRAINING_LOGIN_FILE"
-
-
-from cortex_training.connect import _env, normalize_host as _normalize_host, _login_state_path, read_login_config_path as _read_login_config_path
-
-
-def _has_url_scheme(url: str) -> bool:
-    return url.startswith("http://") or url.startswith("https://")
+from cortex_training._connection import ConnectionSettings
+from cortex_training._connection import build_client as _build_client_from_settings
+from cortex_training._connection import load_config as _load_config
+from cortex_training._connection import login_state_path as _login_state_path
+from cortex_training._connection import resolve_connection
 
 
 def _load_cortex_training_client_class():
@@ -125,17 +103,21 @@ def build_parser(
         prog=prog,
         description="Manage Cortex Training jobs through the Cortex Training REST endpoint.",
     )
+    # --config and --connection read their env vars during resolution, not as
+    # argparse defaults, so an explicit flag can beat a leftover env var.
     parser.add_argument(
         "--config",
-        default=_env("CORTEX_TRAINING_CONFIG"),
-        help="Path to a reusable Cortex Training CLI config JSON file.",
+        help=(
+            "Path to a reusable Cortex Training CLI config JSON file. "
+            "Defaults to CORTEX_TRAINING_CONFIG."
+        ),
     )
     parser.add_argument(
         "--connection",
         "-c",
-        default=_env("CORTEX_TRAINING_CONNECTION"),
         help=(
-            "Snowflake connection profile name. When no legacy config or direct "
+            "Snowflake connection profile name. Defaults to "
+            "CORTEX_TRAINING_CONNECTION. When no legacy config or direct "
             "credentials are configured, the Snowflake default profile is used."
         ),
     )
@@ -409,191 +391,56 @@ def _write_login_config_path(config_path: str) -> str:
     return saved_path
 
 
-def _load_config(path: str | None) -> dict[str, Any]:
-    if not path:
-        return {}
-    path_obj = Path(path).expanduser()
-    try:
-        parsed = json.loads(path_obj.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid JSON in config {path}: {exc}") from exc
-    if not isinstance(parsed, dict):
-        raise ValueError("config JSON must be an object")
-
-    if "connection" in parsed:
-        connection = parsed["connection"]
-        if not isinstance(connection, dict):
-            raise ValueError("config connection must be an object")
-        parsed = connection
-
-    config: dict[str, Any] = {}
-    unknown = []
-    for key, value in parsed.items():
-        normalized = _CONFIG_ALIASES.get(key, key)
-        if normalized not in _CONFIG_KEYS:
-            unknown.append(key)
-            continue
-        config[normalized] = value
-    if unknown:
-        names = ", ".join(sorted(unknown))
-        raise ValueError(f"unknown config key(s): {names}")
-    return config
-
-
-def _coalesce(*values: Any) -> Any:
-    for value in values:
-        if value is not None:
-            return value
-    return None
-
-
-def _config_str(config: dict[str, Any], key: str) -> str | None:
-    if key not in config or config[key] is None:
-        return None
-    if not isinstance(config[key], str):
-        raise ValueError(f"config {key} must be a string")
-    return config[key]
-
-
-def _config_float(config: dict[str, Any], key: str) -> float | None:
-    if key not in config or config[key] is None:
-        return None
-    if isinstance(config[key], bool) or not isinstance(config[key], (int, float)):
-        raise ValueError(f"config {key} must be a number")
-    return float(config[key])
-
-
-def _config_bool(config: dict[str, Any], key: str) -> bool | None:
-    if key not in config or config[key] is None:
-        return None
-    if not isinstance(config[key], bool):
-        raise ValueError(f"config {key} must be a boolean")
-    return config[key]
-
-
-def _has_connection(
-    base_url: str | None,
-    host: str | None,
-    pat: str | None,
-    database: str | None,
-) -> bool:
-    return bool(database and (base_url or (host and pat)))
-
-
-def _select_config(args: argparse.Namespace, *, load_login: bool) -> dict[str, Any]:
-    args._legacy_config_selected = False
-    if getattr(args, "connection", None):
-        return {}
-
-    if args.config:
-        args._legacy_config_selected = True
-        return _load_config(args.config)
-
-    if not load_login:
-        return {}
-
-    base_url = _coalesce(args.base_url, _env("CORTEX_TRAINING_BASE_URL"))
-    host = _coalesce(args.host, _env("CORTEX_TRAINING_HOST", "SNOWFLAKE_HOST"))
-    pat = _coalesce(args.pat, _env("CORTEX_TRAINING_PAT", "SNOWFLAKE_PAT"))
-    database = _coalesce(
-        args.database,
-        _env("CORTEX_TRAINING_DATABASE", "SNOWFLAKE_DATABASE"),
-    )
-    if _has_connection(base_url, host, pat, database):
-        return {}
-
-    login_config = _read_login_config_path()
-    if login_config is None:
-        return {}
-    if not Path(login_config).expanduser().is_file():
-        return {}
-    args.config = login_config
-    args._legacy_config_selected = True
-    return _load_config(login_config)
-
-
 def _resolve_args(
     args: argparse.Namespace,
     *,
     load_login: bool = True,
 ) -> argparse.Namespace:
-    config = _select_config(args, load_login=load_login)
-    profile_requested = bool(getattr(args, "connection", None))
-    args.base_url = _coalesce(
-        args.base_url,
-        _config_str(config, "base_url"),
-        None if profile_requested else _env("CORTEX_TRAINING_BASE_URL"),
+    settings = resolve_connection(
+        connection_name=args.connection,
+        config_path=args.config,
+        base_url=args.base_url,
+        host=args.host,
+        pat=args.pat,
+        database=args.database,
+        schema=args.schema,
+        endpoint=args.endpoint,
+        poll_interval=args.poll_interval,
+        poll_timeout=args.poll_timeout,
+        verify_ssl=False if args.no_verify_ssl else None,
+        load_login=load_login,
     )
-    args.host = _coalesce(
-        args.host,
-        _config_str(config, "host"),
-        None
-        if profile_requested
-        else _env("CORTEX_TRAINING_HOST", "SNOWFLAKE_HOST"),
-    )
-    args.pat = _coalesce(
-        args.pat,
-        _config_str(config, "pat"),
-        None
-        if profile_requested
-        else _env("CORTEX_TRAINING_PAT", "SNOWFLAKE_PAT"),
-    )
-    args.database = _coalesce(
-        args.database,
-        _config_str(config, "database"),
-        _env("CORTEX_TRAINING_DATABASE", "SNOWFLAKE_DATABASE"),
-    )
-    args.schema = _coalesce(
-        args.schema,
-        _config_str(config, "schema"),
-        _env("CORTEX_TRAINING_SCHEMA", "SNOWFLAKE_SCHEMA"),
-    )
-    args.endpoint = _coalesce(
-        args.endpoint,
-        _config_str(config, "endpoint"),
-        _env("CORTEX_TRAINING_ENDPOINT"),
-        "cortex-training",
-    )
-    args.poll_interval = _coalesce(
-        args.poll_interval,
-        _config_float(config, "poll_interval"),
-        0.5,
-    )
-    args.poll_timeout = _coalesce(
-        args.poll_timeout,
-        _config_float(config, "poll_timeout"),
-        1800.0,
-    )
-    if not args.no_verify_ssl:
-        no_verify_ssl = _config_bool(config, "no_verify_ssl")
-        verify_ssl = _config_bool(config, "verify_ssl")
-        if no_verify_ssl is not None:
-            args.no_verify_ssl = no_verify_ssl
-        elif verify_ssl is not None:
-            args.no_verify_ssl = not verify_ssl
-    direct_credentials_present = any((args.base_url, args.host, args.pat))
-    if profile_requested and direct_credentials_present:
-        raise ValueError(
-            "--connection cannot be combined with --base-url, --host, or --pat"
-        )
-    direct_connection_complete = bool(args.base_url or (args.host and args.pat))
-    args.use_connection_profile = profile_requested or (
-        not args._legacy_config_selected and not direct_connection_complete
-    )
-    if not args.use_connection_profile and args.schema is None:
-        args.schema = "PUBLIC"
+    args.connection = settings.connection_name
+    args.config = settings.config_path
+    args.base_url = settings.base_url
+    args.host = settings.host
+    args.pat = settings.pat
+    args.database = settings.database
+    args.schema = settings.schema
+    args.endpoint = settings.endpoint
+    args.poll_interval = settings.poll_interval
+    args.poll_timeout = settings.poll_timeout
+    args.no_verify_ssl = not settings.verify_ssl
+    args.use_connection_profile = settings.use_connection_profile
+    args.connection_source = settings.source
     return args
 
 
-def _normalize_connection_args(args: argparse.Namespace) -> argparse.Namespace:
-    if args.base_url is None or _has_url_scheme(args.base_url):
-        return args
-    if args.pat and args.host is None:
-        args.host = args.base_url
-        args.base_url = None
-        return args
-    raise ValueError(
-        "base_url must start with http:// or https://. For Snowflake PAT auth, use host instead of base_url."
+def _settings_from_args(args: argparse.Namespace) -> ConnectionSettings:
+    return ConnectionSettings(
+        source=getattr(args, "connection_source", "command-line arguments"),
+        use_connection_profile=args.use_connection_profile,
+        connection_name=args.connection,
+        config_path=args.config,
+        base_url=args.base_url,
+        host=args.host,
+        pat=args.pat,
+        database=args.database,
+        schema=args.schema,
+        endpoint=args.endpoint,
+        poll_interval=args.poll_interval,
+        poll_timeout=args.poll_timeout,
+        verify_ssl=not args.no_verify_ssl,
     )
 
 
@@ -613,7 +460,6 @@ def parse_args(
     args = _resolve_args(args, load_login=not dry_run)
     if dry_run:
         return args
-    args = _normalize_connection_args(args)
     if args.use_connection_profile:
         return args
     if not args.database:
@@ -624,27 +470,7 @@ def parse_args(
 
 
 def build_client(args: argparse.Namespace, cortex_training_client_cls):
-    kwargs = {
-        "database": args.database,
-        "schema": args.schema,
-        "endpoint": args.endpoint,
-        "poll_interval": args.poll_interval,
-        "poll_timeout": args.poll_timeout,
-    }
-    if args.base_url:
-        return cortex_training_client_cls(base_url=args.base_url, **kwargs)
-    if args.use_connection_profile:
-        return cortex_training_client_cls.from_connection_name(
-            connection_name=args.connection,
-            verify_ssl=not args.no_verify_ssl,
-            **kwargs,
-        )
-    return cortex_training_client_cls.from_pat(
-        host=_normalize_host(args.host),
-        pat=args.pat,
-        verify_ssl=not args.no_verify_ssl,
-        **kwargs,
-    )
+    return _build_client_from_settings(_settings_from_args(args), cortex_training_client_cls)
 
 
 def _read_json_object(path: str, stdin: TextIO) -> dict[str, Any]:

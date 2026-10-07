@@ -1557,7 +1557,56 @@ def test_named_connection_conflicts_with_direct_flags():
     )
 
     assert rc == 1
-    assert "--connection cannot be combined" in stderr.getvalue()
+    assert "(--connection / connection_name) cannot be combined" in stderr.getvalue()
+
+
+def test_named_connection_conflicts_with_config_flag(tmp_path):
+    config = _write_config(tmp_path, {"base_url": "http://config.local", "database": "DB"})
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        ["--connection", "training-profile", "--config", str(config), "list"],
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert "cannot be combined" in stderr.getvalue()
+
+
+def test_config_flag_beats_connection_env(tmp_path, monkeypatch):
+    config = _write_config(tmp_path, {"base_url": "http://config.local", "database": "DB"})
+    monkeypatch.setenv("CORTEX_TRAINING_CONNECTION", "leftover-profile")
+    seen = {}
+
+    def make_client(args):
+        seen.update(vars(args))
+        return FakeClient()
+
+    rc = cli.main(["--config", str(config), "list"], client_factory=make_client, stdout=io.StringIO())
+
+    assert rc == 0
+    assert seen["use_connection_profile"] is False
+    assert seen["connection"] is None
+    assert seen["base_url"] == "http://config.local"
+
+
+def test_host_pat_flags_beat_connection_env(monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_CONNECTION", "leftover-profile")
+    seen = {}
+
+    def make_client(args):
+        seen.update(vars(args))
+        return FakeClient()
+
+    rc = cli.main(
+        ["--host", "ACCOUNT.snowflakecomputing.com", "--pat", "p", "--database", "DB", "list"],
+        client_factory=make_client,
+        stdout=io.StringIO(),
+    )
+
+    assert rc == 0
+    assert seen["use_connection_profile"] is False
+    assert seen["host"] == "ACCOUNT.snowflakecomputing.com"
 
 
 def test_build_client_uses_named_snowflake_connection(tmp_path, monkeypatch):

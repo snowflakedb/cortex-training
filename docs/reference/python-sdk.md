@@ -6,25 +6,34 @@ from cortex_training import CortexTrainingClient, connect, SubJobConfig, JobType
 
 ## connect()
 
-`connect()` is the recommended way to build a client. It resolves credentials
-automatically in the same order as the CLI:
+`connect()` is the recommended way to build a client. It picks credentials with
+the same rules as the CLI; both use one shared resolver:
 
 ```python
 from cortex_training import connect
 
-client = connect()                              # default connections.toml profile
+client = connect()                              # env vars, saved login, or default connections.toml profile
 client = connect(config_path="config.json")     # JSON config file
 client = connect(connection_name="training")    # named profile
 ```
 
-Resolution order:
+Anything you pass explicitly (`connection_name`, `config_path`, `host` +
+`pat`, or `base_url`) wins over environment variables. Passing
+`connection_name` together with `config_path`, `host`, `pat`, or `base_url` is
+an error. With no explicit source, the first match wins:
 
-1. `connection_name` or `CORTEX_TRAINING_CONNECTION` env var
-2. `config_path` or `CORTEX_TRAINING_CONFIG` env var
-3. `base_url` or `CORTEX_TRAINING_BASE_URL` env var
-4. `CORTEX_TRAINING_HOST` + `CORTEX_TRAINING_PAT` env vars
-5. Remembered config from `cortex-training login`
+1. `CORTEX_TRAINING_CONNECTION` profile
+2. `CORTEX_TRAINING_CONFIG` JSON file
+3. `CORTEX_TRAINING_BASE_URL`, or `CORTEX_TRAINING_HOST` + `CORTEX_TRAINING_PAT`,
+   when a database is also set
+4. Remembered config from `cortex-training login`
+5. The same env vars without a database
 6. Default `connections.toml` profile
+
+Environment variables fill in only what the chosen source leaves unset, such
+as `CORTEX_TRAINING_DATABASE` for a JSON config without `database`. Unlike the
+CLI, `connect()` defaults the database to `CORTEX_TRAINING_DB` for PAT auth.
+The chosen source is logged at `INFO` (never the PAT).
 
 Any keyword argument overrides the resolved value:
 

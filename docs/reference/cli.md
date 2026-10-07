@@ -213,6 +213,12 @@ Profile lookup is a fallback. An explicit or remembered legacy JSON config, or
 a complete direct `--base-url` / `--host` + `--pat` connection, continues to
 win. This preserves existing scripts.
 
+Flags always win over environment variables. For example, `--config` or
+`--host` + `--pat` is used even when `CORTEX_TRAINING_CONNECTION` is set.
+`--connection` cannot be combined with `--config`, `--base-url`, `--host`, or
+`--pat`. The CLI, the log TUI, `connect()`, and the recipes share these rules;
+see the [Python SDK reference](python-sdk.md#connect) for the full order.
+
 ### Legacy Connection Config
 
 For Snowflake PAT auth, use `host` for the account hostname. Do not use
