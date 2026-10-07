@@ -36,6 +36,13 @@ python -m recipes.rl.math_grpo.train \
 python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json \
   job_config=configs/qwen36_35b_a3b_full.json
+
+# Qwen3.8-27B full-parameter
+python -m recipes.rl.math_grpo.train \
+  config=/path/to/config.json \
+  job_config=configs/qwen38_27b_full.json \
+  weight_sync_bucket_size=3221225472 \
+  max_tokens=2048
 ```
 
 `config=` is the Snowflake connection file. Adapt from `examples/config/connection.json.template`.
@@ -53,6 +60,7 @@ python -m recipes.rl.math_grpo.train \
   group_size=GROUP_SIZE \
   max_steps=MAX_STEPS \
   n_test=N_TEST \
+  weight_sync_bucket_size=WEIGHT_SYNC_BUCKET_SIZE_BYTES \
   wandb_project=WANDB_PROJECT \
   sf_tracking=SF_TRACKING
 ```
@@ -62,6 +70,10 @@ LoRA, GPU counts, sequence length, and MoE live in the job-config JSON. Set
 `export WANDB_API_KEY` / `export WANDB_BASE_URL`. Set `sf_tracking=True` to log
 to Snowflake experiment tracking after
 `uv pip install "snowflake-ml-python>=1.19.0"`.
+
+`weight_sync_bucket_size` optionally overrides the transfer-bucket size in
+bytes. When omitted, the recipe leaves the field out and uses the server
+default. Set it above the largest individual model tensor.
 
 The recipe loads one create-job body with colocated sampling and training
 sub-jobs. Pass a shipped example or a copy with `job_config=JOB_CONFIG`.
@@ -150,7 +162,9 @@ sub-jobs. Pass a shipped example or a copy with `job_config=JOB_CONFIG`.
         },
         "ep_size": EP_SIZE,
 
-        // Optional router replay for MoE training.
+        // Optional router replay for MoE training. Add "mode": "best_effort" to
+        // route rows the sampler no longer holds (e.g. after a sampler restart)
+        // with the trainer's own gate instead of failing the step.
         "router_replay": {"enabled": true, "max_cache_bytes": 2147483648}
       }
     }

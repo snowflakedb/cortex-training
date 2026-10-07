@@ -233,6 +233,7 @@ class Config:
     n_test: int | None = None
     eval_temperature: float | None = None
     eval_max_tokens: int | None = None
+    weight_sync_bucket_size: int | None = None
 
     log_path: str = "/tmp/cortex-training-examples/rl-loop"
     wandb_project: str | None = None
@@ -253,6 +254,7 @@ def job_body(config: Config) -> dict:
 def processing_block(config: Config, global_batch_size: int) -> dict:
     return dict(
         loss_fn="grpo",
+        post=["compute_logprobs"],
         config=dict(
             eps_clip=config.eps_clip,
             loss_agg_mode=config.loss_agg_mode,
@@ -474,6 +476,7 @@ def _train(config: Config) -> None:
                     client,
                     job_id,
                     weight_format="lora" if lora_rank > 0 else None,
+                    bucket_size=config.weight_sync_bucket_size,
                 )
 
             if router_replay:

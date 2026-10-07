@@ -675,6 +675,15 @@ back to the Snowflake Connector's configured default. If your profile is not
 named `default`, pass `--connection NAME` or set
 `SNOWFLAKE_DEFAULT_CONNECTION_NAME`.
 
+If Snowflake rejects your PAT, the CLI keeps the original error and adds next
+steps: `394400 (08001) ... Programmatic access token is invalid` from a
+connection profile, or a `401` on a request that sent the PAT directly
+(`config.json`, `--pat`, or `CORTEX_TRAINING_PAT`). The most common cause is a
+user with no network policy; see
+[Network policy requirement](../getting-started/authentication.md#network-policy-requirement).
+A `401` on a connection-profile request gets no hint, because the PAT was
+already accepted at login.
+
 If you see `Invalid URL ... No scheme supplied`, the config is using a bare
 Snowflake hostname as `base_url`. Use `host` for Snowflake PAT auth, or use a
 full local/mock URL such as `http://localhost:8084` for `base_url`.
