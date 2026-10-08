@@ -128,16 +128,15 @@ def test_shipped_qwen_recipes_use_model_limits_and_long_context_sp():
                 ds_config = config["ds_config"]
                 sp_size = config.get("sp_size", 1)
                 logical_dp = config["n_gpus"] // sp_size
-                assert config["train_batch_size"] == ds_config["train_batch_size"]
-                assert config["train_batch_size"] == (
-                    logical_dp
-                    * ds_config["train_micro_batch_size_per_gpu"]
-                    * ds_config["gradient_accumulation_steps"]
-                )
+                assert config["train_batch_size"] == logical_dp
+                assert {
+                    "train_batch_size",
+                    "train_micro_batch_size_per_gpu",
+                    "gradient_accumulation_steps",
+                }.isdisjoint(ds_config)
             if model_id == "Qwen/Qwen3.6-35B-A3B" and sub_job["job_type"] == "training":
                 assert config["sp_size"] == 8
                 assert config["train_batch_size"] == 1
-                assert config["ds_config"]["train_batch_size"] == 1
 
 
 @pytest.mark.parametrize(
