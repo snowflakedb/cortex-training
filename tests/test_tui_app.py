@@ -18,6 +18,7 @@ the optional ``textual`` extra is installed (``pip install 'cortex-training[tui]
 
 import asyncio
 import glob
+import json
 import os
 import re
 import threading
@@ -29,6 +30,10 @@ import pytest
 pytest.importorskip("textual")
 
 from textual.widgets import Input  # noqa: E402
+from textual.widgets import DataTable  # noqa: E402
+from textual.widgets import Label  # noqa: E402
+from textual.widgets import Static  # noqa: E402
+from textual.widgets import TabbedContent  # noqa: E402
 
 from cortex_training.tui.app import CortexTrainingLogTUI  # noqa: E402
 from cortex_training.tui.app import JobListScreen  # noqa: E402
@@ -112,6 +117,616 @@ def test_app_without_job_id_shows_job_picker():
     asyncio.run(_run_with_picker())
 
 
+async def _run_resource_tab(tmp_path):
+    c = _client()
+
+    def download(job_id, output_dir, *, resume=False):
+        assert job_id == "7"
+        assert resume is True
+        _write_gpu_metrics(output_dir, "7:training:0", gpu_count=2)
+        _write_gpu_metrics(output_dir, "7:sampling:0", gpu_count=1)
+        return []
+
+    c.download_metrics.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(100, 36)) as pilot:
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: isinstance(app.screen, LogScreen) and app.screen._current_source == "7:training:0",
+        )
+        assert ok
+        tabs = app.screen.query_one("#job-tabs", TabbedContent)
+        assert tabs.active == "logs"
+        assert {pane.id for pane in app.screen.query("TabPane")} == {"logs", "resource"}
+        c.download_metrics.assert_not_called()
+
+        tabs.active = "resource"
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: c.download_metrics.call_count == 1
+            and app.screen.query_one("#resource-table", DataTable).row_count == 2
+            and not app.screen._resource_loading,
+        )
+        assert ok, "Resource did not load two GPU rows"
+        status = str(app.screen.query_one("#resource-status", Static).render())
+        assert "2 GPU(s)" in status
+        assert "7:training:0" in status
+        calls = c.download_metrics.call_count
+
+        await pilot.press("5")
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: app.screen._resource_range == "all"
+            and "7:training:0  ·  all  ·" in str(app.screen.query_one("#resource-status", Static).render()),
+        )
+        assert ok
+        await pilot.press("1")
+        ok = await _wait(pilot, app, lambda: app.screen._resource_range == "5m")
+        assert ok
+        assert c.download_metrics.call_count == calls
+        app.screen._content_width = lambda: 10
+        app.screen._write_line("x" * 20)
+        assert len(app.screen._logview._lines) > len(app.screen._shown_lines)
+        app.screen.action_refresh_sources()
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: c.download_metrics.call_count == calls + 1 and not app.screen._resource_loading,
+        )
+        assert ok, "r did not refresh metrics on Resource"
+        tabs.active = "logs"
+        app.screen._content_width = lambda: 200
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: app.screen._active_tab == "logs" and app.screen._wrap_width == 200,
+        )
+        assert ok
+        assert len(app.screen._logview._lines) == len(app.screen._shown_lines)
+        downloads = c.download_metrics.call_count
+        app.screen.action_refresh_sources()
+        await pilot.pause()
+        assert c.download_metrics.call_count == downloads
+        app.screen._start_tail("7:sampling:0")
+        tabs.active = "resource"
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: app.screen.query_one("#resource-table", DataTable).row_count == 1
+            and "7:sampling:0" in str(app.screen.query_one("#resource-status", Static).render()),
+        )
+        assert ok, "Resource did not follow the Logs-selected sub-job"
+        assert c.download_metrics.call_count == downloads
+        tabs.active = "logs"
+        await _wait(pilot, app, lambda: app.screen._active_tab == "logs")
+        previous_range = app.screen._resource_range
+        app.screen.action_resource_range("all")
+        assert app.screen._resource_range == previous_range
+        await pilot.press("t")
+        ok = await _wait(pilot, app, lambda: tabs.active == "resource")
+        assert ok
+        await pilot.press("t")
+        ok = await _wait(pilot, app, lambda: tabs.active == "logs")
+        assert ok
+        await _settle(app, pilot)
+
+
+def test_resource_tab_is_lazy_and_renders_multiple_gpus(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    asyncio.run(_run_resource_tab(tmp_path))
+
+
+async def _run_resource_cold_cache_failure():
+    c = _client()
+    c.download_metrics.side_effect = RuntimeError("metrics [/]")
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(100, 36)) as pilot:
+        ok = await _wait(pilot, app, lambda: app.screen._current_source is not None)
+        assert ok
+        app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: c.download_metrics.called and not app.screen._resource_loading,
+        )
+        assert ok
+        status = str(app.screen.query_one("#resource-status", Static).render())
+        assert "GPU metrics unavailable: RuntimeError: metrics [/]" in status
+        assert app.screen.query_one("#resource-table", DataTable).row_count == 0
+        await _settle(app, pilot)
+
+
+def test_resource_cold_cache_download_failure_is_visible(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    asyncio.run(_run_resource_cold_cache_failure())
+
+
+async def _run_resource_parser_failure_resets_loading():
+    c = _client()
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(100, 36)) as pilot:
+        ok = await _wait(pilot, app, lambda: app.screen._current_source is not None)
+        assert ok
+        app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: not app.screen._resource_loading
+            and "OverflowError: bad metric"
+            in str(app.screen.query_one("#resource-status", Static).render()),
+        )
+        assert ok
+        status = str(app.screen.query_one("#resource-status", Static).render())
+        assert "GPU metrics unavailable: OverflowError: bad metric" in status
+        await _settle(app, pilot)
+
+
+def test_resource_parser_failure_does_not_leave_loading_stuck(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    import cortex_training.tui.app as app_module
+
+    monkeypatch.setattr(
+        app_module,
+        "load_resource_data",
+        MagicMock(side_effect=OverflowError("bad metric")),
+    )
+    asyncio.run(_run_resource_parser_failure_resets_loading())
+
+
+async def _run_resource_partial_download_failure():
+    c = _client()
+
+    def download(job_id, output_dir, *, resume):
+        _write_gpu_metrics(output_dir, "7:training:0", gpu_count=2)
+        raise RuntimeError("later sub-job failed")
+
+    c.download_metrics.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(100, 36)) as pilot:
+        ok = await _wait(pilot, app, lambda: app.screen._current_source is not None)
+        assert ok
+        app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: not app.screen._resource_loading
+            and app.screen.query_one("#resource-table", DataTable).row_count == 2,
+        )
+        assert ok
+        status = str(app.screen.query_one("#resource-status", Static).render())
+        assert "cached · refresh failed: RuntimeError: later sub-job failed" in status
+        await _settle(app, pilot)
+
+
+def test_resource_partial_download_is_reparsed_after_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    asyncio.run(_run_resource_partial_download_failure())
+
+
+async def _run_resource_partial_other_sub_job_retries():
+    c = _client()
+    calls = 0
+
+    def download(job_id, output_dir, *, resume):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            _write_gpu_metrics(output_dir, "7:sampling:0", gpu_count=1)
+            raise RuntimeError("training metrics failed")
+        _write_gpu_metrics(output_dir, "7:training:0", gpu_count=2)
+        return []
+
+    c.download_metrics.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(100, 36)) as pilot:
+        ok = await _wait(pilot, app, lambda: app.screen._current_source == "7:training:0")
+        assert ok
+        tabs = app.screen.query_one("#job-tabs", TabbedContent)
+        tabs.active = "resource"
+        ok = await _wait(pilot, app, lambda: calls == 1 and not app.screen._resource_loading)
+        assert ok
+        status = str(app.screen.query_one("#resource-status", Static).render())
+        assert "GPU metrics unavailable: RuntimeError: training metrics failed" in status
+        assert "no GPU metrics" not in status
+        tabs.active = "logs"
+        await _wait(pilot, app, lambda: app.screen._logs_active())
+        tabs.active = "resource"
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: calls == 2
+            and not app.screen._resource_loading
+            and app.screen.query_one("#resource-table", DataTable).row_count == 2,
+        )
+        assert ok, "re-entering Resource did not retry after a partial failure for another sub-job"
+        await _settle(app, pilot)
+
+
+def test_resource_partial_other_sub_job_failure_retries_on_reentry(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    asyncio.run(_run_resource_partial_other_sub_job_retries())
+
+
+async def _run_resource_cached_failure():
+    c = _client()
+    c.download_metrics.side_effect = RuntimeError("refresh unavailable")
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(100, 36)) as pilot:
+        ok = await _wait(pilot, app, lambda: app.screen._current_source is not None)
+        assert ok
+        app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: not app.screen._resource_loading
+            and app.screen.query_one("#resource-table", DataTable).row_count == 2,
+        )
+        assert ok
+        status = str(app.screen.query_one("#resource-status", Static).render())
+        assert "cached · refresh failed: RuntimeError: refresh unavailable" in status
+        app.screen.action_resource_range("all")
+        status = str(app.screen.query_one("#resource-status", Static).render())
+        assert "cached · refresh failed: RuntimeError: refresh unavailable" in status
+        assert app.screen.query_one("#resource-table", DataTable).row_count == 2
+        await _settle(app, pilot)
+
+
+def test_resource_failed_refresh_keeps_cached_rows_and_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    from cortex_training.tui.log_cache import job_cache_dir
+
+    _write_gpu_metrics(job_cache_dir("7") / "metrics", "7:training:0", gpu_count=2)
+    asyncio.run(_run_resource_cached_failure())
+
+
+async def _run_resource_unsupported_warning():
+    c = _client()
+
+    def download(job_id, output_dir, *, resume):
+        path = _write_gpu_metrics(output_dir, "7:training:0", gpu_count=1)
+        row = json.loads(path.read_text(encoding="utf-8"))
+        row["record_version"] = 1
+        path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        path.with_name(".gpu.jsonl.manifest.json").write_text(
+            json.dumps({"version": 1, "names": ["chunk.gz"], "bytes": path.stat().st_size}),
+            encoding="utf-8",
+        )
+        return []
+
+    c.download_metrics.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(100, 36)) as pilot:
+        ok = await _wait(pilot, app, lambda: app.screen._current_source is not None)
+        assert ok
+        app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        ok = await _wait(pilot, app, lambda: not app.screen._resource_loading)
+        assert ok
+        status = str(app.screen.query_one("#resource-status", Static).render())
+        assert "7:training:0" in status
+        assert "no usable GPU metrics" in status
+        assert "1 unsupported row(s)" in status
+        await _settle(app, pilot)
+
+
+def test_resource_all_unsupported_rows_show_warning(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    asyncio.run(_run_resource_unsupported_warning())
+
+
+async def _run_resource_narrow_no_samples():
+    c = _client()
+
+    def download(job_id, output_dir, *, resume):
+        path = _write_gpu_metrics(output_dir, "7:training:0", gpu_count=1)
+        row = json.loads(path.read_text(encoding="utf-8"))
+        row["gpu_util_pct"] = None
+        payload = json.dumps(row) + "\n"
+        path.write_text(payload, encoding="utf-8")
+        path.with_name(".gpu.jsonl.manifest.json").write_text(
+            json.dumps({"version": 1, "names": ["chunk.gz"], "bytes": path.stat().st_size}),
+            encoding="utf-8",
+        )
+        return []
+
+    c.download_metrics.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(60, 30)) as pilot:
+        ok = await _wait(pilot, app, lambda: app.screen._current_source is not None)
+        assert ok
+        app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: not app.screen._resource_loading
+            and app.screen.query_one("#resource-table", DataTable).row_count == 1,
+        )
+        assert ok
+        table = app.screen.query_one("#resource-table", DataTable)
+        assert app.screen._resource_table_has_fb is False
+        assert len(table.columns) == 3
+        assert str(app.screen.query_one("#resource-chart", Static).render()) == "no GPU samples in this range"
+        calls = c.download_metrics.call_count
+        app.screen.on_resize(None)
+        await pilot.pause()
+        assert c.download_metrics.call_count == calls
+        await _settle(app, pilot)
+
+
+def test_resource_narrow_table_no_samples_and_resize_is_local(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    asyncio.run(_run_resource_narrow_no_samples())
+
+
+async def _run_resource_chart_fits_content_width():
+    c = _client()
+
+    def download(job_id, output_dir, *, resume):
+        _write_gpu_metrics(output_dir, "7:training:0", gpu_count=1)
+        return []
+
+    c.download_metrics.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(60, 30)) as pilot:
+        ok = await _wait(pilot, app, lambda: app.screen._current_source is not None)
+        assert ok
+        app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: not app.screen._resource_loading
+            and app.screen.query_one("#resource-table", DataTable).row_count == 1,
+        )
+        assert ok
+        chart = app.screen.query_one("#resource-chart", Static)
+        lines = str(chart.render()).splitlines()
+        assert lines
+        assert chart.region.width - chart.content_region.width == 2
+        assert chart.content_size.width == chart.content_region.width
+        assert all(len(line) <= chart.content_size.width for line in lines)
+        await _settle(app, pilot)
+
+
+def test_resource_chart_accounts_for_widget_padding(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    asyncio.run(_run_resource_chart_fits_content_width())
+
+
+async def _run_resource_ignores_refresh_while_busy(started, release):
+    c = _client()
+
+    def download(job_id, output_dir, *, resume):
+        started.set()
+        assert release.wait(timeout=5)
+        _write_gpu_metrics(output_dir, "7:training:0")
+        return []
+
+    c.download_metrics.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(100, 36)) as pilot:
+        ok = await _wait(pilot, app, lambda: app.screen._current_source is not None)
+        assert ok
+        app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        ok = await _wait(pilot, app, started.is_set)
+        assert ok
+        app.screen.action_refresh_sources()
+        app.screen.action_refresh_sources()
+        await pilot.pause()
+        assert c.download_metrics.call_count == 1
+        release.set()
+        ok = await _wait(pilot, app, lambda: not app.screen._resource_loading)
+        assert ok
+        await _settle(app, pilot)
+
+
+def test_resource_ignores_refresh_while_busy(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    started = threading.Event()
+    release = threading.Event()
+    try:
+        asyncio.run(_run_resource_ignores_refresh_while_busy(started, release))
+    finally:
+        release.set()
+
+
+async def _run_resource_reopen_waits_for_lock(started, release):
+    c = _client()
+    calls = 0
+
+    def download(job_id, output_dir, *, resume):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            assert release.wait(timeout=5)
+        _write_gpu_metrics(output_dir, "7:training:0")
+        return []
+
+    c.download_metrics.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(100, 36)) as pilot:
+        ok = await _wait(pilot, app, lambda: app.screen._current_source is not None)
+        assert ok
+        app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        ok = await _wait(pilot, app, started.is_set)
+        assert ok
+        app.pop_screen()
+        await pilot.pause()
+        app.push_screen(LogScreen(c, "7", poll_interval=0.01))
+        ok = await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen) and app.screen._current_source is not None)
+        assert ok
+        app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        for _ in range(5):
+            await pilot.pause()
+        assert calls == 1
+        release.set()
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: calls == 2
+            and not app.screen._resource_loading
+            and app.screen.query_one("#resource-table", DataTable).row_count == 2,
+        )
+        assert ok, "reopened Resource did not continue after the prior download released the lock"
+        await _settle(app, pilot)
+
+
+def test_resource_reopen_waits_for_inflight_download(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    started = threading.Event()
+    release = threading.Event()
+    try:
+        asyncio.run(_run_resource_reopen_waits_for_lock(started, release))
+    finally:
+        release.set()
+
+
+async def _run_terminal_resource_default():
+    c = _client()
+    c.get_job.return_value = _terminal_job()
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(100, 36)) as pilot:
+        ok = await _wait(pilot, app, lambda: app.screen._sources_ready)
+        assert ok
+        assert app.screen._resource_range == "all"
+        await _settle(app, pilot)
+
+
+def test_direct_terminal_job_resource_defaults_to_all():
+    asyncio.run(_run_terminal_resource_default())
+
+
+async def _run_active_to_terminal_resource_default():
+    app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
+    async with app.run_test(size=(100, 36)) as pilot:
+        ok = await _wait(pilot, app, lambda: app.screen._sources_ready)
+        assert ok
+        assert app.screen._resource_range == "15m"
+        app.screen._apply_terminal_status("COMPLETED", None)
+        assert app.screen._resource_range == "all"
+        app.screen._resource_range = "5m"
+        app.screen._resource_range_selected = True
+        app.screen._apply_terminal_status("FAILED", None)
+        assert app.screen._resource_range == "5m"
+        await _settle(app, pilot)
+
+
+def test_active_job_becoming_terminal_updates_only_default_resource_range():
+    asyncio.run(_run_active_to_terminal_resource_default())
+
+
+async def _run_resource_escape_returns_to_parent(*, direct):
+    c = _client()
+    app = CortexTrainingLogTUI(c, "7" if direct else None, poll_interval=0.01)
+    async with app.run_test(size=(100, 36)) as pilot:
+        if direct:
+            ok = await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen))
+        else:
+            ok = await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen))
+            assert ok
+            app.push_screen(LogScreen(c, "7", poll_interval=0.01))
+            ok = await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen))
+        assert ok
+        app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        ok = await _wait(pilot, app, lambda: app.screen._resource_active())
+        assert ok
+        await pilot.press("escape")
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: not isinstance(app.screen, LogScreen),
+        )
+        assert ok
+        if not direct:
+            assert isinstance(app.screen, JobListScreen)
+        await _settle(app, pilot)
+
+
+def test_resource_escape_returns_from_direct_job():
+    asyncio.run(_run_resource_escape_returns_to_parent(direct=True))
+
+
+def test_resource_escape_returns_to_picker():
+    asyncio.run(_run_resource_escape_returns_to_parent(direct=False))
+
+
+async def _run_resource_guards(tmp_path):
+    c = _client()
+    c.download_metrics.side_effect = lambda job_id, output_dir, *, resume: (
+        _write_gpu_metrics(output_dir, "7:training:0"),
+        [],
+    )[1]
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(100, 36)) as pilot:
+        ok = await _wait(pilot, app, lambda: app.screen._current_source is not None)
+        assert ok
+        app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        ok = await _wait(pilot, app, lambda: not app.screen._resource_loading)
+        assert ok
+        screen = app.screen
+        table = screen.query_one("#resource-table", DataTable)
+        screen.set_focus(table)
+        width = screen._sources_width
+        level = screen._min_level
+        paused = screen._paused
+        copied = []
+        app.copy_to_clipboard = copied.append
+        screen.action_filter()
+        screen.action_cycle_level()
+        screen.action_toggle_pause()
+        screen.action_shrink_sources()
+        screen.action_grow_sources()
+        screen.action_save_log()
+        screen.action_copy_log()
+        screen.action_copy_text()
+        for _ in range(5):
+            await pilot.pause()
+        assert screen.focused is table
+        assert screen._sources_width == width
+        assert screen._min_level == level
+        assert screen._paused == paused
+        assert copied == []
+        assert not list(tmp_path.glob("cortex-training-*.log"))
+        await _settle(app, pilot)
+
+
+def test_log_only_actions_are_guarded_on_resource(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    asyncio.run(_run_resource_guards(tmp_path))
+
+
+async def _run_sub_job_scope(sub_job_id):
+    c = _client()
+    app = CortexTrainingLogTUI(c, "7", sub_job_id=sub_job_id, poll_interval=0.01)
+    async with app.run_test(size=(100, 36)) as pilot:
+        ok = await _wait(pilot, app, lambda: app.screen._sources_ready)
+        assert ok
+        if sub_job_id == "7:sampling:0":
+            assert list(app.screen._source_by_item.values()) == ["7:sampling:0"]
+            assert app.screen._current_source == "7:sampling:0"
+        else:
+            assert app.screen._source_by_item == {}
+            assert app.screen._current_source is None
+            app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+            for _ in range(5):
+                await pilot.pause()
+            c.download_metrics.assert_not_called()
+            labels = [str(item.query_one(Label).render()) for item in app.screen.query("#sources ListItem")]
+            assert any("sub-job not found" in label for label in labels)
+        await _settle(app, pilot)
+
+
+def test_sub_job_id_scopes_source_list():
+    asyncio.run(_run_sub_job_scope("7:sampling:0"))
+
+
+def test_unmatched_sub_job_does_not_download_metrics():
+    asyncio.run(_run_sub_job_scope("7:missing:0"))
+
+
 async def _run_refresh_picker():
     c = _client()
     jobs = c.list_jobs.return_value
@@ -180,6 +795,34 @@ def test_source_refresh_no_duplicate_ids():
     asyncio.run(_run_refresh_sources())
 
 
+async def _run_empty_source_refresh_clears_selection():
+    c = _client()
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, lambda: app.screen._current_source is not None)
+        assert ok
+        c.get_job.return_value = {}
+        app.screen.action_refresh_sources()
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: app.screen._current_source is None
+            and len(app.screen.query("#sources ListItem")) == 0,
+        )
+        assert ok
+        app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        await pilot.pause()
+        c.download_metrics.assert_not_called()
+        status = str(app.screen.query_one("#resource-status", Static).render())
+        assert "select a log source first" in status
+        await _settle(app, pilot)
+
+
+def test_empty_source_refresh_clears_resource_selection(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    asyncio.run(_run_empty_source_refresh_clears_selection())
+
+
 async def _run_offline_fallback():
     c = _client()
     c.get_job.side_effect = RuntimeError("network down")  # can't fetch sub-jobs
@@ -202,6 +845,14 @@ def test_offline_shows_cached_sources(tmp_path, monkeypatch):
     from cortex_training.tui.log_cache import LogCache
 
     LogCache("7").append_entries("7:training:0", [{"_raw": "cached line"}])
+    asyncio.run(_run_offline_fallback())
+
+
+def test_offline_shows_metrics_only_cached_sources(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    from cortex_training.tui.log_cache import job_cache_dir
+
+    _write_gpu_metrics(job_cache_dir("7") / "metrics", "7:training:0", gpu_count=2)
     asyncio.run(_run_offline_fallback())
 
 
@@ -525,6 +1176,34 @@ def _write_stdout(output_dir, sub_job_id, text):
     path = Path(output_dir) / sub_job_id / "stdout.log"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _write_gpu_metrics(output_dir, sub_job_id, *, gpu_count=2):
+    path = Path(output_dir) / sub_job_id / "gpu.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for gpu in range(gpu_count):
+        rows.append(
+            {
+                "record_version": 2,
+                "sub_job_id": sub_job_id,
+                "sample_ts": f"2026-01-01T00:00:0{gpu}.123456789Z",
+                "worker_num": gpu,
+                "local_gpu_index": 0,
+                "global_gpu_index": gpu,
+                "gpu_util_pct": float(gpu * 80),
+                "fb_used_bytes": float((gpu + 1) * 1024**3),
+                "fb_free_bytes": float(8 * 1024**3),
+                "sample_interval_s": 5.0,
+            }
+        )
+    payload = "".join(json.dumps(row) + "\n" for row in rows)
+    path.write_text(payload, encoding="utf-8")
+    path.with_name(".gpu.jsonl.manifest.json").write_text(
+        json.dumps({"version": 1, "names": ["chunk.gz"], "bytes": path.stat().st_size}),
+        encoding="utf-8",
+    )
     return path
 
 
