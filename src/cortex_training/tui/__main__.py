@@ -30,12 +30,15 @@ import sys
 def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog=prog,
-        description="Read-only TUI for Cortex Training logs.",
+        description="Read-only TUI for Cortex Training logs and GPU resources.",
     )
     p.add_argument(
         "job_id", nargs="?", help="Job (session) id to open directly. If omitted, the TUI shows a job picker."
     )
-    p.add_argument("--sub-job-id", help="Sub-job id used to scope log sources and routing.")
+    p.add_argument(
+        "--sub-job-id",
+        help="Open one matching sub-job directly in the Logs and Resource tabs.",
+    )
     p.add_argument(
         "--config",
         dest="config",
@@ -106,8 +109,8 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
 
     client = cli.build_client(args, cli._load_cortex_training_client_class())
 
-    # job_id is optional: given, we jump straight to that job's logs; omitted,
-    # the TUI opens the job picker (list_jobs) so you can choose one.
+    # job_id is optional: given, open that job's dashboard; omitted, open the
+    # job picker (list_jobs) so the user can choose one.
     CortexTrainingLogTUI(client, args.job_id, sub_job_id=args.sub_job_id, poll_interval=args.poll_interval).run()
     return 0
 

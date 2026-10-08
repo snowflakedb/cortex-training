@@ -1792,7 +1792,31 @@ reconstruction to `gpu.YYYYMMDD-HHMMSS.UUID.gz` chunks under
 including `resume` and the manifest beside that file.
 
 The reconstructed file contains the JSONL records emitted by the deployed
-training runtime.
+training runtime. Version 2 GPU rows have no `kind` field and include:
+
+| Field | Meaning |
+|---|---|
+| `record_version` | Row schema version; currently `2` |
+| `sub_job_id` | Sub-job that produced the sample |
+| `sample_ts` | RFC3339 UTC scrape time; fractional seconds may use nanosecond precision |
+| `worker_num` | Worker ordinal within the sub-job |
+| `local_gpu_index` | GPU index within one worker; it repeats across workers |
+| `global_gpu_index` | GPU identity within one sub-job; group GPU series by this field |
+| `gpu_uuid` | Device UUID reported by the GPU runtime |
+| `gpu_util_pct` | GPU utilization percentage gauge |
+| `fb_used_bytes` / `fb_free_bytes` | Used and free framebuffer bytes |
+| `power_watts` | Board power gauge |
+| `gpu_temp_c` | GPU temperature gauge |
+| `sm_active_pct` / `sm_occupancy_pct` | Optional SM activity gauges |
+| `tensor_active_pct` / `dram_active_pct` | Optional tensor and DRAM activity gauges |
+| `seq` / `seq_epoch` | Sample sequence and its opaque generation |
+| `sample_interval_s` | Sampling interval in seconds |
+
+One row represents one GPU at one scrape. Gauge values are used as-is rather
+than differenced. JSON `null` means unmeasured and is distinct from `0.0`.
+`global_gpu_index` is unique only inside a sub-job, so consumers loading more
+than one file also group by `sub_job_id`. A future mixed stream can distinguish
+GPU rows with `kind: "gpu"`; consumers should ignore kinds they do not support.
 
 ### 12.5 Zone scheduling events
 
