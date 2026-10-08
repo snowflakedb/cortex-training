@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 import cortex_training
-import cortex_training._cli as cli_implementation
+import cortex_training._connection as connection_implementation
 import cortex_training.cli as cortex_cli
 from tests.test_cli import FakeClient
 from tests.test_cli import _base_args
@@ -83,26 +83,34 @@ def test_login_parses_config(config_args, monkeypatch):
 @pytest.mark.parametrize(
     "argv",
     [
-        ["login"],
-        ["--config", "global.json", "login"],
         ["login", "--config"],
         ["login", "test.json", "--config", "other.json"],
         ["login", "--config", "other.json", "test.json"],
+        ["login", "test.json", "--host", "ACCOUNT.snowflakecomputing.com"],
     ],
 )
-def test_login_requires_exactly_one_config(argv, monkeypatch):
+def test_login_rejects_ambiguous_config(argv, monkeypatch):
     monkeypatch.setenv("CORTEX_TRAINING_CONFIG", "environment.json")
     with pytest.raises(SystemExit) as exc:
         cortex_cli.parse_args(argv)
     assert exc.value.code == 2
 
 
-def test_login_help_shows_both_config_forms(capsys):
+@pytest.mark.parametrize("argv", [["login"], ["--config", "global.json", "login"]])
+def test_login_without_config_is_interactive(argv, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_CONFIG", "environment.json")
+    args = cortex_cli.parse_args(argv)
+    assert args.command == "login"
+    assert args.login_config is None
+
+
+def test_login_help_shows_both_forms(capsys):
     with pytest.raises(SystemExit) as exc:
         cortex_cli.parse_args(["login", "--help"])
     assert exc.value.code == 0
     help_text = capsys.readouterr().out
-    assert "usage: cortex-training login [-h] (config | --config config)" in help_text
+    assert "usage: cortex-training login [-h] [config | --config config]" in help_text
+    assert "--pat-stdin" in help_text
 
 
 @pytest.mark.parametrize("command", ["fwd-bwd", "step", "load", "generate", "weight-sync"])
@@ -191,7 +199,7 @@ def test_canonical_environment_and_login_paths(monkeypatch, tmp_path):
     args = cortex_cli.parse_args(["--base-url", "http://localhost:8084", "list"])
 
     assert args.database == "TRAINING_DB"
-    assert cli_implementation._login_state_path() == tmp_path / "cortex-training" / "login.json"
+    assert connection_implementation.login_state_path() == tmp_path / "cortex-training" / "login.json"
 
 
 def test_help_includes_tui():

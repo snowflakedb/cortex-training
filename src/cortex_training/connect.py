@@ -65,7 +65,7 @@ def connect(
     2. ``CORTEX_TRAINING_CONFIG`` JSON file
     3. ``CORTEX_TRAINING_BASE_URL``, or ``CORTEX_TRAINING_HOST`` +
        ``CORTEX_TRAINING_PAT``, when a database is also set
-    4. Config remembered by ``cortex-training login``
+    4. Config or profile remembered by ``cortex-training login``
     5. The same env vars without a database
     6. Default ``connections.toml`` profile
 

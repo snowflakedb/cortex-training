@@ -26,7 +26,7 @@ Sources, first match wins:
 2. ``CORTEX_TRAINING_CONNECTION``, then ``CORTEX_TRAINING_CONFIG``.
 3. A complete direct connection from env vars (``CORTEX_TRAINING_BASE_URL``,
    or ``CORTEX_TRAINING_HOST`` + ``CORTEX_TRAINING_PAT``) with a database.
-4. The config remembered by ``cortex-training login``.
+4. The config or profile remembered by ``cortex-training login``.
 5. A complete direct connection from env vars without a database.
 6. The Snowflake Connector's default ``connections.toml`` profile.
 
@@ -123,7 +123,12 @@ def login_state_path() -> Path:
     return base / "cortex-training" / "login.json"
 
 
-def read_login_config_path() -> str | None:
+def read_login_state() -> tuple[str, str] | None:
+    """Return what ``cortex-training login`` remembered, or None.
+
+    The state is either ``("config", path)`` from ``login config.json`` or
+    ``("connection", name)`` from the interactive ``login``.
+    """
     path = login_state_path()
     if not path.exists():
         return None
@@ -133,10 +138,26 @@ def read_login_config_path() -> str | None:
         raise ValueError(f"invalid cortex-training login state {path}: {exc}") from exc
     if not isinstance(parsed, dict):
         raise ValueError(f"invalid cortex-training login state {path}: expected object")
+    connection = parsed.get("connection")
+    if isinstance(connection, str) and connection:
+        return ("connection", connection)
     config_path = parsed.get("config_path")
     if not isinstance(config_path, str) or not config_path:
         raise ValueError(f"invalid cortex-training login state {path}: missing config_path")
-    return config_path
+    return ("config", config_path)
+
+
+def clear_login_state() -> None:
+    """Forget whatever ``cortex-training login`` remembered."""
+    login_state_path().unlink(missing_ok=True)
+
+
+def write_login_state(*, config_path: str | None = None, connection: str | None = None) -> None:
+    """Remember a config path or a connection profile for later commands."""
+    payload = {"connection": connection} if connection else {"config_path": config_path}
+    state_path = login_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def load_config(path: str | None) -> dict[str, Any]:
@@ -273,14 +294,18 @@ def resolve_connection(
     else:
         env_base_url, env_host, env_pat = _env_direct()
         env_complete = bool(env_base_url or (env_host and env_pat))
-        login_config = None
+        login_state = None
         if load_login and not (env_complete and (database or _env_database())):
-            login_config = read_login_config_path()
-            if login_config is not None and not Path(login_config).expanduser().is_file():
-                login_config = None
-        if login_config is not None:
-            selected_config = login_config
-            source = f"config file {login_config} remembered by cortex-training login"
+            login_state = read_login_state()
+            if login_state is not None and login_state[0] == "config":
+                if not Path(login_state[1]).expanduser().is_file():
+                    login_state = None
+        if login_state is not None and login_state[0] == "connection":
+            profile = login_state[1]
+            source = f"connection profile {profile!r} remembered by cortex-training login"
+        elif login_state is not None:
+            selected_config = login_state[1]
+            source = f"config file {selected_config} remembered by cortex-training login"
         elif env_complete:
             source = "environment variables"
         else:

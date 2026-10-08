@@ -42,8 +42,20 @@ Cortex Training authenticates through a Snowflake Programmatic Access Token
 
 ## Step 2: Configure the Client
 
-Once you have a PAT, pick **one** of the following methods to configure the
-client. We recommend `connections.toml`.
+The fastest way is to let the CLI set it up for you:
+
+```bash
+cortex-training login
+```
+
+It reports any setup you already have. Otherwise it asks for your account host,
+Snowflake user, PAT, database, and schema, writes a `connections.toml` profile,
+creates the `CORTEX_TRAINING_DB` database if needed, and checks the connection.
+See [`cortex-training login`](../reference/cli.md#login) for details and
+scripted use.
+
+To configure the client by hand instead, pick **one** of the following methods.
+We recommend `connections.toml`.
 
 ### Option A: connections.toml (recommended)
 

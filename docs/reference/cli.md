@@ -81,6 +81,7 @@ positional `JOB_ID` after the subcommand.
 ### [Connection](#connection-config)
 
 ```bash
+cortex-training login                         # Detect or create a connections.toml profile
 cortex-training --connection training list    # Use a Snowflake profile
 cortex-training list                          # Use the configured default profile
 cortex-training login config.json             # Remember config for future commands
@@ -256,20 +257,103 @@ account, use `base_url` with an explicit scheme. This skips PAT auth:
 }
 ```
 
+### Login
+
+`cortex-training login` with no config path sets up a `connections.toml`
+profile and checks that it works:
+
+```bash
+cortex-training login
+```
+
+1. It first looks for a connection the CLI would already use, with the same
+   rules as every other command. If it finds one, it prints where it comes from
+   (the profile and file, the JSON config, or the environment variable names),
+   the host, user, database, schema, and endpoint, and where the token is
+   stored. The token itself is never printed. It also lists other setups it
+   found but did not use, offers to check the connection, and changes nothing
+   unless you ask for a new profile.
+
+   A login remembered by an earlier `cortex-training login` is always checked
+   before it is trusted. If it points to a profile or config file that no
+   longer exists, its state file is unreadable, or the check fails, login says
+   why, removes the remembered login, and continues with any other setup you
+   have or with the prompts below.
+2. Otherwise it prompts for the account host, Snowflake user, PAT (hidden),
+   database (default `CORTEX_TRAINING_DB`), schema (default `PUBLIC`), and
+   profile name (default `cortex-training`). Values found in other profiles or
+   environment variables are offered as defaults. The host and PAT prompts link
+   to [Authentication](../getting-started/authentication.md), which shows where
+   to find each value, with screenshots. A pasted Snowsight URL
+   (`app.snowflake.com/ORG/ACCOUNT`) is converted to the host, and hosts with
+   underscores are rejected.
+3. It writes the profile to the Snowflake Connector's `connections.toml`
+   (`~/.snowflake/connections.toml`, or `$SNOWFLAKE_HOME/connections.toml`),
+   keeps every other profile and comment, and sets the file to mode `600`. It
+   asks before replacing a profile with the same name.
+4. It remembers the profile, so later commands, recipes, and `connect()` use it
+   when no other connection is given. If an environment variable such as
+   `CORTEX_TRAINING_CONNECTION` would still take precedence, login says so.
+5. It runs a capacity request through the new profile. If the database does not
+   exist yet, the client creates it with
+   `CREATE DATABASE IF NOT EXISTS CORTEX_TRAINING_DB`, and login prints that
+   statement and its result. If the check fails, the profile is kept, the error
+   and next steps are printed, and login exits with status `1`.
+
+Prompts and progress go to stderr; stdout gets one JSON summary.
+
+Flags skip the matching prompt, so login also works in scripts and coding
+agents. Without a terminal, missing values are errors instead of prompts:
+
+```bash
+CORTEX_TRAINING_PAT=... cortex-training login \
+  --host ORG-ACCOUNT.snowflakecomputing.com --user USER
+printf '%s\n' "$PAT" | cortex-training login \
+  --host ORG-ACCOUNT.snowflakecomputing.com --user USER --pat-stdin
+```
+
+| Flag | Default |
+|------|---------|
+| `--host HOST` | prompt |
+| `--user USER` | prompt |
+| `--database DATABASE` | `CORTEX_TRAINING_DB` |
+| `--schema SCHEMA` | `PUBLIC` |
+| `--connection NAME` | `cortex-training` |
+| `--pat-stdin` | read the PAT from the first line of stdin |
+| `--force` | replace an existing profile without asking; with `--reset`, also remove the saved profile |
+| `--reset` | start over (see below) |
+
+The PAT is never accepted as a flag, so it stays out of shell history.
+
+To start over, for example after saving a working profile for the wrong
+account, run:
+
+```bash
+cortex-training login --reset
+```
+
+It removes the saved login (`login.json`, which only points to a profile or
+config file and never stores credentials), asks before removing the profile it
+pointed to, and then runs the prompts without offering values from existing
+profiles. It never modifies other profiles in `connections.toml`, which other
+Snowflake tools may share. Without a terminal, `--reset` only removes the saved
+login, unless `--force` is also given to remove the profile.
+
 ### Legacy Login
 
-Login validates the config and stores only the config path, not the config
-contents:
+With a config path, login validates the config and stores only the config
+path, not the config contents:
 
 ```bash
 cortex-training login config.json
 cortex-training login --config config.json
 ```
 
-Provide exactly one config path, either positionally or with `--config` after
-`login`. Both forms validate and remember the same file. Login requires an
-explicit path even when a global `--config`, `CORTEX_TRAINING_CONFIG`, or a
-previous login is available.
+Provide one config path, either positionally or with `--config` after
+`login`. Both forms validate and remember the same file. Without a path, login
+runs the interactive setup above instead, even when a global `--config`,
+`CORTEX_TRAINING_CONFIG`, or a previous login is available. A config path
+cannot be combined with the profile setup flags.
 
 The login state is written to `~/.config/cortex-training/login.json` by default,
 or `$XDG_CONFIG_HOME/cortex-training/login.json` when `XDG_CONFIG_HOME` is set.
