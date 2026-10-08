@@ -3,14 +3,14 @@
 
 from pathlib import Path
 
-from recipes.sft.conversational.chat_datasets import BuiltinJsonl
-from recipes.sft.conversational.chat_datasets import MappedHfDataset
-from recipes.sft.conversational.chat_datasets import gsm8k_row_to_messages
-from recipes.sft.conversational.chat_datasets import is_gsm8k_dataset
-from recipes.sft.conversational.chat_datasets import load_chat_dataset
-from recipes.sft.conversational.chat_datasets import lookup_chat_dataset
-from recipes.sft.conversational.chat_datasets import sample_prompt_for
-from recipes.sft.conversational.chat_datasets import tile_rows
+from recipes.sft.tasks.conversational import BuiltinJsonl
+from recipes.sft.tasks.conversational import MappedHfDataset
+from recipes.sft.tasks.conversational import gsm8k_row_to_messages
+from recipes.sft.tasks.conversational import is_gsm8k_dataset
+from recipes.sft.tasks.conversational import load_chat_dataset
+from recipes.sft.tasks.conversational import lookup_chat_dataset
+from recipes.sft.tasks.conversational import sample_prompt_for
+from recipes.sft.tasks.conversational import tile_rows
 
 import datasets
 
@@ -50,7 +50,7 @@ def test_load_chat_dataset_converts_gsm8k(monkeypatch):
         return datasets.DatasetDict({"train": raw})
 
     monkeypatch.setattr(
-        "recipes.sft.conversational.chat_datasets.datasets.load_dataset",
+        "recipes.sft.tasks.conversational.datasets.load_dataset",
         fake_load_dataset,
     )
     loaded = load_chat_dataset("openai/gsm8k", dataset_split="train", n_train=2)
@@ -120,7 +120,7 @@ def test_mapped_adapter_can_be_registered(monkeypatch):
         return datasets.DatasetDict({"train": raw})
 
     monkeypatch.setattr(
-        "recipes.sft.conversational.chat_datasets.datasets.load_dataset",
+        "recipes.sft.tasks.conversational.datasets.load_dataset",
         fake_load_dataset,
     )
     loaded = adapter.load(dataset_split="train", n_train=1)

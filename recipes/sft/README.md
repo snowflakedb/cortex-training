@@ -64,9 +64,9 @@ python -m recipes.sft.conversational.train \
   dataset=identity
 ```
 
-Dataset loading lives in `chat_datasets.py`, not `train.py`. To add a source:
+Dataset loading lives in `tasks/conversational.py`, not `train.py`. To add a source:
 
-- JSONL with `messages`: put it under `data/` and append a `BuiltinJsonl` to `CHAT_DATASETS` (see `who_trained_you` and `identity`).
+- JSONL with `messages`: put it under `conversational/data/` and append a `BuiltinJsonl` to `CHAT_DATASETS` (see `who_trained_you` and `identity`).
 - Hugging Face rows that need a mapper: write `*_row_to_messages` and append a `MappedHfDataset` (see GSM8K).
 - Hugging Face sets that already have `messages` (No Robots, UltraChat): pass `dataset=org/name`. No registry entry.
 
