@@ -655,7 +655,98 @@ def test_capacity_prints_account_gpu_usage():
                 "available_gpus": 0,
             },
         },
+        "unsupported_hardware": [],
     }
+
+
+def _unsupported_hardware_error(hardware: str, *, code: str = "517604", message: str | None = None):
+    import requests
+
+    response = requests.Response()
+    response.status_code = 409
+    response._content = json.dumps(
+        {
+            "code": code,
+            "message": message
+            or f'Cortex training getCapacity failed: unsupported hardware "{hardware}": '
+            "supported hardware is H200, B300",
+        }
+    ).encode()
+    return requests.HTTPError("409 Client Error: Conflict", response=response)
+
+
+class _PartialHardwareClient(FakeClient):
+    def __init__(self, failures):
+        super().__init__()
+        self._failures = failures
+
+    def get_capacity(self, hardware=None):
+        if hardware in self._failures:
+            self.capacity_hardware_requests.append(hardware)
+            raise self._failures[hardware]
+        return super().get_capacity(hardware)
+
+
+def test_capacity_lists_unsupported_hardware_separately():
+    client = _PartialHardwareClient({"B200": _unsupported_hardware_error("B200")})
+    stdout = io.StringIO()
+
+    rc = cli.main(_base_args() + ["capacity"], client_factory=lambda _args: client, stdout=stdout)
+
+    assert rc == 0
+    assert client.capacity_hardware_requests == ["H200", "B200", "B300"]
+    result = json.loads(stdout.getvalue())
+    assert set(result["capacity_by_hardware"]) == {"H200", "B300"}
+    assert result["capacity_by_hardware"]["H200"]["available_gpus"] == 40
+    assert result["unsupported_hardware"] == ["B200"]
+
+
+def test_capacity_still_fails_on_other_errors():
+    other = _unsupported_hardware_error("B200", code="517604", message="Cortex training getCapacity failed: timeout")
+    client = _PartialHardwareClient({"B200": other})
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["capacity"],
+        client_factory=lambda _args: client,
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert "timeout" in stderr.getvalue()
+
+
+def test_capacity_errors_when_no_hardware_is_supported():
+    client = _PartialHardwareClient(
+        {hardware: _unsupported_hardware_error(hardware) for hardware in ("H200", "B200", "B300")}
+    )
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["capacity"],
+        client_factory=lambda _args: client,
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert "unsupported hardware" in stderr.getvalue()
+
+
+def test_capacity_with_unsupported_hardware_flag_reports_service_error():
+    client = _PartialHardwareClient({"B200": _unsupported_hardware_error("B200")})
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["capacity", "--hardware", "B200"],
+        client_factory=lambda _args: client,
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert "supported hardware is H200, B300" in stderr.getvalue()
 
 
 def test_capacity_passes_hardware():

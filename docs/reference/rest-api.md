@@ -483,6 +483,19 @@ unknown value client-side. The CLI `capacity` command, with no `--hardware`
 flag, calls this endpoint once per type and wraps the results in
 `capacity_by_hardware`.
 
+A known type that the account does not support is rejected with `409` and code
+`517604`, for example:
+
+```json
+{
+  "code": "517604",
+  "message": "Cortex training getCapacity failed: unsupported hardware \"B200\": supported hardware is H200, B300"
+}
+```
+
+The CLI lists such types in `unsupported_hardware` instead of failing, and
+fails on any other error.
+
 The SDK attempts each capacity lookup once with at most a 10-second connect
 timeout and a 30-second read timeout; a shorter configured request timeout still
 wins. This endpoint is a fast control-plane read, so a silent network, proxy, or
