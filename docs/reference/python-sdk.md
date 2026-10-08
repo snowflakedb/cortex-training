@@ -153,7 +153,9 @@ run and returns `{sub_job_id, filename, artifact_uri, content}` dicts.
 console chunks as `<output_dir>/<sub_job_id>/stdout.log`.
 `download_metrics(job_id, output_dir, *, resume=False)` reconstructs GPU metric
 chunks as `<output_dir>/<sub_job_id>/gpu.jsonl`. `resume=True` appends chunks
-that are not already recorded in the manifest beside that file.
+that are not already recorded in the manifest beside that file. See
+[GPU metrics download](rest-api.md#124-gpu-metrics-download) for the JSONL row
+schema.
 `get_experiment_run(job_id)` resolves the experiment/run names.
 
 ## Building payloads
