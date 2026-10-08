@@ -25,11 +25,25 @@ cortex-training download-metrics JOB_ID --output-dir /path/to/metrics --resume
 
 Metrics are written to `<output_dir>/<sub_job_id>/gpu.jsonl`.
 
-View a running job's live logs, or a finished job's saved console, in the terminal:
+GPU scrape lines use `kind: "gpu"` when `kind` is present; mixed streams may
+also contain other kinds. `sample_ts` is an RFC3339 UTC timestamp,
+`global_gpu_index` identifies a GPU within its sub-job, `gpu_util_pct` is a
+gauge from 0–100, and `fb_used_bytes` / `fb_free_bytes` report framebuffer.
+JSON `null` means unmeasured; it is different from a real `0.0`. Group by both
+`sub_job_id` and `global_gpu_index`, not `local_gpu_index`, which repeats on
+different workers.
+
+Open a job dashboard in the terminal:
 
 ```bash
 cortex-training tui JOB_ID
 ```
+
+The **Logs** tab tails a running job or loads its saved console after it
+finishes. The **Resource** tab plots GPU utilization and lists each GPU. Use
+`1`–`5` for 5 minutes, 15 minutes, 1 hour, 6 hours, or all history; use `r` to
+refresh. Resource refresh is manual and resumes from chunks already in the TUI
+cache. CPU and memory are not available in this view yet.
 
 Recipe-level metrics are also written under each recipe's `log_path`.
 

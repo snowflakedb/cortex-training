@@ -10,7 +10,7 @@ below, such as `ct login config.json` or `ct --job JOB_ID step`.
 ## Installation
 
 Requires Python 3.10+. Installing the package gives you the `cortex-training`
-CLI, the `cortex-training tui` log viewer, and the `cortex_training` Python SDK.
+CLI, the `cortex-training tui` job dashboard, and the `cortex_training` Python SDK.
 
 This project uses [uv](https://docs.astral.sh/uv/); `pip` works in place of
 `uv pip` throughout if you prefer.
@@ -134,11 +134,11 @@ cortex-training --job JOB_ID load CHECKPOINT_ID --target-sub-job-id JOB_ID:train
 cortex-training --job JOB_ID load CHECKPOINT_ID --no-poll
 ```
 
-### [Logs And Metrics](#log-tui)
+### [Logs And Metrics](#job-tui)
 
 ```bash
 cortex-training tui                          # Open job picker
-cortex-training tui JOB_ID                   # Open job logs
+cortex-training tui JOB_ID                   # Open the job dashboard
 cortex-training download-log JOB_ID --output-dir ./logs
 cortex-training download-log JOB_ID --log-type stdout --output-dir ./logs
 cortex-training download-metrics JOB_ID --output-dir ./metrics
@@ -177,7 +177,7 @@ cortex-training fwd-bwd --help
 - [Load checkpoints](#load-a-checkpoint-into-a-running-job) and [initialize sampling](#start-sampling-from-a-training-checkpoint)
 - [Generate](#run-a-generate-smoke-test) and [sync weights](#sync-training-weights)
 - [Download logs](#download-execution-logs), [stdout](#download-persisted-stdout), and [metrics](#download-gpu-metrics)
-- [Log TUI](#log-tui), [JSON output and help](#json-output-and-help), and [troubleshooting](#troubleshooting)
+- [Job TUI](#job-tui), [JSON output and help](#json-output-and-help), and [troubleshooting](#troubleshooting)
 
 `cortex-training` submits and manages Cortex Training jobs through the Cortex
 Training REST endpoint.
@@ -570,15 +570,15 @@ URIs for each reconstructed file. `--resume` continues a metrics download
 already in that directory. Two downloads of the same directory at once are
 unsupported.
 
-### Log TUI
+### Job TUI
 
-`cortex-training tui` is a read-only terminal UI for tailing a running job's
-logs live. It uses the same connection handling and fallback order as the CLI,
+`cortex-training tui` is a read-only terminal dashboard for job logs and GPU
+resources. It uses the same connection handling and fallback order as the CLI,
 including named and configured-default Snowflake profiles:
 
 ```bash
 cortex-training tui                 # opens a job picker
-cortex-training tui JOB_ID          # opens that job's logs directly
+cortex-training tui JOB_ID          # opens that job's dashboard directly
 ```
 
 Without login state, pass connection details the same way as the CLI:
@@ -601,11 +601,13 @@ cortex-training tui \
   --database CORTEX_TRAINING_DB --schema PUBLIC
 ```
 
-Pass `--sub-job-id JOB_ID:training:0` to open one sub-job's log directly instead
-of the source list.
+Pass `--sub-job-id JOB_ID:training:0` to scope Logs and Resource to one matching
+sub-job. An unmatched id is shown as an error rather than falling back to a
+different sub-job.
 
-The left panel lists the job's sub-jobs; select one to tail its logs (the
-zone-manager pod is the Ray head, so a sub-job's worker output is included).
+The **Logs** tab's left panel lists the job's sub-jobs; select one to tail its
+logs (the zone-manager pod is the Ray head, so a sub-job's worker output is
+included).
 Logs are cached locally so reopening a job replays instantly without
 re-fetching from the server — under `~/.cache/cortex-training/` (or
 `$XDG_CACHE_HOME`), overridable with `CORTEX_TRAINING_TUI_CACHE_DIR`.
@@ -619,7 +621,16 @@ key (`~/cortex-training-<job8>-<source>.log`, where `<job8>` is the first eight
 characters of the job id) and its own error log
 (`~/.cortex-training-errors.log`).
 
-Keys in the log view:
+Use `t` to switch between Logs and Resource. The **Resource** tab downloads GPU
+metrics into the same per-job cache with resumable updates. It displays a
+fixed-scale utilization history and one current/window row per GPU. Refresh is
+manual; CPU and memory are not available yet. Do not run another metrics
+download against the TUI's private cache directory at the same time.
+Running jobs start at 15 minutes; terminal jobs start at all history. If the
+latest metrics refresh fails, re-entering Resource retries it; `r` can also
+retry explicitly.
+
+Keys in Logs:
 
 | Key | Action |
 |-----|--------|
@@ -630,7 +641,18 @@ Keys in the log view:
 | `y` | Copy the whole log to the clipboard |
 | `c` | Copy the current selection |
 | `r` | Refresh the sub-job list |
+| `t` | Switch to Resource |
 | `[` / `]` | Narrow / widen the sources panel |
+| `b` / `esc` | Back (`esc` clears an active log filter first) |
+| `q` | Quit |
+
+Keys in Resource:
+
+| Key | Action |
+|-----|--------|
+| `1` / `2` / `3` / `4` / `5` | Show 5m / 15m / 1h / 6h / all history |
+| `r` | Resume the GPU metrics download and refresh the view |
+| `t` | Return to Logs |
 | `b` / `esc` | Back |
 | `q` | Quit |
 
