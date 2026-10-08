@@ -3136,6 +3136,65 @@ class TestEnsureDatabase:
         schema_call = c._session.post.call_args_list[1]
         assert "CREATE SCHEMA IF NOT EXISTS MY_DB.CUSTOM" in schema_call.kwargs["json"]["statement"]
 
+    def _profile_client(self, schema: str = "PUBLIC") -> tuple[CortexTrainingClient, MagicMock]:
+        c = CortexTrainingClient(
+            base_url="https://test.snowflakecomputing.com", database="MY_DB", schema=schema
+        )
+        c._session = MagicMock()
+        auth = MagicMock()
+        auth.get_token.return_value = "session-token"
+        c._auth_provider = auth
+        return c, auth
+
+    def test_profile_client_creates_db_on_its_connector_session(self):
+        """The SQL API rejects Connector session tokens, so profiles use the session."""
+        c, auth = self._profile_client()
+        not_found_resp = _make_error_response(
+            {"code": "517602", "message": "Schema MY_DB.PUBLIC is not found or not authorized"},
+            status_code=400,
+        )
+        c._session.get.side_effect = [not_found_resp, _make_response({"jobs": []})]
+
+        c._send("GET", f"{c.base_url}/test")
+
+        auth.execute_statement.assert_called_once_with("CREATE DATABASE IF NOT EXISTS MY_DB")
+        c._session.post.assert_not_called()
+        assert c._db_ensured is True
+        assert c._session.get.call_count == 2
+
+    def test_profile_client_creates_schema_on_its_connector_session(self):
+        c, auth = self._profile_client(schema="CUSTOM")
+        not_found_resp = _make_error_response(
+            {"code": "517602", "message": "Schema MY_DB.CUSTOM is not found or not authorized"},
+            status_code=400,
+        )
+        c._session.get.side_effect = [not_found_resp, _make_response({"jobs": []})]
+
+        c._send("GET", f"{c.base_url}/test")
+
+        assert [call.args[0] for call in auth.execute_statement.call_args_list] == [
+            "CREATE DATABASE IF NOT EXISTS MY_DB",
+            "CREATE SCHEMA IF NOT EXISTS MY_DB.CUSTOM",
+        ]
+        c._session.post.assert_not_called()
+
+    def test_profile_client_surfaces_create_error(self):
+        c, auth = self._profile_client()
+        auth.execute_statement.side_effect = Exception(
+            "003001 (42501): Insufficient privileges to operate on account"
+        )
+        c._session.get.return_value = _make_error_response(
+            {"code": "517602", "message": "Schema MY_DB.PUBLIC is not found or not authorized"},
+            status_code=400,
+        )
+
+        with pytest.raises(RuntimeError) as excinfo:
+            c._send("GET", f"{c.base_url}/test")
+
+        message = str(excinfo.value)
+        assert "Insufficient privileges to operate on account" in message
+        assert "CREATE DATABASE IF NOT EXISTS MY_DB" in message
+
     def test_skips_schema_creation_for_public(self):
         """PUBLIC schema does not trigger CREATE SCHEMA."""
         c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="PUBLIC")

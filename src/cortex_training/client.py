@@ -1419,12 +1419,30 @@ class CortexTrainingClient:
                 parts.append(f"{key}={value}")
         return " ".join(parts)
 
+    def _run_setup_statement(self, statement: str) -> bool:
+        """Run one setup statement; return False if it was accepted but not finished.
+
+        The SQL API only accepts bearer tokens (PAT, OAuth, key-pair JWT), not a
+        Connector session token, so connection-profile clients run the
+        statement on their own Connector session instead.
+        """
+        if self._auth_provider is not None:
+            self._auth_provider.execute_statement(statement)
+            return True
+        resp = self._send(
+            "POST",
+            f"{self.base_url}/api/v2/statements",
+            json={"statement": statement, "timeout": 60},
+            max_retries=1,
+        )
+        return resp.status_code != 202
+
     def _create_database(self) -> None:
         """Attempt to create the configured database (and schema if non-PUBLIC).
 
         Called only when an API request fails with a database-not-found error.
-        Routes through ``_send`` so auth works for both PAT and connection
-        profile users. Raises on failure with an actionable error message.
+        Works for both PAT and connection profile users. Raises on failure with
+        an actionable error message.
         """
         db_stmt = f"CREATE DATABASE IF NOT EXISTS {self.database}"
         manual_hint = (
@@ -1434,13 +1452,7 @@ class CortexTrainingClient:
         self._db_creating = True  # prevent recursion from inner _send call
         try:
             logger.info("Database '%s' not found. Attempting to create it...", self.database)
-            resp = self._send(
-                "POST",
-                f"{self.base_url}/api/v2/statements",
-                json={"statement": db_stmt, "timeout": 60},
-                max_retries=1,
-            )
-            if resp.status_code == 202:
+            if not self._run_setup_statement(db_stmt):
                 raise RuntimeError(
                     f"Database creation for '{self.database}' was accepted but has not "
                     f"completed yet. {manual_hint}"
@@ -1450,13 +1462,7 @@ class CortexTrainingClient:
             if self.schema.upper() != "PUBLIC":
                 schema_stmt = f"CREATE SCHEMA IF NOT EXISTS {self.database}.{self.schema}"
                 logger.info("Schema '%s' does not exist. Attempting to create it...", self.schema)
-                schema_resp = self._send(
-                    "POST",
-                    f"{self.base_url}/api/v2/statements",
-                    json={"statement": schema_stmt, "timeout": 60},
-                    max_retries=1,
-                )
-                if schema_resp.status_code == 202:
+                if not self._run_setup_statement(schema_stmt):
                     raise RuntimeError(
                         f"Schema creation for '{self.database}.{self.schema}' was accepted but has not "
                         f"completed yet. Create it manually: CREATE SCHEMA IF NOT EXISTS {self.database}.{self.schema};"
