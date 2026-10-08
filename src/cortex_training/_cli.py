@@ -30,8 +30,41 @@ from typing import TextIO
 from cortex_training._connection import ConnectionSettings
 from cortex_training._connection import build_client as _build_client_from_settings
 from cortex_training._connection import load_config as _load_config
-from cortex_training._connection import login_state_path as _login_state_path
 from cortex_training._connection import resolve_connection
+from cortex_training._connection import write_login_state
+
+
+_LOGIN_DESCRIPTION = """\
+Set up and check the connection that cortex-training commands, recipes, and
+connect() use.
+
+What it does:
+  1. Shows the connection already in use: where it comes from, host, user,
+     database, and where the token is stored (never the token). A saved login
+     is checked first and removed if it no longer works.
+  2. If nothing works, prompts for host, user, PAT (hidden), database, schema,
+     and profile name. Found values are offered as defaults.
+  3. Writes the profile to connections.toml (other profiles kept, mode 600)
+     and remembers it for later commands.
+  4. Checks it with a capacity request. A missing database is created with
+     CREATE DATABASE IF NOT EXISTS <database>.
+  Nothing is changed if your current setup works, unless you ask for a new
+  profile.
+
+Files:
+  ~/.snowflake/connections.toml (or $SNOWFLAKE_HOME/connections.toml)
+  ~/.config/cortex-training/login.json: the saved login, a pointer to a
+  profile or config file; it never stores credentials."""
+
+_LOGIN_EPILOG = """\
+examples:
+  cortex-training login                       # interactive setup or check
+  CORTEX_TRAINING_PAT=... cortex-training login \\
+      --host ORG-ACCOUNT.snowflakecomputing.com --user USER
+  cortex-training login --reset               # start over
+  cortex-training login config.json           # legacy: remember a JSON config
+
+Docs: https://github.com/snowflakedb/cortex-training/blob/main/docs/reference/cli.md#login"""
 
 
 def _load_cortex_training_client_class():
@@ -357,21 +390,78 @@ def build_parser(
 
     login = subparsers.add_parser(
         "login",
-        usage="%(prog)s [-h] (config | --config config)",
-        help="Remember a Cortex Training config file for future commands.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        usage=(
+            "%(prog)s [-h] [config | --config config]\n"
+            "       %(prog)s [--host HOST] [--user USER] [--database DATABASE] "
+            "[--schema SCHEMA]\n"
+            "                             [--connection NAME] [--pat-stdin] "
+            "[--force] [--reset]"
+        ),
+        help="Set up and check the connection that commands, recipes, and connect() use.",
+        description=_LOGIN_DESCRIPTION,
+        epilog=_LOGIN_EPILOG,
     )
-    login_config = login.add_mutually_exclusive_group(required=True)
+    login_config = login.add_mutually_exclusive_group()
     login_config.add_argument(
         "login_config",
         nargs="?",
         metavar="config",
-        help="Path to the Cortex Training CLI config JSON file to remember.",
+        help="Remember this JSON config instead (legacy form).",
     )
     login_config.add_argument(
         "--config",
         dest="login_config_option",
         metavar="config",
         help="Alternative to the positional config path.",
+    )
+    login.add_argument(
+        "--host",
+        dest="login_host",
+        metavar="HOST",
+        help="Account host, e.g. ORG-ACCOUNT.snowflakecomputing.com.",
+    )
+    login.add_argument("--user", dest="login_user", metavar="USER", help="Snowflake login name.")
+    login.add_argument(
+        "--database",
+        dest="login_database",
+        metavar="DATABASE",
+        help="Default: CORTEX_TRAINING_DB.",
+    )
+    login.add_argument("--schema", dest="login_schema", metavar="SCHEMA", help="Default: PUBLIC.")
+    login.add_argument(
+        "--connection",
+        dest="login_connection",
+        metavar="NAME",
+        help="Profile to create. Default: cortex-training.",
+    )
+    login.add_argument(
+        "--pat-stdin",
+        dest="login_pat_stdin",
+        action="store_true",
+        help=(
+            "Read the PAT from stdin. The PAT is never accepted as a flag; "
+            "otherwise it comes from CORTEX_TRAINING_PAT or a hidden prompt."
+        ),
+    )
+    login.add_argument(
+        "--force",
+        dest="login_force",
+        action="store_true",
+        help=(
+            "Replace an existing profile without asking. With --reset, also "
+            "remove the profile the saved login pointed to."
+        ),
+    )
+    login.add_argument(
+        "--reset",
+        dest="login_reset",
+        action="store_true",
+        help=(
+            "Start over: remove the saved login, ask before removing the profile "
+            "it pointed to, then set up a new connection. Other profiles are "
+            "never touched."
+        ),
     )
 
     if include_tui:
@@ -384,10 +474,7 @@ def _write_login_config_path(config_path: str) -> str:
     path = Path(config_path).expanduser()
     _load_config(str(path))
     saved_path = str(path.resolve())
-    state_path = _login_state_path()
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"config_path": saved_path}
-    state_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    write_login_state(config_path=saved_path)
     return saved_path
 
 
@@ -454,6 +541,18 @@ def parse_args(
     args = parser.parse_args(argv)
     if args.command == "login":
         args.login_config = args.login_config or args.login_config_option
+        interactive_flags = (
+            args.login_host,
+            args.login_user,
+            args.login_database,
+            args.login_schema,
+            args.login_connection,
+            args.login_pat_stdin,
+            args.login_force,
+            args.login_reset,
+        )
+        if args.login_config and any(interactive_flags):
+            parser.error("a login config path cannot be combined with profile setup flags")
         return args
 
     dry_run = args.command == "submit" and args.dry_run
@@ -564,6 +663,36 @@ def _cmd_submit(
         response = client.wait_for_job(str(job_id))
     _print_json(response, stdout, compact=args.compact)
     return 0
+
+
+def _cmd_login_interactive(
+    args: argparse.Namespace,
+    stdin: TextIO,
+    stdout: TextIO,
+    stderr: TextIO,
+) -> int:
+    from cortex_training._login import LoginOptions
+    from cortex_training._login import run_login
+
+    options = LoginOptions(
+        host=args.login_host,
+        user=args.login_user,
+        database=args.login_database,
+        schema=args.login_schema,
+        connection=args.login_connection,
+        pat_stdin=args.login_pat_stdin,
+        force=args.login_force,
+        reset=args.login_reset,
+    )
+    return run_login(
+        options,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+        client_cls=_load_cortex_training_client_class(),
+        format_error=_format_error,
+        print_json=lambda value, out: _print_json(value, out, compact=args.compact),
+    )
 
 
 def _cmd_login(args: argparse.Namespace, stdout: TextIO) -> int:
@@ -778,9 +907,12 @@ def _run(
     client_factory: Callable[[argparse.Namespace], Any],
     stdout: TextIO,
     stdin: TextIO,
+    stderr: TextIO | None = None,
 ) -> int:
     if args.command == "login":
-        return _cmd_login(args, stdout)
+        if args.login_config:
+            return _cmd_login(args, stdout)
+        return _cmd_login_interactive(args, stdin, stdout, stderr or sys.stderr)
 
     if args.command == "submit" and args.dry_run:
         return _cmd_submit(args, None, stdout, stdin)
@@ -873,7 +1005,7 @@ def main(
                 return None
 
             client_factory = empty_client_factory
-        return _run(args, client_factory, stdout, stdin)
+        return _run(args, client_factory, stdout, stdin, stderr)
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"error: {_format_error(exc)}", file=stderr)
         return 1
