@@ -687,6 +687,10 @@ are emitted by default. See the [Python SDK reference](python-sdk.md#client-metr
 as JSON lists inside the request frame instead of as tensors. The request body
 stays a DSSST1 frame either way.
 
+`CORTEX_TRAINING_FORWARD_OPERATION_MAX_JSON_BYTES` is the per-request JSON body
+ceiling for byte `forward()` `/operation` posts (integer bytes, default 16 MiB,
+minimum 16 KiB). Frames larger than that are split into request chunks.
+
 ### Troubleshooting
 
 If you see `provide --base-url for local/mock use, or both --host and --pat`,

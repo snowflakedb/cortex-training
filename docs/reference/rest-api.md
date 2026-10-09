@@ -1104,13 +1104,17 @@ require `running`.
 `forward()`, `fwd()`, and `fwd_no_grad()` all send exactly
 `operation_type="forward"`. The aliases do not add no-gradient semantics.
 
-Byte payloads over 60 MiB are rejected; this operation path is not request
-chunked. Do not treat this route as a portable log-probability API.
+A byte payload is a DSSST1 frame posted as a JSON `/operation` body. A frame
+that fits the JSON ceiling is one POST of the raw frame. A larger frame is
+split with `wire.encode_byte_chunks` (`kind="request"`, `operation="forward"`)
+and each chunk is its own POST whose `payload_b64` is that request chunk. Only
+the last POST returns the pollable `request_id`.
 
-Known limitation: `_operation()` wraps byte payloads in a base64 JSON object,
-while the server's `/forward` route expects raw DSSST1 bytes. Request
-construction is unit-tested, but byte-based `forward()` is not currently
-end-to-end compatible.
+The ceiling is `CORTEX_TRAINING_FORWARD_OPERATION_MAX_JSON_BYTES` (integer
+bytes, default 16 MiB, minimum 16 KiB). Dict payloads stay a single plain
+`/operation` POST.
+
+Do not treat this route as a portable log-probability API.
 
 ### 7.2 Weight sync
 
@@ -1577,21 +1581,25 @@ metadata = wire.read_metadata(frame)
 
 ### 9.3 Request chunking
 
-`forward_backward()` and `generate()` call:
+`forward_backward()`, `generate()`, and byte `forward()` call:
 
 ```python
 wire.encode_byte_chunks(
     frame,
     kind="request",
-    operation="fwd-bwd-or-generate",
-    max_bytes=60 * 1024 * 1024,
+    operation="fwd-bwd-or-generate-or-forward",
+    max_bytes=...,
 )
 ```
 
 `forward_backward()` always sends a chunk envelope, including when the request
 fits in one chunk, so every logical operation has a caller-generated identity.
-`generate()` still sends the original frame unchanged when it fits. Each
-DSSST1 request chunk contains:
+`generate()` still sends the original frame unchanged when it fits, as
+`application/octet-stream`. Byte `forward()` also sends the original frame
+unchanged when it fits; it splits only when the encoded JSON body would exceed
+`CORTEX_TRAINING_FORWARD_OPERATION_MAX_JSON_BYTES` (default 16 MiB). Those
+chunks travel inside the `/operation` JSON envelope (`payload_b64`) rather than
+as octet-stream. Each DSSST1 request chunk contains:
 
 - A `uint8` payload tensor.
 - `chunk_idx` and `total_chunks`.
@@ -2018,18 +2026,10 @@ These are current gaps, not supported API behavior:
 1. `save(checkpoint_id=...)` sends a field that is absent from the server's
    `SaveRequest`, so a caller-selected id is not honored. Use the server-assigned
    id from `stage_path` or the job's checkpoint list (section 6.3).
-2. Generic `forward()` wraps binary input in a base64 JSON payload, while the
-   server's `/forward` route expects raw DSSST1 bytes, so byte-based
-   `forward()` is not end-to-end compatible. Request construction is
-   unit-tested; the round trip is not.
-3. `tail_events()` and `stream_events()` send an operation type the server does
+2. `tail_events()` and `stream_events()` send an operation type the server does
    not accept (see [section 7.9](#79-unsupported-zone-events-client-helper)).
-4. `wait_for_job()` does not treat `terminated` as terminal, so a torn-down job
+3. `wait_for_job()` does not treat `terminated` as terminal, so a torn-down job
    polls until `poll_timeout` rather than failing immediately.
-5. Generate prompt validation resolves `max_seq_len` from the first sub-job
+4. Generate prompt validation resolves `max_seq_len` from the first sub-job
    carrying an `inference_config` rather than matching `job_type="sampling"`. A
    `log_probability` sub-job listed first therefore supplies the wrong window.
-6. `_operation()` writes a debug line to stdout, which corrupts the CLI's JSON
-   output for operation-based commands (`weight-sync`, `tail-logs`,
-   `cancel-request`, `reset-prefix-cache`, router replay). Redirect stdout or
-   parse stderr-free output until this is removed.
