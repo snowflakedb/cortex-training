@@ -233,14 +233,12 @@ class ConversationalTask:
         renderer,
         *,
         max_seq_len: int,
-        next_token_labels: bool,
     ):
         return sequence_from_conversation(
             row["messages"],
             renderer,
             train_on_what=self.train_on_what,
             max_seq_len=max_seq_len,
-            next_token_labels=next_token_labels,
         )
 
     def sample_prompt(self) -> str | None:

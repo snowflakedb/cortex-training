@@ -459,9 +459,11 @@ training sub-job with `"load_optimizer_states": false` in its `training_config`.
 This cannot be changed at load time. See
 [DP size compatibility](rest-api.md#dp-size-compatibility) for the constraint.
 
-This is the runtime load path. Create-time resume still uses
+This is the runtime load path. Create-time initialization from a checkpoint
+saved by Cortex Training still uses
 [`source_checkpoint_info`](rest-api.md#65-create-time-checkpoint-initialization)
-in the submitted sub-job JSON.
+in the submitted sub-job JSON. To start a job from weights you trained
+elsewhere, see [Start a Job From Your Own Weights](../guides/training/external-weights.md).
 
 `load` polls until the request completes by default. Pass `--no-poll` to return
 the request metadata without waiting for the result.
