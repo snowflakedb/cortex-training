@@ -20,7 +20,7 @@ from recipes.rl.train import train
 
 @chz.chz
 class Config:
-    config: str
+    config: str | None = None
     job_id: str | None = None
 
     problems_per_batch: int = 64

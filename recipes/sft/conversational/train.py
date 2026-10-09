@@ -19,7 +19,7 @@ from tinker_cookbook import renderers
 
 @chz.chz
 class Config:
-    config: str
+    config: str | None = None
     job_id: str | None = None
 
     dataset: str = "who_trained_you"

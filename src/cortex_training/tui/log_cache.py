@@ -46,7 +46,7 @@ from typing import Iterator
 from typing import Optional
 from typing import Tuple
 
-# Cache dir resolution mirrors cortex_training._cli._login_state_path: an explicit
+# Cache dir resolution mirrors cortex_training._connection.login_state_path: an explicit
 # override wins, else XDG_CACHE_HOME, else ~/.cache, namespaced under the app.
 _OVERRIDE_ENV = "CORTEX_TRAINING_TUI_CACHE_DIR"
 _XDG_CACHE_ENV = "XDG_CACHE_HOME"

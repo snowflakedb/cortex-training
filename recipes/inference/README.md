@@ -14,8 +14,9 @@ cortex-training capacity
 
 ## Create an Endpoint
 
-`config=` is the Snowflake connection file only. The default job body is
-`configs/qwen3_8b_full.json`.
+`config=` is the Snowflake connection file only (optional — omit it to use
+environment variables or your default `connections.toml` profile). The default
+job body is `configs/qwen3_8b_full.json`.
 
 From original Hugging Face weights:
 
