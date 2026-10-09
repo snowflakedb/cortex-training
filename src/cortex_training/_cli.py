@@ -18,10 +18,14 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
+import re
 import sys
+from datetime import date
 from datetime import datetime
+from datetime import timedelta
 from datetime import timezone
 from pathlib import Path
 from typing import Any
@@ -47,6 +51,21 @@ _CONFIG_ALIASES = {
 }
 
 _LOGIN_STATE_ENV = "CORTEX_TRAINING_LOGIN_FILE"
+
+# The statuses each `list --status` word matches, as on the account-level
+# route: pending excludes placing, done takes the DONE older jobs show, and
+# UNKNOWN rows match nothing.
+_LIST_STATUS_FILTERS = {
+    "pending": {"pending"},
+    "placing": {"placing"},
+    "initializing": {"initializing"},
+    "running": {"running"},
+    "failed": {"failed"},
+    "cancelled": {"cancelled"},
+    "terminated": {"terminated"},
+    "active": {"pending", "placing", "initializing", "running"},
+    "done": {"cancelled", "terminated", "done"},
+}
 
 
 def _env(*names: str) -> str | None:
@@ -86,6 +105,9 @@ def _hardware_choices() -> list[str]:
     return [member.value for member in Hardware]
 
 
+_FRACTION_RE = re.compile(r"\.([0-9]+)")
+
+
 def _created_epoch(raw: Any) -> float | None:
     if raw is None:
         return None
@@ -94,6 +116,10 @@ def _created_epoch(raw: Any) -> float | None:
         return None
     if created_at.endswith("Z"):
         created_at = created_at[:-1] + "+00:00"
+    # Before Python 3.11, fromisoformat takes only 3 or 6 fractional digits.
+    created_at = _FRACTION_RE.sub(
+        lambda match: "." + match.group(1)[:6].ljust(6, "0"), created_at, count=1
+    )
     try:
         created = datetime.fromisoformat(created_at)
     except ValueError:
@@ -126,6 +152,89 @@ def _jobs_latest_last(jobs: list[Any]) -> list[Any]:
             )
         ]
     return list(reversed(jobs))
+
+
+def _status_list(raw: str) -> str:
+    """argparse type for --status: the comma list, lowercased, every word known."""
+    words = [word.strip().lower() for word in raw.split(",")]
+    for word in words:
+        if word not in _LIST_STATUS_FILTERS:
+            raise argparse.ArgumentTypeError(
+                f"unknown status {word!r}; use a comma-separated list of "
+                + ", ".join(_LIST_STATUS_FILTERS)
+            )
+    return ",".join(words)
+
+
+def _list_statuses(words: str) -> set[str]:
+    """The job statuses a --status list from _status_list keeps."""
+    statuses: set[str] = set()
+    for word in words.split(","):
+        statuses |= _LIST_STATUS_FILTERS[word]
+    return statuses
+
+
+_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
+def _utc_date(value: str) -> date:
+    """argparse type for --since/--until: a YYYY-MM-DD date, read as a UTC day."""
+    # Matched first because date.fromisoformat also takes forms such as 20261001.
+    if _DATE_RE.fullmatch(value):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            pass
+    raise argparse.ArgumentTypeError(f"expected a YYYY-MM-DD date, got {value!r}")
+
+
+def _utc_midnight(day: date) -> float:
+    return datetime(day.year, day.month, day.day, tzinfo=timezone.utc).timestamp()
+
+
+def _same_name(wanted: str, actual: Any) -> bool:
+    # Rows carry names as stored. SQL identifier rules, as the server applies to
+    # submitted_by: an unquoted name means its uppercase form, a "quoted" one
+    # exactly what is between the quotes.
+    if len(wanted) > 1 and wanted[0] == wanted[-1] == '"':
+        wanted = wanted[1:-1].replace('""', '"')
+    else:
+        wanted = wanted.upper()
+    return isinstance(actual, str) and actual == wanted
+
+
+def _list_filter(args: argparse.Namespace) -> Callable[[dict], bool]:
+    """Build the list filters for the schema's jobs; --all has the server apply them."""
+    statuses = None if args.status is None else _list_statuses(args.status)
+    since = None if args.since is None else _utc_midnight(args.since)
+    # --until names the last day kept, so the bound is the next midnight.
+    until = None if args.until is None else _utc_midnight(args.until + timedelta(days=1))
+
+    def keep(job: dict) -> bool:
+        if statuses is not None and str(job.get("status", "")).lower() not in statuses:
+            return False
+        if args.user is not None and not _same_name(args.user, job.get("submitted_by")):
+            return False
+        if since is None and until is None:
+            return True
+        created = _created_epoch(job.get("created_at"))
+        return (
+            created is not None
+            and (since is None or created >= since)
+            and (until is None or created < until)
+        )
+
+    return keep
+
+
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a whole number, got {value!r}") from None
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {number}")
+    return number
 
 
 def build_parser(
@@ -226,7 +335,43 @@ def build_parser(
     checkpoints.add_argument("job_id")
 
     list_jobs = subparsers.add_parser("list", help="List Cortex Training jobs.")
-    list_jobs.add_argument("--status", help="Optional status filter.")
+    list_jobs.add_argument(
+        "--status",
+        type=_status_list,
+        help=(
+            "Comma-separated statuses to keep: "
+            + ", ".join(_LIST_STATUS_FILTERS)
+            + ". active is pending through running; done is cancelled, terminated, "
+            "and the DONE that older jobs show."
+        ),
+    )
+    list_jobs.add_argument(
+        "--all",
+        action="store_true",
+        help=(
+            "List jobs across every schema in the account that the current user "
+            "can see, not just the configured one. Fails if account-level listing "
+            "is not enabled for the account."
+        ),
+    )
+    list_jobs.add_argument("--user", help="Keep jobs submitted by this user.")
+    list_jobs.add_argument(
+        "--since",
+        type=_utc_date,
+        metavar="YYYY-MM-DD",
+        help="Keep jobs created on or after this date (a UTC day).",
+    )
+    list_jobs.add_argument(
+        "--until",
+        type=_utc_date,
+        metavar="YYYY-MM-DD",
+        help="Keep jobs created on or before this date (a UTC day).",
+    )
+    list_jobs.add_argument(
+        "--limit",
+        type=_positive_int,
+        help="Print at most this many of the newest matching jobs.",
+    )
 
     capacity = subparsers.add_parser(
         "capacity",
@@ -660,6 +805,14 @@ def parse_args(
 ) -> argparse.Namespace:
     parser = build_parser(prog=prog, include_tui=include_tui)
     args = parser.parse_args(argv)
+    if args.command == "list":
+        if args.since is not None and args.until is not None and args.since > args.until:
+            parser.error("--since must not be later than --until")
+        # --until is sent as the day after, which does not exist for the last date.
+        if args.until == date.max:
+            parser.error(f"--until must be earlier than {date.max}")
+        if args.user is not None and not args.user.strip():
+            parser.error("--user must not be empty")
     if args.command == "login":
         args.login_config = args.login_config or args.login_config_option
         return args
@@ -823,6 +976,34 @@ def _cmd_submit(
             raise ValueError("submit --wait requires the create response to include job_id")
         response = client.wait_for_job(str(job_id))
     _print_json(response, stdout, compact=args.compact)
+    return 0
+
+
+def _cmd_list(args: argparse.Namespace, client, stdout: TextIO) -> int:
+    if args.all:
+        jobs = list(
+            itertools.islice(
+                client.iter_jobs(
+                    status=args.status,
+                    submitted_by=args.user,
+                    created_after=args.since,
+                    # The server's bound is exclusive; --until names the last day kept.
+                    created_before=(
+                        None if args.until is None else args.until + timedelta(days=1)
+                    ),
+                    # No bigger than what gets printed; the server takes 1 to 1000.
+                    page_size=min(args.limit or 100, 1000),
+                ),
+                args.limit,
+            )
+        )
+    else:
+        keep = _list_filter(args)
+        jobs = [job for job in client.list_jobs() if keep(job)]
+    jobs = _jobs_latest_last(jobs)
+    if args.limit is not None:
+        jobs = jobs[-args.limit:]
+    _print_json({"jobs": jobs}, stdout, compact=args.compact)
     return 0
 
 
@@ -1068,9 +1249,7 @@ def _run(
         )
         return 0
     if args.command == "list":
-        jobs = client.list_jobs(status=args.status)
-        _print_json({"jobs": _jobs_latest_last(jobs)}, stdout, compact=args.compact)
-        return 0
+        return _cmd_list(args, client, stdout)
     if args.command == "capacity":
         if args.hardware is not None:
             capacity = client.get_capacity(hardware=args.hardware)
