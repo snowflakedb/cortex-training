@@ -1429,6 +1429,9 @@ class CortexTrainingClient:
         self._auth_provider: SnowflakeProfileAuth | None = None
         self._db_ensured = False
         self._db_creating = False
+        # Both are cleared on a for_job() child; see for_job().
+        self._owns_session = True
+        self._auto_create_database = True
         self._metric_emitter: OtlpMetricEmitter | None = None
         self._operation_metric_state = threading.local()
         self._session = _DefaultTimeoutSession(self.request_timeout)
@@ -1562,7 +1565,12 @@ class CortexTrainingClient:
             return
 
     def close(self) -> None:
-        """Flush telemetry briefly and close this client's HTTP sessions."""
+        """Flush telemetry briefly and close this client's HTTP sessions.
+
+        A client from :meth:`for_job` borrows these, so closing it is a no-op.
+        """
+        if not self._owns_session:
+            return
         try:
             if self._metric_emitter is not None:
                 self._metric_emitter.close()
@@ -1732,8 +1740,10 @@ class CortexTrainingClient:
         """Send one request with retries.
 
         ``ensure_database=False`` skips creating the configured database on a
-        not-found error, for routes whose path names no database.
+        not-found error, for routes whose path names no database. A client from
+        :meth:`for_job` never creates one, whatever the caller passes.
         """
+        auto_create = ensure_database and self._auto_create_database
         fn = getattr(self._session, method.lower())
         debug_context = kwargs.pop("debug_context", None)
         debug_label = self._debug_context_label(debug_context) if debug_context is not None else None
@@ -1850,7 +1860,7 @@ class CortexTrainingClient:
                         self._debug_response_summary(resp),
                     )
                 if (
-                    ensure_database
+                    auto_create
                     and not self._db_ensured
                     and not self._db_creating
                     and self._is_database_not_found(resp)
@@ -1860,7 +1870,7 @@ class CortexTrainingClient:
                     # Retry the original request once after creating the DB.
                     continue
                 if (
-                    ensure_database
+                    auto_create
                     and self._db_ensured
                     and self._is_database_not_found(resp)
                 ):
@@ -2064,12 +2074,11 @@ class CortexTrainingClient:
         Reads the account-level ``GET /api/v2/{endpoint}`` route rather than
         this client's schema, and follows ``next_page_token`` until the server
         returns none; a page may hold fewer than ``page_size`` rows, even none.
-        ``page_size`` is 1 to 1000, the server's bound; outside it, the first
-        ``next()`` raises ``ValueError``.
+        Arguments are checked on the call, pages fetched as you iterate:
+        ``page_size`` is 1 to 1000, and ``schema`` needs ``database`` with it.
         The server applies every filter: ``database`` / ``schema`` narrow the
-        scope (``schema`` alone matches that schema name in any database),
-        ``status`` is one status or a list of them (``active`` and ``done``
-        name groups), ``submitted_by`` takes a user name, and
+        scope, ``status`` is one status or a list of them (``active`` and
+        ``done`` name groups), ``submitted_by`` takes a user name, and
         ``created_after`` (inclusive) / ``created_before`` (exclusive) take a
         ``date``, a ``datetime`` (sent in UTC; naive is taken as UTC) or a
         string sent as-is. Rows also carry ``database_name`` and
@@ -2080,6 +2089,11 @@ class CortexTrainingClient:
         """
         if not 1 <= page_size <= 1000:
             raise ValueError(f"page_size must be between 1 and 1000, got {page_size}")
+        if schema is not None and database is None:
+            raise ValueError(
+                "iter_jobs(schema=...) needs database=... with it: a schema name "
+                "alone does not name one schema."
+            )
         if status is not None and not isinstance(status, str):
             status = ",".join(status)
         query = {
@@ -2092,14 +2106,11 @@ class CortexTrainingClient:
             "limit": page_size,
         }
         params = {key: value for key, value in query.items() if value is not None}
+        return self._iter_account_jobs(params)
+
+    def _iter_account_jobs(self, params: dict) -> Iterator[dict]:
         while True:
             page = self._list_account_jobs_page(params)
-            if page.get("unknown_status_count"):
-                logger.warning(
-                    "%d job(s) left out because their live status could not be "
-                    "read for the status filter",
-                    page["unknown_status_count"],
-                )
             yield from page.get("jobs", [])
             token = page.get("next_page_token")
             if not token:
@@ -2134,9 +2145,10 @@ class CortexTrainingClient:
         """Return a client bound to ``job``'s schema, for per-job calls on a
         row from :meth:`iter_jobs`.
 
-        The new client shares this client's HTTP session, auth and telemetry,
-        so keep this client open while using it, and close this client rather
-        than the new one.
+        The new client borrows this client's session, auth and telemetry, so
+        keep this one open and close it rather than the new one. It never
+        creates the job's database, which exists and may be another role's: a
+        not-found answer surfaces as the HTTP error it is.
         """
         client = type(self)(
             base_url=self.base_url,
@@ -2150,7 +2162,11 @@ class CortexTrainingClient:
             max_retries=self.max_retries,
             request_timeout=self.request_timeout,
         )
+        # Release the session and pool the constructor just opened.
+        client._session.close()
         client._session = self._session
+        client._owns_session = False
+        client._auto_create_database = False
         client._auth_provider = self._auth_provider
         client._metric_emitter = self._metric_emitter
         client._artifact_connection_config = self._artifact_connection_config

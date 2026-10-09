@@ -67,6 +67,17 @@ _LIST_STATUS_FILTERS = {
     "done": {"cancelled", "terminated", "done"},
 }
 
+# Status words the server can answer with that are not the ones it filters on:
+# older rows, and states a backend ahead of the API layer reports.
+_STATUS_ALIASES = {
+    "queued": "pending",
+    "creating": "initializing",
+    "canceled": "cancelled",
+    "completed": "done",
+    "succeeded": "done",
+    "error": "failed",
+}
+
 
 def _env(*names: str) -> str | None:
     for name in names:
@@ -154,6 +165,25 @@ def _jobs_latest_last(jobs: list[Any]) -> list[Any]:
     return list(reversed(jobs))
 
 
+def _newest_jobs(jobs: list[Any], limit: int) -> list[Any]:
+    """The ``limit`` newest jobs by ``created_at``, in the order given.
+
+    A missing timestamp ranks oldest, so ``--limit`` drops those rows first;
+    ties break toward the earlier row, the server answering newest first.
+    """
+    if limit >= len(jobs):
+        return list(jobs)
+    last = len(jobs) - 1
+
+    def rank(item: tuple[int, Any]) -> tuple[float, int]:
+        index, job = item
+        created = _created_epoch(job.get("created_at")) if isinstance(job, dict) else None
+        return (created if created is not None else float("-inf"), last - index)
+
+    newest = sorted(enumerate(jobs), key=rank)[-limit:]
+    return [job for _, job in sorted(newest)]
+
+
 def _status_list(raw: str) -> str:
     """argparse type for --status: the comma list, lowercased, every word known."""
     words = [word.strip().lower() for word in raw.split(",")]
@@ -205,13 +235,21 @@ def _same_name(wanted: str, actual: Any) -> bool:
 
 def _list_filter(args: argparse.Namespace) -> Callable[[dict], bool]:
     """Build the list filters for the schema's jobs; --all has the server apply them."""
+    # Rows can carry an enum name (JOB_STATE_RUNNING) or an alias, so compare
+    # on the normalized word rather than the raw field.
+    from .client import CortexTrainingClient
+
+    def status_of(job: dict) -> str:
+        word = CortexTrainingClient._normalize_job_status(job.get("status"))
+        return _STATUS_ALIASES.get(word, word)
+
     statuses = None if args.status is None else _list_statuses(args.status)
     since = None if args.since is None else _utc_midnight(args.since)
     # --until names the last day kept, so the bound is the next midnight.
     until = None if args.until is None else _utc_midnight(args.until + timedelta(days=1))
 
     def keep(job: dict) -> bool:
-        if statuses is not None and str(job.get("status", "")).lower() not in statuses:
+        if statuses is not None and status_of(job) not in statuses:
             return False
         if args.user is not None and not _same_name(args.user, job.get("submitted_by")):
             return False
@@ -1000,10 +1038,9 @@ def _cmd_list(args: argparse.Namespace, client, stdout: TextIO) -> int:
     else:
         keep = _list_filter(args)
         jobs = [job for job in client.list_jobs() if keep(job)]
-    jobs = _jobs_latest_last(jobs)
     if args.limit is not None:
-        jobs = jobs[-args.limit:]
-    _print_json({"jobs": jobs}, stdout, compact=args.compact)
+        jobs = _newest_jobs(jobs, args.limit)
+    _print_json({"jobs": _jobs_latest_last(jobs)}, stdout, compact=args.compact)
     return 0
 
 
