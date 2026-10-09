@@ -1136,6 +1136,24 @@ Optional payload fields:
   weights. For adapter-only synchronization, see
   [section 7.3](#73-lora-adapter-sync).
 
+On server versions that include this behavior, the default weight sync, which
+pauses generation and keeps in-flight requests, also clears the sampling
+sub-job's prefix cache. No request after the sync reads KV computed under the
+old weights. In-flight requests are preempted and recomputed with the new
+weights, and the next turn of each conversation recomputes its history, so
+generation is somewhat slower right after a sync. Syncs that use another mode
+are unchanged. A sampling sub-job can opt out with
+`vllm_config.clear_cache_on_weight_sync` (see
+[section 8.3](#83-inferenceconfig)).
+
+Each sampling target in the result reports `clear_cache`, at
+`targets[].recv.recv.clear_cache`. It is the value the sync sent to the sampling
+workers' pause, so it shows what was requested and is not proof that the cache
+was cleared. It is `false` when no pause was issued. A result without the key
+comes from a server version that predates this behavior. If you set the opt-out
+and the result still shows `clear_cache: true`, check the key's spelling and
+that it is set under `vllm_config`.
+
 ### 7.3 LoRA adapter sync
 
 LoRA synchronization uses the same `weight-sync` operation, but it requires
@@ -1481,6 +1499,18 @@ configuration used for adapter synchronization. It is validated and rewritten by
 the same rules as the training block (see
 [section 8.2](#82-trainingconfig)).
 
+`vllm_config.clear_cache_on_weight_sync` controls whether a weight sync clears
+the sampling sub-job's prefix cache. It is a boolean, default `true`, and
+applies only to the default weight sync (see
+[section 7.2](#72-weight-sync)). Set it to `false` to opt out, for example
+`extra_sampling={"vllm_config": {"clear_cache_on_weight_sync": False}}`. With
+`false`, only a best-effort reset after the sync remains. That reset cannot clear
+blocks held by running requests, so requests may read KV computed under the old
+weights. The key is not validated: a misspelled key is silently ignored, and the
+sync keeps clearing the cache. The `clear_cache` key in each sampling target's
+sync result shows whether the opt-out was applied (see
+[section 7.2](#72-weight-sync)).
+
 For either config type, the server requires `multiplex_job_id` to be a complete
 `{job_id}:{sub_job_type}:{index}` id outside the job being created.
 
@@ -1755,7 +1785,7 @@ These are conventional backend results, not closed REST schemas:
 | `save` | `job_id`, `stage_path` (carries the `cp_<uuid>` id), `checkpoint_path`, `checkpoint_tag`, `version` — no `checkpoint_id` key in the observed release (see 6.3) |
 | `load` | `checkpoint_id` and backend load metadata |
 | `generate` | `job_id`, `results[]` |
-| `weight-sync` | Completion/transfer metadata |
+| `weight-sync` | Completion/transfer metadata; each sampling target's result carries `clear_cache` (see [section 7.2](#72-weight-sync)) |
 | `forward` | Backend-specific forward-only result |
 
 Generic-operation responses and fields inside `metrics` or generation results
