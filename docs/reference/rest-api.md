@@ -110,6 +110,13 @@ The SQL statements API used by execution-log download is outside this prefix:
 https://{account_host}/api/v2/statements
 ```
 
+So is the account-level job list
+([section 5.3](#across-the-account---get-apiv2endpoint)):
+
+```text
+https://{account_host}/api/v2/{endpoint}
+```
+
 If you point the client at a server that exposes the endpoint under a
 different name, pass it explicitly: `endpoint="my-endpoint-name"`.
 
@@ -303,10 +310,11 @@ Paths are relative to the prefix in [section 2.1](#21-base-url).
 The operation endpoint supports the operation types in
 [section 7](#7-generic-operation-envelope).
 
-One auxiliary call is outside the Cortex Training prefix:
+These calls are outside the Cortex Training prefix:
 
 | REST path | HTTP | Client use | Purpose |
 |---|---|---|---|
+| `/api/v2/{endpoint}` | `GET` | `iter_jobs` | List jobs across the account ([section 5.3](#across-the-account---get-apiv2endpoint)) |
 | `/api/v2/statements` | `POST` | artifact download methods | Resolve the current Snowflake identity |
 
 ---
@@ -464,6 +472,59 @@ REST response:
 
 `CortexTrainingClient.list_jobs()` returns only the `jobs` list, not the outer object.
 The client forwards the status string without validating an enum.
+
+#### Across the account - `GET /api/v2/{endpoint}`
+
+Lists the jobs the caller can see in every database and schema of the account,
+newest first, one page at a time. The path is outside the per-schema prefix:
+`https://{account_host}/api/v2/{endpoint}`. It returns 404 where account-level
+listing is not enabled for the account. Jobs in dropped databases or schemas
+are not listed. Every other job call stays on the per-schema routes.
+
+Optional query parameters:
+
+| Parameter | Value |
+|---|---|
+| `database` | Only jobs in this database. SQL identifier rules apply: an unquoted name is case-insensitive, a `"quoted"` one exact. A database the caller cannot see returns 400. |
+| `schema` | Only jobs in this schema of `database`, by the same rules. Requires `database`: a schema name alone does not name one schema, and sending it without `database` returns 400. A schema the caller cannot see returns 400. |
+| `status` | Comma-separated and case-insensitive: `pending`, `placing`, `initializing`, `running`, `failed`, `cancelled`, `terminated`, and the groups `active` (`pending` through `running`) and `done` (`cancelled`, `terminated`, and the `done` that older jobs show). `pending` does not include `placing`. Any other value returns 400. |
+| `submitted_by` | Only jobs submitted by this user, by SQL identifier rules. Jobs with no recorded submitter never match, and a user the caller cannot see returns no jobs. |
+| `created_after` | Inclusive lower bound on creation time: an RFC 3339 timestamp, or `YYYY-MM-DD` for midnight UTC. Must be earlier than `created_before`. |
+| `created_before` | Exclusive upper bound on creation time, in the same forms. |
+| `limit` | Page size, 1 to 1000. Defaults to 100. |
+| `page_token` | The previous page's `next_page_token`. Send it with the same filters; different filters return 400. |
+
+The creation bounds compare with the time the service recorded the job, which
+can differ slightly from the job's `created_at`.
+
+REST response:
+
+```json
+{
+  "jobs": [
+    {
+      "job_id": "job-id",
+      "database_name": "CORTEX_TRAINING_DB",
+      "schema_name": "PUBLIC",
+      "status": "running"
+    }
+  ],
+  "next_page_token": "opaque-token"
+}
+```
+
+Each job carries the per-schema list's fields plus `database_name` and
+`schema_name`. A page can hold fewer than `limit` jobs, or none, and still carry
+`next_page_token`; keep requesting until it is absent. The token is opaque:
+pass it back unchanged. A job whose live status cannot be read while `status`
+is set is left out, uncounted, so a page's size is not a count of what matched.
+
+`CortexTrainingClient.iter_jobs(...)` takes the same filters, with `page_size`
+for `limit`, checks its arguments on the call, and yields jobs across pages as
+you iterate. It raises a 404 at once instead of retrying it, and never creates
+the configured database. `for_job(job)` returns a client bound to a listed
+job's `database_name` and `schema_name`; it borrows the parent's session and
+creates no database either.
 
 ### 5.4 Capacity - `GET /capacity`
 

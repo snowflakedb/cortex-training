@@ -103,6 +103,8 @@ cortex-training submit - < job.json           # Read JSON from stdin
 ```bash
 cortex-training list
 cortex-training list --status running
+cortex-training list --status active,failed --user JDOE --since 2026-10-01 --limit 20
+cortex-training list --all                    # Every schema you can see
 cortex-training get JOB_ID
 cortex-training wait JOB_ID                   # Wait until running, not finished
 cortex-training cancel JOB_ID
@@ -287,11 +289,33 @@ Explicit CLI flags override config values.
 ```bash
 cortex-training list
 cortex-training list --status running
+cortex-training list --status active,failed --user JDOE --since 2026-10-01 --limit 20
+cortex-training list --all
 cortex-training get JOB_ID
 cortex-training checkpoints JOB_ID
 cortex-training cancel JOB_ID
 cortex-training wait JOB_ID
 ```
+
+`list` takes these filters:
+
+| Flag | Takes | Notes |
+|---|---|---|
+| `--all` | nothing | lists jobs across every schema in the account that you can see, not just the configured one |
+| `--status` | comma list of `pending`, `placing`, `initializing`, `running`, `failed`, `cancelled`, `terminated`, `active`, `done` | `active` is `pending` through `running`; `done` is `cancelled`, `terminated`, and the `done` that older jobs show; `pending` does not include `placing`. Matched against a row's status in any form the server sends, including `JOB_STATE_RUNNING` and aliases such as `canceled`, `completed`, `succeeded`, `error`, `queued`, `creating` |
+| `--user` | user name | SQL name rules: unquoted means its uppercase form, `"quoted"` means exactly that name |
+| `--since` | `YYYY-MM-DD` | a UTC day; keeps jobs created on or after it |
+| `--until` | `YYYY-MM-DD` | a UTC day; keeps jobs created on or before it, so `--since D --until D` means "on day D" |
+| `--limit` | number | prints at most this many of the newest matching jobs by `created_at`; a job listed without one counts as oldest |
+
+Without `--all`, the CLI fetches the configured schema's jobs and applies the
+filters itself, leaving out a job with no `created_at` when `--since` or
+`--until` is set. With `--all`, the server applies them across the account
+([REST API reference section 5.3](rest-api.md#across-the-account---get-apiv2endpoint));
+where account-level listing is not enabled for the account, the command fails
+with `account-level job listing is not enabled for this account`. A bad
+`--status`, `--since`, `--until`, or `--limit`, or an empty `--user`, exits
+with status 2 before connecting.
 
 `get` fetches current job details; `checkpoints` lists saved checkpoints.
 `wait` waits for the job to reach **running**, not for training to finish.

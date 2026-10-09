@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import io
 import json
+import time
+from datetime import date
 from unittest.mock import MagicMock
 
 import pytest
@@ -55,6 +57,9 @@ class FakeClient:
         self.capacity_hardware_requests = []
         self.checkpoints_job_id = None
         self.jobs = None
+        self.account_jobs = []
+        self.account_jobs_pulled = 0
+        self.iter_jobs_filters = None
         self.stdout_log_job_id = None
         self.stdout_log_output_dir = None
         self.metrics_job_id = None
@@ -76,6 +81,12 @@ class FakeClient:
         if self.jobs is not None:
             return self.jobs
         return [{"job_id": "j1", "status": status or "running"}]
+
+    def iter_jobs(self, **filters):
+        self.iter_jobs_filters = filters
+        for job in self.account_jobs:
+            self.account_jobs_pulled += 1
+            yield job
 
     def list_checkpoints(self, job_id):
         self.checkpoints_job_id = job_id
@@ -501,10 +512,401 @@ def test_list_prints_jobs_with_status_filter():
     )
 
     assert rc == 0
-    assert instances[0].status_filter == "running"
+    # The schema route mishandles comma lists and groups, so the CLI asks it for
+    # every job and filters the rows itself.
+    assert instances[0].status_filter is None
     assert json.loads(stdout.getvalue()) == {
         "jobs": [{"job_id": "j1", "status": "running"}],
     }
+
+
+_STATUS_ROWS = [
+    {"job_id": status.lower(), "status": status}
+    for status in (
+        "PENDING",
+        "PLACING",
+        "INITIALIZING",
+        "RUNNING",
+        "FAILED",
+        "CANCELLED",
+        "TERMINATED",
+        "UNKNOWN",
+    )
+]
+
+_SUBMITTED_ROWS = [
+    {"job_id": "upper", "submitted_by": "JDOE"},
+    {"job_id": "lower", "submitted_by": "jdoe"},
+    {"job_id": "quoted", "submitted_by": 'J"DOE'},
+    {"job_id": "other", "submitted_by": "ASMITH"},
+    {"job_id": "anonymous"},
+]
+
+_DATED_ROWS = [
+    {"job_id": "before", "created_at": "2026-09-30T23:59:59Z"},
+    {"job_id": "midnight", "created_at": "2026-10-01T00:00:00Z"},
+    {"job_id": "noon", "created_at": "2026-10-01T12:00:00.250Z"},
+    {"job_id": "next-day", "created_at": "2026-10-02T00:00:00+00:00"},
+]
+
+
+def _list_ids(argv, *, jobs=None, account_jobs=()):
+    """Run `list ARGV` on one FakeClient; return it and the printed job ids."""
+    client = FakeClient()
+    client.jobs = jobs
+    client.account_jobs = list(account_jobs)
+    stdout = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["list", *argv],
+        client_factory=lambda _args: client,
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    return client, [job["job_id"] for job in json.loads(stdout.getvalue())["jobs"]]
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("pending", {"pending"}),
+        ("placing", {"placing"}),
+        ("active", {"pending", "placing", "initializing", "running"}),
+        ("done", {"cancelled", "terminated"}),
+        (" Running , FAILED ", {"running", "failed"}),
+        ("done,terminated", {"cancelled", "terminated"}),
+        (
+            "active,failed,done",
+            {
+                "pending",
+                "placing",
+                "initializing",
+                "running",
+                "failed",
+                "cancelled",
+                "terminated",
+            },
+        ),
+    ],
+)
+def test_list_status_accepts_words_groups_and_comma_lists(status, expected):
+    client, ids = _list_ids(["--status", status], jobs=_STATUS_ROWS)
+
+    assert client.status_filter is None
+    assert set(ids) == expected
+
+
+@pytest.mark.parametrize("scope", [[], ["--all"]])
+@pytest.mark.parametrize(
+    "status", ["unknown", "completed", "running,", "job_state_running"]
+)
+def test_list_rejects_unknown_status_before_building_a_client(capsys, scope, status):
+    instances = []
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(
+            _base_args() + ["list", *scope, "--status", status],
+            client_factory=_factory(instances),
+        )
+
+    assert exc.value.code == 2
+    assert "unknown status" in capsys.readouterr().err
+    # Building a client can open a Snowflake login.
+    assert instances == []
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        # Enum names and aliases a server can answer with, not only the words
+        # --status takes.
+        ("running", {"enum", "plain"}),
+        ("active", {"enum", "plain", "queued", "creating"}),
+        ("done", {"canceled", "completed", "succeeded"}),
+        ("failed", {"error"}),
+        # UNKNOWN is deliberately matched by no word.
+        ("active,done,failed", {"enum", "plain", "queued", "creating",
+                                "canceled", "completed", "succeeded", "error"}),
+    ],
+)
+def test_list_status_matches_enum_names_and_aliases(status, expected):
+    rows = [
+        {"job_id": "enum", "status": "JOB_STATE_RUNNING"},
+        {"job_id": "plain", "status": "running"},
+        {"job_id": "queued", "status": "queued"},
+        {"job_id": "creating", "status": "creating"},
+        {"job_id": "canceled", "status": "canceled"},
+        {"job_id": "completed", "status": "completed"},
+        {"job_id": "succeeded", "status": "succeeded"},
+        {"job_id": "error", "status": "error"},
+        {"job_id": "unknown", "status": "UNKNOWN"},
+    ]
+
+    _, ids = _list_ids(["--status", status], jobs=rows)
+
+    assert set(ids) == expected
+
+
+def test_list_status_done_includes_legacy_done_rows():
+    _, ids = _list_ids(
+        ["--status", "done"],
+        jobs=[
+            {"job_id": "legacy", "status": "DONE"},
+            {"job_id": "cancelled", "status": "CANCELLED"},
+            {"job_id": "failed", "status": "FAILED"},
+        ],
+    )
+
+    assert set(ids) == {"legacy", "cancelled"}
+
+
+@pytest.mark.parametrize(
+    ("user", "expected"),
+    [
+        # As on the server: unquoted means uppercase, quoted means exact.
+        ("jdoe", {"upper"}),
+        ("JDoe", {"upper"}),
+        ('"jdoe"', {"lower"}),
+        ('"J""DOE"', {"quoted"}),
+        ("asmith", {"other"}),
+    ],
+)
+def test_list_user_follows_sql_identifier_rules(user, expected):
+    _, ids = _list_ids(["--user", user], jobs=_SUBMITTED_ROWS)
+
+    assert set(ids) == expected
+
+
+@pytest.mark.parametrize("scope", [[], ["--all"]])
+@pytest.mark.parametrize("user", ["", "  "])
+def test_list_rejects_an_empty_user(capsys, scope, user):
+    instances = []
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(
+            _base_args() + ["list", *scope, "--user", user],
+            client_factory=_factory(instances),
+        )
+
+    assert exc.value.code == 2
+    assert "--user must not be empty" in capsys.readouterr().err
+    assert instances == []
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["--since", "2026-10-01"], ["midnight", "noon", "next-day"]),
+        (["--until", "2026-09-30"], ["before"]),
+        # --until keeps the whole day it names.
+        (["--until", "2026-10-01"], ["before", "midnight", "noon"]),
+        (["--since", "2026-10-01", "--until", "2026-10-01"], ["midnight", "noon"]),
+    ],
+)
+def test_list_since_and_until_keep_whole_utc_days(argv, expected):
+    _, ids = _list_ids(argv, jobs=_DATED_ROWS + [{"job_id": "undated"}])
+
+    assert ids == expected
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="needs time.tzset")
+@pytest.mark.parametrize("zone", ["America/Los_Angeles", "Asia/Tokyo"])
+def test_list_dates_are_utc_days_in_any_local_zone(monkeypatch, zone):
+    monkeypatch.setenv("TZ", zone)
+    time.tzset()
+    try:
+        _, ids = _list_ids(
+            ["--since", "2026-10-01", "--until", "2026-10-01"], jobs=_DATED_ROWS
+        )
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+    assert ids == ["midnight", "noon"]
+
+
+def test_list_dates_read_created_at_with_any_fraction_precision():
+    jobs = [
+        {"job_id": "five", "created_at": "2026-10-01T01:00:00.12345Z"},
+        {"job_id": "nine", "created_at": "2026-10-01T02:00:00.123456789Z"},
+    ]
+
+    _, ids = _list_ids(["--since", "2026-10-01", "--until", "2026-10-01"], jobs=jobs)
+
+    assert ids == ["five", "nine"]
+
+
+@pytest.mark.parametrize("scope", [[], ["--all"]])
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--since", "yesterday"], "expected a YYYY-MM-DD date, got 'yesterday'"),
+        (["--until", "10/01/2026"], "expected a YYYY-MM-DD date"),
+        # Dates only: a time of day, or a compact date, is refused.
+        (["--since", "2026-10-01T12:00:00Z"], "expected a YYYY-MM-DD date"),
+        (["--since", "20261001"], "expected a YYYY-MM-DD date"),
+        (["--until", "2026-02-30"], "expected a YYYY-MM-DD date"),
+        (
+            ["--since", "2026-10-02", "--until", "2026-10-01"],
+            "--since must not be later than --until",
+        ),
+        (["--until", "9999-12-31"], "--until must be earlier than 9999-12-31"),
+    ],
+)
+def test_list_rejects_bad_dates_before_building_a_client(capsys, scope, argv, message):
+    instances = []
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(
+            _base_args() + ["list", *scope, *argv],
+            client_factory=_factory(instances),
+        )
+
+    assert exc.value.code == 2
+    assert message in capsys.readouterr().err
+    assert instances == []
+
+
+def test_list_limit_keeps_the_newest_matching_jobs_printed_last():
+    jobs = [
+        {**row, "status": status}
+        for row, status in zip(_DATED_ROWS, ("RUNNING", "RUNNING", "FAILED", "RUNNING"))
+    ]
+
+    _, ids = _list_ids(["--limit", "2"], jobs=jobs)
+    assert ids == ["noon", "next-day"]
+
+    _, ids = _list_ids(["--status", "running", "--limit", "2"], jobs=jobs)
+    assert ids == ["midnight", "next-day"]
+
+
+def test_list_limit_drops_undated_jobs_before_newer_dated_ones():
+    # A row whose live status could not be read carries no created_at.
+    jobs = [{"job_id": "undated-a"}, {"job_id": "undated-b"}] + _DATED_ROWS
+
+    _, ids = _list_ids(["--limit", "2"], jobs=jobs)
+    assert ids == ["noon", "next-day"]
+
+    # Every dated job outranks both undated rows, however old it is.
+    _, ids = _list_ids(["--limit", "4"], jobs=jobs)
+    assert ids == ["before", "midnight", "noon", "next-day"]
+
+    # Undated rows fill what the dated ones leave, newest first, and still
+    # print after them.
+    _, ids = _list_ids(["--limit", "5"], jobs=jobs)
+    assert ids == ["before", "midnight", "noon", "next-day", "undated-a"]
+
+
+def test_list_limit_keeps_the_first_undated_jobs_when_none_are_dated():
+    # Nothing is dated, so the server's newest-first order is all there is.
+    jobs = [{"job_id": name} for name in ("newest", "middle", "oldest")]
+
+    _, ids = _list_ids(["--limit", "2"], jobs=jobs)
+
+    assert ids == ["middle", "newest"]
+
+
+@pytest.mark.parametrize("limit", ["0", "-1", "two"])
+def test_list_rejects_a_limit_below_one(limit):
+    with pytest.raises(SystemExit):
+        cli.parse_args(_base_args() + ["list", "--limit", limit])
+
+
+def test_list_all_reads_the_account_and_prints_it_oldest_first():
+    newest_first = list(reversed(_DATED_ROWS))
+
+    client, ids = _list_ids(
+        ["--all"], jobs=[{"job_id": "schema-row"}], account_jobs=newest_first
+    )
+
+    assert ids == ["before", "midnight", "noon", "next-day"]
+    assert client.iter_jobs_filters == {
+        "status": None,
+        "submitted_by": None,
+        "created_after": None,
+        "created_before": None,
+        "page_size": 100,
+    }
+
+
+def test_list_all_sends_every_filter_to_the_server():
+    rows = [
+        {"job_id": "b", "status": "FAILED", "created_at": "2026-10-01T02:00:00Z"},
+        {"job_id": "a", "status": "RUNNING", "created_at": "2026-10-01T01:00:00Z"},
+    ]
+
+    client, ids = _list_ids(
+        [
+            "--all",
+            "--status",
+            "active, FAILED",
+            "--user",
+            "jdoe",
+            "--since",
+            "2026-10-01",
+            "--until",
+            "2026-10-02",
+        ],
+        account_jobs=rows,
+    )
+
+    assert client.iter_jobs_filters == {
+        "status": "active,failed",
+        "submitted_by": "jdoe",
+        "created_after": date(2026, 10, 1),
+        # The server's bound is exclusive, so --until sends the day after.
+        "created_before": date(2026, 10, 3),
+        "page_size": 100,
+    }
+    assert ids == ["a", "b"]
+
+
+def test_list_all_limit_stops_reading_after_the_newest_jobs():
+    client, ids = _list_ids(
+        ["--all", "--limit", "2"], account_jobs=list(reversed(_DATED_ROWS))
+    )
+
+    assert ids == ["noon", "next-day"]
+    assert client.account_jobs_pulled == 2
+    assert client.iter_jobs_filters["page_size"] == 2
+
+
+def test_list_all_caps_the_page_size_at_the_server_maximum():
+    client, _ = _list_ids(["--all", "--limit", "5000"])
+
+    assert client.iter_jobs_filters["page_size"] == 1000
+
+
+def test_list_all_reports_listing_that_is_not_enabled():
+    import requests
+
+    class NotEnabledClient(FakeClient):
+        def iter_jobs(self, **filters):
+            response = requests.Response()
+            response.status_code = 404
+            raise requests.HTTPError(
+                "account-level job listing is not enabled for this account",
+                response=response,
+            )
+            yield
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["list", "--all"],
+        client_factory=lambda _args: NotEnabledClient(),
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert (
+        "error: account-level job listing is not enabled for this account"
+        in stderr.getvalue()
+    )
+    assert stdout.getvalue() == ""
 
 
 def test_list_prints_latest_jobs_last():
