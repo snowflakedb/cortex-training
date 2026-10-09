@@ -55,10 +55,14 @@ from collections.abc import Iterator
 from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field
+from datetime import date
+from datetime import datetime
+from datetime import timezone
 from enum import Enum
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
+from urllib.parse import quote
 
 from pydantic import BaseModel
 from pydantic import ConfigDict
@@ -458,6 +462,15 @@ def _track_operation(operation: str):
 def _is_chunk_post_transient(exc: BaseException) -> bool:
     if isinstance(exc, requests.exceptions.HTTPError):
         if _chunk_group_error_detail(exc.response) is not None:
+            return False
+    return _is_transient(exc)
+
+
+def _is_account_list_transient(exc: BaseException) -> bool:
+    # The account-level job list answers 404 when it is not enabled for the
+    # account, which no retry fixes.
+    if isinstance(exc, requests.exceptions.HTTPError):
+        if exc.response is not None and exc.response.status_code == 404:
             return False
     return _is_transient(exc)
 
@@ -1278,6 +1291,36 @@ def _sql_string_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+_PLAIN_IDENTIFIER_RE = re.compile(r"[A-Z_][A-Z0-9_$]*")
+
+
+def _sql_identifier(name: str) -> str:
+    """Return ``name`` as a Snowflake identifier that resolves to exactly ``name``.
+
+    A plain uppercase name stays bare; any other is double-quoted, with embedded
+    quotes doubled, so its case and characters survive identifier resolution.
+    """
+    if _PLAIN_IDENTIFIER_RE.fullmatch(name):
+        return name
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _created_param(value: date | datetime | str | None) -> str | None:
+    """Render a ``created_after`` / ``created_before`` query value.
+
+    A ``datetime`` becomes UTC RFC 3339 (a naive one is taken as UTC), a
+    ``date`` stays ``YYYY-MM-DD`` (UTC midnight on the server), and a string is
+    sent as given.
+    """
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    if isinstance(value, date):
+        return value.isoformat()
+    return value
+
+
 def _validate_artifact_relative_path(path: str) -> str:
     """Reject paths that could escape or ambiguously address the run stage."""
     candidate = PurePosixPath(path)
@@ -1490,7 +1533,12 @@ class CortexTrainingClient:
 
     @property
     def _prefix(self) -> str:
-        return f"{self.base_url}/api/v2/databases/{self.database}/schemas/{self.schema}/{self.endpoint}"
+        # "$" is legal in a path segment and common in plain identifiers, so it
+        # stays bare; anything else that could end or split the segment is encoded.
+        return (
+            f"{self.base_url}/api/v2/databases/{quote(self.database, safe='$')}"
+            f"/schemas/{quote(self.schema, safe='$')}/{self.endpoint}"
+        )
 
     def emit_metric(
         self,
@@ -1678,8 +1726,14 @@ class CortexTrainingClient:
         *,
         retry_on=_is_transient,
         max_retries: int | None = None,
+        ensure_database: bool = True,
         **kwargs,
     ) -> requests.Response:
+        """Send one request with retries.
+
+        ``ensure_database=False`` skips creating the configured database on a
+        not-found error, for routes whose path names no database.
+        """
         fn = getattr(self._session, method.lower())
         debug_context = kwargs.pop("debug_context", None)
         debug_label = self._debug_context_label(debug_context) if debug_context is not None else None
@@ -1796,7 +1850,8 @@ class CortexTrainingClient:
                         self._debug_response_summary(resp),
                     )
                 if (
-                    not self._db_ensured
+                    ensure_database
+                    and not self._db_ensured
                     and not self._db_creating
                     and self._is_database_not_found(resp)
                 ):
@@ -1804,7 +1859,11 @@ class CortexTrainingClient:
                     self._create_database()
                     # Retry the original request once after creating the DB.
                     continue
-                if self._db_ensured and self._is_database_not_found(resp):
+                if (
+                    ensure_database
+                    and self._db_ensured
+                    and self._is_database_not_found(resp)
+                ):
                     raise RuntimeError(
                         f"Database '{self.database}' still not found after creation attempt. "
                         f"The database may already exist but your role lacks USAGE on it. "
@@ -1988,6 +2047,115 @@ class CortexTrainingClient:
             params["status"] = status
         resp = self._send("GET", self._prefix, params=params)
         return resp.json().get("jobs", [])
+
+    def iter_jobs(
+        self,
+        *,
+        database: str | None = None,
+        schema: str | None = None,
+        status: str | list[str] | None = None,
+        submitted_by: str | None = None,
+        created_after: date | datetime | str | None = None,
+        created_before: date | datetime | str | None = None,
+        page_size: int = 100,
+    ) -> Iterator[dict]:
+        """Yield the jobs the caller can see across the account, newest first.
+
+        Reads the account-level ``GET /api/v2/{endpoint}`` route rather than
+        this client's schema, and follows ``next_page_token`` until the server
+        returns none; a page may hold fewer than ``page_size`` rows, even none.
+        ``page_size`` is 1 to 1000, the server's bound; outside it, the first
+        ``next()`` raises ``ValueError``.
+        The server applies every filter: ``database`` / ``schema`` narrow the
+        scope (``schema`` alone matches that schema name in any database),
+        ``status`` is one status or a list of them (``active`` and ``done``
+        name groups), ``submitted_by`` takes a user name, and
+        ``created_after`` (inclusive) / ``created_before`` (exclusive) take a
+        ``date``, a ``datetime`` (sent in UTC; naive is taken as UTC) or a
+        string sent as-is. Rows also carry ``database_name`` and
+        ``schema_name``; use :meth:`for_job` for per-job calls on one.
+
+        A 404 means account-level listing is not enabled for this account, and
+        is raised at once rather than retried.
+        """
+        if not 1 <= page_size <= 1000:
+            raise ValueError(f"page_size must be between 1 and 1000, got {page_size}")
+        if status is not None and not isinstance(status, str):
+            status = ",".join(status)
+        query = {
+            "database": database,
+            "schema": schema,
+            "status": status,
+            "submitted_by": submitted_by,
+            "created_after": _created_param(created_after),
+            "created_before": _created_param(created_before),
+            "limit": page_size,
+        }
+        params = {key: value for key, value in query.items() if value is not None}
+        while True:
+            page = self._list_account_jobs_page(params)
+            if page.get("unknown_status_count"):
+                logger.warning(
+                    "%d job(s) left out because their live status could not be "
+                    "read for the status filter",
+                    page["unknown_status_count"],
+                )
+            yield from page.get("jobs", [])
+            token = page.get("next_page_token")
+            if not token:
+                return
+            params = {**params, "page_token": token}
+
+    # Tracked per page: around the generator, _track_operation would record
+    # iter_jobs as finished before its first request.
+    @_track_operation("iter_jobs")
+    def _list_account_jobs_page(self, params: dict) -> dict:
+        try:
+            resp = self._send(
+                "GET",
+                f"{self.base_url}/api/v2/{self.endpoint}",
+                params=params,
+                retry_on=_is_account_list_transient,
+                # The path names no database, so a not-found error here is not
+                # about the configured one.
+                ensure_database=False,
+            )
+        except requests.exceptions.HTTPError as exc:
+            if exc.response is None or exc.response.status_code != 404:
+                raise
+            raise requests.exceptions.HTTPError(
+                "account-level job listing is not enabled for this account",
+                request=exc.request,
+                response=exc.response,
+            ) from exc
+        return resp.json()
+
+    def for_job(self, job: dict) -> "CortexTrainingClient":
+        """Return a client bound to ``job``'s schema, for per-job calls on a
+        row from :meth:`iter_jobs`.
+
+        The new client shares this client's HTTP session, auth and telemetry,
+        so keep this client open while using it, and close this client rather
+        than the new one.
+        """
+        client = type(self)(
+            base_url=self.base_url,
+            database=_sql_identifier(job["database_name"]),
+            schema=_sql_identifier(job["schema_name"]),
+            endpoint=self.endpoint,
+            poll_interval=self.poll_interval,
+            poll_timeout=self.poll_timeout,
+            poll_backoff_multiplier=self.poll_backoff_multiplier,
+            poll_max_interval=self.poll_max_interval,
+            max_retries=self.max_retries,
+            request_timeout=self.request_timeout,
+        )
+        client._session = self._session
+        client._auth_provider = self._auth_provider
+        client._metric_emitter = self._metric_emitter
+        client._artifact_connection_config = self._artifact_connection_config
+        client._artifact_connection_factory = self._artifact_connection_factory
+        return client
 
     @_track_operation("cancel_job")
     def cancel_job(self, job_id: str) -> None:
