@@ -50,7 +50,7 @@ Tracked operations:
 
 - Job lifecycle: `create_job`, `wait_for_job`, `get_job`, `list_jobs`,
   `iter_jobs` (one event per page), `cancel_job`, `get_capacity`,
-  `get_experiment_run`
+  `get_capacity_breakdown`, `get_experiment_run`
 - Compute: `forward_backward`, `forward`, `generate`, `generate_stream`, `step`
 - Checkpoints and logs: `save`, `load`, `list_checkpoints`,
   `export_checkpoint`, `delete_checkpoint`, `fetch_execution_logs`
@@ -97,6 +97,7 @@ operation.
 | `wait_for_job(job_id)` | job dict | Polls until `running`; raises on `failed`/`done`/`cancelled` or timeout. Does not treat `terminated` as terminal |
 | `cancel_job(job_id)` | `None` | Idempotent while cancelling/cancelled |
 | `get_capacity(hardware=None)` | capacity dict | `has_reservation`, `max_total_gpus`, `reserved_gpus`, `in_use_gpus`, `pending_gpus`, `available_gpus`, scoped to `hardware` (omitted means the server default, H200). The CLI `capacity` command queries every type unless `--hardware` is set. `max_total_gpus` is the canonical ceiling (`-1` uncapped); `reserved_gpus` is deprecated |
+| `get_capacity_breakdown(hardware=None, *, dimensions=("job_type", "submitted_by"))` | capacity dict plus `breakdown` | `get_capacity` split by sub-job type and/or submitter; each split has a `status` and `groups`. Unknown dimensions raise `ValueError`. See [rest-api.md section 5.4](rest-api.md#breakdown---breakdown) |
 
 `JobType.LOG_PROBABILITY` stays a schema type: a `SubJobConfig` carrying it
 still constructs, validates, and serializes to `"log_probability"`. Submission

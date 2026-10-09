@@ -55,6 +55,8 @@ class FakeClient:
         self.capacity_requested = False
         self.capacity_hardware = None
         self.capacity_hardware_requests = []
+        self.capacity_breakdown_requests = []
+        self.capacity_breakdown_errors = {}
         self.checkpoints_job_id = None
         self.jobs = None
         self.account_jobs = []
@@ -114,6 +116,14 @@ class FakeClient:
                 "B300": 0,
             }.get(hardware, 40),
         }
+
+    def get_capacity_breakdown(
+        self, hardware=None, *, dimensions=("job_type", "submitted_by")
+    ):
+        self.capacity_breakdown_requests.append((hardware, dimensions))
+        if hardware in self.capacity_breakdown_errors:
+            raise self.capacity_breakdown_errors[hardware]
+        return _capacity_with_breakdown(hardware, dimensions)
 
     def forward_backward(self, job_id, payload):
         self.forward_backward_job_id = job_id
@@ -250,6 +260,42 @@ class FakeHTTPError(OSError):
                 "text": '{"message":"backend detail"}',
             },
         )()
+
+
+def _capacity_with_breakdown(hardware, dimensions):
+    """A normalized get_capacity_breakdown() result for ``dimensions``."""
+    breakdown = {"job_count": 1, "truncated": False, "unsupported_dimensions": []}
+    if "job_type" in dimensions:
+        breakdown["by_job_type"] = {
+            "status": "OK",
+            "groups": [
+                {"job_type": "TRAINING", "in_use_gpus": 8, "pending_gpus": 0, "sub_job_count": 1},
+                {"job_type": "SAMPLING", "in_use_gpus": 0, "pending_gpus": 0, "sub_job_count": 0},
+                {"job_type": "LOG_PROBABILITY", "in_use_gpus": 0, "pending_gpus": 0, "sub_job_count": 0},
+            ],
+        }
+    if "submitted_by" in dimensions:
+        breakdown["by_submitted_by"] = {
+            "status": "OK",
+            "scope": "SELF",
+            "groups": [
+                {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+                 "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+                {"kind": "OTHER", "submitted_by": None, "is_caller": False,
+                 "in_use_gpus": 0, "pending_gpus": 0, "job_count": 0},
+                {"kind": "UNATTRIBUTED", "submitted_by": None, "is_caller": False,
+                 "in_use_gpus": 0, "pending_gpus": 0, "job_count": 0},
+            ],
+        }
+    return {
+        "has_reservation": True,
+        "max_total_gpus": 8,
+        "reserved_gpus": 8,
+        "in_use_gpus": 8,
+        "pending_gpus": 0,
+        "available_gpus": {"H200": 0, "B200": 4, "B300": 2}.get(hardware, 0),
+        "breakdown": breakdown,
+    }
 
 
 def _factory(instances):
@@ -1175,6 +1221,308 @@ def test_capacity_rejects_unknown_hardware():
             client_factory=_factory([]),
             stdout=io.StringIO(),
         )
+
+
+_CAPACITY_HARDWARE = ("H200", "B200", "B300")
+
+
+def _run_capacity(argv, *, client=None):
+    client = client or FakeClient()
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + argv,
+        client_factory=lambda _args: client,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    return rc, client, stdout.getvalue(), stderr.getvalue()
+
+
+@pytest.mark.parametrize(
+    "hardware_args", [[], ["--hardware", "B300"]], ids=["fan-out", "single"]
+)
+def test_capacity_without_breakdown_prints_get_capacity_unchanged(hardware_args):
+    rc, client, out, err = _run_capacity(["capacity", *hardware_args])
+
+    if hardware_args:
+        expected = FakeClient().get_capacity("B300")
+        lookups = ["B300"]
+    else:
+        expected = {
+            "capacity_by_hardware": {
+                hardware: FakeClient().get_capacity(hardware)
+                for hardware in _CAPACITY_HARDWARE
+            },
+            "unsupported_hardware": [],
+        }
+        lookups = list(_CAPACITY_HARDWARE)
+    assert rc == 0
+    assert err == ""
+    assert client.capacity_breakdown_requests == []
+    assert client.capacity_hardware_requests == lookups
+    assert out == json.dumps(expected, indent=2, sort_keys=True) + "\n"
+
+
+def test_capacity_help_lists_breakdown(capsys, monkeypatch):
+    # Wide enough that argparse does not wrap the help text mid-phrase.
+    monkeypatch.setenv("COLUMNS", "200")
+
+    with pytest.raises(SystemExit) as exc:
+        cli.parse_args(["capacity", "--help"])
+
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "--breakdown {job-type,submitted-by}" in help_text
+    assert (
+        "by sub-job type (job-type) or by submitting user (submitted-by)" in help_text
+    )
+
+
+@pytest.mark.parametrize("choice", ["owner-role", "job_type", "JOB-TYPE"])
+def test_capacity_breakdown_rejects_unknown_choice(choice):
+    with pytest.raises(SystemExit):
+        cli.parse_args(_base_args() + ["capacity", "--breakdown", choice])
+
+
+# The CLI spells each dimension with a hyphen; it must send the client's name.
+def test_cli_breakdown_choices_match_client_dimensions():
+    from cortex_training import client
+
+    assert (
+        tuple(cli._CAPACITY_BREAKDOWN_CHOICES.values())
+        == client._CAPACITY_BREAKDOWN_DIMENSIONS
+    )
+
+
+@pytest.mark.parametrize(
+    "breakdown_args, dimensions",
+    [
+        (["--breakdown", "job-type"], ("job_type",)),
+        (["--breakdown", "submitted-by"], ("submitted_by",)),
+        (
+            ["--breakdown", "job-type", "--breakdown", "submitted-by"],
+            ("job_type", "submitted_by"),
+        ),
+        (
+            ["--breakdown", "submitted-by", "--breakdown", "job-type"],
+            ("submitted_by", "job_type"),
+        ),
+    ],
+    ids=["job-type", "submitted-by", "both", "both-reversed"],
+)
+def test_capacity_breakdown_fans_out_with_wire_dimensions(breakdown_args, dimensions):
+    rc, client, out, err = _run_capacity(["capacity", *breakdown_args])
+
+    assert rc == 0
+    assert err == ""
+    assert client.capacity_hardware_requests == []
+    assert client.capacity_breakdown_requests == [
+        (hardware, dimensions) for hardware in _CAPACITY_HARDWARE
+    ]
+    assert json.loads(out) == {
+        "capacity_by_hardware": {
+            hardware: _capacity_with_breakdown(hardware, dimensions)
+            for hardware in _CAPACITY_HARDWARE
+        },
+        "unsupported_hardware": [],
+    }
+
+
+def test_capacity_breakdown_lists_unsupported_hardware_separately():
+    client = FakeClient()
+    client.capacity_breakdown_errors["B200"] = _unsupported_hardware_error("B200")
+
+    rc, client, out, err = _run_capacity(
+        ["capacity", "--breakdown", "job-type"], client=client
+    )
+
+    assert rc == 0
+    assert err == ""
+    result = json.loads(out)
+    assert set(result["capacity_by_hardware"]) == {"H200", "B300"}
+    assert result["unsupported_hardware"] == ["B200"]
+
+
+def test_capacity_breakdown_single_hardware_prints_compact_sorted_json():
+    rc, client, out, err = _run_capacity(
+        ["--compact", "capacity", "--hardware", "B300", "--breakdown", "submitted-by"]
+    )
+
+    assert rc == 0
+    assert err == ""
+    assert client.capacity_hardware_requests == []
+    assert client.capacity_breakdown_requests == [("B300", ("submitted_by",))]
+    expected = _capacity_with_breakdown("B300", ("submitted_by",))
+    assert out == json.dumps(expected, separators=(",", ":"), sort_keys=True) + "\n"
+
+
+@pytest.mark.parametrize("hardware", _CAPACITY_HARDWARE)
+def test_capacity_breakdown_fails_on_the_first_lookup_error(hardware):
+    client = FakeClient()
+    client.capacity_breakdown_errors = {hardware: _http_error(503)}
+
+    rc, _, out, err = _run_capacity(
+        ["capacity", "--breakdown", "job-type"], client=client
+    )
+
+    assert rc == 1
+    assert out == ""
+    assert err.startswith("error: 503 Client Error")
+    # As without --breakdown, the first failed lookup fails the command.
+    looked_up = [requested for requested, _ in client.capacity_breakdown_requests]
+    assert looked_up == list(
+        _CAPACITY_HARDWARE[: _CAPACITY_HARDWARE.index(hardware) + 1]
+    )
+    assert client.capacity_hardware_requests == []
+
+
+def test_capacity_breakdown_prints_the_real_client_result_with_sorted_keys():
+    from cortex_training import client as client_module
+
+    client = client_module.CortexTrainingClient(
+        base_url="http://test.local", database="DB", schema="SCH"
+    )
+    client._session = MagicMock()
+    response = MagicMock(status_code=200)
+    response.json.return_value = {
+        "has_reservation": True,
+        "max_total_gpus": 16,
+        "reserved_gpus": 16,
+        "in_use_gpus": 12,
+        "available_gpus": 4,
+        "breakdown": {
+            "unsupported_dimensions": [],
+            "job_count": 2,
+            "truncated": False,
+            "by_job_type": {"status": "DISABLED", "groups": []},
+            "by_submitted_by": {
+                "status": "OK",
+                "scope": "SELF",
+                "groups": [
+                    {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+                     "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+                    {"kind": "OTHER", "in_use_gpus": 4, "pending_gpus": 0, "job_count": 1},
+                    {"kind": "UNATTRIBUTED", "in_use_gpus": 0, "pending_gpus": 0, "job_count": 0},
+                ],
+            },
+        },
+    }
+    client._session.get.return_value = response
+
+    rc, _, out, err = _run_capacity(
+        [
+            "capacity",
+            "--hardware",
+            "H200",
+            "--breakdown",
+            "job-type",
+            "--breakdown",
+            "submitted-by",
+        ],
+        client=client,
+    )
+
+    assert rc == 0, err
+    client._session.get.assert_called_once_with(
+        f"{client._prefix}/capacity",
+        timeout=client_module._CAPACITY_REQUEST_TIMEOUT,
+        params={"hardware": "H200", "breakdown": "job_type,submitted_by"},
+    )
+    expected = {
+        "has_reservation": True,
+        "max_total_gpus": 16,
+        "reserved_gpus": 16,
+        "in_use_gpus": 12,
+        "pending_gpus": 0,
+        "available_gpus": 4,
+        "breakdown": {
+            "job_count": 2,
+            "truncated": False,
+            "unsupported_dimensions": [],
+            "by_job_type": {"status": "DISABLED", "groups": []},
+            "by_submitted_by": {
+                "status": "OK",
+                "scope": "SELF",
+                "groups": [
+                    {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+                     "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+                    {"kind": "OTHER", "submitted_by": None, "is_caller": False,
+                     "in_use_gpus": 4, "pending_gpus": 0, "job_count": 1},
+                    {"kind": "UNATTRIBUTED", "submitted_by": None, "is_caller": False,
+                     "in_use_gpus": 0, "pending_gpus": 0, "job_count": 0},
+                ],
+            },
+        },
+    }
+    assert out == json.dumps(expected, indent=2, sort_keys=True) + "\n"
+
+
+def test_capacity_breakdown_prints_visible_user_rows_in_server_order():
+    from cortex_training import client as client_module
+
+    client = client_module.CortexTrainingClient(
+        base_url="http://test.local", database="DB", schema="SCH"
+    )
+    client._session = MagicMock()
+    response = MagicMock(status_code=200)
+    # Scope VISIBLE names other users as well as the caller, ALICE, by
+    # in_use_gpus + pending_gpus descending and then by name. Printing with
+    # sorted keys must not reorder the rows.
+    response.json.return_value = {
+        "in_use_gpus": 28,
+        "pending_gpus": 16,
+        "breakdown": {
+            "unsupported_dimensions": [],
+            "job_count": 5,
+            "truncated": False,
+            "by_submitted_by": {
+                "status": "OK",
+                "scope": "VISIBLE",
+                "groups": [
+                    {"kind": "USER", "submitted_by": "CAROL", "is_caller": False,
+                     "in_use_gpus": 16, "pending_gpus": 8, "job_count": 2},
+                    {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+                     "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+                    {"kind": "USER", "submitted_by": "BOB", "is_caller": False,
+                     "in_use_gpus": 0, "pending_gpus": 8, "job_count": 1},
+                    {"kind": "OTHER", "in_use_gpus": 4, "pending_gpus": 0, "job_count": 1},
+                    {"kind": "UNATTRIBUTED", "in_use_gpus": 0, "pending_gpus": 0, "job_count": 0},
+                ],
+            },
+        },
+    }
+    client._session.get.return_value = response
+
+    rc, _, out, err = _run_capacity(
+        ["--compact", "capacity", "--hardware", "H200", "--breakdown", "submitted-by"],
+        client=client,
+    )
+
+    assert rc == 0, err
+    assert err == ""
+    assert client._session.get.call_args.kwargs["params"] == {
+        "hardware": "H200",
+        "breakdown": "submitted_by",
+    }
+    assert json.loads(out)["breakdown"]["by_submitted_by"] == {
+        "status": "OK",
+        "scope": "VISIBLE",
+        "groups": [
+            {"kind": "USER", "submitted_by": "CAROL", "is_caller": False,
+             "in_use_gpus": 16, "pending_gpus": 8, "job_count": 2},
+            {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+             "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+            {"kind": "USER", "submitted_by": "BOB", "is_caller": False,
+             "in_use_gpus": 0, "pending_gpus": 8, "job_count": 1},
+            {"kind": "OTHER", "submitted_by": None, "is_caller": False,
+             "in_use_gpus": 4, "pending_gpus": 0, "job_count": 1},
+            {"kind": "UNATTRIBUTED", "submitted_by": None, "is_caller": False,
+             "in_use_gpus": 0, "pending_gpus": 0, "job_count": 0},
+        ],
+    }
 
 
 def test_cancel_prints_confirmation():

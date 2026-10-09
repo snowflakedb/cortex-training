@@ -367,6 +367,33 @@ is reported separately in `pending_gpus`. See
 [REST API reference section 5.4](rest-api.md#54-capacity---get-capacity) and
 [GPU hardware](../concepts/hardware.md).
 
+#### Capacity Breakdown
+
+`--breakdown` splits `in_use_gpus` and `pending_gpus` by sub-job type
+(`job-type`) or by submitting user (`submitted-by`). Repeat it for both:
+
+```bash
+cortex-training capacity --hardware H200 --breakdown job-type --breakdown submitted-by
+```
+
+Each capacity object then carries a `breakdown`, as
+`get_capacity_breakdown()` returns it:
+
+```bash
+cortex-training capacity --hardware H200 --breakdown submitted-by \
+  | jq -c '.breakdown.by_submitted_by.groups[]'
+```
+
+```json
+{"kind":"USER","submitted_by":"YOUR_USER","is_caller":true,"in_use_gpus":24,"pending_gpus":0,"job_count":2}
+{"kind":"OTHER","submitted_by":null,"is_caller":false,"in_use_gpus":16,"pending_gpus":16,"job_count":3}
+{"kind":"UNATTRIBUTED","submitted_by":null,"is_caller":false,"in_use_gpus":4,"pending_gpus":0,"job_count":1}
+```
+
+Until the breakdown is enabled for your account, each dimension reports
+`DISABLED`. See [REST API reference section 5.4](rest-api.md#breakdown---breakdown)
+for every field, status and scope.
+
 ### Submit A Job
 
 The submit command expects a CreateJob JSON body:
