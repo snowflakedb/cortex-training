@@ -238,14 +238,14 @@ def test_moe_rl_recipes_have_runnable_parallelism():
             16,
             16,
             8,
-            "sdpa",
+            "sparse_mla",
         ),
         "glm53_flash_bf16.json": (
             "zai-org/GLM-5.3-Flash-BF16",
             16,
             16,
             8,
-            "sdpa",
+            "sparse_mla",
         ),
         "qwen38_flash_next.json": (
             "Qwen/Qwen3.8-Flash-Next",

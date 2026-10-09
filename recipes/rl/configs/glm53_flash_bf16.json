@@ -26,7 +26,7 @@
         "train_batch_size": 16,
         "gradient_clipping": 1.0,
         "model_provider": "prime_rl",
-        "attn_implementation": "sdpa",
+        "attn_implementation": "sparse_mla",
         "ac_config": {
           "mode": "full",
           "freq": 1
