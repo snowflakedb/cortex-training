@@ -31,6 +31,7 @@ python -m recipes.sft.conversational.train \
 
 Defaults are Qwen3-8B full-parameter, thinking off, and 100 steps. It uses the
 builtin `who_trained_you` dataset as default.
+The default run will be finished within few minutes.
 
 ## Common Variations
 
@@ -107,9 +108,6 @@ shipped example or a copy with `job_config=JOB_CONFIG`.
           "eps": ADAM_EPS
         },
         "ds_config": {
-          "train_batch_size": TRAIN_BATCH_SIZE,
-          "train_micro_batch_size_per_gpu": MICRO_BATCH_SIZE,
-          "gradient_accumulation_steps": TRAIN_BATCH_SIZE / (MICRO_BATCH_SIZE * NUM_TRAINING_GPUS),
           "zero_optimization": {
             "stage": ZERO_STAGE
           },
@@ -145,11 +143,11 @@ The target list above is for dense Qwen models. For
 The shipped Qwen3.6 configs use sequence parallel size 8 and logical batch 1
 to run at the model's 262K context limit.
 
-For dense long-context profiles, an integer
-`fused_lm_head_token_chunk_size` makes this recipe use the weighted
-`causal_cross_entropy` processing path. DSS then consumes chunked per-token
-log probabilities without materializing the full `[sequence, vocabulary]`
-logits tensor.
+For dense long-context profiles, set an integer
+`fused_lm_head_token_chunk_size` in `training_config`. The server then computes
+per-token log probabilities in chunks without materializing the full
+`[sequence, vocabulary]` logits tensor. The setting saves memory and does not
+change the loss.
 
 ```bash
 python -m recipes.sft.conversational.train \
@@ -220,9 +218,11 @@ a Snowflake experiment; results are viewable in Snowsight under
 **AI & ML > Experiments**. See the
 [Snowflake ML Experiments docs](https://docs.snowflake.com/en/developer-guide/snowflake-ml/experiments).
 
-On the default memorize task, `train_nll` should fall quickly. After save, the
-recipe prints one generate command. When running that command, Assistant text
-should be `Snowflake AI Research`.
+Each step logs `train_nll` (the server's `avg_loss`) and `loss_weight_sum`, the
+sum of `loss_mask` over the batch. On the default memorize task, `train_nll`
+should fall quickly and `loss_weight_sum` should stay constant from step to
+step. After save, the recipe prints one generate command. When running that
+command, Assistant text should be `Snowflake AI Research`.
 
 ```bash
 python -m recipes.inference.generate \
