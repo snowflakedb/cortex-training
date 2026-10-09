@@ -44,6 +44,7 @@ from types import SimpleNamespace
 from urllib.parse import unquote
 from urllib.parse import urlparse
 from unittest.mock import MagicMock
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -2010,14 +2011,31 @@ class TestIterJobs:
             },
         )
 
-    def test_sends_a_schema_without_a_database(self):
+    def test_refuses_a_schema_without_a_database(self):
         c = _make_client(get_json={"jobs": []})
 
-        list(c.iter_jobs(schema="EXP"))
+        with pytest.raises(ValueError, match="needs database=... with it"):
+            c.iter_jobs(schema="EXP")
 
-        c._session.get.assert_called_once_with(
-            ACCOUNT_ROUTE, params={"schema": "EXP", "limit": 100}
+        c._session.get.assert_not_called()
+
+    def test_checks_arguments_before_the_first_page_is_iterated(self):
+        c = _make_client(get_json={"jobs": []})
+
+        # Not next(...): the call itself refuses, so nothing is left to iterate.
+        with pytest.raises(ValueError, match="page_size must be between 1 and 1000"):
+            c.iter_jobs(page_size=0)
+        with pytest.raises(ValueError, match="needs database"):
+            c.iter_jobs(schema="EXP")
+
+        c._session.get.assert_not_called()
+
+    def test_ignores_a_count_the_server_no_longer_returns(self):
+        c = _make_client(
+            get_json={"jobs": [{"job_id": "a"}], "unknown_status_count": 3}
         )
+
+        assert list(c.iter_jobs(status="running")) == [{"job_id": "a"}]
 
     @pytest.mark.parametrize(
         ("value", "wire"),
@@ -2138,16 +2156,6 @@ class TestIterJobs:
 
         c._session.get.assert_called_once()
 
-    def test_logs_jobs_left_out_for_an_unreadable_status(self, caplog):
-        c = _make_client(
-            get_json={"jobs": [{"job_id": "a"}], "unknown_status_count": 3}
-        )
-
-        with caplog.at_level("WARNING", logger=nc.logger.name):
-            assert list(c.iter_jobs(status="running")) == [{"job_id": "a"}]
-
-        assert any("3 job(s) left out" in r.getMessage() for r in caplog.records)
-
     def test_emits_one_metric_per_page_without_filter_values(self, monkeypatch):
         monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "1")
         c = _make_client()
@@ -2247,6 +2255,56 @@ class TestForJob:
             "http://test.local/api/v2/databases/ML/schemas/EXP/training-v2/j1",
             headers={"Authorization": 'Snowflake Token="tok"'},
         )
+
+    def test_closes_the_session_it_opened_before_borrowing(self):
+        c = _make_client()
+
+        with patch.object(
+            nc._DefaultTimeoutSession, "close", autospec=True
+        ) as closed:
+            job_client = c.for_job({"database_name": "ML", "schema_name": "EXP"})
+
+        # The constructor opens a session and a connection pool; for_job
+        # releases them instead of leaking one per call.
+        closed.assert_called_once()
+        leaked = closed.call_args.args[0]
+        assert leaked is not c._session
+        assert job_client._session is c._session
+
+    def test_closing_it_leaves_the_parent_session_auth_and_telemetry_open(self):
+        c = _make_client()
+        c._auth_provider = MagicMock()
+        c._metric_emitter = MagicMock()
+
+        job_client = c.for_job({"database_name": "ML", "schema_name": "EXP"})
+        with job_client:
+            pass
+        job_client.close()
+
+        assert c._session.close.called is False
+        assert c._auth_provider.close.called is False
+        assert c._metric_emitter.close.called is False
+        # The parent still owns all three and closes them.
+        c.close()
+        assert c._session.close.called
+        assert c._auth_provider.close.called
+        assert c._metric_emitter.close.called
+
+    def test_does_not_create_the_jobs_database(self):
+        c = _make_client()
+        c._session.get.return_value = _make_error_response(
+            {"message": "Schema OTHER_DB.PUBLIC is not found or not authorized."}, 400
+        )
+
+        job_client = c.for_job({"database_name": "OTHER_DB", "schema_name": "PUBLIC"})
+        with pytest.raises(nc.requests.exceptions.HTTPError, match="400 Client Error"):
+            job_client.get_job("j1")
+
+        # The listed database already exists and may belong to another role, so
+        # the not-found answer surfaces instead of a CREATE DATABASE for it.
+        assert c._is_database_not_found(c._session.get.return_value)
+        c._session.post.assert_not_called()
+        assert job_client._db_ensured is False
 
     def test_returns_a_client_of_the_same_class(self):
         class SubClient(CortexTrainingClient):

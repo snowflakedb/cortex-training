@@ -616,6 +616,38 @@ def test_list_rejects_unknown_status_before_building_a_client(capsys, scope, sta
     assert instances == []
 
 
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        # Enum names and aliases a server can answer with, not only the words
+        # --status takes.
+        ("running", {"enum", "plain"}),
+        ("active", {"enum", "plain", "queued", "creating"}),
+        ("done", {"canceled", "completed", "succeeded"}),
+        ("failed", {"error"}),
+        # UNKNOWN is deliberately matched by no word.
+        ("active,done,failed", {"enum", "plain", "queued", "creating",
+                                "canceled", "completed", "succeeded", "error"}),
+    ],
+)
+def test_list_status_matches_enum_names_and_aliases(status, expected):
+    rows = [
+        {"job_id": "enum", "status": "JOB_STATE_RUNNING"},
+        {"job_id": "plain", "status": "running"},
+        {"job_id": "queued", "status": "queued"},
+        {"job_id": "creating", "status": "creating"},
+        {"job_id": "canceled", "status": "canceled"},
+        {"job_id": "completed", "status": "completed"},
+        {"job_id": "succeeded", "status": "succeeded"},
+        {"job_id": "error", "status": "error"},
+        {"job_id": "unknown", "status": "UNKNOWN"},
+    ]
+
+    _, ids = _list_ids(["--status", status], jobs=rows)
+
+    assert set(ids) == expected
+
+
 def test_list_status_done_includes_legacy_done_rows():
     _, ids = _list_ids(
         ["--status", "done"],
@@ -747,6 +779,32 @@ def test_list_limit_keeps_the_newest_matching_jobs_printed_last():
 
     _, ids = _list_ids(["--status", "running", "--limit", "2"], jobs=jobs)
     assert ids == ["midnight", "next-day"]
+
+
+def test_list_limit_drops_undated_jobs_before_newer_dated_ones():
+    # A row whose live status could not be read carries no created_at.
+    jobs = [{"job_id": "undated-a"}, {"job_id": "undated-b"}] + _DATED_ROWS
+
+    _, ids = _list_ids(["--limit", "2"], jobs=jobs)
+    assert ids == ["noon", "next-day"]
+
+    # Every dated job outranks both undated rows, however old it is.
+    _, ids = _list_ids(["--limit", "4"], jobs=jobs)
+    assert ids == ["before", "midnight", "noon", "next-day"]
+
+    # Undated rows fill what the dated ones leave, newest first, and still
+    # print after them.
+    _, ids = _list_ids(["--limit", "5"], jobs=jobs)
+    assert ids == ["before", "midnight", "noon", "next-day", "undated-a"]
+
+
+def test_list_limit_keeps_the_first_undated_jobs_when_none_are_dated():
+    # Nothing is dated, so the server's newest-first order is all there is.
+    jobs = [{"job_id": name} for name in ("newest", "middle", "oldest")]
+
+    _, ids = _list_ids(["--limit", "2"], jobs=jobs)
+
+    assert ids == ["middle", "newest"]
 
 
 @pytest.mark.parametrize("limit", ["0", "-1", "two"])

@@ -486,7 +486,7 @@ Optional query parameters:
 | Parameter | Value |
 |---|---|
 | `database` | Only jobs in this database. SQL identifier rules apply: an unquoted name is case-insensitive, a `"quoted"` one exact. A database the caller cannot see returns 400. |
-| `schema` | Only jobs in this schema, by the same rules. With `database`, the schema of that name in that database, and one the caller cannot see returns 400. Alone, the schemas of that name in every database the caller can see, and a name none has returns no jobs. |
+| `schema` | Only jobs in this schema of `database`, by the same rules. Requires `database`: a schema name alone does not name one schema, and sending it without `database` returns 400. A schema the caller cannot see returns 400. |
 | `status` | Comma-separated and case-insensitive: `pending`, `placing`, `initializing`, `running`, `failed`, `cancelled`, `terminated`, and the groups `active` (`pending` through `running`) and `done` (`cancelled`, `terminated`, and the `done` that older jobs show). `pending` does not include `placing`. Any other value returns 400. |
 | `submitted_by` | Only jobs submitted by this user, by SQL identifier rules. Jobs with no recorded submitter never match, and a user the caller cannot see returns no jobs. |
 | `created_after` | Inclusive lower bound on creation time: an RFC 3339 timestamp, or `YYYY-MM-DD` for midnight UTC. Must be earlier than `created_before`. |
@@ -509,24 +509,22 @@ REST response:
       "status": "running"
     }
   ],
-  "next_page_token": "opaque-token",
-  "unknown_status_count": 1
+  "next_page_token": "opaque-token"
 }
 ```
 
 Each job carries the per-schema list's fields plus `database_name` and
 `schema_name`. A page can hold fewer than `limit` jobs, or none, and still carry
-`next_page_token`; keep requesting until it is absent.
-`unknown_status_count`, omitted when zero, counts jobs on the page that matched
-every other filter but were left out because their status could not be read
-while `status` was set.
+`next_page_token`; keep requesting until it is absent. The token is opaque:
+pass it back unchanged. A job whose live status cannot be read while `status`
+is set is left out, uncounted, so a page's size is not a count of what matched.
 
 `CortexTrainingClient.iter_jobs(...)` takes the same filters, with `page_size`
-for `limit`, and yields jobs across pages, requesting a page only as you iterate.
-It logs a warning for a nonzero `unknown_status_count`, raises a 404 at once
-instead of retrying it, and never creates the configured database for this
-route. `for_job(job)` returns a client bound to a listed job's `database_name`
-and `schema_name`, for per-job calls.
+for `limit`, checks its arguments on the call, and yields jobs across pages as
+you iterate. It raises a 404 at once instead of retrying it, and never creates
+the configured database. `for_job(job)` returns a client bound to a listed
+job's `database_name` and `schema_name`; it borrows the parent's session and
+creates no database either.
 
 ### 5.4 Capacity - `GET /capacity`
 
