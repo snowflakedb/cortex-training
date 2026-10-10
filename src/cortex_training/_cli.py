@@ -68,6 +68,10 @@ def _has_url_scheme(url: str) -> bool:
     return url.startswith("http://") or url.startswith("https://")
 
 
+# The service rejects a GPU type the account does not support with this code.
+_UNSUPPORTED_HARDWARE_CODE = "517604"
+
+
 def _load_cortex_training_client_class():
     from .client import CortexTrainingClient
 
@@ -236,8 +240,8 @@ def build_parser(
         "--hardware",
         choices=_hardware_choices(),
         help=(
-            "Show only this GPU hardware. "
-            "Omit to show capacity for every hardware type."
+            "Show only this GPU hardware. Omit to show capacity for every type "
+            "your account supports; unsupported types are listed separately."
         ),
     )
 
@@ -1039,6 +1043,40 @@ def _cmd_download_metrics(
     return 0
 
 
+def _is_unsupported_hardware(exc: BaseException) -> bool:
+    """Whether a capacity lookup failed only because the account lacks that GPU type."""
+    response = getattr(exc, "response", None)
+    if response is None:
+        return False
+    try:
+        body = response.json()
+    except Exception:
+        return False
+    if not isinstance(body, dict):
+        return False
+    code = str(body.get("code") or body.get("error_code") or "")
+    message = str(body.get("message") or "")
+    return code == _UNSUPPORTED_HARDWARE_CODE and "unsupported hardware" in message
+
+
+def _capacity_by_hardware(client) -> dict[str, Any]:
+    """Capacity for every GPU type the account supports, plus the ones it does not."""
+    supported: dict[str, Any] = {}
+    unsupported: list[str] = []
+    first_unsupported: BaseException | None = None
+    for hardware in _hardware_choices():
+        try:
+            supported[hardware] = client.get_capacity(hardware=hardware)
+        except Exception as exc:
+            if not _is_unsupported_hardware(exc):
+                raise
+            unsupported.append(hardware)
+            first_unsupported = first_unsupported or exc
+    if not supported and first_unsupported is not None:
+        raise first_unsupported
+    return {"capacity_by_hardware": supported, "unsupported_hardware": unsupported}
+
+
 def _run(
     args: argparse.Namespace,
     client_factory: Callable[[argparse.Namespace], Any],
@@ -1075,12 +1113,7 @@ def _run(
         if args.hardware is not None:
             capacity = client.get_capacity(hardware=args.hardware)
         else:
-            capacity = {
-                "capacity_by_hardware": {
-                    hardware: client.get_capacity(hardware=hardware)
-                    for hardware in _hardware_choices()
-                }
-            }
+            capacity = _capacity_by_hardware(client)
         _print_json(capacity, stdout, compact=args.compact)
         return 0
     if args.command == "cancel":
