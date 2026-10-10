@@ -60,6 +60,7 @@ class Config(Protocol):
     n_test: int | None
     eval_temperature: float | None
     eval_max_tokens: int | None
+    weight_sync_format: str | None
     weight_sync_bucket_size: int | None
     job_config: str
 
@@ -372,7 +373,9 @@ def _train(config: Config, task: Task) -> None:
                 sync_weights(
                     client,
                     job_id,
-                    weight_format="lora" if lora_rank > 0 else None,
+                    weight_format=(
+                        "lora" if lora_rank > 0 else config.weight_sync_format
+                    ),
                     bucket_size=config.weight_sync_bucket_size,
                 )
 

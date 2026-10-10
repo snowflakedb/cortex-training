@@ -143,7 +143,27 @@ The target list above is for dense Qwen models. For
 The shipped Qwen3.6 configs use sequence parallel size 8 and logical batch 1
 to run at the model's 262K context limit.
 
-For dense long-context profiles, set an integer
+### MoE models
+
+Full-parameter recipes for the other MoE families. Each uses a 4K sequence
+length:
+
+- `qwen3_30b_a3b.json`: Qwen3-30B-A3B, 4 GPUs, EP4
+- `glm45_air.json`: GLM-4.5-Air, 4 GPUs, EP4, CPU optimizer offload
+- `minimax_m2.json`: MiniMax-M2-BF16, 16 GPUs, EP8, CPU optimizer offload
+- `trinity_mini.json`: Trinity-Mini, 4 GPUs, EP4
+- `nemotron3_nano_30b.json`: Nemotron-3-Nano-30B-A3B-BF16, 4 GPUs, EP4
+- `glm53_flash.json`: GLM-5.3-Flash FP8 weights, 16 GPUs, EP16, CPU optimizer offload
+- `glm53_flash_bf16.json`: GLM-5.3-Flash-BF16, 16 GPUs, EP16, CPU optimizer offload
+- `qwen38_flash_next.json`: Qwen3.8-Flash-Next, 8 GPUs, EP8
+
+```bash
+python -m recipes.sft.conversational.train \
+  config=/path/to/config.json \
+  job_config=configs/qwen3_30b_a3b.json
+```
+
+For dense long-context profiles, an integer
 `fused_lm_head_token_chunk_size` in `training_config`. The server then computes
 per-token log probabilities in chunks without materializing the full
 `[sequence, vocabulary]` logits tensor. The setting saves memory and does not
