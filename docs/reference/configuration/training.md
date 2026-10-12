@@ -26,5 +26,5 @@ first, and an invalid one fails before anything is submitted. Everything else,
 `optimizer` included, is posted unchanged, so
 [REST API section 8](../rest-api.md#8-create-job-schemas) is the authoritative
 schema for its fields. The
-[conversational SFT README](../../../recipes/sft/conversational/README.md#job-config-json)
+[conversational SFT README](../../../recipes/sft/README.md)
 documents the shape with every field named.

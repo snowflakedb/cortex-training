@@ -1,6 +1,6 @@
 # Reinforcement Learning
 
-The [Math GRPO recipe](../../../recipes/rl/math_grpo/README.md) is the current
+The [Math GRPO recipe](../../../recipes/rl/README.md) is the current
 end-to-end RL example. It demonstrates:
 
 - Colocated training and sampling sub-jobs

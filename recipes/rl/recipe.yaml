@@ -1,23 +1,21 @@
-id: conversational-sft
-title: Conversational supervised fine-tuning
+id: math-grpo
+title: Math GRPO
 status: runnable
-task: sft
+task: rl
 methods:
   - lora
   - full-parameter
-planned_methods:
-  - qlora
 models:
   - Qwen/Qwen3-8B
   - Qwen/Qwen3.6-35B-A3B
+  - Qwen/Qwen3.8-27B
 datasets:
-  - who_trained_you
-  - HuggingFaceH4/no_robots
-  - HuggingFaceH4/ultrachat_200k
+  - hendrycks/competition_math
+  - HuggingFaceH4/MATH-500
 precision:
   - bfloat16
 default_training_gpus: 4
 provenance:
   project: tinker-cookbook
-  recipe: recipes/sl_loop.py
+  recipe: recipes/math_rl/train.py
 last_validated: null

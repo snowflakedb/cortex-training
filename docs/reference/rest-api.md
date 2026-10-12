@@ -110,6 +110,13 @@ The SQL statements API used by execution-log download is outside this prefix:
 https://{account_host}/api/v2/statements
 ```
 
+So is the account-level job list
+([section 5.3](#across-the-account---get-apiv2endpoint)):
+
+```text
+https://{account_host}/api/v2/{endpoint}
+```
+
 If you point the client at a server that exposes the endpoint under a
 different name, pass it explicitly: `endpoint="my-endpoint-name"`.
 
@@ -303,10 +310,11 @@ Paths are relative to the prefix in [section 2.1](#21-base-url).
 The operation endpoint supports the operation types in
 [section 7](#7-generic-operation-envelope).
 
-One auxiliary call is outside the Cortex Training prefix:
+These calls are outside the Cortex Training prefix:
 
 | REST path | HTTP | Client use | Purpose |
 |---|---|---|---|
+| `/api/v2/{endpoint}` | `GET` | `iter_jobs` | List jobs across the account ([section 5.3](#across-the-account---get-apiv2endpoint)) |
 | `/api/v2/statements` | `POST` | artifact download methods | Resolve the current Snowflake identity |
 
 ---
@@ -464,6 +472,59 @@ REST response:
 
 `CortexTrainingClient.list_jobs()` returns only the `jobs` list, not the outer object.
 The client forwards the status string without validating an enum.
+
+#### Across the account - `GET /api/v2/{endpoint}`
+
+Lists the jobs the caller can see in every database and schema of the account,
+newest first, one page at a time. The path is outside the per-schema prefix:
+`https://{account_host}/api/v2/{endpoint}`. It returns 404 where account-level
+listing is not enabled for the account. Jobs in dropped databases or schemas
+are not listed. Every other job call stays on the per-schema routes.
+
+Optional query parameters:
+
+| Parameter | Value |
+|---|---|
+| `database` | Only jobs in this database. SQL identifier rules apply: an unquoted name is case-insensitive, a `"quoted"` one exact. A database the caller cannot see returns 400. |
+| `schema` | Only jobs in this schema of `database`, by the same rules. Requires `database`: a schema name alone does not name one schema, and sending it without `database` returns 400. A schema the caller cannot see returns 400. |
+| `status` | Comma-separated and case-insensitive: `pending`, `placing`, `initializing`, `running`, `failed`, `cancelled`, `terminated`, and the groups `active` (`pending` through `running`) and `done` (`cancelled`, `terminated`, and the `done` that older jobs show). `pending` does not include `placing`. Any other value returns 400. |
+| `submitted_by` | Only jobs submitted by this user, by SQL identifier rules. Jobs with no recorded submitter never match, and an unknown user matches no jobs. |
+| `created_after` | Inclusive lower bound on creation time: an RFC 3339 timestamp, or `YYYY-MM-DD` for midnight UTC. Must be earlier than `created_before`. |
+| `created_before` | Exclusive upper bound on creation time, in the same forms. |
+| `limit` | Page size, 1 to 1000. Defaults to 100. |
+| `page_token` | The previous page's `next_page_token`. Send it with the same filters; different filters return 400. |
+
+The creation bounds compare with the time the service recorded the job, which
+can differ slightly from the job's `created_at`.
+
+REST response:
+
+```json
+{
+  "jobs": [
+    {
+      "job_id": "job-id",
+      "database_name": "CORTEX_TRAINING_DB",
+      "schema_name": "PUBLIC",
+      "status": "RUNNING"
+    }
+  ],
+  "next_page_token": "opaque-token"
+}
+```
+
+Each job carries the per-schema list's fields plus `database_name` and
+`schema_name`. A page can hold fewer than `limit` jobs, or none, and still carry
+`next_page_token`; keep requesting until it is absent. The token is opaque:
+pass it back unchanged. A job whose live status cannot be read while `status`
+is set is left out, uncounted, so a page's size is not a count of what matched.
+
+`CortexTrainingClient.iter_jobs(...)` takes the same filters, with `page_size`
+for `limit`, checks its arguments on the call, and yields jobs across pages as
+you iterate. It raises a 404 at once instead of retrying it, and never creates
+the configured database. `for_job(job)` returns a client bound to a listed
+job's `database_name` and `schema_name`; it borrows the parent's session and
+creates no database either.
 
 ### 5.4 Capacity - `GET /capacity`
 
@@ -839,7 +900,8 @@ be changed at runtime. The server will reject incompatible loads.
 ### 6.5 Create-time checkpoint initialization
 
 Create-time initialization is not `resume_from_checkpoint` in the typed
-`cortex-training` API. Use:
+`cortex-training` API. To initialize from a checkpoint saved by Cortex
+Training, use:
 
 ```json
 {
@@ -853,10 +915,29 @@ Create-time initialization is not `resume_from_checkpoint` in the typed
 This object is a field on `SubJobConfig`. The server stamps scoped `stage_info`
 credentials; clients should not provide credentials themselves.
 
-Sampling initialization requires a `weights-only` checkpoint. The source job no
-longer needs to be running after the checkpoint has been saved.
+To initialize from a complete Hugging Face safetensors directory uploaded to a
+Snowflake stage, use the alternative source field:
 
-For training initialization from a `resumable` checkpoint, set
+```json
+{
+  "source_checkpoint_info": {
+    "external_stage_path": "@MY_DB.MY_SCHEMA.MODEL_IMPORT/qwen-sft-run7"
+  }
+}
+```
+
+`external_stage_path` is mutually exclusive with both `checkpoint_id` and
+`source_job_id`. The service resolves the stage and credentials under the
+submitting role. The source must be an S3-backed stage containing a flat,
+uncompressed Hugging Face safetensors model directory. See
+[Start a Job From Your Own Weights](../guides/training/external-weights.md)
+for the upload workflow and file requirements.
+
+When initializing from a checkpoint saved by Cortex Training, sampling requires
+a `weights-only` checkpoint. The source job no longer needs to be running after
+the checkpoint has been saved.
+
+For training initialization from a Cortex Training `resumable` checkpoint, set
 `training_config.load_optimizer_states=false` (see
 [section 8.2](#82-trainingconfig)) to restore weights only with a fresh
 optimizer. This is required when the new job changes data-parallel size, since
@@ -1120,6 +1201,24 @@ Optional payload fields:
   weights. For adapter-only synchronization, see
   [section 7.3](#73-lora-adapter-sync).
 
+On server versions that include this behavior, the default weight sync, which
+pauses generation and keeps in-flight requests, also clears the sampling
+sub-job's prefix cache. No request after the sync reads KV computed under the
+old weights. In-flight requests are preempted and recomputed with the new
+weights, and the next turn of each conversation recomputes its history, so
+generation is somewhat slower right after a sync. Syncs that use another mode
+are unchanged. A sampling sub-job can opt out with
+`vllm_config.clear_cache_on_weight_sync` (see
+[section 8.3](#83-inferenceconfig)).
+
+Each sampling target in the result reports `clear_cache`, at
+`targets[].recv.recv.clear_cache`. It is the value the sync sent to the sampling
+workers' pause, so it shows what was requested and is not proof that the cache
+was cleared. It is `false` when no pause was issued. A result without the key
+comes from a server version that predates this behavior. If you set the opt-out
+and the result still shows `clear_cache: true`, check the key's spelling and
+that it is set under `vllm_config`.
+
 ### 7.3 LoRA adapter sync
 
 LoRA synchronization uses the same `weight-sync` operation, but it requires
@@ -1288,7 +1387,7 @@ Exactly one type-specific config is set.
 | `dtype` | string | no | Example: `bfloat16` |
 | `seed` | integer | no | |
 | `model_post_init` | list of strings | no | Server maps to post-init hooks |
-| `source_checkpoint_info` | object | no | Create-time checkpoint initialization |
+| `source_checkpoint_info` | object | no | Create-time initialization from a saved checkpoint or external weights |
 
 Typed factories:
 
@@ -1465,6 +1564,18 @@ configuration used for adapter synchronization. It is validated and rewritten by
 the same rules as the training block (see
 [section 8.2](#82-trainingconfig)).
 
+`vllm_config.clear_cache_on_weight_sync` controls whether a weight sync clears
+the sampling sub-job's prefix cache. It is a boolean, default `true`, and
+applies only to the default weight sync (see
+[section 7.2](#72-weight-sync)). Set it to `false` to opt out, for example
+`extra_sampling={"vllm_config": {"clear_cache_on_weight_sync": False}}`. With
+`false`, only a best-effort reset after the sync remains. That reset cannot clear
+blocks held by running requests, so requests may read KV computed under the old
+weights. The key is not validated: a misspelled key is silently ignored, and the
+sync keeps clearing the cache. The `clear_cache` key in each sampling target's
+sync result shows whether the opt-out was applied (see
+[section 7.2](#72-weight-sync)).
+
 For either config type, the server requires `multiplex_job_id` to be a complete
 `{job_id}:{sub_job_type}:{index}` id outside the job being created.
 
@@ -1477,10 +1588,23 @@ For either config type, the server requires `multiplex_job_id` to be a complete
 }
 ```
 
-`checkpoint_id` is required by the server-side source-checkpoint model.
-`source_job_id` is optional in the client/proto shape, but cross-job
-initialization must identify the job that owns the saved checkpoint. The typed
-client forwards this object without validating either field.
+Exactly one source is required:
+
+- `checkpoint_id` identifies a checkpoint saved by Cortex Training.
+  `source_job_id` identifies the job that owns it and is required for cross-job
+  initialization.
+- `external_stage_path` identifies a complete Hugging Face safetensors
+  directory in a stage the submitting role can read. It cannot be combined with
+  `checkpoint_id` or `source_job_id`.
+
+```json
+{
+  "external_stage_path": "@MY_DB.MY_SCHEMA.MODEL_IMPORT/qwen-sft-run7"
+}
+```
+
+The typed client forwards this object without validating its fields. The server
+resolves stage credentials; clients must not provide `stage_info` themselves.
 
 ### 8.5 Memory-diagnostics settings
 
@@ -1701,10 +1825,140 @@ batch = {
 
 `context` and `processing` are open backend contracts. Their accepted keys,
 registered loss functions, and post-processors come from the deployed training
-backend, not the REST schema.
+backend, not the REST schema. The optional ratio controls of the `grpo` loss and
+its variants, described below, are an exception: their configuration keys, and
+the metrics named below, are listed here.
 
 Do not use `build_forward_backward_payload()` for this extended shape: that
 helper currently ignores `context` and `processing`.
+
+#### Ratio controls for the CISPO loss
+
+On server versions that include these controls, the `grpo` loss and its variants
+`ap_grpo`, `grpo_echo_v1`, and `ap_grpo_echo_v1` accept optional ratio controls
+in `processing.config`. All are off by default, and any active control requires
+`use_cispo_loss` to be `true`. The masks drop tokens from the CISPO policy term
+only; the loss normalizers stay as they were.
+
+| Key | Meaning |
+|---|---|
+| `ratio_mask_bounds_pos`, `ratio_mask_bounds_neg` | Inclusive importance-ratio bands, chosen by the sign of the token's advantage (see below). A pair `[low, high]` of finite numbers or `null`, with `low < high` and `low >= 0`; a `null` end is unbounded |
+| `prob_diff_mask_max_pos`, `prob_diff_mask_max_neg` | Finite, non-negative maximum directional probability gap between the current policy and the sampler |
+| `seq_mask_stat` | The sequence statistic that the sequence gate tests: `mean_log_ratio` (default) or `mean_k3` |
+| `seq_mask_bounds_pos`, `seq_mask_bounds_neg` | Inclusive bands for that statistic, chosen by advantage sign (see below). A pair of finite numbers or `null`, with `low < high`; a `null` end is unbounded |
+| `ratio_m2_threshold` | Finite, positive M2PO filtering threshold for the current-policy versus sampler ratio |
+| `log_ratio_sq_coef` | Finite, non-negative coefficient of a squared log-ratio penalty. Unlike the masks, the penalty is computed over the original loss mask whatever the masks drop. A positive value is rejected with `token-mean` aggregation when `sequence_loss_weights` is present |
+| `ratio_stats` | Boolean. `true` reports the ratio metrics (histograms, mask counts, and the metrics below) without enabling a mask |
+| `ratio_mask_rebalance` | Boolean. `true` rescales the kept advantages of each sign that keeps any mass so that its total returns to its pre-mask value (see below) |
+
+A control is active as soon as its key is present with a valid value, even a
+neutral one such as `log_ratio_sq_coef: 0.0`. An explicit `null` is rejected for
+every ratio-control key, so omit a key to leave it off; inside a bounds pair, a
+`null` end still means unbounded. An explicit `false` of `ratio_stats` or
+`ratio_mask_rebalance` does not count: a request whose only ratio-control keys
+are one or both of these set to `false` is inert and needs no `use_cispo_loss`.
+The mixed losses `grpo_mixed_v1` and `ap_grpo_mixed_v1` reject every
+ratio-control key, including an explicit `false`, so that policy-only gates
+cannot affect NLL tokens.
+
+The `_pos` and `_neg` gates split tokens by the sign of the token-level
+advantage, before any sequence-level averaging and including the teacher term
+when it is enabled. An advantage of exactly `0` counts as positive. With
+`importance_sampling_level` set to `"sequence"`, the CISPO term uses each
+sequence's averaged advantage while the gates keep the token-level sign, so the
+two can differ. A sequence is tested against `seq_mask_bounds_pos` when it has
+at least one positive-side token and against `seq_mask_bounds_neg` when it has
+at least one negative-side token, and a band violation drops only that side's
+tokens.
+
+Whenever a ratio control is active, the `metrics` of the forward/backward result
+carry the keys below. Keys ending in `_sum` are added up over workers. The
+result also carries other ratio-control entries, such as per-drop counts and
+further histogram bins, that are not listed here.
+
+| Metric | Meaning |
+|---|---|
+| `ratio_mask_pos_pre_mass_sum`, `ratio_mask_neg_pre_mass_sum` | The advantage mass before masking: `\|A\|` summed over the policy tokens with advantage `A >= 0` (`pos`) or `A < 0` (`neg`). It goes through the loss's own normalization (for `token-mean`, divided by the number of policy tokens in the whole request), without the data-parallel factor and without importance, clip, `rollout_is_weights`, or `behav_imp_weight_cap` weights. `A` is the advantage the CISPO term uses: with `importance_sampling_level` set to `"sequence"`, each sequence's averaged advantage, so the sequence counts as `pos` or `neg` as a whole by the sign of its mean |
+| `ratio_mask_pos_kept_mass_sum`, `ratio_mask_neg_kept_mass_sum` | The same sums over the tokens that survive every active drop (ratio band, probability gap, sequence gate, `ratio_m2_threshold`) |
+| `ratio_mask_kept_k3_sum` | The sum over the kept tokens of `exp(d) - 1 - d`, where `d` is the trainer log probability minus the sampler log probability (`old_log_probs_shifted`), clamped to `[-20, 20]`. It is raw, not divided by the loss denominators, and is `0` when the request has no `old_log_probs_shifted` |
+| `ratio_trainable_token_count`, `ratio_mask_dropped_token_count` | The policy tokens the ratio controls see, and how many of them some active drop removes |
+| `seq_stat_bin_<i>_sequence_count`, `i` from `0` to `6` | The number of sequences whose log ratio (current policy minus sampler log probability), averaged over the sequence's policy tokens, falls in bucket `i` of the edges `-0.2, -0.05, -0.01, 0.01, 0.05, 0.2`. Each bucket includes its upper edge: bucket `0` holds values up to `-0.2` and bucket `6` values above `0.2`. It always bins the mean log ratio, also when `seq_mask_stat` is `mean_k3` |
+| `ratio_mask_rebalance` | The flag as `0.0` or `1.0` |
+| `ratio_rebalance_pos_post_mass_sum`, `ratio_rebalance_neg_post_mass_sum` | Only with `ratio_mask_rebalance` set to `true`. The kept mass of the sign after scaling: equal to its pre-mask mass, up to rounding, when the sign's kept mass is positive, and `0` when it is not |
+| `ratio_rebalance_pos_unrestored_mass_sum`, `ratio_rebalance_neg_unrestored_mass_sum` | Only with `ratio_mask_rebalance` set to `true`. The pre-mask mass of a sign whose kept mass is `0`, and `0` otherwise |
+
+The four mass sums equal their value for the unsplit batch, up to rounding, when
+the loss normalization is request-global: `token-mean`; `prompt-mean` with
+`prompt_group_ids` (the service derives the request-wide counts it needs) or with
+client-supplied `sequence_loss_weights`; and the `seq-mean-token-sum`,
+`seq-mean-token-sum-norm`, and `seq-mean-token-mean` values of `loss_agg_mode`
+when the client sends a request-global `global_batch_size`. Otherwise each call
+normalizes by its own counts, and so do these sums. Sequence-parallel shards
+count once, and a worker with no policy token reports `0`. The `post` and
+`unrestored` sums below are in the same normalized units and are also added up
+over workers. The k3 sum and the two counts are not normalized: they add up across microbatches, workers, and
+sequence-parallel ranks in every aggregation mode, apart from the placement
+effects below.
+
+`ratio_m2_threshold` ranks the tokens of one model call, so with it the kept
+mass, the dropped count, and the k3 sum depend on how rows are placed on
+workers, while the pre-mask mass does not. The baseline `m2_threshold` key,
+which is not `ratio_m2_threshold`, acts on the tokens a worker holds in one call
+(under sequence parallelism, on each rank's own window) and removes tokens
+before the ratio controls act. Those tokens are in neither the pre-mask nor the
+kept mass, and are excluded from `ratio_trainable_token_count`. With it the
+masses, the k3 sum, and the counts depend on how rows are placed in calls and on
+the sequence-parallel split, and with several calls per worker on
+`max_tokens_per_mb`. With either key the restoration scale below depends on
+placement as well.
+
+The clamp of `d` applies to the reported k3 sum only: `seq_mask_stat` set to
+`mean_k3` gates on the unclamped k3. The kept-token mean is
+`ratio_mask_kept_k3_sum / (ratio_trainable_token_count -
+ratio_mask_dropped_token_count)`. When the request carries
+`old_log_probs_shifted`, the service also reports
+`trainable_logprob_lowvar_all/mean`, the same estimator over every trainable
+token before masking, with the same clamp. With no drop, no token removed by the
+baseline `m2_threshold`, and finite log probabilities,
+`ratio_mask_kept_k3_sum / ratio_trainable_token_count` equals it up to rounding.
+The service computes `trainable_logprob_lowvar_all/mean` with `exp(d) - 1 - d` in
+float32, which loses precision for `|d|` of about `1e-3` or less, so a gap there
+comes from that metric. A trainer log probability that is not finite is replaced
+by `0` before the loss, and its token still counts. A sampler log probability
+that is not finite at a trained token makes the request fail, so no k3 sum is
+returned.
+
+With `ratio_mask_rebalance` set to `true`, once the masks have decided which
+tokens to drop, the kept tokens of positive advantage are scaled by `P0/Pk` and
+those of negative advantage by `N0/Nk`. `P0` and `N0` are
+`ratio_mask_pos_pre_mass_sum` and `ratio_mask_neg_pre_mass_sum`; `Pk` and `Nk`
+are `ratio_mask_pos_kept_mass_sum` and `ratio_mask_neg_kept_mass_sum`; all four
+are summed over all workers. Every worker applies the same scale, and each sign
+returns to its own pre-mask mass, not to the other sign's. Only advantage
+magnitudes change: which tokens are dropped, the counts, and the k3 sum do not
+depend on the scaling. The scale is computed for one forward/backward request,
+so a step split across several requests gets one scale per request, and a sign
+that loses all its mass in one part is not restored there. A sign whose kept mass
+is `0` has nothing to scale, including a sign whose only surviving tokens have
+advantage `0`: its scale is `1` and its pre-mask mass is reported as
+unrestored. With nothing dropped, both scales are `1` and the objective is
+unchanged, up to rounding. The scale is not capped and is not reported, but it
+can be computed from the reported masses, and it is large when little of a
+sign's mass survives (`100` when one of 100 equal-magnitude positive tokens is
+kept). The CISPO ratio clip (`is_weight_clip_max`, when set) still applies
+independently of the scaling, so the restoration does not equalize
+ratio-weighted gradients.
+
+`ratio_mask_rebalance` set to `true` and `ratio_m2_threshold` each require one
+packed model call per worker. A request that would need more than one call per
+worker is rejected before it is dispatched to the workers, with an error that
+names the key (both keys when both are set) and the per-worker call counts. The
+training sub-job's `training_config.mb_spec.max_tokens_per_mb` budget (default
+`10240` tokens when `mb_spec` or the key is omitted) must therefore be large
+enough to keep each worker's share in one call. Two rejections come later:
+`ratio_m2_threshold` is also rejected under sequence parallelism, and an active
+ratio control without `use_cispo_loss` is rejected. A worker raises both when it
+resolves the loss, before any forward pass.
 
 ### 10.4 Shifted log-probability convention
 
@@ -1725,12 +1979,12 @@ These are conventional backend results, not closed REST schemas:
 
 | Operation | Common result |
 |---|---|
-| `forward-backward` | `job_id`, `avg_loss`, `metrics`, `post_process_outputs` |
+| `forward-backward` | `job_id`, `avg_loss`, `metrics`, `post_process_outputs`; `metrics` carries the ratio-control metrics when those controls are active (see [section 10.3](#103-arctictraining-extensions)) |
 | `step` | `global_steps`, `last_lr`, optional `peak_memory` |
 | `save` | `job_id`, `stage_path` (carries the `cp_<uuid>` id), `checkpoint_path`, `checkpoint_tag`, `version` — no `checkpoint_id` key in the observed release (see 6.3) |
 | `load` | `checkpoint_id` and backend load metadata |
 | `generate` | `job_id`, `results[]` |
-| `weight-sync` | Completion/transfer metadata |
+| `weight-sync` | Completion/transfer metadata; each sampling target's result carries `clear_cache` (see [section 7.2](#72-weight-sync)) |
 | `forward` | Backend-specific forward-only result |
 
 Generic-operation responses and fields inside `metrics` or generation results
@@ -1778,16 +2032,26 @@ paths or object-store credentials.
 
 ### 12.3 Persisted stdout download
 
-`download_stdout_logs(job_id, output_dir)` downloads gzip chunks under
-`_stdout/{sub_job_id}/`, orders them by artifact name, and streams them into
-`<output_dir>/<sub_job_id>/stdout.log`. Each destination is replaced atomically;
-an invalid chunk leaves an existing file unchanged.
+`download_stdout_logs(job_id, output_dir, *, resume=False)` downloads gzip chunks
+under `_stdout/{sub_job_id}/`, orders them by artifact name, and streams them
+into `<output_dir>/<sub_job_id>/stdout.log`. Each sub-job is committed before
+the next one starts. A failed chunk leaves that sub-job's committed bytes
+and manifest in place. A hidden
+`.<filename>.manifest.json` beside the file records `version`, the sorted
+relative chunk paths, and the committed byte length.
+
+`resume=True` appends only when those paths are a prefix of the current sorted
+list and the file is at least that many bytes. A longer file is truncated back
+to the committed length. A missing or shorter file is rebuilt, as is a chunk
+list that is no longer a prefix of the sorted paths.
+Two downloads of the same output directory at once are unsupported.
 
 ### 12.4 GPU metrics download
 
-`download_metrics(job_id, output_dir)` applies the same bounded reconstruction
-to `gpu.YYYYMMDD-HHMMSS.UUID.gz` chunks under `_metrics/{sub_job_id}/` and
-writes `<output_dir>/<sub_job_id>/gpu.jsonl`.
+`download_metrics(job_id, output_dir, *, resume=False)` applies the same
+reconstruction to `gpu.YYYYMMDD-HHMMSS.UUID.gz` chunks under
+`_metrics/{sub_job_id}/` and writes `<output_dir>/<sub_job_id>/gpu.jsonl`,
+including `resume` and the manifest beside that file.
 
 The reconstructed file contains the JSONL records emitted by the deployed
 training runtime.

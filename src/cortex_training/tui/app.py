@@ -27,8 +27,11 @@ never mutates job state.
 from __future__ import annotations
 
 import os
+import tempfile
 import time
 import traceback
+from collections import deque
+from pathlib import Path
 
 from rich.markup import escape
 from textual import work
@@ -263,6 +266,12 @@ class LogScreen(Screen):
         self._shown_lines: list[str] = []  # unwrapped lines on screen (for re-wrap)
         self._wrap_width = -1  # content width the buffer is wrapped to
         self._last_update = None  # local HH:MM:SS of the last live line
+        self._screen_open = True
+        self._stage: tempfile.TemporaryDirectory[str] | None = None
+        self._stdout_inflight = False
+        self._stdout_ready = False
+        self._stdout_failed = False
+        self._held: tuple[list[str], bool] | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -286,7 +295,12 @@ class LogScreen(Screen):
 
     def on_unmount(self) -> None:
         # Stop the tail worker when leaving this job (it polls follow=True).
+        # A download still inside download_stdout_logs recreates its output
+        # directory, so the temp dir is removed only after that call returns.
+        self._screen_open = False
         self.workers.cancel_all()
+        if not self._stdout_inflight:
+            self._cleanup_stage()
 
     def _apply_sources_width(self) -> None:
         try:
@@ -368,9 +382,22 @@ class LogScreen(Screen):
     def action_toggle_pause(self) -> None:
         self._paused = not self._paused
         # Resuming jumps to the end and follows again; pausing just stops
-        # following (the user can scroll freely).
-        if not self._paused and self._logview is not None:
-            self._logview.scroll_end(animate=False)
+        # following (the user can scroll freely). A saved console that arrived
+        # while paused replaces the pane now.
+        if not self._paused:
+            held = self._held
+            self._held = None
+            if held is not None:
+                lines, empty_note = held
+                self._shown_lines = []
+                if self._logview is not None:
+                    self._logview.clear()
+                if lines:
+                    self._write_lines(lines)
+                elif empty_note:
+                    self._write_line("No log output is available.")
+            if self._logview is not None:
+                self._logview.scroll_end(animate=False)
         self._update_subtitle()
 
     def _refilter(self) -> None:
@@ -379,32 +406,66 @@ class LogScreen(Screen):
             self._start_tail(self._current_source)
 
     # ─── export / copy ───────────────────────────────────────────────────
-    @work(thread=True, exclusive=True, group="export")
-    def action_save_log(self) -> None:
+    def _export_target(self) -> tuple[str, str] | None:
+        """UI thread. ``path`` is the saved console; empty means export the cache."""
         src = self._current_source
         if not src:
-            return
+            return None
+        if self._stdout_ready:
+            path = self._stdout_path(src)
+            try:
+                if path.is_file() and path.stat().st_size > 0:
+                    return src, str(path)
+            except OSError:
+                pass
+        return src, ""
+
+    def _exported_text(self, src: str, path: str) -> str:
+        if path:
+            return Path(path).read_bytes().decode("utf-8", errors="replace")
         entries = self._cache.load_entries(src)
-        text = "\n".join(format_log_entry(e) for e in entries)
+        return "\n".join(format_log_entry(entry) for entry in entries)
+
+    def _take_export(self) -> tuple[str, str, str] | None:
+        try:
+            target = self.app.call_from_thread(self._export_target)
+        except RuntimeError:
+            return None
+        if target is None:
+            return None
+        src, path = target
+        return src, path, self._exported_text(src, path)
+
+    @work(thread=True, exclusive=True, group="export")
+    def action_save_log(self) -> None:
+        exported = self._take_export()
+        if exported is None:
+            return
+        src, file_path, text = exported
+        count = len(text.splitlines())
         safe = src.replace("/", "_").replace(":", "-")
         path = os.path.expanduser(f"~/cortex-training-{self._job_id[:8]}-{safe}.log")
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(text + ("\n" if text else ""))
-            msg = f"[saved] {len(entries)} line(s) → {path}"
+            if file_path:
+                with open(path, "wb") as handle:
+                    handle.write(Path(file_path).read_bytes())
+            else:
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(text + ("\n" if text else ""))
+            msg = f"[saved] {count} line(s) → {path}"
         except OSError as exc:  # noqa: BLE001
             msg = f"[error] save failed: {exc}"
         self.app.call_from_thread(self._write_line, msg)
 
     @work(thread=True, exclusive=True, group="copy")
     def action_copy_log(self) -> None:
-        src = self._current_source
-        if not src:
+        exported = self._take_export()
+        if exported is None:
             return
-        entries = self._cache.load_entries(src)
-        text = "\n".join(format_log_entry(e) for e in entries)
+        _src, _path, text = exported
+        count = len(text.splitlines())
         self.app.call_from_thread(self.app.copy_to_clipboard, text)
-        self.app.call_from_thread(self._write_line, f"[copied] {len(entries)} line(s) to clipboard")
+        self.app.call_from_thread(self._write_line, f"[copied] {count} line(s) to clipboard")
 
     @work(thread=True, exclusive=True, group="sources")
     def _load_sources(self) -> None:
@@ -480,8 +541,88 @@ class LogScreen(Screen):
         except RuntimeError:
             return False
 
+    def _stdout_path(self, sub_job_id: str) -> Path:
+        root = "" if self._stage is None else self._stage.name
+        return Path(root) / sub_job_id / "stdout.log"
+
+    def _cleanup_stage(self) -> None:
+        stage = self._stage
+        self._stage = None
+        if stage is not None:
+            stage.cleanup()
+
+    def _claim_stdout(self) -> bool:
+        """UI thread. One whole-job download for this view; a failure retries on the next open."""
+        if not self._screen_open or self._stdout_ready or self._stdout_inflight or self._stdout_failed:
+            return False
+        if self._stage is None:
+            self._stage = tempfile.TemporaryDirectory(prefix="cortex-training-stage-")
+        self._stdout_inflight = True
+        return True
+
+    def _filtered_stdout(self, sub_job_id: str) -> list[str] | None:
+        path = self._stdout_path(sub_job_id)
+        if not path.is_file() or path.stat().st_size == 0:
+            return None
+        query = self._filter
+        kept: deque[str] = deque(maxlen=20000)
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for raw in handle:
+                text = raw.rstrip("\n")
+                if entry_matches(text, query):
+                    kept.append(text)
+        return list(kept)
+
+    def _replace_body(self, lines: list[str], *, empty_note: bool) -> None:
+        if self._paused:
+            self._held = (list(lines), empty_note)
+            return
+        self._held = None
+        self._shown_lines = []
+        if self._logview is not None:
+            self._logview.clear()
+        if lines:
+            self._write_lines(lines)
+        elif empty_note:
+            self._write_line("No log output is available.")
+
+    def _paint_saved(self) -> None:
+        source = self._current_source
+        if not source:
+            return
+        lines = self._filtered_stdout(source)
+        if lines is None:
+            entries = self._cache.load_entries(source, limit=2000)
+            cached = [
+                format_log_entry(entry)
+                for entry in entries
+                if entry_matches(entry, self._filter) and entry_at_level(entry, self._min_level)
+            ]
+            self._replace_body(cached, empty_note=not entries)
+            return
+        self._replace_body(lines, empty_note=False)
+
+    def _finish_download(self, ok: bool) -> None:
+        if not self._screen_open:
+            self._stdout_inflight = False
+            self._cleanup_stage()
+            return
+        self._stdout_inflight = False
+        if not ok:
+            self._stdout_failed = True
+            return
+        self._stdout_ready = True
+        self._paint_saved()
+
+    def _apply_terminal_status(self, status: str, reason: str | None) -> None:
+        self._job_status = status
+        if reason is not None:
+            self._job_reason = reason
+        self._update_subtitle()
+
     def _start_tail(self, sub_job_id: str) -> None:
         self._current_source = sub_job_id
+        self._held = None
         self._shown_lines = []
         # A fresh tail context (new source, or a re-tail after a filter change)
         # starts following the tail — otherwise a pause left over from a prior
@@ -491,66 +632,129 @@ class LogScreen(Screen):
         if self._logview is not None:
             self._logview.clear()
         self._write_line(f"— tailing {sub_job_id} —")
-        self._tail(sub_job_id)
+        if self._stdout_ready:
+            self._paint_saved()
+            return
+        download = not is_active_status(self._job_status) and self._claim_stdout()
+        live = is_active_status(self._job_status)
+        self._tail(sub_job_id, download, live)
 
     @work(thread=True, exclusive=True, group="tail")
-    def _tail(self, sub_job_id: str) -> None:
+    def _tail(self, sub_job_id: str, download: bool, live: bool) -> None:
         worker = get_current_worker()
         # A terminal job's zone is gone, so the operation API would error: serve
-        # cache only (no live fetch). A running/unknown job follows live.
-        active = is_active_status(self._job_status)
+        # cache, then one saved-console download. A running/unknown job follows live.
         try:
-            # Replay the local cache instantly, then (only for a live job) resume
-            # the tail from the saved cursor so only new lines are fetched. Each
-            # yield is a whole page (or the cache batch); render it in one shot
-            # so high-velocity logs don't saturate the UI thread per line.
-            saw_live = False
-            for kind, entries in cached_log_pages(
-                self._cache,
-                self._client,
-                self._job_id,
-                sub_job_id,
-                follow=active,
-                live=active,
-                poll_interval=self._poll_interval,
-                replay_limit=2000,
-                is_cancelled=lambda: worker.is_cancelled,
-            ):
-                if worker.is_cancelled:
-                    return
-                # Apply the grep filter + min-level to the whole batch.
-                lines = [
-                    format_log_entry(e)
-                    for e in entries
-                    if entry_matches(e, self._filter) and entry_at_level(e, self._min_level)
-                ]
-                if not lines:
-                    continue
-                if kind == "live" and not saw_live:
-                    saw_live = True
-                    lines = ["— live —"] + lines
-                # Every batch sticks to the tail (unless paused), so the view
-                # opens on the newest cached lines and follows live from there.
-                # _post fails closed if the app is tearing down, so the worker
-                # stops cleanly.
-                if not self._post(self._write_lines, lines):
-                    return
-                if kind == "live":
-                    # Stamp the freshness indicator on each live batch.
-                    self._last_update = time.strftime("%H:%M:%S")
-                    if not self._post(self._update_subtitle):
-                        return
+            self._stream(worker, sub_job_id, live=live)
         except Exception as exc:  # noqa: BLE001 - surfaced in the UI
-            if not worker.is_cancelled:
-                try:
-                    with open(os.path.expanduser(_ERROR_LOG), "a", encoding="utf-8") as f:
-                        f.write(f"tail {sub_job_id} failed:\n{traceback.format_exc()}\n")
-                except Exception:  # noqa: BLE001
-                    pass
-                self._post(
-                    self._write_line,
-                    f"[error] tail {sub_job_id} failed: {type(exc).__name__}: {exc}  (full traceback: {_ERROR_LOG})",
-                )
+            if worker.is_cancelled:
+                pass
+            elif live:
+                if not self._handoff_after_tail_error(worker):
+                    self._report_tail_error(sub_job_id, exc)
+                return
+            elif not download:
+                self._report_tail_error(sub_job_id, exc)
+                return
+        if download:
+            self._run_download(sub_job_id)
+
+    def _stream(self, worker, sub_job_id: str, *, live: bool) -> None:
+        # Replay the local cache instantly, then (only for a live job) resume
+        # the tail from the saved cursor so only new lines are fetched. Each
+        # yield is a whole page (or the cache batch); render it in one shot
+        # so high-velocity logs don't saturate the UI thread per line.
+        saw_live = False
+        for kind, entries in cached_log_pages(
+            self._cache,
+            self._client,
+            self._job_id,
+            sub_job_id,
+            follow=live,
+            live=live,
+            poll_interval=self._poll_interval,
+            replay_limit=2000,
+            is_cancelled=lambda: worker.is_cancelled,
+        ):
+            if worker.is_cancelled:
+                return
+            lines = [
+                format_log_entry(entry)
+                for entry in entries
+                if entry_matches(entry, self._filter) and entry_at_level(entry, self._min_level)
+            ]
+            if not lines:
+                continue
+            if kind == "live" and not saw_live:
+                saw_live = True
+                lines = ["— live —"] + lines
+            if not self._post(self._write_replay, lines):
+                return
+            if kind == "live":
+                self._last_update = time.strftime("%H:%M:%S")
+                if not self._post(self._update_subtitle):
+                    return
+
+    def _report_tail_error(self, sub_job_id: str, exc: BaseException) -> None:
+        try:
+            with open(os.path.expanduser(_ERROR_LOG), "a", encoding="utf-8") as handle:
+                handle.write(f"tail {sub_job_id} failed:\n{traceback.format_exc()}\n")
+        except Exception:  # noqa: BLE001
+            pass
+        self._post(
+            self._write_line,
+            f"[error] tail {sub_job_id} failed: {type(exc).__name__}: {exc}  (full traceback: {_ERROR_LOG})",
+        )
+
+    def _handoff_after_tail_error(self, worker) -> bool:
+        """Return False when the tail error should stay: get_job failed, or the job is still active."""
+        if worker.is_cancelled or not self._screen_open:
+            return True
+        try:
+            job = self._client.get_job(self._job_id) or {}
+        except Exception:  # noqa: BLE001 - a running job keeps the tail error
+            return False
+        status = job.get("status") or self._job_status
+        if is_active_status(status):
+            return False
+        if worker.is_cancelled or not self._screen_open:
+            return True
+        reason = job.get("reason") if isinstance(job, dict) and "reason" in job else None
+        if not self._post(self._apply_terminal_status, status, reason):
+            return True
+        if worker.is_cancelled or not self._screen_open:
+            return True
+        try:
+            claimed = self.app.call_from_thread(self._claim_stdout)
+        except RuntimeError:
+            return True
+        if not claimed:
+            if self._stdout_ready:
+                self._post(self._paint_saved)
+            return True
+        self._run_download(self._current_source or "")
+        return True
+
+    def _run_download(self, sub_job_id: str) -> None:
+        if not self._screen_open:
+            if not self._post(self._finish_download, False):
+                self._cleanup_stage()
+            return
+        ok = False
+        try:
+            root = "" if self._stage is None else self._stage.name
+            self._client.download_stdout_logs(self._job_id, root)
+            ok = True
+        except Exception:  # noqa: BLE001 - keep the cache; record the traceback
+            try:
+                with open(os.path.expanduser(_ERROR_LOG), "a", encoding="utf-8") as handle:
+                    handle.write(
+                        f"saved log {sub_job_id} failed:\n{traceback.format_exc()}\n"
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+        if not self._post(self._finish_download, ok):
+            self._cleanup_stage()
 
     def _content_width(self) -> int:
         """Usable text columns of the log pane (accounts for padding/scrollbar)."""
@@ -564,6 +768,13 @@ class LogScreen(Screen):
         if w <= 0:
             w = getattr(lv.size, "width", 0)
         return max(0, w)
+
+    def _write_replay(self, lines: list[str]) -> None:
+        # Checked on the UI thread so a replay started before the saved console
+        # cannot append after that console replaces the pane.
+        if self._stdout_ready:
+            return
+        self._write_lines(lines)
 
     def _write_line(self, line: str) -> None:
         self._write_lines([line])

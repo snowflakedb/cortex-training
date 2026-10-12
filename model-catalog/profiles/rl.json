@@ -7,7 +7,7 @@
       "summary": "LoRA RL starting point with eight training and eight sampling GPUs.",
       "recipePath": "recipes/rl/math_grpo/train.py",
       "evidencePaths": [
-        "recipes/rl/math_grpo/configs/qwen3_8b_lora.json"
+        "recipes/rl/configs/qwen3_8b_lora.json"
       ],
       "subJobs": [
         {
@@ -198,7 +198,7 @@
       "summary": "Full-parameter RL starting point with eight training and eight sampling GPUs.",
       "recipePath": "recipes/rl/math_grpo/train.py",
       "evidencePaths": [
-        "recipes/rl/math_grpo/configs/qwen3_8b_full.json"
+        "recipes/rl/configs/qwen3_8b_full.json"
       ],
       "subJobs": [
         {
@@ -259,7 +259,7 @@
       "summary": "PrimeRL sequence-parallel attention-only LoRA RL starting point for Qwen3.6-35B-A3B.",
       "recipePath": "recipes/rl/math_grpo/train.py",
       "evidencePaths": [
-        "recipes/rl/math_grpo/configs/qwen36_35b_a3b_lora.json"
+        "recipes/rl/configs/qwen36_35b_a3b_lora.json"
       ],
       "subJobs": [
         {
@@ -365,7 +365,7 @@
       "summary": "PrimeRL sequence-parallel full RL starting point with sixteen training and sixteen sampling GPUs.",
       "recipePath": "recipes/rl/math_grpo/train.py",
       "evidencePaths": [
-        "recipes/rl/math_grpo/configs/qwen36_35b_a3b_full.json"
+        "recipes/rl/configs/qwen36_35b_a3b_full.json"
       ],
       "subJobs": [
         {

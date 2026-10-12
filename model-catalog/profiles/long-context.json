@@ -7,7 +7,7 @@
       "summary": "Eight-GPU sequence-parallel LoRA SFT starting point for long-context dense models.",
       "recipePath": "recipes/sft/conversational/train.py",
       "evidencePaths": [
-        "recipes/sft/conversational/configs/qwen3_8b_lora.json"
+        "recipes/sft/configs/qwen3_8b_lora.json"
       ],
       "subJobs": [
         {
@@ -69,7 +69,7 @@
       "summary": "Eight-GPU sequence-parallel full SFT starting point for long-context dense models.",
       "recipePath": "recipes/sft/conversational/train.py",
       "evidencePaths": [
-        "recipes/sft/conversational/configs/qwen3_8b_full.json"
+        "recipes/sft/configs/qwen3_8b_full.json"
       ],
       "subJobs": [
         {
@@ -115,7 +115,7 @@
       "summary": "Sequence-parallel LoRA RL starting point with eight training and eight sampling GPUs.",
       "recipePath": "recipes/rl/math_grpo/train.py",
       "evidencePaths": [
-        "recipes/rl/math_grpo/configs/qwen3_8b_lora.json"
+        "recipes/rl/configs/qwen3_8b_lora.json"
       ],
       "subJobs": [
         {
@@ -209,7 +209,7 @@
       "summary": "Sequence-parallel full RL starting point with eight training and eight sampling GPUs.",
       "recipePath": "recipes/rl/math_grpo/train.py",
       "evidencePaths": [
-        "recipes/rl/math_grpo/configs/qwen3_8b_full.json"
+        "recipes/rl/configs/qwen3_8b_full.json"
       ],
       "subJobs": [
         {

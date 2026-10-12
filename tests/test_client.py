@@ -35,12 +35,17 @@ import importlib
 import json
 import logging
 import sys
+from datetime import date
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 from pathlib import Path
 from pathlib import PurePosixPath
 from types import SimpleNamespace
 from urllib.parse import unquote
 from urllib.parse import urlparse
 from unittest.mock import MagicMock
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -776,6 +781,10 @@ class TestClientConstruction:
     def test_prefix_url(self):
         c = CortexTrainingClient(base_url="http://x.test", database="DB", schema="SCH")
         assert c._prefix == "http://x.test/api/v2/databases/DB/schemas/SCH/cortex-training"
+
+    def test_prefix_url_leaves_dollar_in_plain_names_bare(self):
+        c = CortexTrainingClient(base_url="http://x.test", database="MY$DB", schema="S$1")
+        assert c._prefix == "http://x.test/api/v2/databases/MY$DB/schemas/S$1/cortex-training"
 
     def test_from_pat_sets_headers_and_verify(self):
         c = CortexTrainingClient.from_pat(
@@ -1931,6 +1940,382 @@ class TestReadAndControl:
             "pending_gpus": 8,
             "available_gpus": 0,
         }
+
+
+# ─── CortexTrainingClient — account-level job listing ────────────────────────
+
+ACCOUNT_ROUTE = "http://test.local/api/v2/cortex-training"
+
+
+def _resolve_identifier(segment: str) -> str:
+    """Resolve a URL path segment the way the server resolves an identifier."""
+    identifier = unquote(segment)
+    if identifier.startswith('"'):
+        return identifier[1:-1].replace('""', '"')
+    return identifier.upper()
+
+
+class TestIterJobs:
+    def test_gets_the_account_route_not_the_schema(self):
+        c = _make_client(get_json={"jobs": [{"job_id": "a"}]})
+
+        assert list(c.iter_jobs()) == [{"job_id": "a"}]
+
+        c._session.get.assert_called_once_with(ACCOUNT_ROUTE, params={"limit": 100})
+
+    @pytest.mark.parametrize("page_size", [0, 1001])
+    def test_refuses_a_page_size_the_server_would_reject(self, page_size):
+        c = _make_client(get_json={"jobs": []})
+
+        with pytest.raises(ValueError, match="page_size must be between 1 and 1000"):
+            next(c.iter_jobs(page_size=page_size))
+
+        c._session.get.assert_not_called()
+
+    @pytest.mark.parametrize("page_size", [1, 1000])
+    def test_accepts_the_page_size_bounds(self, page_size):
+        c = _make_client(get_json={"jobs": []})
+
+        assert list(c.iter_jobs(page_size=page_size)) == []
+
+        c._session.get.assert_called_once_with(
+            ACCOUNT_ROUTE, params={"limit": page_size}
+        )
+
+    def test_sends_every_filter(self):
+        c = _make_client(get_json={"jobs": []})
+
+        list(
+            c.iter_jobs(
+                database="ML",
+                schema='"Exp 1"',
+                status=["running", "FAILED"],
+                submitted_by="jdoe",
+                created_after=date(2026, 10, 1),
+                created_before=datetime(
+                    2026, 10, 2, 9, 30, tzinfo=timezone(timedelta(hours=2))
+                ),
+                page_size=50,
+            )
+        )
+
+        c._session.get.assert_called_once_with(
+            ACCOUNT_ROUTE,
+            params={
+                "database": "ML",
+                "schema": '"Exp 1"',
+                "status": "running,FAILED",
+                "submitted_by": "jdoe",
+                "created_after": "2026-10-01",
+                "created_before": "2026-10-02T07:30:00Z",
+                "limit": 50,
+            },
+        )
+
+    def test_refuses_a_schema_without_a_database(self):
+        c = _make_client(get_json={"jobs": []})
+
+        with pytest.raises(ValueError, match="needs database=... with it"):
+            c.iter_jobs(schema="EXP")
+
+        c._session.get.assert_not_called()
+
+    def test_checks_arguments_before_the_first_page_is_iterated(self):
+        c = _make_client(get_json={"jobs": []})
+
+        # Not next(...): the call itself refuses, so nothing is left to iterate.
+        with pytest.raises(ValueError, match="page_size must be between 1 and 1000"):
+            c.iter_jobs(page_size=0)
+        with pytest.raises(ValueError, match="needs database"):
+            c.iter_jobs(schema="EXP")
+
+        c._session.get.assert_not_called()
+
+    def test_ignores_a_count_the_server_no_longer_returns(self):
+        c = _make_client(
+            get_json={"jobs": [{"job_id": "a"}], "unknown_status_count": 3}
+        )
+
+        assert list(c.iter_jobs(status="running")) == [{"job_id": "a"}]
+
+    @pytest.mark.parametrize(
+        ("value", "wire"),
+        [
+            (date(2026, 10, 1), "2026-10-01"),
+            (
+                datetime(2026, 10, 1, 1, 0, tzinfo=timezone(timedelta(hours=-7))),
+                "2026-10-01T08:00:00Z",
+            ),
+            (datetime(2026, 10, 1, 8, 0, 0, 250000), "2026-10-01T08:00:00.250000Z"),
+            ("2026-10-01T00:00:00+02:00", "2026-10-01T00:00:00+02:00"),
+        ],
+    )
+    def test_created_after_is_sent_in_utc_or_as_given(self, value, wire):
+        c = _make_client(get_json={"jobs": []})
+
+        list(c.iter_jobs(status="active", created_after=value))
+
+        assert c._session.get.call_args.kwargs["params"] == {
+            "status": "active",
+            "created_after": wire,
+            "limit": 100,
+        }
+
+    def test_follows_next_page_token_with_the_same_filters(self):
+        c = _make_client()
+        c._session.get.side_effect = [
+            _make_response(
+                {"jobs": [{"job_id": "c"}, {"job_id": "b"}], "next_page_token": "t1"}
+            ),
+            # A page may be empty and still carry a token.
+            _make_response({"jobs": [], "next_page_token": "t2"}),
+            _make_response({"jobs": [{"job_id": "a"}], "next_page_token": None}),
+        ]
+
+        jobs = list(c.iter_jobs(status="failed", page_size=2))
+
+        assert [job["job_id"] for job in jobs] == ["c", "b", "a"]
+        calls = c._session.get.call_args_list
+        assert [call.args for call in calls] == [(ACCOUNT_ROUTE,)] * 3
+        assert [call.kwargs["params"] for call in calls] == [
+            {"status": "failed", "limit": 2},
+            {"status": "failed", "limit": 2, "page_token": "t1"},
+            {"status": "failed", "limit": 2, "page_token": "t2"},
+        ]
+
+    def test_reads_the_next_page_only_when_iterated(self):
+        c = _make_client()
+        c._session.get.side_effect = [
+            _make_response({"jobs": [{"job_id": "b"}], "next_page_token": "t1"}),
+            _make_response({"jobs": [{"job_id": "a"}]}),
+        ]
+
+        jobs = c.iter_jobs()
+
+        assert next(jobs) == {"job_id": "b"}
+        assert c._session.get.call_count == 1
+        assert list(jobs) == [{"job_id": "a"}]
+        assert c._session.get.call_count == 2
+
+    def test_404_is_not_retried_and_says_listing_is_not_enabled(self):
+        c = _make_client()
+        c._session.get.return_value = _make_error_response(
+            {"message": "Account-level job listing is not enabled for this account"},
+            404,
+        )
+
+        with pytest.raises(
+            nc.requests.exceptions.HTTPError,
+            match="account-level job listing is not enabled for this account",
+        ) as exc:
+            list(c.iter_jobs())
+
+        assert exc.value.response.status_code == 404
+        assert c.max_retries == 10
+        c._session.get.assert_called_once()
+        # No auto-create, or any other request, follows a 404.
+        c._session.post.assert_not_called()
+
+    def test_a_not_found_error_does_not_create_the_configured_database(self):
+        c = _make_client()
+        c._session.get.return_value = _make_error_response(
+            {"message": "Database 'NOPE' does not exist or not authorized."}, 400
+        )
+
+        with pytest.raises(nc.requests.exceptions.HTTPError, match="400 Client Error"):
+            list(c.iter_jobs(database="NOPE"))
+
+        # The same response on a schema route would run CREATE DATABASE DB.
+        assert c._is_database_not_found(c._session.get.return_value)
+        c._session.get.assert_called_once()
+        c._session.post.assert_not_called()
+        assert c._db_ensured is False
+
+    def test_other_transient_errors_are_still_retried(self, monkeypatch):
+        monkeypatch.setattr(
+            nc,
+            "wait_exponential_jitter",
+            lambda **kwargs: lambda retry_state: 0,
+        )
+        c = _make_client()
+        c._session.get.side_effect = [
+            _make_error_response({"message": "unavailable"}, 503),
+            _make_response({"jobs": [{"job_id": "a"}]}),
+        ]
+
+        assert list(c.iter_jobs()) == [{"job_id": "a"}]
+        assert c._session.get.call_count == 2
+
+    def test_bad_request_is_raised_unchanged(self):
+        c = _make_client()
+        c._session.get.return_value = _make_error_response(
+            {"message": "Invalid database or schema scope"}, 400
+        )
+
+        with pytest.raises(nc.requests.exceptions.HTTPError, match="400 Client Error"):
+            list(c.iter_jobs(database="NOPE"))
+
+        c._session.get.assert_called_once()
+
+    def test_emits_one_metric_per_page_without_filter_values(self, monkeypatch):
+        monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "1")
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        c._session.get.side_effect = [
+            _make_response({"jobs": [{"job_id": "b"}], "next_page_token": "t1"}),
+            _make_error_response({"message": "not enabled"}, 404),
+        ]
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            list(c.iter_jobs(submitted_by="jdoe"))
+
+        calls = c._metric_emitter.emit.call_args_list
+        assert [call.args[0] for call in calls] == ["iter_jobs", "iter_jobs"]
+        assert [call.args[1]["success"] for call in calls] == [True, False]
+        assert [call.args[1]["request_count"] for call in calls] == [1, 1]
+        assert [call.kwargs["attributes"] for call in calls] == [
+            {},
+            {"error.type": "HTTPError", "error.http_status": 404},
+        ]
+        assert "jdoe" not in repr(calls)
+
+
+class TestForJob:
+    @pytest.mark.parametrize(
+        ("database_name", "schema_name", "path"),
+        [
+            ("ML", "EXP_1$", "ML/schemas/EXP_1$"),
+            ("_DB", "PUBLIC", "_DB/schemas/PUBLIC"),
+            ("ml", "Exp1", "%22ml%22/schemas/%22Exp1%22"),
+            ("My DB", 'a"b', "%22My%20DB%22/schemas/%22a%22%22b%22"),
+            ("1DB", "a/b?c#d%e", "%221DB%22/schemas/%22a%2Fb%3Fc%23d%25e%22"),
+            ("DB\n", "$X", "%22DB%0A%22/schemas/%22$X%22"),
+        ],
+    )
+    def test_binds_quoted_percent_encoded_names(
+        self, database_name, schema_name, path
+    ):
+        c = _make_client()
+
+        job_client = c.for_job(
+            {"job_id": "j1", "database_name": database_name, "schema_name": schema_name}
+        )
+
+        assert job_client._prefix == (
+            f"http://test.local/api/v2/databases/{path}/cortex-training"
+        )
+        database_segment, schema_segment = path.split("/schemas/")
+        assert _resolve_identifier(database_segment) == database_name
+        assert _resolve_identifier(schema_segment) == schema_name
+
+    def test_shares_session_auth_and_telemetry_and_copies_settings(self):
+        c = CortexTrainingClient(
+            base_url="http://test.local",
+            database="DB",
+            schema="SCH",
+            endpoint="training-v2",
+            poll_interval=1.0,
+            poll_timeout=60.0,
+            poll_backoff_multiplier=2.0,
+            poll_max_interval=8.0,
+            max_retries=3,
+            request_timeout=(5.0, 7.0),
+        )
+        c._session = MagicMock()
+        c._session.get.return_value = _make_response({"job_id": "j1"})
+        c._auth_provider = MagicMock()
+        c._auth_provider.get_token.return_value = "tok"
+        c._metric_emitter = MagicMock()
+        c._artifact_connection_config = {"host": "x.test", "pat": "pat"}
+        c._artifact_connection_factory = MagicMock()
+
+        job_client = c.for_job(
+            {"job_id": "j1", "database_name": "ML", "schema_name": "EXP"}
+        )
+
+        assert type(job_client) is CortexTrainingClient and job_client is not c
+        assert job_client._session is c._session
+        assert job_client._auth_provider is c._auth_provider
+        assert job_client._metric_emitter is c._metric_emitter
+        assert job_client._artifact_connection_config is c._artifact_connection_config
+        assert job_client._artifact_connection_factory is c._artifact_connection_factory
+        assert (
+            job_client.endpoint,
+            job_client.poll_interval,
+            job_client.poll_timeout,
+            job_client.poll_backoff_multiplier,
+            job_client.poll_max_interval,
+            job_client.max_retries,
+            job_client.request_timeout,
+        ) == ("training-v2", 1.0, 60.0, 2.0, 8.0, 3, (5.0, 7.0))
+        assert (c.database, c.schema) == ("DB", "SCH")
+
+        job_client.get_job("j1")
+
+        c._session.get.assert_called_once_with(
+            "http://test.local/api/v2/databases/ML/schemas/EXP/training-v2/j1",
+            headers={"Authorization": 'Snowflake Token="tok"'},
+        )
+
+    def test_closes_the_session_it_opened_before_borrowing(self):
+        c = _make_client()
+
+        with patch.object(
+            nc._DefaultTimeoutSession, "close", autospec=True
+        ) as closed:
+            job_client = c.for_job({"database_name": "ML", "schema_name": "EXP"})
+
+        # The constructor opens a session and a connection pool; for_job
+        # releases them instead of leaking one per call.
+        closed.assert_called_once()
+        leaked = closed.call_args.args[0]
+        assert leaked is not c._session
+        assert job_client._session is c._session
+
+    def test_closing_it_leaves_the_parent_session_auth_and_telemetry_open(self):
+        c = _make_client()
+        c._auth_provider = MagicMock()
+        c._metric_emitter = MagicMock()
+
+        job_client = c.for_job({"database_name": "ML", "schema_name": "EXP"})
+        with job_client:
+            pass
+        job_client.close()
+
+        assert c._session.close.called is False
+        assert c._auth_provider.close.called is False
+        assert c._metric_emitter.close.called is False
+        # The parent still owns all three and closes them.
+        c.close()
+        assert c._session.close.called
+        assert c._auth_provider.close.called
+        assert c._metric_emitter.close.called
+
+    def test_does_not_create_the_jobs_database(self):
+        c = _make_client()
+        c._session.get.return_value = _make_error_response(
+            {"message": "Schema OTHER_DB.PUBLIC is not found or not authorized."}, 400
+        )
+
+        job_client = c.for_job({"database_name": "OTHER_DB", "schema_name": "PUBLIC"})
+        with pytest.raises(nc.requests.exceptions.HTTPError, match="400 Client Error"):
+            job_client.get_job("j1")
+
+        # The listed database already exists and may belong to another role, so
+        # the not-found answer surfaces instead of a CREATE DATABASE for it.
+        assert c._is_database_not_found(c._session.get.return_value)
+        c._session.post.assert_not_called()
+        assert job_client._db_ensured is False
+
+    def test_returns_a_client_of_the_same_class(self):
+        class SubClient(CortexTrainingClient):
+            pass
+
+        c = SubClient(base_url="http://test.local", database="DB", schema="SCH")
+
+        job_client = c.for_job({"database_name": "ML", "schema_name": "EXP"})
+
+        assert type(job_client) is SubClient
 
 
 # ─── CortexTrainingClient — wait_for_job ─────────────────────────────────────
@@ -3832,6 +4217,203 @@ class TestExecutionLogDownload:
 
         assert not any(command.startswith("GET ") for command in connection.commands)
         assert connection.closed
+
+    def _gzip_download(self, monkeypatch, tmp_path, artifact_name, listed, bodies):
+        c = _make_client()
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        root = f"_{artifact_name}"
+        connection = self.FakeArtifactConnection(
+            {
+                run_uri + root + "/": [(f"/versions/RUN_ABC/{path}",) for path in listed],
+                run_uri + "checkpoints/" + root + "/": [],
+            },
+            {run_uri + path: gzip.compress(body) for path, body in bodies.items()},
+        )
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", lambda: connection)
+        return c, connection, run_uri
+
+    @pytest.mark.parametrize(
+        ("artifact_name", "chunk_name", "destination_name", "method_name"),
+        [
+            ("stdout", "console", "stdout.log", "download_stdout_logs"),
+            ("metrics", "gpu", "gpu.jsonl", "download_metrics"),
+        ],
+    )
+    def test_download_resume_appends_suffix_and_writes_manifest(
+        self, artifact_name, chunk_name, destination_name, method_name, tmp_path, monkeypatch
+    ):
+        root = f"_{artifact_name}"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/{chunk_name}.20260904-120001.first.gz"
+        later = f"{root}/{sub}/{chunk_name}.20260904-120002.zulu.gz"
+        c, connection, run_uri = self._gzip_download(
+            monkeypatch, tmp_path, artifact_name, [first], {first: b"first\n"}
+        )
+        download = getattr(c, method_name)
+        download("job-1", tmp_path)
+        destination = tmp_path / sub / destination_name
+        manifest = destination.with_name("." + destination.name + ".manifest.json")
+        assert json.loads(manifest.read_text())["names"] == [first]
+        gets_before = [cmd for cmd in connection.commands if cmd.startswith("GET ")]
+        connection.list_rows[run_uri + root + "/"] = [
+            (f"/versions/RUN_ABC/{first}",),
+            (f"/versions/RUN_ABC/{later}",),
+        ]
+        connection.content_by_uri[run_uri + later] = gzip.compress(b"second\n")
+        result = download("job-1", tmp_path, resume=True)
+        new_gets = [cmd for cmd in connection.commands if cmd.startswith("GET ")][len(gets_before) :]
+        assert len(new_gets) == 1
+        assert later in new_gets[0]
+        assert destination.read_bytes() == b"first\nsecond\n"
+        assert result[0]["chunk_count"] == 2
+        assert result[0]["first_artifact_uri"] == run_uri + first
+        assert result[0]["last_artifact_uri"] == run_uri + later
+
+    @pytest.mark.parametrize(
+        ("artifact_name", "chunk_name", "destination_name", "method_name"),
+        [
+            ("stdout", "console", "stdout.log", "download_stdout_logs"),
+            ("metrics", "gpu", "gpu.jsonl", "download_metrics"),
+        ],
+    )
+    def test_download_resume_rebuilds_when_new_name_sorts_earlier(
+        self, artifact_name, chunk_name, destination_name, method_name, tmp_path, monkeypatch
+    ):
+        root = f"_{artifact_name}"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/{chunk_name}.20260904-120001.first.gz"
+        zulu = f"{root}/{sub}/{chunk_name}.20260904-120002.zulu.gz"
+        alpha = f"{root}/{sub}/{chunk_name}.20260904-120002.alpha.gz"
+        c, connection, run_uri = self._gzip_download(
+            monkeypatch,
+            tmp_path,
+            artifact_name,
+            [first, zulu],
+            {first: b"first\n", zulu: b"third\n"},
+        )
+        download = getattr(c, method_name)
+        download("job-1", tmp_path)
+        connection.list_rows[run_uri + root + "/"].append((f"/versions/RUN_ABC/{alpha}",))
+        connection.content_by_uri[run_uri + alpha] = gzip.compress(b"second\n")
+        download("job-1", tmp_path, resume=True)
+        destination = tmp_path / sub / destination_name
+        assert destination.read_bytes() == b"first\nsecond\nthird\n"
+
+    @pytest.mark.parametrize(
+        ("artifact_name", "chunk_name", "destination_name", "method_name"),
+        [
+            ("stdout", "console", "stdout.log", "download_stdout_logs"),
+            ("metrics", "gpu", "gpu.jsonl", "download_metrics"),
+        ],
+    )
+    def test_download_resume_truncates_torn_tail(
+        self, artifact_name, chunk_name, destination_name, method_name, tmp_path, monkeypatch
+    ):
+        root = f"_{artifact_name}"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/{chunk_name}.20260904-120001.first.gz"
+        c, connection, _run_uri = self._gzip_download(
+            monkeypatch, tmp_path, artifact_name, [first], {first: b"first\n"}
+        )
+        download = getattr(c, method_name)
+        download("job-1", tmp_path)
+        destination = tmp_path / sub / destination_name
+        committed = destination.read_bytes()
+        destination.write_bytes(committed + b"TORN")
+        gets_before = [cmd for cmd in connection.commands if cmd.startswith("GET ")]
+        download("job-1", tmp_path, resume=True)
+        assert destination.read_bytes() == committed
+        assert [cmd for cmd in connection.commands if cmd.startswith("GET ")] == gets_before
+
+    @pytest.mark.parametrize("manifest_setup", ["missing", "malformed", "version", "short"])
+    def test_download_resume_unusable_manifest_rebuilds(self, manifest_setup, tmp_path, monkeypatch):
+        root = "_stdout"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/console.20260904-120001.first.gz"
+        c, _connection, _run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "stdout", [first], {first: b"first\n"}
+        )
+        c.download_stdout_logs("job-1", tmp_path)
+        destination = tmp_path / sub / "stdout.log"
+        manifest = destination.with_name(".stdout.log.manifest.json")
+        if manifest_setup == "missing":
+            manifest.unlink()
+        elif manifest_setup == "malformed":
+            manifest.write_text("not-json", encoding="utf-8")
+        elif manifest_setup == "version":
+            doc = json.loads(manifest.read_text())
+            doc["version"] = 2
+            manifest.write_text(json.dumps(doc), encoding="utf-8")
+        else:
+            destination.write_bytes(b"x")
+        c.download_stdout_logs("job-1", tmp_path, resume=True)
+        assert destination.read_bytes() == b"first\n"
+        assert json.loads(manifest.read_text())["version"] == 1
+
+    def test_download_resume_rebuilds_when_manifest_was_removed(self, tmp_path, monkeypatch):
+        root = "_stdout"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/console.20260904-120001.first.gz"
+        c, _connection, _run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "stdout", [first], {first: b"first\n"}
+        )
+        c.download_stdout_logs("job-1", tmp_path)
+        destination = tmp_path / sub / "stdout.log"
+        destination.with_name(".stdout.log.manifest.json").unlink()
+        destination.write_bytes(b"replaced\n")
+        c.download_stdout_logs("job-1", tmp_path, resume=True)
+        assert destination.read_bytes() == b"first\n"
+
+    def test_download_resume_failed_chunk_keeps_prefix(self, tmp_path, monkeypatch):
+        root = "_stdout"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/console.20260904-120001.first.gz"
+        bad = f"{root}/{sub}/console.20260904-120002.bad.gz"
+        c, connection, run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "stdout", [first], {first: b"first\n"}
+        )
+        c.download_stdout_logs("job-1", tmp_path)
+        destination = tmp_path / sub / "stdout.log"
+        connection.list_rows[run_uri + root + "/"].append((f"/versions/RUN_ABC/{bad}",))
+        connection.content_by_uri[run_uri + bad] = b"not gzip"
+        with pytest.raises(gzip.BadGzipFile):
+            c.download_stdout_logs("job-1", tmp_path, resume=True)
+        assert destination.read_bytes() == b"first\n"
+        manifest = json.loads(destination.with_name(".stdout.log.manifest.json").read_text())
+        assert manifest["names"] == [first]
+
+    def test_download_resume_keeps_committed_sub_job_when_later_one_fails(
+        self, tmp_path, monkeypatch
+    ):
+        c = _make_client()
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        first_sub = "job-1:training:0"
+        second_sub = "job-1:training:1"
+        good = f"_stdout/{first_sub}/console.20260904-120001.first.gz"
+        bad = f"_stdout/{second_sub}/console.20260904-120001.bad.gz"
+        connection = self.FakeArtifactConnection(
+            {
+                run_uri + "_stdout/": [
+                    (f"/versions/RUN_ABC/{good}",),
+                    (f"/versions/RUN_ABC/{bad}",),
+                ],
+                run_uri + "checkpoints/_stdout/": [],
+            },
+            {run_uri + good: gzip.compress(b"ok\n"), run_uri + bad: b"not gzip"},
+        )
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", lambda: connection)
+        with pytest.raises(gzip.BadGzipFile):
+            c.download_stdout_logs("job-1", tmp_path)
+        committed = tmp_path / first_sub / "stdout.log"
+        assert committed.read_bytes() == b"ok\n"
+        connection.content_by_uri[run_uri + bad] = gzip.compress(b"later\n")
+        gets_before = [cmd for cmd in connection.commands if cmd.startswith("GET ") and good in cmd]
+        c.download_stdout_logs("job-1", tmp_path, resume=True)
+        gets_after = [cmd for cmd in connection.commands if cmd.startswith("GET ") and good in cmd]
+        assert gets_after == gets_before
+        assert (tmp_path / second_sub / "stdout.log").read_bytes() == b"later\n"
 
     def test_fetch_execution_logs_errors_when_experiment_run_missing_fields(self):
         c = _make_client(get_json={"experiment_name": "DB.SCH.EXP"})

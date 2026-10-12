@@ -15,6 +15,19 @@
         "router_replay": {
           "enabled": true,
           "max_cache_bytes": 17179869184
+        },
+        "peft_config": {
+          "peft_type": "Lora",
+          "r": 32,
+          "lora_alpha": 32,
+          "lora_dropout": 0.0,
+          "bias": "none",
+          "target_modules": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj"
+          ]
         }
       }
     },
@@ -49,7 +62,7 @@
         },
         "optimizer": {
           "name": "AdamW",
-          "lr": 2e-05,
+          "lr": 1e-04,
           "weight_decay": 0.0,
           "betas": [
             0.9,
@@ -58,9 +71,6 @@
           "eps": 1e-08
         },
         "ds_config": {
-          "train_batch_size": 1,
-          "train_micro_batch_size_per_gpu": 1,
-          "gradient_accumulation_steps": 1,
           "zero_optimization": {
             "stage": 2,
             "reduce_scatter": true
@@ -68,6 +78,19 @@
           "bf16": {
             "enabled": true
           }
+        },
+        "peft_config": {
+          "peft_type": "Lora",
+          "r": 32,
+          "lora_alpha": 32,
+          "lora_dropout": 0.0,
+          "bias": "none",
+          "target_modules": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj"
+          ]
         }
       }
     }
