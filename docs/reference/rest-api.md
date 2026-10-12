@@ -1817,10 +1817,140 @@ batch = {
 
 `context` and `processing` are open backend contracts. Their accepted keys,
 registered loss functions, and post-processors come from the deployed training
-backend, not the REST schema.
+backend, not the REST schema. The optional ratio controls of the `grpo` loss and
+its variants, described below, are an exception: their configuration keys, and
+the metrics named below, are listed here.
 
 Do not use `build_forward_backward_payload()` for this extended shape: that
 helper currently ignores `context` and `processing`.
+
+#### Ratio controls for the CISPO loss
+
+On server versions that include these controls, the `grpo` loss and its variants
+`ap_grpo`, `grpo_echo_v1`, and `ap_grpo_echo_v1` accept optional ratio controls
+in `processing.config`. All are off by default, and any active control requires
+`use_cispo_loss` to be `true`. The masks drop tokens from the CISPO policy term
+only; the loss normalizers stay as they were.
+
+| Key | Meaning |
+|---|---|
+| `ratio_mask_bounds_pos`, `ratio_mask_bounds_neg` | Inclusive importance-ratio bands, chosen by the sign of the token's advantage (see below). A pair `[low, high]` of finite numbers or `null`, with `low < high` and `low >= 0`; a `null` end is unbounded |
+| `prob_diff_mask_max_pos`, `prob_diff_mask_max_neg` | Finite, non-negative maximum directional probability gap between the current policy and the sampler |
+| `seq_mask_stat` | The sequence statistic that the sequence gate tests: `mean_log_ratio` (default) or `mean_k3` |
+| `seq_mask_bounds_pos`, `seq_mask_bounds_neg` | Inclusive bands for that statistic, chosen by advantage sign (see below). A pair of finite numbers or `null`, with `low < high`; a `null` end is unbounded |
+| `ratio_m2_threshold` | Finite, positive M2PO filtering threshold for the current-policy versus sampler ratio |
+| `log_ratio_sq_coef` | Finite, non-negative coefficient of a squared log-ratio penalty. Unlike the masks, the penalty is computed over the original loss mask whatever the masks drop. A positive value is rejected with `token-mean` aggregation when `sequence_loss_weights` is present |
+| `ratio_stats` | Boolean. `true` reports the ratio metrics (histograms, mask counts, and the metrics below) without enabling a mask |
+| `ratio_mask_rebalance` | Boolean. `true` rescales the kept advantages of each sign that keeps any mass so that its total returns to its pre-mask value (see below) |
+
+A control is active as soon as its key is present with a valid value, even a
+neutral one such as `log_ratio_sq_coef: 0.0`. An explicit `null` is rejected for
+every ratio-control key, so omit a key to leave it off; inside a bounds pair, a
+`null` end still means unbounded. An explicit `false` of `ratio_stats` or
+`ratio_mask_rebalance` does not count: a request whose only ratio-control keys
+are one or both of these set to `false` is inert and needs no `use_cispo_loss`.
+The mixed losses `grpo_mixed_v1` and `ap_grpo_mixed_v1` reject every
+ratio-control key, including an explicit `false`, so that policy-only gates
+cannot affect NLL tokens.
+
+The `_pos` and `_neg` gates split tokens by the sign of the token-level
+advantage, before any sequence-level averaging and including the teacher term
+when it is enabled. An advantage of exactly `0` counts as positive. With
+`importance_sampling_level` set to `"sequence"`, the CISPO term uses each
+sequence's averaged advantage while the gates keep the token-level sign, so the
+two can differ. A sequence is tested against `seq_mask_bounds_pos` when it has
+at least one positive-side token and against `seq_mask_bounds_neg` when it has
+at least one negative-side token, and a band violation drops only that side's
+tokens.
+
+Whenever a ratio control is active, the `metrics` of the forward/backward result
+carry the keys below. Keys ending in `_sum` are added up over workers. The
+result also carries other ratio-control entries, such as per-drop counts and
+further histogram bins, that are not listed here.
+
+| Metric | Meaning |
+|---|---|
+| `ratio_mask_pos_pre_mass_sum`, `ratio_mask_neg_pre_mass_sum` | The advantage mass before masking: `\|A\|` summed over the policy tokens with advantage `A >= 0` (`pos`) or `A < 0` (`neg`). It goes through the loss's own normalization (for `token-mean`, divided by the number of policy tokens in the whole request), without the data-parallel factor and without importance, clip, `rollout_is_weights`, or `behav_imp_weight_cap` weights. `A` is the advantage the CISPO term uses: with `importance_sampling_level` set to `"sequence"`, each sequence's averaged advantage, so the sequence counts as `pos` or `neg` as a whole by the sign of its mean |
+| `ratio_mask_pos_kept_mass_sum`, `ratio_mask_neg_kept_mass_sum` | The same sums over the tokens that survive every active drop (ratio band, probability gap, sequence gate, `ratio_m2_threshold`) |
+| `ratio_mask_kept_k3_sum` | The sum over the kept tokens of `exp(d) - 1 - d`, where `d` is the trainer log probability minus the sampler log probability (`old_log_probs_shifted`), clamped to `[-20, 20]`. It is raw, not divided by the loss denominators, and is `0` when the request has no `old_log_probs_shifted` |
+| `ratio_trainable_token_count`, `ratio_mask_dropped_token_count` | The policy tokens the ratio controls see, and how many of them some active drop removes |
+| `seq_stat_bin_<i>_sequence_count`, `i` from `0` to `6` | The number of sequences whose log ratio (current policy minus sampler log probability), averaged over the sequence's policy tokens, falls in bucket `i` of the edges `-0.2, -0.05, -0.01, 0.01, 0.05, 0.2`. Each bucket includes its upper edge: bucket `0` holds values up to `-0.2` and bucket `6` values above `0.2`. It always bins the mean log ratio, also when `seq_mask_stat` is `mean_k3` |
+| `ratio_mask_rebalance` | The flag as `0.0` or `1.0` |
+| `ratio_rebalance_pos_post_mass_sum`, `ratio_rebalance_neg_post_mass_sum` | Only with `ratio_mask_rebalance` set to `true`. The kept mass of the sign after scaling: equal to its pre-mask mass, up to rounding, when the sign's kept mass is positive, and `0` when it is not |
+| `ratio_rebalance_pos_unrestored_mass_sum`, `ratio_rebalance_neg_unrestored_mass_sum` | Only with `ratio_mask_rebalance` set to `true`. The pre-mask mass of a sign whose kept mass is `0`, and `0` otherwise |
+
+The four mass sums equal their value for the unsplit batch, up to rounding, when
+the loss normalization is request-global: `token-mean`; `prompt-mean` with
+`prompt_group_ids` (the service derives the request-wide counts it needs) or with
+client-supplied `sequence_loss_weights`; and the `seq-mean-token-sum`,
+`seq-mean-token-sum-norm`, and `seq-mean-token-mean` values of `loss_agg_mode`
+when the client sends a request-global `global_batch_size`. Otherwise each call
+normalizes by its own counts, and so do these sums. Sequence-parallel shards
+count once, and a worker with no policy token reports `0`. The `post` and
+`unrestored` sums below are in the same normalized units and are also added up
+over workers. The k3 sum and the two counts are not normalized: they add up across microbatches, workers, and
+sequence-parallel ranks in every aggregation mode, apart from the placement
+effects below.
+
+`ratio_m2_threshold` ranks the tokens of one model call, so with it the kept
+mass, the dropped count, and the k3 sum depend on how rows are placed on
+workers, while the pre-mask mass does not. The baseline `m2_threshold` key,
+which is not `ratio_m2_threshold`, acts on the tokens a worker holds in one call
+(under sequence parallelism, on each rank's own window) and removes tokens
+before the ratio controls act. Those tokens are in neither the pre-mask nor the
+kept mass, and are excluded from `ratio_trainable_token_count`. With it the
+masses, the k3 sum, and the counts depend on how rows are placed in calls and on
+the sequence-parallel split, and with several calls per worker on
+`max_tokens_per_mb`. With either key the restoration scale below depends on
+placement as well.
+
+The clamp of `d` applies to the reported k3 sum only: `seq_mask_stat` set to
+`mean_k3` gates on the unclamped k3. The kept-token mean is
+`ratio_mask_kept_k3_sum / (ratio_trainable_token_count -
+ratio_mask_dropped_token_count)`. When the request carries
+`old_log_probs_shifted`, the service also reports
+`trainable_logprob_lowvar_all/mean`, the same estimator over every trainable
+token before masking, with the same clamp. With no drop, no token removed by the
+baseline `m2_threshold`, and finite log probabilities,
+`ratio_mask_kept_k3_sum / ratio_trainable_token_count` equals it up to rounding.
+The service computes `trainable_logprob_lowvar_all/mean` with `exp(d) - 1 - d` in
+float32, which loses precision for `|d|` of about `1e-3` or less, so a gap there
+comes from that metric. A trainer log probability that is not finite is replaced
+by `0` before the loss, and its token still counts. A sampler log probability
+that is not finite at a trained token makes the request fail, so no k3 sum is
+returned.
+
+With `ratio_mask_rebalance` set to `true`, once the masks have decided which
+tokens to drop, the kept tokens of positive advantage are scaled by `P0/Pk` and
+those of negative advantage by `N0/Nk`. `P0` and `N0` are
+`ratio_mask_pos_pre_mass_sum` and `ratio_mask_neg_pre_mass_sum`; `Pk` and `Nk`
+are `ratio_mask_pos_kept_mass_sum` and `ratio_mask_neg_kept_mass_sum`; all four
+are summed over all workers. Every worker applies the same scale, and each sign
+returns to its own pre-mask mass, not to the other sign's. Only advantage
+magnitudes change: which tokens are dropped, the counts, and the k3 sum do not
+depend on the scaling. The scale is computed for one forward/backward request,
+so a step split across several requests gets one scale per request, and a sign
+that loses all its mass in one part is not restored there. A sign whose kept mass
+is `0` has nothing to scale, including a sign whose only surviving tokens have
+advantage `0`: its scale is `1` and its pre-mask mass is reported as
+unrestored. With nothing dropped, both scales are `1` and the objective is
+unchanged, up to rounding. The scale is not capped and is not reported, but it
+can be computed from the reported masses, and it is large when little of a
+sign's mass survives (`100` when one of 100 equal-magnitude positive tokens is
+kept). The CISPO ratio clip (`is_weight_clip_max`, when set) still applies
+independently of the scaling, so the restoration does not equalize
+ratio-weighted gradients.
+
+`ratio_mask_rebalance` set to `true` and `ratio_m2_threshold` each require one
+packed model call per worker. A request that would need more than one call per
+worker is rejected before it is dispatched to the workers, with an error that
+names the key (both keys when both are set) and the per-worker call counts. The
+training sub-job's `training_config.mb_spec.max_tokens_per_mb` budget (default
+`10240` tokens when `mb_spec` or the key is omitted) must therefore be large
+enough to keep each worker's share in one call. Two rejections come later:
+`ratio_m2_threshold` is also rejected under sequence parallelism, and an active
+ratio control without `use_cispo_loss` is rejected. A worker raises both when it
+resolves the loss, before any forward pass.
 
 ### 10.4 Shifted log-probability convention
 
@@ -1841,7 +1971,7 @@ These are conventional backend results, not closed REST schemas:
 
 | Operation | Common result |
 |---|---|
-| `forward-backward` | `job_id`, `avg_loss`, `metrics`, `post_process_outputs` |
+| `forward-backward` | `job_id`, `avg_loss`, `metrics`, `post_process_outputs`; `metrics` carries the ratio-control metrics when those controls are active (see [section 10.3](#103-arctictraining-extensions)) |
 | `step` | `global_steps`, `last_lr`, optional `peak_memory` |
 | `save` | `job_id`, `stage_path` (carries the `cp_<uuid>` id), `checkpoint_path`, `checkpoint_tag`, `version` — no `checkpoint_id` key in the observed release (see 6.3) |
 | `load` | `checkpoint_id` and backend load metadata |
