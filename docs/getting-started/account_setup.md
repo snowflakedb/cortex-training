@@ -86,8 +86,8 @@ python -m recipes.sft.conversational.train \
   max_steps=10
 ```
 
-Recipes use the connection you set up once in
-[Authentication](authentication.md). Connection problems? See the same page. To use a specific JSON file, add
+Recipes use the connection you set up once with `cortex-training login`
+(see [Authentication](authentication.md)). To use a specific JSON file, add
 `config=/path/to/config.json`.
 
 What happens during this run:

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import threading
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -244,3 +245,17 @@ def test_rejected_pat_error_points_to_network_policy(exc) -> None:
     assert "Snowflake rejected your programmatic access token (PAT)." in message
     assert "Your user has no network policy." in message
     assert "authentication.md#network-policy-requirement" in message
+
+
+def test_execute_statement_runs_on_the_owned_session() -> None:
+    cursor = MagicMock()
+    connection = MagicMock()
+    connection.rest.token = "session-token"
+    connection.rest.server_url = "https://ACCOUNT.snowflakecomputing.com"
+    connection.cursor.return_value = cursor
+
+    auth = SnowflakeProfileAuth("training-profile", connect_factory=lambda **_: connection)
+    auth.execute_statement("CREATE DATABASE IF NOT EXISTS CORTEX_TRAINING_DB")
+
+    cursor.execute.assert_called_once_with("CREATE DATABASE IF NOT EXISTS CORTEX_TRAINING_DB")
+    cursor.close.assert_called_once()

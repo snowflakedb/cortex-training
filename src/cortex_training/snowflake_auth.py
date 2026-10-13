@@ -241,6 +241,17 @@ class SnowflakeProfileAuth:
                 return
             self._invalidated_token = self._read_token(self._connection)
 
+    def execute_statement(self, statement: str) -> None:
+        """Run one SQL statement on the owned Connector session."""
+        self._ensure_process()
+        with self._lock:
+            self._require_open()
+            cursor = self._connection.cursor()
+            try:
+                cursor.execute(statement)
+            finally:
+                cursor.close()
+
     def open_artifact_connection(self) -> Any:
         """Open an independent same-profile connection for artifact LIST/GET."""
         self._ensure_process()

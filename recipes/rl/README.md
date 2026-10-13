@@ -44,8 +44,8 @@ python -m recipes.rl.math_grpo.train \
   max_tokens=2048
 ```
 
-Recipes use the connection you set up once in
-[Authentication](../../docs/getting-started/authentication.md). Connection problems? See the same page. To use a specific JSON file, add
+Recipes use the connection you set up once with `cortex-training login`
+(see [Authentication](../../docs/getting-started/authentication.md)). To use a specific JSON file, add
 `config=/path/to/config.json` (start from `examples/config/connection.json.template`).
 
 The default job body is `configs/qwen3_8b_lora.json`. The default run will be finished within 1h.

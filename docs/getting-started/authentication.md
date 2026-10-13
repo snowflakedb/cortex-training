@@ -2,8 +2,8 @@
 
 > **You only need to do this once per machine.** After that, the CLI, recipes,
 > notebooks, and `connect()` all use the same connection automatically, so no
-> command needs connection details. Repeat Step 2 only when your PAT expires or
-> you switch accounts.
+> command needs connection details. Run `cortex-training login` again when your
+> PAT expires or you switch accounts.
 
 Cortex Training authenticates through a Snowflake Programmatic Access Token
 (PAT). This page walks you through two steps:
@@ -51,8 +51,20 @@ explains which one is used.
 
 ## Step 2: Configure the Client
 
-Once you have a PAT, pick **one** of the following methods to configure the
-client. We recommend `connections.toml`.
+The fastest way is to let the CLI set it up for you:
+
+```bash
+cortex-training login
+```
+
+It reports any setup you already have. Otherwise it asks for your account host,
+Snowflake user, PAT, database, and schema, writes a `connections.toml` profile,
+creates the `CORTEX_TRAINING_DB` database if needed, and checks the connection.
+See [`cortex-training login`](../reference/cli.md#login) for details and
+scripted use.
+
+To configure the client by hand instead, pick **one** of the following methods.
+We recommend `connections.toml`.
 
 ### Option A: connections.toml (recommended)
 

@@ -14,8 +14,8 @@ cortex-training capacity
 
 ## Create an Endpoint
 
-Recipes use the connection you set up once in
-[Authentication](../../docs/getting-started/authentication.md). Connection problems? See the same page. To use a specific JSON file, add
+Recipes use the connection you set up once with `cortex-training login`
+(see [Authentication](../../docs/getting-started/authentication.md)). To use a specific JSON file, add
 `config=/path/to/config.json`.
 
 The default job body is `configs/qwen3_8b_full.json`.

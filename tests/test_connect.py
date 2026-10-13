@@ -484,7 +484,8 @@ class TestNothingConfiguredHint:
         message = str(excinfo.value)
         assert message.startswith(self._DEFAULT_MISSING)
         assert "No Cortex Training connection is configured." in message
-        assert "cortex-training login --config config.json" in message
+        assert "\n    cortex-training login\n" in message
+        assert "--config config.json" not in message
         assert "docs/getting-started/authentication.md" in message
         assert excinfo.value.__cause__ is original
 

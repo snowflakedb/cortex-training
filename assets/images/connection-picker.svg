@@ -83,11 +83,11 @@
   <circle class="badge" cx="62" cy="720" r="16"/><text class="badgetext" x="62" y="725.5" text-anchor="middle">5</text>
   <rect class="check" x="90" y="670" width="530" height="100" rx="10"/>
   <text class="title" x="112" y="712">Is there a saved login?</text>
-  <text class="mono" x="112" y="738">cortex-training login config.json</text>
+  <text class="mono" x="112" y="738">cortex-training login</text>
   <line class="edge" x1="620" y1="720" x2="696" y2="720" marker-end="url(#arrow)"/>
   <text class="yes" x="646" y="712">yes</text>
   <rect class="result" x="700" y="670" width="460" height="100" rx="10"/>
-  <text class="rtitle" x="722" y="726">The remembered JSON config</text>
+  <text class="rtitle" x="722" y="726">The remembered profile or config</text>
 
   <line class="edge" x1="355" y1="770" x2="355" y2="806" marker-end="url(#arrow)"/>
   <text class="no" x="366" y="794">no</text>
