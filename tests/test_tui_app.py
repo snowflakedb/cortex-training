@@ -21,6 +21,7 @@ import glob
 import os
 import re
 import threading
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -518,3 +519,467 @@ async def _run_wrap_and_select():
 
 def test_log_wrap_and_selectable():
     asyncio.run(_run_wrap_and_select())
+
+
+def _write_stdout(output_dir, sub_job_id, text):
+    path = Path(output_dir) / sub_job_id / "stdout.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _terminal_job():
+    return {
+        "status": "FAILED",
+        "sub_jobs": [
+            {"sub_job_id": "7:training:0", "job_type": "training"},
+            {"sub_job_id": "7:sampling:0", "job_type": "sampling"},
+        ],
+    }
+
+
+async def _run_terminal_shows_saved_file():
+    c = _client()
+    c.get_job.return_value = _terminal_job()
+
+    def download(job_id, output_dir):
+        _write_stdout(output_dir, "7:training:0", "saved line\n")
+        return []
+
+    c.download_stdout_logs.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, lambda: "saved line" in app.screen._shown_lines)
+        assert ok, "saved console did not replace the pane"
+        c.tail_logs.assert_not_called()
+        await _settle(app, pilot)
+
+
+def test_terminal_open_shows_downloaded_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    asyncio.run(_run_terminal_shows_saved_file())
+
+
+async def _run_keeps_cache_when_download_fails():
+    c = _client()
+    c.get_job.return_value = _terminal_job()
+    c.download_stdout_logs.side_effect = RuntimeError("unavailable")
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: "cached line" in app.screen._shown_lines and not app.screen._stdout_inflight,
+        )
+        assert ok, "cache line missing after a failed download"
+        assert "No log output is available." not in app.screen._shown_lines
+        downloads = c.download_stdout_logs.call_count
+        app.screen._refilter()
+        for _ in range(5):
+            await pilot.pause()
+        assert c.download_stdout_logs.call_count == downloads
+        await _settle(app, pilot)
+
+
+def test_failed_download_keeps_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    from cortex_training.tui.log_cache import LogCache
+
+    LogCache("7").append_entries("7:training:0", [{"_raw": "cached line"}])
+    asyncio.run(_run_keeps_cache_when_download_fails())
+
+
+async def _run_empty_file_keeps_cache():
+    c = _client()
+    c.get_job.return_value = _terminal_job()
+
+    def download(job_id, output_dir):
+        _write_stdout(output_dir, "7:training:0", "")
+        return []
+
+    c.download_stdout_logs.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: app.screen._stdout_ready and "cached line" in app.screen._shown_lines,
+        )
+        assert ok, "empty saved file did not leave the cache on screen"
+        await _settle(app, pilot)
+
+
+def test_empty_saved_file_keeps_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    from cortex_training.tui.log_cache import LogCache
+
+    LogCache("7").append_entries("7:training:0", [{"_raw": "cached line"}])
+    asyncio.run(_run_empty_file_keeps_cache())
+
+
+async def _run_hidden_filter_shows_no_note(release, started):
+    c = _client()
+    c.get_job.return_value = _terminal_job()
+
+    def download(job_id, output_dir):
+        started.set()
+        assert release.wait(timeout=5)
+        _write_stdout(output_dir, "7:training:0", "")
+        return []
+
+    c.download_stdout_logs.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, lambda: "cached line" in app.screen._shown_lines and started.is_set())
+        assert ok, "cache was not shown before the filter"
+        app.screen._filter = "no-such-line"
+        release.set()
+        ok = await _wait(pilot, app, lambda: app.screen._stdout_ready)
+        assert ok, "download did not finish"
+        for _ in range(5):
+            await pilot.pause()
+        assert "cached line" not in app.screen._shown_lines
+        assert "No log output is available." not in app.screen._shown_lines
+        await _settle(app, pilot)
+
+
+def test_filter_that_hides_cache_shows_no_empty_note(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    from cortex_training.tui.log_cache import LogCache
+
+    LogCache("7").append_entries("7:training:0", [{"_raw": "cached line"}])
+    release = threading.Event()
+    try:
+        asyncio.run(_run_hidden_filter_shows_no_note(release, threading.Event()))
+    finally:
+        release.set()
+
+
+async def _run_running_tail_error_does_not_download():
+    c = _client()
+    c.tail_logs.side_effect = RuntimeError("zone down")
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, lambda: any(line.startswith("[error] tail") for line in app.screen._shown_lines))
+        assert ok, "running-job tail error was not shown"
+        c.download_stdout_logs.assert_not_called()
+        await _settle(app, pilot)
+
+
+def test_running_tail_error_does_not_download():
+    asyncio.run(_run_running_tail_error_does_not_download())
+
+
+async def _run_tail_error_after_finish_shows_file():
+    c = _client()
+    calls = {"get": 0, "tail": 0}
+
+    def get_job(_job_id):
+        calls["get"] += 1
+        if calls["get"] == 1:
+            return {
+                "status": "RUNNING",
+                "sub_jobs": [{"sub_job_id": "7:training:0", "job_type": "training"}],
+            }
+        return {"status": "FAILED", "reason": "cancelled", "sub_jobs": []}
+
+    def tail_logs(*_args, **_kwargs):
+        calls["tail"] += 1
+        raise RuntimeError("zone gone")
+
+    def download(job_id, output_dir):
+        _write_stdout(output_dir, "7:training:0", "after finish\n")
+        return []
+
+    c.get_job.side_effect = get_job
+    c.tail_logs.side_effect = tail_logs
+    c.download_stdout_logs.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, lambda: "after finish" in app.screen._shown_lines)
+        assert ok, "terminal tail error did not show the saved console"
+        assert app.screen._job_status == "FAILED"
+        tails = calls["tail"]
+        app.screen._refilter()
+        await _wait(pilot, app, lambda: "after finish" in app.screen._shown_lines)
+        assert calls["tail"] == tails
+        await _settle(app, pilot)
+
+
+def test_tail_error_after_terminal_status_shows_file_once():
+    asyncio.run(_run_tail_error_after_finish_shows_file())
+
+
+async def _run_terminal_download_failure_keeps_cache():
+    c = _client()
+    calls = {"get": 0}
+
+    def get_job(_job_id):
+        calls["get"] += 1
+        if calls["get"] == 1:
+            return {
+                "status": "RUNNING",
+                "sub_jobs": [{"sub_job_id": "7:training:0", "job_type": "training"}],
+            }
+        return {"status": "FAILED", "sub_jobs": []}
+
+    c.get_job.side_effect = get_job
+    c.tail_logs.side_effect = RuntimeError("zone gone")
+    c.download_stdout_logs.side_effect = RuntimeError("unavailable")
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: c.download_stdout_logs.called and "cached line" in app.screen._shown_lines,
+        )
+        assert ok, "failed saved-console download did not leave the cache"
+        for _ in range(5):
+            await pilot.pause()
+        assert not any(line.startswith("[error] tail") for line in app.screen._shown_lines)
+        await _settle(app, pilot)
+
+
+def test_terminal_download_failure_keeps_cache_without_tail_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    from cortex_training.tui.log_cache import LogCache
+
+    LogCache("7").append_entries("7:training:0", [{"_raw": "cached line"}])
+    asyncio.run(_run_terminal_download_failure_keeps_cache())
+
+
+async def _run_healthy_tail_does_not_download():
+    c = _client()
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, lambda: app.screen._current_source == "7:training:0")
+        assert ok, "live tail did not start"
+        await _settle(app, pilot)
+        c.download_stdout_logs.assert_not_called()
+
+
+def test_healthy_running_tail_does_not_download():
+    asyncio.run(_run_healthy_tail_does_not_download())
+
+
+async def _run_filter_during_download_once(release, started, calls):
+    c = _client()
+    c.get_job.return_value = _terminal_job()
+
+    def download(job_id, output_dir):
+        calls.append(output_dir)
+        started.set()
+        assert release.wait(timeout=5)
+        _write_stdout(output_dir, "7:training:0", "from file\n")
+        return []
+
+    c.download_stdout_logs.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, started.is_set)
+        assert ok, "download did not start"
+        app.screen._refilter()
+        assert len(calls) == 1
+        ok = await _wait(pilot, app, lambda: "cached line" in app.screen._shown_lines)
+        assert ok, "cache replay did not paint during the download"
+        release.set()
+        ok = await _wait(pilot, app, lambda: "from file" in app.screen._shown_lines)
+        assert ok, "finished download did not replace the current source"
+        assert "cached line" not in app.screen._shown_lines
+        for _ in range(5):
+            await pilot.pause()
+        assert "cached line" not in app.screen._shown_lines
+        assert len(calls) == 1
+        await _settle(app, pilot)
+
+
+def test_filter_during_download_does_not_start_another(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    from cortex_training.tui.log_cache import LogCache
+
+    LogCache("7").append_entries("7:training:0", [{"_raw": "cached line"}])
+    release = threading.Event()
+    started = threading.Event()
+    try:
+        asyncio.run(_run_filter_during_download_once(release, started, []))
+    finally:
+        release.set()
+
+
+async def _run_switch_source_does_not_download_again():
+    c = _client()
+    c.get_job.return_value = _terminal_job()
+    calls = []
+
+    def download(job_id, output_dir):
+        calls.append(1)
+        _write_stdout(output_dir, "7:training:0", "training line\n")
+        return []
+
+    c.download_stdout_logs.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, lambda: app.screen._stdout_ready)
+        assert ok, "first download did not finish"
+        app.screen._start_tail("7:sampling:0")
+        await _wait(pilot, app, lambda: "sampling cache" in app.screen._shown_lines)
+        assert len(calls) == 1
+        await _settle(app, pilot)
+
+
+def test_source_switch_after_download_does_not_download_again(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    from cortex_training.tui.log_cache import LogCache
+
+    LogCache("7").append_entries("7:sampling:0", [{"_raw": "sampling cache"}])
+    asyncio.run(_run_switch_source_does_not_download_again())
+
+
+async def _run_missing_sibling_shows_note():
+    c = _client()
+    c.get_job.return_value = _terminal_job()
+
+    def download(job_id, output_dir):
+        _write_stdout(output_dir, "7:training:0", "training line\n")
+        return []
+
+    c.download_stdout_logs.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, lambda: app.screen._stdout_ready)
+        assert ok, "first download did not finish"
+        app.screen._start_tail("7:sampling:0")
+        ok = await _wait(pilot, app, lambda: "No log output is available." in app.screen._shown_lines)
+        assert ok, "empty sibling did not show the finished-view note"
+        assert "training line" not in app.screen._shown_lines
+        assert c.download_stdout_logs.call_count == 1
+        await _settle(app, pilot)
+
+
+def test_missing_sibling_after_download_shows_empty_note():
+    asyncio.run(_run_missing_sibling_shows_note())
+
+
+async def _run_save_exports_file(tmp_path):
+    c = _client()
+    c.get_job.return_value = _terminal_job()
+
+    payload = b"file body\r\nsecond\r"
+
+    def download(job_id, output_dir):
+        path = _write_stdout(output_dir, "7:training:0", "")
+        path.write_bytes(payload)
+        return []
+
+    c.download_stdout_logs.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, lambda: "file body" in app.screen._shown_lines)
+        assert ok, "saved console was not shown"
+        app.screen._filter = "file"
+        copied: list[str] = []
+        app.copy_to_clipboard = copied.append
+        app.screen.action_copy_log()
+        ok = await _wait(pilot, app, lambda: bool(copied))
+        assert ok, "copy did not export the saved console"
+        assert copied == ["file body\r\nsecond\r"]
+        home = tmp_path / "home"
+        home.mkdir()
+        import cortex_training.tui.app as app_module
+
+        original = app_module.os.path.expanduser
+        app_module.os.path.expanduser = lambda path: str(home / os.path.basename(path))
+        try:
+            app.screen.action_save_log()
+            saved = home / "cortex-training-7-7-training-0.log"
+            ok = await _wait(pilot, app, saved.is_file)
+            assert ok, "save did not write the console file"
+            assert saved.read_bytes() == b"file body\r\nsecond\r"
+        finally:
+            app_module.os.path.expanduser = original
+        await _settle(app, pilot)
+
+
+def test_save_exports_saved_console_not_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path / "cache"))
+    from cortex_training.tui.log_cache import LogCache
+
+    LogCache("7").append_entries("7:training:0", [{"_raw": "cached only"}])
+    asyncio.run(_run_save_exports_file(tmp_path))
+
+
+async def _run_pause_holds_replacement(release, started):
+    c = _client()
+    c.get_job.return_value = _terminal_job()
+
+    def download(job_id, output_dir):
+        started.set()
+        assert release.wait(timeout=5)
+        _write_stdout(output_dir, "7:training:0", "held line\n")
+        return []
+
+    c.download_stdout_logs.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, lambda: "cached line" in app.screen._shown_lines and started.is_set())
+        assert ok, "cache was not on screen before the file arrived"
+        app.screen.action_toggle_pause()
+        release.set()
+        ok = await _wait(pilot, app, lambda: app.screen._held is not None)
+        assert ok, "paused view did not hold the saved console"
+        assert "held line" not in app.screen._shown_lines
+        app.screen.action_toggle_pause()
+        ok = await _wait(pilot, app, lambda: "held line" in app.screen._shown_lines)
+        assert ok, "unpause did not show the saved console"
+        app.screen.action_toggle_pause()
+        app.screen._held = (["stale line"], False)
+        app.screen._start_tail("7:training:0")
+        assert app.screen._held is None
+        assert "stale line" not in app.screen._shown_lines
+        assert "held line" in app.screen._shown_lines
+        await _settle(app, pilot)
+
+
+def test_pause_holds_saved_console_until_unpause(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    from cortex_training.tui.log_cache import LogCache
+
+    LogCache("7").append_entries("7:training:0", [{"_raw": "cached line"}])
+    release = threading.Event()
+    try:
+        asyncio.run(_run_pause_holds_replacement(release, threading.Event()))
+    finally:
+        release.set()
+
+
+async def _run_leave_during_download(release, started, dirs):
+    c = _client()
+    c.get_job.return_value = _terminal_job()
+
+    def download(job_id, output_dir):
+        dirs.append(output_dir)
+        started.set()
+        assert release.wait(timeout=5)
+        _write_stdout(output_dir, "7:training:0", "too late\n")
+        return []
+
+    c.download_stdout_logs.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, started.is_set)
+        assert ok, "download did not start"
+        app.pop_screen()
+        await pilot.pause()
+        release.set()
+        ok = await _wait(pilot, app, lambda: dirs and not Path(dirs[0]).exists())
+        assert ok, "temp dir was not removed after leaving"
+        assert not any("too late" in line for line in getattr(app.screen, "_shown_lines", []))
+        await _settle(app, pilot)
+
+
+def test_leave_during_download_removes_temp_dir():
+    release = threading.Event()
+    try:
+        asyncio.run(_run_leave_during_download(release, threading.Event(), []))
+    finally:
+        release.set()

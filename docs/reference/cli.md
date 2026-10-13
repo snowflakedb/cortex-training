@@ -103,6 +103,8 @@ cortex-training submit - < job.json           # Read JSON from stdin
 ```bash
 cortex-training list
 cortex-training list --status running
+cortex-training list --status active,failed --user JDOE --since 2026-10-01 --limit 20
+cortex-training list --all                    # Every schema you can see
 cortex-training get JOB_ID
 cortex-training wait JOB_ID                   # Wait until running, not finished
 cortex-training cancel JOB_ID
@@ -287,11 +289,33 @@ Explicit CLI flags override config values.
 ```bash
 cortex-training list
 cortex-training list --status running
+cortex-training list --status active,failed --user JDOE --since 2026-10-01 --limit 20
+cortex-training list --all
 cortex-training get JOB_ID
 cortex-training checkpoints JOB_ID
 cortex-training cancel JOB_ID
 cortex-training wait JOB_ID
 ```
+
+`list` takes these filters:
+
+| Flag | Takes | Notes |
+|---|---|---|
+| `--all` | nothing | lists jobs across every schema in the account that you can see, not just the configured one |
+| `--status` | comma list of `pending`, `placing`, `initializing`, `running`, `failed`, `cancelled`, `terminated`, `active`, `done` | `active` is `pending` through `running`; `done` is `cancelled`, `terminated`, and the `done` that older jobs show; `pending` does not include `placing`. Matched against a row's status in any form the server sends, including `JOB_STATE_RUNNING` and aliases such as `canceled`, `completed`, `succeeded`, `error`, `queued`, `creating` |
+| `--user` | user name | SQL name rules: unquoted means its uppercase form, `"quoted"` means exactly that name |
+| `--since` | `YYYY-MM-DD` | a UTC day; keeps jobs created on or after it |
+| `--until` | `YYYY-MM-DD` | a UTC day; keeps jobs created on or before it, so `--since D --until D` means "on day D" |
+| `--limit` | number | prints at most this many of the newest matching jobs by `created_at`; a job listed without one counts as oldest |
+
+Without `--all`, the CLI fetches the configured schema's jobs and applies the
+filters itself, leaving out a job with no `created_at` when `--since` or
+`--until` is set. With `--all`, the server applies them across the account
+([REST API reference section 5.3](rest-api.md#across-the-account---get-apiv2endpoint));
+where account-level listing is not enabled for the account, the command fails
+with `account-level job listing is not enabled for this account`. A bad
+`--status`, `--since`, `--until`, or `--limit`, or an empty `--user`, exits
+with status 2 before connecting.
 
 `get` fetches current job details; `checkpoints` lists saved checkpoints.
 `wait` waits for the job to reach **running**, not for training to finish.
@@ -476,9 +500,11 @@ training sub-job with `"load_optimizer_states": false` in its `training_config`.
 This cannot be changed at load time. See
 [DP size compatibility](rest-api.md#dp-size-compatibility) for the constraint.
 
-This is the runtime load path. Create-time resume still uses
+This is the runtime load path. Create-time initialization from a checkpoint
+saved by Cortex Training still uses
 [`source_checkpoint_info`](rest-api.md#65-create-time-checkpoint-initialization)
-in the submitted sub-job JSON.
+in the submitted sub-job JSON. To start a job from weights you trained
+elsewhere, see [Start a Job From Your Own Weights](../guides/training/external-weights.md).
 
 `load` polls until the request completes by default. Pass `--no-poll` to return
 the request metadata without waiting for the result.
@@ -564,9 +590,13 @@ Reconstruct each sub-job's persisted stdout/stderr chunks into
 
 ```bash
 cortex-training download-log JOB_ID --log-type stdout --output-dir /path/to/logs
+cortex-training download-log JOB_ID --log-type stdout --output-dir /path/to/logs --resume
 ```
 
 The current working directory is used when `--output-dir` is omitted.
+`--resume` continues a stdout download already in that directory. It does not
+apply to execution logs, including `download-log` without `--log-type stdout`.
+Two downloads of the same directory at once are unsupported.
 
 ### Download GPU Metrics
 
@@ -575,10 +605,13 @@ Reconstruct each sub-job's GPU metric chunks into
 
 ```bash
 cortex-training download-metrics JOB_ID --output-dir /path/to/metrics
+cortex-training download-metrics JOB_ID --output-dir /path/to/metrics --resume
 ```
 
 The command prints the saved path, chunk count, and first/last logical artifact
-URIs for each reconstructed file.
+URIs for each reconstructed file. `--resume` continues a metrics download
+already in that directory. Two downloads of the same directory at once are
+unsupported.
 
 ### Log TUI
 
@@ -619,6 +652,10 @@ zone-manager pod is the Ray head, so a sub-job's worker output is included).
 Logs are cached locally so reopening a job replays instantly without
 re-fetching from the server — under `~/.cache/cortex-training/` (or
 `$XDG_CACHE_HOME`), overridable with `CORTEX_TRAINING_TUI_CACHE_DIR`.
+
+A finished job loads its saved console once. A stream error while the job is
+still running stays an error. The level key filters structured live lines and
+does not hide lines from that saved console.
 
 The TUI also writes two files into your home directory: saved logs from the `s`
 key (`~/cortex-training-<job8>-<source>.log`, where `<job8>` is the first eight
@@ -690,6 +727,10 @@ are emitted by default. See the [Python SDK reference](python-sdk.md#client-metr
 `CORTEX_TRAINING_DISABLE_TENSOR_PROMPTS` (truthy) sends pre-tokenized prompts
 as JSON lists inside the request frame instead of as tensors. The request body
 stays a DSSST1 frame either way.
+
+`CORTEX_TRAINING_FORWARD_OPERATION_MAX_JSON_BYTES` is the per-request JSON body
+ceiling for byte `forward()` `/operation` posts (integer bytes, default 16 MiB,
+minimum 16 KiB). Frames larger than that are split into request chunks.
 
 ### Troubleshooting
 

@@ -55,10 +55,14 @@ from collections.abc import Iterator
 from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field
+from datetime import date
+from datetime import datetime
+from datetime import timezone
 from enum import Enum
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
+from urllib.parse import quote
 
 from pydantic import BaseModel
 from pydantic import ConfigDict
@@ -153,6 +157,72 @@ _CHUNK_GROUP_ERROR_CODES = {
     "chunk_group_conflict",
     "chunk_group_missing_chunks",
 }
+
+# Ceiling on one ``/operation`` JSON request body. A binary payload is
+# base64-encoded and inflated 4/3, so this default is conservative relative
+# to the 60 MiB octet-stream budget. Raise it via the env var once the real
+# ceiling is measured.
+_OPERATION_MAX_JSON_BYTES_ENV = "CORTEX_TRAINING_FORWARD_OPERATION_MAX_JSON_BYTES"
+_DEFAULT_OPERATION_MAX_JSON_BYTES = 16 * 1024 * 1024
+_MIN_OPERATION_MAX_JSON_BYTES = 16 * 1024
+
+# Headroom for everything in the envelope that is not the base64 payload:
+# ``operation_type``, the routing hints, the JSON punctuation and key names.
+_OPERATION_ENVELOPE_OVERHEAD_BYTES = 4096
+
+
+def _operation_max_json_bytes() -> int:
+    """Read the per-request ``/operation`` JSON body ceiling from the env."""
+    raw = os.environ.get(_OPERATION_MAX_JSON_BYTES_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_OPERATION_MAX_JSON_BYTES
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{_OPERATION_MAX_JSON_BYTES_ENV} must be an integer, got {raw!r}"
+        ) from exc
+    if value < _MIN_OPERATION_MAX_JSON_BYTES:
+        raise ValueError(
+            f"{_OPERATION_MAX_JSON_BYTES_ENV} must be at least "
+            f"{_MIN_OPERATION_MAX_JSON_BYTES} bytes"
+        )
+    return value
+
+
+def _operation_chunk_max_bytes(max_json_bytes: int) -> int:
+    """Raw frame bytes that fit one ``/operation`` body once base64-inflated."""
+    return max(1, (max_json_bytes - _OPERATION_ENVELOPE_OVERHEAD_BYTES) * 3 // 4)
+
+
+def _operation_body_json_bytes(body: dict) -> int:
+    """Encoded size of an operation body without re-serializing its payload.
+
+    ``json.dumps`` on a body holding a multi-megabyte base64 string copies that
+    string. The base64 alphabet needs no JSON escaping and is single-byte in
+    UTF-8, so the payload's encoded length is its character count: measure the
+    envelope around an empty placeholder and add that count back.
+    """
+    payload = body.get("payload")
+    raw = payload.get("payload_b64") if isinstance(payload, dict) else None
+    if not isinstance(raw, str):
+        return len(json.dumps(body).encode("utf-8"))
+    skeleton = {**body, "payload": {**payload, "payload_b64": ""}}
+    return len(json.dumps(skeleton).encode("utf-8")) + len(raw)
+
+
+def _log_safe_operation_body(body: dict) -> dict:
+    """Replace an operation body's base64 payload with its length for logging."""
+    payload = body.get("payload")
+    if not isinstance(payload, dict) or not isinstance(payload.get("payload_b64"), str):
+        return body
+    return {
+        **body,
+        "payload": {
+            **payload,
+            "payload_b64": f"<{len(payload['payload_b64'])} base64 chars>",
+        },
+    }
 
 
 class ChunkGroupError(requests.exceptions.HTTPError):
@@ -458,6 +528,15 @@ def _track_operation(operation: str):
 def _is_chunk_post_transient(exc: BaseException) -> bool:
     if isinstance(exc, requests.exceptions.HTTPError):
         if _chunk_group_error_detail(exc.response) is not None:
+            return False
+    return _is_transient(exc)
+
+
+def _is_account_list_transient(exc: BaseException) -> bool:
+    # The account-level job list answers 404 when it is not enabled for the
+    # account, which no retry fixes.
+    if isinstance(exc, requests.exceptions.HTTPError):
+        if exc.response is not None and exc.response.status_code == 404:
             return False
     return _is_transient(exc)
 
@@ -1278,6 +1357,36 @@ def _sql_string_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+_PLAIN_IDENTIFIER_RE = re.compile(r"[A-Z_][A-Z0-9_$]*")
+
+
+def _sql_identifier(name: str) -> str:
+    """Return ``name`` as a Snowflake identifier that resolves to exactly ``name``.
+
+    A plain uppercase name stays bare; any other is double-quoted, with embedded
+    quotes doubled, so its case and characters survive identifier resolution.
+    """
+    if _PLAIN_IDENTIFIER_RE.fullmatch(name):
+        return name
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _created_param(value: date | datetime | str | None) -> str | None:
+    """Render a ``created_after`` / ``created_before`` query value.
+
+    A ``datetime`` becomes UTC RFC 3339 (a naive one is taken as UTC), a
+    ``date`` stays ``YYYY-MM-DD`` (UTC midnight on the server), and a string is
+    sent as given.
+    """
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    if isinstance(value, date):
+        return value.isoformat()
+    return value
+
+
 def _validate_artifact_relative_path(path: str) -> str:
     """Reject paths that could escape or ambiguously address the run stage."""
     candidate = PurePosixPath(path)
@@ -1386,6 +1495,9 @@ class CortexTrainingClient:
         self._auth_provider: SnowflakeProfileAuth | None = None
         self._db_ensured = False
         self._db_creating = False
+        # Both are cleared on a for_job() child; see for_job().
+        self._owns_session = True
+        self._auto_create_database = True
         self._metric_emitter: OtlpMetricEmitter | None = None
         self._operation_metric_state = threading.local()
         self._session = _DefaultTimeoutSession(self.request_timeout)
@@ -1490,7 +1602,12 @@ class CortexTrainingClient:
 
     @property
     def _prefix(self) -> str:
-        return f"{self.base_url}/api/v2/databases/{self.database}/schemas/{self.schema}/{self.endpoint}"
+        # "$" is legal in a path segment and common in plain identifiers, so it
+        # stays bare; anything else that could end or split the segment is encoded.
+        return (
+            f"{self.base_url}/api/v2/databases/{quote(self.database, safe='$')}"
+            f"/schemas/{quote(self.schema, safe='$')}/{self.endpoint}"
+        )
 
     def emit_metric(
         self,
@@ -1514,7 +1631,12 @@ class CortexTrainingClient:
             return
 
     def close(self) -> None:
-        """Flush telemetry briefly and close this client's HTTP sessions."""
+        """Flush telemetry briefly and close this client's HTTP sessions.
+
+        A client from :meth:`for_job` borrows these, so closing it is a no-op.
+        """
+        if not self._owns_session:
+            return
         try:
             if self._metric_emitter is not None:
                 self._metric_emitter.close()
@@ -1678,8 +1800,16 @@ class CortexTrainingClient:
         *,
         retry_on=_is_transient,
         max_retries: int | None = None,
+        ensure_database: bool = True,
         **kwargs,
     ) -> requests.Response:
+        """Send one request with retries.
+
+        ``ensure_database=False`` skips creating the configured database on a
+        not-found error, for routes whose path names no database. A client from
+        :meth:`for_job` never creates one, whatever the caller passes.
+        """
+        auto_create = ensure_database and self._auto_create_database
         fn = getattr(self._session, method.lower())
         debug_context = kwargs.pop("debug_context", None)
         debug_label = self._debug_context_label(debug_context) if debug_context is not None else None
@@ -1796,7 +1926,8 @@ class CortexTrainingClient:
                         self._debug_response_summary(resp),
                     )
                 if (
-                    not self._db_ensured
+                    auto_create
+                    and not self._db_ensured
                     and not self._db_creating
                     and self._is_database_not_found(resp)
                 ):
@@ -1804,7 +1935,11 @@ class CortexTrainingClient:
                     self._create_database()
                     # Retry the original request once after creating the DB.
                     continue
-                if self._db_ensured and self._is_database_not_found(resp):
+                if (
+                    auto_create
+                    and self._db_ensured
+                    and self._is_database_not_found(resp)
+                ):
                     raise RuntimeError(
                         f"Database '{self.database}' still not found after creation attempt. "
                         f"The database may already exist but your role lacks USAGE on it. "
@@ -1988,6 +2123,121 @@ class CortexTrainingClient:
             params["status"] = status
         resp = self._send("GET", self._prefix, params=params)
         return resp.json().get("jobs", [])
+
+    def iter_jobs(
+        self,
+        *,
+        database: str | None = None,
+        schema: str | None = None,
+        status: str | list[str] | None = None,
+        submitted_by: str | None = None,
+        created_after: date | datetime | str | None = None,
+        created_before: date | datetime | str | None = None,
+        page_size: int = 100,
+    ) -> Iterator[dict]:
+        """Yield the jobs the caller can see across the account, newest first.
+
+        Reads the account-level ``GET /api/v2/{endpoint}`` route rather than
+        this client's schema, and follows ``next_page_token`` until the server
+        returns none; a page may hold fewer than ``page_size`` rows, even none.
+        Arguments are checked on the call, pages fetched as you iterate:
+        ``page_size`` is 1 to 1000, and ``schema`` needs ``database`` with it.
+        The server applies every filter: ``database`` / ``schema`` narrow the
+        scope, ``status`` is one status or a list of them (``active`` and
+        ``done`` name groups), ``submitted_by`` takes a user name, and
+        ``created_after`` (inclusive) / ``created_before`` (exclusive) take a
+        ``date``, a ``datetime`` (sent in UTC; naive is taken as UTC) or a
+        string sent as-is. Rows also carry ``database_name`` and
+        ``schema_name``; use :meth:`for_job` for per-job calls on one.
+
+        A 404 means account-level listing is not enabled for this account, and
+        is raised at once rather than retried.
+        """
+        if not 1 <= page_size <= 1000:
+            raise ValueError(f"page_size must be between 1 and 1000, got {page_size}")
+        if schema is not None and database is None:
+            raise ValueError(
+                "iter_jobs(schema=...) needs database=... with it: a schema name "
+                "alone does not name one schema."
+            )
+        if status is not None and not isinstance(status, str):
+            status = ",".join(status)
+        query = {
+            "database": database,
+            "schema": schema,
+            "status": status,
+            "submitted_by": submitted_by,
+            "created_after": _created_param(created_after),
+            "created_before": _created_param(created_before),
+            "limit": page_size,
+        }
+        params = {key: value for key, value in query.items() if value is not None}
+        return self._iter_account_jobs(params)
+
+    def _iter_account_jobs(self, params: dict) -> Iterator[dict]:
+        while True:
+            page = self._list_account_jobs_page(params)
+            yield from page.get("jobs", [])
+            token = page.get("next_page_token")
+            if not token:
+                return
+            params = {**params, "page_token": token}
+
+    # Tracked per page: around the generator, _track_operation would record
+    # iter_jobs as finished before its first request.
+    @_track_operation("iter_jobs")
+    def _list_account_jobs_page(self, params: dict) -> dict:
+        try:
+            resp = self._send(
+                "GET",
+                f"{self.base_url}/api/v2/{self.endpoint}",
+                params=params,
+                retry_on=_is_account_list_transient,
+                # The path names no database, so a not-found error here is not
+                # about the configured one.
+                ensure_database=False,
+            )
+        except requests.exceptions.HTTPError as exc:
+            if exc.response is None or exc.response.status_code != 404:
+                raise
+            raise requests.exceptions.HTTPError(
+                "account-level job listing is not enabled for this account",
+                request=exc.request,
+                response=exc.response,
+            ) from exc
+        return resp.json()
+
+    def for_job(self, job: dict) -> "CortexTrainingClient":
+        """Return a client bound to ``job``'s schema, for per-job calls on a
+        row from :meth:`iter_jobs`.
+
+        The new client borrows this client's session, auth and telemetry, so
+        keep this one open and close it rather than the new one. It never
+        creates the job's database, which exists and may be another role's: a
+        not-found answer surfaces as the HTTP error it is.
+        """
+        client = type(self)(
+            base_url=self.base_url,
+            database=_sql_identifier(job["database_name"]),
+            schema=_sql_identifier(job["schema_name"]),
+            endpoint=self.endpoint,
+            poll_interval=self.poll_interval,
+            poll_timeout=self.poll_timeout,
+            poll_backoff_multiplier=self.poll_backoff_multiplier,
+            poll_max_interval=self.poll_max_interval,
+            max_retries=self.max_retries,
+            request_timeout=self.request_timeout,
+        )
+        # Release the session and pool the constructor just opened.
+        client._session.close()
+        client._session = self._session
+        client._owns_session = False
+        client._auto_create_database = False
+        client._auth_provider = self._auth_provider
+        client._metric_emitter = self._metric_emitter
+        client._artifact_connection_config = self._artifact_connection_config
+        client._artifact_connection_factory = self._artifact_connection_factory
+        return client
 
     @_track_operation("cancel_job")
     def cancel_job(self, job_id: str) -> None:
@@ -2271,6 +2521,205 @@ class CortexTrainingClient:
         finally:
             connection.close()
 
+    @staticmethod
+    def _resume_manifest_path(destination: Path) -> Path:
+        return destination.with_name("." + destination.name + ".manifest.json")
+
+    @classmethod
+    def _read_resume_manifest(cls, destination: Path) -> tuple[list[str], int] | None:
+        path = cls._resume_manifest_path(destination)
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(doc, dict) or doc.get("version") != 1:
+            return None
+        names = doc.get("names")
+        nbytes = doc.get("bytes")
+        if (
+            not isinstance(names, list)
+            or not names
+            or not all(isinstance(name, str) and name for name in names)
+            or isinstance(nbytes, bool)
+            or not isinstance(nbytes, int)
+            or nbytes < 0
+        ):
+            return None
+        return list(names), nbytes
+
+    @classmethod
+    def _write_resume_manifest(cls, destination: Path, names: list[str], nbytes: int) -> None:
+        path = cls._resume_manifest_path(destination)
+        payload = json.dumps({"bytes": nbytes, "names": names, "version": 1}) + "\n"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".manifest-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
+    def _copy_gzip_member(downloaded: Path, output) -> None:
+        with downloaded.open("rb") as compressed:
+            with gzip.GzipFile(fileobj=compressed, mode="rb") as source:
+                shutil.copyfileobj(source, output, length=_STREAM_COPY_BUFFER_BYTES)
+
+    @staticmethod
+    def _artifact_result(
+        destination: Path,
+        run_uri: str,
+        names: list[str],
+    ) -> dict[str, Any]:
+        return {
+            "sub_job_id": destination.parent.name,
+            "filename": destination.name,
+            "saved_path": str(destination),
+            "chunk_count": len(names),
+            "first_artifact_uri": run_uri + names[0],
+            "last_artifact_uri": run_uri + names[-1],
+        }
+
+    def _download_gzip_member(
+        self,
+        connection: Any,
+        run_uri: str,
+        relative_path: str,
+        artifact_temp: Path,
+        output,
+    ) -> None:
+        downloaded = self._download_experiment_artifact(
+            connection,
+            run_uri,
+            relative_path,
+            artifact_temp,
+        )
+        try:
+            self._copy_gzip_member(downloaded, output)
+        finally:
+            downloaded.unlink(missing_ok=True)
+
+    def _rebuild_gzip_file(
+        self,
+        connection: Any,
+        run_uri: str,
+        artifact_temp: Path,
+        destination: Path,
+        chunk_paths: list[str],
+        *,
+        temporary_prefix: str,
+    ) -> dict[str, Any]:
+        """Write every chunk to a temp file, then replace the destination.
+
+        The manifest is removed only after the temp file is fsynced, so a failed
+        chunk download leaves the previous manifest and destination in place.
+        """
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        output = tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=str(destination.parent),
+            prefix=temporary_prefix,
+            suffix=".tmp",
+            delete=False,
+        )
+        temporary = Path(output.name)
+        try:
+            for relative_path in chunk_paths:
+                self._download_gzip_member(
+                    connection,
+                    run_uri,
+                    relative_path,
+                    artifact_temp,
+                    output,
+                )
+            output.flush()
+            os.fsync(output.fileno())
+            output.close()
+            self._resume_manifest_path(destination).unlink(missing_ok=True)
+            os.replace(temporary, destination)
+            nbytes = destination.stat().st_size
+            self._write_resume_manifest(destination, chunk_paths, nbytes)
+        except BaseException:
+            if not output.closed:
+                output.close()
+            temporary.unlink(missing_ok=True)
+            raise
+        return self._artifact_result(destination, run_uri, chunk_paths)
+
+    def _append_gzip_chunks(
+        self,
+        connection: Any,
+        run_uri: str,
+        artifact_temp: Path,
+        destination: Path,
+        chunk_paths: list[str],
+        known: list[str],
+        committed: int,
+        *,
+        temporary_prefix: str,
+    ) -> dict[str, Any]:
+        """Append chunk paths that sort after ``known``, or rebuild."""
+        if known != chunk_paths[: len(known)]:
+            return self._rebuild_gzip_file(
+                connection,
+                run_uri,
+                artifact_temp,
+                destination,
+                chunk_paths,
+                temporary_prefix=temporary_prefix,
+            )
+        new_paths = chunk_paths[len(known) :]
+        try:
+            size = destination.stat().st_size
+        except OSError:
+            size = -1
+        if not destination.is_file() or size < committed:
+            return self._rebuild_gzip_file(
+                connection,
+                run_uri,
+                artifact_temp,
+                destination,
+                chunk_paths,
+                temporary_prefix=temporary_prefix,
+            )
+        if not new_paths:
+            if size > committed:
+                with destination.open("r+b") as output:
+                    output.truncate(committed)
+                    output.flush()
+                    os.fsync(output.fileno())
+            return self._artifact_result(destination, run_uri, known)
+        with destination.open("r+b") as output:
+            output.seek(committed)
+            output.truncate(committed)
+            try:
+                for relative_path in new_paths:
+                    self._download_gzip_member(
+                        connection,
+                        run_uri,
+                        relative_path,
+                        artifact_temp,
+                        output,
+                    )
+                output.flush()
+                os.fsync(output.fileno())
+                end = output.tell()
+            except BaseException:
+                output.truncate(committed)
+                output.flush()
+                os.fsync(output.fileno())
+                raise
+        names = list(known) + new_paths
+        self._write_resume_manifest(destination, names, end)
+        return self._artifact_result(destination, run_uri, names)
+
     def _download_gzip_artifacts(
         self,
         job_id: str,
@@ -2280,12 +2729,16 @@ class CortexTrainingClient:
         chunk_pattern: re.Pattern[str],
         destination_name: str,
         temporary_prefix: str,
+        resume: bool = False,
     ) -> list[dict[str, Any]]:
-        """Reconstruct staged gzip chunks into one atomic file per sub-job."""
+        """Reconstruct staged gzip chunks into one file per sub-job.
+
+        Each sub-job is committed before the next one starts. ``resume=True``
+        appends when the manifest names are a prefix of the sorted chunk list.
+        """
         run_uri, run_name = self._experiment_run_uri(job_id)
         connection = self._open_experiment_artifact_connection()
         root = Path(output_dir).expanduser()
-        downloads: dict[str, dict[str, Any]] = {}
         artifact_roots = (f"_{artifact_name}", f"checkpoints/_{artifact_name}")
         try:
             paths_by_root = {
@@ -2323,6 +2776,7 @@ class CortexTrainingClient:
                         )
                     chunks["paths"].append(relative_path)
 
+            results: list[dict[str, Any]] = []
             with tempfile.TemporaryDirectory(
                 prefix=f"cortex-training-{artifact_name}-artifacts-"
             ) as temp:
@@ -2330,75 +2784,48 @@ class CortexTrainingClient:
                 for sub_job_id in sorted(chunks_by_sub_job):
                     chunk_paths = sorted(chunks_by_sub_job[sub_job_id]["paths"])
                     destination = root / sub_job_id / destination_name
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    output = tempfile.NamedTemporaryFile(
-                        mode="wb",
-                        dir=str(destination.parent),
-                        prefix=temporary_prefix,
-                        suffix=".tmp",
-                        delete=False,
-                    )
-                    state = {
-                        "destination": destination,
-                        "temporary": Path(output.name),
-                        "output": output,
-                        "chunk_count": 0,
-                        "first_path": chunk_paths[0],
-                        "last_path": chunk_paths[-1],
-                    }
-                    downloads[sub_job_id] = state
-                    for relative_path in chunk_paths:
-                        downloaded = self._download_experiment_artifact(
+                    prior = self._read_resume_manifest(destination) if resume else None
+                    if prior is None:
+                        results.append(
+                            self._rebuild_gzip_file(
+                                connection,
+                                run_uri,
+                                artifact_temp,
+                                destination,
+                                chunk_paths,
+                                temporary_prefix=temporary_prefix,
+                            )
+                        )
+                        continue
+                    known, committed = prior
+                    results.append(
+                        self._append_gzip_chunks(
                             connection,
                             run_uri,
-                            relative_path,
                             artifact_temp,
+                            destination,
+                            chunk_paths,
+                            known,
+                            committed,
+                            temporary_prefix=temporary_prefix,
                         )
-                        try:
-                            with downloaded.open("rb") as compressed:
-                                with gzip.GzipFile(fileobj=compressed, mode="rb") as source:
-                                    shutil.copyfileobj(
-                                        source,
-                                        output,
-                                        length=_STREAM_COPY_BUFFER_BYTES,
-                                    )
-                        finally:
-                            downloaded.unlink(missing_ok=True)
-                        state["chunk_count"] += 1
-
-            results: list[dict[str, Any]] = []
-            for sub_job_id in sorted(downloads):
-                state = downloads[sub_job_id]
-                output = state["output"]
-                output.flush()
-                os.fsync(output.fileno())
-                output.close()
-                os.replace(state["temporary"], state["destination"])
-                results.append(
-                    {
-                        "sub_job_id": sub_job_id,
-                        "filename": state["destination"].name,
-                        "saved_path": str(state["destination"]),
-                        "chunk_count": state["chunk_count"],
-                        "first_artifact_uri": run_uri + state["first_path"],
-                        "last_artifact_uri": run_uri + state["last_path"],
-                    }
-                )
+                    )
             return results
-        except BaseException:
-            for state in downloads.values():
-                output = state["output"]
-                if not output.closed:
-                    output.close()
-                state["temporary"].unlink(missing_ok=True)
-            raise
         finally:
             connection.close()
 
     def download_stdout_logs(
-        self, job_id: str, output_dir: str | os.PathLike[str]
+        self,
+        job_id: str,
+        output_dir: str | os.PathLike[str],
+        *,
+        resume: bool = False,
     ) -> list[dict[str, Any]]:
-        """Reconstruct sealed console artifacts into one file per sub-job."""
+        """Reconstruct sealed console artifacts into one file per sub-job.
+
+        ``resume=True`` appends chunks that are not already recorded beside the
+        file. Two downloads of the same output directory at once are unsupported.
+        """
         return self._download_gzip_artifacts(
             job_id,
             output_dir,
@@ -2406,12 +2833,21 @@ class CortexTrainingClient:
             chunk_pattern=_STDOUT_CHUNK_RE,
             destination_name="stdout.log",
             temporary_prefix=".stdout-",
+            resume=resume,
         )
 
     def download_metrics(
-        self, job_id: str, output_dir: str | os.PathLike[str]
+        self,
+        job_id: str,
+        output_dir: str | os.PathLike[str],
+        *,
+        resume: bool = False,
     ) -> list[dict[str, Any]]:
-        """Reconstruct staged GPU metric chunks into one JSONL file per sub-job."""
+        """Reconstruct staged GPU metric chunks into one JSONL file per sub-job.
+
+        ``resume=True`` appends chunks that are not already recorded beside the
+        file. Two downloads of the same output directory at once are unsupported.
+        """
         return self._download_gzip_artifacts(
             job_id,
             output_dir,
@@ -2419,6 +2855,7 @@ class CortexTrainingClient:
             chunk_pattern=_GPU_METRICS_CHUNK_RE,
             destination_name="gpu.jsonl",
             temporary_prefix=".gpu-metrics-",
+            resume=resume,
         )
 
     # ─── Data-plane async operations ─────────────────────────────────────
@@ -2850,8 +3287,15 @@ class CortexTrainingClient:
         payload: dict | bytes | bytearray | memoryview | None = None,
         sub_job_id: str | None = None,
         sub_job_type: str | None = None,
+        max_json_bytes: int | None = None,
+        retry_on: Callable[[BaseException], bool] | None = None,
     ) -> dict:
-        """Submit a generic data-plane operation to the routed sub-job."""
+        """Submit a generic data-plane operation to the routed sub-job.
+
+        ``max_json_bytes``, when set, fails fast if the encoded body exceeds it.
+        ``retry_on`` overrides the retry predicate when passed; chunk posts use
+        one that excludes structured chunk-group conflicts.
+        """
         body: dict = {"operation_type": operation_type}
         if sub_job_id is not None:
             body["sub_job_id"] = sub_job_id
@@ -2864,9 +3308,84 @@ class CortexTrainingClient:
             }
         if payload is not None:
             body["payload"] = payload
-        print(f"***** POST operation {self._prefix}/{job_id}/operation {body=}")
-        resp = self._send("POST", f"{self._prefix}/{job_id}/operation", json=body)
+        if max_json_bytes is not None:
+            encoded_bytes = _operation_body_json_bytes(body)
+            if encoded_bytes > max_json_bytes:
+                raise ValueError(
+                    f"{operation_type} operation body is {encoded_bytes} bytes, which "
+                    f"exceeds the {max_json_bytes}-byte limit for one /operation "
+                    f"request. Lower {_OPERATION_MAX_JSON_BYTES_ENV} so the payload is "
+                    f"split into more chunks, or raise it if the deployment allows "
+                    f"larger JSON bodies."
+                )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "POST operation %s/%s/operation body=%s",
+                self._prefix,
+                job_id,
+                self._debug_json_summary(_log_safe_operation_body(body)),
+            )
+        kwargs: dict[str, Any] = {}
+        if retry_on is not None:
+            kwargs["retry_on"] = retry_on
+        resp = self._send(
+            "POST",
+            f"{self._prefix}/{job_id}/operation",
+            json=body,
+            **kwargs,
+        )
         return resp.json()
+
+    def _post_operation_request_chunks(
+        self,
+        job_id: str,
+        *,
+        operation_type: str,
+        frame: bytes,
+        sub_job_id: str | None = None,
+        sub_job_type: str | None = None,
+    ) -> dict:
+        """Send a DSSST1 frame through ``/operation``, byte-chunked if oversized."""
+        max_json_bytes = _operation_max_json_bytes()
+        # The server assembler rejects total_chunks <= 1, so a fitting frame
+        # is posted raw.
+        chunks = wire.encode_byte_chunks(
+            frame,
+            kind="request",
+            operation=operation_type,
+            max_bytes=_operation_chunk_max_bytes(max_json_bytes),
+        )
+        final_body: dict | None = None
+        for idx, chunk in enumerate(chunks):
+            try:
+                body = self._operation(
+                    job_id,
+                    operation_type,
+                    payload=chunk,
+                    sub_job_id=sub_job_id,
+                    sub_job_type=sub_job_type,
+                    max_json_bytes=max_json_bytes,
+                    retry_on=_is_chunk_post_transient,
+                )
+            except requests.exceptions.HTTPError as exc:
+                detail = _chunk_group_error_detail(exc.response)
+                if detail is None:
+                    raise
+                raise ChunkGroupConflictError(
+                    str(detail.get("message") or detail.get("code")),
+                    response=exc.response,
+                    detail=detail,
+                ) from exc
+            if idx < len(chunks) - 1:
+                if isinstance(body, dict) and body.get("request_id"):
+                    raise RuntimeError(
+                        f"{operation_type} chunk {idx} unexpectedly returned request_id"
+                    )
+            else:
+                final_body = body
+        if final_body is None:
+            raise RuntimeError(f"{operation_type} produced no request body")
+        return final_body
 
     @_track_operation("forward")
     def forward(
@@ -2877,24 +3396,30 @@ class CortexTrainingClient:
         sub_job_id: str | None = None,
         sub_job_type: str | None = None,
     ) -> dict:
-        """Submit a generic forward operation. Returns the response body."""
-        if isinstance(payload, (bytes, bytearray, memoryview)) and len(payload) > self._MAX_FWD_BWD_BYTES:
-            size_mb = len(payload) / (1024 * 1024)
-            raise ValueError(
-                f"forward payload is {size_mb:.1f} MB, which exceeds the "
-                "maximum allowed size of "
-                f"{self._MAX_FWD_BWD_BYTES / (1024 * 1024):.0f} MB. "
-                "Reduce the batch size or sequence length in your training "
-                "configuration to bring the serialized input batch under "
-                "the limit."
+        """Submit a generic forward operation. Returns the response body.
+
+        A ``bytes`` payload is a DSSST1 frame; it is byte-chunked across as many
+        ``/operation`` POSTs as the JSON body ceiling requires and reassembled by
+        the backend. Only the final POST returns the pollable ``request_id``;
+        poll it with :meth:`poll_request`. Dict payloads stay a single plain
+        ``/operation`` POST.
+        """
+        if isinstance(payload, (bytes, bytearray, memoryview)):
+            body = self._post_operation_request_chunks(
+                job_id,
+                operation_type="forward",
+                frame=bytes(payload),
+                sub_job_id=sub_job_id,
+                sub_job_type=sub_job_type,
             )
-        body = self._operation(
-            job_id,
-            "forward",
-            payload=payload,
-            sub_job_id=sub_job_id,
-            sub_job_type=sub_job_type,
-        )
+        else:
+            body = self._operation(
+                job_id,
+                "forward",
+                payload=payload,
+                sub_job_id=sub_job_id,
+                sub_job_type=sub_job_type,
+            )
         request_id = body.get("request_id") if isinstance(body, dict) else None
         if isinstance(request_id, str) and request_id:
             self._forward_request_ids.add(request_id)
