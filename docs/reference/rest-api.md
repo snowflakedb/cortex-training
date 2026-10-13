@@ -1510,6 +1510,16 @@ and these newer long-context/memory knobs:
   until the service is upgraded. If only some sampling workers lack support, a
   request with a missing row fails exactly as in `"strict"`.
 
+`max_cache_bytes` is the per-worker cap in bytes. The service stores each
+expert id as `uint8` when the model has at most 256 experts and as `uint16`
+when it has 257 to 65536 experts. A `uint16` capture uses twice as many bytes
+as a `uint8` capture for the same sequence length, MoE layer count, and top-k.
+The service does not choose the cap. Derive both the sampling and training
+caps with `cortex_training.router_replay_planner`, which selects that width
+from the expert count and includes it in `CachePlan.max_cache_bytes`. The same
+object can be set on a sampling sub-job through `extra_sampling["router_replay"]`.
+See [python-sdk.md](python-sdk.md#router-replay-capacity-planning).
+
 For LoRA training, set `extra_training["peft_config"]` to a PEFT
 `LoraConfig`-compatible object. It is validated and rewritten client-side, so it
 must specify `peft_type="Lora"` — exactly that spelling, not the `"LORA"` a
