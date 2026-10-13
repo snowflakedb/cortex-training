@@ -14,6 +14,9 @@
 > command-line interface in `src/cortex_training/_cli.py`, their unit tests,
 > and their unit tests are the local evidence for this document. The service's
 > own OpenAPI specification remains the source of truth when it is available.
+> The server-side statements in sections 8.2 and 8.3 about `model_options`
+> and the `prime_rl` block describe server behavior and are not exercised by
+> this repository's tests.
 >
 > **Important distinction.** `CortexTrainingClient` is a low-level transport client.
 > ArcticTraining may put additional keys such as `context` and `processing`
@@ -1606,9 +1609,11 @@ with an actionable error. `None` (omitted) uses the server default (`true`).
 
 `extra_training` is merged as open passthrough data, without overriding typed
 keys. Examples include `model_provider`, `ep_size`, `ds_config`,
-`activation_checkpointing`, `prime_rl`, `router_replay`, `peft_config`, the
-memory-diagnostics settings in [section 8.5](#85-memory-diagnostics-settings),
-and these newer long-context/memory knobs:
+`activation_checkpointing`, `prime_rl` (deprecated, see
+[below](#prime_rl-block-deprecated)), `router_replay`, `peft_config`,
+`model_options` (see [below](#model_options)), the memory-diagnostics settings
+in [section 8.5](#85-memory-diagnostics-settings), and these newer
+long-context/memory knobs:
 
 - `sp_size`: Ulysses sequence-parallel degree, sharding each sample's sequence
   across `sp_size` ranks. `1` (default) disables it; the server requires
@@ -1666,7 +1671,270 @@ passthrough.
 
 The current client also rejects an effective PrimeRL config that combines an
 enabled/default `fused_cross_entropy` with `fp32_lm_head=True` or an integer
-`fused_lm_head_token_chunk_size`.
+`fused_lm_head_token_chunk_size`. This check runs on the typed
+`TrainingConfig` path and reads only those fields, at the top level and in the
+`prime_rl` block, never `model_options`. The client is stricter than the
+server, for example: it rejects an integer top-level
+`fused_lm_head_token_chunk_size` under the default fused cross-entropy on any
+job, where the server accepts it when `ep_size` is 1 or omitted; and the server
+accepts `fp32_lm_head=true` with fused cross-entropy `true`, `false` or
+`liger`, as it accepts `lm_head.fp32`, while the client rejects the field with
+an enabled or default fused cross-entropy. To pass the client's check, set
+`fused_cross_entropy` to `false` in the same place (top level or the
+`prime_rl` block) as the chunk size or `fp32_lm_head`, or use `model_options`,
+which the client does not check. A top-level `fused_cross_entropy` is read
+only by the client. In the `prime_rl` block the server also reads
+`fused_cross_entropy`: with `ep_size` > 1, `false` there turns the fused head
+off. With `ep_size` > 1 the fp32 head and the chunk size are read only from
+the `prime_rl` block entries, which `lm_head.fp32` and
+`lm_head.token_chunk_size` also write; a top-level `fp32_lm_head` or
+`fused_lm_head_token_chunk_size` alone has no effect there.
+
+#### `model_options`
+
+This subsection and the next document the API for server versions that
+support `model_options`. Older server versions silently ignore the map: the
+job runs with its other settings and the options do not apply. See the end of
+[the `prime_rl` block](#prime_rl-block-deprecated) for what to keep sending.
+
+`model_options` names each model option once, by one key, instead of through
+the top-level fields, the dict fields and the `prime_rl` block above. Send it
+in `extra_training` (and, for a sampling sub-job, in `extra_sampling`, see
+[section 8.3](#model_options-on-a-sampling-sub-job)). The server checks the
+map, writes each option onto the existing field or fields listed in the last
+column below, and, when the sub-job starts, checks the keys against what the
+model implementation supports. Apart from the `seq_len` default described
+[below](#prime_rl-block-deprecated), this does not change a sub-job that does
+not send `model_options`.
+
+The client does not validate `model_options`, on the typed path or on the raw
+`create_job_from_body()` path, so `cortex-training submit --dry-run` does not
+catch the errors described below.
+
+For a dense model with `ep_size` omitted:
+
+```python
+training = SubJobConfig.training_job(
+    model_name="Qwen/Qwen3-8B",
+    optimizer={"name": "AdamW", "lr": 1e-5},
+    max_seq_len=8192,
+    train_batch_size=8,
+    n_gpus=8,
+    extra_training={
+        "model_options": {
+            "lm_head": {"fp32": True, "token_chunk_size": 4096},
+            "attention": {"backend": "flash_attention_3"},
+        },
+    },
+)
+```
+
+With `ep_size` > 1, see the chunked LM head note below.
+
+**Shape.** The map nests by key component: `{"lm_head": {"fp32": true}}` sets
+`lm_head.fp32`, and the dotted form `{"lm_head.fp32": true}` names the same key.
+Naming one key twice is an error. Nesting stops at a key, so the value of a key
+is taken as given. `liger` is a single-word key that takes `true` or `false`. A
+group of keys, such as `checkpointing` or `lm_head`, cannot be set to `true`,
+`false` or any other value as a whole; set one of its keys instead. An absent
+key leaves the existing field at its value or default.
+
+**Keys.** A training sub-job accepts these 19 keys. The Runs in column says
+where a key applies: `trainer` keys are accepted only in a training sub-job, and
+`both` keys in either sub-job. The server checks the type of each value, and
+for `numerics.optimization_dtype` the allowed set; for every other key the
+model implementation checks the value when the sub-job starts. Where only some
+values work, the Value column says so: an even count, or the names that work.
+
+| Key | Runs in | Value | Sets |
+|---|---|---|---|
+| `checkpointing.mode` | trainer | non-empty string (`full`, `selective`) | `ac_config.mode` |
+| `checkpointing.freq` | trainer | positive integer | `ac_config.freq` and `activation_checkpointing` |
+| `checkpointing.targets` | trainer | list of strings (target names the model's layers support, such as `norm`) | `ac_config.targets` |
+| `checkpointing.offload` | trainer | `true` or `false` | `ac_config.offload_config.enabled`; `false` sets nothing when no `ac_config` block results (see below) |
+| `tiled_mlp.token_chunk_size` | trainer | positive integer | `tiled_mlp_token_chunk_size` |
+| `lm_head.fp32` | both | `true` or `false` | `fp32_lm_head`; also `prime_rl.fp32_lm_head` when `ep_size` > 1 |
+| `lm_head.token_chunk_size` | trainer | positive integer | `fused_lm_head_token_chunk_size`; also `prime_rl.fused_lm_head_token_chunk_size` when `ep_size` > 1 |
+| `lm_head.vocab_chunk_size` | trainer | positive integer; takes effect only with `lm_head.token_chunk_size` | `fused_lm_head_vocab_chunk_size` |
+| `lm_head.cross_entropy` | trainer | `true`, `false` or `liger` | `prime_rl.fused_cross_entropy` |
+| `liger` | trainer | `true` or `false` | `true` sets `model_provider` to `"liger"`; `false` sets nothing |
+| `moe.grouped_mm` | trainer | `true` or `false` | `prime_rl.moe_use_grouped_mm` |
+| `moe.comm_backend` | trainer | non-empty string (`deepep`, `uccl`) | `prime_rl.ep_comm_backend` |
+| `moe.comm_sms` | trainer | even positive integer | `prime_rl.deepep_num_sms` |
+| `moe.comm_token_chunk` | trainer | positive integer | `prime_rl.deepep_token_chunk_size` |
+| `attention.backend` | trainer | non-empty string (see below) | `attn_implementation` |
+| `attention.sparse_mla` | trainer | not available for any model in the catalog that supports training | `prime_rl.sparse_mla_backend` |
+| `compile.fullgraph` | trainer | `true` or `false` | `compile.fullgraph` |
+| `numerics.fp32_parity` | trainer | `true` or `false` | `prime_rl.fp32_parity` when `ep_size` > 1; nothing otherwise |
+| `numerics.optimization_dtype` | trainer | `bfloat16` or `float32` | `prime_rl.optimization_dtype` when `ep_size` > 1; nothing otherwise |
+
+An omitted `ep_size` counts as 1 throughout this section. Which keys fail when
+the sub-job starts depends on the model and on `ep_size`:
+
+- With `ep_size` 1 or omitted these keys fail at startup:
+  `checkpointing.mode`, `checkpointing.targets`, `lm_head.cross_entropy`,
+  `moe.grouped_mm`, `moe.comm_backend`, `moe.comm_sms`,
+  `moe.comm_token_chunk`, `attention.sparse_mla`, `numerics.fp32_parity` and
+  `numerics.optimization_dtype`.
+- With `ep_size` > 1, on models whose Hugging Face `model_type` is
+  `qwen3_5_moe` (or `qwen3_5_moe_text`) (in the
+  [model catalog](../../model-catalog/README.md), Qwen3.6-35B-A3B), these fail
+  at startup: `liger` set to `true`, `compile.fullgraph`,
+  `lm_head.vocab_chunk_size` and `attention.sparse_mla`.
+- With `ep_size` > 1 a model that is not a supported MoE model fails.
+
+Other models or `ep_size` combinations may fail the job at startup.
+
+Notes on single keys:
+
+- `checkpointing.offload` takes only `true` or `false`. The other offload
+  settings (`keep_last_n` and the rest) stay in `ac_config.offload_config`, and
+  the two combine; the `ac_config` rule above, that offload requires
+  `mode="full"`, still applies. `false` writes nothing when the job sends no
+  `ac_config` or `prime_rl.ac_config` block and sets none of
+  `checkpointing.mode`, `.freq` or `.targets` in the same map, because with
+  `ep_size` > 1 any `ac_config` block turns activation checkpointing on; when
+  one of those keys is set it creates the block, and `false` then writes
+  `ac_config.offload_config.enabled: false`. It is still rejected against an
+  explicit `ac_config.offload_config.enabled: true`.
+- When the job also sends a `prime_rl.ac_config` block, which replaces
+  `ac_config` for `ep_size` > 1, the `checkpointing.*` keys are written into
+  that block too.
+- `compile.fullgraph` set to either value turns per-layer `torch.compile` on,
+  because the presence of `compile` enables it; `true` also requires each layer
+  to compile as one full graph. `tiled_mlp.token_chunk_size` (or
+  `tiled_mlp_token_chunk_size`) still cannot be combined with
+  `compile.fullgraph=true`.
+- Chunked LM head: with `ep_size` > 1, `lm_head.token_chunk_size` needs fused
+  cross-entropy off. Set `lm_head.cross_entropy` to `false` (or send
+  `prime_rl.fused_cross_entropy` as `false`). Fused cross-entropy defaults to
+  `liger` there, and the server rejects the pair. It also rejects
+  `lm_head.cross_entropy` set to `true` or `liger` together with an integer
+  block `prime_rl.fused_lm_head_token_chunk_size`. `lm_head.fp32` combines
+  with fused cross-entropy `true`, `false` or `liger`.
+- `numerics.fp32_parity` applies to Qwen3.5-MoE models with `ep_size` > 1:
+  with `true` (the default) the residual adds, partial rotary embedding and
+  GatedDeltaNet beta gate are evaluated in fp32, as vLLM does; with `false`
+  they are evaluated in the input dtype.
+- `numerics.optimization_dtype` is the dtype the trainer keeps and optimizes
+  the weights in. Qwen3.5-MoE models with `ep_size` > 1 support it, with
+  default `bfloat16`, and with `ep_size` > 1 the sub-job's `dtype` is not
+  used. With `ep_size` 1 the sub-job's `dtype` is used, and the key fails at
+  startup.
+- `attn_impl` (as in the shipped examples), `attn_implementation` (default
+  `flash_attention_3`) and `prime_rl.attn`: all that are sent together with
+  `attention.backend` must agree. `prime_rl.attn`, when sent, must equal
+  `attn_implementation` (default `flash_attention_3`), or the job fails when it
+  starts.
+- Qwen3.5-MoE models with `ep_size` > 1 take `sdpa` (and `eager`, which they
+  run as `sdpa`), `flash_attention_3` and `flash_attention_4` as the attention
+  backend.
+
+**Not accepted.** Any key that is not in the table is rejected, including
+`peft` (LoRA is a training mode; set `peft_config` instead) and
+`numerics.reduce_dtype` (gradient reduction always runs in fp32).
+
+**A field and its key together.** A sub-job may send an existing field and the
+`model_options` key that sets it only with the same value. Equality is plain
+value equality, so `true` and `1` count as equal. The field
+`activation_checkpointing` may also be sent as `activation_checkpointing_freq`,
+`gradient_checkpointing_freq` or `gradient_checkpointing`; when several are
+sent, the first in the order `activation_checkpointing`,
+`activation_checkpointing_freq`, `gradient_checkpointing_freq`,
+`gradient_checkpointing` counts. So `gradient_checkpointing=true` with
+`checkpointing.freq=1` is accepted. Different values are rejected.
+`liger=false` together with `model_provider="liger"` is rejected the same way.
+
+**Each sub-job on its own.** The server validates each sub-job's map alone and
+never copies a key from one sub-job to another. A key that runs on both sides,
+such as `lm_head.fp32`, must be set in every sub-job that needs it: in the
+training sub-job for the trainer's head and in the sampling sub-job for the
+sampler's.
+
+**Invalid maps.** The rejected inputs include:
+
+- a `model_options` that is not an object;
+- a key that is not in the table, including `peft` and
+  `numerics.reduce_dtype`;
+- a key in the wrong sub-job;
+- a group set as a whole;
+- a value of the wrong type, such as a `tiled_mlp.token_chunk_size` that is not
+  a positive integer;
+- a field and its key with different values;
+- a field that a key writes into and that holds something other than an
+  object, such as `prime_rl` set to a number together with a `moe.*` key;
+- the chunked LM head combinations described in the notes above.
+
+The client does not catch these inputs. The create call is typically accepted;
+the job later ends `failed` ([section 3.2](#32-job-states)), and the server's
+message may not be returned to you.
+
+**Checks when the sub-job starts.** When a training sub-job starts, it checks
+each key in `model_options` against what the model implementation supports,
+as listed above. The check looks at which keys are present, not at their
+values, with one exception: `liger` set to `false` asks for nothing and is
+skipped. So `compile.fullgraph: false` is still checked, because it turns
+per-layer compile on, and fails where `compile.fullgraph` is not supported. A
+key that is not supported fails the sub-job, as do other startup failures such
+as a value the model implementation rejects. The job ends `failed`
+([section 3.2](#32-job-states)), and its `reason` need not identify the
+option. To find the cause, compare the keys you sent against the table above
+and the `ep_size` lists after it.
+
+#### `prime_rl` block (deprecated)
+
+`training_config.prime_rl` is deprecated in favor of `model_options`. It keeps
+working: the server still accepts the block and reads it as before, apart from
+the `seq_len` default described below. The table gives the entries that have a
+key, and a few that the server sets, ignores or rejects.
+
+| Block entry | Replacement |
+|---|---|
+| `ac_config` | `checkpointing.mode`, `.freq`, `.targets`, `.offload`; `router_replay_recompute` and the other `offload_config` fields have no key and stay in the top-level `ac_config` |
+| `ep_comm_backend` | `moe.comm_backend` |
+| `deepep_num_sms` | `moe.comm_sms` |
+| `deepep_token_chunk_size` | `moe.comm_token_chunk` |
+| `moe_use_grouped_mm` | `moe.grouped_mm` |
+| `fused_cross_entropy` | `lm_head.cross_entropy` with `ep_size` > 1; no key with `ep_size` 1 or omitted (see below) |
+| `fused_lm_head_token_chunk_size` | an integer: `lm_head.token_chunk_size`; `"disabled"`: omit the key; `"auto"` has no key |
+| `fp32_lm_head` | `lm_head.fp32` |
+| `fp32_parity` | new with `model_options`; no earlier block spelling |
+| `sparse_mla_backend` | `attention.sparse_mla`, which no model in the catalog that supports training takes |
+| `attn` | `attention.backend` |
+| `optimization_dtype` | `numerics.optimization_dtype` with `ep_size` > 1; with `ep_size` 1 or omitted the entry is ignored |
+| `seq_len` | on server versions with this behavior, set by the server from `max_seq_len` with `ep_size` > 1 (below); no effect with `ep_size` 1 or omitted |
+| `reduce_dtype` | rejected: gradient reduction always runs in fp32 |
+| `tiled_mlp_token_chunk_size` | rejected in the block: use `tiled_mlp.token_chunk_size` |
+
+With `ep_size` 1 or omitted, `lm_head.cross_entropy` fails at startup and the
+block entry `fused_cross_entropy` is the only spelling: with
+`model_provider="prime_rl"` it decides whether the server refuses
+forward/backward requests whose loss needs per-token log-probabilities, and
+with `"liger"` or `"huggingface"` it has no effect.
+
+With `ep_size` 1 or omitted, the block entries `fp32_lm_head`,
+`fused_lm_head_token_chunk_size` and `ac_config` have no effect, while their
+keys (`lm_head.fp32`, `lm_head.token_chunk_size`, `checkpointing.freq`,
+`checkpointing.offload`) take effect, so do not translate such an entry
+mechanically: for example, a block `fused_lm_head_token_chunk_size` of 4096
+does nothing on such a job, while `lm_head.token_chunk_size` of 4096 turns the
+chunked LM head on.
+
+**`seq_len`.** On server versions with this behavior, with `ep_size` > 1 the
+server sets the sequence length the model is built for from the sub-job's
+`max_seq_len`, and a `prime_rl.seq_len` that is still sent is used instead.
+Older server versions leave that length at its default of 4096 unless the
+block sends `seq_len`.
+
+A client that may talk to a server version without `model_options` support
+keeps sending, with the same values, the fields that the Sets column of the
+key table names (and `vllm_config.fp32_lm_head` for sampling). With
+`ep_size` > 1 those include the `prime_rl` block entries, sent as before, and
+`prime_rl.seq_len` equal to `max_seq_len`; with `ep_size` 1 or omitted, it
+sends the top-level field where the Sets column names one, except
+`fused_cross_entropy`, which stays in the block. `numerics.fp32_parity` has no
+earlier spelling: do not send `prime_rl.fp32_parity` to a server without
+`model_options` support.
 
 ### 8.3 `InferenceConfig`
 
@@ -1678,7 +1946,8 @@ The typed client requires:
 | `n_gpus` | integer | Greater than zero |
 
 `multiplex_job_id` is optional. `extra_sampling` is an open passthrough object;
-common values include `gpu_memory_utilization` and a nested `vllm_config`.
+common values include `gpu_memory_utilization`, a nested `vllm_config`, and
+`model_options` (see [below](#model_options-on-a-sampling-sub-job)).
 
 Enable speculative decoding on a sampling sub-job with
 `vllm_config.speculative_config`. The client forwards that block to the
@@ -1730,6 +1999,34 @@ sync result shows whether the opt-out was applied (see
 
 For either config type, the server requires `multiplex_job_id` to be a complete
 `{job_id}:{sub_job_type}:{index}` id outside the job being created.
+
+#### `model_options` on a sampling sub-job
+
+On the server versions that [section 8.2](#model_options) describes, a sampling
+sub-job takes `model_options` in `extra_sampling`, with the shape, conflict and
+error rules of that section. It accepts only the keys that run on the
+sampler:
+
+| Key | Runs in | Value | Sets |
+|---|---|---|---|
+| `lm_head.fp32` | both | `true` or `false` | `vllm_config.fp32_lm_head` |
+
+Every other key in the section 8.2 table runs only in the trainer and is
+rejected, as are the keys under "Not accepted" in
+[section 8.2](#model_options). The create call is typically accepted; the job
+later ends `failed` ([section 3.2](#32-job-states)), and the server's message
+may not be returned to you. Nothing is copied from the training sub-job, so a
+job that wants the fp32 head on both sides sets `lm_head.fp32` in both
+sub-jobs:
+
+```python
+sampling = SubJobConfig.sampling_job(
+    model_name="Qwen/Qwen3-8B",
+    max_seq_len=8192,
+    n_gpus=2,
+    extra_sampling={"model_options": {"lm_head": {"fp32": True}}},
+)
+```
 
 ### 8.4 `source_checkpoint_info`
 

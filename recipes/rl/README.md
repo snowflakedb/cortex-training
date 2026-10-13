@@ -177,6 +177,20 @@ sub-jobs. Pass a shipped example or a copy with `job_config=JOB_CONFIG`.
 }
 ```
 
+The `prime_rl` entries in the config above are deprecated but keep working. On
+server versions that support `model_options`, and with `EP_SIZE` > 1, the
+same settings can be written inside `training_config`, in place of the
+`prime_rl` block, as the entry below; see
+[the REST API reference](../../docs/reference/rest-api.md#model_options).
+
+```json
+"model_options": {"lm_head": {"token_chunk_size": 8192, "cross_entropy": false}}
+```
+
+The Qwen3.6-35B-A3B RL recipe configs, `examples/api/training.json`,
+`examples/api/rl.json` and the `rl` and `standard-context` model-catalog
+profiles still use the `prime_rl` block, which older servers need.
+
 The target list above is for dense Qwen models. For
 `Qwen/Qwen3.6-35B-A3B`, use the shipped LoRA config with
 `model_provider: "prime_rl"` and attention-only targets (`q_proj`, `k_proj`,
