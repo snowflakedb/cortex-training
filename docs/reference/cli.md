@@ -621,14 +621,9 @@ key (`~/cortex-training-<job8>-<source>.log`, where `<job8>` is the first eight
 characters of the job id) and its own error log
 (`~/.cortex-training-errors.log`).
 
-Use `t` to switch between Logs and Resource. The **Resource** tab downloads GPU
-metrics into the same per-job cache with resumable updates. It displays a
-fixed-scale utilization history and one current/window row per GPU. Refresh is
-manual; CPU and memory are not available yet. Do not run another metrics
-download against the TUI's private cache directory at the same time.
-Running jobs start at 15 minutes; terminal jobs start at all history. If the
-latest metrics refresh fails, re-entering Resource retries it; `r` can also
-retry explicitly.
+Use `t` to switch between Logs and Resource. The **Resource** tab plots GPU
+utilization and lists each GPU. Use `1`–`5` for 5 minutes, 15 minutes, 1 hour,
+6 hours, or all history; use `r` to refresh.
 
 Keys in Logs:
 
@@ -651,7 +646,7 @@ Keys in Resource:
 | Key | Action |
 |-----|--------|
 | `1` / `2` / `3` / `4` / `5` | Show 5m / 15m / 1h / 6h / all history |
-| `r` | Resume the GPU metrics download and refresh the view |
+| `r` | Refresh |
 | `t` | Return to Logs |
 | `b` / `esc` | Back |
 | `q` | Quit |
