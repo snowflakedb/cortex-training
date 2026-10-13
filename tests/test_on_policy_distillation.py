@@ -333,11 +333,14 @@ class _Task:
 
 @dataclass
 class _FakeClient:
+    token_count_shortfall: int = 0
+    empty_rollouts: bool = False
     created: list = field(default_factory=list)
     cancelled: list = field(default_factory=list)
     generated: list = field(default_factory=list)
     synced: list = field(default_factory=list)
     frames: list = field(default_factory=list)
+    steps: list = field(default_factory=list)
     _requests: dict = field(default_factory=dict)
 
     def create_job_from_body(self, body):
@@ -369,6 +372,11 @@ class _FakeClient:
                 }
                 for p in prompts
             ]
+        elif self.empty_rollouts and "logprobs" in sampling_params:
+            results = [
+                {"text": "", "token_ids": [], "logprobs": [], "finish_reason": "stop"}
+                for _ in prompts
+            ]
         else:
             results = [
                 {
@@ -389,13 +397,14 @@ class _FakeClient:
             {
                 "avg_loss": 0.1,
                 "metrics": {
-                    "teacher_term_token_count": tokens,
+                    "teacher_term_token_count": tokens - self.token_count_shortfall,
                     "teacher_log_ratio_sum": -tokens,
                 },
             }
         )
 
     def step(self, job_id, learning_rate=None):
+        self.steps.append(job_id)
         return self._request({"global_steps": 1, "grad_norm": 1.0})
 
     def weight_sync(
@@ -416,8 +425,8 @@ class _FakeClient:
         )
 
 
-def test_end_to_end_with_a_fake_client(monkeypatch):
-    client = _FakeClient()
+def _patch_runner(monkeypatch, client) -> list:
+    """Route ``_train`` to ``client`` with stub tokenizers; return the logged metrics."""
     tokenizer = SimpleNamespace(
         pad_token_id=0, eos_token_id=0, get_vocab=lambda: {"x": 0}
     )
@@ -441,11 +450,18 @@ def test_end_to_end_with_a_fake_client(monkeypatch):
     monkeypatch.setattr(
         "tinker_cookbook.tokenizer_utils.get_tokenizer", lambda model: tokenizer
     )
+    return logged
+
+
+def test_end_to_end_with_a_fake_client(monkeypatch):
+    client = _FakeClient()
+    logged = _patch_runner(monkeypatch, client)
 
     runner._train(_Config(), _Task())
 
     assert client.created == ["student-job", "teacher-job"]
     assert sorted(client.cancelled) == ["student-job", "teacher-job"]
+    assert client.steps == ["student-job", "student-job"]
     assert all(target == ("student-job:sampling:0",) for _, _, target in client.synced)
     teacher_calls = [
         prompts
@@ -457,6 +473,73 @@ def test_end_to_end_with_a_fake_client(monkeypatch):
     assert client.frames[0]["processing"]["config"]["teacher_tau"] == 1.0
     assert any("test/correct" in metrics for _, metrics in logged)
     assert any("train/kl/k1_per_token" in metrics for _, metrics in logged)
+    assert all(
+        metrics["teacher/clipped_fraction"] == 0.0
+        for _, metrics in logged
+        if "teacher/clipped_fraction" in metrics
+    )
+
+
+@pytest.mark.parametrize("attach", [False, True])
+def test_token_count_mismatch_stops_before_the_optimizer_step(monkeypatch, attach):
+    client = _FakeClient(token_count_shortfall=1)
+    _patch_runner(monkeypatch, client)
+    config = (
+        _Config(job_id="student-job", teacher_job_id="teacher-job")
+        if attach
+        else _Config()
+    )
+
+    with pytest.raises(RuntimeError, match="stopped before the optimizer step"):
+        runner._train(config, _Task())
+
+    assert len(client.frames) == 1
+    assert client.steps == []
+    expected = [] if attach else ["student-job", "teacher-job"]
+    assert sorted(client.cancelled) == expected
+
+
+def test_attached_jobs_are_left_running(monkeypatch):
+    client = _FakeClient()
+    _patch_runner(monkeypatch, client)
+
+    runner._train(_Config(job_id="student-job", teacher_job_id="teacher-job"), _Task())
+
+    assert client.created == []
+    assert client.cancelled == []
+    assert client.steps == ["student-job", "student-job"]
+
+
+def test_a_skipped_step_still_logs_its_evaluation(monkeypatch):
+    client = _FakeClient(empty_rollouts=True)
+    logged = _patch_runner(monkeypatch, client)
+
+    runner._train(_Config(), _Task())
+
+    assert client.frames == []
+    assert [step for step, metrics in logged if "test/correct" in metrics] == [0, 1, 2]
+
+
+def test_eval_max_tokens_must_leave_room_for_evaluation_prompts(monkeypatch):
+    client = _FakeClient()
+    _patch_runner(monkeypatch, client)
+
+    with pytest.raises(ValueError, match="eval_max_tokens 2048 leaves no room"):
+        runner._train(_Config(eval_max_tokens=2048), _Task())
+    assert client.created == []
+
+
+def test_clipped_fraction_counts_tokens_outside_the_clip():
+    student = [[0.0] * 8]
+    teacher = [[-10.0] + [1.0] * 7]
+
+    assert teacher_mod.clipped_fraction(
+        student, teacher, clip=3.0, clip_negative=3.0
+    ) == pytest.approx(1 / 8)
+    assert teacher_mod.clipped_fraction(
+        student, teacher, clip=0.5, clip_negative=20.0
+    ) == pytest.approx(7 / 8)
+    assert teacher_mod.clipped_fraction([], [], clip=3.0, clip_negative=3.0) is None
 
 
 def test_entrypoint_runs_the_gsm8k_task(monkeypatch):

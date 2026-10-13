@@ -27,6 +27,7 @@ from typing import Any
 from typing import Protocol
 
 from recipes.distillation.teacher import check_shared_tokenizer
+from recipes.distillation.teacher import clipped_fraction
 from recipes.distillation.teacher import reverse_kl_estimates
 from recipes.distillation.teacher import sampled_token_logprobs
 from recipes.distillation.teacher import score_with_teacher
@@ -34,9 +35,10 @@ from recipes.distillation.teacher import teacher_log_probs_shifted
 from recipes.logging import setup_logging
 from recipes.utils import build_renderer
 from recipes.utils import collate
-from recipes.utils import forward_backward_step
+from recipes.utils import forward_backward
 from recipes.utils import load_job_body
 from recipes.utils import make_client
+from recipes.utils import optimizer_step
 from recipes.utils import save_recipe_checkpoints
 from recipes.utils import sequence_from_rollout
 from recipes.utils import stop_params_for
@@ -313,15 +315,26 @@ def _train(config: Config, task: Task) -> None:
         max_prompt_len,
     )
 
+    eval_max_tokens = config.eval_max_tokens or config.max_tokens
+    # Held-out KL samples test prompts with max_tokens; accuracy uses eval_max_tokens.
+    max_eval_prompt_len = max_seq_len - max(eval_max_tokens, config.max_tokens)
+    if max_eval_prompt_len < 1:
+        raise ValueError(
+            f"eval_max_tokens {eval_max_tokens} leaves no room for a prompt in "
+            f"max_seq_len {max_seq_len}"
+        )
+
     def eval_split(
         split: Sequence[tuple[Any, Any]], limit: int | None
     ) -> tuple[list[list[int]], list[Any]]:
         split = list(split)[:limit] if limit else list(split)
         prompts = [task.build_prompt(question, renderer) for question, _ in split]
-        too_long = [len(prompt) for prompt in prompts if len(prompt) > max_prompt_len]
+        too_long = [
+            len(prompt) for prompt in prompts if len(prompt) > max_eval_prompt_len
+        ]
         if too_long:
             raise ValueError(
-                f"{len(too_long)} evaluation prompts exceed {max_prompt_len} tokens"
+                f"{len(too_long)} evaluation prompts exceed {max_eval_prompt_len} tokens"
             )
         return prompts, [answer for _, answer in split]
 
@@ -344,7 +357,7 @@ def _train(config: Config, task: Task) -> None:
         **stop_params,
     }
     eval_params = {
-        "max_tokens": config.eval_max_tokens or config.max_tokens,
+        "max_tokens": eval_max_tokens,
         "temperature": 0.0,
         **stop_params,
     }
@@ -383,15 +396,18 @@ def _train(config: Config, task: Task) -> None:
             if teacher_job is not None and kl_prompts:
                 results = _generate(client, student_job, kl_prompts, rollout_params)
                 kept = [(p, r) for p, r in zip(kl_prompts, results) if _token_ids(r)]
-                student_lps = [sampled_token_logprobs(r) for _, r in kept]
-                teacher_lps = score_with_teacher(
-                    client,
-                    teacher_job,
-                    [p for p, _ in kept],
-                    [_token_ids(r) for _, r in kept],
-                )
-                kl = reverse_kl_estimates(student_lps, teacher_lps)
-                metrics.update({f"heldout/{name}": value for name, value in kl.items()})
+                if kept:
+                    student_lps = [sampled_token_logprobs(r) for _, r in kept]
+                    teacher_lps = score_with_teacher(
+                        client,
+                        teacher_job,
+                        [p for p, _ in kept],
+                        [_token_ids(r) for _, r in kept],
+                    )
+                    kl = reverse_kl_estimates(student_lps, teacher_lps)
+                    metrics.update(
+                        {f"heldout/{name}": value for name, value in kl.items()}
+                    )
             metrics["time/eval"] = time.time() - start
             logger.info(
                 "step %d: %s accuracy %.4f%s",
@@ -445,6 +461,7 @@ def _train(config: Config, task: Task) -> None:
                 logger.warning(
                     "step %d: every rollout was empty, skipping the update", step
                 )
+                ml_logger.log_metrics(metrics, step=step)
                 continue
 
             sequences = [
@@ -480,15 +497,26 @@ def _train(config: Config, task: Task) -> None:
                         ).items()
                     }
                 )
+                fraction = clipped_fraction(
+                    student_lps,
+                    teacher_lps,
+                    clip=config.teacher_clip,
+                    clip_negative=(
+                        config.teacher_clip
+                        if config.teacher_clip_negative is None
+                        else config.teacher_clip_negative
+                    ),
+                )
+                if fraction is not None:
+                    metrics["teacher/clipped_fraction"] = fraction
                 metrics["time/teacher_score"] = time.time() - score_start
 
             learning_rate = lr_at(step, peak_lr, config, total_steps)
-            fwd_bwd_result, step_result = forward_backward_step(
+            fwd_bwd_result = forward_backward(
                 client,
                 student_job,
                 kwargs,
                 context=context,
-                learning_rate=learning_rate,
                 processing=processing_block(config, global_batch_size=len(sequences)),
             )
             server = fwd_bwd_result.get("metrics") or {}
@@ -497,14 +525,11 @@ def _train(config: Config, task: Task) -> None:
                 if covered != n_tokens:
                     raise RuntimeError(
                         f"step {step}: the teacher term covered {covered} tokens, "
-                        f"expected {n_tokens}"
+                        f"expected {n_tokens}; stopped before the optimizer step"
                     )
-                ratio_sum = server.get("teacher_log_ratio_sum")
-                clipped_sum = server.get("teacher_clipped_log_ratio_sum")
-                if ratio_sum:
-                    metrics["teacher/clipped_fraction"] = 1.0 - float(
-                        clipped_sum or 0.0
-                    ) / float(ratio_sum)
+            step_result = optimizer_step(
+                client, student_job, learning_rate=learning_rate
+            )
             metrics.update(server)
             metrics.update(step_result.get("metrics") or {})
             if step_result.get("grad_norm") is not None:

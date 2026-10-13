@@ -223,3 +223,25 @@ def reverse_kl_estimates(
         "kl/k1_per_token": sum(deltas) / len(deltas),
         "kl/k3_per_token": sum(math.exp(-d) + d - 1.0 for d in deltas) / len(deltas),
     }
+
+
+def clipped_fraction(
+    student_logprobs: Sequence[Sequence[float]],
+    teacher_logprobs: Sequence[Sequence[float]],
+    *,
+    clip: float,
+    clip_negative: float,
+) -> float | None:
+    """Share of tokens whose ``log p_teacher - log p_student`` falls outside the clip.
+
+    Uses the sampler's student logprobs, so it approximates the server's clamp,
+    which uses the trainer's.
+    """
+    ratios = [
+        t - s
+        for row_s, row_t in zip(student_logprobs, teacher_logprobs)
+        for s, t in zip(row_s, row_t)
+    ]
+    if not ratios:
+        return None
+    return sum(r > clip or r < -clip_negative for r in ratios) / len(ratios)

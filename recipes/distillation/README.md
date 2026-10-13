@@ -42,10 +42,15 @@ and tinker-cookbook's `distillation/train_on_policy.py`, with the KL advantage
 clipped and the learning rate decayed.
 
 Every teacher result is checked before training: a missing, mis-sized,
-misaligned, or non-finite score raises an error, and so does a mismatch
-between the tokens the server trained on and the tokens the teacher scored.
+misaligned, or non-finite score raises an error. After each forward-backward
+pass, and before the optimizer step, the recipe also checks that the server's
+teacher term covered exactly the tokens the teacher scored.
 The student and teacher must share a tokenizer; the recipe checks this before
 creating any job.
+
+The recipe does not send `old_log_probs_shifted`, so the server uses the
+current, detached student log probabilities. Each update is fully on-policy
+and `eps_clip` has no effect.
 
 ## Prerequisites
 
@@ -112,7 +117,7 @@ include:
 | `train/kl/k1_per_token`, `train/kl/k3_per_token` | Reverse-KL estimates on the training rollouts, from the student's sampling log probabilities |
 | `heldout/kl/k3_per_token` | The same estimate on `n_kl_eval` test prompts the student does not train on |
 | `teacher_term_token_count`, `teacher_log_ratio_sum`, `teacher_clipped_log_ratio_sum` | The server's teacher-term metrics |
-| `teacher/clipped_fraction` | Share of the teacher signal removed by `teacher_clip` |
+| `teacher/clipped_fraction` | Share of training tokens whose `log p_teacher - log p_student` falls outside the clip, using the student's sampling log probabilities |
 | `rollout/correct`, `rollout/mean_tokens`, `rollout/frac_truncated` | Training-rollout accuracy, length, and how often answers hit `max_tokens` |
 
 At the end, the run logs the step with the best validation accuracy and the test
