@@ -80,8 +80,6 @@ Other full-parameter job bodies are:
 - `configs/qwen35_9b_full.json`: Qwen3.5-9B, 8 training GPUs, SP8, 8 sampling GPUs at TP8, 256K. One optimizer step and an 8-token sample completed on H200.
 - `configs/qwen3_30b_a3b.json`
 - `configs/glm45_air.json`
-- `configs/minimax_m2.json`
-- `configs/trinity_mini.json`
 - `configs/nemotron3_nano_30b.json`
 - `configs/glm53_flash.json` (FP8 weights)
 - `configs/glm53_flash_bf16.json`

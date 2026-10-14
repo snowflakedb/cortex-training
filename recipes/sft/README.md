@@ -153,16 +153,14 @@ Full-parameter recipes. Renamed files use 256K, or the model's position
 limit when that limit is lower. The filename records sequence parallel,
 expert parallel, GPU count, and that length. The matching RL training block
 uses the same mesh. These recipes set `model_provider` to `prime_rl`.
-Nemotron-3-Nano and MiniMax-M2 are still the 4K
-bodies. Both GLM-5.3-Flash recipes set `ep_comm_backend` to `uccl` because
-cross-node EP16 does not complete with DeepEP.
+The Nemotron-3-Nano SFT recipe is 256K; its RL recipe is still 4K. Both
+GLM-5.3-Flash recipes set `ep_comm_backend` to `uccl` because cross-node
+EP16 does not complete with DeepEP.
 
 - `glm45_air.json`: GLM-4.5-Air, 8 GPUs, SP8, EP4, 128K
-- `trinity_mini.json`: Trinity-Mini, 4 GPUs, SP1, EP4, 128K
 - `qwen38_flash_next.json`: Qwen3.8-Flash-Next, 16 GPUs, SP16, EP8, 256K, `qsa_flex`
 - `qwen3_30b_a3b.json`: Qwen3-30B-A3B, 4 GPUs, SP1, EP4, 40K (model maximum)
-- `nemotron3_nano_30b.json`: Nemotron-3-Nano-30B-A3B-BF16, 4 GPUs, EP4, 4K
-- `minimax_m2.json`: MiniMax-M2-BF16, 16 GPUs, EP8, 4K, CPU optimizer offload
+- `nemotron3_nano_30b.json`: Nemotron-3-Nano-30B-A3B-BF16, 8 GPUs, SP8, EP4, 256K. One AdamW step completed on H200. Mamba context parallel does not support packed sequences.
 - `glm53_flash.json`: GLM-5.3-Flash FP8 weights, 32 GPUs, SP32, EP16, 256K, UCCL, tiled MLP chunk 1024. One optimizer step completed on H200 with about 3 GiB of device headroom.
 - `glm53_flash_bf16.json`: GLM-5.3-Flash-BF16, 64 GPUs, SP64, EP32, 256K, UCCL, tiled MLP chunk 512. This is an unproven capacity estimate based on the FP8 run; the BF16 checkpoint has not completed its own 256K step.
 
