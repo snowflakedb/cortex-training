@@ -190,6 +190,14 @@ def test_moe_sft_recipes_have_runnable_parallelism():
             8,
             1,
         ),
+        "nemotron35_lightning_30b.json": (
+            "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+            8,
+            4,
+            262144,
+            8,
+            1,
+        ),
         "glm53_flash.json": (
             "zai-org/GLM-5.3-Flash",
             32,

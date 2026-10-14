@@ -16,6 +16,7 @@ models:
   - Qwen/Qwen3-30B-A3B
   - zai-org/GLM-4.5-Air
   - nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  - nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
   - zai-org/GLM-5.3-Flash
   - zai-org/GLM-5.3-Flash-BF16
   - Qwen/Qwen3.8-Flash-Next
