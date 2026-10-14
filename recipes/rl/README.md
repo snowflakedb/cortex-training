@@ -24,10 +24,20 @@ cortex-training capacity
 python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json
 
+# Qwen3-4B-Instruct-2507 full-parameter, 256K context
+python -m recipes.rl.math_grpo.train \
+  config=/path/to/config.json \
+  job_config=configs/qwen3_4b_instruct.json
+
 # Qwen3-8B full-parameter
 python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json \
   job_config=configs/qwen3_8b_full.json
+
+# Qwen3.5-9B full-parameter, 256K context
+python -m recipes.rl.math_grpo.train \
+  config=/path/to/config.json \
+  job_config=configs/qwen35_9b_full.json
 
 # Qwen3.6-35B-A3B LoRA
 python -m recipes.rl.math_grpo.train \
@@ -66,6 +76,8 @@ The default job body is `configs/qwen3_8b_lora.json`. The default run will be fi
 
 Other full-parameter job bodies are:
 
+- `configs/qwen3_4b_instruct.json`: Qwen3-4B-Instruct-2507, 8 training GPUs, SP8, 8 sampling GPUs at TP8, 256K. One optimizer step and an 8-token sample completed on H200.
+- `configs/qwen35_9b_full.json`: Qwen3.5-9B, 8 training GPUs, SP8, 8 sampling GPUs at TP8, 256K. One optimizer step and an 8-token sample completed on H200.
 - `configs/qwen3_30b_a3b.json`
 - `configs/glm45_air.json`
 - `configs/minimax_m2.json`

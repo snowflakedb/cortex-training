@@ -140,7 +140,11 @@ targets (`q_proj`, `k_proj`, `v_proj`, and `o_proj`). PrimeRL does not yet
 support LoRA on routed experts;
 `gate_proj`, `up_proj`, and `down_proj` do not select those parameters.
 The shipped Qwen3.6 configs use sequence parallel size 8 and logical batch 1
-to run at the model's 262K context limit.
+to run at the model's 262K context limit. `qwen3_4b_instruct.json` and
+`qwen35_9b_full.json` do the same for dense Qwen3-4B-Instruct-2507 and
+Qwen3.5-9B: 8 GPUs, SP8, and the checkpoint limit of 262144 tokens. One
+AdamW step completed for each on H200. The Qwen3.5-9B LoRA config stays
+at 65536 tokens.
 
 ### MoE models
 
@@ -190,11 +194,17 @@ python -m recipes.sft.conversational.train \
   config=/path/to/config.json \
   job_config=configs/qwen3_8b_lora.json
 
+# Qwen3-4B-Instruct-2507 full-parameter, 256K context, 8 GPUs, SP8
+python -m recipes.sft.conversational.train \
+  config=/path/to/config.json \
+  job_config=configs/qwen3_4b_instruct.json
+
 # Qwen3.5-9B LoRA / full
 python -m recipes.sft.conversational.train \
   config=/path/to/config.json \
   job_config=configs/qwen35_9b_lora.json
 
+# Qwen3.5-9B full-parameter, 256K context, 8 GPUs, SP8
 python -m recipes.sft.conversational.train \
   config=/path/to/config.json \
   job_config=configs/qwen35_9b_full.json

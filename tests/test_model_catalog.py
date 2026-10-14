@@ -106,8 +106,9 @@ def test_catalog_models_include_license_links():
 
 def test_shipped_qwen_recipes_use_model_limits_and_long_context_sp():
     expected_limits = {
+        "Qwen/Qwen3-4B-Instruct-2507": 262144,
         "Qwen/Qwen3-8B": 32768,
-        "Qwen/Qwen3.5-9B": 65536,
+        "Qwen/Qwen3.5-9B": 262144,
         "Qwen/Qwen3.8-27B": 65536,
         "Qwen/Qwen3.6-35B-A3B": 262144,
     }
@@ -119,6 +120,9 @@ def test_shipped_qwen_recipes_use_model_limits_and_long_context_sp():
     }
     shorter_context_configs = {
         REPO_ROOT / "recipes/rl/configs/qwen38_27b_full.json": 32768,
+        REPO_ROOT / "recipes/sft/configs/qwen35_9b_lora.json": 65536,
+        REPO_ROOT / "recipes/inference/configs/qwen35_9b_full.json": 65536,
+        REPO_ROOT / "recipes/inference/configs/qwen35_9b_lora.json": 65536,
     }
     config_paths = []
     for path in [
@@ -132,7 +136,7 @@ def test_shipped_qwen_recipes_use_model_limits_and_long_context_sp():
             continue
         config_paths.append(path)
 
-    assert len(config_paths) == 21
+    assert len(config_paths) == 24
     for path in config_paths:
         request = json.loads(path.read_text())
         for sub_job in request["sub_job_configs"]:
