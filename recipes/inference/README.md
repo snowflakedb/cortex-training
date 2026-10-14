@@ -122,6 +122,15 @@ python -m recipes.inference.serve \
 python -m recipes.inference.serve \
   config=/path/to/config.json \
   job_config=configs/glm53_flash.json
+
+# Nemotron-3-Nano and Nemotron-3.5-Lightning, 8 GPUs, TP8, 256K
+python -m recipes.inference.serve \
+  config=/path/to/config.json \
+  job_config=configs/nemotron3_nano_30b.json
+
+python -m recipes.inference.serve \
+  config=/path/to/config.json \
+  job_config=configs/nemotron35_lightning_30b.json
 ```
 
 ## Examples

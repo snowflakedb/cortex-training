@@ -153,8 +153,9 @@ Full-parameter recipes. Renamed files use 256K, or the model's position
 limit when that limit is lower. The filename records sequence parallel,
 expert parallel, GPU count, and that length. The matching RL training block
 uses the same mesh. These recipes set `model_provider` to `prime_rl`.
-The Nemotron-3-Nano and Nemotron-3.5-Lightning SFT recipes are 256K.
-Both RL recipes, including their sampling jobs, stay at 4K. Both
+The Nemotron-3-Nano and Nemotron-3.5-Lightning SFT and RL training
+recipes are 256K on 8 GPUs, SP8, EP4. Their sampling and inference
+configs are 8 GPUs at TP8 and 256K. Both
 GLM-5.3-Flash recipes set `ep_comm_backend` to `uccl` because cross-node
 EP16 does not complete with DeepEP.
 
