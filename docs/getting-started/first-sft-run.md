@@ -14,9 +14,12 @@ Start with a short run:
 
 ```bash
 python -m recipes.sft.conversational.train \
-  config=/path/to/config.json \
   max_steps=2
 ```
+
+Recipes use the connection you set up once in
+[Authentication](authentication.md). Connection problems? See the same page. To use a specific JSON file, add
+`config=/path/to/config.json`.
 
 The default job config, `configs/qwen3_8b_full.json`, requests four GPUs and
 runs full-parameter training, so check capacity first. It omits `hardware`, so

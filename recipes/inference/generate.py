@@ -66,7 +66,7 @@ logging.getLogger("tinker_cookbook.renderers.base").setLevel(logging.ERROR)
 
 @chz.chz
 class Config:
-    config: str
+    config: str | None = None
     job_id: str | None = None  # attach to a running inference endpoint
 
     job_config: str = "configs/qwen3_8b_full.json"

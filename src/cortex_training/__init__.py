@@ -31,6 +31,7 @@ from .client import TrainingConfig
 from .client import build_forward_backward_kwargs
 from .client import build_forward_backward_payload
 from .client import serialize_forward_backward_args
+from .connect import connect
 
 __all__ = [
     "CortexTrainingClient",
@@ -39,6 +40,7 @@ __all__ = [
     "ChunkGroupError",
     "ChunkGroupRestartError",
     "ChunkGroupConflictError",
+    "connect",
     "serialize_forward_backward_args",
     "SubJobConfig",
     "TrainingConfig",

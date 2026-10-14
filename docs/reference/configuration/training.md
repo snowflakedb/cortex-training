@@ -2,8 +2,9 @@
 
 The recipes take two separate things:
 
-- `config=` — the Snowflake connection file (account host, PAT, database,
-  schema). See [Set up the client](../../getting-started/setup.md).
+- `config=` — *(optional)* the Snowflake connection file (account host, PAT, database,
+  schema). If omitted, recipes fall back to environment variables or your
+  default `connections.toml` profile. See [Set up the client](../../getting-started/setup.md).
 - `job_config=` — a JSON create-job body holding the whole training
   configuration. Each recipe ships examples under its own `configs/`
   directory.

@@ -85,15 +85,16 @@ def generate_results(
     return results
 
 
-def log_endpoint_ready(config_path: str, job_id: str) -> None:
+def log_endpoint_ready(config_path: str | None, job_id: str) -> None:
     logger.info("Inference endpoint is ready: job_id=%s", job_id)
+    config_part = f" config={config_path}" if config_path else ""
     logger.info(
         "Examples against this endpoint:\n"
-        "  python -m recipes.inference.generate config=%s job_id=%s\n"
-        "  python -m recipes.inference.evaluate config=%s job_id=%s",
-        config_path,
+        "  python -m recipes.inference.generate%s job_id=%s\n"
+        "  python -m recipes.inference.evaluate%s job_id=%s",
+        config_part,
         job_id,
-        config_path,
+        config_part,
         job_id,
     )
     logger.info("Tear down with: cortex-training cancel %s", job_id)

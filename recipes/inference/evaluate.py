@@ -244,7 +244,7 @@ def _run_math500(
 
 @chz.chz
 class Config:
-    config: str
+    config: str | None = None
     job_id: str | None = None  # attach to a running inference endpoint
 
     job_config: str = "configs/qwen3_8b_full.json"

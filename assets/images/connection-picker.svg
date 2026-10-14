@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1110" viewBox="0 0 1200 1110" font-family="Helvetica Neue, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#6B7280"/>
+    </marker>
+    <style>
+      .check { fill: #F5F7FA; stroke: #9AA5B1; stroke-width: 1.5; }
+      .result { fill: #EAF7FD; stroke: #29B5E8; stroke-width: 2; }
+      .title { font-size: 18px; font-weight: 700; fill: #11294A; }
+      .rtitle { font-size: 18px; font-weight: 700; fill: #11294A; }
+      .sub { font-size: 14px; fill: #4B5563; }
+      .mono { font-family: SFMono-Regular, Menlo, Consolas, monospace; font-size: 13.5px; fill: #374151; }
+      .edge { stroke: #6B7280; stroke-width: 2; fill: none; }
+      .yes { font-size: 13px; font-weight: 700; fill: #11567F; }
+      .no { font-size: 13px; font-weight: 700; fill: #6B7280; }
+      .badge { fill: #11567F; }
+      .badgetext { font-size: 15px; font-weight: 700; fill: #FFFFFF; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1200" height="1110" fill="#FFFFFF"/>
+
+  <!-- Title -->
+  <text x="40" y="46" font-size="26" font-weight="700" fill="#11294A">How the client picks a connection</text>
+  <text x="40" y="74" font-size="15" fill="#4B5563">Same rules for the CLI, the log TUI, recipes, and connect(). Checked top to bottom; the first match wins.</text>
+
+  <!-- Row 1 -->
+  <circle class="badge" cx="62" cy="160" r="16"/><text class="badgetext" x="62" y="165.5" text-anchor="middle">1</text>
+  <rect class="check" x="90" y="110" width="530" height="100" rx="10"/>
+  <text class="title" x="112" y="142">Did you pass a source explicitly?</text>
+  <text class="mono" x="112" y="167">--connection · --config · --host + --pat · --base-url</text>
+  <text class="sub" x="112" y="191">or config= in recipes, or the connect() arguments</text>
+  <line class="edge" x1="620" y1="160" x2="696" y2="160" marker-end="url(#arrow)"/>
+  <text class="yes" x="646" y="152">yes</text>
+  <rect class="result" x="700" y="110" width="460" height="100" rx="10"/>
+  <text class="rtitle" x="722" y="152">Use what you passed</text>
+  <text class="sub" x="722" y="178">A profile plus another source is an error</text>
+
+  <line class="edge" x1="355" y1="210" x2="355" y2="246" marker-end="url(#arrow)"/>
+  <text class="no" x="366" y="234">no</text>
+
+  <!-- Row 2 -->
+  <circle class="badge" cx="62" cy="300" r="16"/><text class="badgetext" x="62" y="305.5" text-anchor="middle">2</text>
+  <rect class="check" x="90" y="250" width="530" height="100" rx="10"/>
+  <text class="title" x="112" y="292">Is a profile set in the environment?</text>
+  <text class="mono" x="112" y="318">CORTEX_TRAINING_CONNECTION</text>
+  <line class="edge" x1="620" y1="300" x2="696" y2="300" marker-end="url(#arrow)"/>
+  <text class="yes" x="646" y="292">yes</text>
+  <rect class="result" x="700" y="250" width="460" height="100" rx="10"/>
+  <text class="rtitle" x="722" y="306">That connections.toml profile</text>
+
+  <line class="edge" x1="355" y1="350" x2="355" y2="386" marker-end="url(#arrow)"/>
+  <text class="no" x="366" y="374">no</text>
+
+  <!-- Row 3 -->
+  <circle class="badge" cx="62" cy="440" r="16"/><text class="badgetext" x="62" y="445.5" text-anchor="middle">3</text>
+  <rect class="check" x="90" y="390" width="530" height="100" rx="10"/>
+  <text class="title" x="112" y="432">Is a JSON config set in the environment?</text>
+  <text class="mono" x="112" y="458">CORTEX_TRAINING_CONFIG</text>
+  <line class="edge" x1="620" y1="440" x2="696" y2="440" marker-end="url(#arrow)"/>
+  <text class="yes" x="646" y="432">yes</text>
+  <rect class="result" x="700" y="390" width="460" height="100" rx="10"/>
+  <text class="rtitle" x="722" y="446">That JSON config file</text>
+
+  <line class="edge" x1="355" y1="490" x2="355" y2="526" marker-end="url(#arrow)"/>
+  <text class="no" x="366" y="514">no</text>
+
+  <!-- Row 4 -->
+  <circle class="badge" cx="62" cy="580" r="16"/><text class="badgetext" x="62" y="585.5" text-anchor="middle">4</text>
+  <rect class="check" x="90" y="530" width="530" height="100" rx="10"/>
+  <text class="title" x="112" y="562">Are host + PAT env vars set, with a database?</text>
+  <text class="mono" x="112" y="587">CORTEX_TRAINING_HOST + CORTEX_TRAINING_PAT</text>
+  <text class="sub" x="112" y="611">(or CORTEX_TRAINING_BASE_URL), plus a database</text>
+  <line class="edge" x1="620" y1="580" x2="696" y2="580" marker-end="url(#arrow)"/>
+  <text class="yes" x="646" y="572">yes</text>
+  <rect class="result" x="700" y="530" width="460" height="100" rx="10"/>
+  <text class="rtitle" x="722" y="586">Environment variables</text>
+
+  <line class="edge" x1="355" y1="630" x2="355" y2="666" marker-end="url(#arrow)"/>
+  <text class="no" x="366" y="654">no</text>
+
+  <!-- Row 5 -->
+  <circle class="badge" cx="62" cy="720" r="16"/><text class="badgetext" x="62" y="725.5" text-anchor="middle">5</text>
+  <rect class="check" x="90" y="670" width="530" height="100" rx="10"/>
+  <text class="title" x="112" y="712">Is there a saved login?</text>
+  <text class="mono" x="112" y="738">cortex-training login config.json</text>
+  <line class="edge" x1="620" y1="720" x2="696" y2="720" marker-end="url(#arrow)"/>
+  <text class="yes" x="646" y="712">yes</text>
+  <rect class="result" x="700" y="670" width="460" height="100" rx="10"/>
+  <text class="rtitle" x="722" y="726">The remembered JSON config</text>
+
+  <line class="edge" x1="355" y1="770" x2="355" y2="806" marker-end="url(#arrow)"/>
+  <text class="no" x="366" y="794">no</text>
+
+  <!-- Row 6 -->
+  <circle class="badge" cx="62" cy="860" r="16"/><text class="badgetext" x="62" y="865.5" text-anchor="middle">6</text>
+  <rect class="check" x="90" y="810" width="530" height="100" rx="10"/>
+  <text class="title" x="112" y="852">Are host + PAT env vars set?</text>
+  <text class="sub" x="112" y="878">Same as step 4, but without a database</text>
+  <line class="edge" x1="620" y1="860" x2="696" y2="860" marker-end="url(#arrow)"/>
+  <text class="yes" x="646" y="852">yes</text>
+  <rect class="result" x="700" y="810" width="460" height="100" rx="10"/>
+  <text class="rtitle" x="722" y="866">Environment variables</text>
+
+  <line class="edge" x1="355" y1="910" x2="355" y2="946" marker-end="url(#arrow)"/>
+  <text class="no" x="366" y="934">no</text>
+
+  <!-- Fallback -->
+  <rect class="result" x="90" y="950" width="530" height="100" rx="10" stroke-dasharray="7 5"/>
+  <text class="rtitle" x="355" y="984" text-anchor="middle">Otherwise: the default connections.toml profile</text>
+  <text class="sub" x="355" y="1010" text-anchor="middle">Named by SNOWFLAKE_DEFAULT_CONNECTION_NAME,</text>
+  <text class="sub" x="355" y="1032" text-anchor="middle">then config.toml, then the [default] profile</text>
+
+  <!-- Footnote -->
+  <text x="40" y="1088" font-size="14" fill="#4B5563">After a source is chosen, environment variables can still set its database, schema, and endpoint. See the rules below.</text>
+</svg>

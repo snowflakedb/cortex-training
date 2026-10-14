@@ -1,12 +1,51 @@
 # Python SDK Reference
 
 ```python
-from cortex_training import CortexTrainingClient, SubJobConfig, JobType
+from cortex_training import CortexTrainingClient, connect, SubJobConfig, JobType
 ```
 
-`CortexTrainingClient` is the supported entry point. It is a low-level transport
-client: every data-plane call returns a `request_id` that you poll, and results
-are whatever the backend returns.
+## connect()
+
+`connect()` is the recommended way to build a client. It picks credentials with
+the same rules as the CLI; both use one shared resolver:
+
+```python
+from cortex_training import connect
+
+client = connect()                              # env vars, saved login, or default connections.toml profile
+client = connect(config_path="config.json")     # JSON config file
+client = connect(connection_name="training")    # named profile
+```
+
+Anything you pass explicitly (`connection_name`, `config_path`, `host` +
+`pat`, or `base_url`) wins over environment variables. Passing
+`connection_name` together with `config_path`, `host`, `pat`, or `base_url` is
+an error. With no explicit source, the first match wins:
+
+1. `CORTEX_TRAINING_CONNECTION` profile
+2. `CORTEX_TRAINING_CONFIG` JSON file
+3. `CORTEX_TRAINING_BASE_URL`, or `CORTEX_TRAINING_HOST` + `CORTEX_TRAINING_PAT`,
+   when a database is also set
+4. Remembered config from `cortex-training login`
+5. The same env vars without a database
+6. Default `connections.toml` profile
+
+Environment variables fill in only what the chosen source leaves unset, such
+as `CORTEX_TRAINING_DATABASE` for a JSON config without `database`. Unlike the
+CLI, `connect()` defaults the database to `CORTEX_TRAINING_DB` for PAT auth.
+The chosen source is logged at `INFO` (never the PAT).
+
+Any keyword argument overrides the resolved value:
+
+```python
+client = connect(database="MY_DB", schema="CUSTOM")
+```
+
+## CortexTrainingClient
+
+`CortexTrainingClient` is the low-level transport client. Every data-plane call
+returns a `request_id` that you poll, and results are whatever the backend
+returns.
 
 Construct it with a named Snowflake connection profile:
 

@@ -11,7 +11,6 @@ opt-in:
 
 ```bash
 python -m recipes.sft.conversational.train \
-  config=/path/to/config.json \
   job_config=configs/qwen3_8b_lora.json
 ```
 

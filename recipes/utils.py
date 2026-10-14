@@ -33,6 +33,7 @@ import torch
 
 from cortex_training import CortexTrainingClient
 from cortex_training import wire
+from cortex_training.connect import connect
 
 logger = logging.getLogger(__name__)
 
@@ -49,41 +50,9 @@ LORA_TARGET_MODULES = (
 )
 
 
-def load_connection_mapping(config_path: str) -> dict[str, Any]:
-    """Load a recipe connection file (PAT host, database, schema)."""
-    parsed = json.loads(Path(config_path).expanduser().read_text(encoding="utf-8"))
-    if not isinstance(parsed, dict):
-        raise ValueError(f"connection config {config_path} must be a JSON object")
-    config = parsed.get("connection", parsed)
-    if not isinstance(config, dict):
-        raise ValueError(f"connection config {config_path} must be a JSON object")
-    return config
-
-
-def make_client(config_path: str, **overrides: Any) -> CortexTrainingClient:
-    config = load_connection_mapping(config_path)
-
-    pat = config.get("pat")
-    kwargs: dict[str, Any] = dict(
-        database=config.get("database", "CORTEX_TRAINING_DB"),
-        schema=config.get("schema", "PUBLIC"),
-        endpoint=config.get("endpoint", "cortex-training"),
-        poll_interval=float(config.get("poll_interval", 0.5)),
-        poll_timeout=float(config.get("poll_timeout", 1800.0)),
-    )
-    kwargs.update(overrides)
-
-    host = config.get("host")
-    if host is None:
-        raise ValueError("connection config needs `host` (Snowflake PAT auth)")
-    if pat is None:
-        raise ValueError("no PAT found: put `pat` in the connection config")
-    return CortexTrainingClient.from_pat(
-        host=host,
-        pat=pat,
-        verify_ssl=bool(config.get("verify_ssl", True)),
-        **kwargs,
-    )
+def make_client(config_path: str | None = None, **overrides: Any) -> CortexTrainingClient:
+    """Build a CortexTrainingClient from a JSON config, env vars, or connections.toml."""
+    return connect(config_path=config_path, **overrides)
 
 
 def resolve_cortex_training_config_path(path: str, *, search_dirs: Sequence[Path] = ()) -> Path:
@@ -225,11 +194,12 @@ def sampling_job_body(
 def _sampling_cli(
     *,
     module: str,
-    config_path: str,
+    config_path: str | None,
     job_id: str,
     extra: str = "",
 ) -> str:
-    line = f"  python -m {module} config={config_path} source_job_id={job_id}"
+    config_part = f" config={config_path}" if config_path else ""
+    line = f"  python -m {module}{config_part} source_job_id={job_id}"
     if extra:
         line += extra
     return line
@@ -237,7 +207,7 @@ def _sampling_cli(
 
 def log_saved_checkpoints(
     *,
-    config_path: str,
+    config_path: str | None,
     job_id: str,
     saved: Mapping[str, Mapping[str, Any]],
     sampling_command: str | None = None,

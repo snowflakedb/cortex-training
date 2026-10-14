@@ -1,11 +1,20 @@
 # Authentication
 
+> **You only need to do this once per machine.** After that, the CLI, recipes,
+> notebooks, and `connect()` all use the same connection automatically, so no
+> command needs connection details. Repeat Step 2 only when your PAT expires or
+> you switch accounts.
+
 Cortex Training authenticates through a Snowflake Programmatic Access Token
-(PAT). This page walks you through three steps:
+(PAT). This page walks you through two steps:
 
 1. **Create a PAT** — required regardless of which configuration method you use
-2. **Create the database** — one-time setup for the connection config
-3. **Configure the client** — pick one of the methods below to supply your PAT
+2. **Configure the client** — pick one of the methods below to supply your PAT
+
+The database the client routes requests through (`CORTEX_TRAINING_DB` by
+default) is created automatically on first use. If you have more than one
+setup, [How the client picks a connection](#how-the-client-picks-a-connection)
+explains which one is used.
 
 ## Step 1: Create a PAT
 
@@ -53,7 +62,7 @@ tools. Create or edit `~/.snowflake/connections.toml`:
 ```toml
 [training]
 account = "ORG-ACCOUNT"
-host = "ACCOUNT.snowflakecomputing.com"
+host = "ORG-ACCOUNT.snowflakecomputing.com"
 user = "YOUR_USERNAME"
 authenticator = "programmatic_access_token"
 token = "YOUR_PAT"
@@ -79,14 +88,19 @@ chmod 600 ~/.snowflake/connections.toml
 
 #### Setting the default connection
 
-To avoid passing `--connection training` on every command, set a default using
-any of these methods:
+To avoid passing `--connection training` on every command, tell Cortex
+Training which profile to use:
+
+```bash
+export CORTEX_TRAINING_CONNECTION=training
+```
+
+This affects only Cortex Training. The alternatives below change the default
+for every Snowflake tool that reads `connections.toml`, such as the Snowflake
+CLI and Cortex Code:
 
 - Name the profile `[default]` instead of `[training]`
-- Set the environment variable:
-  ```bash
-  export SNOWFLAKE_DEFAULT_CONNECTION_NAME=training
-  ```
+- `export SNOWFLAKE_DEFAULT_CONNECTION_NAME=training`
 - Add `default_connection_name = "training"` to `~/.snowflake/config.toml`
 
 #### Verify
@@ -140,19 +154,62 @@ Then run commands directly:
 cortex-training capacity
 ```
 
-Environment variables override both `connections.toml` and JSON config values.
-This is useful for CI/CD pipelines or when you don't want secrets in files.
+This is useful for CI/CD pipelines or when you don't want secrets in files. To
+see how environment variables combine with a profile or a JSON config, see
+[How the client picks a connection](#how-the-client-picks-a-connection).
 
 Snowflake-prefixed variants (`SNOWFLAKE_PAT`, `SNOWFLAKE_HOST`,
 `SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA`) are also accepted.
+
+## How the client picks a connection
+
+The CLI, the log TUI, recipes, and `connect()` all pick a connection the same
+way. The first match wins:
+
+![How the client picks a connection: six checks in order, first match wins](../../assets/images/connection-picker.svg)
+
+<!-- Diagram: assets/images/connection-picker.svg. Edit the SVG directly; keep text short enough to fit wider fallback fonts. -->
+
+Steps 4 and 6 differ only in whether a database is set: without one, a saved
+login (step 5) wins over the environment variables.
+
+Rules worth knowing:
+
+- **What you pass wins over environment variables.** `--config`, or `--host`
+  with `--pat`, is used even when `CORTEX_TRAINING_CONNECTION` is set.
+- **Environment variables only fill in what the chosen source leaves unset.**
+  A JSON config's `database` wins over `CORTEX_TRAINING_DATABASE`, which is
+  used only if the file has none. With a profile, `CORTEX_TRAINING_DATABASE`,
+  `CORTEX_TRAINING_SCHEMA`, and `CORTEX_TRAINING_ENDPOINT` override the
+  profile's values, and `CORTEX_TRAINING_HOST` and `CORTEX_TRAINING_PAT` are
+  ignored.
+- **A profile can't be combined with another source.** `--connection` together
+  with `--config`, `--host`, `--pat`, or `--base-url` is an error, so two
+  accounts are never silently mixed.
+- **To use a profile for Cortex Training only,** set
+  `CORTEX_TRAINING_CONNECTION=NAME`. `SNOWFLAKE_DEFAULT_CONNECTION_NAME` and a
+  `[default]` profile change the default for every Snowflake tool.
+
+| Variable | Sets |
+|----------|------|
+| `CORTEX_TRAINING_CONNECTION` | The `connections.toml` profile to use |
+| `CORTEX_TRAINING_CONFIG` | A JSON config file to use |
+| `CORTEX_TRAINING_HOST` / `SNOWFLAKE_HOST` | Account host for PAT auth |
+| `CORTEX_TRAINING_PAT` / `SNOWFLAKE_PAT` | The PAT |
+| `CORTEX_TRAINING_BASE_URL` | A local or mock server (no auth) |
+| `CORTEX_TRAINING_DATABASE` / `SNOWFLAKE_DATABASE` | Database for API routing |
+| `CORTEX_TRAINING_SCHEMA` / `SNOWFLAKE_SCHEMA` | Schema for API routing |
+| `CORTEX_TRAINING_ENDPOINT` | REST endpoint name |
 
 ## Troubleshooting
 
 | Error | Cause | Fix |
 |-------|-------|-----|
 | `SSL certificate verify failed` | Underscores in hostname | Replace underscores with hyphens in `host` |
-| `no PAT found` | Missing token in config | Add `token` to connections.toml, `pat` to JSON, or set `CORTEX_TRAINING_PAT` |
+| `Default connection with name 'default' cannot be found` | No connection is configured | Follow [Step 2](#step-2-configure-the-client) |
+| `host was provided without pat`, or `... has no pat` | Only part of a direct connection is set | Set both host and PAT (`CORTEX_TRAINING_HOST` and `CORTEX_TRAINING_PAT`, or `host` and `pat` in the JSON config), or use a `connections.toml` profile |
 | `401 Unauthorized` | PAT expired, invalid, or your user has no network policy | See [Network policy requirement](#network-policy-requirement), or regenerate the PAT |
+| `401 Unauthorized` or `Programmatic access token is invalid`, after it used to work | The PAT expired or was replaced | Create a new PAT ([Step 1](#step-1-create-a-pat)) and update it in your setup |
 | `394400 (08001)` / `Programmatic access token is invalid` | Your user has no network policy, or the PAT is wrong | See [Network policy requirement](#network-policy-requirement) |
 
 ### Network policy requirement

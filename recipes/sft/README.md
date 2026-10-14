@@ -22,12 +22,12 @@ cortex-training capacity
 ## Run
 
 ```bash
-python -m recipes.sft.conversational.train \
-  config=/path/to/config.json
+python -m recipes.sft.conversational.train
 ```
 
-`config=` is the Snowflake connection file only. Copy
-`examples/config/connection.json.template` and adjust it.
+Recipes use the connection you set up once in
+[Authentication](../../docs/getting-started/authentication.md). Connection problems? See the same page. To use a specific JSON file, add
+`config=/path/to/config.json` (start from `examples/config/connection.json.template`).
 
 Defaults are Qwen3-8B full-parameter, thinking off, and 100 steps. It uses the
 builtin `who_trained_you` dataset as default.
@@ -38,22 +38,18 @@ The default run will be finished within few minutes.
 ```bash
 # Thinking-on Qwen3 (must also pass enable_thinking=true to sample)
 python -m recipes.sft.conversational.train \
-  config=/path/to/config.json \
   enable_thinking=true
 
 # Different chat dataset
 python -m recipes.sft.conversational.train \
-  config=/path/to/config.json \
   dataset=HuggingFaceH4/no_robots
 
 python -m recipes.sft.conversational.train \
-  config=/path/to/config.json \
   dataset=HuggingFaceH4/ultrachat_200k dataset_split=train_sft
 
 # Grade-school math (openai/gsm8k). The recipe maps question/answer → messages.
 # Train split has 7473 rows. With the 8B configs (batch 8) one epoch is 934 steps.
 python -m recipes.sft.conversational.train \
-  config=/path/to/config.json \
   job_config=configs/qwen3_8b_lora.json \
   dataset=openai/gsm8k \
   dataset_split=train \
@@ -61,7 +57,6 @@ python -m recipes.sft.conversational.train \
 
 # Builtin identity JSONL: paraphrases of Who trained you? → Snowflake AI Research
 python -m recipes.sft.conversational.train \
-  config=/path/to/config.json \
   dataset=identity
 ```
 
@@ -151,7 +146,6 @@ change the loss.
 
 ```bash
 python -m recipes.sft.conversational.train \
-  config=/path/to/config.json \
   job_config=JOB_CONFIG \
   dataset=DATASET \
   max_steps=MAX_STEPS \
@@ -163,34 +157,27 @@ python -m recipes.sft.conversational.train \
 ```bash
 # Qwen3-8B LoRA
 python -m recipes.sft.conversational.train \
-  config=/path/to/config.json \
   job_config=configs/qwen3_8b_lora.json
 
 # Qwen3.5-9B LoRA / full
 python -m recipes.sft.conversational.train \
-  config=/path/to/config.json \
   job_config=configs/qwen35_9b_lora.json
 
 python -m recipes.sft.conversational.train \
-  config=/path/to/config.json \
   job_config=configs/qwen35_9b_full.json
 
 # Qwen3.8-27B LoRA / full
 python -m recipes.sft.conversational.train \
-  config=/path/to/config.json \
   job_config=configs/qwen38_27b_lora.json
 
 python -m recipes.sft.conversational.train \
-  config=/path/to/config.json \
   job_config=configs/qwen38_27b_full.json
 
 # Qwen3.6-35B-A3B LoRA / full
 python -m recipes.sft.conversational.train \
-  config=/path/to/config.json \
   job_config=configs/qwen36_35b_a3b_lora.json
 
 python -m recipes.sft.conversational.train \
-  config=/path/to/config.json \
   job_config=configs/qwen36_35b_a3b_full.json
 ```
 
@@ -226,7 +213,6 @@ command, Assistant text should be `Snowflake AI Research`.
 
 ```bash
 python -m recipes.inference.generate \
-  config=/path/to/config.json \
   job_config=recipes/inference/configs/JOB_CONFIG \
   source_job_id=TRAINING_JOB_ID \
   checkpoint_id=CHECKPOINT_ID \
@@ -240,7 +226,6 @@ on contest math, run MATH-500 against the same checkpoint (harder than GSM8K):
 
 ```bash
 python -m recipes.inference.evaluate \
-  config=/path/to/config.json \
   job_config=configs/qwen3_8b_lora.json \
   source_job_id=TRAINING_JOB_ID \
   checkpoint_id=CHECKPOINT_ID \
@@ -254,7 +239,6 @@ After identity SFT, score the percent of completions that contain
 
 ```bash
 python -m recipes.inference.evaluate \
-  config=/path/to/config.json \
   job_config=configs/qwen3_8b_lora.json \
   source_job_id=TRAINING_JOB_ID \
   checkpoint_id=CHECKPOINT_ID \

@@ -21,36 +21,32 @@ cortex-training capacity
 
 ```bash
 # Qwen3-8B LoRA (default)
-python -m recipes.rl.math_grpo.train \
-  config=/path/to/config.json
+python -m recipes.rl.math_grpo.train
 
 # Qwen3-8B full-parameter
 python -m recipes.rl.math_grpo.train \
-  config=/path/to/config.json \
   job_config=configs/qwen3_8b_full.json
 
 # Qwen3.6-35B-A3B LoRA
 python -m recipes.rl.math_grpo.train \
-  config=/path/to/config.json \
   job_config=configs/qwen36_35b_a3b_lora.json \
   max_tokens=2048
 
 # Qwen3.6-35B-A3B full-parameter
 python -m recipes.rl.math_grpo.train \
-  config=/path/to/config.json \
   job_config=configs/qwen36_35b_a3b_full.json \
   max_tokens=2048
 
 # Qwen3.8-27B full-parameter
 python -m recipes.rl.math_grpo.train \
-  config=/path/to/config.json \
   job_config=configs/qwen38_27b_full.json \
   weight_sync_bucket_size=3221225472 \
   max_tokens=2048
 ```
 
-`config=` is the Snowflake connection file. Adapt from
-`examples/config/connection.json.template`.
+Recipes use the connection you set up once in
+[Authentication](../../docs/getting-started/authentication.md). Connection problems? See the same page. To use a specific JSON file, add
+`config=/path/to/config.json` (start from `examples/config/connection.json.template`).
 
 The default job body is `configs/qwen3_8b_lora.json`. The default run will be finished within 1h.
 
@@ -58,7 +54,6 @@ The default job body is `configs/qwen3_8b_lora.json`. The default run will be fi
 
 ```bash
 python -m recipes.rl.math_grpo.train \
-  config=/path/to/config.json \
   job_config=JOB_CONFIG \
   max_tokens=MAX_TOKENS \
   problems_per_batch=PROBLEMS_PER_BATCH \
@@ -214,7 +209,6 @@ decoding settings.
 
 ```bash
 python -m recipes.inference.evaluate \
-  config=/path/to/config.json \
   job_config=JOB_CONFIG \
   source_job_id=TRAINING_JOB_ID \
   checkpoint_id=CHECKPOINT_ID \
