@@ -297,6 +297,16 @@ def test_moe_rl_recipes_have_runnable_parallelism():
             1,
             4,
         ),
+        "nemotron35_lightning_30b.json": (
+            "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+            4,
+            4,
+            4,
+            "flash_attention_3",
+            4096,
+            1,
+            4,
+        ),
         "glm53_flash.json": (
             "zai-org/GLM-5.3-Flash",
             32,
@@ -380,6 +390,7 @@ def test_moe_rl_recipes_have_runnable_parallelism():
         if filename in {
             "qwen3_30b_a3b.json",
             "nemotron3_nano_30b.json",
+            "nemotron35_lightning_30b.json",
         }:
             assert "offload_optimizer" not in ds_config["zero_optimization"]
         else:

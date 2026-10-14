@@ -80,7 +80,8 @@ Other full-parameter job bodies are:
 - `configs/qwen35_9b_full.json`: Qwen3.5-9B, 8 training GPUs, SP8, 8 sampling GPUs at TP8, 256K. One optimizer step and an 8-token sample completed on H200.
 - `configs/qwen3_30b_a3b.json`
 - `configs/glm45_air.json`
-- `configs/nemotron3_nano_30b.json`
+- `configs/nemotron3_nano_30b.json`: Nemotron-3-Nano, 4 training GPUs, EP4, 4 sampling GPUs at TP4, 4K
+- `configs/nemotron35_lightning_30b.json`: Nemotron-3.5-Lightning, same 4K mesh as Nano
 - `configs/glm53_flash.json` (FP8 weights)
 - `configs/glm53_flash_bf16.json`
 - `configs/qwen38_flash_next.json`
