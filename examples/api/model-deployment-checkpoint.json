@@ -1,0 +1,16 @@
+{
+  "deployment": {
+    "class": "EVALUATION",
+    "min_replicas": 1,
+    "gpus_per_replica": 1,
+    "gpu_type": "H200"
+  },
+  "source": {
+    "type": "checkpoint",
+    "job_id": "SOURCE_TRAINING_JOB_UUID",
+    "checkpoint_id": "COMPLETED_WEIGHTS_ONLY_CHECKPOINT_ID"
+  },
+  "inference": {
+    "max_seq_len": 8192
+  }
+}

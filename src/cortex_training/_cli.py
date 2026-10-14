@@ -32,6 +32,12 @@ from typing import Any
 from typing import Callable
 from typing import TextIO
 
+from .model_deployment import OUT_BASE_URL
+from .model_deployment import OUT_DEPLOYMENT
+from .model_deployment import OUT_FAILURE
+from .model_deployment import OUT_STATUS
+from .model_deployment import ModelDeploymentSpec
+
 _CONFIG_KEYS = {
     "base_url",
     "host",
@@ -285,6 +291,71 @@ def _positive_int(value: str) -> int:
     return number
 
 
+def _add_model_deployment_common_args(parser: argparse.ArgumentParser) -> None:
+    """Add ``--database``, ``--schema``, and ``--compact`` to a subcommand.
+
+    They are also accepted before ``model-deployment``; SUPPRESS keeps a value
+    given there unless the subcommand repeats the flag.
+    """
+    parser.add_argument(
+        "--database",
+        default=argparse.SUPPRESS,
+        help="Database containing the model deployment.",
+    )
+    parser.add_argument(
+        "--schema",
+        default=argparse.SUPPRESS,
+        help="Schema containing the model deployment.",
+    )
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Print compact JSON instead of pretty JSON.",
+    )
+
+
+def _add_model_deployment_positional_arg(parser: argparse.ArgumentParser) -> None:
+    """Add the ``DEPLOYMENT`` positional argument naming one model deployment."""
+    parser.add_argument(
+        "deployment",
+        metavar="DEPLOYMENT",
+        help="The deployment (currently an sf-ct-<UUID> ID).",
+    )
+
+
+def _add_model_deployment_timeout_arg(parser: argparse.ArgumentParser) -> None:
+    """Add ``--timeout``, a per-command alias for the global ``--poll-timeout``."""
+    parser.add_argument(
+        "--timeout",
+        dest="poll_timeout",
+        type=float,
+        default=argparse.SUPPRESS,
+        metavar="SECONDS",
+        help="Seconds to wait for READY before giving up (default: --poll-timeout).",
+    )
+
+
+# Printed by ``model-deployment create --help``.
+_MODEL_DEPLOYMENT_SPEC_EXAMPLE = """\
+example spec (base model):
+  {
+    "deployment": {"class": "EVALUATION", "min_replicas": 1,
+                   "gpus_per_replica": 1, "gpu_type": "H200"},
+    "source": {"type": "base_model", "model": "Qwen/Qwen3-1.7B"},
+    "inference": {"max_seq_len": 8192}
+  }
+
+For a checkpoint, use:
+  "source": {"type": "checkpoint", "job_id": "TRAINING_JOB_UUID",
+             "checkpoint_id": "CHECKPOINT_ID"}
+
+Only EVALUATION is supported today. gpu_type is H200, B200, or B300; gpus_per_replica is 1, 2, 4, or 8; and
+min_replicas * gpus_per_replica must be at most 8 or a multiple of 8. Use
+--dry-run to check a spec without creating anything.
+"""
+
+
 def build_parser(
     *,
     prog: str = "cortex-training",
@@ -337,8 +408,16 @@ def build_parser(
         action="store_true",
         help="Disable SSL certificate verification for authenticated requests.",
     )
-    parser.add_argument("--poll-interval", type=float)
-    parser.add_argument("--poll-timeout", type=float)
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        help="Initial seconds between status polls while waiting.",
+    )
+    parser.add_argument(
+        "--poll-timeout",
+        type=float,
+        help="Seconds to wait for a job or model deployment before giving up.",
+    )
     parser.add_argument(
         "--compact",
         action="store_true",
@@ -605,6 +684,118 @@ def build_parser(
             "the same directory at once are unsupported."
         ),
     )
+
+    model_deployment = subparsers.add_parser(
+        "model-deployment",
+        help="Create and manage OpenAI-compatible evaluation deployments.",
+    )
+    deployment_commands = model_deployment.add_subparsers(
+        dest="model_deployment_command", required=True
+    )
+
+    deployment_create = deployment_commands.add_parser(
+        "create",
+        help="Create an evaluation deployment from a base model or checkpoint.",
+        description=(
+            "Create an evaluation deployment. Checkpoint sources must name a "
+            "completed Cortex Training weights-only checkpoint."
+        ),
+        epilog=_MODEL_DEPLOYMENT_SPEC_EXAMPLE,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_model_deployment_common_args(deployment_create)
+    deployment_create.add_argument(
+        "--spec",
+        "--spec-file",
+        dest="spec_file",
+        required=True,
+        help=(
+            "Deployment JSON file. --spec-file is a deprecated alias. "
+            "Checkpoint sources require a completed weights-only save."
+        ),
+    )
+    create_mode = deployment_create.add_mutually_exclusive_group()
+    create_mode.add_argument(
+        "--wait",
+        action="store_true",
+        help=(
+            "Wait until the deployment reaches READY or a terminal failure "
+            "state, then print its metadata."
+        ),
+    )
+    create_mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate the spec and print it as it would be sent; create nothing.",
+    )
+    _add_model_deployment_timeout_arg(deployment_create)
+
+    deployment_list = deployment_commands.add_parser(
+        "list",
+        help=(
+            "List the ID and status of each model deployment in the database and "
+            "schema. Use describe for details."
+        ),
+    )
+    _add_model_deployment_common_args(deployment_list)
+    deployment_list.add_argument(
+        "--status",
+        action="append",
+        metavar="STATUS",
+        help=(
+            "Only list deployments in this status (e.g. READY, PENDING, DROPPED). "
+            "Repeat to allow several."
+        ),
+    )
+
+    deployment_describe = deployment_commands.add_parser(
+        "describe",
+        help="Show one model deployment's status, endpoint, and configuration.",
+        description=(
+            "Show one model deployment: status, base URL, database and schema, "
+            "creator, owner role, and its configuration grouped under spec."
+        ),
+    )
+    _add_model_deployment_common_args(deployment_describe)
+    _add_model_deployment_positional_arg(deployment_describe)
+
+    deployment_wait = deployment_commands.add_parser(
+        "wait", help="Wait until one model deployment is READY or terminal."
+    )
+    _add_model_deployment_common_args(deployment_wait)
+    _add_model_deployment_timeout_arg(deployment_wait)
+    _add_model_deployment_positional_arg(deployment_wait)
+
+    deployment_download_log = deployment_commands.add_parser(
+        "download-log", help="Download logs for one model deployment."
+    )
+    _add_model_deployment_common_args(deployment_download_log)
+    _add_model_deployment_positional_arg(deployment_download_log)
+    deployment_download_log.add_argument(
+        "--log-type",
+        choices=("execution", "stdout"),
+        default="execution",
+    )
+    deployment_download_log.add_argument(
+        "--output-dir",
+        help="Directory to write deployment logs. Defaults to the current directory.",
+    )
+
+    deployment_download_metrics = deployment_commands.add_parser(
+        "download-metrics", help="Download metrics for one model deployment."
+    )
+    _add_model_deployment_common_args(deployment_download_metrics)
+    _add_model_deployment_positional_arg(deployment_download_metrics)
+    deployment_download_metrics.add_argument(
+        "--output-dir",
+        help="Directory to write deployment metrics. Defaults to the current directory.",
+    )
+
+    deployment_drop = deployment_commands.add_parser(
+        "drop", help="Drop one model deployment. Safe to retry."
+    )
+    _add_model_deployment_common_args(deployment_drop)
+    _add_model_deployment_positional_arg(deployment_drop)
 
     login = subparsers.add_parser(
         "login",
@@ -1300,6 +1491,156 @@ def _cmd_download_metrics(
     return 0
 
 
+class _InterruptedCommand(Exception):
+    """Ctrl+C stopped a command; the message says what is still running."""
+
+
+def _still_running_message(deployment_id: str) -> str:
+    return (
+        f"{deployment_id} is still running; run `cortex-training model-deployment "
+        f"wait {deployment_id}` to keep waiting, or `cortex-training "
+        f"model-deployment drop {deployment_id}` to release its GPUs"
+    )
+
+
+def _model_deployment_summary(metadata: dict) -> dict:
+    """What ``create`` and ``wait`` print: ID, status, base URL, and failure."""
+    summary = {
+        key: metadata[key]
+        for key in (OUT_DEPLOYMENT, OUT_STATUS, OUT_BASE_URL)
+        if key in metadata
+    }
+    if OUT_FAILURE in metadata:
+        summary[OUT_FAILURE] = metadata[OUT_FAILURE]
+    return summary
+
+
+def _cmd_model_deployment_create(
+    args: argparse.Namespace,
+    client,
+    stdout: TextIO,
+    stdin: TextIO,
+) -> int:
+    """Run ``model-deployment create``, optionally waiting for ``READY``."""
+    raw_spec = _read_json_object(args.spec_file, stdin)
+    if args.dry_run:
+        spec = ModelDeploymentSpec.from_dict(raw_spec)
+        _print_json(spec.to_public_spec(), stdout, compact=args.compact)
+        return 0
+    output = client.create_model_deployment(raw_spec)
+    if args.wait:
+        deployment_id = output[OUT_DEPLOYMENT]
+        try:
+            output = client.wait_for_model_deployment(deployment_id)
+        except KeyboardInterrupt:
+            # Keep the deployment ID visible; the deployment keeps running and
+            # is not dropped automatically.
+            _print_json(_model_deployment_summary(output), stdout, compact=args.compact)
+            stdout.flush()
+            raise _InterruptedCommand(_still_running_message(deployment_id)) from None
+        except Exception as exc:
+            # Keep the deployment ID visible so a failed wait can be retried or
+            # dropped, with the last status the wait saw rather than PENDING.
+            output = getattr(exc, "deployment", None) or output
+            _print_json(_model_deployment_summary(output), stdout, compact=args.compact)
+            stdout.flush()
+            raise
+    _print_json(_model_deployment_summary(output), stdout, compact=args.compact)
+    return 0
+
+
+def _cmd_model_deployment_list(args: argparse.Namespace, client, stdout: TextIO) -> int:
+    """Run ``model-deployment list``: each deployment's ID and status only.
+
+    ``describe`` shows the rest. Rows are ordered by creation time first.
+    """
+    deployments = _jobs_latest_last(client.list_model_deployments(status=args.status))
+    rows = [
+        {"deployment": item["deployment"], "status": item["status"]}
+        for item in deployments
+    ]
+    _print_json({"deployments": rows}, stdout, compact=args.compact)
+    return 0
+
+
+def _cmd_model_deployment_wait(args: argparse.Namespace, client, stdout: TextIO) -> int:
+    """Run ``model-deployment wait``; prints the same summary as ``create``."""
+    try:
+        metadata = client.wait_for_model_deployment(args.deployment)
+    except KeyboardInterrupt:
+        raise _InterruptedCommand(_still_running_message(args.deployment)) from None
+    _print_json(_model_deployment_summary(metadata), stdout, compact=args.compact)
+    return 0
+
+
+def _cmd_model_deployment_describe(
+    args: argparse.Namespace, client, stdout: TextIO
+) -> int:
+    """Run ``model-deployment describe``."""
+    _print_json(
+        client.describe_model_deployment(args.deployment),
+        stdout,
+        compact=args.compact,
+    )
+    return 0
+
+
+def _cmd_model_deployment_download_log(
+    args: argparse.Namespace, client, stdout: TextIO
+) -> int:
+    """Run ``model-deployment download-log``."""
+    output_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.cwd()
+    result = client.download_model_deployment_logs(
+        args.deployment, output_dir, log_type=args.log_type
+    )
+    _print_json(result, stdout, compact=args.compact)
+    return 0
+
+
+def _cmd_model_deployment_download_metrics(
+    args: argparse.Namespace, client, stdout: TextIO
+) -> int:
+    """Run ``model-deployment download-metrics``."""
+    output_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.cwd()
+    result = client.download_model_deployment_metrics(
+        args.deployment, output_dir
+    )
+    _print_json(result, stdout, compact=args.compact)
+    return 0
+
+
+def _cmd_model_deployment_drop(args: argparse.Namespace, client, stdout: TextIO) -> int:
+    """Run ``model-deployment drop``."""
+    result = client.drop_model_deployment(args.deployment)
+    _print_json(result, stdout, compact=args.compact)
+    return 0
+
+
+def _cmd_model_deployment(
+    args: argparse.Namespace,
+    client,
+    stdout: TextIO,
+    stdin: TextIO,
+) -> int:
+    """Dispatch a ``model-deployment`` subcommand to its handler."""
+    command = args.model_deployment_command
+    if command == "create":
+        return _cmd_model_deployment_create(args, client, stdout, stdin)
+    if command == "list":
+        return _cmd_model_deployment_list(args, client, stdout)
+    if command == "describe":
+        return _cmd_model_deployment_describe(args, client, stdout)
+    if command == "wait":
+        return _cmd_model_deployment_wait(args, client, stdout)
+    if command == "download-log":
+        return _cmd_model_deployment_download_log(args, client, stdout)
+    if command == "download-metrics":
+        return _cmd_model_deployment_download_metrics(args, client, stdout)
+    if command == "drop":
+        return _cmd_model_deployment_drop(args, client, stdout)
+    raise ValueError(f"unknown model-deployment command: {command}")
+
+
 def _is_unsupported_hardware(exc: BaseException) -> bool:
     """Whether a capacity lookup failed only because the account lacks that GPU type."""
     response = getattr(exc, "response", None)
@@ -1391,6 +1732,8 @@ def _run(
         return _cmd_download_log(args, client, stdout)
     if args.command == "download-metrics":
         return _cmd_download_metrics(args, client, stdout)
+    if args.command == "model-deployment":
+        return _cmd_model_deployment(args, client, stdout, stdin)
     raise ValueError(f"unknown command: {args.command}")
 
 
@@ -1410,7 +1753,11 @@ def main(
 
     try:
         args = parse_args(argv, prog=prog, include_tui=include_tui)
-        dry_run = args.command == "submit" and args.dry_run
+        dry_run = (args.command == "submit" and args.dry_run) or (
+            args.command == "model-deployment"
+            and args.model_deployment_command == "create"
+            and args.dry_run
+        )
         no_client = dry_run or args.command == "login"
         if client_factory is None and not no_client:
             cortex_training_client_cls = _load_cortex_training_client_class()
@@ -1426,6 +1773,9 @@ def main(
 
             client_factory = empty_client_factory
         return _run(args, client_factory, stdout, stdin)
+    except _InterruptedCommand as exc:
+        print(f"interrupted; {exc}", file=stderr)
+        return 130
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"error: {_format_error(exc)}", file=stderr)
         return 1
