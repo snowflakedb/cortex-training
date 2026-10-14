@@ -25,8 +25,10 @@ The DeepSeek V4 and GLM 5.2 FP8 1M recommendations were validated with
 1,048,575 pre-tokenized input tokens plus one generated token, not only with
 short prompts.
 
-For `Qwen/Qwen3.6-35B-A3B`, LoRA support is limited to `q_proj`, `k_proj`,
-`v_proj`, and `o_proj`. Routed expert LoRA is not yet supported.
+For `Qwen/Qwen3.6-35B-A3B`, LoRA training and checkpoint save/load require the
+`prime_rl` model provider. Current PrimeRL LoRA support for this MoE model is
+limited to `q_proj`, `k_proj`, `v_proj`, and `o_proj`. Routed expert LoRA is not
+yet supported.
 
 Validate catalog changes with:
 

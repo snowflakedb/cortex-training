@@ -10,6 +10,7 @@
         "max_seq_len": 131072,
         "train_batch_size": 1,
         "gradient_clipping": 1.0,
+        "model_provider": "prime_rl",
         "attn_implementation": "flash_attention_3",
         "cuda_allocator_conf": "expandable_segments:True",
         "activation_checkpointing": true,

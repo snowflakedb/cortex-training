@@ -9,7 +9,8 @@ python -m recipes.sft.conversational.train \
   config=/path/to/config.json
 ```
 
-For a MoE model, use the matching config, which sets `ep_size`:
+For a MoE model, use the matching config, which sets `model_provider` and
+`ep_size`:
 
 ```bash
 python -m recipes.sft.conversational.train \

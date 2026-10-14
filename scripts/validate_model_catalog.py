@@ -262,6 +262,17 @@ def _validate_profile_reference(
         )
 
     if model_id == QWEN36_MODEL_ID and profile_key in {"sftLora", "rlLora"}:
+        training_sub_job = next(
+            sub_job
+            for sub_job in profile["subJobs"]
+            if sub_job["builder"] == "training_job"
+        )
+        training_extra = training_sub_job["args"].get("extra_training") or {}
+        if training_extra.get("model_provider") != "prime_rl":
+            raise CatalogValidationError(
+                f"model {model_id}.{profile_key}{variant}: LoRA save/load requires "
+                "extra_training.model_provider='prime_rl'"
+            )
         for sub_job in profile["subJobs"]:
             args = sub_job["args"]
             extra = args.get("extra_training") or args.get("extra_sampling") or {}
@@ -361,7 +372,7 @@ def _validate_profile_reference(
             if (
                 max_context >= LONG_CONTEXT_TRAINING_THRESHOLD
                 and profile_key in {"sftLora", "sftFull"}
-                and int(extra_training.get("ep_size") or 1) == 1
+                and extra_training.get("model_provider", "huggingface") != "prime_rl"
             ):
                 _require_positive_int(
                     extra_training.get("fused_lm_head_token_chunk_size"),

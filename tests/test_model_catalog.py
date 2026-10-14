@@ -241,7 +241,7 @@ def test_moe_sft_recipes_have_runnable_parallelism():
         assert sub_job["job_type"] == "training"
         assert sub_job["model_name"] == model_id
         assert sub_job["dtype"] == "bfloat16"
-        assert "model_provider" not in training
+        assert training["model_provider"] == "prime_rl"
         if filename in {
             "glm53_flash.json",
             "glm53_flash_bf16.json",
@@ -378,7 +378,7 @@ def test_moe_rl_recipes_have_runnable_parallelism():
         assert training["job_type"] == "training"
         assert training["model_name"] == model_id
         assert training["dtype"] == "bfloat16"
-        assert "model_provider" not in training_config
+        assert training_config["model_provider"] == "prime_rl"
         if filename in {
             "glm53_flash.json",
             "glm53_flash_bf16.json",
@@ -835,7 +835,7 @@ def test_qwen36_lora_uses_prime_rl_attention_targets(
         for sub_job in request["sub_job_configs"]
         if sub_job["job_type"] == "training"
     )
-    assert "model_provider" not in training
+    assert training["model_provider"] == "prime_rl"
     assert training.get("sp_size", 1) == expected_sp
     assert {
         tuple(

@@ -98,6 +98,7 @@ shipped example or a copy with `job_config=JOB_CONFIG`.
         "train_batch_size": TRAIN_BATCH_SIZE,
         "sp_size": SEQUENCE_PARALLEL_SIZE,
         "gradient_clipping": GRADIENT_CLIPPING,
+        "model_provider": MODEL_PROVIDER, // Use prime_rl for MoE
         "attn_implementation": "flash_attention_3",
         "optimizer": {
           "name": "AdamW",
@@ -135,9 +136,9 @@ shipped example or a copy with `job_config=JOB_CONFIG`.
 ```
 
 The target list above is for dense Qwen models. For
-`Qwen/Qwen3.6-35B-A3B`, use the shipped LoRA config with attention-only
-targets (`q_proj`, `k_proj`, `v_proj`, and `o_proj`). PrimeRL does not yet
-support LoRA on routed experts;
+`Qwen/Qwen3.6-35B-A3B`, use the shipped LoRA config with
+`model_provider: "prime_rl"` and attention-only targets (`q_proj`, `k_proj`,
+`v_proj`, and `o_proj`). PrimeRL does not yet support LoRA on routed experts;
 `gate_proj`, `up_proj`, and `down_proj` do not select those parameters.
 The shipped Qwen3.6 configs use sequence parallel size 8 and logical batch 1
 to run at the model's 262K context limit. `qwen3_4b_instruct.json` and
@@ -151,8 +152,8 @@ at 65536 tokens.
 Full-parameter recipes. Renamed files use 256K, or the model's position
 limit when that limit is lower. The filename records sequence parallel,
 expert parallel, GPU count, and that length. The matching RL training block
-uses the same mesh. These recipes omit `model_provider`; expert parallelism
-selects the MoE runtime. Nemotron-3-Nano and MiniMax-M2 are still the 4K
+uses the same mesh. These recipes set `model_provider` to `prime_rl`.
+Nemotron-3-Nano and MiniMax-M2 are still the 4K
 bodies. Both GLM-5.3-Flash recipes set `ep_comm_backend` to `uccl` because
 cross-node EP16 does not complete with DeepEP.
 
