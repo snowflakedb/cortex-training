@@ -23,6 +23,7 @@ from .client import ChunkGroupConflictError
 from .client import ChunkGroupError
 from .client import ChunkGroupRestartError
 from .client import CortexTrainingClient
+from .client import DatabaseAccessError
 from .client import Hardware
 from .client import InferenceConfig
 from .client import JobType
@@ -39,6 +40,7 @@ __all__ = [
     "ChunkGroupError",
     "ChunkGroupRestartError",
     "ChunkGroupConflictError",
+    "DatabaseAccessError",
     "serialize_forward_backward_args",
     "SubJobConfig",
     "TrainingConfig",

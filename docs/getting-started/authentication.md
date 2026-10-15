@@ -95,9 +95,12 @@ any of these methods:
 cortex-training capacity
 ```
 
-This should print your available GPU capacity. The client automatically creates
-the configured database if it does not exist. If automatic creation fails (for
-example, your role lacks `CREATE DATABASE`), create it manually in Snowsight:
+This should print your available GPU capacity. When a request fails, the client
+checks once with `SHOW DATABASES` whether your role can see the configured
+database, and creates it only if it is not listed. If the database exists but
+your role can't access it, the error says so and names the `GRANT` to ask an
+admin for. If automatic creation fails (for example, your role lacks
+`CREATE DATABASE`), create it manually in Snowsight:
 
 ```sql
 CREATE DATABASE IF NOT EXISTS CORTEX_TRAINING_DB;

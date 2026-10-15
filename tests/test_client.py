@@ -121,6 +121,8 @@ def _make_error_response(json_body, status_code: int = 409):
     resp.url = "http://test.local/error"
     resp.headers["Content-Type"] = "application/json"
     resp._content = json.dumps(json_body).encode("utf-8")
+    # As after requests reads a non-streamed body, so close() needs no connection.
+    resp._content_consumed = True
     return resp
 
 
@@ -1050,6 +1052,8 @@ class TestOperationMetrics:
         response = _make_error_response({"code": "CORTEX_TRAINING_BAD_REQUEST"}, 400)
         response.headers["x-snowflake-request-id"] = "sf-request-1"
         c._session.post.return_value = response
+        # The one-time database check after a 400 is covered in TestEnsureDatabase.
+        c._db_ensured = True
 
         with pytest.raises(
             nc.requests.exceptions.HTTPError,
@@ -2508,8 +2512,6 @@ class TestIterJobs:
         with pytest.raises(nc.requests.exceptions.HTTPError, match="400 Client Error"):
             list(c.iter_jobs(database="NOPE"))
 
-        # The same response on a schema route would run CREATE DATABASE DB.
-        assert c._is_database_not_found(c._session.get.return_value)
         c._session.get.assert_called_once()
         c._session.post.assert_not_called()
         assert c._db_ensured is False
@@ -2686,7 +2688,6 @@ class TestForJob:
 
         # The listed database already exists and may belong to another role, so
         # the not-found answer surfaces instead of a CREATE DATABASE for it.
-        assert c._is_database_not_found(c._session.get.return_value)
         c._session.post.assert_not_called()
         assert job_client._db_ensured is False
 
@@ -5350,119 +5351,261 @@ class TestExecutionLogDownload:
 # ─── _ensure_database ──────────────────────────────────────────────────
 
 
+def _sql_rows(columns, rows):
+    """A SQL API response with the given columns and rows."""
+    return _make_response(
+        {"resultSetMetaData": {"rowType": [{"name": name} for name in columns]}, "data": rows}
+    )
+
+
+def _listed(*names):
+    """A ``SHOW DATABASES`` or ``SHOW SCHEMAS`` response listing ``names``."""
+    return _sql_rows(["created_on", "name"], [["2026-01-01", name] for name in names])
+
+
+def _created(message="Statement executed successfully."):
+    return _sql_rows(["status"], [[message]])
+
+
+def _role(name):
+    return _sql_rows(["CURRENT_ROLE()"], [[name]])
+
+
+def _sql_error(sqlstate, message):
+    """A failed SQL API statement, shaped like the API's error body."""
+    return _make_error_response({"code": "000000", "sqlState": sqlstate, "message": message}, 422)
+
+
+# The SQLSTATEs Snowflake returned in a dry run of CREATE DATABASE IF NOT EXISTS.
+_NO_CREATE_PRIVILEGE = "42501"
+_EXISTS_WITHOUT_ACCESS = "42710"
+
+
+_FAILED_REQUEST = {"message": "Schema MY_DB.SCH is not found or not authorized"}
+
+
 class TestEnsureDatabase:
-    def test_skipped_for_http_base_url(self):
-        """Mock/test mode: no DB check at all."""
-        c = CortexTrainingClient(base_url="http://test.local", database="DB", schema="SCH")
-        c._session = MagicMock()
-        c._session.get.return_value = _make_response({"jobs": []})
-        c._send("GET", f"{c.base_url}/test")
-        c._session.post.assert_not_called()
-
-    def test_no_extra_call_when_db_exists(self):
-        """Happy path: DB exists, no CREATE DATABASE call made."""
-        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
-        c._session = MagicMock()
-        api_resp = _make_response({"jobs": []})
-        c._session.get.return_value = api_resp
-        c._send("GET", f"{c.base_url}/api/v2/databases/MY_DB/schemas/SCH/cortex-training/jobs")
-        # Only the GET was made, no POST to /statements
-        c._session.post.assert_not_called()
-
-    def test_creates_db_on_not_found_then_retries(self):
-        """DB missing: first request fails, CREATE DATABASE, retry succeeds."""
-        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
-        c._session = MagicMock()
-        not_found_resp = _make_error_response(
-            {"code": "517602", "message": "Schema MY_DB.SCH is not found or not authorized"}, status_code=400
+    @staticmethod
+    def _client(database="MY_DB", schema="SCH"):
+        c = CortexTrainingClient(
+            base_url="https://test.snowflakecomputing.com", database=database, schema=schema
         )
-        create_resp = _make_response({"data": [["Database MY_DB successfully created."]]})
-        ok_resp = _make_response({"jobs": []})
-        c._session.get.side_effect = [not_found_resp, ok_resp]
-        c._session.post.return_value = create_resp
-        c._send("GET", f"{c.base_url}/test")
+        c._session = MagicMock()
+        return c
+
+    @staticmethod
+    def _statements(c):
+        return [call.kwargs["json"]["statement"] for call in c._session.post.call_args_list]
+
+    def test_no_extra_call_when_request_succeeds(self):
+        c = self._client()
+        c._session.get.return_value = _make_response({"jobs": []})
+        c._send("GET", f"{c.base_url}/api/v2/databases/MY_DB/schemas/SCH/cortex-training/jobs")
+        c._session.post.assert_not_called()
+        assert c._db_ensured is False
+
+    def test_server_errors_do_not_trigger_the_check(self):
+        c = self._client()
+        c.max_retries = 0
+        c._session.get.return_value = _make_error_response({"message": "boom"}, 500)
+        with pytest.raises(nc.requests.exceptions.HTTPError, match="500"):
+            c._send("GET", f"{c.base_url}/test")
+        c._session.post.assert_not_called()
+
+    def test_listed_database_keeps_the_original_error(self):
+        """The database exists, so something else is wrong: no CREATE."""
+        c = self._client()
+        c._session.get.return_value = _make_error_response(
+            {"message": "Stage MY_DB.SCH.S does not exist or not authorized."}, 400
+        )
+        c._session.post.side_effect = [_listed("MY_DB"), _listed("SCH")]
+        with pytest.raises(nc.requests.exceptions.HTTPError, match="400 Client Error"):
+            c._send("GET", f"{c.base_url}/test")
+        assert self._statements(c) == [
+            "SHOW DATABASES LIKE 'MY_DB'",
+            "SHOW SCHEMAS LIKE 'SCH' IN DATABASE MY_DB",
+        ]
+        c._session.get.assert_called_once()
         assert c._db_ensured is True
-        create_call = c._session.post.call_args_list[0]
-        assert "/api/v2/statements" in create_call.args[0]
-        assert "CREATE DATABASE IF NOT EXISTS MY_DB" in create_call.kwargs["json"]["statement"]
+
+    def test_checks_once_per_client(self):
+        c = self._client(schema="PUBLIC")
+        c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
+        c._session.post.return_value = _listed("MY_DB")
+        for _ in range(2):
+            with pytest.raises(nc.requests.exceptions.HTTPError):
+                c._send("GET", f"{c.base_url}/test")
+        assert self._statements(c) == ["SHOW DATABASES LIKE 'MY_DB'"]
+
+    def test_failed_check_keeps_the_original_error(self):
+        """When the check cannot run, nothing is guessed or created."""
+        c = self._client()
+        c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
+        c._session.post.return_value = _make_error_response({"message": "denied"}, 401)
+        with pytest.raises(nc.requests.exceptions.HTTPError, match="400 Client Error"):
+            c._send("GET", f"{c.base_url}/test")
+        assert self._statements(c) == ["SHOW DATABASES LIKE 'MY_DB'"]
+        assert c._db_ensured is True
+
+    def test_unfinished_check_keeps_the_original_error(self):
+        c = self._client()
+        c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
+        c._session.post.return_value = _make_response({}, status_code=202)
+        with pytest.raises(nc.requests.exceptions.HTTPError, match="400 Client Error"):
+            c._send("GET", f"{c.base_url}/test")
+        assert self._statements(c) == ["SHOW DATABASES LIKE 'MY_DB'"]
+
+    def test_creates_db_when_not_listed_then_retries(self):
+        c = self._client(schema="PUBLIC")
+        ok = _make_response({"jobs": []})
+        c._session.get.side_effect = [_make_error_response(_FAILED_REQUEST, 400), ok]
+        c._session.post.side_effect = [_listed(), _created()]
+        assert c._send("GET", f"{c.base_url}/test") is ok
+        assert self._statements(c) == [
+            "SHOW DATABASES LIKE 'MY_DB'",
+            "CREATE DATABASE IF NOT EXISTS MY_DB",
+        ]
+        assert all("/api/v2/statements" in call.args[0] for call in c._session.post.call_args_list)
         assert c._session.get.call_count == 2
 
-    def test_only_retries_once(self):
-        """If DB is still missing after CREATE, don't loop — raise the error."""
-        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
-        c._session = MagicMock()
-        not_found_resp = _make_error_response(
-            {"code": "517602", "message": "Schema MY_DB.SCH is not found or not authorized"}, status_code=400
-        )
-        create_resp = _make_response({"data": [["OK"]]})
-        c._session.get.return_value = not_found_resp
-        c._session.post.return_value = create_resp
-        with pytest.raises(RuntimeError, match="CREATE DATABASE IF NOT EXISTS"):
+    def test_no_create_privilege_says_the_role_cannot_find_or_create_it(self):
+        c = self._client(schema="PUBLIC")
+        c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
+        c._session.post.side_effect = [
+            _listed(),
+            _sql_error(_NO_CREATE_PRIVILEGE, "Your primary role must have CREATE DATABASE granted on ACCOUNT."),
+            _role("TRAINER"),
+        ]
+        with pytest.raises(nc.DatabaseAccessError) as exc:
             c._send("GET", f"{c.base_url}/test")
-        assert c._db_ensured is True
+        message = str(exc.value)
+        assert message.startswith("Role TRAINER can't find database MY_DB and can't create it.")
+        assert "GRANT CREATE DATABASE ON ACCOUNT TO ROLE TRAINER" in message
+        assert "GRANT USAGE ON DATABASE MY_DB TO ROLE TRAINER" in message
+        assert (exc.value.kind, exc.value.name, exc.value.role, exc.value.exists) == (
+            "database", "MY_DB", "TRAINER", None
+        )
+        assert exc.value.statement == "CREATE DATABASE IF NOT EXISTS MY_DB"
+        assert isinstance(exc.value, RuntimeError)
+        c._session.get.assert_called_once()
 
-    def test_raises_when_create_fails_permission(self):
-        """CREATE DATABASE fails with 403: raise with actionable message."""
-        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
-        c._session = MagicMock()
-        not_found_resp = _make_error_response(
-            {"code": "517602", "message": "Schema MY_DB.SCH is not found or not authorized"}, status_code=400
-        )
-        perm_resp = _make_error_response({"message": "Insufficient privileges"}, status_code=403)
-        c._session.get.return_value = not_found_resp
-        c._session.post.return_value = perm_resp
-        with pytest.raises(RuntimeError, match="CREATE DATABASE IF NOT EXISTS"):
+    def test_hidden_database_says_it_exists_but_is_not_accessible(self):
+        """Snowflake reports the database exists but the role has no privileges on it."""
+        c = self._client(schema="PUBLIC")
+        c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
+        c._session.post.side_effect = [
+            _listed(),
+            _sql_error(_EXISTS_WITHOUT_ACCESS, "Database 'MY_DB' already exists, but current role has no privileges on it."),
+            _role("TRAINER"),
+        ]
+        with pytest.raises(nc.DatabaseAccessError) as exc:
             c._send("GET", f"{c.base_url}/test")
+        assert str(exc.value) == (
+            "Database MY_DB exists, but role TRAINER can't access it. Ask an admin to run "
+            "`GRANT USAGE ON DATABASE MY_DB TO ROLE TRAINER`, or use a role or database you can access."
+        )
+        assert exc.value.exists is True
+        # No retry: the request cannot succeed until access is granted.
+        c._session.get.assert_called_once()
+
+    def test_other_create_failure_names_the_statement(self):
+        c = self._client(schema="PUBLIC")
+        c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
+        c._session.post.side_effect = [_listed(), _make_response({}, status_code=202), _role("TRAINER")]
+        with pytest.raises(nc.DatabaseAccessError) as exc:
+            c._send("GET", f"{c.base_url}/test")
+        assert str(exc.value) == (
+            "Could not create database MY_DB with role TRAINER. "
+            "Run `CREATE DATABASE IF NOT EXISTS MY_DB` in Snowsight, or ask an admin to."
+        )
+
+    def test_retry_failure_after_create_keeps_the_original_error(self):
+        c = self._client(schema="PUBLIC")
+        c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
+        c._session.post.side_effect = [_listed(), _created()]
+        with pytest.raises(nc.requests.exceptions.HTTPError, match="400 Client Error"):
+            c._send("GET", f"{c.base_url}/test")
+        assert c._session.get.call_count == 2
+        assert len(self._statements(c)) == 2
+
+    def test_unknown_role_says_your_role(self):
+        c = self._client(schema="PUBLIC")
+        c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
+        c._session.post.side_effect = [
+            _listed(),
+            _sql_error(_NO_CREATE_PRIVILEGE, "Insufficient privileges"),
+            _make_error_response({"message": "denied"}, 403),
+        ]
+        with pytest.raises(nc.DatabaseAccessError) as exc:
+            c._send("GET", f"{c.base_url}/test")
+        assert str(exc.value).startswith("Your role can't find database MY_DB and can't create it.")
+        assert "TO ROLE <ROLE>" in str(exc.value)
+
+    def test_lowercase_database_name_matches_its_stored_name(self):
+        """Unquoted names resolve to upper case, as in the URL path."""
+        c = self._client(database="my_db", schema="PUBLIC")
+        c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
+        c._session.post.return_value = _listed("MY_DB")
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c._send("GET", f"{c.base_url}/test")
+        assert self._statements(c) == ["SHOW DATABASES LIKE 'my_db'"]
 
     def test_lowercase_database_name_not_quoted(self):
-        """Lowercase DB names are NOT quoted — SQL resolves the same as the URL path."""
-        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="my_db", schema="SCH")
-        c._session = MagicMock()
-        not_found_resp = _make_error_response(
-            {"code": "517602", "message": "Schema MY_DB.SCH is not found or not authorized"}, status_code=400
-        )
-        create_resp = _make_response({"data": [["OK"]]})
-        ok_resp = _make_response({"jobs": []})
-        c._session.get.side_effect = [not_found_resp, ok_resp]
-        c._session.post.return_value = create_resp
+        c = self._client(database="my_db", schema="PUBLIC")
+        c._session.get.side_effect = [_make_error_response(_FAILED_REQUEST, 400), _make_response({"jobs": []})]
+        # LIKE treats "_" as a wildcard, so a near match must not count as listed.
+        c._session.post.side_effect = [_listed("MYXDB"), _created()]
         c._send("GET", f"{c.base_url}/test")
-        create_call = c._session.post.call_args_list[0]
-        stmt = create_call.kwargs["json"]["statement"]
-        assert stmt == "CREATE DATABASE IF NOT EXISTS my_db"
-        assert '"' not in stmt
+        assert self._statements(c)[1] == "CREATE DATABASE IF NOT EXISTS my_db"
 
-    def test_creates_schema_when_not_public(self):
-        """Non-PUBLIC schema triggers CREATE SCHEMA after CREATE DATABASE."""
-        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="CUSTOM")
-        c._session = MagicMock()
-        not_found_resp = _make_error_response(
-            {"code": "517602", "message": "Schema MY_DB.CUSTOM is not found or not authorized"}, status_code=400
-        )
-        create_db_resp = _make_response({"data": [["Database MY_DB successfully created."]]})
-        create_schema_resp = _make_response({"data": [["Schema CUSTOM successfully created."]]})
-        ok_resp = _make_response({"jobs": []})
-        c._session.get.side_effect = [not_found_resp, ok_resp]
-        c._session.post.side_effect = [create_db_resp, create_schema_resp]
+    def test_creates_db_and_schema_when_not_public(self):
+        c = self._client(schema="CUSTOM")
+        c._session.get.side_effect = [_make_error_response(_FAILED_REQUEST, 400), _make_response({"jobs": []})]
+        c._session.post.side_effect = [_listed(), _created(), _created()]
         c._send("GET", f"{c.base_url}/test")
-        assert c._db_ensured is True
-        assert c._session.post.call_count == 2
-        db_call = c._session.post.call_args_list[0]
-        assert "CREATE DATABASE IF NOT EXISTS MY_DB" in db_call.kwargs["json"]["statement"]
-        schema_call = c._session.post.call_args_list[1]
-        assert "CREATE SCHEMA IF NOT EXISTS MY_DB.CUSTOM" in schema_call.kwargs["json"]["statement"]
+        assert self._statements(c) == [
+            "SHOW DATABASES LIKE 'MY_DB'",
+            "CREATE DATABASE IF NOT EXISTS MY_DB",
+            "CREATE SCHEMA IF NOT EXISTS MY_DB.CUSTOM",
+        ]
 
-    def test_skips_schema_creation_for_public(self):
-        """PUBLIC schema does not trigger CREATE SCHEMA."""
-        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="PUBLIC")
-        c._session = MagicMock()
-        not_found_resp = _make_error_response(
-            {"code": "517602", "message": "Schema MY_DB.PUBLIC is not found or not authorized"}, status_code=400
-        )
-        create_db_resp = _make_response({"data": [["Database MY_DB successfully created."]]})
-        ok_resp = _make_response({"jobs": []})
-        c._session.get.side_effect = [not_found_resp, ok_resp]
-        c._session.post.return_value = create_db_resp
+    def test_creates_only_the_schema_when_the_database_is_listed(self):
+        c = self._client(schema="CUSTOM")
+        c._session.get.side_effect = [_make_error_response(_FAILED_REQUEST, 400), _make_response({"jobs": []})]
+        c._session.post.side_effect = [_listed("MY_DB"), _listed(), _created()]
         c._send("GET", f"{c.base_url}/test")
-        assert c._db_ensured is True
-        # Only one POST for CREATE DATABASE, no schema creation
-        assert c._session.post.call_count == 1
+        assert self._statements(c) == [
+            "SHOW DATABASES LIKE 'MY_DB'",
+            "SHOW SCHEMAS LIKE 'CUSTOM' IN DATABASE MY_DB",
+            "CREATE SCHEMA IF NOT EXISTS MY_DB.CUSTOM",
+        ]
+
+    def test_schema_create_failure_names_the_schema(self):
+        c = self._client(schema="CUSTOM")
+        c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
+        c._session.post.side_effect = [
+            _listed("MY_DB"),
+            _listed(),
+            _sql_error(_NO_CREATE_PRIVILEGE, "Insufficient privileges"),
+            _role("TRAINER"),
+        ]
+        with pytest.raises(nc.DatabaseAccessError) as exc:
+            c._send("GET", f"{c.base_url}/test")
+        message = str(exc.value)
+        assert message.startswith("Role TRAINER can't find schema MY_DB.CUSTOM and can't create it.")
+        assert "GRANT CREATE SCHEMA ON DATABASE MY_DB TO ROLE TRAINER" in message
+        assert "GRANT USAGE ON SCHEMA MY_DB.CUSTOM TO ROLE TRAINER" in message
+
+    def test_hidden_schema_says_it_exists_but_is_not_accessible(self):
+        c = self._client(schema="CUSTOM")
+        c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
+        c._session.post.side_effect = [
+            _listed("MY_DB"),
+            _listed(),
+            _sql_error(_EXISTS_WITHOUT_ACCESS, "Schema 'CUSTOM' already exists, but current role has no privileges on it."),
+            _role("TRAINER"),
+        ]
+        with pytest.raises(nc.DatabaseAccessError) as exc:
+            c._send("GET", f"{c.base_url}/test")
+        assert str(exc.value).startswith("Schema MY_DB.CUSTOM exists, but role TRAINER can't access it.")
+        assert "GRANT USAGE ON SCHEMA MY_DB.CUSTOM TO ROLE TRAINER" in str(exc.value)
