@@ -25,12 +25,10 @@ never mutates job state.
 
 from __future__ import annotations
 
+import inspect
 import os
-import tempfile
-import threading
 import time
 import traceback
-from collections import deque
 from datetime import datetime
 from datetime import timezone
 from pathlib import Path
@@ -76,16 +74,20 @@ from cortex_training.tui.resource import format_bytes
 from cortex_training.tui.resource import format_percent
 from cortex_training.tui.resource import load_resource_data
 from cortex_training.tui.resource import render_chart
+from cortex_training.tui.saved_log import DownloadLock
+from cortex_training.tui.saved_log import read_saved_tail
 
 _ERROR_LOG = "~/.cortex-training-errors.log"
-_RESOURCE_LOCKS: dict[str, threading.Lock] = {}
-_RESOURCE_LOCKS_GUARD = threading.Lock()
 
 
-def _resource_lock(path: Path) -> threading.Lock:
-    key = str(path.resolve())
-    with _RESOURCE_LOCKS_GUARD:
-        return _RESOURCE_LOCKS.setdefault(key, threading.Lock())
+def _accepts_kwarg(fn, name: str) -> bool:
+    """Whether ``fn`` takes keyword ``name`` (so optional client features can be
+    passed without breaking an older client)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params
 
 
 class JobListScreen(Screen):
@@ -295,10 +297,15 @@ class LogScreen(Screen):
         self._wrap_width = -1  # content width the buffer is wrapped to
         self._last_update = None  # local HH:MM:SS of the last live line
         self._screen_open = True
-        self._stage: tempfile.TemporaryDirectory[str] | None = None
-        self._stdout_inflight = False
-        self._stdout_ready = False
-        self._stdout_failed = False
+        # A finished job's saved console is downloaded (incrementally, with
+        # resume) into the shared per-job cache, so reopening reuses it.
+        self._stdout_root = job_cache_dir(job_id) / "stdout"
+        self._stdout_inflight = False  # this screen's download worker is running
+        self._stdout_ready = False  # saved files on disk can be painted
+        self._stdout_done = False  # a download completed for this screen
+        self._stdout_error: str | None = None  # last failure; r retries
+        self._stdout_status: str | None = None  # shown while downloading
+        self._paint_gen = 0  # invalidates stale saved-console paints
         self._held: tuple[list[str], bool] | None = None
         self._active_tab = "logs"
         self._log_focus_id = "sources"
@@ -353,12 +360,10 @@ class LogScreen(Screen):
 
     def on_unmount(self) -> None:
         # Stop the tail worker when leaving this job (it polls follow=True).
-        # A download still inside download_stdout_logs recreates its output
-        # directory, so the temp dir is removed only after that call returns.
+        # A download already inside download_stdout_logs finishes into the
+        # shared cache and releases its lock; a reopened view waits for it.
         self._screen_open = False
         self.workers.cancel_all()
-        if not self._stdout_inflight:
-            self._cleanup_stage()
 
     def _logs_active(self) -> bool:
         return self._active_tab == "logs"
@@ -421,6 +426,11 @@ class LogScreen(Screen):
         if self._resource_active():
             self._start_resource_refresh(force=True)
             return
+        # Also retries a failed saved-console download, or picks up chunks that
+        # landed after the last one (resume makes that incremental).
+        if not self._stdout_inflight:
+            self._stdout_error = None
+            self._stdout_done = False
         self._load_sources()
 
     def _update_subtitle(self) -> None:
@@ -440,6 +450,10 @@ class LogScreen(Screen):
             bits.append("PAUSED")
         if self._last_update:
             bits.append(f"updated {self._last_update}")
+        if self._stdout_status:
+            bits.append(self._stdout_status)
+        elif self._stdout_error:
+            bits.append("saved console download failed (r retries)")
         self.app.sub_title = "  ·  ".join(bits)
 
     def _set_summary(self, text: str) -> None:
@@ -474,15 +488,10 @@ class LogScreen(Screen):
     @work(thread=True, group="resource")
     def _refresh_resource(self) -> None:
         worker = get_current_worker()
-        lock = _resource_lock(self._metrics_root)
-        acquired = False
+        lock = DownloadLock(self._metrics_root)
+        if not lock.acquire(lambda: self._screen_open and not worker.is_cancelled):
+            return
         try:
-            while self._screen_open and not worker.is_cancelled:
-                if lock.acquire(timeout=0.1):
-                    acquired = True
-                    break
-            if not acquired:
-                return
             cached = load_resource_data(self._metrics_root)
             if (cached.sub_jobs or cached.ignored_rows_by_sub_job) and not worker.is_cancelled:
                 self._post(self._accept_cached_resource, cached)
@@ -506,8 +515,7 @@ class LogScreen(Screen):
                     f"{type(exc).__name__}: {exc}",
                 )
         finally:
-            if acquired:
-                lock.release()
+            lock.release()
 
     def _accept_cached_resource(self, data: ResourceData) -> None:
         if not self._screen_open:
@@ -701,7 +709,7 @@ class LogScreen(Screen):
                 if lines:
                     self._write_lines(lines)
                 elif empty_note:
-                    self._write_line("No log output is available.")
+                    self._write_line(self._empty_note())
             if self._logview is not None:
                 self._logview.scroll_end(animate=False)
         self._update_subtitle()
@@ -819,6 +827,7 @@ class LogScreen(Screen):
             # get_job failed/empty (e.g. offline): fall back to cached sub-jobs.
             source_ids = self._cache.cached_sources()
             source_ids.extend(cached_metric_sources(self._metrics_root))
+            source_ids.extend(self._cached_stdout_sources())
             sources = [{"sub_job_id": sid} for sid in dict.fromkeys(source_ids)]
         if not sources:
             self._post(
@@ -882,36 +891,113 @@ class LogScreen(Screen):
             return False
 
     def _stdout_path(self, sub_job_id: str) -> Path:
-        root = "" if self._stage is None else self._stage.name
-        return Path(root) / sub_job_id / "stdout.log"
+        return self._stdout_root / sub_job_id / "stdout.log"
 
-    def _cleanup_stage(self) -> None:
-        stage = self._stage
-        self._stage = None
-        if stage is not None:
-            stage.cleanup()
+    def _cached_stdout_sources(self) -> list[str]:
+        try:
+            return [path.parent.name for path in sorted(self._stdout_root.glob("*/stdout.log"))]
+        except OSError:
+            return []
 
     def _claim_stdout(self) -> bool:
-        """UI thread. One whole-job download for this view; a failure retries on the next open."""
-        if not self._screen_open or self._stdout_ready or self._stdout_inflight or self._stdout_failed:
+        """UI thread. At most one saved-console download per view at a time.
+
+        A failure is not retried until ``r`` clears it, so filter or source
+        changes never start another download.
+        """
+        if (
+            not self._screen_open
+            or self._stdout_inflight
+            or self._stdout_done
+            or self._stdout_error is not None
+        ):
             return False
-        if self._stage is None:
-            self._stage = tempfile.TemporaryDirectory(prefix="cortex-training-stage-")
         self._stdout_inflight = True
         return True
 
-    def _filtered_stdout(self, sub_job_id: str) -> list[str] | None:
-        path = self._stdout_path(sub_job_id)
-        if not path.is_file() or path.stat().st_size == 0:
-            return None
-        query = self._filter
-        kept: deque[str] = deque(maxlen=20000)
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
-            for raw in handle:
-                text = raw.rstrip("\n")
-                if entry_matches(text, query):
-                    kept.append(text)
-        return list(kept)
+    def _start_stdout_download(self) -> None:
+        if self._claim_stdout():
+            self._set_stdout_status("saved console: checking…")
+            self._download_stdout()
+
+    def _set_stdout_status(self, status: str | None) -> None:
+        if not self._screen_open:
+            return
+        self._stdout_status = status
+        self._update_subtitle()
+
+    def _on_stdout_progress(self, *args, **kwargs) -> None:
+        """Hook for a client ``progress`` callback; runs on the download thread."""
+
+    @work(thread=True, group="stdout")
+    def _download_stdout(self) -> None:
+        worker = get_current_worker()
+
+        def keep_waiting() -> bool:
+            return self._screen_open and not worker.is_cancelled
+
+        # Paint what an earlier open (or another process) already saved before
+        # waiting on the lock or the network.
+        if self._cached_stdout_sources():
+            self._post(self._accept_cached_stdout)
+        lock = DownloadLock(self._stdout_root)
+        if not lock.acquire(
+            keep_waiting,
+            on_wait=lambda: self._post(
+                self._set_stdout_status, "saved console: waiting for another download…"
+            ),
+        ):
+            self._post(self._finish_download, False, None)
+            return
+        error = None
+        try:
+            self._post(self._set_stdout_status, "saved console: downloading…")
+            download = self._client.download_stdout_logs
+            kwargs = {"resume": True}
+            if _accepts_kwarg(download, "progress"):
+                kwargs["progress"] = self._on_stdout_progress
+            download(self._job_id, self._stdout_root, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - surfaced in the pane; keep the cache
+            error = f"{type(exc).__name__}: {exc}"
+            try:
+                with open(os.path.expanduser(_ERROR_LOG), "a", encoding="utf-8") as handle:
+                    handle.write(f"saved console {self._job_id} failed:\n{traceback.format_exc()}\n")
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            lock.release()
+        self._post(self._finish_download, error is None, error)
+
+    def _accept_cached_stdout(self) -> None:
+        if not self._screen_open or self._stdout_ready:
+            return
+        self._stdout_ready = True
+        self._paint_saved()
+
+    def _finish_download(self, ok: bool, error: str | None) -> None:
+        self._stdout_inflight = False
+        self._stdout_status = None
+        if not self._screen_open:
+            return
+        if error is not None:
+            self._stdout_error = error
+            self._update_subtitle()
+            self._write_line(
+                f"[error] saved console download failed: {error}  "
+                f"(r retries; full traceback: {_ERROR_LOG})"
+            )
+            return
+        self._update_subtitle()
+        if not ok:
+            return
+        self._stdout_done = True
+        self._stdout_ready = True
+        self._paint_saved()
+
+    def _empty_note(self) -> str:
+        if self._stdout_inflight:
+            return "Downloading the saved console…"
+        return "No log output is available."
 
     def _replace_body(self, lines: list[str], *, empty_note: bool) -> None:
         if self._paused:
@@ -924,35 +1010,47 @@ class LogScreen(Screen):
         if lines:
             self._write_lines(lines)
         elif empty_note:
-            self._write_line("No log output is available.")
+            self._write_line(self._empty_note())
 
     def _paint_saved(self) -> None:
+        """UI thread. Read the saved console off-thread and replace the pane."""
         source = self._current_source
         if not source:
             return
-        lines = self._filtered_stdout(source)
-        if lines is None:
-            entries = self._cache.load_entries(source, limit=2000)
-            cached = [
-                format_log_entry(entry)
-                for entry in entries
-                if entry_matches(entry, self._filter) and entry_at_level(entry, self._min_level)
-            ]
-            self._replace_body(cached, empty_note=not entries)
-            return
-        self._replace_body(lines, empty_note=False)
+        self._paint_gen += 1
+        self._load_saved(self._paint_gen, source, self._filter, self._min_level)
 
-    def _finish_download(self, ok: bool) -> None:
-        if not self._screen_open:
-            self._stdout_inflight = False
-            self._cleanup_stage()
+    @work(thread=True, exclusive=True, group="paint")
+    def _load_saved(self, gen: int, source: str, query: str, min_level) -> None:
+        worker = get_current_worker()
+        try:
+            tail = read_saved_tail(self._stdout_path(source), query)
+            if tail is None:
+                entries = self._cache.load_entries(source, limit=2000)
+                lines = [
+                    format_log_entry(entry)
+                    for entry in entries
+                    if entry_matches(entry, query) and entry_at_level(entry, min_level)
+                ]
+                empty_note = not entries
+            else:
+                lines = tail.lines
+                if tail.truncated:
+                    lines = [
+                        f"— showing the end of a {format_bytes(tail.size)} console; "
+                        "s saves the full file —"
+                    ] + lines
+                empty_note = False
+        except Exception as exc:  # noqa: BLE001 - surfaced in the pane
+            lines = [f"[error] reading saved console failed: {type(exc).__name__}: {exc}"]
+            empty_note = False
+        if not worker.is_cancelled:
+            self._post(self._apply_saved, gen, lines, empty_note)
+
+    def _apply_saved(self, gen: int, lines: list[str], empty_note: bool) -> None:
+        if not self._screen_open or gen != self._paint_gen:
             return
-        self._stdout_inflight = False
-        if not ok:
-            self._stdout_failed = True
-            return
-        self._stdout_ready = True
-        self._paint_saved()
+        self._replace_body(lines, empty_note=empty_note)
 
     def _apply_terminal_status(self, status: str, reason: str | None) -> None:
         self._job_status = status
@@ -968,6 +1066,7 @@ class LogScreen(Screen):
         self._current_source = sub_job_id
         self._held = None
         self._shown_lines = []
+        self._paint_gen += 1
         # A fresh tail context (new source, or a re-tail after a filter change)
         # starts following the tail — otherwise a pause left over from a prior
         # source would strand this one at the top, the very bug we're fixing.
@@ -976,32 +1075,30 @@ class LogScreen(Screen):
         if self._logview is not None:
             self._logview.clear()
         self._write_line(f"— tailing {sub_job_id} —")
+        live = is_active_status(self._job_status)
+        if not live:
+            self._start_stdout_download()
         if self._stdout_ready:
             self._paint_saved()
             return
-        download = not is_active_status(self._job_status) and self._claim_stdout()
-        live = is_active_status(self._job_status)
-        self._tail(sub_job_id, download, live)
+        self._tail(sub_job_id, live)
 
     @work(thread=True, exclusive=True, group="tail")
-    def _tail(self, sub_job_id: str, download: bool, live: bool) -> None:
+    def _tail(self, sub_job_id: str, live: bool) -> None:
         worker = get_current_worker()
         # A terminal job's zone is gone, so the operation API would error: serve
-        # cache, then one saved-console download. A running/unknown job follows live.
+        # cache while the saved console downloads. A running/unknown job follows live.
         try:
             self._stream(worker, sub_job_id, live=live)
         except Exception as exc:  # noqa: BLE001 - surfaced in the UI
             if worker.is_cancelled:
-                pass
-            elif live:
+                return
+            if live:
                 if not self._handoff_after_tail_error(worker):
                     self._report_tail_error(sub_job_id, exc)
                 return
-            elif not download:
+            if not (self._stdout_inflight or self._stdout_ready):
                 self._report_tail_error(sub_job_id, exc)
-                return
-        if download:
-            self._run_download(sub_job_id)
 
     def _stream(self, worker, sub_job_id: str, *, live: bool) -> None:
         # Replay the local cache instantly, then (only for a live job) resume
@@ -1066,39 +1163,16 @@ class LogScreen(Screen):
         reason = job.get("reason") if isinstance(job, dict) and "reason" in job else None
         if not self._post(self._apply_terminal_status, status, reason):
             return True
-        if worker.is_cancelled or not self._screen_open:
-            return True
-        try:
-            claimed = self.app.call_from_thread(self._claim_stdout)
-        except RuntimeError:
-            return True
-        if not claimed:
-            if self._stdout_ready:
-                self._post(self._paint_saved)
-            return True
-        self._run_download(self._current_source or "")
+        self._post(self._resume_after_finish)
         return True
 
-    def _run_download(self, sub_job_id: str) -> None:
+    def _resume_after_finish(self) -> None:
+        """UI thread. The job turned terminal mid-tail: switch to the saved console."""
         if not self._screen_open:
-            if not self._post(self._finish_download, False):
-                self._cleanup_stage()
             return
-        ok = False
-        try:
-            root = "" if self._stage is None else self._stage.name
-            self._client.download_stdout_logs(self._job_id, root)
-            ok = True
-        except Exception:  # noqa: BLE001 - keep the cache; record the traceback
-            try:
-                with open(os.path.expanduser(_ERROR_LOG), "a", encoding="utf-8") as handle:
-                    handle.write(
-                        f"saved log {sub_job_id} failed:\n{traceback.format_exc()}\n"
-                    )
-            except Exception:  # noqa: BLE001
-                pass
-        if not self._post(self._finish_download, ok):
-            self._cleanup_stage()
+        self._start_stdout_download()
+        if self._stdout_ready:
+            self._paint_saved()
 
     def _content_width(self) -> int:
         """Usable text columns of the log pane (accounts for padding/scrollbar)."""

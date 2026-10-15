@@ -40,6 +40,13 @@ from cortex_training.tui.app import JobListScreen  # noqa: E402
 from cortex_training.tui.app import LogScreen  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _isolated_cache(tmp_path, monkeypatch):
+    # The saved console and caches live under the per-job cache dir; keep every
+    # test (including those that do not set it themselves) out of ~/.cache.
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path / "isolated-cache"))
+
+
 def _client():
     c = MagicMock()
     c.list_jobs.return_value = [
@@ -1221,7 +1228,7 @@ async def _run_terminal_shows_saved_file():
     c = _client()
     c.get_job.return_value = _terminal_job()
 
-    def download(job_id, output_dir):
+    def download(job_id, output_dir, **kwargs):
         _write_stdout(output_dir, "7:training:0", "saved line\n")
         return []
 
@@ -1272,7 +1279,7 @@ async def _run_empty_file_keeps_cache():
     c = _client()
     c.get_job.return_value = _terminal_job()
 
-    def download(job_id, output_dir):
+    def download(job_id, output_dir, **kwargs):
         _write_stdout(output_dir, "7:training:0", "")
         return []
 
@@ -1300,7 +1307,7 @@ async def _run_hidden_filter_shows_no_note(release, started):
     c = _client()
     c.get_job.return_value = _terminal_job()
 
-    def download(job_id, output_dir):
+    def download(job_id, output_dir, **kwargs):
         started.set()
         assert release.wait(timeout=5)
         _write_stdout(output_dir, "7:training:0", "")
@@ -1366,7 +1373,7 @@ async def _run_tail_error_after_finish_shows_file():
         calls["tail"] += 1
         raise RuntimeError("zone gone")
 
-    def download(job_id, output_dir):
+    def download(job_id, output_dir, **kwargs):
         _write_stdout(output_dir, "7:training:0", "after finish\n")
         return []
 
@@ -1445,7 +1452,7 @@ async def _run_filter_during_download_once(release, started, calls):
     c = _client()
     c.get_job.return_value = _terminal_job()
 
-    def download(job_id, output_dir):
+    def download(job_id, output_dir, **kwargs):
         calls.append(output_dir)
         started.set()
         assert release.wait(timeout=5)
@@ -1490,7 +1497,7 @@ async def _run_switch_source_does_not_download_again():
     c.get_job.return_value = _terminal_job()
     calls = []
 
-    def download(job_id, output_dir):
+    def download(job_id, output_dir, **kwargs):
         calls.append(1)
         _write_stdout(output_dir, "7:training:0", "training line\n")
         return []
@@ -1518,7 +1525,7 @@ async def _run_missing_sibling_shows_note():
     c = _client()
     c.get_job.return_value = _terminal_job()
 
-    def download(job_id, output_dir):
+    def download(job_id, output_dir, **kwargs):
         _write_stdout(output_dir, "7:training:0", "training line\n")
         return []
 
@@ -1545,7 +1552,7 @@ async def _run_save_exports_file(tmp_path):
 
     payload = b"file body\r\nsecond\r"
 
-    def download(job_id, output_dir):
+    def download(job_id, output_dir, **kwargs):
         path = _write_stdout(output_dir, "7:training:0", "")
         path.write_bytes(payload)
         return []
@@ -1591,7 +1598,7 @@ async def _run_pause_holds_replacement(release, started):
     c = _client()
     c.get_job.return_value = _terminal_job()
 
-    def download(job_id, output_dir):
+    def download(job_id, output_dir, **kwargs):
         started.set()
         assert release.wait(timeout=5)
         _write_stdout(output_dir, "7:training:0", "held line\n")
@@ -1615,7 +1622,9 @@ async def _run_pause_holds_replacement(release, started):
         app.screen._start_tail("7:training:0")
         assert app.screen._held is None
         assert "stale line" not in app.screen._shown_lines
-        assert "held line" in app.screen._shown_lines
+        ok = await _wait(pilot, app, lambda: "held line" in app.screen._shown_lines)
+        assert ok, "re-tail did not repaint the saved console"
+        assert "stale line" not in app.screen._shown_lines
         await _settle(app, pilot)
 
 
@@ -1631,34 +1640,195 @@ def test_pause_holds_saved_console_until_unpause(tmp_path, monkeypatch):
         release.set()
 
 
-async def _run_leave_during_download(release, started, dirs):
+def _stdout_root():
+    from cortex_training.tui.log_cache import job_cache_dir
+
+    return job_cache_dir("7") / "stdout"
+
+
+async def _run_reopen_reuses_cache(release, calls):
     c = _client()
     c.get_job.return_value = _terminal_job()
 
-    def download(job_id, output_dir):
-        dirs.append(output_dir)
-        started.set()
+    def download(job_id, output_dir, **kwargs):
+        calls.append((Path(output_dir), kwargs))
+        if len(calls) == 1:
+            _write_stdout(output_dir, "7:training:0", "saved line\n")
+            return []
+        # Second open: nothing new to fetch; hold so the test can observe the
+        # cached file painted while the incremental refresh is still running.
         assert release.wait(timeout=5)
-        _write_stdout(output_dir, "7:training:0", "too late\n")
         return []
 
     c.download_stdout_logs.side_effect = download
     app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
     async with app.run_test() as pilot:
-        ok = await _wait(pilot, app, started.is_set)
-        assert ok, "download did not start"
+        ok = await _wait(pilot, app, lambda: "saved line" in app.screen._shown_lines)
+        assert ok, "first open did not show the saved console"
         app.pop_screen()
         await pilot.pause()
+        app.push_screen(LogScreen(c, "7", poll_interval=0.01))
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: isinstance(app.screen, LogScreen)
+            and "saved line" in app.screen._shown_lines
+            and len(calls) == 2,
+        )
+        assert ok, "reopen did not paint the cached console during the refresh"
+        assert "downloading" in (app.sub_title or "")
         release.set()
-        ok = await _wait(pilot, app, lambda: dirs and not Path(dirs[0]).exists())
-        assert ok, "temp dir was not removed after leaving"
-        assert not any("too late" in line for line in getattr(app.screen, "_shown_lines", []))
+        ok = await _wait(pilot, app, lambda: app.screen._stdout_done)
+        assert ok, "incremental refresh did not finish"
+        assert "saved line" in app.screen._shown_lines
+        assert "saved console" not in (app.sub_title or "")
+        await _settle(app, pilot)
+    assert [path for path, _ in calls] == [_stdout_root(), _stdout_root()]
+    assert all(kwargs.get("resume") is True for _, kwargs in calls)
+
+
+def test_reopen_reuses_persistent_stdout_cache_with_resume():
+    release = threading.Event()
+    calls = []
+    try:
+        asyncio.run(_run_reopen_reuses_cache(release, calls))
+    finally:
+        release.set()
+    assert len(calls) == 2
+
+
+async def _run_reopen_during_download(release, state):
+    c = _client()
+    c.get_job.return_value = _terminal_job()
+    guard = threading.Lock()
+
+    def download(job_id, output_dir, **kwargs):
+        with guard:
+            state["active"] += 1
+            state["max"] = max(state["max"], state["active"])
+            state["calls"] += 1
+            first = state["calls"] == 1
+        try:
+            if first:
+                assert release.wait(timeout=5)
+                _write_stdout(output_dir, "7:training:0", "first download\n")
+        finally:
+            with guard:
+                state["active"] -= 1
+        return []
+
+    c.download_stdout_logs.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, lambda: state["calls"] == 1)
+        assert ok, "first download did not start"
+        app.pop_screen()
+        await pilot.pause()
+        app.push_screen(LogScreen(c, "7", poll_interval=0.01))
+        ok = await _wait(pilot, app, lambda: "waiting for another download" in (app.sub_title or ""))
+        assert ok, "reopened view did not report waiting on the running download"
+        for _ in range(10):
+            await pilot.pause()
+        assert state["calls"] == 1, "reopen started a second concurrent download"
+        release.set()
+        ok = await _wait(pilot, app, lambda: "first download" in app.screen._shown_lines)
+        assert ok, "reopened view did not show the console the first download saved"
+        ok = await _wait(pilot, app, lambda: app.screen._stdout_done)
+        assert ok, "reopened view never ran its own refresh"
         await _settle(app, pilot)
 
 
-def test_leave_during_download_removes_temp_dir():
+def test_reopen_during_download_waits_instead_of_downloading_twice():
     release = threading.Event()
+    state = {"active": 0, "max": 0, "calls": 0}
     try:
-        asyncio.run(_run_leave_during_download(release, threading.Event(), []))
+        asyncio.run(_run_reopen_during_download(release, state))
     finally:
         release.set()
+    assert state["max"] == 1
+    assert state["calls"] == 2
+
+
+async def _run_failure_then_retry():
+    c = _client()
+    c.get_job.return_value = _terminal_job()
+    calls = []
+
+    def download(job_id, output_dir, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("stage unavailable")
+        _write_stdout(output_dir, "7:training:0", "after retry\n")
+        return []
+
+    c.download_stdout_logs.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: any("saved console download failed" in line for line in app.screen._shown_lines),
+        )
+        assert ok, "download failure was not shown in the pane"
+        assert "RuntimeError: stage unavailable" in "\n".join(app.screen._shown_lines)
+        assert "r retries" in (app.sub_title or "")
+        app.screen._refilter()
+        for _ in range(5):
+            await pilot.pause()
+        assert len(calls) == 1, "a filter change retried the failed download"
+        app.screen.action_refresh_sources()
+        ok = await _wait(pilot, app, lambda: "after retry" in app.screen._shown_lines)
+        assert ok, "r did not retry the saved-console download"
+        assert len(calls) == 2
+        assert app.screen._stdout_error is None
+        await _settle(app, pilot)
+
+
+def test_download_failure_shows_error_and_r_retries(monkeypatch, tmp_path):
+    import cortex_training.tui.app as app_module
+
+    monkeypatch.setattr(app_module, "_ERROR_LOG", str(tmp_path / "errors.log"))
+    asyncio.run(_run_failure_then_retry())
+
+
+async def _run_saved_console_read_off_ui_thread(seen):
+    import cortex_training.tui.app as app_module
+
+    real = app_module.read_saved_tail
+
+    def spy(path, query=""):
+        seen.append((threading.current_thread() is threading.main_thread(), query))
+        return real(path, query)
+
+    app_module.read_saved_tail = spy
+    try:
+        c = _client()
+        c.get_job.return_value = _terminal_job()
+
+        def download(job_id, output_dir, **kwargs):
+            _write_stdout(output_dir, "7:training:0", "alpha\nbeta\n")
+            return []
+
+        c.download_stdout_logs.side_effect = download
+        app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+        async with app.run_test() as pilot:
+            ok = await _wait(pilot, app, lambda: "beta" in app.screen._shown_lines)
+            assert ok, "saved console was not shown"
+            app.screen._filter = "alp"
+            app.screen._refilter()
+            ok = await _wait(
+                pilot,
+                app,
+                lambda: "alpha" in app.screen._shown_lines and "beta" not in app.screen._shown_lines,
+            )
+            assert ok, "filter was not applied to the saved console"
+            await _settle(app, pilot)
+    finally:
+        app_module.read_saved_tail = real
+
+
+def test_saved_console_is_read_off_the_ui_thread():
+    seen = []
+    asyncio.run(_run_saved_console_read_off_ui_thread(seen))
+    assert seen and not any(on_main for on_main, _ in seen)
+    assert "alp" in [query for _, query in seen]

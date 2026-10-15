@@ -35,7 +35,8 @@ cortex-training tui JOB_ID
 ```
 
 The **Logs** tab tails a running job or loads its saved console after it
-finishes. The **Resource** tab plots GPU utilization and lists each GPU. Use
+finishes; the saved console is cached locally, so reopening the job only
+fetches what is new. The **Resource** tab plots GPU utilization and lists each GPU. Use
 `1`–`5` for 5 minutes, 15 minutes, 1 hour, 6 hours, or all history; use `r` to
 refresh.
 

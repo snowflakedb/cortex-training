@@ -726,9 +726,18 @@ Logs are cached locally so reopening a job replays instantly without
 re-fetching from the server — under `~/.cache/cortex-training/` (or
 `$XDG_CACHE_HOME`), overridable with `CORTEX_TRAINING_TUI_CACHE_DIR`.
 
-A finished job loads its saved console once. A stream error while the job is
-still running stays an error. The level key filters structured live lines and
-does not hide lines from that saved console.
+A finished job loads its saved console into the same per-job cache
+(`jobs/<job>/stdout/<sub_job_id>/stdout.log` under the cache directory), with
+resume, so reopening the job shows the saved copy at once and only fetches
+chunks that are not already on disk. The status line reports while that
+download runs or waits for another download of the same job — another view,
+or another TUI process, finishes first rather than both writing the same
+files. A failed download is shown in the log pane and keeps the cached view;
+`r` retries it. The pane shows, and `/` filters, only the end of a large
+console (up to 20,000 lines from at most its last 64 MiB); `s` and `y` still
+export the whole file. A stream error while the job
+is still running stays an error. The level key filters structured live lines
+and does not hide lines from that saved console.
 
 The TUI also writes two files into your home directory: saved logs from the `s`
 key (`~/cortex-training-<job8>-<source>.log`, where `<job8>` is the first eight
@@ -749,7 +758,7 @@ Keys in Logs:
 | `s` | Save the current source to `~/cortex-training-<job8>-<source>.log` |
 | `y` | Copy the whole log to the clipboard |
 | `c` | Copy the current selection |
-| `r` | Refresh the sub-job list |
+| `r` | Refresh the sub-job list (and retry or refresh a finished job's saved console) |
 | `t` | Switch to Resource |
 | `[` / `]` | Narrow / widen the sources panel |
 | `b` / `esc` | Back (`esc` clears an active log filter first) |
