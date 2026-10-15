@@ -5374,11 +5374,13 @@ class TestExecutionLogDownload:
         getattr(c, method_name)("job-1", tmp_path, progress=calls.append)
         quiet = getattr(c, method_name)("job-1", tmp_path / "quiet")
         assert quiet[0]["chunk_count"] == 3
+        status = c._artifact_progress_status
         assert calls == [
-            f"{artifact_name}: found 3 chunks for {sub}\n",
-            f"{artifact_name}: 1/3 {sub}\n",
-            f"{artifact_name}: 2/3 {sub}\n",
-            f"{artifact_name}: 3/3 {sub}\n",
+            status(artifact_name, 0, 3, sub),
+            status(artifact_name, 1, 3, sub),
+            status(artifact_name, 2, 3, sub),
+            status(artifact_name, 3, 3, sub),
+            "\n",
         ]
         assert (tmp_path / sub / destination_name).read_bytes() == (
             tmp_path / "quiet" / sub / destination_name
@@ -5406,9 +5408,10 @@ class TestExecutionLogDownload:
         monkeypatch.setattr(c, "_open_experiment_artifact_connection", lambda: connection)
         calls = []
         c.download_stdout_logs("job-1", tmp_path, progress=calls.append)
-        assert calls[0].startswith("stdout: found 1 chunks for job-1:training:0\n")
-        assert calls[1] == "stdout: 1/1 job-1:training:0\n"
-        assert calls[2].startswith("stdout: found 1 chunks for job-1:training:1\n")
+        assert calls[0] == c._artifact_progress_status("stdout", 0, 1, "job-1:training:0")
+        assert calls[1] == c._artifact_progress_status("stdout", 1, 1, "job-1:training:0")
+        assert calls[2] == "\n"
+        assert calls[3] == c._artifact_progress_status("stdout", 0, 1, "job-1:training:1")
 
     def test_download_progress_resume_counts_new_chunks_only(self, tmp_path, monkeypatch):
         root = "_metrics"
@@ -5427,10 +5430,12 @@ class TestExecutionLogDownload:
         connection.content_by_uri[run_uri + third] = gzip.compress(b"c\n")
         calls = []
         c.download_metrics("job-1", tmp_path, resume=True, progress=calls.append)
+        status = c._artifact_progress_status
         assert calls == [
-            f"metrics: found 2 chunks for {sub}\n",
-            f"metrics: 1/2 {sub}\n",
-            f"metrics: 2/2 {sub}\n",
+            status("metrics", 0, 2, sub),
+            status("metrics", 1, 2, sub),
+            status("metrics", 2, 2, sub),
+            "\n",
         ]
 
     def test_download_progress_resume_nothing_new(self, tmp_path, monkeypatch):
@@ -5508,15 +5513,16 @@ class TestExecutionLogDownload:
         calls = []
         with pytest.raises(gzip.BadGzipFile):
             c.download_metrics("job-1", tmp_path, resume=True, progress=calls.append)
-        assert f"metrics: 1/2 {sub}\n" in calls
-        assert all("2/2" not in line for line in calls)
+        assert c._artifact_progress_status("metrics", 1, 2, sub) in calls
+        assert c._artifact_progress_status("metrics", 2, 2, sub) not in calls
+        assert calls[-1] == "\n"
         assert destination.read_bytes() == committed
 
         connection.content_by_uri[run_uri + names[2]] = gzip.compress(b"c\n")
 
         def stop_on_second(message):
             calls.append(message)
-            if message.startswith("metrics: 2/"):
+            if " 2/" in message:
                 raise RuntimeError("stop")
 
         calls.clear()
@@ -5559,8 +5565,9 @@ class TestExecutionLogDownload:
                 "job-1", tmp_path / "dir-case", resume=True, progress=calls.append
             )
         assert calls == [
-            f"stdout: found 1 chunks for {sub}\n",
-            f"stdout: 1/1 {sub}\n",
+            c._artifact_progress_status("stdout", 0, 1, sub),
+            c._artifact_progress_status("stdout", 1, 1, sub),
+            "\n",
         ]
         assert destination.is_dir()
         assert not list(destination.parent.glob(".*.tmp"))
@@ -5578,8 +5585,8 @@ class TestExecutionLogDownload:
         connection.content_by_uri[run_uri + earlier] = gzip.compress(b"a\n")
         calls = []
         c.download_stdout_logs("job-1", tmp_path, resume=True, progress=calls.append)
-        assert calls[0] == f"stdout: found 2 chunks for {sub}\n"
-        assert calls.count(f"stdout: found 2 chunks for {sub}\n") == 1
+        assert calls[0] == c._artifact_progress_status("stdout", 0, 2, sub)
+        assert calls.count(calls[0]) == 1
 
     def test_download_progress_rebuild_chunk_failure_keeps_previous(self, tmp_path, monkeypatch):
         root = "_stdout"
@@ -5600,8 +5607,9 @@ class TestExecutionLogDownload:
         calls = []
         with pytest.raises(gzip.BadGzipFile):
             c.download_stdout_logs("job-1", tmp_path, progress=calls.append)
-        assert f"stdout: 1/2 {sub}\n" in calls
-        assert all("2/2" not in line for line in calls)
+        assert c._artifact_progress_status("stdout", 1, 2, sub) in calls
+        assert c._artifact_progress_status("stdout", 2, 2, sub) not in calls
+        assert calls[-1] == "\n"
         assert destination.read_bytes() == b"previous\n"
         assert not list(destination.parent.glob(".*.tmp"))
 
@@ -5622,7 +5630,7 @@ class TestExecutionLogDownload:
         destination.write_bytes(b"x")
         calls = []
         c.download_metrics("job-1", tmp_path, resume=True, progress=calls.append)
-        assert calls[0] == f"metrics: found 2 chunks for {sub}\n"
+        assert calls[0] == c._artifact_progress_status("metrics", 0, 2, sub)
         assert calls.count(calls[0]) == 1
         assert destination.read_bytes() == b"a\nb\n"
 

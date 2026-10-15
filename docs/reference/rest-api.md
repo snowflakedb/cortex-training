@@ -2172,8 +2172,8 @@ list and the file is at least that many bytes. A longer file is truncated back
 to the committed length. A missing or shorter file is rebuilt, as is a chunk
 list that is no longer a prefix of the sorted paths.
 Two downloads of the same output directory at once are unsupported.
-The method stays silent unless `progress` is passed. The CLI writes those
-lines to stderr.
+The method stays silent unless `progress` is passed. On a terminal, the CLI
+draws one updating line on stderr.
 
 ### 12.4 GPU metrics download
 

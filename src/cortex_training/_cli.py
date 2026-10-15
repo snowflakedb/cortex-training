@@ -1258,12 +1258,29 @@ def _cmd_weight_sync(args: argparse.Namespace, client, stdout: TextIO) -> int:
     return 0
 
 
-def _write_artifact_progress(stderr: TextIO, message: str) -> None:
-    try:
-        stderr.write(message)
-        stderr.flush()
-    except OSError:
-        return
+def _artifact_progress_writer(stderr: TextIO):
+    """Draw one updating terminal line. A redirected stderr gets the final line."""
+    latest: dict[str, str | None] = {"text": None}
+
+    def write(message: str) -> None:
+        try:
+            if message == "\n":
+                if stderr.isatty():
+                    stderr.write("\n")
+                elif latest["text"] is not None:
+                    stderr.write(latest["text"] + "\n")
+                latest["text"] = None
+            elif message.endswith("\n"):
+                stderr.write(message)
+            else:
+                latest["text"] = message
+                if stderr.isatty():
+                    stderr.write("\r" + message)
+            stderr.flush()
+        except OSError:
+            return
+
+    return write
 
 
 def _cmd_download_log(
@@ -1275,7 +1292,7 @@ def _cmd_download_log(
             args.job_id,
             out_dir,
             resume=args.resume,
-            progress=lambda message: _write_artifact_progress(stderr, message),
+            progress=_artifact_progress_writer(stderr),
         )
         _print_json(
             {"job_id": args.job_id, "logs": logs},
@@ -1310,7 +1327,7 @@ def _cmd_download_metrics(
         args.job_id,
         out_dir,
         resume=args.resume,
-        progress=lambda message: _write_artifact_progress(stderr, message),
+        progress=_artifact_progress_writer(stderr),
     )
     _print_json(
         {"job_id": args.job_id, "metrics": metrics},

@@ -2232,6 +2232,43 @@ def test_download_metrics_survives_stderr_oserror(tmp_path):
         assert json.loads(stdout.getvalue())["job_id"] == "job-1"
 
 
+def test_download_progress_is_one_terminal_line(tmp_path):
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    class ProgressClient(FakeClient):
+        def download_metrics(self, job_id, output_dir, *, resume=False, progress=None):
+            if progress is not None:
+                progress("metrics: [##------------------] 1/2 job")
+                progress("metrics: [####################] 2/2 job")
+                progress("\n")
+            return super().download_metrics(job_id, output_dir, resume=resume, progress=None)
+
+    tty = Tty()
+    rc = cli.main(
+        _base_args() + ["download-metrics", "job-1", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: ProgressClient(),
+        stdout=io.StringIO(),
+        stderr=tty,
+    )
+    assert rc == 0
+    assert tty.getvalue() == (
+        "\rmetrics: [##------------------] 1/2 job"
+        "\rmetrics: [####################] 2/2 job\n"
+    )
+
+    plain = io.StringIO()
+    rc = cli.main(
+        _base_args() + ["download-metrics", "job-1", "--output-dir", str(tmp_path / "plain")],
+        client_factory=lambda _: ProgressClient(),
+        stdout=io.StringIO(),
+        stderr=plain,
+    )
+    assert rc == 0
+    assert plain.getvalue() == "metrics: [####################] 2/2 job\n"
+
+
 def test_execution_log_download_writes_no_progress(tmp_path):
     stderr = io.StringIO()
     rc = cli.main(
