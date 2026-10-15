@@ -2913,6 +2913,11 @@ class CortexTrainingClient:
         finally:
             downloaded.unlink(missing_ok=True)
 
+    @staticmethod
+    def _report_artifact_progress(progress: Callable[[str], None] | None, message: str) -> None:
+        if progress is not None:
+            progress(message)
+
     def _rebuild_gzip_file(
         self,
         connection: Any,
@@ -2922,12 +2927,20 @@ class CortexTrainingClient:
         chunk_paths: list[str],
         *,
         temporary_prefix: str,
+        artifact_name: str,
+        progress: Callable[[str], None] | None,
     ) -> dict[str, Any]:
         """Write every chunk to a temp file, then replace the destination.
 
         The manifest is removed only after the temp file is fsynced, so a failed
         chunk download leaves the previous manifest and destination in place.
         """
+        sub_job_id = destination.parent.name
+        chunk_count = len(chunk_paths)
+        self._report_artifact_progress(
+            progress,
+            f"{artifact_name}: found {chunk_count} chunks for {sub_job_id}\n",
+        )
         destination.parent.mkdir(parents=True, exist_ok=True)
         output = tempfile.NamedTemporaryFile(
             mode="wb",
@@ -2938,13 +2951,17 @@ class CortexTrainingClient:
         )
         temporary = Path(output.name)
         try:
-            for relative_path in chunk_paths:
+            for index, relative_path in enumerate(chunk_paths, start=1):
                 self._download_gzip_member(
                     connection,
                     run_uri,
                     relative_path,
                     artifact_temp,
                     output,
+                )
+                self._report_artifact_progress(
+                    progress,
+                    f"{artifact_name}: {index}/{chunk_count} {sub_job_id}\n",
                 )
             output.flush()
             os.fsync(output.fileno())
@@ -2971,8 +2988,11 @@ class CortexTrainingClient:
         committed: int,
         *,
         temporary_prefix: str,
+        artifact_name: str,
+        progress: Callable[[str], None] | None,
     ) -> dict[str, Any]:
         """Append chunk paths that sort after ``known``, or rebuild."""
+        sub_job_id = destination.parent.name
         if known != chunk_paths[: len(known)]:
             return self._rebuild_gzip_file(
                 connection,
@@ -2981,6 +3001,8 @@ class CortexTrainingClient:
                 destination,
                 chunk_paths,
                 temporary_prefix=temporary_prefix,
+                artifact_name=artifact_name,
+                progress=progress,
             )
         new_paths = chunk_paths[len(known) :]
         try:
@@ -2995,25 +3017,39 @@ class CortexTrainingClient:
                 destination,
                 chunk_paths,
                 temporary_prefix=temporary_prefix,
+                artifact_name=artifact_name,
+                progress=progress,
             )
         if not new_paths:
+            self._report_artifact_progress(
+                progress,
+                f"{artifact_name}: no new chunks for {sub_job_id}\n",
+            )
             if size > committed:
                 with destination.open("r+b") as output:
                     output.truncate(committed)
                     output.flush()
                     os.fsync(output.fileno())
             return self._artifact_result(destination, run_uri, known)
+        self._report_artifact_progress(
+            progress,
+            f"{artifact_name}: found {len(new_paths)} chunks for {sub_job_id}\n",
+        )
         with destination.open("r+b") as output:
             output.seek(committed)
             output.truncate(committed)
             try:
-                for relative_path in new_paths:
+                for index, relative_path in enumerate(new_paths, start=1):
                     self._download_gzip_member(
                         connection,
                         run_uri,
                         relative_path,
                         artifact_temp,
                         output,
+                    )
+                    self._report_artifact_progress(
+                        progress,
+                        f"{artifact_name}: {index}/{len(new_paths)} {sub_job_id}\n",
                     )
                 output.flush()
                 os.fsync(output.fileno())
@@ -3037,6 +3073,7 @@ class CortexTrainingClient:
         destination_name: str,
         temporary_prefix: str,
         resume: bool = False,
+        progress: Callable[[str], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Reconstruct staged gzip chunks into one file per sub-job.
 
@@ -3083,6 +3120,12 @@ class CortexTrainingClient:
                         )
                     chunks["paths"].append(relative_path)
 
+            if not chunks_by_sub_job:
+                self._report_artifact_progress(
+                    progress, f"{artifact_name}: found 0 chunks\n"
+                )
+                return []
+
             results: list[dict[str, Any]] = []
             with tempfile.TemporaryDirectory(
                 prefix=f"cortex-training-{artifact_name}-artifacts-"
@@ -3101,6 +3144,8 @@ class CortexTrainingClient:
                                 destination,
                                 chunk_paths,
                                 temporary_prefix=temporary_prefix,
+                                artifact_name=artifact_name,
+                                progress=progress,
                             )
                         )
                         continue
@@ -3115,6 +3160,8 @@ class CortexTrainingClient:
                             known,
                             committed,
                             temporary_prefix=temporary_prefix,
+                            artifact_name=artifact_name,
+                            progress=progress,
                         )
                     )
             return results
@@ -3127,11 +3174,13 @@ class CortexTrainingClient:
         output_dir: str | os.PathLike[str],
         *,
         resume: bool = False,
+        progress: Callable[[str], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Reconstruct sealed console artifacts into one file per sub-job.
 
         ``resume=True`` appends chunks that are not already recorded beside the
         file. Two downloads of the same output directory at once are unsupported.
+        ``progress`` receives status lines; the return value is unchanged.
         """
         return self._download_gzip_artifacts(
             job_id,
@@ -3141,6 +3190,7 @@ class CortexTrainingClient:
             destination_name="stdout.log",
             temporary_prefix=".stdout-",
             resume=resume,
+            progress=progress,
         )
 
     def download_metrics(
@@ -3149,11 +3199,13 @@ class CortexTrainingClient:
         output_dir: str | os.PathLike[str],
         *,
         resume: bool = False,
+        progress: Callable[[str], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Reconstruct staged GPU metric chunks into one JSONL file per sub-job.
 
         ``resume=True`` appends chunks that are not already recorded beside the
         file. Two downloads of the same output directory at once are unsupported.
+        ``progress`` receives status lines; the return value is unchanged.
         """
         return self._download_gzip_artifacts(
             job_id,
@@ -3163,6 +3215,7 @@ class CortexTrainingClient:
             destination_name="gpu.jsonl",
             temporary_prefix=".gpu-metrics-",
             resume=resume,
+            progress=progress,
         )
 
     # ─── Data-plane async operations ─────────────────────────────────────

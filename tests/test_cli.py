@@ -212,7 +212,7 @@ class FakeClient:
             },
         ]
 
-    def download_stdout_logs(self, job_id, output_dir, *, resume=False):
+    def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None):
         self.stdout_log_job_id = job_id
         self.stdout_log_output_dir = output_dir
         self.stdout_resume = resume
@@ -230,7 +230,7 @@ class FakeClient:
             }
         ]
 
-    def download_metrics(self, job_id, output_dir, *, resume=False):
+    def download_metrics(self, job_id, output_dir, *, resume=False, progress=None):
         self.metrics_job_id = job_id
         self.metrics_output_dir = output_dir
         self.metrics_resume = resume
@@ -2161,6 +2161,87 @@ def test_download_metrics_resume_reaches_client(tmp_path):
 
     assert rc == 0
     assert client.metrics_resume is True
+
+
+def test_download_commands_write_progress_to_stderr(tmp_path):
+    class ProgressClient(FakeClient):
+        def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None):
+            if progress is not None:
+                progress("stdout: found 1 chunks for job\n")
+            return super().download_stdout_logs(
+                job_id, output_dir, resume=resume, progress=None
+            )
+
+        def download_metrics(self, job_id, output_dir, *, resume=False, progress=None):
+            if progress is not None:
+                progress("metrics: found 1 chunks for job\n")
+            return super().download_metrics(
+                job_id, output_dir, resume=resume, progress=None
+            )
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    rc = cli.main(
+        _base_args()
+        + ["download-log", "job-1", "--log-type", "stdout", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: ProgressClient(),
+        stdout=stdout,
+        stderr=stderr,
+    )
+    assert rc == 0
+    assert json.loads(stdout.getvalue())["logs"][0]["filename"] == "stdout.log"
+    assert stderr.getvalue() == "stdout: found 1 chunks for job\n"
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    rc = cli.main(
+        _base_args() + ["download-metrics", "job-1", "--output-dir", str(tmp_path / "metrics")],
+        client_factory=lambda _: ProgressClient(),
+        stdout=stdout,
+        stderr=stderr,
+    )
+    assert rc == 0
+    assert json.loads(stdout.getvalue())["metrics"][0]["filename"] == "gpu.jsonl"
+    assert stderr.getvalue() == "metrics: found 1 chunks for job\n"
+
+
+def test_download_metrics_survives_stderr_oserror(tmp_path):
+    class ProgressClient(FakeClient):
+        def download_metrics(self, job_id, output_dir, *, resume=False, progress=None):
+            if progress is not None:
+                progress("metrics: found 1 chunks for job\n")
+            return super().download_metrics(job_id, output_dir, resume=resume, progress=None)
+
+    class WriteFails(io.StringIO):
+        def write(self, message):
+            raise BrokenPipeError(message)
+
+    class FlushFails(io.StringIO):
+        def flush(self):
+            raise OSError("flush")
+
+    for stderr in (WriteFails(), FlushFails()):
+        stdout = io.StringIO()
+        rc = cli.main(
+            _base_args() + ["download-metrics", "job-1", "--output-dir", str(tmp_path)],
+            client_factory=lambda _: ProgressClient(),
+            stdout=stdout,
+            stderr=stderr,
+        )
+        assert rc == 0
+        assert json.loads(stdout.getvalue())["job_id"] == "job-1"
+
+
+def test_execution_log_download_writes_no_progress(tmp_path):
+    stderr = io.StringIO()
+    rc = cli.main(
+        _base_args() + ["download-log", "job-1", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: FakeClient(),
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+    assert rc == 0
+    assert stderr.getvalue() == ""
 
 
 def test_download_metrics_defaults_to_cwd(tmp_path, monkeypatch):

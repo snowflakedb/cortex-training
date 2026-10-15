@@ -250,10 +250,11 @@ with 256 or fewer experts. See
 `stream_logs(job_id, follow=True, ...)` yields entries and keeps polling.
 `fetch_execution_logs(job_id)` downloads every log file for the job's experiment
 run and returns `{sub_job_id, filename, artifact_uri, content}` dicts.
-`download_stdout_logs(job_id, output_dir, *, resume=False)` reconstructs persisted
+`download_stdout_logs(job_id, output_dir, *, resume=False, progress=None)` reconstructs persisted
 console chunks as `<output_dir>/<sub_job_id>/stdout.log`.
-`download_metrics(job_id, output_dir, *, resume=False)` reconstructs GPU metric
-chunks as `<output_dir>/<sub_job_id>/gpu.jsonl`. `resume=True` appends chunks
+`download_metrics(job_id, output_dir, *, resume=False, progress=None)` reconstructs GPU metric
+chunks as `<output_dir>/<sub_job_id>/gpu.jsonl`. The methods stay silent unless
+`progress` is passed. `resume=True` appends chunks
 that are not already recorded in the manifest beside that file. See
 [GPU metrics download](rest-api.md#124-gpu-metrics-download) for the JSONL row
 schema.
