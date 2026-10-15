@@ -80,8 +80,26 @@ from cortex_training.tui.saved_log import read_saved_tail
 _ERROR_LOG = "~/.cortex-training-errors.log"
 
 
-class _DownloadCancelled(Exception):
-    """Raised from a download progress callback once its view has closed."""
+class _DownloadCancelled(BaseException):
+    """Raised from a download progress callback once its view has closed.
+
+    A ``BaseException`` (like ``KeyboardInterrupt``) so the client neither
+    retries it nor records the stop as a failed operation.
+    """
+
+
+# Name of the client's public cancellation exception, if it exports one.
+_CLIENT_CANCEL_NAME = "DownloadCancelled"
+
+
+def _cancel_exception() -> type[BaseException]:
+    """The client's public cancellation exception, when it exports one."""
+    from cortex_training import client as client_module
+
+    exc = getattr(client_module, _CLIENT_CANCEL_NAME, None)
+    if isinstance(exc, type) and issubclass(exc, BaseException):
+        return exc
+    return _DownloadCancelled
 
 
 def _accepts_kwarg(fn, name: str) -> bool:
@@ -922,7 +940,7 @@ class LogScreen(Screen):
     def _start_stdout_download(self) -> None:
         if self._claim_stdout():
             self._set_stdout_status("saved console: checking…")
-            self._download_stdout()
+            self._download_stdout(self._current_source)
 
     def _set_stdout_status(self, status: str | None) -> None:
         if not self._screen_open:
@@ -937,10 +955,11 @@ class LogScreen(Screen):
         download, which keeps what it saved so the next open resumes.
         """
         last = [0.0]
+        cancel = _cancel_exception()
 
         def progress(sub_job_id: str, chunks_done: int, chunks_total: int, bytes_done: int) -> None:
             if not keep_waiting():
-                raise _DownloadCancelled()
+                raise cancel()
             now = time.monotonic()
             if chunks_done < chunks_total and now - last[0] < 0.25:
                 return
@@ -953,7 +972,9 @@ class LogScreen(Screen):
         return progress
 
     @work(thread=True, group="stdout")
-    def _download_stdout(self) -> None:
+    def _download_stdout(self, first: str | None) -> None:
+        """Download the saved console; ``first`` (the selected sub-job) goes first
+        when the client can limit a download to some sub-jobs."""
         worker = get_current_worker()
 
         def keep_waiting() -> bool:
@@ -980,8 +1001,12 @@ class LogScreen(Screen):
             kwargs = {"resume": True}
             if _accepts_kwarg(download, "progress"):
                 kwargs["progress"] = self._stdout_progress(keep_waiting)
+            if first and _accepts_kwarg(download, "sub_job_ids"):
+                download(self._job_id, self._stdout_root, sub_job_ids=[first], **kwargs)
+                self._post(self._accept_saved_sub_job, first)
+            # With resume, a sub-job fetched above costs only a listing here.
             download(self._job_id, self._stdout_root, **kwargs)
-        except _DownloadCancelled:
+        except (_DownloadCancelled, _cancel_exception()):
             cancelled = True
         except Exception as exc:  # noqa: BLE001 - surfaced in the pane; keep the cache
             error = f"{type(exc).__name__}: {exc}"
@@ -993,6 +1018,14 @@ class LogScreen(Screen):
         finally:
             lock.release()
         self._post(self._finish_download, error is None and not cancelled, error)
+
+    def _accept_saved_sub_job(self, sub_job_id: str) -> None:
+        """UI thread. One sub-job's console is committed; show it if selected."""
+        if not self._screen_open:
+            return
+        self._stdout_ready = True
+        if self._current_source == sub_job_id:
+            self._paint_saved()
 
     def _accept_cached_stdout(self) -> None:
         if not self._screen_open or self._stdout_ready:

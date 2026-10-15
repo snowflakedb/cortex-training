@@ -733,9 +733,13 @@ chunks that are not already on disk. The status line reports while that
 download runs or waits for another download of the same job — another view,
 or another TUI process, finishes first rather than both writing the same
 files. A failed download is shown in the log pane and keeps the cached view;
-`r` retries it. The pane shows, and `/` filters, only the end of a large
-console (up to 20,000 lines from at most its last 64 MiB); `s` and `y` still
-export the whole file. A stream error while the job
+`r` retries it. The selected sub-job is fetched first and shown as soon as it
+is saved, then the rest of the job. The pane shows, and `/` filters, only the
+end of a large console (up to 20,000 lines from at most its last 64 MiB, and
+only bytes the download has committed); `s` and `y` still export the whole
+file. As in a terminal, a carriage return rewinds the line, so a progress bar
+redrawn with `\r` shows only its final state, and a line longer than 8 KiB
+shows only its end. A stream error while the job
 is still running stays an error. The level key filters structured live lines
 and does not hide lines from that saved console.
 

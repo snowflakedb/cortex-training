@@ -1878,3 +1878,131 @@ def test_progress_updates_status_and_leaving_cancels_download(monkeypatch, tmp_p
     assert state["resume"] is True
     assert state.get("raised") == "_DownloadCancelled"
     assert not (tmp_path / "errors.log").exists(), "a cancel was logged as a failure"
+
+
+async def _run_selected_sub_job_first(release, calls):
+    c = _client()
+    c.get_job.return_value = _terminal_job()
+
+    class _Downloads:
+        def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None, sub_job_ids=None):
+            calls.append(None if sub_job_ids is None else list(sub_job_ids))
+            if sub_job_ids is not None:
+                for sid in sub_job_ids:
+                    _write_stdout(output_dir, sid, f"{sid} saved\n")
+                return []
+            assert release.wait(timeout=5)
+            _write_stdout(output_dir, "7:sampling:0", "7:sampling:0 saved\n")
+            return []
+
+    c.download_stdout_logs = _Downloads().download_stdout_logs
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, lambda: "7:training:0 saved" in app.screen._shown_lines)
+        assert ok, "selected sub-job was not shown before the rest finished"
+        ok = await _wait(pilot, app, lambda: len(calls) == 2)
+        assert ok, "the rest of the job was not downloaded"
+        assert calls == [["7:training:0"], None]
+        assert app.screen._stdout_inflight
+        release.set()
+        ok = await _wait(pilot, app, lambda: app.screen._stdout_done)
+        assert ok, "whole-job download did not finish"
+        app.screen._start_tail("7:sampling:0")
+        ok = await _wait(pilot, app, lambda: "7:sampling:0 saved" in app.screen._shown_lines)
+        assert ok, "sibling sub-job was not shown after the full download"
+        await _settle(app, pilot)
+
+
+def test_selected_sub_job_downloads_and_paints_first():
+    release = threading.Event()
+    calls = []
+    try:
+        asyncio.run(_run_selected_sub_job_first(release, calls))
+    finally:
+        release.set()
+
+
+async def _run_reopen_while_download_blocks(state):
+    c = _client()
+    c.get_job.return_value = _terminal_job()
+
+    class _Downloads:
+        # The first download blocks (like a retry backoff that still polls the
+        # callback) until the TUI cancels it; later ones finish at once.
+        def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None):
+            state["calls"] += 1
+            if state["calls"] > 1:
+                _write_stdout(output_dir, "7:training:0", "second view\n")
+                return []
+            state["started"].set()
+            try:
+                while True:
+                    progress("7:training:0", 0, 10, 0)
+                    time.sleep(0.02)
+            except BaseException as exc:  # noqa: BLE001 - the TUI's cancel signal
+                state["raised"] = type(exc).__name__
+                raise
+
+    c.download_stdout_logs = _Downloads().download_stdout_logs
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, state["started"].is_set)
+        assert ok, "first download did not start"
+        app.pop_screen()
+        await pilot.pause()
+        app.push_screen(LogScreen(c, "7", poll_interval=0.01))
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: isinstance(app.screen, LogScreen) and "second view" in app.screen._shown_lines,
+            tries=300,
+        )
+        assert ok, "reopened view stayed waiting on the cancelled download"
+        assert "waiting" not in (app.sub_title or "")
+        await _settle(app, pilot)
+
+
+def test_reopen_does_not_wait_forever_on_a_blocked_download(monkeypatch, tmp_path):
+    import cortex_training.tui.app as app_module
+
+    monkeypatch.setattr(app_module, "_ERROR_LOG", str(tmp_path / "errors.log"))
+    state = {"calls": 0, "started": threading.Event()}
+    asyncio.run(_run_reopen_while_download_blocks(state))
+    assert state["raised"] == "_DownloadCancelled"
+    assert state["calls"] == 2
+    assert not (tmp_path / "errors.log").exists()
+
+
+async def _run_quit_during_download(state):
+    c = _client()
+    c.get_job.return_value = _terminal_job()
+
+    class _Downloads:
+        def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None):
+            state["started"].set()
+            try:
+                while True:
+                    progress("7:training:0", 0, 10, 0)
+                    time.sleep(0.02)
+            finally:
+                state["returned"].set()
+
+    c.download_stdout_logs = _Downloads().download_stdout_logs
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, state["started"].is_set)
+        assert ok, "download did not start"
+        await app.action_quit()
+        await pilot.pause()
+
+
+def test_quit_during_download_stops_it_and_frees_the_lock():
+    from cortex_training.tui.saved_log import DownloadLock
+
+    state = {"started": threading.Event(), "returned": threading.Event()}
+    asyncio.run(_run_quit_during_download(state))
+    assert state["returned"].wait(timeout=5), "download kept running after quit"
+    lock = DownloadLock(_stdout_root())
+    deadline = time.monotonic() + 5
+    assert lock.acquire(lambda: time.monotonic() < deadline), "lock still held after quit"
+    lock.release()

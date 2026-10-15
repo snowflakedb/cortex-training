@@ -23,6 +23,7 @@ TUI processes.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -42,6 +43,7 @@ logger = logging.getLogger(__name__)
 TAIL_MAX_LINES = 20000
 TAIL_CHUNK_BYTES = 1 << 20
 TAIL_MAX_BYTES = 64 << 20
+TAIL_MAX_LINE_BYTES = 8192
 
 
 @dataclass(frozen=True)
@@ -54,12 +56,32 @@ class SavedTail:
     size: int
 
 
-def _split_universal(raw: bytes) -> list[str]:
-    # Match text-mode universal newlines: "\r\n" and a lone "\r" both end a line.
-    text = raw.decode("utf-8", errors="replace")
-    if text.endswith("\r"):
-        text = text[:-1]
-    return text.split("\r")
+def committed_size(path: Path, size: int) -> int:
+    """Bytes of ``path`` that a download has committed.
+
+    A download records the committed length in ``.<name>.manifest.json``;
+    anything past it is a torn append the next download truncates. Without a
+    readable manifest the whole file counts.
+    """
+    manifest = path.with_name("." + path.name + ".manifest.json")
+    try:
+        doc = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return size
+    committed = doc.get("bytes") if isinstance(doc, dict) else None
+    if isinstance(committed, bool) or not isinstance(committed, int) or not 0 <= committed <= size:
+        return size
+    return committed
+
+
+def _decode(raw: bytes, *, cut: bool) -> str:
+    if not cut:
+        return raw.decode("utf-8", errors="replace")
+    # The left edge may split a multi-byte character; drop its continuation bytes.
+    i = 0
+    while i < len(raw) and i < 3 and 0x80 <= raw[i] <= 0xBF:
+        i += 1
+    return "…" + raw[i:].decode("utf-8", errors="replace")
 
 
 def read_saved_tail(
@@ -69,20 +91,28 @@ def read_saved_tail(
     max_lines: int = TAIL_MAX_LINES,
     chunk_bytes: int = TAIL_CHUNK_BYTES,
     max_bytes: int = TAIL_MAX_BYTES,
+    max_line_bytes: int = TAIL_MAX_LINE_BYTES,
 ) -> SavedTail | None:
     """Return up to ``max_lines`` lines matching ``query`` from the end of ``path``.
 
-    Reads backwards in ``chunk_bytes`` steps and stops once enough lines match
-    or ``max_bytes`` have been read, so cost is bounded by the window rather
-    than the file. The line cut by the window start is dropped. Returns
-    ``None`` when the file is missing or empty.
+    Lines end at ``\n``. A ``\r`` inside a line returns the cursor to column 0,
+    as in a terminal, so a line rewritten with ``\r`` (a progress bar) shows only
+    its last non-empty segment and ``\r\n`` is an ordinary line end. The filter
+    applies to that shown text.
+
+    The file is scanned backwards once, in ``chunk_bytes`` steps, stopping once
+    enough lines match or ``max_bytes`` have been read. Only bytes the download
+    has committed are read. The line cut by the window start is dropped unless
+    it is the only one; a line longer than ``max_line_bytes`` shows its last
+    ``max_line_bytes`` bytes after a leading ``…``. Returns ``None`` when the
+    file is missing or empty.
     """
     try:
         handle = path.open("rb")
     except OSError:
         return None
     with handle:
-        size = handle.seek(0, 2)
+        size = committed_size(path, handle.seek(0, 2))
         if size == 0:
             return None
         end = size
@@ -90,29 +120,83 @@ def read_saved_tail(
         if handle.read(1) == b"\n":
             end -= 1  # the final newline terminates the last line; it starts none
         kept: list[str] = []  # newest first
-        carry = b""  # start of a line whose beginning lies before ``pos``
+        capped = False
+        # The \r-segment being collected (right to left), capped to its last
+        # ``max_line_bytes`` bytes.
+        parts: list[bytes] = []
+        seg_len = 0
+        shown = False  # the current line already produced its shown text
+
+        def take(piece: bytes) -> None:
+            nonlocal seg_len
+            room = max_line_bytes - min(seg_len, max_line_bytes)
+            if room > 0 and piece:
+                parts.append(piece[-room:])
+            seg_len += len(piece)
+
+        def emit(*, cut: bool = False) -> None:
+            nonlocal capped, shown, seg_len
+            raw = b"".join(reversed(parts))
+            parts.clear()
+            text = _decode(raw, cut=cut or seg_len > max_line_bytes)
+            seg_len = 0
+            shown = True
+            if not entry_matches(text, query):
+                return
+            if len(kept) >= max_lines:
+                capped = True
+                return
+            kept.append(text)
+
+        def drop_segment() -> None:
+            nonlocal seg_len
+            parts.clear()
+            seg_len = 0
+
         pos = end
         read = 0
-        capped = False
         while pos > 0 and not capped and read < max_bytes:
             start = max(0, pos - chunk_bytes, end - max_bytes)
             handle.seek(start)
-            data = handle.read(pos - start) + carry
+            data = handle.read(pos - start)
             read += pos - start
             pos = start
-            parts = data.split(b"\n")
-            if pos > 0:
-                carry = parts[0]
-                parts = parts[1:]
-            else:
-                carry = b""
-            texts = [text for raw in parts for text in _split_universal(raw)]
-            for i in range(len(texts) - 1, -1, -1):
-                if entry_matches(texts[i], query):
-                    if len(kept) >= max_lines:
-                        capped = True
+            i = len(data)
+            # Cached rfind results; each is recomputed only once ``i`` passes it,
+            # so every byte is searched at most once per separator.
+            nl = cr = i + 1
+            while i > 0 and not capped:
+                if nl >= i:
+                    nl = data.rfind(b"\n", 0, i)
+                if shown:
+                    if nl < 0:
+                        i = 0
                         break
-                    kept.append(texts[i])
+                    i = nl
+                    shown = False  # the next line to the left starts here
+                    drop_segment()
+                    continue
+                if cr >= i:
+                    cr = data.rfind(b"\r", 0, i)
+                sep = max(nl, cr)
+                take(data[sep + 1 : i])
+                if sep < 0:
+                    i = 0
+                    break
+                i = sep
+                if seg_len:
+                    emit()
+                else:
+                    drop_segment()
+                if sep == nl:
+                    if not shown:
+                        emit()  # an empty line
+                    shown = False
+        if pos == 0 and not capped:
+            if not shown:
+                emit()  # the first line of the file
+        elif not capped and not shown and seg_len and not kept:
+            emit(cut=True)  # one line longer than the window: show its end
         kept.reverse()
         return SavedTail(lines=kept, truncated=capped or pos > 0, size=size)
 

@@ -15,6 +15,7 @@
 
 """Tests for the TUI's saved-console tail reader and download lock."""
 
+import json
 import threading
 import time
 
@@ -81,10 +82,81 @@ def test_filter_is_applied_and_keeps_the_newest_matches(tmp_path):
     assert read_saved_tail(path, "no-such-text").lines == []
 
 
-def test_universal_newlines_and_invalid_utf8(tmp_path):
-    path = _write(tmp_path, b"crlf\r\nprogress 1\rprogress 2\r\nbad \xff byte\n")
-    tail = read_saved_tail(path, chunk_bytes=3)
-    assert tail.lines == ["crlf", "progress 1", "progress 2", "bad � byte"]
+@pytest.mark.parametrize("chunk_bytes", [1, 3, 1 << 20])
+def test_carriage_returns_show_what_a_terminal_would(tmp_path, chunk_bytes):
+    # "\r" rewinds to column 0: only the last non-empty segment of a line shows,
+    # and "\r\n" is an ordinary line end.
+    path = _write(
+        tmp_path,
+        b"crlf\r\nprogress 1\rprogress 2\r\n\r\nbar 10%\rbar 50%\rbar 100%\rbad \xff byte\r\n",
+    )
+    tail = read_saved_tail(path, chunk_bytes=chunk_bytes)
+    assert tail.lines == ["crlf", "progress 2", "", "bad � byte"]
+    assert tail.truncated is False
+
+
+def test_filter_matches_the_shown_segment(tmp_path):
+    path = _write(tmp_path, b"step 1 loss\rstep 2 done\nother\n")
+    assert read_saved_tail(path, "done").lines == ["step 2 done"]
+    assert read_saved_tail(path, "loss").lines == []
+
+
+def test_carriage_return_only_tail_larger_than_the_window(tmp_path):
+    head = b"".join(b"line %d\n" % i for i in range(1000))
+    updates = b"\r".join(b"progress %07d" % i for i in range(300000))  # ~5 MiB
+    path = _write(tmp_path, head + updates + b"\n")
+    tail = read_saved_tail(path, chunk_bytes=64 << 10, max_bytes=1 << 20)
+    # The last progress state shows even though its line starts outside the window.
+    assert tail.lines == ["progress 0299999"]
+    assert tail.truncated is True
+    whole = read_saved_tail(path, chunk_bytes=64 << 10)
+    assert whole.lines[-2:] == ["line 999", "progress 0299999"]
+    assert len(whole.lines) == 1001
+
+
+def test_carriage_return_scan_is_linear(tmp_path):
+    updates = b"\r".join(b"%08d" % i for i in range(2_000_000))  # ~18 MiB, one line
+    path = _write(tmp_path, b"first\n" + updates)
+    started = time.monotonic()
+    tail = read_saved_tail(path)
+    elapsed = time.monotonic() - started
+    assert tail.lines == ["first", "01999999"]
+    assert elapsed < 5, f"scan took {elapsed:.1f}s"
+
+
+def test_single_line_longer_than_the_window_shows_its_end(tmp_path):
+    path = _write(tmp_path, b"x" * 5000 + b"END\n")
+    tail = read_saved_tail(path, chunk_bytes=256, max_bytes=1024, max_line_bytes=100)
+    assert tail.lines == ["…" + "x" * 97 + "END"]
+    assert tail.truncated is True
+
+
+def test_long_line_is_capped_for_display(tmp_path):
+    path = _write(tmp_path, b"short\n" + "é".encode() * 300 + b"\nlast\n")
+    tail = read_saved_tail(path, chunk_bytes=7, max_line_bytes=101)
+    assert tail.lines[0] == "short"
+    assert tail.lines[2] == "last"
+    capped = tail.lines[1]
+    assert capped.startswith("…") and "�" not in capped
+    assert capped == "…" + "é" * 50
+
+
+def test_reads_only_bytes_the_manifest_committed(tmp_path):
+    path = _write(tmp_path, b"one\ntwo\ntorn app")
+    manifest = tmp_path / ".stdout.log.manifest.json"
+    manifest.write_text(json.dumps({"version": 1, "names": ["a.gz"], "bytes": 8}), encoding="utf-8")
+    tail = read_saved_tail(path)
+    assert tail.lines == ["one", "two"]
+    assert tail.size == 8
+    manifest.write_text("not json", encoding="utf-8")
+    assert read_saved_tail(path).lines == ["one", "two", "torn app"]
+    manifest.write_text(json.dumps({"bytes": 999}), encoding="utf-8")
+    assert read_saved_tail(path).lines == ["one", "two", "torn app"]
+
+
+def test_invalid_utf8_is_replaced(tmp_path):
+    path = _write(tmp_path, b"bad \xff byte\n")
+    assert read_saved_tail(path, chunk_bytes=3).lines == ["bad � byte"]
 
 
 def test_multibyte_characters_split_across_chunks(tmp_path):
