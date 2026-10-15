@@ -15,6 +15,9 @@ models:
   - Qwen/Qwen3.8-Flash-Next
   - nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   - nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
+  - google/gemma-3-4b-it
+  - google/medgemma-4b-it
+  - google/medgemma-1.5-4b-it
   - google/gemma-4-31B-it
   - zai-org/GLM-4.5-Air
   - zai-org/GLM-5.3-Flash

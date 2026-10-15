@@ -39,6 +39,20 @@ python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json \
   job_config=configs/qwen35_9b_full.json
 
+# Gemma 3 4B IT, MedGemma 4B IT, and MedGemma 1.5 4B IT.
+# Full-parameter, 128K context.
+python -m recipes.rl.math_grpo.train \
+  config=/path/to/config.json \
+  job_config=configs/gemma3_4b.json
+
+python -m recipes.rl.math_grpo.train \
+  config=/path/to/config.json \
+  job_config=configs/medgemma_4b.json
+
+python -m recipes.rl.math_grpo.train \
+  config=/path/to/config.json \
+  job_config=configs/medgemma15_4b.json
+
 # Gemma 4 31B IT full-parameter, 256K context
 python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json \
@@ -83,6 +97,7 @@ Other full-parameter job bodies are:
 
 - `configs/qwen3_4b_instruct.json`: Qwen3-4B-Instruct-2507, 8 training GPUs, SP8, 8 sampling GPUs at TP8, 256K. One optimizer step and an 8-token sample completed on H200.
 - `configs/qwen35_9b_full.json`: Qwen3.5-9B, 8 training GPUs, SP8, 8 sampling GPUs at TP8, 256K. One optimizer step and an 8-token sample completed on H200.
+- `configs/gemma3_4b.json`, `configs/medgemma_4b.json`, and `configs/medgemma15_4b.json`: Gemma 3 4B IT, MedGemma 4B IT, and MedGemma 1.5 4B IT. Each is 8 training GPUs, SP8, 8 sampling GPUs at TP8, 128K. The training block matches the SFT recipe. All three are Gemma 3 conditional-generation checkpoints. MedGemma 4B IT and MedGemma 1.5 4B IT each completed one optimizer step, weight sync, and an 8-token post-sync sample on H200. On Transformers 5, vLLM's Gemma 3 mapper has to send `model.vision_tower.` to `vision_tower.vision_model.`. `google/gemma-3-4b-it` uses this same mesh; that checkpoint was not run because its Hugging Face license grant is still pending.
 - `configs/gemma4_31b.json`: Gemma 4 31B IT, 8 training GPUs, SP8, 8 sampling GPUs at TP8, 256K. The training block matches the SFT recipe. One optimizer step and an 8-token sample completed on H200. Sliding layers use head size 256; full-attention layers use head size 512. Long sequences use flex attention, and shorter sequences use math attention.
 - `configs/qwen3_30b_a3b.json`
 - `configs/glm45_air.json`

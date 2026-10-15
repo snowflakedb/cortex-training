@@ -145,8 +145,13 @@ to run at the model's 262K context limit. `qwen3_4b_instruct.json` and
 `qwen35_9b_full.json` do the same for dense Qwen3-4B-Instruct-2507 and
 Qwen3.5-9B: 8 GPUs, SP8, and the checkpoint limit of 262144 tokens. One
 AdamW step completed for each on H200. The Qwen3.5-9B LoRA config stays
-at 65536 tokens. `gemma4_31b.json` trains `google/gemma-4-31B-it` on the
-same 8-GPU SP8 mesh. One AdamW step at 262144 tokens completed on H200.
+at 65536 tokens. `gemma3_4b.json`, `medgemma_4b.json`, and `medgemma15_4b.json` train
+`google/gemma-3-4b-it`, `google/medgemma-4b-it`, and
+`google/medgemma-1.5-4b-it` on 8 GPUs, SP8, at the checkpoint limit of
+131072 tokens. All three are Gemma 3 conditional-generation models and
+share that mesh. `gemma4_31b.json` trains
+`google/gemma-4-31B-it` on the same 8-GPU SP8 mesh. One AdamW step at
+262144 tokens completed on H200.
 Sliding layers use head size 256 and 16 KV heads; full-attention layers
 use head size 512 and 4 KV heads, and sequence parallel replicates those
 4 KV heads across the 8 ranks. FlashAttention stops at head size 256, so
@@ -215,6 +220,20 @@ python -m recipes.sft.conversational.train \
 python -m recipes.sft.conversational.train \
   config=/path/to/config.json \
   job_config=configs/qwen35_9b_full.json
+
+# Gemma 3 4B IT, MedGemma 4B IT, and MedGemma 1.5 4B IT.
+# Full-parameter, 128K context, 8 GPUs, SP8.
+python -m recipes.sft.conversational.train \
+  config=/path/to/config.json \
+  job_config=configs/gemma3_4b.json
+
+python -m recipes.sft.conversational.train \
+  config=/path/to/config.json \
+  job_config=configs/medgemma_4b.json
+
+python -m recipes.sft.conversational.train \
+  config=/path/to/config.json \
+  job_config=configs/medgemma15_4b.json
 
 # Gemma 4 31B IT full-parameter, 256K context, 8 GPUs, SP8
 python -m recipes.sft.conversational.train \
