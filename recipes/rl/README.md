@@ -39,6 +39,11 @@ python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json \
   job_config=configs/qwen35_9b_full.json
 
+# Gemma 4 31B IT full-parameter, 256K context
+python -m recipes.rl.math_grpo.train \
+  config=/path/to/config.json \
+  job_config=configs/gemma4_31b.json
+
 # Qwen3.6-35B-A3B LoRA
 python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json \
@@ -78,6 +83,7 @@ Other full-parameter job bodies are:
 
 - `configs/qwen3_4b_instruct.json`: Qwen3-4B-Instruct-2507, 8 training GPUs, SP8, 8 sampling GPUs at TP8, 256K. One optimizer step and an 8-token sample completed on H200.
 - `configs/qwen35_9b_full.json`: Qwen3.5-9B, 8 training GPUs, SP8, 8 sampling GPUs at TP8, 256K. One optimizer step and an 8-token sample completed on H200.
+- `configs/gemma4_31b.json`: Gemma 4 31B IT, 8 training GPUs, SP8, 8 sampling GPUs at TP8, 256K. The training block matches the SFT recipe. One optimizer step and an 8-token sample completed on H200. Sliding layers use head size 256; full-attention layers use head size 512. Long sequences use flex attention, and shorter sequences use math attention.
 - `configs/qwen3_30b_a3b.json`
 - `configs/glm45_air.json`
 - `configs/nemotron3_nano_30b.json`: Nemotron-3-Nano, 8 training GPUs, SP8, EP4, 8 sampling GPUs at TP8, 256K. The training mesh matches the SFT recipe, which completed an AdamW step on H200. Sampling was not probed.
