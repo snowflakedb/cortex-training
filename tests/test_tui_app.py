@@ -22,6 +22,7 @@ import json
 import os
 import re
 import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -1832,3 +1833,48 @@ def test_saved_console_is_read_off_the_ui_thread():
     asyncio.run(_run_saved_console_read_off_ui_thread(seen))
     assert seen and not any(on_main for on_main, _ in seen)
     assert "alp" in [query for _, query in seen]
+
+
+async def _run_progress_status_and_cancel(state):
+    c = _client()
+    c.get_job.return_value = _terminal_job()
+
+    class _Downloads:
+        # A real signature, so the TUI detects the optional progress kwarg.
+        def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None):
+            state["resume"] = resume
+            try:
+                for i in range(1, 10000):
+                    progress("7:training:0", i, 10000, i * 1024)
+                    if i == 1:
+                        state["started"].set()
+                    time.sleep(0.005)
+            except BaseException as exc:  # noqa: BLE001 - the TUI's cancel signal
+                state["raised"] = type(exc).__name__
+                raise
+            return []
+
+    c.download_stdout_logs = _Downloads().download_stdout_logs
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, lambda: re.search(r"\d+/10000 chunks", app.sub_title or ""))
+        assert ok, "download progress did not reach the status line"
+        app.pop_screen()
+        for _ in range(5):
+            await pilot.pause()
+        await _settle(app, pilot)
+    for _ in range(200):
+        if "raised" in state:
+            break
+        time.sleep(0.01)
+
+
+def test_progress_updates_status_and_leaving_cancels_download(monkeypatch, tmp_path):
+    import cortex_training.tui.app as app_module
+
+    monkeypatch.setattr(app_module, "_ERROR_LOG", str(tmp_path / "errors.log"))
+    state = {"started": threading.Event()}
+    asyncio.run(_run_progress_status_and_cancel(state))
+    assert state["resume"] is True
+    assert state.get("raised") == "_DownloadCancelled"
+    assert not (tmp_path / "errors.log").exists(), "a cancel was logged as a failure"

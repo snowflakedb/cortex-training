@@ -80,6 +80,10 @@ from cortex_training.tui.saved_log import read_saved_tail
 _ERROR_LOG = "~/.cortex-training-errors.log"
 
 
+class _DownloadCancelled(Exception):
+    """Raised from a download progress callback once its view has closed."""
+
+
 def _accepts_kwarg(fn, name: str) -> bool:
     """Whether ``fn`` takes keyword ``name`` (so optional client features can be
     passed without breaking an older client)."""
@@ -926,8 +930,27 @@ class LogScreen(Screen):
         self._stdout_status = status
         self._update_subtitle()
 
-    def _on_stdout_progress(self, *args, **kwargs) -> None:
-        """Hook for a client ``progress`` callback; runs on the download thread."""
+    def _stdout_progress(self, keep_waiting):
+        """Build the client's ``progress`` callback (called on the download thread).
+
+        Status updates are throttled; raising once the view closes stops the
+        download, which keeps what it saved so the next open resumes.
+        """
+        last = [0.0]
+
+        def progress(sub_job_id: str, chunks_done: int, chunks_total: int, bytes_done: int) -> None:
+            if not keep_waiting():
+                raise _DownloadCancelled()
+            now = time.monotonic()
+            if chunks_done < chunks_total and now - last[0] < 0.25:
+                return
+            last[0] = now
+            self._post(
+                self._set_stdout_status,
+                f"saved console: {sub_job_id} {chunks_done}/{chunks_total} chunks, {format_bytes(bytes_done)}",
+            )
+
+        return progress
 
     @work(thread=True, group="stdout")
     def _download_stdout(self) -> None:
@@ -950,13 +973,16 @@ class LogScreen(Screen):
             self._post(self._finish_download, False, None)
             return
         error = None
+        cancelled = False
         try:
             self._post(self._set_stdout_status, "saved console: downloading…")
             download = self._client.download_stdout_logs
             kwargs = {"resume": True}
             if _accepts_kwarg(download, "progress"):
-                kwargs["progress"] = self._on_stdout_progress
+                kwargs["progress"] = self._stdout_progress(keep_waiting)
             download(self._job_id, self._stdout_root, **kwargs)
+        except _DownloadCancelled:
+            cancelled = True
         except Exception as exc:  # noqa: BLE001 - surfaced in the pane; keep the cache
             error = f"{type(exc).__name__}: {exc}"
             try:
@@ -966,7 +992,7 @@ class LogScreen(Screen):
                 pass
         finally:
             lock.release()
-        self._post(self._finish_download, error is None, error)
+        self._post(self._finish_download, error is None and not cancelled, error)
 
     def _accept_cached_stdout(self) -> None:
         if not self._screen_open or self._stdout_ready:
