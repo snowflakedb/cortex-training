@@ -267,7 +267,6 @@ def _capacity_with_breakdown(hardware, dimensions):
     breakdown = {"job_count": 1, "truncated": False, "unsupported_dimensions": []}
     if "job_type" in dimensions:
         breakdown["by_job_type"] = {
-            "status": "OK",
             "groups": [
                 {"job_type": "TRAINING", "in_use_gpus": 8, "pending_gpus": 0, "sub_job_count": 1},
                 {"job_type": "SAMPLING", "in_use_gpus": 0, "pending_gpus": 0, "sub_job_count": 0},
@@ -276,8 +275,6 @@ def _capacity_with_breakdown(hardware, dimensions):
         }
     if "submitted_by" in dimensions:
         breakdown["by_submitted_by"] = {
-            "status": "OK",
-            "scope": "SELF",
             "groups": [
                 {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
                  "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
@@ -1355,8 +1352,9 @@ def test_capacity_breakdown_single_hardware_prints_compact_sorted_json():
     assert err == ""
     assert client.capacity_hardware_requests == []
     assert client.capacity_breakdown_requests == [("B300", ("submitted_by",))]
-    expected = _capacity_with_breakdown("B300", ("submitted_by",))
-    assert out == json.dumps(expected, separators=(",", ":"), sort_keys=True) + "\n"
+    expected = cli._breakdown_last(_capacity_with_breakdown("B300", ("submitted_by",)))
+    assert out == json.dumps(expected, separators=(",", ":")) + "\n"
+    assert list(json.loads(out))[-1] == "breakdown"
 
 
 @pytest.mark.parametrize("hardware", _CAPACITY_HARDWARE)
@@ -1399,8 +1397,6 @@ def test_capacity_breakdown_prints_the_real_client_result_with_sorted_keys():
             "truncated": False,
             "by_job_type": {"status": "DISABLED", "groups": []},
             "by_submitted_by": {
-                "status": "OK",
-                "scope": "SELF",
                 "groups": [
                     {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
                      "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
@@ -1444,8 +1440,6 @@ def test_capacity_breakdown_prints_the_real_client_result_with_sorted_keys():
             "unsupported_dimensions": [],
             "by_job_type": {"status": "DISABLED", "groups": []},
             "by_submitted_by": {
-                "status": "OK",
-                "scope": "SELF",
                 "groups": [
                     {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
                      "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
@@ -1457,7 +1451,8 @@ def test_capacity_breakdown_prints_the_real_client_result_with_sorted_keys():
             },
         },
     }
-    assert out == json.dumps(expected, indent=2, sort_keys=True) + "\n"
+    assert out == json.dumps(cli._breakdown_last(expected), indent=2) + "\n"
+    assert list(json.loads(out))[-1] == "breakdown"
 
 
 def test_capacity_breakdown_prints_visible_user_rows_in_server_order():
@@ -1479,8 +1474,6 @@ def test_capacity_breakdown_prints_visible_user_rows_in_server_order():
             "job_count": 5,
             "truncated": False,
             "by_submitted_by": {
-                "status": "OK",
-                "scope": "VISIBLE",
                 "groups": [
                     {"kind": "USER", "submitted_by": "CAROL", "is_caller": False,
                      "in_use_gpus": 16, "pending_gpus": 8, "job_count": 2},
@@ -1508,8 +1501,6 @@ def test_capacity_breakdown_prints_visible_user_rows_in_server_order():
         "breakdown": "submitted_by",
     }
     assert json.loads(out)["breakdown"]["by_submitted_by"] == {
-        "status": "OK",
-        "scope": "VISIBLE",
         "groups": [
             {"kind": "USER", "submitted_by": "CAROL", "is_caller": False,
              "in_use_gpus": 16, "pending_gpus": 8, "job_count": 2},
