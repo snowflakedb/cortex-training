@@ -1016,8 +1016,8 @@ class LogScreen(Screen):
         self._stdout_status = status
         self._update_subtitle()
 
-    def _stdout_progress(self, keep_waiting):
-        """Build the client's ``progress`` callback (called on the download thread).
+    def _stdout_on_chunk(self, keep_waiting):
+        """Build the client's ``on_chunk`` callback (called on the download thread).
 
         Status updates are throttled; a finished sub-job is repainted if it is
         selected. Raising once the view closes stops the download, which keeps
@@ -1025,7 +1025,7 @@ class LogScreen(Screen):
         """
         last = [0.0]
 
-        def progress(sub_job_id: str, chunks_done: int, chunks_total: int, bytes_done: int) -> None:
+        def on_chunk(sub_job_id: str, chunks_done: int, chunks_total: int, bytes_done: int) -> None:
             if not keep_waiting():
                 raise DownloadCancelled()
             if chunks_total and chunks_done == chunks_total:
@@ -1041,7 +1041,7 @@ class LogScreen(Screen):
                 f"saved console: {sub_job_id} {chunks_done}/{chunks_total} chunks, {format_bytes(bytes_done)}",
             )
 
-        return progress
+        return on_chunk
 
     @work(thread=True, group="stdout")
     def _download_stdout(self, first: str | None) -> None:
@@ -1074,7 +1074,7 @@ class LogScreen(Screen):
             # check cannot fire; skip its status lookup.
             kwargs = {
                 "resume": True,
-                "progress": self._stdout_progress(keep_waiting),
+                "on_chunk": self._stdout_on_chunk(keep_waiting),
                 "stale_after_seconds": None,
             }
             if first:

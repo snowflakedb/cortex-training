@@ -1870,14 +1870,14 @@ async def _run_progress_status_and_cancel(state):
     c.get_job.return_value = _terminal_job()
 
     class _Downloads:
-        # A real signature, so the TUI detects the optional progress kwarg.
-        def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None, **kwargs):
+        # A real signature: unknown keyword arguments would fail the call.
+        def download_stdout_logs(self, job_id, output_dir, *, resume=False, on_chunk=None, **kwargs):
             if kwargs.get("sub_job_ids") is not None:
                 return []
             state["resume"] = resume
             try:
                 for i in range(1, 10000):
-                    progress("7:training:0", i, 10000, i * 1024)
+                    on_chunk("7:training:0", i, 10000, i * 1024)
                     if i == 1:
                         state["started"].set()
                     time.sleep(0.005)
@@ -1918,7 +1918,7 @@ async def _run_selected_sub_job_first(release, calls):
 
     class _Downloads:
         def download_stdout_logs(
-            self, job_id, output_dir, *, resume=False, progress=None, sub_job_ids=None, **_kwargs
+            self, job_id, output_dir, *, resume=False, on_chunk=None, sub_job_ids=None, **_kwargs
         ):
             calls.append(None if sub_job_ids is None else list(sub_job_ids))
             if sub_job_ids is not None:
@@ -1963,7 +1963,7 @@ async def _run_reopen_while_download_blocks(state):
     class _Downloads:
         # The first download blocks (like a retry backoff that still polls the
         # callback) until the TUI cancels it; later ones finish at once.
-        def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None, **kwargs):
+        def download_stdout_logs(self, job_id, output_dir, *, resume=False, on_chunk=None, **kwargs):
             if kwargs.get("sub_job_ids") is not None:
                 return []
             state["calls"] += 1
@@ -1973,7 +1973,7 @@ async def _run_reopen_while_download_blocks(state):
             state["started"].set()
             try:
                 while True:
-                    progress("7:training:0", 0, 10, 0)
+                    on_chunk("7:training:0", 0, 10, 0)
                     time.sleep(0.02)
             except BaseException as exc:  # noqa: BLE001 - the TUI's cancel signal
                 state["raised"] = type(exc)
@@ -2014,13 +2014,13 @@ async def _run_quit_during_download(state):
     c.get_job.return_value = _terminal_job()
 
     class _Downloads:
-        def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None, **kwargs):
+        def download_stdout_logs(self, job_id, output_dir, *, resume=False, on_chunk=None, **kwargs):
             if kwargs.get("sub_job_ids") is not None:
                 return []
             state["started"].set()
             try:
                 while True:
-                    progress("7:training:0", 0, 10, 0)
+                    on_chunk("7:training:0", 0, 10, 0)
                     time.sleep(0.02)
             finally:
                 state["returned"].set()
@@ -2052,7 +2052,7 @@ async def _run_stdout_warnings(calls):
 
     class _Downloads:
         def download_stdout_logs(
-            self, job_id, output_dir, *, resume=False, progress=None, sub_job_ids=None, stale_after_seconds=600
+            self, job_id, output_dir, *, resume=False, on_chunk=None, sub_job_ids=None, stale_after_seconds=600
         ):
             calls.append(stale_after_seconds)
             _write_stdout(output_dir, "7:training:0", "saved\n")
@@ -2131,15 +2131,15 @@ async def _run_repaint_on_sub_job_done(release):
 
     class _Downloads:
         # No sub_job_ids support: the whole job downloads in one call.
-        def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None, **kwargs):
+        def download_stdout_logs(self, job_id, output_dir, *, resume=False, on_chunk=None, **kwargs):
             if kwargs.get("sub_job_ids") is not None:
                 return []
-            progress("7:sampling:0", 0, 2, 0)
+            on_chunk("7:sampling:0", 0, 2, 0)
             _write_stdout(output_dir, "7:sampling:0", "sampling saved\n")
-            progress("7:sampling:0", 2, 2, 15)
-            progress("7:training:0", 0, 3, 0)
+            on_chunk("7:sampling:0", 2, 2, 15)
+            on_chunk("7:training:0", 0, 3, 0)
             _write_stdout(output_dir, "7:training:0", "training saved\n")
-            progress("7:training:0", 3, 3, 15)
+            on_chunk("7:training:0", 3, 3, 15)
             assert release.wait(timeout=5)
             return []
 
