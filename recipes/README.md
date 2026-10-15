@@ -9,6 +9,7 @@ under its `configs/` directory.
 | Recipe | Method | Dataset | Status |
 |---|---|---|---|
 | [Conversational SFT](sft/README.md) | LoRA or full-parameter SFT | Hugging Face chat datasets, GSM8K, identity | Runnable |
+| [DARE-Bench agent SFT](sft/dare/README.md) | Full-parameter multi-turn tool SFT + agent eval | DARE-Bench | Runnable |
 | [Math GRPO](rl/README.md) | Reinforcement learning | Hendrycks MATH and MATH-500 | Runnable |
 | [On-policy distillation](distillation/README.md) | Distillation from a frozen teacher | GSM8K | Runnable |
 | [Inference endpoint](inference/README.md) | Serve, generate, eval | Open weights, checkpoints, MATH-500, GSM8K, identity | Runnable |
