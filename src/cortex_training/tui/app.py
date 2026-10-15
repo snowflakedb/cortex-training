@@ -53,6 +53,7 @@ from textual.widgets import TabPane
 from textual.worker import get_current_worker
 
 from cortex_training.client import DownloadCancelled
+from cortex_training.client import NoChunksError
 from cortex_training.tui.format import entry_at_level
 from cortex_training.tui.format import entry_matches
 from cortex_training.tui.format import format_job_config
@@ -1066,9 +1067,16 @@ class LogScreen(Screen):
                 "stale_after_seconds": None,
             }
             if first:
-                results = download(self._job_id, self._stdout_root, sub_job_ids=[first], **kwargs)
-                self._post(self._accept_download_warnings, "stdout", _result_warnings(results), stall_checked=False)
-                self._post(self._accept_saved_sub_job, first)
+                try:
+                    results = download(self._job_id, self._stdout_root, sub_job_ids=[first], **kwargs)
+                except NoChunksError:
+                    # The selected sub-job saved no console (for example, the job
+                    # failed before it started); the whole-job call below still
+                    # fetches the others, and the pane shows the empty note.
+                    pass
+                else:
+                    self._post(self._accept_download_warnings, "stdout", _result_warnings(results), stall_checked=False)
+                    self._post(self._accept_saved_sub_job, first)
             # With resume, a sub-job fetched above costs only a listing here.
             results = download(self._job_id, self._stdout_root, **kwargs)
             self._post(self._accept_download_warnings, "stdout", _result_warnings(results), stall_checked=False)

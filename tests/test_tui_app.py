@@ -2215,3 +2215,47 @@ def test_failed_metrics_refresh_does_not_use_up_the_stall_check():
     # The failed first refresh leaves the check due; the next one runs it and
     # starts the quiet window.
     assert calls == [600, 600, None]
+
+
+def _real_download_client(monkeypatch, *, subs, count=3):
+    """A TUI client whose downloads go through the real SDK code over a fake
+    Snowflake connection (job metadata and tails stay mocked)."""
+    from tests.test_client import TestChunkedArtifactDownload
+
+    real, connection, _paths, _sleeps, _opened = TestChunkedArtifactDownload()._setup(
+        monkeypatch, subs=subs, count=count
+    )
+    c = _client()
+    c.download_stdout_logs = real.download_stdout_logs
+    return c, connection
+
+
+async def _run_selected_sub_job_without_chunks(c):
+    app = CortexTrainingLogTUI(c, "job-1", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen) and app.screen._stdout_done, tries=300)
+        assert ok, "saved-console download did not finish"
+        screen = app.screen
+        assert screen._current_source == "job-1:sampling:0"
+        assert screen._stdout_error is None
+        assert not any("download failed" in line for line in screen._shown_lines)
+        ok = await _wait(pilot, app, lambda: "No log output is available." in screen._shown_lines)
+        assert ok, "a sub-job without saved output did not show the empty note"
+        screen._start_tail("job-1:training:0")
+        ok = await _wait(pilot, app, lambda: "job-1:training:0 line 2" in screen._shown_lines)
+        assert ok, "the other sub-job's console was not fetched"
+        await _settle(app, pilot)
+
+
+def test_selected_sub_job_without_chunks_falls_through_to_the_whole_job(monkeypatch):
+    c, connection = _real_download_client(monkeypatch, subs=["job-1:training:0"])
+    c.get_job.return_value = {
+        "status": "FAILED",
+        "sub_jobs": [
+            {"sub_job_id": "job-1:sampling:0", "job_type": "sampling"},
+            {"sub_job_id": "job-1:training:0", "job_type": "training"},
+        ],
+    }
+    asyncio.run(_run_selected_sub_job_without_chunks(c))
+    gets = [cmd for cmd in connection.commands if cmd.startswith("GET ")]
+    assert len(gets) == 3
