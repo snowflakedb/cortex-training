@@ -145,7 +145,12 @@ to run at the model's 262K context limit. `qwen3_4b_instruct.json` and
 `qwen35_9b_full.json` do the same for dense Qwen3-4B-Instruct-2507 and
 Qwen3.5-9B: 8 GPUs, SP8, and the checkpoint limit of 262144 tokens. One
 AdamW step completed for each on H200. The Qwen3.5-9B LoRA config stays
-at 65536 tokens.
+at 65536 tokens. `gemma4_31b.json` trains `google/gemma-4-31B-it` on the
+same 8-GPU SP8 mesh. One AdamW step at 262144 tokens completed on H200.
+Sliding layers use head size 256 and 16 KV heads; full-attention layers
+use head size 512 and 4 KV heads, and sequence parallel replicates those
+4 KV heads across the 8 ranks. FlashAttention stops at head size 256, so
+the full-attention layers run with flex attention.
 
 ### MoE models
 
@@ -210,6 +215,11 @@ python -m recipes.sft.conversational.train \
 python -m recipes.sft.conversational.train \
   config=/path/to/config.json \
   job_config=configs/qwen35_9b_full.json
+
+# Gemma 4 31B IT full-parameter, 256K context, 8 GPUs, SP8
+python -m recipes.sft.conversational.train \
+  config=/path/to/config.json \
+  job_config=configs/gemma4_31b.json
 
 # Qwen3.8-27B LoRA / full
 python -m recipes.sft.conversational.train \
