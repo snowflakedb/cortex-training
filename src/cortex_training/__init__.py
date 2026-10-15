@@ -26,6 +26,7 @@ from .client import CortexTrainingClient
 from .client import Hardware
 from .client import InferenceConfig
 from .client import JobType
+from .client import ModelDeploymentSpec
 from .client import SubJobConfig
 from .client import TrainingConfig
 from .client import build_forward_backward_kwargs
@@ -44,6 +45,7 @@ __all__ = [
     "TrainingConfig",
     "InferenceConfig",
     "JobType",
+    "ModelDeploymentSpec",
     "Hardware",
     "router_replay_planner",
     "wire",

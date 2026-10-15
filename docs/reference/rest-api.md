@@ -243,7 +243,9 @@ Every HTTP request has a default 30-second connect timeout and 600-second read
 timeout. Callers can configure a shorter positive scalar or a `(connect, read)`
 pair with `CortexTrainingClient(request_timeout=...)`.
 
-The general request path retries connection/time-out failures and HTTP:
+The general request path retries connection/time-out failures (except TLS
+errors such as a certificate or hostname mismatch, which fail the same way on
+every attempt) and HTTP:
 
 ```text
 307, 308, 404, 409, 429, 500, 502, 503, 504
@@ -310,6 +312,10 @@ Paths are relative to the prefix in [section 2.1](#21-base-url).
 
 The operation endpoint supports the operation types in
 [section 7](#7-generic-operation-envelope).
+
+Model deployments add no client-called path: the `*_model_deployment*` methods
+use the job paths above, and a deployment serves under
+`/inference/v1` ([section 14](#14-model-deployments)).
 
 These calls are outside the Cortex Training prefix:
 
@@ -2461,7 +2467,190 @@ result = client.poll_request(job_id, request_id)
 
 ---
 
-## 14. Known limitations
+## 14. Model deployments
+
+A model deployment is an ephemeral, OpenAI-compatible evaluation endpoint. The
+server has no separate deployment resource: a deployment is an ordinary job
+([section 5](#5-control-plane-endpoints)) with exactly one `sampling` sub-job
+whose `inference_config.deployment_class` is `"EVALUATION"`. The
+`CortexTrainingClient.*_model_deployment*` methods and the `cortex-training
+model-deployment` CLI build on the job endpoints and never show the backing
+job or sub-job IDs.
+
+### 14.1 Deployment IDs
+
+A deployment is identified by the `deployment` output key and the CLI's
+`DEPLOYMENT` positional argument. Today that value is always the ID
+`sf-ct-<UUID>`, where `<UUID>` is the backing job's canonical lowercase UUID;
+names may be accepted later under the same key and argument. Inputs that do
+not use exactly this form are rejected before any request is sent
+(`deployment must currently be an sf-ct-<UUID> ID`). Use the deployment ID as
+the OpenAI `model`; the base URL is `<prefix>/inference/v1` for the
+deployment's database and schema (`model_deployment_base_url`).
+
+### 14.2 Deployment spec
+
+`create` accepts one JSON object with exactly these three top-level fields:
+
+```json
+{
+  "deployment": {"class": "EVALUATION", "min_replicas": 3, "gpus_per_replica": 2, "gpu_type": "H200"},
+  "source": {"type": "base_model", "model": "Qwen/Qwen3-1.7B"},
+  "inference": {"max_seq_len": 8192}
+}
+```
+
+`deployment` describes the deployment itself: its class and capacity.
+
+A checkpoint source is `{"type": "checkpoint", "job_id": ..., "checkpoint_id": ...}`
+and must name a completed `weights-only` checkpoint
+(`examples/api/model-deployment-checkpoint.json`). It names no model: the
+server already knows the source job's model and rejects one that does not
+match it, so `create` reads the training sub-job's `model_name` from
+`GET /{source job_id}` and sends that. `model` is rejected as an unknown key.
+
+Client-side checks (all others are left to the server):
+
+| Field | Rule |
+|---|---|
+| every object | no unknown keys; an error names both unknown and missing keys, so a typo such as `min_replica` is reported as such |
+| `deployment.class` | exactly `"EVALUATION"`; only `EVALUATION` is supported today |
+| `source.type` | `base_model` or `checkpoint`; every source field a non-empty string |
+| counts | positive integers (`true`/`false` and fractions rejected) |
+| `deployment.gpu_type` | `H200`, `B200`, or `B300`, case-insensitive |
+| `gpus_per_replica` | 1, 2, 4, or 8 |
+| `min_replicas * gpus_per_replica` | at most 8, or a multiple of 8 |
+
+Which models can be deployed, and the minimum GPUs per replica each needs, is
+decided by the server (`Unsupported model for a model deployment: <name>`), as
+for ordinary sampling jobs. New models need no client release. `create
+--dry-run` runs only these client-side checks and prints the normalized spec;
+it does not read a checkpoint's source job.
+
+The spec becomes a `POST /` body with `idle_timeout_seconds: 0`, top-level
+`hardware` set to `gpu_type`, and one sampling sub-job with
+`inference_config.{deployment_class, num_replicas, n_gpus, max_seq_len}`,
+`inference_config.vllm_config.{tensor_parallel_size, max_model_len}`, and
+`source_checkpoint_info: {source_job_id, checkpoint_id}` for a checkpoint
+source. `n_gpus` is `min_replicas * gpus_per_replica`.
+
+### 14.3 Statuses
+
+Deployment statuses are derived from the job status
+([section 3.2](#32-job-states)):
+
+| Job status | Deployment status |
+|---|---|
+| `pending` | `PENDING` |
+| `placing`, `initializing` | `INITIALIZING` |
+| `running` | `READY` |
+| `failed` | `FAILED` |
+| `cancelling` | `DROPPING` |
+| `cancelled`, `done` | `DROPPED` |
+| `terminated` | `TERMINATED` |
+| anything else | the job status upper-cased (e.g. `UNKNOWN`) |
+
+`wait_for_model_deployment` returns on `READY`. It raises
+`ModelDeploymentWaitError` on `FAILED` or `TERMINATED` (naming the failure
+code and pointing to `download-log`) or `DROPPED`, and
+`ModelDeploymentWaitTimeout` (a `TimeoutError`) when the poll timeout
+(`--timeout`, default `--poll-timeout`) passes. The timeout message says the
+deployment is still running and holding GPUs. Both carry the last observed
+metadata as `deployment`; `create --wait` prints that instead of the initial
+`PENDING`. Ctrl+C during `wait` or `create --wait` prints
+`interrupted; sf-ct-<UUID> is still running ...` and exits with code 130. No
+deployment is dropped automatically.
+
+For `FAILED` and `TERMINATED`, the job's `failure_code` and `reason` are shown
+as `failure: {code, message}`. In any other status, `reason` is shown as
+`status_reason`, except that the server's `cancelled_by_client` is not repeated
+for `DROPPING`/`DROPPED`, where the status already says it. `base_url` is shown
+only while the deployment can serve: it is omitted for `FAILED`, `DROPPING`,
+`DROPPED`, and `TERMINATED`.
+
+### 14.4 Reading deployments
+
+In the CLI, `create`, `create --wait`, and `wait` print the same summary:
+`deployment`, `status`, `base_url`, and `failure` when present. `list` prints
+only `deployment` and `status` per deployment, oldest first, and `describe`
+prints the full record. The client methods return the full metadata in every
+case.
+
+`list_model_deployments` (`GET /`, keeping only deployments) and
+`describe_model_deployment` (`GET /{job_id}`) report what the server stored and
+do not re-check admission rules, so a deployment using a model or GPU shape
+this client does not know about is still listed. A record is rejected only if
+it is malformed: non-positive counts,
+`n_gpus != num_replicas * tensor_parallel_size`, or
+`max_seq_len != max_model_len`.
+
+`list --status STATUS` (repeatable, case-insensitive) keeps only deployments in
+the given statuses; an unknown status is rejected.
+
+`describe` groups the deployment's configuration under `spec` for readability,
+in the same `deployment` / `source` / `inference` shape. It is a read view, not
+a `create` input: it may gain read-only fields, and it is not guaranteed to be
+accepted by `create`.
+
+Missing metadata is reported, not guessed:
+
+- `gpu_type` (and `describe`'s `spec.deployment.gpu_type`) is `null` when the
+  server returns no `hardware`, e.g. for a job read while the server cannot
+  reach its scheduler.
+- The source is `checkpoint` only when the sub-job carries
+  `source_checkpoint_info` (see [section 15](#15-known-limitations), item 5).
+
+### 14.5 Dropping
+
+`drop_model_deployment` looks the job up with `GET /{job_id}`, refuses a job
+that is not a deployment, then calls `POST /{job_id}:cancel`. The status moves
+through `DROPPING` to `DROPPED`.
+
+Dropping is idempotent: a 404 counts as already dropped.
+
+Every deployment lookup (`describe`, `wait`, `drop`, and the downloads) treats
+the server's job-not-found error (code `517601`) as final on the first attempt
+instead of retrying it like a transient routing 404
+([section 3.5](#35-retries)).
+
+### 14.6 Logs and metrics
+
+`download_model_deployment_logs` (execution logs by default, or
+`log_type="stdout"`) and `download_model_deployment_metrics` use the downloads
+in [section 12](#12-logs-and-events), then write every file directly into the
+output directory under its server filename. Sub-job directories are flattened
+away. Filenames that are empty, `.`, `..`, or contain a path separator, and
+duplicate log filenames, are rejected.
+
+Results list each `filename` and `saved_path`. The stdout and metrics results
+also include `chunk_count`. Every saved file has mode `0600`.
+
+File contents are written as the server produced them, so a log line may
+mention the backing job or sub-job ID.
+
+### 14.7 Errors
+
+Every HTTP error from a deployment method, including `create` and the requests
+made by the log and metrics downloads, is replaced by
+
+```text
+model deployment sf-ct-<UUID> request failed with HTTP <status> (<code>): <message> (snowflake request id: <id>)
+```
+
+`create` has no deployment ID yet, so its errors start with
+`model deployment request failed`. The server's error code and message are
+kept, so "feature disabled", "not authorized", and "unsupported model" stay
+distinguishable. The backing job ID is replaced by the deployment ID in the
+message, and the request URL and raw body are never shown. A job-not-found
+error becomes `model deployment sf-ct-<UUID> not found in <DB>.<SCHEMA>`.
+
+Request debug log lines written while a deployment method runs also name the
+deployment ID instead of the backing job ID. Local filesystem errors are
+raised unchanged.
+
+---
+
+## 15. Known limitations
 
 These are current gaps, not supported API behavior:
 
@@ -2475,3 +2664,8 @@ These are current gaps, not supported API behavior:
 4. Generate prompt validation resolves `max_seq_len` from the first sub-job
    carrying an `inference_config` rather than matching `job_type="sampling"`. A
    `log_probability` sub-job listed first therefore supplies the wrong window.
+5. The server does not yet echo `source_checkpoint_info` when a job is read
+   back (it is accepted on create), so a checkpoint model deployment is
+   reported with a `base_model` source by `list_model_deployments`,
+   `describe_model_deployment`, and `wait_for_model_deployment`
+   ([section 14.4](#144-reading-deployments)).

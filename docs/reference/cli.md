@@ -150,6 +150,19 @@ See [execution logs](#download-execution-logs),
 [persisted stdout](#download-persisted-stdout), and [GPU metrics](#download-gpu-metrics)
 for download paths and output fields.
 
+### [Model Deployments](#model-deployments)
+
+```bash
+cortex-training model-deployment create --spec examples/api/model-deployment-checkpoint.json --wait
+cortex-training model-deployment create --spec deployment.json --dry-run   # Validate only
+cortex-training model-deployment list --status READY
+cortex-training model-deployment describe sf-ct-DEPLOYMENT_UUID
+cortex-training model-deployment wait sf-ct-DEPLOYMENT_UUID --timeout 1800
+cortex-training model-deployment download-log sf-ct-DEPLOYMENT_UUID --output-dir ./logs
+cortex-training model-deployment download-metrics sf-ct-DEPLOYMENT_UUID --output-dir ./metrics
+cortex-training model-deployment drop sf-ct-DEPLOYMENT_UUID
+```
+
 ### [Output And Help](#json-output-and-help)
 
 ```bash
@@ -170,6 +183,8 @@ cortex-training fwd-bwd --help
 | `load`, `weight-sync` | Poll the submitted request until completion | `--no-poll` returns without waiting for the result |
 | `capacity` | Query each GPU type the account supports | Select one with `--hardware` |
 | `download-log`, `download-metrics` | Write under the current directory | Set `--output-dir` |
+| `model-deployment create` | Return after creation with status `PENDING` | `--wait` waits until `READY`; `--dry-run` validates without creating |
+| `model-deployment wait` | Wait until `READY`, for up to `--poll-timeout` | Set `--timeout SECONDS` |
 
 ## Detailed Reference
 
@@ -639,6 +654,129 @@ The command prints the saved path, chunk count, and first/last logical artifact
 URIs for each reconstructed file. `--resume` continues a metrics download
 already in that directory. Two downloads of the same directory at once are
 unsupported.
+
+### Model Deployments
+
+`cortex-training model-deployment` manages ephemeral OpenAI-compatible
+evaluation deployments while keeping their backing jobs and sub-jobs hidden.
+It uses the same connection settings as every other command. See
+[REST API reference section 14](rest-api.md#14-model-deployments) for the full
+spec format, statuses, drop and download behavior, and errors.
+
+`--database`, `--schema`, and `--compact` may be given either before
+`model-deployment` or after its subcommand.
+
+Create a deployment from a base model or a completed Cortex Training
+`weights-only` checkpoint:
+
+```bash
+cortex-training model-deployment create \
+  --database CORTEX_TRAINING_DB \
+  --schema PUBLIC \
+  --spec examples/api/model-deployment-checkpoint.json \
+  --wait
+```
+
+`--spec -` reads the spec from stdin; `--spec-file` is a deprecated alias for `--spec`. The checkpoint must come from a completed
+`save` whose checkpoint type is `weights-only`; resumable checkpoints and
+customer-supplied stage credentials are not accepted. A checkpoint source
+names only `job_id` and `checkpoint_id`; the model is read from the source
+job. Base-model sources use `{"type": "base_model", "model": "Qwen/Qwen3-1.7B"}`
+instead. The `deployment` object sets `class` (only `EVALUATION` is supported
+today), `min_replicas`, `gpus_per_replica` (1, 2, 4, or 8), and `gpu_type`
+(`H200`, `B200`, or `B300`, in any case); `min_replicas * gpus_per_replica`
+must be at most 8 or a multiple of 8. `create --help` shows a full example
+spec, and `create --dry-run` checks a spec and prints it without connecting.
+
+`create`, `create --wait`, and `wait` print the same summary (plus `failure`
+when the deployment failed):
+
+```json
+{
+  "base_url": "https://ACCOUNT.snowflakecomputing.com/api/v2/databases/CORTEX_TRAINING_DB/schemas/PUBLIC/cortex-training/inference/v1",
+  "deployment": "sf-ct-DEPLOYMENT_UUID",
+  "status": "READY"
+}
+```
+
+`--wait` (on `create`) and `wait` poll until the deployment reaches `READY` or
+a terminal failure state, for up to `--timeout SECONDS` (default
+`--poll-timeout`). If waiting fails, times out, or is interrupted with Ctrl+C
+(exit code 130), the deployment ID and its last observed status are still
+printed, and the deployment keeps running and holding GPUs until you `drop` it.
+
+`list` shows only each deployment's ID and status, oldest first. `--status`
+(repeatable, case-insensitive) keeps only `PENDING`, `INITIALIZING`, `READY`,
+`FAILED`, `DROPPING`, `DROPPED`, `TERMINATED`, or `UNKNOWN` deployments:
+
+```json
+{
+  "deployments": [
+    {"deployment": "sf-ct-DEPLOYMENT_UUID", "status": "READY"}
+  ]
+}
+```
+
+`describe` shows one deployment in full: its status (with `status_reason` or
+`failure` when present), `base_url` while it can serve, the `database` and
+`schema` it lives in, `created_at`, `creator`, `owner_role`, and its
+configuration grouped under `spec`. `spec` is a read view that may gain
+read-only fields, so don't rely on feeding it back to `create`. A `gpu_type`
+of `null` means the server did not report the hardware.
+
+```json
+{
+  "base_url": "https://ACCOUNT.snowflakecomputing.com/api/v2/databases/CORTEX_TRAINING_DB/schemas/PUBLIC/cortex-training/inference/v1",
+  "created_at": "2026-09-16T20:00:00Z",
+  "creator": "JDOE",
+  "database": "CORTEX_TRAINING_DB",
+  "deployment": "sf-ct-DEPLOYMENT_UUID",
+  "owner_role": "ML_ENGINEER",
+  "schema": "PUBLIC",
+  "spec": {
+    "deployment": {"class": "EVALUATION", "gpu_type": "H200", "gpus_per_replica": 1, "min_replicas": 1},
+    "inference": {"max_seq_len": 8192},
+    "source": {"model": "Qwen/Qwen3-1.7B", "type": "base_model"}
+  },
+  "status": "READY"
+}
+```
+
+`download-log` (execution logs by default, or `--log-type stdout`) and
+`download-metrics` write every file directly into `--output-dir` (default: the
+current directory) under its server filename, with mode `0600`. `drop` is safe
+to retry: a deployment that no longer exists counts as dropped.
+
+#### Calling A Deployment
+
+The `base_url` is an OpenAI-compatible endpoint. Authenticate with a Snowflake
+programmatic access token (PAT) and pass the deployment ID as `model`.
+Inference is not yet available on all accounts; until it is enabled for yours,
+requests return 404.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://ACCOUNT.snowflakecomputing.com/api/v2/databases/CORTEX_TRAINING_DB/schemas/PUBLIC/cortex-training/inference/v1",
+    api_key=PAT,  # sent as "Authorization: Bearer <PAT>"
+    default_headers={"X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN"},
+)
+response = client.chat.completions.create(
+    model="sf-ct-DEPLOYMENT_UUID",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+```
+
+```bash
+curl "$BASE_URL/chat/completions" \
+  -H "Authorization: Bearer $PAT" \
+  -H "X-Snowflake-Authorization-Token-Type: PROGRAMMATIC_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "sf-ct-DEPLOYMENT_UUID", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+`GET $BASE_URL/models` lists the `READY` deployments you own in that schema.
 
 ### Job TUI
 
