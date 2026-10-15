@@ -126,8 +126,14 @@ shipped example or a copy with `job_config=JOB_CONFIG`.
           "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
         },
 
-        // Optional expert parallelism for MoE.
+        // Optional expert parallelism for MoE. With model_provider prime_rl, keep
+        // the prime_rl block: the SFT loss needs per-token log-probabilities, which
+        // the fused cross-entropy does not return.
         "ac_config": {"mode": "full", "freq": 1},
+        "prime_rl": {
+          "fused_lm_head_token_chunk_size": 8192,
+          "fused_cross_entropy": false
+        },
         "ep_size": EP_SIZE
       }
     }
