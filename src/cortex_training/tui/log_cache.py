@@ -76,6 +76,12 @@ def cache_root() -> Path:
     return base / _NAMESPACE
 
 
+def job_cache_dir(job_id: str, *, root: Optional[Path] = None) -> Path:
+    """Return the shared per-job cache directory without creating it."""
+    base = root if root is not None else cache_root()
+    return base / "jobs" / safe_source_name(job_id)
+
+
 def safe_source_name(source_id: str) -> str:
     """Encode an arbitrary source_id into one filesystem-safe path component.
 
@@ -151,8 +157,7 @@ class LogCache:
         max_bytes: int = DEFAULT_MAX_BYTES,
         max_lines: int = DEFAULT_MAX_LINES,
     ) -> None:
-        base = root if root is not None else cache_root()
-        self._dir = base / "jobs" / safe_source_name(job_id)
+        self._dir = job_cache_dir(job_id, root=root)
         self._max_bytes = max_bytes
         self._max_lines = max_lines
 

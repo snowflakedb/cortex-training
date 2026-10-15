@@ -50,7 +50,7 @@ Tracked operations:
 
 - Job lifecycle: `create_job`, `wait_for_job`, `get_job`, `list_jobs`,
   `iter_jobs` (one event per page), `cancel_job`, `get_capacity`,
-  `get_experiment_run`
+  `get_capacity_breakdown`, `get_experiment_run`
 - Compute: `forward_backward`, `forward`, `generate`, `generate_stream`, `step`
 - Checkpoints and logs: `save`, `load`, `list_checkpoints`,
   `export_checkpoint`, `delete_checkpoint`, `fetch_execution_logs`
@@ -62,8 +62,16 @@ Each emitted event body contains `success`, `duration_ms`, `request_count`,
 `attempt_count`, and `retry_count`. Failures also include a bounded
 `error_message` with common credential patterns redacted. Queryable attributes
 include available `job_id`, sub-job identifiers, `request_id`,
-`checkpoint_id`, `error.type`, HTTP status, Snowflake request ID, and server
-error code. Records use OTLP resource attributes
+`checkpoint_id`, `error.type`, HTTP status, and server error code.
+Two attributes carry Snowflake request IDs:
+
+| Attribute | Meaning | When set |
+|---|---|---|
+| `error.snowflake_request_id` | Snowflake request ID of the failing response | Failures whose response had the header |
+| `snowflake.request_ids` | Recent Snowflake request IDs of the operation (up to 10, including retried attempts), newest last | Whenever any were seen |
+
+`snowflake.request_id` is a deprecated alias of `error.snowflake_request_id`,
+emitted for one release. Records use OTLP resource attributes
 `service.name = cortex-training` and
 `snowflake.account_host = <normalized connection hostname>`.
 
@@ -97,6 +105,7 @@ operation.
 | `wait_for_job(job_id)` | job dict | Polls until `running`; raises on `failed`/`done`/`cancelled` or timeout. Does not treat `terminated` as terminal |
 | `cancel_job(job_id)` | `None` | Idempotent while cancelling/cancelled |
 | `get_capacity(hardware=None)` | capacity dict | `has_reservation`, `max_total_gpus`, `reserved_gpus`, `in_use_gpus`, `pending_gpus`, `available_gpus`, scoped to `hardware` (omitted means the server default, H200). The CLI `capacity` command queries every type unless `--hardware` is set. `max_total_gpus` is the canonical ceiling (`-1` uncapped); `reserved_gpus` is deprecated |
+| `get_capacity_breakdown(hardware=None, *, dimensions=("job_type", "submitted_by"))` | capacity dict plus `breakdown` | `get_capacity` split by sub-job type and/or submitter; each split has a `status` and `groups`. Unknown dimensions raise `ValueError`. See [rest-api.md section 5.4](rest-api.md#breakdown---breakdown) |
 
 `JobType.LOG_PROBABILITY` stays a schema type: a `SubJobConfig` carrying it
 still constructs, validates, and serializes to `"log_probability"`. Submission
@@ -138,6 +147,95 @@ other than `"strict"` on a sampling sub-job. See
 [rest-api.md section 8.2](rest-api.md#82-trainingconfig) and
 [section 6.1](rest-api.md#61-forwardbackward---post-job_idforward-backward).
 
+## Router-replay capacity planning
+
+`cortex_training.router_replay_planner` derives the per-worker
+`router_replay.max_cache_bytes` caps before you create a job. It only
+calculates. It does not call the service, edit a job config, or reserve GPU
+memory. Put `CachePlan.max_cache_bytes` on the sampling and training
+`router_replay` objects yourself. When bootstrapping with an explicit cap, pass
+the training result to `bootstrap_router_replay(..., max_cache_bytes=...)`.
+
+One full-sequence capture occupies:
+
+```text
+entry_bytes = seq_len * num_moe_layers * topk * dtype_bytes
+```
+
+`moe_geometry_from_config` reads `num_hidden_layers` and `num_experts_per_tok`
+from the config root or `text_config`, and rejects conflicting values. Every
+recognized expert-count field (`num_local_experts`, `n_routed_experts`,
+`num_experts`, `moe_num_experts`) must agree, be positive, and be at least
+`topk`. A count of 256 or fewer selects `dtype_bytes=1` because those expert
+ids fit in `uint8`. A count from 257 through 65536 selects `dtype_bytes=2`
+(`uint16`). A larger count is rejected. `plan_sampling_cache_bytes` and
+`plan_training_cache_bytes` use that width unless you pass `dtype_bytes`.
+
+The sampling cap is per sampling replica, and the training cap is per
+data-parallel shard:
+
+```text
+backlog = max_inflight_rollouts
+        + ceil(batch_size * over_generation_multiplier)
+        + batch_size * max(async_depth, 1)
+per_replica_rollouts = ceil(backlog / replicas * routing_skew)
+sampling_cap = ceil(per_replica_rollouts * entry_bytes * safety_factor)
+
+resident_rows = ceil(batch_size / dp_size)
+training_cap = ceil(resident_rows * entry_bytes * safety_factor)
+```
+
+`max_inflight_rollouts` defaults to `batch_size`. `routing_skew` defaults to
+`2.0` and `safety_factor` defaults to `1.2`. Replica and data-parallel counts
+come from `derive_num_sampling_workers` and `derive_dp_size`; known GPU counts
+must divide exactly by the parallel widths. The skew estimate is not an
+overflow-proof bound. Raise it, or set a manual cap, when a worker retains
+more replay entries than the average backlog times the skew.
+
+`plan_vllm_gpu_memory_utilization` lowers vLLM's `gpu_memory_utilization` by
+the sampling cap divided by the GPU's byte capacity. It raises when that
+reservation exceeds half the GPU or would push utilization below `0.05`.
+
+```python
+from cortex_training import router_replay_planner as rrp
+
+geometry = rrp.resolve_model_moe_geometry(
+    "org/moe-model",
+    num_moe_layers_override=40,
+    topk_override=8,
+    num_experts_override=512,
+)
+assert geometry.dtype_bytes == 2
+
+backlog = rrp.derive_backlog_rollouts(batch_size=16, async_depth=2)
+sampling_workers = rrp.derive_num_sampling_workers(
+    sampling_gpus=8,
+    sampling_tensor_parallel_size=2,
+)
+sampling_plan = rrp.plan_sampling_cache_bytes(
+    seq_len=8192,
+    geometry=geometry,
+    backlog_rollouts=backlog,
+    num_sampling_workers=sampling_workers,
+)
+training_plan = rrp.plan_training_cache_bytes(
+    seq_len=8192,
+    geometry=geometry,
+    resident_rows=rrp.derive_resident_rows(
+        batch_size=16,
+        dp_size=rrp.derive_dp_size(training_gpus=8, sp_size=2),
+    ),
+)
+sampling_cap = sampling_plan.max_cache_bytes
+training_cap = training_plan.max_cache_bytes
+```
+
+The same sequence length, layer count, and top-k with 512 experts stores each
+expert id in two bytes, so each capture is twice as large as one from a model
+with 256 or fewer experts. See
+[rest-api.md section 8.2](rest-api.md#82-trainingconfig) for the
+`max_cache_bytes` field.
+
 ## Checkpoints
 
 `save(job_id, checkpoint_id=None, checkpoint_type=None)` →  `request_id`
@@ -156,7 +254,9 @@ run and returns `{sub_job_id, filename, artifact_uri, content}` dicts.
 console chunks as `<output_dir>/<sub_job_id>/stdout.log`.
 `download_metrics(job_id, output_dir, *, resume=False)` reconstructs GPU metric
 chunks as `<output_dir>/<sub_job_id>/gpu.jsonl`. `resume=True` appends chunks
-that are not already recorded in the manifest beside that file.
+that are not already recorded in the manifest beside that file. See
+[GPU metrics download](rest-api.md#124-gpu-metrics-download) for the JSONL row
+schema.
 `get_experiment_run(job_id)` resolves the experiment/run names.
 
 ## Building payloads

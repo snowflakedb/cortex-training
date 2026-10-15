@@ -13,12 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Read-only Textual TUI for Cortex Training job logs and scheduling events.
+"""Read-only Textual TUI for Cortex Training job logs and GPU resources.
 
 Flow: open → a list of jobs with their status (via the SDK's list_jobs) →
-pick one → its log sources (zone server / job orchestration / Ray head /
-scheduling events) → live tail. Pass a job_id on the command line to jump
-straight to that job's logs and skip the picker.
+pick one → its Logs and Resource dashboard. Pass a job_id on the command line
+to jump straight to that dashboard and skip the picker.
 
 Imports ``textual`` at module load. The interface is strictly read-only and
 never mutates job state.
@@ -28,17 +27,22 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import time
 import traceback
 from collections import deque
+from datetime import datetime
+from datetime import timezone
 from pathlib import Path
 
 from rich.markup import escape
 from textual import work
 from textual.app import App
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal
 from textual.screen import Screen
+from textual.widgets import DataTable
 from textual.widgets import Footer
 from textual.widgets import Header
 from textual.widgets import Input
@@ -47,6 +51,8 @@ from textual.widgets import ListItem
 from textual.widgets import ListView
 from textual.widgets import Log
 from textual.widgets import Static
+from textual.widgets import TabbedContent
+from textual.widgets import TabPane
 from textual.worker import get_current_worker
 
 from cortex_training.tui.format import entry_at_level
@@ -62,8 +68,24 @@ from cortex_training.tui.format import source_label
 from cortex_training.tui.format import wrap_log_line
 from cortex_training.tui.log_cache import LogCache
 from cortex_training.tui.log_cache import cached_log_pages
+from cortex_training.tui.log_cache import job_cache_dir
+from cortex_training.tui.resource import RANGES
+from cortex_training.tui.resource import ResourceData
+from cortex_training.tui.resource import cached_metric_sources
+from cortex_training.tui.resource import format_bytes
+from cortex_training.tui.resource import format_percent
+from cortex_training.tui.resource import load_resource_data
+from cortex_training.tui.resource import render_chart
 
 _ERROR_LOG = "~/.cortex-training-errors.log"
+_RESOURCE_LOCKS: dict[str, threading.Lock] = {}
+_RESOURCE_LOCKS_GUARD = threading.Lock()
+
+
+def _resource_lock(path: Path) -> threading.Lock:
+    key = str(path.resolve())
+    with _RESOURCE_LOCKS_GUARD:
+        return _RESOURCE_LOCKS.setdefault(key, threading.Lock())
 
 
 class JobListScreen(Screen):
@@ -225,11 +247,12 @@ class JobListScreen(Screen):
 
 
 class LogScreen(Screen):
-    """Source list + live tail for one job. Read-only."""
+    """Read-only Logs and Resource dashboard for one job."""
 
     BINDINGS = [
         ("b", "app.pop_screen", "Back"),
         ("escape", "dismiss_or_back", "Back/clear"),
+        ("t", "cycle_tab", "Tab"),
         ("/", "filter", "Filter"),
         ("L", "cycle_level", "Level"),
         ("p", "toggle_pause", "Pause"),
@@ -240,6 +263,11 @@ class LogScreen(Screen):
         ("[", "shrink_sources", "Narrower"),
         ("]", "grow_sources", "Wider"),
         ("q", "quit", "Quit"),
+        Binding("1", "resource_range('5m')", "5m", show=False),
+        Binding("2", "resource_range('15m')", "15m", show=False),
+        Binding("3", "resource_range('1h')", "1h", show=False),
+        Binding("4", "resource_range('6h')", "6h", show=False),
+        Binding("5", "resource_range('all')", "All", show=False),
     ]
 
     _SOURCES_MIN = 24
@@ -272,26 +300,56 @@ class LogScreen(Screen):
         self._stdout_ready = False
         self._stdout_failed = False
         self._held: tuple[list[str], bool] | None = None
+        self._active_tab = "logs"
+        self._log_focus_id = "sources"
+        self._metrics_root = job_cache_dir(job_id) / "metrics"
+        self._resource_data = ResourceData({})
+        self._resource_loaded = False
+        self._resource_loading = False
+        self._resource_refresh_succeeded = False
+        self._resource_error: str | None = None
+        self._resource_range = "15m" if is_active_status(job_status) else "all"
+        self._resource_range_selected = False
+        self._resource_table: DataTable | None = None
+        self._resource_table_has_fb = True
+        self._sources_ready = False
+        self._sub_job_missing = False
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static("", id="summary")
-        with Horizontal():
-            yield ListView(id="sources")
-            # Log (not RichLog): it supports native text selection + copy. It
-            # does not soft-wrap, so we pre-wrap each line to the pane width.
-            yield Log(id="logview", highlight=False, max_lines=20000)
-        yield Input(placeholder="filter logs…  (/ focus · Esc clear)", id="logfilter")
-        yield Footer()
+        with TabbedContent(initial="logs", id="job-tabs"):
+            with TabPane("Logs", id="logs"):
+                with Horizontal(id="logs-body"):
+                    yield ListView(id="sources")
+                    # Log supports native selection but not soft-wrap, so lines
+                    # are wrapped to the current pane width before writing.
+                    yield Log(id="logview", highlight=False, max_lines=20000)
+                yield Input(placeholder="filter logs…  (/ focus · Esc clear)", id="logfilter")
+            with TabPane("Resource", id="resource"):
+                yield Static("Select Resource to load GPU metrics.", id="resource-status")
+                yield Static("", id="resource-chart")
+                yield DataTable(id="resource-table", cursor_type="row", zebra_stripes=True)
+                yield Static(
+                    "1 5m   2 15m   3 1h   4 6h   5 all   r refresh   t tab",
+                    id="resource-keys",
+                )
+        yield Footer(id="footer")
 
     def on_mount(self) -> None:
         self._logview = self.query_one("#logview", Log)
+        self._resource_table = self.query_one("#resource-table", DataTable)
+        self._resource_table.add_column("GPU", key="gpu")
+        self._resource_table.add_column("Now", key="now")
+        self._resource_table.add_column("Window avg", key="average")
+        self._resource_table.add_column("Framebuffer", key="fb")
         # We drive scrolling ourselves (scroll to the tail on every write unless
         # paused), so disable the widget's blanket auto-scroll.
         self._logview.auto_scroll = False
         self._apply_sources_width()
         self._update_subtitle()
         self._load_sources()
+        self.call_after_refresh(self.set_focus, self.query_one("#sources", ListView))
 
     def on_unmount(self) -> None:
         # Stop the tail worker when leaving this job (it polls follow=True).
@@ -302,6 +360,37 @@ class LogScreen(Screen):
         if not self._stdout_inflight:
             self._cleanup_stage()
 
+    def _logs_active(self) -> bool:
+        return self._active_tab == "logs"
+
+    def _resource_active(self) -> bool:
+        return self._active_tab == "resource"
+
+    def action_cycle_tab(self) -> None:
+        tabs = self.query_one("#job-tabs", TabbedContent)
+        tabs.active = "resource" if tabs.active == "logs" else "logs"
+
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        self._active_tab = event.pane.id or "logs"
+        footer = self.query_one("#footer", Footer)
+        footer.display = self._logs_active()
+        if self._resource_active():
+            focused = self.focused
+            if focused is not None and focused.id in {"sources", "logview", "logfilter"}:
+                self._log_focus_id = focused.id
+            if self._resource_table is not None:
+                self.set_focus(self._resource_table)
+            self.call_after_refresh(self._render_resource)
+            self._start_resource_refresh(force=False)
+            return
+        try:
+            target = self.query_one(f"#{self._log_focus_id}")
+        except Exception:  # noqa: BLE001 - stale focus id after a remount
+            target = self.query_one("#sources", ListView)
+        self.set_focus(target)
+        self._wrap_width = -1
+        self.call_after_refresh(self._rewrap)
+
     def _apply_sources_width(self) -> None:
         try:
             self.query_one("#sources", ListView).styles.width = self._sources_width
@@ -309,20 +398,29 @@ class LogScreen(Screen):
             pass
 
     def action_grow_sources(self) -> None:
+        if not self._logs_active():
+            return
         self._sources_width = min(self._SOURCES_MAX, self._sources_width + self._SOURCES_STEP)
         self._apply_sources_width()
         self.call_after_refresh(self._rewrap)  # log pane width changed
 
     def action_shrink_sources(self) -> None:
+        if not self._logs_active():
+            return
         self._sources_width = max(self._SOURCES_MIN, self._sources_width - self._SOURCES_STEP)
         self._apply_sources_width()
         self.call_after_refresh(self._rewrap)  # log pane width changed
 
     def on_resize(self, event) -> None:
-        # Terminal resize changes the log pane width → re-wrap the buffer.
+        # Reflow only the in-memory views; resize never performs I/O.
         self.call_after_refresh(self._rewrap)
+        if self._resource_active():
+            self.call_after_refresh(self._render_resource)
 
     def action_refresh_sources(self) -> None:
+        if self._resource_active():
+            self._start_resource_refresh(force=True)
+            return
         self._load_sources()
 
     def _update_subtitle(self) -> None:
@@ -350,11 +448,215 @@ class LogScreen(Screen):
         except Exception:  # noqa: BLE001 - not mounted yet
             pass
 
+    # ─── GPU resources ───────────────────────────────────────────────────
+    def action_resource_range(self, name: str) -> None:
+        if not self._resource_active() or name not in RANGES:
+            return
+        self._resource_range = name
+        self._resource_range_selected = True
+        self._render_resource()
+
+    def _start_resource_refresh(self, *, force: bool) -> None:
+        if (
+            not self._screen_open
+            or not self._sources_ready
+            or not self._current_source
+            or self._sub_job_missing
+            or self._resource_loading
+            or (self._resource_refresh_succeeded and not force)
+        ):
+            return
+        self._resource_loading = True
+        if not self._resource_data.sub_jobs:
+            self.query_one("#resource-status", Static).update("loading GPU metrics…")
+        self._refresh_resource()
+
+    @work(thread=True, group="resource")
+    def _refresh_resource(self) -> None:
+        worker = get_current_worker()
+        lock = _resource_lock(self._metrics_root)
+        acquired = False
+        try:
+            while self._screen_open and not worker.is_cancelled:
+                if lock.acquire(timeout=0.1):
+                    acquired = True
+                    break
+            if not acquired:
+                return
+            cached = load_resource_data(self._metrics_root)
+            if (cached.sub_jobs or cached.ignored_rows_by_sub_job) and not worker.is_cancelled:
+                self._post(self._accept_cached_resource, cached)
+            self._client.download_metrics(
+                self._job_id,
+                self._metrics_root,
+                resume=True,
+            )
+            fresh = load_resource_data(self._metrics_root)
+            if not worker.is_cancelled:
+                self._post(self._finish_resource_refresh, fresh, None)
+        except Exception as exc:  # noqa: BLE001 - surfaced in the Resource tab
+            if not worker.is_cancelled:
+                try:
+                    partial = load_resource_data(self._metrics_root)
+                except Exception:  # noqa: BLE001 - preserve the original refresh error
+                    partial = ResourceData({})
+                self._post(
+                    self._finish_resource_refresh,
+                    partial if partial.sub_jobs or partial.ignored_rows_by_sub_job else None,
+                    f"{type(exc).__name__}: {exc}",
+                )
+        finally:
+            if acquired:
+                lock.release()
+
+    def _accept_cached_resource(self, data: ResourceData) -> None:
+        if not self._screen_open:
+            return
+        self._resource_data = data
+        self._resource_loaded = True
+        self._resource_error = None
+        if self._resource_active():
+            self._render_resource()
+
+    def _finish_resource_refresh(
+        self,
+        data: ResourceData | None,
+        error: str | None,
+    ) -> None:
+        if not self._screen_open:
+            return
+        self._resource_loading = False
+        self._resource_refresh_succeeded = error is None
+        if data is not None:
+            self._resource_data = data
+            self._resource_loaded = True
+            self._resource_error = error
+            if self._resource_active():
+                self._render_resource()
+            return
+        self._resource_error = error
+        self._resource_loaded = bool(
+            self._resource_data.sub_jobs or self._resource_data.ignored_rows_by_sub_job
+        )
+        if self._resource_active():
+            self._render_resource()
+
+    def _resource_sub_job(self):
+        source = self._current_source
+        if not source:
+            return None
+        return self._resource_data.sub_jobs.get(source)
+
+    def _set_resource_columns(self, *, show_fb: bool) -> None:
+        table = self._resource_table
+        if table is None or show_fb == self._resource_table_has_fb:
+            return
+        if show_fb:
+            table.add_column("Framebuffer", key="fb")
+        else:
+            table.remove_column("fb")
+        self._resource_table_has_fb = show_fb
+
+    def _render_resource(self, *, retry_layout: bool = True) -> None:
+        if not self._screen_open or not self._resource_active():
+            return
+        status = self.query_one("#resource-status", Static)
+        chart = self.query_one("#resource-chart", Static)
+        table = self._resource_table
+        source = self._current_source
+        if table is None:
+            return
+        width = chart.content_size.width
+        if width <= 0:
+            if retry_layout:
+                self.call_after_refresh(self._render_resource, retry_layout=False)
+            return
+        table.clear()
+        if not source:
+            status.update(
+                f"sub-job not found: {escape(self._sub_job_id)}"
+                if self._sub_job_missing and self._sub_job_id
+                else ("select a log source first" if self._sources_ready else "loading log sources…")
+            )
+            chart.update("")
+            return
+        sub_job = self._resource_sub_job()
+        ignored = self._resource_data.ignored_rows_by_sub_job.get(source, 0)
+        selected_cache = sub_job is not None or source in self._resource_data.ignored_rows_by_sub_job
+        if self._resource_loading:
+            state = "cached · refreshing…" if selected_cache else "loading GPU metrics…"
+        elif self._resource_error:
+            state = (
+                f"cached · refresh failed: {escape(self._resource_error)}"
+                if selected_cache
+                else f"GPU metrics unavailable: {escape(self._resource_error)}"
+            )
+        else:
+            state = None
+        if sub_job is None:
+            bits = [escape(source)]
+            if self._resource_loaded and not self._resource_error and not self._resource_loading:
+                bits.append("no usable GPU metrics for this sub-job" if ignored else "no GPU metrics for this sub-job")
+            if state:
+                bits.append(state)
+            if ignored:
+                bits.append(f"{ignored} unsupported row(s)")
+            status.update("  ·  ".join(bits))
+            chart.update("")
+            return
+        view = sub_job.views[self._resource_range]
+        show_fb = table.size.width >= 70
+        self._set_resource_columns(show_fb=show_fb)
+        for row in view.rows:
+            cells = [
+                str(row.global_gpu_index),
+                format_percent(row.current_util_pct),
+                format_percent(row.window_avg_util_pct),
+            ]
+            if show_fb:
+                fb = (
+                    "—"
+                    if row.fb_used_bytes is None or row.fb_total_bytes is None
+                    else f"{format_bytes(row.fb_used_bytes)} / {format_bytes(row.fb_total_bytes)}"
+                )
+                cells.append(fb)
+            table.add_row(*cells, key=str(row.global_gpu_index))
+
+        age = max(
+            0,
+            int((datetime.now(timezone.utc) - sub_job.latest_sample_ts).total_seconds()),
+        )
+        average = format_percent(view.average_util_pct)
+        framebuffer = (
+            "—"
+            if view.fb_used_bytes is None or view.fb_total_bytes is None
+            else f"{format_bytes(view.fb_used_bytes)} / {format_bytes(view.fb_total_bytes)}"
+        )
+        bits = [
+            escape(source),
+            self._resource_range,
+            f"{view.gpu_count} GPU(s)",
+            f"avg {average}",
+            f"fb {framebuffer} ({view.fb_gpu_count}/{view.gpu_count} GPUs)",
+            f"last sample {age}s ago",
+        ]
+        if ignored:
+            bits.append(f"{ignored} unsupported row(s)")
+        if state:
+            bits.append(state)
+        status.update("  ·  ".join(bits))
+        chart.update("no GPU samples in this range" if view.average_util_pct is None else render_chart(view, width))
+
     # ─── filter / level / pause ──────────────────────────────────────────
     def action_filter(self) -> None:
+        if not self._logs_active():
+            return
         self.set_focus(self.query_one("#logfilter", Input))
 
     def action_dismiss_or_back(self) -> None:
+        if not self._logs_active():
+            self.app.pop_screen()
+            return
         # Esc clears an active filter (and unfocuses the input); otherwise backs out.
         inp = self.query_one("#logfilter", Input)
         if self.focused is inp or self._filter:
@@ -374,12 +676,16 @@ class LogScreen(Screen):
             self.set_focus(self.query_one("#sources", ListView))
 
     def action_cycle_level(self) -> None:
+        if not self._logs_active():
+            return
         i = self._LEVEL_CYCLE.index(self._min_level) if self._min_level in self._LEVEL_CYCLE else 0
         self._min_level = self._LEVEL_CYCLE[(i + 1) % len(self._LEVEL_CYCLE)]
         self._update_subtitle()
         self._refilter()
 
     def action_toggle_pause(self) -> None:
+        if not self._logs_active():
+            return
         self._paused = not self._paused
         # Resuming jumps to the end and follows again; pausing just stops
         # following (the user can scroll freely). A saved console that arrived
@@ -436,8 +742,13 @@ class LogScreen(Screen):
         src, path = target
         return src, path, self._exported_text(src, path)
 
-    @work(thread=True, exclusive=True, group="export")
     def action_save_log(self) -> None:
+        if not self._logs_active():
+            return
+        self._save_log()
+
+    @work(thread=True, exclusive=True, group="export")
+    def _save_log(self) -> None:
         exported = self._take_export()
         if exported is None:
             return
@@ -457,8 +768,13 @@ class LogScreen(Screen):
             msg = f"[error] save failed: {exc}"
         self.app.call_from_thread(self._write_line, msg)
 
-    @work(thread=True, exclusive=True, group="copy")
     def action_copy_log(self) -> None:
+        if not self._logs_active():
+            return
+        self._copy_log()
+
+    @work(thread=True, exclusive=True, group="copy")
+    def _copy_log(self) -> None:
         exported = self._take_export()
         if exported is None:
             return
@@ -466,6 +782,10 @@ class LogScreen(Screen):
         count = len(text.splitlines())
         self.app.call_from_thread(self.app.copy_to_clipboard, text)
         self.app.call_from_thread(self._write_line, f"[copied] {count} line(s) to clipboard")
+
+    def action_copy_text(self) -> None:
+        if self._logs_active():
+            super().action_copy_text()
 
     @work(thread=True, exclusive=True, group="sources")
     def _load_sources(self) -> None:
@@ -478,6 +798,8 @@ class LogScreen(Screen):
             job = {}
         if job.get("status"):
             self._job_status = job.get("status")
+            if not self._resource_range_selected:
+                self._resource_range = "15m" if is_active_status(self._job_status) else "all"
         if job:
             self._job_reason = job.get("reason")  # clears a stale reason on refresh
             # The summary line is reserved for static config; status/reason go
@@ -495,7 +817,9 @@ class LogScreen(Screen):
                     sources.append({"sub_job_id": sid, "job_type": sj.get("job_type") or sj.get("type")})
         if not sources:
             # get_job failed/empty (e.g. offline): fall back to cached sub-jobs.
-            sources = [{"sub_job_id": sid} for sid in self._cache.cached_sources()]
+            source_ids = self._cache.cached_sources()
+            source_ids.extend(cached_metric_sources(self._metrics_root))
+            sources = [{"sub_job_id": sid} for sid in dict.fromkeys(source_ids)]
         if not sources:
             self._post(
                 self._write_line,
@@ -509,15 +833,31 @@ class LogScreen(Screen):
         lv = self.query_one("#sources", ListView)
         await lv.clear()  # await removal before re-appending src-* ids (see _populate)
         self._source_by_item = {}
+        self._sources_ready = True
+        self._sub_job_missing = False
         items = [s for s in sources if s.get("sub_job_id")]
+        if self._sub_job_id:
+            items = [s for s in items if s["sub_job_id"] == self._sub_job_id]
+            if not items:
+                self._sub_job_missing = True
+                lv.append(ListItem(Label(f"error: sub-job not found: {escape(self._sub_job_id)}")))
+                self._current_source = None
+                if self._resource_active():
+                    self._render_resource()
+                return
         for i, s in enumerate(items):
             sid = s["sub_job_id"]
             item_id = f"src-{i}"
             self._source_by_item[item_id] = sid
             lv.append(ListItem(Label(source_label(s)), id=item_id))
+        if not items:
+            self._current_source = None
         if items:
             lv.index = 0
             self._start_tail(items[0]["sub_job_id"])
+        if self._resource_active():
+            self._render_resource()
+            self._start_resource_refresh(force=False)
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         sid = self._source_by_item.get(event.item.id or "")
@@ -616,9 +956,13 @@ class LogScreen(Screen):
 
     def _apply_terminal_status(self, status: str, reason: str | None) -> None:
         self._job_status = status
+        if not self._resource_range_selected and not is_active_status(status):
+            self._resource_range = "all"
         if reason is not None:
             self._job_reason = reason
         self._update_subtitle()
+        if self._resource_active():
+            self._render_resource()
 
     def _start_tail(self, sub_job_id: str) -> None:
         self._current_source = sub_job_id
@@ -819,16 +1163,24 @@ class LogScreen(Screen):
 
 
 class CortexTrainingLogTUI(App):
-    """Entry app: show the job picker, or jump straight to a job's logs when a
+    """Entry app: show the job picker, or jump straight to a job dashboard when a
     job_id is supplied."""
 
     CSS = """
     #jobs { padding: 0 1; }
     #sources { width: 48; border-right: solid $panel; }
-    #logview { padding: 0 1; }
+    #job-tabs, #job-tabs ContentSwitcher, #logs, #resource, #logs-body {
+        height: 1fr;
+    }
+    #logview { height: 1fr; padding: 0 1; }
     #summary { color: $text-muted; padding: 0 1; }
     #logfilter { border: tall $panel; }
     #jobfilter { border: tall $panel; }
+    #resource { padding: 0 1; }
+    #resource-status { color: $text-muted; height: auto; padding: 0 1; }
+    #resource-chart { height: auto; min-height: 3; padding: 0 1; }
+    #resource-table { height: 1fr; }
+    #resource-keys { color: $text-muted; height: 1; padding: 0 1; }
     /* Text-selection highlight: reuse the picker's subtle "blurred cursor"
        shade so it's visible but not a heavy saturated block. */
     LogScreen > .screen--selection {
@@ -844,14 +1196,23 @@ class CortexTrainingLogTUI(App):
         self._job_id = job_id
         self._sub_job_id = sub_job_id
         self._poll_interval = poll_interval
-        self.title = "cortex training logs"
+        self.title = "cortex training"
 
     def on_mount(self) -> None:
         if self._job_id:
             self.push_screen(
-                LogScreen(self._client, self._job_id, sub_job_id=self._sub_job_id, poll_interval=self._poll_interval)
+                LogScreen(
+                    self._client,
+                    self._job_id,
+                    sub_job_id=self._sub_job_id,
+                    poll_interval=self._poll_interval,
+                )
             )
         else:
             self.push_screen(
-                JobListScreen(self._client, sub_job_id=self._sub_job_id, poll_interval=self._poll_interval)
+                JobListScreen(
+                    self._client,
+                    sub_job_id=self._sub_job_id,
+                    poll_interval=self._poll_interval,
+                )
             )

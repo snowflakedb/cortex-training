@@ -78,6 +78,12 @@ _STATUS_ALIASES = {
     "error": "failed",
 }
 
+# `capacity --breakdown` choice -> get_capacity_breakdown() dimension.
+_CAPACITY_BREAKDOWN_CHOICES = {
+    "job-type": "job_type",
+    "submitted-by": "submitted_by",
+}
+
 
 def _env(*names: str) -> str | None:
     for name in names:
@@ -427,6 +433,16 @@ def build_parser(
             "your account supports; unsupported types are listed separately."
         ),
     )
+    capacity.add_argument(
+        "--breakdown",
+        action="append",
+        choices=tuple(_CAPACITY_BREAKDOWN_CHOICES),
+        help=(
+            "Also split in_use_gpus and pending_gpus by sub-job type "
+            "(job-type) or by submitting user (submitted-by). Repeat to get "
+            "both."
+        ),
+    )
 
     cancel = subparsers.add_parser("cancel", help="Cancel one Cortex Training job.")
     cancel.add_argument("job_id")
@@ -610,7 +626,10 @@ def build_parser(
     )
 
     if include_tui:
-        subparsers.add_parser("tui", help="Open the read-only Cortex Training log TUI.")
+        subparsers.add_parser(
+            "tui",
+            help="Open the read-only Cortex Training logs and resources TUI.",
+        )
 
     return parser
 
@@ -978,7 +997,7 @@ def _format_error(exc: BaseException) -> str:
 
     parts = [str(exc)]
     request_id = getattr(response, "headers", {}).get("x-snowflake-request-id")
-    if request_id:
+    if request_id and request_id not in parts[0]:
         parts.append(f"snowflake request id: {request_id}")
 
     body = (getattr(response, "text", "") or "").strip()
@@ -1055,6 +1074,26 @@ def _cmd_login(args: argparse.Namespace, stdout: TextIO) -> int:
         stdout,
         compact=args.compact,
     )
+    return 0
+
+
+def _cmd_capacity(args: argparse.Namespace, client, stdout: TextIO) -> int:
+    dimensions = tuple(
+        _CAPACITY_BREAKDOWN_CHOICES[choice] for choice in args.breakdown or ()
+    )
+
+    def lookup(hardware: str) -> dict:
+        if dimensions:
+            return client.get_capacity_breakdown(
+                hardware=hardware, dimensions=dimensions
+            )
+        return client.get_capacity(hardware=hardware)
+
+    if args.hardware is not None:
+        capacity = lookup(args.hardware)
+    else:
+        capacity = _capacity_by_hardware(lookup)
+    _print_json(capacity, stdout, compact=args.compact)
     return 0
 
 
@@ -1277,14 +1316,14 @@ def _is_unsupported_hardware(exc: BaseException) -> bool:
     return code == _UNSUPPORTED_HARDWARE_CODE and "unsupported hardware" in message
 
 
-def _capacity_by_hardware(client) -> dict[str, Any]:
+def _capacity_by_hardware(lookup: Callable[[str], dict]) -> dict[str, Any]:
     """Capacity for every GPU type the account supports, plus the ones it does not."""
     supported: dict[str, Any] = {}
     unsupported: list[str] = []
     first_unsupported: BaseException | None = None
     for hardware in _hardware_choices():
         try:
-            supported[hardware] = client.get_capacity(hardware=hardware)
+            supported[hardware] = lookup(hardware)
         except Exception as exc:
             if not _is_unsupported_hardware(exc):
                 raise
@@ -1326,12 +1365,7 @@ def _run(
     if args.command == "list":
         return _cmd_list(args, client, stdout)
     if args.command == "capacity":
-        if args.hardware is not None:
-            capacity = client.get_capacity(hardware=args.hardware)
-        else:
-            capacity = _capacity_by_hardware(client)
-        _print_json(capacity, stdout, compact=args.compact)
-        return 0
+        return _cmd_capacity(args, client, stdout)
     if args.command == "cancel":
         client.cancel_job(args.job_id)
         _print_json(

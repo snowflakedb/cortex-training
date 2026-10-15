@@ -23,6 +23,7 @@ from cortex_training.tui.log_cache import LogCache
 from cortex_training.tui.log_cache import cache_root
 from cortex_training.tui.log_cache import cached_log_pages
 from cortex_training.tui.log_cache import cached_pages
+from cortex_training.tui.log_cache import job_cache_dir
 from cortex_training.tui.log_cache import safe_source_name
 from cortex_training.tui.log_cache import unsafe_source_name
 
@@ -46,6 +47,12 @@ def test_override_env_wins(monkeypatch, tmp_path):
     monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path / "override"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
     assert cache_root() == tmp_path / "override"
+
+
+def test_job_cache_dir_matches_log_cache_layout(tmp_path):
+    path = job_cache_dir("job:training/0", root=tmp_path)
+    assert path == tmp_path / "jobs" / safe_source_name("job:training/0")
+    assert LogCache("job:training/0", root=tmp_path)._dir == path
 
 
 # ─── source-id <-> filename encoding ─────────────────────────────────────

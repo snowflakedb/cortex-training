@@ -971,6 +971,7 @@ class TestOperationMetrics:
         "list_jobs",
         "cancel_job",
         "get_capacity",
+        "get_capacity_breakdown",
         "get_experiment_run",
         "fetch_execution_logs",
         "forward_backward",
@@ -1050,7 +1051,10 @@ class TestOperationMetrics:
         response.headers["x-snowflake-request-id"] = "sf-request-1"
         c._session.post.return_value = response
 
-        with pytest.raises(nc.requests.exceptions.HTTPError):
+        with pytest.raises(
+            nc.requests.exceptions.HTTPError,
+            match=r"^\[snowflake request id: sf-request-1\] ",
+        ):
             c.step("job-1")
 
         _, value = c._metric_emitter.emit.call_args.args
@@ -1059,13 +1063,392 @@ class TestOperationMetrics:
         assert value["attempt_count"] == 1
         assert value["request_count"] == 1
         assert value["retry_count"] == 0
+        assert "snowflake request id: sf-request-1" in value["error_message"]
         assert attributes == {
             "job_id": "job-1",
             "error.type": "HTTPError",
             "error.http_status": 400,
+            "error.snowflake_request_id": "sf-request-1",
             "snowflake.request_id": "sf-request-1",
+            "snowflake.request_ids": ["sf-request-1"],
             "error.code": "CORTEX_TRAINING_BAD_REQUEST",
         }
+
+    def test_http_error_message_carries_request_id_without_telemetry(self, caplog):
+        c = _make_client()
+        c._metric_emitter = None
+        response = _make_error_response({"code": "CORTEX_TRAINING_BAD_REQUEST"}, 400)
+        response.headers["x-snowflake-request-id"] = "sf-request-1"
+        c._session.post.return_value = response
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(
+                nc.requests.exceptions.HTTPError,
+                match=r"^\[snowflake request id: sf-request-1\] 400 Client Error",
+            ):
+                c.step("job-1")
+
+        # The id is already in the raised error, so no duplicate warning.
+        assert not [r for r in caplog.records if "last snowflake request id" in r.message]
+        assert c._operation_metric_state.active == set()
+        assert c._operation_metric_state.snowflake_request_ids == []
+
+    def test_non_http_failure_logs_last_request_id_from_history(
+        self, monkeypatch, caplog
+    ):
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        responses = []
+        for index, status in enumerate(("running", "failed"), start=1):
+            response = _make_error_response({"status": status, "error": "oom"}, 200)
+            response.headers["x-snowflake-request-id"] = f"sf-poll-{index}"
+            responses.append(response)
+        c._session.get.side_effect = responses
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(RuntimeError, match="oom"):
+                c.poll_request("job-1", "r1")
+
+        assert any(
+            "[last snowflake request id: sf-poll-2] poll_request failed" in r.getMessage()
+            for r in caplog.records
+        )
+        operation, value = c._metric_emitter.emit.call_args.args
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert operation == "poll_request"
+        assert value["success"] is False
+        assert attributes["error.type"] == "RuntimeError"
+        assert "error.snowflake_request_id" not in attributes
+        assert attributes["snowflake.request_ids"] == ["sf-poll-1", "sf-poll-2"]
+
+    def test_non_http_failure_logs_request_id_without_telemetry(
+        self, monkeypatch, caplog
+    ):
+        c = _make_client()
+        c._metric_emitter = None
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        response = _make_error_response({"status": "failed", "error": "oom"}, 200)
+        response.headers["x-snowflake-request-id"] = "sf-poll-1"
+        c._session.get.return_value = response
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(RuntimeError, match="oom"):
+                c.poll_request("job-1", "r1")
+
+        assert any(
+            "[last snowflake request id: sf-poll-1] poll_request failed" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_failure_before_any_request_logs_no_request_id(self, caplog):
+        c = _make_client()
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(ValueError, match="checkpoint_type"):
+                c.save("job-1", checkpoint_type="invalid")
+
+        assert not [r for r in caplog.records if "snowflake request id" in r.message]
+
+    def test_http_error_without_header_does_not_borrow_an_earlier_id(
+        self, monkeypatch, caplog
+    ):
+        c = _make_client()
+        c.max_retries = 0
+        c._metric_emitter = MagicMock()
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        running = _make_error_response({"status": "running"}, 200)
+        running.headers["x-snowflake-request-id"] = "sf-prev"
+        c._session.get.side_effect = [running, _make_error_response({}, 502)]
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+                c.poll_request("job-1", "r1")
+
+        assert "sf-prev" not in str(excinfo.value)
+        assert not [r for r in caplog.records if "sf-prev" in r.getMessage()]
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert attributes["error.http_status"] == 502
+        assert "error.snowflake_request_id" not in attributes
+        assert attributes["snowflake.request_ids"] == ["sf-prev"]
+
+    def test_validation_error_after_lookup_is_not_blamed_on_the_lookup(
+        self, caplog
+    ):
+        c = _make_client(
+            post_json={"request_id": "g1"},
+            get_json={
+                "sub_jobs": [
+                    {"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}
+                ]
+            },
+        )
+        c._session.get.return_value.headers = {
+            "x-snowflake-request-id": "sf-getjob"
+        }
+        c._metric_emitter = MagicMock()
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(ValueError, match="prompt at index 0 has 5 tokens"):
+                c.generate("j1", prompts=[[1, 2, 3, 4, 5]])
+
+        assert not [r for r in caplog.records if "sf-getjob" in r.getMessage()]
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert attributes["error.type"] == "ValueError"
+        assert "error.snowflake_request_id" not in attributes
+        # Recorded only as history, never as the failing request.
+        assert attributes["snowflake.request_ids"] == ["sf-getjob"]
+
+    def test_retried_attempts_record_every_request_id(self, monkeypatch):
+        c = _make_client()
+        c.max_retries = 2
+        c._metric_emitter = MagicMock()
+        monkeypatch.setattr(
+            nc,
+            "wait_exponential_jitter",
+            lambda **kwargs: lambda retry_state: 0,
+        )
+        responses = []
+        for index in range(1, 4):
+            response = _make_error_response({"code": "TEMPORARY"}, 503)
+            response.headers["x-snowflake-request-id"] = f"sf-{index}"
+            responses.append(response)
+        c._session.post.side_effect = responses
+
+        with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+            c.step("job-1")
+
+        message = str(excinfo.value)
+        assert message.startswith("[snowflake request id: sf-3] ")
+        assert message.count("snowflake request id") == 1
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert attributes["error.snowflake_request_id"] == "sf-3"
+        assert attributes["snowflake.request_ids"] == ["sf-1", "sf-2", "sf-3"]
+
+    def test_nested_operation_accumulates_ids_with_one_warning(
+        self, monkeypatch, caplog
+    ):
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        pending = _make_error_response({"status": "pending"}, 200)
+        pending.headers["x-snowflake-request-id"] = "sf-job-1"
+        failed = _make_error_response({"status": "failed", "reason": "boom"}, 200)
+        failed.headers["x-snowflake-request-id"] = "sf-job-2"
+        c._session.get.side_effect = [pending, failed]
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(RuntimeError, match="boom"):
+                c.wait_for_job("job-1")
+
+        warnings = [r.getMessage() for r in caplog.records if "last snowflake request id" in r.getMessage()]
+        assert warnings == [
+            "[last snowflake request id: sf-job-2] wait_for_job failed: "
+            "Job job-1 reached terminal state 'failed': boom"
+        ]
+        c._metric_emitter.emit.assert_called_once()
+        operation, _ = c._metric_emitter.emit.call_args.args
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert operation == "wait_for_job"
+        assert attributes["snowflake.request_ids"] == ["sf-job-1", "sf-job-2"]
+
+    def test_chunk_group_error_message_carries_request_id(self, caplog):
+        c = _make_client()
+        response = _make_error_response(
+            {
+                "code": "517604",
+                "message": (
+                    "Cortex training forwardBackward failed: zone returned 409: "
+                    '{"detail":{"message":"request chunk group is missing chunks",'
+                    '"chunk_group_id":"group-a","missing_chunks":[0,1]}}'
+                ),
+            }
+        )
+        response.headers["x-snowflake-request-id"] = "sf-chunk"
+        c._session.post.return_value = response
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(nc.ChunkGroupConflictError) as excinfo:
+                c.forward_backward("j1", b"small")
+
+        assert str(excinfo.value).startswith("[snowflake request id: sf-chunk] ")
+        assert not [r for r in caplog.records if "last snowflake request id" in r.getMessage()]
+
+    def test_redirect_error_message_carries_request_id(self):
+        c = _make_client()
+        response = _make_error_response({}, 302)
+        response.headers["x-snowflake-request-id"] = "sf-redirect"
+        c._session.post.return_value = response
+
+        with pytest.raises(
+            nc.requests.exceptions.HTTPError,
+            match=r"^\[snowflake request id: sf-redirect\] Unexpected redirect 302 ",
+        ):
+            c.step("job-1")
+
+    def test_untracked_send_still_tags_http_errors(self):
+        c = _make_client()
+        response = _make_error_response({}, 500)
+        response.headers["x-snowflake-request-id"] = "sf-raw"
+        c._session.get.return_value = response
+        c.max_retries = 0
+
+        with pytest.raises(
+            nc.requests.exceptions.HTTPError,
+            match=r"^\[snowflake request id: sf-raw\] ",
+        ):
+            c._send("GET", "http://test.local/raw")
+        assert getattr(c._operation_metric_state, "active", set()) == set()
+
+    def test_success_event_records_request_id_history(self, monkeypatch):
+        monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "1")
+        c = _make_client(post_json={"request_id": "r1"})
+        c._session.post.return_value.headers = {"x-snowflake-request-id": "sf-ok"}
+        c._metric_emitter = MagicMock()
+
+        assert c.step("job-1") == "r1"
+
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert "error.snowflake_request_id" not in attributes
+        assert attributes["snowflake.request_ids"] == ["sf-ok"]
+
+    def test_request_id_survives_error_message_truncation(self):
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        response = _make_error_response({"code": "BAD"}, 400)
+        response.url = "http://test.local/" + "x" * 1000
+        response.headers["x-snowflake-request-id"] = "sf-long"
+        c._session.post.return_value = response
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.step("job-1")
+
+        _, value = c._metric_emitter.emit.call_args.args
+        assert len(value["error_message"]) == nc._METRIC_ERROR_MESSAGE_LIMIT
+        assert value["error_message"].startswith("[snowflake request id: sf-long] ")
+
+    def test_undecodable_server_payload_logs_last_request_id(
+        self, monkeypatch, caplog
+    ):
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        response = _make_error_response({"status": "done"}, 200)
+        response.headers["x-snowflake-request-id"] = "sf-bad-payload"
+        c._session.get.return_value = response
+
+        def bad_payload(_status):
+            raise nc.wire.WireError("not a valid DSSST1 safetensors payload")
+
+        monkeypatch.setattr(c, "_decode_stream_result_events", bad_payload)
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(nc.wire.WireError):
+                c.poll_request("job-1", "r1")
+
+        assert any(
+            "[last snowflake request id: sf-bad-payload] poll_request failed"
+            in r.getMessage()
+            for r in caplog.records
+        )
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert attributes["error.type"] == "WireError"
+        assert attributes["snowflake.request_ids"] == ["sf-bad-payload"]
+
+    @pytest.mark.parametrize("status", ["done", "cancelled"])
+    def test_wait_for_job_non_failed_terminal_state_logs_nothing(
+        self, monkeypatch, caplog, status
+    ):
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        response = _make_error_response({"status": status, "reason": "r"}, 200)
+        response.headers["x-snowflake-request-id"] = "sf-job"
+        c._session.get.return_value = response
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(RuntimeError, match=f"terminal state '{status}'"):
+                c.wait_for_job("job-1")
+
+        assert not [
+            r for r in caplog.records if "last snowflake request id" in r.getMessage()
+        ]
+        # Telemetry keeps the history even when nothing is logged.
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert attributes["snowflake.request_ids"] == ["sf-job"]
+
+    def test_poll_request_cancelled_logs_nothing(self, monkeypatch, caplog):
+        c = _make_client()
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        response = _make_error_response({"status": "cancelled"}, 200)
+        response.headers["x-snowflake-request-id"] = "sf-poll"
+        c._session.get.return_value = response
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(RuntimeError, match="cancelled"):
+                c.poll_request("job-1", "r1")
+
+        assert not [
+            r for r in caplog.records if "last snowflake request id" in r.getMessage()
+        ]
+
+    def test_poll_request_timeout_logs_last_request_id(self, monkeypatch, caplog):
+        c = _make_client()
+        c.poll_interval = 0.01
+        c.poll_max_interval = 0.01
+        c.poll_timeout = 0.05
+        response = _make_error_response({"status": "running"}, 200)
+        response.headers["x-snowflake-request-id"] = "sf-running"
+        c._session.get.return_value = response
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(TimeoutError):
+                c.poll_request("job-1", "r1")
+
+        assert any(
+            "[last snowflake request id: sf-running] poll_request failed"
+            in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_session_expired_401_request_id_is_recorded(self, monkeypatch):
+        monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "1")
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        expired = _make_error_response({"code": "390112"}, status_code=401)
+        expired.headers["x-snowflake-request-id"] = "sf-401"
+        succeeded = _make_response({"job_id": "j1"})
+        succeeded.headers = {"x-snowflake-request-id": "sf-ok"}
+        c._session.get.side_effect = [expired, succeeded]
+        auth = MagicMock()
+        auth.get_token.side_effect = ["old-token", "new-token"]
+        c._auth_provider = auth
+
+        assert c.get_job("j1") == {"job_id": "j1"}
+
+        auth.refresh.assert_called_once_with("old-token")
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert attributes["snowflake.request_ids"] == ["sf-401", "sf-ok"]
+
+    def test_tracked_request_ids_are_bounded(self, monkeypatch):
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        total = nc._MAX_TRACKED_SNOWFLAKE_REQUEST_IDS + 5
+        responses = []
+        for index in range(1, total + 1):
+            status = "failed" if index == total else "running"
+            response = _make_error_response({"status": status, "error": "x"}, 200)
+            response.headers["x-snowflake-request-id"] = f"sf-{index}"
+            responses.append(response)
+        c._session.get.side_effect = responses
+
+        with pytest.raises(RuntimeError):
+            c.poll_request("job-1", "r1")
+
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert attributes["snowflake.request_ids"] == [
+            f"sf-{index}" for index in range(6, total + 1)
+        ]
 
     def test_retry_attempts_are_summarized_in_final_metric(self, monkeypatch):
         monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "1")
@@ -2316,6 +2699,549 @@ class TestForJob:
         job_client = c.for_job({"database_name": "ML", "schema_name": "EXP"})
 
         assert type(job_client) is SubClient
+
+
+# ─── CortexTrainingClient — get_capacity_breakdown ───────────────────────────
+
+# One H200 snapshot (a reservation of 64, caller ALICE) in which every split
+# sums to the totals.
+_CAPACITY_TOTALS = {
+    "has_reservation": True,
+    "max_total_gpus": 64,
+    "reserved_gpus": 64,
+    "in_use_gpus": 44,
+    "pending_gpus": 16,
+    "available_gpus": 4,
+}
+_CAPACITY_BREAKDOWN_BODY = {
+    **_CAPACITY_TOTALS,
+    "breakdown": {
+        "unsupported_dimensions": [],
+        "job_count": 6,
+        "truncated": False,
+        "by_job_type": {
+            "status": "OK",
+            "groups": [
+                {"job_type": "TRAINING", "in_use_gpus": 28, "pending_gpus": 16, "sub_job_count": 5},
+                {"job_type": "SAMPLING", "in_use_gpus": 16, "pending_gpus": 0, "sub_job_count": 2},
+                {"job_type": "LOG_PROBABILITY", "in_use_gpus": 0, "pending_gpus": 0, "sub_job_count": 1},
+            ],
+        },
+        "by_submitted_by": {
+            "status": "OK",
+            "scope": "SELF",
+            "groups": [
+                {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+                 "in_use_gpus": 24, "pending_gpus": 0, "job_count": 2},
+                {"kind": "OTHER", "in_use_gpus": 16, "pending_gpus": 16, "job_count": 3},
+                {"kind": "UNATTRIBUTED", "in_use_gpus": 4, "pending_gpus": 0, "job_count": 1},
+            ],
+        },
+    },
+}
+
+
+class TestCapacityBreakdown:
+    def test_sends_breakdown_with_capacity_timeout_and_no_retries(self):
+        c = _make_client(get_json=_CAPACITY_BREAKDOWN_BODY)
+        c._send = MagicMock(wraps=c._send)
+
+        c.get_capacity_breakdown(hardware=Hardware.B200)
+
+        c._session.get.assert_called_once_with(
+            f"{c._prefix}/capacity",
+            timeout=nc._CAPACITY_REQUEST_TIMEOUT,
+            params={"hardware": "B200", "breakdown": "job_type,submitted_by"},
+        )
+        assert c._send.call_args.kwargs["max_retries"] == 0
+
+    def test_omits_hardware_when_not_given(self):
+        c = _make_client(get_json=_CAPACITY_BREAKDOWN_BODY)
+
+        c.get_capacity_breakdown()
+
+        c._session.get.assert_called_once_with(
+            f"{c._prefix}/capacity",
+            timeout=nc._CAPACITY_REQUEST_TIMEOUT,
+            params={"breakdown": "job_type,submitted_by"},
+        )
+
+    def test_uses_shorter_caller_timeout_and_does_not_retry(self):
+        c = _make_client()
+        c.request_timeout = (2.0, 0.5)
+        c._session.get.side_effect = nc.requests.exceptions.ReadTimeout("silent peer")
+
+        with pytest.raises(nc.requests.exceptions.ReadTimeout):
+            c.get_capacity_breakdown(dimensions=("job_type",))
+
+        c._session.get.assert_called_once_with(
+            f"{c._prefix}/capacity",
+            timeout=(2.0, 0.5),
+            params={"breakdown": "job_type"},
+        )
+
+    def test_joins_any_iterable_of_dimensions_in_order(self):
+        c = _make_client(get_json={})
+        c.get_capacity_breakdown(dimensions=iter(["submitted_by", "job_type"]))
+        assert c._session.get.call_args.kwargs["params"] == {
+            "breakdown": "submitted_by,job_type",
+        }
+
+    def test_str_enum_dimension_reads_its_own_section(self):
+        from enum import Enum
+
+        # On Python 3.11+ a member like this formats as "Dimension.JOB_TYPE".
+        class Dimension(str, Enum):
+            JOB_TYPE = "job_type"
+
+        c = _make_client(get_json={
+            "in_use_gpus": 8,
+            "breakdown": {
+                "job_count": 1,
+                "by_job_type": {
+                    "status": "OK",
+                    "groups": [{"job_type": "TRAINING", "in_use_gpus": 8, "sub_job_count": 1}],
+                },
+            },
+        })
+
+        by_job_type = c.get_capacity_breakdown(dimensions=(Dimension.JOB_TYPE,))[
+            "breakdown"
+        ]["by_job_type"]
+
+        assert c._session.get.call_args.kwargs["params"] == {"breakdown": "job_type"}
+        assert by_job_type["status"] == "OK"
+        assert by_job_type["groups"][0]["in_use_gpus"] == 8
+
+    @pytest.mark.parametrize(
+        "dimensions",
+        [
+            (), [], "job_type", "job_type,submitted_by", None, 7,
+            ("owner_role",), ("job-type",), ("JOB_TYPE",), ("job_type", None),
+        ],
+    )
+    def test_rejects_bad_dimensions_before_any_request(self, dimensions):
+        c = _make_client(get_json={})
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"^dimensions must be a non-empty iterable of job_type, "
+                r"submitted_by \(not a string\), got "
+            ),
+        ):
+            c.get_capacity_breakdown(dimensions=dimensions)
+        c._session.get.assert_not_called()
+
+    def test_rejects_unknown_hardware_before_any_request(self):
+        c = _make_client(get_json={})
+        with pytest.raises(ValueError, match="hardware must be one of"):
+            c.get_capacity_breakdown(hardware="A10")
+        c._session.get.assert_not_called()
+
+    def test_ok_breakdown_is_normalized(self):
+        c = _make_client(get_json=_CAPACITY_BREAKDOWN_BODY)
+        cap = c.get_capacity_breakdown()
+        assert cap == {
+            **_CAPACITY_TOTALS,
+            "breakdown": {
+                "job_count": 6,
+                "truncated": False,
+                "unsupported_dimensions": [],
+                "by_job_type": {
+                    "status": "OK",
+                    "groups": [
+                        {"job_type": "TRAINING", "in_use_gpus": 28, "pending_gpus": 16, "sub_job_count": 5},
+                        {"job_type": "SAMPLING", "in_use_gpus": 16, "pending_gpus": 0, "sub_job_count": 2},
+                        {"job_type": "LOG_PROBABILITY", "in_use_gpus": 0, "pending_gpus": 0, "sub_job_count": 1},
+                    ],
+                },
+                "by_submitted_by": {
+                    "status": "OK",
+                    "scope": "SELF",
+                    "groups": [
+                        {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+                         "in_use_gpus": 24, "pending_gpus": 0, "job_count": 2},
+                        {"kind": "OTHER", "submitted_by": None, "is_caller": False,
+                         "in_use_gpus": 16, "pending_gpus": 16, "job_count": 3},
+                        {"kind": "UNATTRIBUTED", "submitted_by": None, "is_caller": False,
+                         "in_use_gpus": 4, "pending_gpus": 0, "job_count": 1},
+                    ],
+                },
+            },
+        }
+        # The CLI prints with sort_keys=True, which needs every key to be a string.
+        json.dumps(cap, sort_keys=True)
+
+    def test_job_types_are_zero_filled_in_order_with_prefix_stripped(self):
+        c = _make_client(get_json={
+            "in_use_gpus": 12,
+            "pending_gpus": 16,
+            "breakdown": {
+                "job_count": 3,
+                "by_job_type": {
+                    "status": "OK",
+                    "groups": [
+                        {"job_type": "JOB_TYPE_SAMPLING", "in_use_gpus": 8, "sub_job_count": 1},
+                        {"job_type": "TRAINING", "pending_gpus": 16, "sub_job_count": 2},
+                        {"job_type": "UNKNOWN", "in_use_gpus": 4, "sub_job_count": 1},
+                    ],
+                },
+            },
+        })
+
+        cap = c.get_capacity_breakdown(dimensions=("job_type",))
+
+        assert cap["breakdown"] == {
+            "job_count": 3,
+            "truncated": False,
+            "unsupported_dimensions": [],
+            "by_job_type": {
+                "status": "OK",
+                "groups": [
+                    {"job_type": "TRAINING", "in_use_gpus": 0, "pending_gpus": 16, "sub_job_count": 2},
+                    {"job_type": "SAMPLING", "in_use_gpus": 8, "pending_gpus": 0, "sub_job_count": 1},
+                    {"job_type": "LOG_PROBABILITY", "in_use_gpus": 0, "pending_gpus": 0, "sub_job_count": 0},
+                    {"job_type": "UNKNOWN", "in_use_gpus": 4, "pending_gpus": 0, "sub_job_count": 1},
+                ],
+            },
+        }
+
+    def test_repeated_known_job_type_is_summed_into_its_row(self):
+        # The server sends each known type once. If it ever repeated one,
+        # summing keeps the groups adding up to the totals.
+        c = _make_client(get_json={
+            "in_use_gpus": 10,
+            "breakdown": {
+                "job_count": 2,
+                "by_job_type": {
+                    "status": "OK",
+                    "groups": [
+                        {"job_type": "TRAINING", "in_use_gpus": 8, "sub_job_count": 1},
+                        {"job_type": "JOB_TYPE_TRAINING", "in_use_gpus": 2, "sub_job_count": 1},
+                    ],
+                },
+            },
+        })
+
+        groups = c.get_capacity_breakdown(dimensions=("job_type",))["breakdown"][
+            "by_job_type"
+        ]["groups"]
+
+        assert [group["job_type"] for group in groups] == list(nc._CAPACITY_BREAKDOWN_JOB_TYPES)
+        assert groups[0] == {
+            "job_type": "TRAINING", "in_use_gpus": 10, "pending_gpus": 0, "sub_job_count": 2,
+        }
+
+    def test_only_user_rows_carry_a_name(self):
+        c = _make_client(get_json={
+            "in_use_gpus": 20,
+            "pending_gpus": 12,
+            "breakdown": {
+                "job_count": 5,
+                "by_submitted_by": {
+                    "status": "OK",
+                    "scope": "VISIBLE",
+                    "groups": [
+                        {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+                         "in_use_gpus": 8, "job_count": 1},
+                        # A USER row's is_caller is passed through, and is False if omitted.
+                        {"kind": "USER", "submitted_by": "CAROL", "is_caller": False,
+                         "in_use_gpus": 4, "job_count": 1},
+                        {"kind": "USER", "submitted_by": "DAVE", "pending_gpus": 4, "job_count": 1},
+                        {"kind": "OTHER", "submitted_by": "BOB", "is_caller": True,
+                         "in_use_gpus": 8, "job_count": 1},
+                        {"kind": "UNATTRIBUTED", "submitted_by": "", "pending_gpus": 8, "job_count": 1},
+                    ],
+                },
+            },
+        })
+
+        groups = c.get_capacity_breakdown(dimensions=("submitted_by",))["breakdown"][
+            "by_submitted_by"
+        ]["groups"]
+
+        assert groups == [
+            {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+             "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+            {"kind": "USER", "submitted_by": "CAROL", "is_caller": False,
+             "in_use_gpus": 4, "pending_gpus": 0, "job_count": 1},
+            {"kind": "USER", "submitted_by": "DAVE", "is_caller": False,
+             "in_use_gpus": 0, "pending_gpus": 4, "job_count": 1},
+            {"kind": "OTHER", "submitted_by": None, "is_caller": False,
+             "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+            {"kind": "UNATTRIBUTED", "submitted_by": None, "is_caller": False,
+             "in_use_gpus": 0, "pending_gpus": 8, "job_count": 1},
+        ]
+
+    def test_visible_scope_keeps_every_user_row_in_server_order(self):
+        # Scope VISIBLE names other users too. The server orders USER rows by
+        # in_use_gpus + pending_gpus descending and then by name, so the
+        # caller, ALICE, comes third.
+        c = _make_client(get_json={
+            "in_use_gpus": 52,
+            "pending_gpus": 16,
+            "breakdown": {
+                "unsupported_dimensions": [],
+                "job_count": 7,
+                "truncated": False,
+                "by_submitted_by": {
+                    "status": "OK",
+                    "scope": "VISIBLE",
+                    "groups": [
+                        {"kind": "USER", "submitted_by": "DAVE", "is_caller": False,
+                         "in_use_gpus": 16, "pending_gpus": 8, "job_count": 2},
+                        {"kind": "USER", "submitted_by": "BOB", "is_caller": False,
+                         "in_use_gpus": 16, "pending_gpus": 0, "job_count": 1},
+                        {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+                         "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+                        {"kind": "USER", "submitted_by": "CAROL", "is_caller": False,
+                         "in_use_gpus": 0, "pending_gpus": 8, "job_count": 1},
+                        {"kind": "OTHER", "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+                        {"kind": "UNATTRIBUTED", "in_use_gpus": 4, "pending_gpus": 0, "job_count": 1},
+                    ],
+                },
+            },
+        })
+
+        by_submitted_by = c.get_capacity_breakdown(dimensions=("submitted_by",))[
+            "breakdown"
+        ]["by_submitted_by"]
+
+        assert by_submitted_by == {
+            "status": "OK",
+            "scope": "VISIBLE",
+            "groups": [
+                {"kind": "USER", "submitted_by": "DAVE", "is_caller": False,
+                 "in_use_gpus": 16, "pending_gpus": 8, "job_count": 2},
+                {"kind": "USER", "submitted_by": "BOB", "is_caller": False,
+                 "in_use_gpus": 16, "pending_gpus": 0, "job_count": 1},
+                {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+                 "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+                {"kind": "USER", "submitted_by": "CAROL", "is_caller": False,
+                 "in_use_gpus": 0, "pending_gpus": 8, "job_count": 1},
+                {"kind": "OTHER", "submitted_by": None, "is_caller": False,
+                 "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+                {"kind": "UNATTRIBUTED", "submitted_by": None, "is_caller": False,
+                 "in_use_gpus": 4, "pending_gpus": 0, "job_count": 1},
+            ],
+        }
+
+    def test_scope_this_client_does_not_know_is_passed_through(self):
+        # Unlike an unknown status, an unknown scope keeps its groups: scope is
+        # passed through as sent, and every USER row is kept.
+        c = _make_client(get_json={
+            "in_use_gpus": 12,
+            "breakdown": {
+                "unsupported_dimensions": [],
+                "job_count": 2,
+                "truncated": False,
+                "by_submitted_by": {
+                    "status": "OK",
+                    "scope": "ACCOUNT",
+                    "groups": [
+                        {"kind": "USER", "submitted_by": "BOB", "is_caller": False,
+                         "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+                        {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+                         "in_use_gpus": 4, "pending_gpus": 0, "job_count": 1},
+                        {"kind": "OTHER", "in_use_gpus": 0, "pending_gpus": 0, "job_count": 0},
+                        {"kind": "UNATTRIBUTED", "in_use_gpus": 0, "pending_gpus": 0, "job_count": 0},
+                    ],
+                },
+            },
+        })
+
+        by_submitted_by = c.get_capacity_breakdown(dimensions=("submitted_by",))[
+            "breakdown"
+        ]["by_submitted_by"]
+
+        assert by_submitted_by == {
+            "status": "OK",
+            "scope": "ACCOUNT",
+            "groups": [
+                {"kind": "USER", "submitted_by": "BOB", "is_caller": False,
+                 "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+                {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+                 "in_use_gpus": 4, "pending_gpus": 0, "job_count": 1},
+                {"kind": "OTHER", "submitted_by": None, "is_caller": False,
+                 "in_use_gpus": 0, "pending_gpus": 0, "job_count": 0},
+                {"kind": "UNATTRIBUTED", "submitted_by": None, "is_caller": False,
+                 "in_use_gpus": 0, "pending_gpus": 0, "job_count": 0},
+            ],
+        }
+
+    def test_old_server_reports_every_dimension_unsupported(self):
+        c = _make_client(get_json=_CAPACITY_TOTALS)
+        assert c.get_capacity_breakdown() == {
+            **_CAPACITY_TOTALS,
+            "breakdown": {
+                "job_count": 0,
+                "truncated": False,
+                "unsupported_dimensions": [],
+                "by_job_type": {"status": "UNSUPPORTED", "groups": []},
+                "by_submitted_by": {"status": "UNSUPPORTED", "scope": None, "groups": []},
+            },
+        }
+
+    def test_dimension_missing_from_server_breakdown_is_unsupported(self):
+        # A server that knows job_type but not submitted_by lists it as unsupported.
+        c = _make_client(get_json={
+            "in_use_gpus": 8,
+            "breakdown": {
+                "unsupported_dimensions": ["submitted_by"],
+                "job_count": 1,
+                "truncated": False,
+                "by_job_type": {
+                    "status": "OK",
+                    "groups": [{"job_type": "TRAINING", "in_use_gpus": 8, "sub_job_count": 1}],
+                },
+            },
+        })
+
+        breakdown = c.get_capacity_breakdown()["breakdown"]
+
+        assert breakdown["unsupported_dimensions"] == ["submitted_by"]
+        assert breakdown["by_job_type"]["status"] == "OK"
+        assert breakdown["by_submitted_by"] == {
+            "status": "UNSUPPORTED",
+            "scope": None,
+            "groups": [],
+        }
+
+    @pytest.mark.parametrize("status", ["DISABLED", "UNSUPPORTED", "UNAVAILABLE"])
+    def test_status_other_than_ok_is_passed_through_without_groups(self, status):
+        c = _make_client(get_json={
+            "in_use_gpus": 8,
+            "breakdown": {
+                "unsupported_dimensions": [],
+                "by_job_type": {
+                    "status": status,
+                    "groups": [{"job_type": "TRAINING", "in_use_gpus": 8, "sub_job_count": 1}],
+                },
+                "by_submitted_by": {
+                    "status": status,
+                    "groups": [{"kind": "OTHER", "in_use_gpus": 8, "job_count": 1}],
+                },
+            },
+        })
+
+        breakdown = c.get_capacity_breakdown()["breakdown"]
+
+        assert breakdown["by_job_type"] == {"status": status, "groups": []}
+        assert breakdown["by_submitted_by"] == {"status": status, "scope": None, "groups": []}
+
+    @pytest.mark.parametrize(
+        "section_status",
+        [{"status": "SOMETHING_NEW"}, {"status": None}, {"status": 1}, {}],
+        ids=["unknown", "null", "not-a-string", "missing"],
+    )
+    def test_status_this_client_does_not_know_fails_closed_as_unavailable(
+        self, section_status
+    ):
+        c = _make_client(get_json={
+            "in_use_gpus": 8,
+            "breakdown": {
+                "unsupported_dimensions": [],
+                "by_job_type": {
+                    **section_status,
+                    "groups": [{"job_type": "TRAINING", "in_use_gpus": 8, "sub_job_count": 1}],
+                },
+                "by_submitted_by": {
+                    **section_status,
+                    "scope": "SELF",
+                    "groups": [{"kind": "OTHER", "in_use_gpus": 8, "job_count": 1}],
+                },
+            },
+        })
+
+        breakdown = c.get_capacity_breakdown()["breakdown"]
+
+        assert breakdown["by_job_type"] == {"status": "UNAVAILABLE", "groups": []}
+        # The groups are dropped, but scope is passed through as sent.
+        assert breakdown["by_submitted_by"] == {
+            "status": "UNAVAILABLE",
+            "scope": "SELF",
+            "groups": [],
+        }
+
+    def test_truncated_is_passed_through(self):
+        # The jobs the server did not attribute one by one hold the fewest
+        # GPUs, and are counted as UNATTRIBUTED.
+        c = _make_client(get_json={
+            "in_use_gpus": 48,
+            "pending_gpus": 16,
+            "breakdown": {
+                "unsupported_dimensions": [],
+                "job_count": 7,
+                "truncated": True,
+                "by_submitted_by": {
+                    "status": "OK",
+                    "scope": "SELF",
+                    "groups": [
+                        {"kind": "OTHER", "in_use_gpus": 48, "job_count": 5},
+                        {"kind": "UNATTRIBUTED", "pending_gpus": 16, "job_count": 2},
+                    ],
+                },
+            },
+        })
+
+        breakdown = c.get_capacity_breakdown(dimensions=("submitted_by",))["breakdown"]
+
+        assert breakdown == {
+            "job_count": 7,
+            "truncated": True,
+            "unsupported_dimensions": [],
+            "by_submitted_by": {
+                "status": "OK",
+                "scope": "SELF",
+                "groups": [
+                    {"kind": "OTHER", "submitted_by": None, "is_caller": False,
+                     "in_use_gpus": 48, "pending_gpus": 0, "job_count": 5},
+                    {"kind": "UNATTRIBUTED", "submitted_by": None, "is_caller": False,
+                     "in_use_gpus": 0, "pending_gpus": 16, "job_count": 2},
+                ],
+            },
+        }
+
+    def test_records_its_own_operation_metric(self, monkeypatch):
+        monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "1")
+        c = _make_client(get_json=_CAPACITY_BREAKDOWN_BODY)
+        c._metric_emitter = MagicMock()
+
+        c.get_capacity_breakdown()
+
+        c._metric_emitter.emit.assert_called_once()
+        operation, value = c._metric_emitter.emit.call_args.args
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert operation == "get_capacity_breakdown"
+        assert value["success"] is True
+        assert value["request_count"] == 1
+        assert value["attempt_count"] == 1
+        # The result names the caller, so none of it becomes part of the metric.
+        assert attributes == {}
+        assert "ALICE" not in repr(c._metric_emitter.emit.call_args)
+
+    def test_bad_dimensions_record_a_failed_operation_without_a_request(self):
+        c = _make_client(get_json=_CAPACITY_BREAKDOWN_BODY)
+        c._metric_emitter = MagicMock()
+
+        with pytest.raises(ValueError, match="dimensions must be"):
+            c.get_capacity_breakdown(dimensions=("owner_role",))
+
+        c._session.get.assert_not_called()
+        c._metric_emitter.emit.assert_called_once()
+        operation, value = c._metric_emitter.emit.call_args.args
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert operation == "get_capacity_breakdown"
+        assert value["success"] is False
+        assert value["request_count"] == 0
+        assert attributes == {"error.type": "ValueError"}
+
+    def test_get_capacity_still_returns_only_the_six_totals(self):
+        c = _make_client(get_json=_CAPACITY_BREAKDOWN_BODY)
+        assert c.get_capacity() == _CAPACITY_TOTALS
+        c._session.get.assert_called_once_with(
+            f"{c._prefix}/capacity", timeout=nc._CAPACITY_REQUEST_TIMEOUT
+        )
 
 
 # ─── CortexTrainingClient — wait_for_job ─────────────────────────────────────

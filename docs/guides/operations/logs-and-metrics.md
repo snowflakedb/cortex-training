@@ -25,11 +25,16 @@ cortex-training download-metrics JOB_ID --output-dir /path/to/metrics --resume
 
 Metrics are written to `<output_dir>/<sub_job_id>/gpu.jsonl`.
 
-View a running job's live logs, or a finished job's saved console, in the terminal:
+Open a job dashboard in the terminal:
 
 ```bash
 cortex-training tui JOB_ID
 ```
+
+The **Logs** tab tails a running job or loads its saved console after it
+finishes. The **Resource** tab plots GPU utilization and lists each GPU. Use
+`1`–`5` for 5 minutes, 15 minutes, 1 hour, 6 hours, or all history; use `r` to
+refresh.
 
 Recipe-level metrics are also written under each recipe's `log_path`.
 

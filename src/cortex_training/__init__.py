@@ -17,6 +17,7 @@
 
 __version__ = "0.0.2"
 
+from . import router_replay_planner
 from . import wire
 from .client import ChunkGroupConflictError
 from .client import ChunkGroupError
@@ -44,6 +45,7 @@ __all__ = [
     "InferenceConfig",
     "JobType",
     "Hardware",
+    "router_replay_planner",
     "wire",
     "__version__",
 ]

@@ -37,6 +37,7 @@ use the ``extra`` fields for anything the typed layer does not model yet.
 from __future__ import annotations
 
 import base64
+import contextlib
 import functools
 import gzip
 import hashlib
@@ -51,6 +52,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
+from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -62,6 +64,7 @@ from enum import Enum
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
+from typing import TypeVar
 from urllib.parse import quote
 
 from pydantic import BaseModel
@@ -418,6 +421,130 @@ def _safe_metric_error_message(exc: BaseException) -> str:
     return message[:_METRIC_ERROR_MESSAGE_LIMIT]
 
 
+_SNOWFLAKE_REQUEST_ID_HEADER = "x-snowflake-request-id"
+# Bound per-operation history so long polls (wait_for_job) stay cheap.
+_MAX_TRACKED_SNOWFLAKE_REQUEST_IDS = 10
+
+
+def _response_snowflake_request_id(response: Any) -> str | None:
+    headers = getattr(response, "headers", None) or {}
+    request_id = headers.get(_SNOWFLAKE_REQUEST_ID_HEADER)
+    return request_id if isinstance(request_id, str) and request_id else None
+
+
+def _add_snowflake_request_id_to_error(
+    exc: BaseException, request_id: str | None
+) -> None:
+    """Prefix the Snowflake request id to an error message so tracebacks carry it.
+
+    The id goes first so it survives truncation of long messages, e.g. the
+    512-character telemetry ``error_message``.
+    """
+    if not request_id or not exc.args or not isinstance(exc.args[0], str):
+        return
+    if request_id in exc.args[0]:
+        return
+    exc.args = (
+        f"[snowflake request id: {request_id}] {exc.args[0]}",
+        *exc.args[1:],
+    )
+
+
+def _snowflake_request_attributes(
+    error: BaseException | None,
+    request_ids: list[str],
+) -> dict[str, Any]:
+    """Snowflake request id attributes for an operation outcome.
+
+    ``error.snowflake_request_id`` is the failing response's id, set only when
+    that response carried the header. ``snowflake.request_ids`` is the
+    operation's recent Snowflake request ids, newest last; no entry in it is
+    implied to have failed.
+    """
+    attributes: dict[str, Any] = {}
+    if error is not None:
+        request_id = _response_snowflake_request_id(getattr(error, "response", None))
+        if request_id is not None:
+            attributes["error.snowflake_request_id"] = request_id
+            # Deprecated name for the same value; remove after one release.
+            attributes["snowflake.request_id"] = request_id
+    if request_ids:
+        attributes["snowflake.request_ids"] = list(request_ids)
+    return attributes
+
+
+_E = TypeVar("_E", bound=BaseException)
+_SERVER_FAILURE_ATTR = "_snowflake_server_failure"
+
+
+def _server_failure(exc: _E, failed: bool = True) -> _E:
+    """Mark ``exc`` as caused by a server outcome when ``failed`` is true.
+
+    Marked errors (a request or job that ended ``failed``, a poll that timed
+    out, a response payload that could not be decoded) carry no response of
+    their own, so :func:`_log_untagged_request_id` names the operation's last
+    Snowflake request id for them.
+    """
+    if failed:
+        try:
+            setattr(exc, _SERVER_FAILURE_ATTR, True)
+        except Exception:
+            pass
+    return exc
+
+
+@contextlib.contextmanager
+def _server_payload() -> Iterator[None]:
+    """Treat decode errors in the enclosed code as server failures."""
+    try:
+        yield
+    except ValueError as exc:
+        raise _server_failure(exc)
+
+
+def _log_untagged_request_id(
+    operation: str,
+    exc: BaseException,
+    request_ids: list[str],
+) -> None:
+    """Log the last Snowflake request id for a server-side failure with no response.
+
+    This is the fallback for :func:`_add_snowflake_request_id_to_error`, which
+    tags any error that has a response. It covers:
+
+    - transport errors with no response, such as a connection error or
+      timeout after retries;
+    - errors marked by :func:`_server_failure`: a request or job that ended
+      ``failed``, a poll that timed out, or an undecodable response payload.
+
+    It logs ``request_ids[-1]`` labeled "last" because that request did not
+    necessarily fail. It logs nothing when the operation made no Snowflake
+    requests, when the error has a response (already tagged, or the response
+    lacked the header), or for any other error, such as client-side
+    validation or a job that reached ``done`` or ``cancelled``. Telemetry
+    still records ``snowflake.request_ids`` for those.
+    """
+    try:
+        if getattr(exc, "response", None) is not None or not request_ids:
+            return
+        if not (
+            isinstance(exc, requests.exceptions.RequestException)
+            or getattr(exc, _SERVER_FAILURE_ATTR, False)
+        ):
+            return
+        request_id = request_ids[-1]
+        if request_id in str(exc):
+            return
+        logger.warning(
+            "[last snowflake request id: %s] %s failed: %s",
+            request_id,
+            operation,
+            _safe_metric_error_message(exc),
+        )
+    except Exception:
+        logger.debug("client operation request id logging failed", exc_info=True)
+
+
 def _metric_error_attributes(exc: BaseException) -> dict[str, Any]:
     attributes: dict[str, Any] = {"error.type": type(exc).__name__}
     response = getattr(exc, "response", None)
@@ -426,10 +553,6 @@ def _metric_error_attributes(exc: BaseException) -> dict[str, Any]:
     status_code = getattr(response, "status_code", None)
     if isinstance(status_code, int):
         attributes["error.http_status"] = status_code
-    headers = getattr(response, "headers", {}) or {}
-    request_id = headers.get("x-snowflake-request-id")
-    if isinstance(request_id, str) and request_id:
-        attributes["snowflake.request_id"] = request_id
     try:
         body = response.json()
     except Exception:
@@ -475,50 +598,64 @@ def _track_operation(operation: str):
 
         @functools.wraps(method)
         def wrapped(self, *args, **kwargs):
-            if getattr(self, "_metric_emitter", None) is None:
-                return method(self, *args, **kwargs)
             state = getattr(self, "_operation_metric_state", None)
             if state is None:
                 return method(self, *args, **kwargs)
             active = getattr(state, "active", set())
             if active:
                 return method(self, *args, **kwargs)
-            try:
-                bound = signature.bind(self, *args, **kwargs)
-                bound.apply_defaults()
-            except TypeError:
-                return method(self, *args, **kwargs)
-            except Exception:
-                logger.debug("client operation metric setup failed", exc_info=True)
-                return method(self, *args, **kwargs)
+            # Snowflake request ids are tracked even with telemetry off so a
+            # failure can still be logged with the id; only metrics need the
+            # arguments.
+            arguments = None
+            if getattr(self, "_metric_emitter", None) is not None:
+                try:
+                    bound = signature.bind(self, *args, **kwargs)
+                    bound.apply_defaults()
+                    arguments = bound.arguments
+                except TypeError:
+                    return method(self, *args, **kwargs)
+                except Exception:
+                    logger.debug("client operation metric setup failed", exc_info=True)
+                    return method(self, *args, **kwargs)
             active = set()
             active.add(operation)
             state.active = active
             state.attempt_count = 0
             state.request_count = 0
+            state.snowflake_request_ids = []
             started = time.monotonic()
             try:
                 result = method(self, *args, **kwargs)
             except Exception as exc:
-                self._emit_operation_outcome(
-                    operation,
-                    started,
-                    bound.arguments,
-                    error=exc,
+                # Errors wrapped after _send (e.g. chunk-group errors) still
+                # carry the failing response.
+                _add_snowflake_request_id_to_error(
+                    exc, _response_snowflake_request_id(getattr(exc, "response", None))
                 )
+                _log_untagged_request_id(operation, exc, state.snowflake_request_ids)
+                if arguments is not None:
+                    self._emit_operation_outcome(
+                        operation,
+                        started,
+                        arguments,
+                        error=exc,
+                    )
                 raise
             else:
-                self._emit_operation_outcome(
-                    operation,
-                    started,
-                    bound.arguments,
-                    result=result,
-                )
+                if arguments is not None:
+                    self._emit_operation_outcome(
+                        operation,
+                        started,
+                        arguments,
+                        result=result,
+                    )
                 return result
             finally:
                 state.active = set()
                 state.attempt_count = 0
                 state.request_count = 0
+                state.snowflake_request_ids = []
 
         return wrapped
 
@@ -613,6 +750,118 @@ def _hardware_wire(hardware: Hardware | str) -> str:
     except ValueError as exc:
         allowed = ", ".join(member.value for member in Hardware)
         raise ValueError(f"hardware must be one of {allowed}, got {hardware!r}") from exc
+
+
+# ``get_capacity_breakdown`` dimensions, statuses, and the job types always
+# reported under ``job_type``, in order.
+_CAPACITY_BREAKDOWN_DIMENSIONS = ("job_type", "submitted_by")
+_CAPACITY_BREAKDOWN_STATUSES = ("OK", "DISABLED", "UNSUPPORTED", "UNAVAILABLE")
+_CAPACITY_BREAKDOWN_JOB_TYPES = ("TRAINING", "SAMPLING", "LOG_PROBABILITY")
+
+
+def _capacity_totals(body: Mapping[str, Any]) -> dict:
+    """Return the six ``/capacity`` totals, filling proto3-omitted defaults."""
+    return {
+        "has_reservation": bool(body.get("has_reservation", False)),
+        "max_total_gpus": int(body.get("max_total_gpus", 0)),
+        "reserved_gpus": int(body.get("reserved_gpus", 0)),
+        "in_use_gpus": int(body.get("in_use_gpus", 0)),
+        "pending_gpus": int(body.get("pending_gpus", 0)),
+        "available_gpus": int(body.get("available_gpus", 0)),
+    }
+
+
+def _capacity_breakdown_dimensions(dimensions: Any) -> tuple[str, ...]:
+    """Validate ``get_capacity_breakdown(dimensions=...)`` before any request."""
+    try:
+        names = tuple(dimensions)
+    except TypeError:
+        names = ()
+    if not names or not all(
+        isinstance(name, str) and name in _CAPACITY_BREAKDOWN_DIMENSIONS
+        for name in names
+    ):
+        allowed = ", ".join(_CAPACITY_BREAKDOWN_DIMENSIONS)
+        raise ValueError(
+            f"dimensions must be a non-empty iterable of {allowed} "
+            f"(not a string), got {dimensions!r}"
+        )
+    # Use our own strings: a str Enum member equal to a name formats differently.
+    return tuple(
+        _CAPACITY_BREAKDOWN_DIMENSIONS[_CAPACITY_BREAKDOWN_DIMENSIONS.index(name)]
+        for name in names
+    )
+
+
+def _capacity_breakdown(
+    body: Mapping[str, Any], dimensions: tuple[str, ...]
+) -> dict[str, Any]:
+    """Normalize ``breakdown``: a missing dimension is ``UNSUPPORTED``, an
+    unknown status ``UNAVAILABLE``, and groups are kept only under ``OK``."""
+    raw = body.get("breakdown")
+    if not isinstance(raw, dict):
+        raw = {}
+    breakdown: dict[str, Any] = {
+        "job_count": int(raw.get("job_count", 0)),
+        "truncated": bool(raw.get("truncated", False)),
+        "unsupported_dimensions": list(raw.get("unsupported_dimensions") or []),
+    }
+    for dimension in dict.fromkeys(dimensions):
+        section = raw.get(f"by_{dimension}")
+        if not isinstance(section, dict):
+            section = {"status": "UNSUPPORTED"}
+        status = section.get("status")
+        if status not in _CAPACITY_BREAKDOWN_STATUSES:
+            status = "UNAVAILABLE"
+        ok = status == "OK"
+        groups = (section.get("groups") or []) if ok else []
+        if dimension == "job_type":
+            breakdown["by_job_type"] = {
+                "status": status,
+                "groups": _capacity_job_type_groups(groups) if ok else [],
+            }
+        else:
+            breakdown["by_submitted_by"] = {
+                "status": status,
+                "scope": section.get("scope"),
+                "groups": [_capacity_submitted_by_group(group) for group in groups],
+            }
+    return breakdown
+
+
+def _capacity_job_type_groups(groups: list[Mapping[str, Any]]) -> list[dict]:
+    """Known job types first, zero-filled and in order, then any others as sent."""
+    counts = ("in_use_gpus", "pending_gpus", "sub_job_count")
+    known: dict[str, dict[str, Any]] = {
+        job_type: {"job_type": job_type, **dict.fromkeys(counts, 0)}
+        for job_type in _CAPACITY_BREAKDOWN_JOB_TYPES
+    }
+    others = []
+    for group in groups:
+        job_type = group.get("job_type")
+        row: dict[str, Any] | None = None
+        if isinstance(job_type, str):
+            job_type = job_type.removeprefix("JOB_TYPE_")
+            row = known.get(job_type)
+        if row is None:
+            row = {"job_type": job_type, **dict.fromkeys(counts, 0)}
+            others.append(row)
+        for key in counts:
+            row[key] += int(group.get(key, 0))
+    return [*known.values(), *others]
+
+
+def _capacity_submitted_by_group(group: Mapping[str, Any]) -> dict:
+    """Normalize one ``by_submitted_by`` group; only a ``USER`` row names anyone."""
+    user = group.get("kind") == "USER"
+    return {
+        "kind": group.get("kind"),
+        "submitted_by": group.get("submitted_by") if user else None,
+        "is_caller": bool(group.get("is_caller", False)) if user else False,
+        "in_use_gpus": int(group.get("in_use_gpus", 0)),
+        "pending_gpus": int(group.get("pending_gpus", 0)),
+        "job_count": int(group.get("job_count", 0)),
+    }
 
 
 def _effective_primerl_config(extra: dict) -> dict:
@@ -1687,6 +1936,14 @@ class CortexTrainingClient:
             if error is not None:
                 value["error_message"] = _safe_metric_error_message(error)
                 attributes.update(_metric_error_attributes(error))
+            attributes.update(
+                _snowflake_request_attributes(
+                    error,
+                    list(
+                        getattr(self._operation_metric_state, "snowflake_request_ids", [])
+                    ),
+                )
+            )
             self.emit_metric(operation, value, attributes=attributes)
         except Exception:
             logger.debug("client operation metric construction failed", exc_info=True)
@@ -1874,6 +2131,29 @@ class CortexTrainingClient:
                         )
                     raise
 
+                status_code = getattr(resp, "status_code", None)
+                sf_request_id = _response_snowflake_request_id(resp)
+                if sf_request_id:
+                    req = getattr(resp, "request", None)
+                    logger.debug(
+                        "snowflake request_id=%s  %s %s  status=%d",
+                        sf_request_id,
+                        getattr(req, "method", method.upper()),
+                        getattr(req, "path_url", url),
+                        status_code,
+                    )
+                    try:
+                        state = self._operation_metric_state
+                        if getattr(state, "active", set()):
+                            seen = state.snowflake_request_ids
+                            seen.append(sf_request_id)
+                            del seen[:-_MAX_TRACKED_SNOWFLAKE_REQUEST_IDS]
+                    except Exception:
+                        logger.debug(
+                            "client operation request id tracking failed",
+                            exc_info=True,
+                        )
+
                 if (
                     self._auth_provider is not None
                     and not auth_retry_used
@@ -1884,20 +2164,6 @@ class CortexTrainingClient:
                     self._auth_provider.refresh(observed_token)
                     continue
 
-                status_code = getattr(resp, "status_code", None)
-                headers = getattr(resp, "headers", {}) or {}
-                sf_request_id = headers.get("x-snowflake-request-id")
-                if not isinstance(sf_request_id, str) or not sf_request_id:
-                    sf_request_id = None
-                if sf_request_id:
-                    req = getattr(resp, "request", None)
-                    logger.debug(
-                        "snowflake request_id=%s  %s %s  status=%d",
-                        sf_request_id,
-                        getattr(req, "method", method.upper()),
-                        getattr(req, "path_url", url),
-                        status_code,
-                    )
                 if debug_label is not None:
                     try:
                         status_int = int(status_code)
@@ -1945,14 +2211,18 @@ class CortexTrainingClient:
                         f"The database may already exist but your role lacks USAGE on it. "
                         f"Create it manually in Snowsight: CREATE DATABASE IF NOT EXISTS {self.database};"
                     )
-                # requests.Response.raise_for_status() intentionally ignores 3xx.
-                if 300 <= resp.status_code < 400:
-                    raise requests.exceptions.HTTPError(
-                        f"Unexpected redirect {resp.status_code} for url: {url}",
-                        response=resp,
-                        request=getattr(resp, "request", None),
-                    )
-                resp.raise_for_status()
+                try:
+                    # requests.Response.raise_for_status() intentionally ignores 3xx.
+                    if 300 <= resp.status_code < 400:
+                        raise requests.exceptions.HTTPError(
+                            f"Unexpected redirect {resp.status_code} for url: {url}",
+                            response=resp,
+                            request=getattr(resp, "request", None),
+                        )
+                    resp.raise_for_status()
+                except requests.exceptions.HTTPError as exc:
+                    _add_snowflake_request_id_to_error(exc, sf_request_id)
+                    raise
                 return resp
 
         retryer = Retrying(
@@ -2107,9 +2377,14 @@ class CortexTrainingClient:
                 return job
             if status in ("failed", "done", "cancelled", "canceled"):
                 reason = job.get("reason", "")
-                raise RuntimeError(f"Job {job_id} reached terminal state '{status}': {reason}")
+                raise _server_failure(
+                    RuntimeError(f"Job {job_id} reached terminal state '{status}': {reason}"),
+                    failed=status == "failed",
+                )
             delay = self._sleep_with_backoff(delay, deadline)
-        raise TimeoutError(f"Job {job_id} did not become running within {self.poll_timeout}s")
+        raise _server_failure(
+            TimeoutError(f"Job {job_id} did not become running within {self.poll_timeout}s")
+        )
 
     @_track_operation("get_job")
     def get_job(self, job_id: str) -> dict:
@@ -2281,11 +2556,51 @@ class CortexTrainingClient:
           blocked: a submit within the ceiling is still accepted and queued.
 
         See ``docs/reference/rest-api.md`` section 5.4 for the authoritative
-        field list.
+        field list, and :meth:`get_capacity_breakdown` to split ``in_use_gpus``
+        and ``pending_gpus`` by sub-job type or by submitting user.
         """
         params = {}
         if hardware is not None:
             params["hardware"] = _hardware_wire(hardware)
+        return _capacity_totals(self._fetch_capacity(params))
+
+    @_track_operation("get_capacity_breakdown")
+    def get_capacity_breakdown(
+        self,
+        hardware: Hardware | str | None = None,
+        *,
+        dimensions: Iterable[str] = _CAPACITY_BREAKDOWN_DIMENSIONS,
+    ) -> dict:
+        """Return :meth:`get_capacity` plus a ``"breakdown"`` of its GPU usage.
+
+        Sends the same single request as :meth:`get_capacity` with
+        ``?breakdown=`` naming ``dimensions``: ``"job_type"``,
+        ``"submitted_by"``, or both (the default). Any other value raises
+        ``ValueError`` before sending.
+
+        ``breakdown`` holds ``job_count``, ``truncated``,
+        ``unsupported_dimensions``, and ``by_job_type`` / ``by_submitted_by``
+        for the requested dimensions. Each has a ``status`` (``OK``,
+        ``DISABLED``, ``UNSUPPORTED`` or ``UNAVAILABLE``) and ``groups``,
+        which is empty unless ``OK`` and then adds up to ``in_use_gpus`` and
+        ``pending_gpus``. Missing counts are 0; on non-``USER`` groups
+        ``submitted_by`` is ``None`` and ``is_caller`` is ``False``.
+
+        See ``docs/reference/rest-api.md`` section 5.4 for every field.
+        """
+        dimensions = _capacity_breakdown_dimensions(dimensions)
+        params = {}
+        if hardware is not None:
+            params["hardware"] = _hardware_wire(hardware)
+        params["breakdown"] = ",".join(dimensions)
+        body = self._fetch_capacity(params)
+        return {
+            **_capacity_totals(body),
+            "breakdown": _capacity_breakdown(body, dimensions),
+        }
+
+    def _fetch_capacity(self, params: Mapping[str, str]) -> Any:
+        """``GET /capacity`` once, under the capacity timeout bound; return its JSON."""
         resp = self._send(
             "GET",
             f"{self._prefix}/capacity",
@@ -2296,15 +2611,7 @@ class CortexTrainingClient:
             max_retries=0,
             **({"params": params} if params else {}),
         )
-        body = resp.json()
-        return {
-            "has_reservation": bool(body.get("has_reservation", False)),
-            "max_total_gpus": int(body.get("max_total_gpus", 0)),
-            "reserved_gpus": int(body.get("reserved_gpus", 0)),
-            "in_use_gpus": int(body.get("in_use_gpus", 0)),
-            "pending_gpus": int(body.get("pending_gpus", 0)),
-            "available_gpus": int(body.get("available_gpus", 0)),
-        }
+        return resp.json()
 
     @_track_operation("get_experiment_run")
     def get_experiment_run(self, job_id: str) -> dict[str, str]:
@@ -3729,7 +4036,8 @@ class CortexTrainingClient:
             events = status.get("events") or []
             received_chunk = False
             for event in events:
-                chunk = self._decode_result_chunk_event(event)
+                with _server_payload():
+                    chunk = self._decode_result_chunk_event(event)
                 if chunk is not None:
                     result_chunks.append(chunk)
                     received_chunk = True
@@ -3740,14 +4048,16 @@ class CortexTrainingClient:
                 continue
             if state in ("completed", "done", "succeeded"):
                 if result_chunks:
-                    result = wire.decode_result_chunks(result_chunks)
+                    with _server_payload():
+                        result = wire.decode_result_chunks(result_chunks)
                     result = self._merge_transport_metrics(
                         result,
                         status.get("result") or {},
                     )
                 else:
                     result = status.get("result") or {}
-                    decoded = self._decode_result_payload(result)
+                    with _server_payload():
+                        decoded = self._decode_result_payload(result)
                     if decoded is not None:
                         result = decoded
                 result = self._normalize_generate_result_if_needed(request_id, result)
@@ -3774,7 +4084,10 @@ class CortexTrainingClient:
                     self._fwd_bwd_request_debug.pop(request_id, None)
                 self._generate_request_ids.discard(request_id)
                 self._forward_request_ids.discard(request_id)
-                raise RuntimeError(f"Request {request_id} ended with state '{state}': {error}")
+                raise _server_failure(
+                    RuntimeError(f"Request {request_id} ended with state '{state}': {error}"),
+                    failed=state == "failed",
+                )
             if received_chunk:
                 # Defensive: if the server returns a chunk without next_cursor
                 # before terminal status, poll again immediately rather than
@@ -3786,7 +4099,9 @@ class CortexTrainingClient:
             self._fwd_bwd_request_debug.pop(request_id, None)
         self._generate_request_ids.discard(request_id)
         self._forward_request_ids.discard(request_id)
-        raise TimeoutError(f"Request {request_id} did not complete within {self.poll_timeout}s")
+        raise _server_failure(
+            TimeoutError(f"Request {request_id} did not complete within {self.poll_timeout}s")
+        )
 
     @_track_operation("get_request_status")
     def get_request_status(
@@ -3809,7 +4124,8 @@ class CortexTrainingClient:
             params=params or None,
             debug_context=debug_context,
         )
-        return self._decode_stream_result_events(resp.json())
+        with _server_payload():
+            return self._decode_stream_result_events(resp.json())
 
     @_track_operation("cancel_request")
     def cancel_request(

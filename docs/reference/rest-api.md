@@ -158,7 +158,8 @@ Raw `torch.save`/pickle is not the current binary protocol. See
 ### 2.4 Snowflake request id
 
 Responses may include `x-snowflake-request-id`. Include it when diagnosing an
-HTTP failure.
+HTTP failure. When the response carries it, the Python client prefixes
+raised HTTP errors with `[snowflake request id: <id>]`.
 
 ---
 
@@ -291,7 +292,7 @@ Paths are relative to the prefix in [section 2.1](#21-base-url).
 |---|---|---|---|
 | `/` | `POST` | `create_job`, `create_job_from_body` | Create a job |
 | `/` | `GET` | `list_jobs` | List jobs, optionally filtered by status |
-| `/capacity` | `GET` | `get_capacity` | Account reservation and GPU usage |
+| `/capacity` | `GET` | `get_capacity`, `get_capacity_breakdown` | Account reservation and GPU usage, optionally broken down |
 | `/{job_id}` | `GET` | `get_job`, `wait_for_job` | Job and sub-job status |
 | `/{job_id}:cancel` | `POST` | `cancel_job` | Cancel a job |
 | `/{job_id}/experiment-run` | `GET` | `get_experiment_run` | Resolve experiment/run metadata |
@@ -529,7 +530,9 @@ creates no database either.
 ### 5.4 Capacity - `GET /capacity`
 
 This account-scoped endpoint takes no account id from the caller. The server
-resolves the account from the authenticated session.
+resolves the account from the authenticated session. Besides `hardware`
+(below), an optional `breakdown` query parameter splits the usage numbers; see
+[Breakdown](#breakdown---breakdown).
 
 Optional query:
 
@@ -592,6 +595,107 @@ service hop fails rather than blocking indefinitely.
 Proto3 JSON may omit false or zero fields, so an account holding nothing under a
 zero ceiling responds with literally `{}`. `get_capacity()` fills in the
 documented defaults for all six keys.
+
+#### Breakdown - `breakdown`
+
+Optional. A comma-separated list of dimensions that split `in_use_gpus` and
+`pending_gpus`:
+
+| Dimension | Splits the usage by |
+|---|---|
+| `job_type` | Sub-job type |
+| `submitted_by` | The user who submitted each job |
+
+Names are case-insensitive; blanks and repeats are ignored. More than 8
+names, or a name not matching `[a-z_]{1,32}`, is HTTP `400`. A well-formed
+name the server does not know is listed in `unsupported_dimensions`. Without
+the parameter the response has no `breakdown` key.
+
+The breakdown is enabled per account. Until it is enabled for yours, each
+requested dimension reports `DISABLED`. Example for `?breakdown=job_type,submitted_by`:
+
+```json
+{
+  "has_reservation": true,
+  "max_total_gpus": 64,
+  "reserved_gpus": 64,
+  "in_use_gpus": 44,
+  "pending_gpus": 16,
+  "available_gpus": 4,
+  "breakdown": {
+    "unsupported_dimensions": [],
+    "job_count": 6,
+    "truncated": false,
+    "by_job_type": {
+      "status": "OK",
+      "groups": [
+        {"job_type": "TRAINING", "in_use_gpus": 28, "pending_gpus": 16,
+         "sub_job_count": 5},
+        {"job_type": "SAMPLING", "in_use_gpus": 16, "pending_gpus": 0,
+         "sub_job_count": 2},
+        {"job_type": "LOG_PROBABILITY", "in_use_gpus": 0, "pending_gpus": 0,
+         "sub_job_count": 0}
+      ]
+    },
+    "by_submitted_by": {
+      "status": "OK",
+      "scope": "SELF",
+      "groups": [
+        {"kind": "USER", "submitted_by": "YOUR_USER", "is_caller": true,
+         "in_use_gpus": 24, "pending_gpus": 0, "job_count": 2},
+        {"kind": "OTHER", "in_use_gpus": 16, "pending_gpus": 16,
+         "job_count": 3},
+        {"kind": "UNATTRIBUTED", "in_use_gpus": 4, "pending_gpus": 0,
+         "job_count": 1}
+      ]
+    }
+  }
+}
+```
+
+- `unsupported_dimensions`: always present, possibly empty.
+- `job_count`: jobs behind `in_use_gpus` and `pending_gpus`, including those
+  holding no GPUs. Present only when a dimension is `OK`.
+- `truncated`: the account had more jobs than the server attributes one by
+  one; the rest count as `UNATTRIBUTED`. Present only when a dimension is `OK`.
+- `by_job_type` / `by_submitted_by`: present only when requested.
+
+Each dimension has a `status`, and `groups`, which is empty unless `OK`.
+Every status comes with HTTP `200` and the six totals unchanged:
+
+| `status` | Meaning |
+|---|---|
+| `OK` | `groups` adds up to `in_use_gpus` and `pending_gpus`. |
+| `DISABLED` | Not enabled for the account. |
+| `UNSUPPORTED` | The service does not support it yet. |
+| `UNAVAILABLE` | Could not be computed for this request. Treat unknown statuses the same way. |
+
+`by_job_type.groups[]`: `TRAINING`, `SAMPLING` and `LOG_PROBABILITY` first,
+then any other type (`UNKNOWN` if the service cannot name it). A job counts
+under each of its sub-jobs' types. `log_probability` sub-jobs and sub-jobs
+that set `multiplex_job_id` add 0 GPUs but count in `sub_job_count`.
+
+`by_submitted_by` carries `scope`, which is set per account: `SELF` names
+only the caller, `VISIBLE` names every submitter of a job the caller can see.
+Each job counts in exactly one group:
+
+| `kind` | Jobs |
+|---|---|
+| `USER` | Submitted by `submitted_by`, and visible to the caller. `is_caller` marks the caller's row. |
+| `OTHER` | Not visible to the caller, plus, with `SELF`, other users' jobs. |
+| `UNATTRIBUTED` | No known submitter: none was recorded, the user no longer exists, or the job is past the `truncated` limit. |
+
+`USER` rows come first, most GPUs (`in_use_gpus + pending_gpus`) first and
+then by name, then `OTHER`, then `UNATTRIBUTED`. Find the caller's row by
+`is_caller`, not position. The breakdown never contains job ids or database
+or schema names.
+
+`get_capacity_breakdown(hardware=None, *, dimensions=("job_type",
+"submitted_by"))` sends this parameter. It fills missing counts with `0`,
+reports a dimension missing from the response (including from a server
+without this parameter) as `UNSUPPORTED`, and always lists the three known
+job types under `OK`. The CLI exposes it as
+[`capacity --breakdown`](cli.md#capacity-breakdown).
 
 ### 5.5 Cancel job - `POST /{job_id}:cancel`
 
@@ -1510,6 +1614,16 @@ and these newer long-context/memory knobs:
   until the service is upgraded. If only some sampling workers lack support, a
   request with a missing row fails exactly as in `"strict"`.
 
+`max_cache_bytes` is the per-worker cap in bytes. The service stores each
+expert id as `uint8` when the model has at most 256 experts and as `uint16`
+when it has 257 to 65536 experts. A `uint16` capture uses twice as many bytes
+as a `uint8` capture for the same sequence length, MoE layer count, and top-k.
+The service does not choose the cap. Derive both the sampling and training
+caps with `cortex_training.router_replay_planner`, which selects that width
+from the expert count and includes it in `CachePlan.max_cache_bytes`. The same
+object can be set on a sampling sub-job through `extra_sampling["router_replay"]`.
+See [python-sdk.md](python-sdk.md#router-replay-capacity-planning).
+
 For LoRA training, set `extra_training["peft_config"]` to a PEFT
 `LoraConfig`-compatible object. It is validated and rewritten client-side, so it
 must specify `peft_type="Lora"` — exactly that spelling, not the `"LORA"` a
@@ -2067,7 +2181,31 @@ reconstruction to `gpu.YYYYMMDD-HHMMSS.UUID.gz` chunks under
 including `resume` and the manifest beside that file.
 
 The reconstructed file contains the JSONL records emitted by the deployed
-training runtime.
+training runtime. Version 2 GPU rows have no `kind` field and include:
+
+| Field | Meaning |
+|---|---|
+| `record_version` | Row schema version; currently `2` |
+| `sub_job_id` | Sub-job that produced the sample |
+| `sample_ts` | RFC3339 UTC scrape time; fractional seconds may use nanosecond precision |
+| `worker_num` | Worker ordinal within the sub-job |
+| `local_gpu_index` | GPU index within one worker; it repeats across workers |
+| `global_gpu_index` | GPU identity within one sub-job; group GPU series by this field |
+| `gpu_uuid` | Device UUID reported by the GPU runtime |
+| `gpu_util_pct` | GPU utilization percentage gauge |
+| `fb_used_bytes` / `fb_free_bytes` | Used and free framebuffer bytes |
+| `power_watts` | Board power gauge |
+| `gpu_temp_c` | GPU temperature gauge |
+| `sm_active_pct` / `sm_occupancy_pct` | Optional SM activity gauges |
+| `tensor_active_pct` / `dram_active_pct` | Optional tensor and DRAM activity gauges |
+| `seq` / `seq_epoch` | Sample sequence and its opaque generation |
+| `sample_interval_s` | Sampling interval in seconds |
+
+One row represents one GPU at one scrape. Gauge values are used as-is rather
+than differenced. JSON `null` means unmeasured and is distinct from `0.0`.
+`global_gpu_index` is unique only inside a sub-job, so consumers loading more
+than one file also group by `sub_job_id`. A future mixed stream can distinguish
+GPU rows with `kind: "gpu"`; consumers should ignore kinds they do not support.
 
 ### 12.5 Zone scheduling events
 
