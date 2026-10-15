@@ -86,13 +86,20 @@ _STALL_CHECK_SECONDS = 300.0
 _STALL_CHECKED_AT: dict[str, float] = {}
 
 
-def _take_stall_check(job_id: str) -> bool:
-    now = time.monotonic()
+def _stall_check_due(job_id: str) -> bool:
     last = _STALL_CHECKED_AT.get(job_id)
-    if last is not None and now - last < _STALL_CHECK_SECONDS:
-        return False
-    _STALL_CHECKED_AT[job_id] = now
-    return True
+    return last is None or time.monotonic() - last >= _STALL_CHECK_SECONDS
+
+
+def _mark_stall_checked(job_id: str) -> None:
+    """Start the quiet window; called only after a refresh that ran the check succeeds."""
+    _STALL_CHECKED_AT[job_id] = time.monotonic()
+
+
+# The client suggests a non-resume download to retry skipped damaged chunks.
+# The TUI always resumes, so point at the CLI command that can do it instead.
+_RESUME_HINT = "download again without resume to retry them"
+_TUI_RESUME_HINT = "retry them with `cortex-training download-log JOB_ID --log-type stdout` (without --resume)"
 
 
 def _result_warnings(results) -> dict[str, list[str]]:
@@ -104,7 +111,7 @@ def _result_warnings(results) -> dict[str, list[str]]:
         sid = row.get("sub_job_id")
         messages = row.get("warnings")
         if isinstance(sid, str) and isinstance(messages, list):
-            texts = [str(m) for m in messages if m]
+            texts = [str(m).replace(_RESUME_HINT, _TUI_RESUME_HINT) for m in messages if m]
             if texts:
                 out.setdefault(sid, []).extend(texts)
     return out
@@ -553,9 +560,11 @@ class LogScreen(Screen):
             if (cached.sub_jobs or cached.ignored_rows_by_sub_job) and not worker.is_cancelled:
                 self._post(self._accept_cached_resource, cached)
             # Omitting stale_after_seconds uses the client's default check.
-            stall_checked = _take_stall_check(self._job_id)
+            stall_checked = _stall_check_due(self._job_id)
             kwargs = {} if stall_checked else {"stale_after_seconds": None}
             results = self._client.download_metrics(self._job_id, self._metrics_root, resume=True, **kwargs)
+            if stall_checked:
+                _mark_stall_checked(self._job_id)
             if not worker.is_cancelled:
                 self._post(
                     self._accept_download_warnings,

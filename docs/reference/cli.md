@@ -741,8 +741,11 @@ file. As in a terminal, a carriage return rewinds the line, so a progress bar
 redrawn with `\r` shows only its final state, and a line longer than 8 KiB
 shows only its end. Warnings from a download (for example skipped damaged
 chunks, or uploads that look stalled while the job runs) appear on the status
-line, and on the Resource tab, for the selected sub-job. The stalled-upload
-check runs on at most one GPU metrics refresh per job every five minutes. A
+line, and on the Resource tab, for the selected sub-job. The TUI always
+resumes, so it keeps a skipped chunk skipped; `download-log` without
+`--resume` retries it. The stalled-upload check runs on at most one GPU
+metrics refresh per job every five minutes (a refresh that fails does not
+count). A
 stream error while the job is still running stays an error. The level key
 filters structured live lines and does not hide lines from that saved console.
 

@@ -2161,3 +2161,57 @@ def test_selected_sub_job_repaints_when_progress_reports_it_done():
         asyncio.run(_run_repaint_on_sub_job_done(release))
     finally:
         release.set()
+
+
+def test_skipped_chunk_hint_points_at_the_cli_not_a_resume_toggle():
+    from cortex_training.tui.app import _result_warnings
+
+    rows = [
+        {
+            "sub_job_id": "7:training:0",
+            "skipped_chunks": ["chunk"],
+            "warnings": [
+                "1 damaged chunk(s) skipped by an earlier download are still missing from the saved file; "
+                "download again without resume to retry them"
+            ],
+        }
+    ]
+    (message,) = _result_warnings(rows)["7:training:0"]
+    assert "without resume to retry" not in message.replace("(without --resume)", "")
+    assert "cortex-training download-log JOB_ID --log-type stdout` (without --resume)" in message
+
+
+async def _run_failed_refresh_keeps_stall_check_due(calls):
+    c = _client()
+
+    class _Downloads:
+        def download_metrics(self, job_id, output_dir, *, resume=False, stale_after_seconds=600, **_kwargs):
+            calls.append(stale_after_seconds)
+            if len(calls) == 1:
+                raise RuntimeError("listing failed")
+            _write_gpu_metrics(output_dir, "7:training:0", gpu_count=1)
+            return []
+
+    c.download_metrics = _Downloads().download_metrics
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(100, 36)) as pilot:
+        ok = await _wait(pilot, app, lambda: app.screen._current_source == "7:training:0")
+        assert ok
+        app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        ok = await _wait(pilot, app, lambda: len(calls) == 1 and not app.screen._resource_loading)
+        assert ok
+        app.screen.action_refresh_sources()
+        ok = await _wait(pilot, app, lambda: len(calls) == 2 and not app.screen._resource_loading)
+        assert ok
+        app.screen.action_refresh_sources()
+        ok = await _wait(pilot, app, lambda: len(calls) == 3 and not app.screen._resource_loading)
+        assert ok
+        await _settle(app, pilot)
+
+
+def test_failed_metrics_refresh_does_not_use_up_the_stall_check():
+    calls = []
+    asyncio.run(_run_failed_refresh_keeps_stall_check_due(calls))
+    # The failed first refresh leaves the check due; the next one runs it and
+    # starts the quiet window.
+    assert calls == [600, 600, None]
