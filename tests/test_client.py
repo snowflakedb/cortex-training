@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import threading
 import time
 from datetime import date
@@ -977,6 +978,8 @@ class TestOperationMetrics:
         "get_capacity_breakdown",
         "get_experiment_run",
         "fetch_execution_logs",
+        "download_stdout_logs",
+        "download_metrics",
         "forward_backward",
         "generate",
         "generate_stream",
@@ -4842,8 +4845,9 @@ class TestExecutionLogDownload:
             self.commands = []
             self.closed = False
             self.close_count = 0
-            self.on_get = on_get
             self.raise_on_close = False
+            # Called with the source URI before a GET writes its file; may block or raise.
+            self.on_get = on_get
 
         class Cursor:
             def __init__(self, connection):
@@ -4864,11 +4868,11 @@ class TestExecutionLogDownload:
                     source_literal, target_literal = statement.removeprefix("GET ").split(" ", 1)
                     source = self._unquote(source_literal)
                     target_uri = self._unquote(target_literal)
+                    if self.connection.on_get is not None:
+                        self.connection.on_get(source)
                     target = Path(unquote(urlparse(target_uri).path))
                     target.mkdir(parents=True, exist_ok=True)
                     assert not list(target.iterdir())
-                    if self.connection.on_get is not None:
-                        self.connection.on_get(source)
                     (target / PurePosixPath(source).name).write_bytes(
                         self.connection.content_by_uri[source]
                     )
@@ -5122,13 +5126,13 @@ class TestExecutionLogDownload:
         )
 
         with pytest.raises(gzip.BadGzipFile):
-            getattr(c, method_name)("job-1", tmp_path)
+            getattr(c, method_name)("job-1", tmp_path, strict=True)
 
         assert destination.read_bytes() == b"previous\n"
         assert not list(destination.parent.glob(".*.tmp"))
         assert connection.closed
 
-    def test_download_metrics_rejects_duplicate_roots_before_get(
+    def test_download_metrics_merges_chunks_from_both_roots_in_time_order(
         self, tmp_path, monkeypatch
     ):
         c = _make_client()
@@ -5136,24 +5140,46 @@ class TestExecutionLogDownload:
         sub_job_id = "job-1:training:0"
         first = f"_metrics/{sub_job_id}/gpu.20260904-120001.first.gz"
         second = f"checkpoints/_metrics/{sub_job_id}/gpu.20260904-120002.second.gz"
+        third = f"_metrics/{sub_job_id}/gpu.20260904-120003.third.gz"
+        both = "gpu.20260904-120004.both.gz"
         connection = self.FakeArtifactConnection(
             {
-                run_uri + "_metrics/": [(f"/versions/RUN_ABC/{first}",)],
-                run_uri + "checkpoints/_metrics/": [
-                    (f"/versions/RUN_ABC/{second}",)
+                run_uri + "_metrics/": [
+                    (f"/versions/RUN_ABC/{first}",),
+                    (f"/versions/RUN_ABC/{third}",),
+                    (f"/versions/RUN_ABC/_metrics/{sub_job_id}/{both}",),
                 ],
-            }
+                run_uri + "checkpoints/_metrics/": [
+                    (f"/versions/RUN_ABC/{second}",),
+                    (f"/versions/RUN_ABC/checkpoints/_metrics/{sub_job_id}/{both}",),
+                ],
+            },
+            {
+                run_uri + first: gzip.compress(b"1\n"),
+                run_uri + second: gzip.compress(b"2\n"),
+                run_uri + third: gzip.compress(b"3\n"),
+                run_uri + f"_metrics/{sub_job_id}/{both}": gzip.compress(b"4\n"),
+                run_uri + f"checkpoints/_metrics/{sub_job_id}/{both}": gzip.compress(b"dup\n"),
+            },
         )
         monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
         monkeypatch.setattr(
             c, "_open_experiment_artifact_connection", lambda: connection
         )
 
-        with pytest.raises(ValueError, match="multiple artifact roots"):
-            c.download_metrics("job-1", tmp_path)
+        result = c.download_metrics("job-1", tmp_path)
 
-        assert not any(command.startswith("GET ") for command in connection.commands)
+        assert (tmp_path / sub_job_id / "gpu.jsonl").read_bytes() == b"1\n2\n3\n4\n"
+        assert result[0]["chunk_count"] == 4
+        assert result[0]["last_artifact_uri"] == run_uri + f"_metrics/{sub_job_id}/{both}"
+        assert "merged in chunk time order" in result[0]["warnings"][0]
         assert connection.closed
+
+        # The merged order is stable, so a resume finds nothing new.
+        gets = [cmd for cmd in connection.commands if cmd.startswith("GET ")]
+        again = c.download_metrics("job-1", tmp_path, resume=True)
+        assert [cmd for cmd in connection.commands if cmd.startswith("GET ")] == gets
+        assert again[0]["chunk_count"] == 4
 
     def _gzip_download(self, monkeypatch, tmp_path, artifact_name, listed, bodies):
         c = _make_client()
@@ -5315,7 +5341,7 @@ class TestExecutionLogDownload:
         connection.list_rows[run_uri + root + "/"].append((f"/versions/RUN_ABC/{bad}",))
         connection.content_by_uri[run_uri + bad] = b"not gzip"
         with pytest.raises(gzip.BadGzipFile):
-            c.download_stdout_logs("job-1", tmp_path, resume=True)
+            c.download_stdout_logs("job-1", tmp_path, resume=True, strict=True)
         assert destination.read_bytes() == b"first\n"
         manifest = json.loads(destination.with_name(".stdout.log.manifest.json").read_text())
         assert manifest["names"] == [first]
@@ -5342,7 +5368,7 @@ class TestExecutionLogDownload:
         monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
         monkeypatch.setattr(c, "_open_experiment_artifact_connection", lambda: connection)
         with pytest.raises(gzip.BadGzipFile):
-            c.download_stdout_logs("job-1", tmp_path)
+            c.download_stdout_logs("job-1", tmp_path, strict=True)
         committed = tmp_path / first_sub / "stdout.log"
         assert committed.read_bytes() == b"ok\n"
         connection.content_by_uri[run_uri + bad] = gzip.compress(b"later\n")
@@ -5353,6 +5379,7 @@ class TestExecutionLogDownload:
         assert (tmp_path / second_sub / "stdout.log").read_bytes() == b"later\n"
 
     def _parallel_stdout(self, monkeypatch, count, *, bodies=None, on_get=None):
+        """One sub-job of ``count`` stdout chunks; every connection opened is recorded."""
         c = _make_client()
         run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
         sub = "job-1:training:0"
@@ -5378,38 +5405,100 @@ class TestExecutionLogDownload:
 
         monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
         monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
-        monkeypatch.setattr(nc, "_ARTIFACT_GET_MIN_CHUNKS", 2)
         return c, opened, run_uri, paths
 
-    def test_parallel_download_overlaps_and_keeps_sorted_order(
+    def test_parallel_download_overlaps_on_one_session_and_keeps_sorted_order(
         self, tmp_path, monkeypatch
     ):
-        started = {"n": 0}
+        workers = 8
+        barrier = threading.Barrier(workers, timeout=5)
+        started = []
         lock = threading.Lock()
-        released = {}
-        workers = nc._ARTIFACT_GET_WORKERS
-
-        def note_release():
-            released["n"] = started["n"]
-
-        barrier = threading.Barrier(workers, action=note_release, timeout=5)
 
         def on_get(_source):
             with lock:
-                started["n"] += 1
-                current = started["n"]
+                started.append(1)
+                current = len(started)
             if current <= workers:
-                barrier.wait()
+                barrier.wait()  # only passes if `workers` GETs run at once
 
-        c, opened, _run_uri, _paths = self._parallel_stdout(
-            monkeypatch, 20, on_get=on_get
-        )
-        c.download_stdout_logs("job-1", tmp_path)
-        assert released["n"] == workers
+        c, opened, _run_uri, _paths = self._parallel_stdout(monkeypatch, 20, on_get=on_get)
+        c.download_stdout_logs("job-1", tmp_path, max_workers=workers)
         expected = b"".join(f"{index}\n".encode() for index in range(20))
         assert (tmp_path / "job-1:training:0" / "stdout.log").read_bytes() == expected
-        assert len(opened) == workers
-        assert [conn.close_count for conn in opened] == [1] * workers
+        # The GETs share one session (one cursor each); nothing else is opened.
+        assert len(opened) == 1
+        assert opened[0].close_count == 1
+
+    def test_parallel_get_failure_keeps_previous_file(self, tmp_path, monkeypatch):
+        def on_get(source):
+            if source.endswith("000001.part.gz"):
+                raise RuntimeError("get failed")
+
+        c, opened, _run_uri, _paths = self._parallel_stdout(monkeypatch, 4, on_get=on_get)
+        destination = tmp_path / "job-1:training:0" / "stdout.log"
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"previous\n")
+        with pytest.raises(RuntimeError, match="get failed"):
+            c.download_stdout_logs("job-1", tmp_path)
+        assert destination.read_bytes() == b"previous\n"
+        assert [conn.close_count for conn in opened] == [1]
+
+    def test_parallel_bad_gzip_on_resume_keeps_committed_chunks(self, tmp_path, monkeypatch):
+        c, opened, run_uri, paths = self._parallel_stdout(monkeypatch, 1)
+        c.download_stdout_logs("job-1", tmp_path)
+        destination = tmp_path / "job-1:training:0" / "stdout.log"
+        committed = destination.read_bytes()
+        manifest = destination.with_name(".stdout.log.manifest.json")
+        names = json.loads(manifest.read_text())["names"]
+        later = [
+            f"_stdout/job-1:training:0/console.20260904-{index:06d}.part.gz" for index in (1, 2)
+        ]
+        opened[0].content_by_uri[run_uri + later[0]] = gzip.compress(b"new\n")
+        opened[0].content_by_uri[run_uri + later[1]] = b"not gzip"
+        opened[0].list_rows[run_uri + "_stdout/"].extend(
+            (f"/versions/RUN_ABC/{path}",) for path in later
+        )
+        with pytest.raises(gzip.BadGzipFile):
+            c.download_stdout_logs("job-1", tmp_path, resume=True, strict=True)
+        # The chunk appended before the damaged one is kept and recorded.
+        assert destination.read_bytes() == committed + b"new\n"
+        assert json.loads(manifest.read_text())["names"] == names + later[:1]
+        assert [conn.close_count for conn in opened] == [1, 1]
+
+    def test_close_failure_does_not_fail_the_download(self, tmp_path, monkeypatch, caplog):
+        c, opened, _run_uri, _paths = self._parallel_stdout(monkeypatch, 3)
+        real_opener = c._open_experiment_artifact_connection
+
+        def opener():
+            conn = real_opener()
+            conn.raise_on_close = True
+            return conn
+
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
+        with caplog.at_level(logging.WARNING):
+            c.download_stdout_logs("job-1", tmp_path)
+        assert (tmp_path / "job-1:training:0" / "stdout.log").read_bytes() == b"0\n1\n2\n"
+        assert [conn.close_count for conn in opened] == [1]
+        assert "could not close the artifact download session" in caplog.text
+
+    def test_get_error_survives_a_close_error(self, tmp_path, monkeypatch):
+        def on_get(source):
+            if source.endswith("000001.part.gz"):
+                raise RuntimeError("get failed")
+
+        c, opened, _run_uri, _paths = self._parallel_stdout(monkeypatch, 3, on_get=on_get)
+        real_opener = c._open_experiment_artifact_connection
+
+        def opener():
+            conn = real_opener()
+            conn.raise_on_close = True
+            return conn
+
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
+        with pytest.raises(RuntimeError, match="get failed"):
+            c.download_stdout_logs("job-1", tmp_path)
+        assert [conn.close_count for conn in opened] == [1]
 
     def test_parallel_progress_reports_on_caller_after_each_copy(
         self, tmp_path, monkeypatch
@@ -5418,13 +5507,13 @@ class TestExecutionLogDownload:
         sub = "job-1:training:0"
         caller = threading.get_ident()
         copied = []
-        real_copy = c._copy_gzip_member
+        real_copy = nc._artifact_download.copy_gzip_member
 
-        def copy(downloaded, output):
-            real_copy(downloaded, output)
+        def copy(downloaded, output, buffer_bytes):
+            real_copy(downloaded, output, buffer_bytes)
             copied.append(output.tell())
 
-        c._copy_gzip_member = copy
+        monkeypatch.setattr(nc._artifact_download, "copy_gzip_member", copy)
         calls = []
 
         def progress(message):
@@ -5436,7 +5525,7 @@ class TestExecutionLogDownload:
             assert len(copied) == done
 
         c.download_stdout_logs("job-1", tmp_path, progress=progress)
-        assert len(opened) > 1
+        assert len(opened) == 1  # one session shared by the concurrent GETs
         status = c._artifact_progress_status
         assert calls == [status("stdout", index, 20, sub) for index in range(21)] + ["\n"]
         expected = b"".join(f"{index}\n".encode() for index in range(20))
@@ -5479,250 +5568,15 @@ class TestExecutionLogDownload:
             c.download_stdout_logs("job-1", tmp_path, resume=True, progress=stop)
         assert calls[0] == c._artifact_progress_status("stdout", 0, 4, sub)
         assert calls[-1] == "\n"
-        assert destination.read_bytes() == committed
-        assert manifest.read_text(encoding="utf-8") == manifest_before
+        # Stopping at "2/4" keeps the two chunks already appended for a resume.
+        assert destination.read_bytes() == committed + b"4\n5\n"
+        names = json.loads(manifest_before)["names"]
+        assert json.loads(manifest.read_text(encoding="utf-8"))["names"] == names + [
+            f"_stdout/{sub}/console.20260904-{index:06d}.part.gz" for index in (4, 5)
+        ]
         resume_connections = opened[before:]
         assert resume_connections
         assert [conn.close_count for conn in resume_connections] == [1] * len(resume_connections)
-
-    def test_parallel_download_stays_serial_when_opener_returns_one_connection(
-        self, tmp_path, monkeypatch
-    ):
-        inflight = {"n": 0, "max": 0}
-        lock = threading.Lock()
-
-        def on_get(source):
-            with lock:
-                inflight["n"] += 1
-                inflight["max"] = max(inflight["max"], inflight["n"])
-            try:
-                if source.endswith("000000.part.gz"):
-                    time.sleep(0.2)
-            finally:
-                with lock:
-                    inflight["n"] -= 1
-
-        c, _opened, _run_uri, paths = self._parallel_stdout(
-            monkeypatch, 4, on_get=on_get
-        )
-        primary = self.FakeArtifactConnection(
-            {
-                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/_stdout/": [
-                    (f"/versions/RUN_ABC/{path}",) for path in paths
-                ],
-                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_stdout/": [],
-            },
-            {
-                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/" + path: gzip.compress(
-                    f"{index}\n".encode()
-                )
-                for index, path in enumerate(paths)
-            },
-            on_get=on_get,
-        )
-        monkeypatch.setattr(
-            c, "_open_experiment_artifact_connection", lambda: primary
-        )
-        c.download_stdout_logs("job-1", tmp_path)
-        assert inflight["max"] == 1
-        assert primary.close_count == 1
-        assert primary.closed
-        assert (tmp_path / "job-1:training:0" / "stdout.log").read_bytes() == b"0\n1\n2\n3\n"
-
-    def test_parallel_get_failure_keeps_previous_file(self, tmp_path, monkeypatch):
-        def on_get(source):
-            if source.endswith("000001.part.gz"):
-                raise RuntimeError("get failed")
-
-        c, opened, _run_uri, _paths = self._parallel_stdout(
-            monkeypatch, 4, on_get=on_get
-        )
-        destination = tmp_path / "job-1:training:0" / "stdout.log"
-        destination.parent.mkdir(parents=True)
-        destination.write_bytes(b"previous\n")
-        with pytest.raises(RuntimeError, match="get failed"):
-            c.download_stdout_logs("job-1", tmp_path)
-        assert destination.read_bytes() == b"previous\n"
-        assert opened
-        assert [conn.close_count for conn in opened] == [1] * len(opened)
-
-    def test_parallel_bad_gzip_on_resume_keeps_committed_prefix(
-        self, tmp_path, monkeypatch
-    ):
-        c, opened, run_uri, paths = self._parallel_stdout(monkeypatch, 1)
-        c.download_stdout_logs("job-1", tmp_path)
-        destination = tmp_path / "job-1:training:0" / "stdout.log"
-        committed = destination.read_bytes()
-        manifest = destination.with_name(".stdout.log.manifest.json")
-        names = json.loads(manifest.read_text())["names"]
-        later = [
-            f"_stdout/job-1:training:0/console.20260904-{index:06d}.part.gz"
-            for index in (1, 2)
-        ]
-        bodies = opened[0].content_by_uri
-        bodies[run_uri + later[0]] = gzip.compress(b"new\n")
-        bodies[run_uri + later[1]] = b"not gzip"
-        listed = opened[0].list_rows[run_uri + "_stdout/"]
-        listed.extend((f"/versions/RUN_ABC/{path}",) for path in later)
-        resume_opened = []
-
-        def opener():
-            conn = self.FakeArtifactConnection(
-                opened[0].list_rows, bodies
-            )
-            resume_opened.append(conn)
-            return conn
-
-        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
-        with pytest.raises(gzip.BadGzipFile):
-            c.download_stdout_logs("job-1", tmp_path, resume=True)
-        assert destination.read_bytes() == committed
-        assert json.loads(manifest.read_text())["names"] == names
-        assert len(resume_opened) > 1
-        assert [conn.close_count for conn in resume_opened] == [1] * len(resume_opened)
-
-    def test_parallel_download_continues_when_a_later_session_open_fails(
-        self, tmp_path, monkeypatch, caplog
-    ):
-        c, _opened, _run_uri, paths = self._parallel_stdout(monkeypatch, 3)
-        created = []
-
-        def opener():
-            if len(created) >= 2:
-                raise RuntimeError("open failed")
-            conn = self.FakeArtifactConnection(
-                {
-                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/_stdout/": [
-                        (f"/versions/RUN_ABC/{path}",) for path in paths
-                    ],
-                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_stdout/": [],
-                },
-                {
-                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/" + path: gzip.compress(
-                        f"{index}\n".encode()
-                    )
-                    for index, path in enumerate(paths)
-                },
-            )
-            created.append(conn)
-            return conn
-
-        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
-        with caplog.at_level(logging.WARNING, logger=nc.__name__):
-            c.download_stdout_logs("job-1", tmp_path)
-        assert (tmp_path / "job-1:training:0" / "stdout.log").read_bytes() == b"0\n1\n2\n"
-        assert len(created) == 2
-        assert [conn.close_count for conn in created] == [1, 1]
-
-    def test_parallel_download_warns_when_the_first_extra_session_fails(
-        self, tmp_path, monkeypatch, caplog
-    ):
-        c, _opened, _run_uri, paths = self._parallel_stdout(monkeypatch, 3)
-        primary = self.FakeArtifactConnection(
-            {
-                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/_stdout/": [
-                    (f"/versions/RUN_ABC/{path}",) for path in paths
-                ],
-                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_stdout/": [],
-            },
-            {
-                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/" + path: gzip.compress(
-                    f"{index}\n".encode()
-                )
-                for index, path in enumerate(paths)
-            },
-        )
-        calls = {"n": 0}
-
-        def opener():
-            calls["n"] += 1
-            if calls["n"] > 1:
-                raise RuntimeError("open failed")
-            return primary
-
-        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
-        with caplog.at_level(logging.WARNING, logger=nc.__name__):
-            c.download_stdout_logs("job-1", tmp_path)
-        assert any(
-            "could not open an extra session" in record.message
-            for record in caplog.records
-        )
-        assert primary.close_count == 1
-        assert (tmp_path / "job-1:training:0" / "stdout.log").read_bytes() == b"0\n1\n2\n"
-
-    def test_parallel_close_failure_does_not_fail_the_download(
-        self, tmp_path, monkeypatch, caplog
-    ):
-        c, _opened, _run_uri, paths = self._parallel_stdout(monkeypatch, 3)
-        created = []
-
-        def opener():
-            conn = self.FakeArtifactConnection(
-                {
-                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/_stdout/": [
-                        (f"/versions/RUN_ABC/{path}",) for path in paths
-                    ],
-                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_stdout/": [],
-                },
-                {
-                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/" + path: gzip.compress(
-                        f"{index}\n".encode()
-                    )
-                    for index, path in enumerate(paths)
-                },
-            )
-            if len(created) == 1:
-                conn.raise_on_close = True
-            created.append(conn)
-            return conn
-
-        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
-        with caplog.at_level(logging.WARNING, logger=nc.__name__):
-            c.download_stdout_logs("job-1", tmp_path)
-        assert (tmp_path / "job-1:training:0" / "stdout.log").read_bytes() == b"0\n1\n2\n"
-        assert [conn.close_count for conn in created] == [1, 1, 1]
-        assert any("failed to close" in record.message for record in caplog.records)
-
-    def test_parallel_get_error_survives_a_close_error(self, tmp_path, monkeypatch):
-        def on_get(source):
-            if source.endswith("000001.part.gz"):
-                raise RuntimeError("get failed")
-
-        c, _opened, _run_uri, paths = self._parallel_stdout(
-            monkeypatch, 3, on_get=on_get
-        )
-        created = []
-
-        def opener():
-            conn = self.FakeArtifactConnection(
-                {
-                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/_stdout/": [
-                        (f"/versions/RUN_ABC/{path}",) for path in paths
-                    ],
-                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_stdout/": [],
-                },
-                {
-                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/" + path: gzip.compress(
-                        f"{index}\n".encode()
-                    )
-                    for index, path in enumerate(paths)
-                },
-                on_get=on_get,
-            )
-            if created:
-                conn.raise_on_close = True
-            created.append(conn)
-            return conn
-
-        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
-        with pytest.raises(RuntimeError, match="get failed"):
-            c.download_stdout_logs("job-1", tmp_path)
-        assert [conn.close_count for conn in created] == [1] * len(created)
-
-    def test_fetch_execution_logs_errors_when_experiment_run_missing_fields(self):
-        c = _make_client(get_json={"experiment_name": "DB.SCH.EXP"})
-        with pytest.raises(ValueError, match="experiment_run_name"):
-            c.fetch_execution_logs("job-1")
 
     @pytest.mark.parametrize(
         ("artifact_name", "chunk_name", "destination_name", "method_name"),
@@ -5911,11 +5765,14 @@ class TestExecutionLogDownload:
         connection.content_by_uri[run_uri + names[2]] = b"not gzip"
         calls = []
         with pytest.raises(gzip.BadGzipFile):
-            c.download_metrics("job-1", tmp_path, resume=True, progress=calls.append)
+            c.download_metrics(
+                "job-1", tmp_path, resume=True, progress=calls.append, strict=True
+            )
         assert c._artifact_progress_status("metrics", 1, 2, sub) in calls
         assert c._artifact_progress_status("metrics", 2, 2, sub) not in calls
         assert calls[-1] == "\n"
-        assert destination.read_bytes() == committed
+        # The chunk appended before the damaged one is kept for a resume.
+        assert destination.read_bytes() == committed + b"b\n"
 
         connection.content_by_uri[run_uri + names[2]] = gzip.compress(b"c\n")
 
@@ -5924,11 +5781,21 @@ class TestExecutionLogDownload:
             if " 2/" in message:
                 raise RuntimeError("stop")
 
+        def stop_on_first(message):
+            calls.append(message)
+            if " 1/" in message:
+                raise RuntimeError("stop")
+
         calls.clear()
         with pytest.raises(RuntimeError, match="stop"):
-            c.download_metrics("job-1", tmp_path, resume=True, progress=stop_on_second)
+            c.download_metrics("job-1", tmp_path, resume=True, progress=stop_on_first)
         assert calls[-1] == "\n"
-        assert destination.read_bytes() == committed
+        # The callback stops the download after the chunk it reports; that chunk
+        # stays committed and a resume has nothing left to fetch.
+        assert destination.read_bytes() == committed + b"b\nc\n"
+        calls.clear()
+        c.download_metrics("job-1", tmp_path, resume=True, progress=calls.append)
+        assert calls == [f"metrics: no new chunks for {sub}\n"]
 
         fresh = tmp_path / "fresh"
         calls.clear()
@@ -6037,13 +5904,16 @@ class TestExecutionLogDownload:
         connection.content_by_uri[run_uri + later] = gzip.compress(b"later\n")
         connection.content_by_uri[run_uri + bad] = b"not gzip"
         with pytest.raises(gzip.BadGzipFile):
-            c.download_stdout_logs("job-1", tmp_path, resume=True, progress=fail_on_newline)
-        assert seen == [(b"good\n", [])]
-        assert destination.read_bytes() == b"good\n"
+            c.download_stdout_logs(
+                "job-1", tmp_path, resume=True, progress=fail_on_newline, strict=True
+            )
+        # The line closes after the chunks before the damaged one are saved.
+        assert seen == [(b"good\nlater\n", [])]
+        assert destination.read_bytes() == b"good\nlater\n"
 
         seen.clear()
         with pytest.raises(gzip.BadGzipFile):
-            c.download_stdout_logs("job-1", fresh, progress=fail_on_newline)
+            c.download_stdout_logs("job-1", fresh, progress=fail_on_newline, strict=True)
         assert [fresh_temps for _bytes, fresh_temps in seen] == [[]]
         assert not list((fresh / sub).glob(".*.tmp"))
         assert not (fresh / sub / "stdout.log").exists()
@@ -6058,7 +5928,7 @@ class TestExecutionLogDownload:
         def interrupt(*_args):
             raise KeyboardInterrupt
 
-        monkeypatch.setattr(c, "_download_gzip_member", interrupt)
+        monkeypatch.setattr(c, "_fetch_artifact_chunk", interrupt)
         calls = []
         with pytest.raises(KeyboardInterrupt):
             c.download_stdout_logs("job-1", tmp_path, progress=calls.append)
@@ -6134,7 +6004,7 @@ class TestExecutionLogDownload:
         destination.write_bytes(b"previous\n")
         calls = []
         with pytest.raises(gzip.BadGzipFile):
-            c.download_stdout_logs("job-1", tmp_path, progress=calls.append)
+            c.download_stdout_logs("job-1", tmp_path, progress=calls.append, strict=True)
         assert c._artifact_progress_status("stdout", 1, 2, sub) in calls
         assert c._artifact_progress_status("stdout", 2, 2, sub) not in calls
         assert calls[-1] == "\n"
@@ -6161,6 +6031,1288 @@ class TestExecutionLogDownload:
         assert calls[0] == c._artifact_progress_status("metrics", 0, 2, sub)
         assert calls.count(calls[0]) == 1
         assert destination.read_bytes() == b"a\nb\n"
+
+    def test_fetch_execution_logs_errors_when_experiment_run_missing_fields(self):
+        c = _make_client(get_json={"experiment_name": "DB.SCH.EXP"})
+        with pytest.raises(ValueError, match="experiment_run_name"):
+            c.fetch_execution_logs("job-1")
+
+
+class TestChunkedArtifactDownload:
+    """Parallel fetch, ordered commit, retries, and durable progress."""
+
+    RUN_URI = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+    SUB = "job-1:training:0"
+
+    def _setup(self, monkeypatch, *, subs=None, count=6, artifact_name="stdout"):
+        subs = subs or [self.SUB]
+        root = f"_{artifact_name}"
+        chunk_name = "console" if artifact_name == "stdout" else "gpu"
+        paths = {
+            sub: [
+                f"{root}/{sub}/{chunk_name}.20260904-"
+                f"{12 + index // 3600:02d}{index // 60 % 60:02d}{index % 60:02d}.c{index:04d}.gz"
+                for index in range(count)
+            ]
+            for sub in subs
+        }
+        connection = TestExecutionLogDownload.FakeArtifactConnection(
+            {
+                self.RUN_URI + root + "/": [
+                    (f"/versions/RUN_ABC/{path}",) for sub in subs for path in reversed(paths[sub])
+                ],
+                self.RUN_URI + "checkpoints/" + root + "/": [],
+            },
+            {
+                self.RUN_URI + path: gzip.compress(f"{sub} line {index}\n".encode())
+                for sub in subs
+                for index, path in enumerate(paths[sub])
+            },
+        )
+        c = _make_client()
+        sleeps = []
+        c._artifact_retry_policy = nc._artifact_download.RetryPolicy(sleep=sleeps.append)
+        opened = []
+
+        def open_connection():
+            opened.append(connection)
+            return connection
+
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (self.RUN_URI, "RUN_ABC"))
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", open_connection)
+        return c, connection, paths, sleeps, opened
+
+    @staticmethod
+    def _expected(sub, indexes):
+        return "".join(f"{sub} line {index}\n" for index in indexes).encode()
+
+    @staticmethod
+    def _settle(timeout=5.0):
+        """Wait for workers a cancelled download abandoned (it does not join them)."""
+        deadline = time.monotonic() + timeout
+        while any(t.name.startswith("cortex-training-download") for t in threading.enumerate()):
+            assert time.monotonic() < deadline, "download workers kept running"
+            time.sleep(0.01)
+
+    @staticmethod
+    def _gets(connection, needle=""):
+        return [cmd for cmd in connection.commands if cmd.startswith("GET ") and needle in cmd]
+
+    def test_out_of_order_completion_commits_in_sorted_order(self, tmp_path, monkeypatch):
+        subs = [self.SUB, "job-1:training:1"]
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, subs=subs, count=3)
+        first = self.RUN_URI + paths[self.SUB][0]
+        last = self.RUN_URI + paths[subs[1]][-1]
+        last_done = threading.Event()
+        finished = []
+        lock = threading.Lock()
+
+        def on_get(source):
+            if source == first:
+                # The first chunk completes only after the very last one has.
+                assert last_done.wait(5)
+            with lock:
+                finished.append(source)
+            if source == last:
+                last_done.set()
+
+        connection.on_get = on_get
+        result = c.download_stdout_logs("job-1", tmp_path, max_workers=6)
+
+        assert finished.index(last) < finished.index(first)
+        for sub in subs:
+            assert (tmp_path / sub / "stdout.log").read_bytes() == self._expected(sub, range(3))
+            manifest = json.loads((tmp_path / sub / ".stdout.log.manifest.json").read_text())
+            assert manifest["names"] == paths[sub]
+            assert manifest["bytes"] == (tmp_path / sub / "stdout.log").stat().st_size
+        assert [entry["sub_job_id"] for entry in result] == subs
+        assert not list((tmp_path / self.SUB).glob(".*.partial*"))
+        assert connection.closed
+
+    def test_get_targets_are_raw_paths_without_percent_encoding(self, tmp_path, monkeypatch):
+        c, connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=2)
+        c.download_stdout_logs("job-1", tmp_path, max_workers=2)
+        for command in self._gets(connection):
+            target = command.rsplit(" ", 1)[1]
+            assert target.startswith("'file:///") and "%" not in target and ":" not in target[8:]
+
+    def test_fetch_window_bounds_chunks_held_ahead_of_the_writer(self, tmp_path, monkeypatch):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=8)
+        monkeypatch.setattr(c, "_DOWNLOAD_WINDOW_PER_WORKER", 1)
+        first = self.RUN_URI + paths[self.SUB][0]
+        started_while_first_blocked = []
+
+        def on_get(source):
+            if source == first:
+                time.sleep(0.3)
+                started_while_first_blocked.append(len(self._gets(connection)))
+
+        connection.on_get = on_get
+        c.download_stdout_logs("job-1", tmp_path, max_workers=2)
+
+        # Two workers with a window of two: only the blocked chunk and one more.
+        assert started_while_first_blocked == [2]
+        assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(self.SUB, range(8))
+
+    def test_transient_get_failure_is_retried(self, tmp_path, monkeypatch):
+        errors = importlib.import_module("snowflake.connector.errors")
+        c, connection, paths, sleeps, _opened = self._setup(monkeypatch, count=4)
+        flaky = self.RUN_URI + paths[self.SUB][2]
+        failures = [errors.OperationalError(msg="connection reset"), ConnectionResetError("reset")]
+
+        def on_get(source):
+            if source == flaky and failures:
+                raise failures.pop(0)
+
+        connection.on_get = on_get
+        c.download_stdout_logs("job-1", tmp_path)
+
+        assert len(sleeps) == 2
+        assert len(self._gets(connection, flaky)) == 3
+        assert len(self._gets(connection)) == 6
+        assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(self.SUB, range(4))
+
+    def test_transient_list_failure_is_retried(self, tmp_path, monkeypatch):
+        errors = importlib.import_module("snowflake.connector.errors")
+        c, connection, _paths, sleeps, _opened = self._setup(monkeypatch, count=2)
+        cursor_cls = connection.Cursor
+        failures = [errors.ServiceUnavailableError(msg="503")]
+
+        class FlakyCursor(cursor_cls):
+            def execute(self, statement):
+                if statement.startswith("LIST ") and failures:
+                    raise failures.pop(0)
+                return super().execute(statement)
+
+        monkeypatch.setattr(connection, "cursor", lambda: FlakyCursor(connection))
+        c.download_stdout_logs("job-1", tmp_path)
+
+        assert len(sleeps) == 1
+        assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(self.SUB, range(2))
+
+    def test_expired_session_reopens_the_connection(self, tmp_path, monkeypatch):
+        errors = importlib.import_module("snowflake.connector.errors")
+        c, connection, paths, sleeps, opened = self._setup(monkeypatch, count=3)
+        target = self.RUN_URI + paths[self.SUB][1]
+        failures = [errors.ProgrammingError(msg="token expired", errno=390114)]
+
+        def on_get(source):
+            if source == target and failures:
+                raise failures.pop(0)
+
+        connection.on_get = on_get
+        c.download_stdout_logs("job-1", tmp_path)
+
+        assert len(opened) == 2
+        assert len(sleeps) == 1
+        assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(self.SUB, range(3))
+
+    def test_permanent_error_fails_fast_and_keeps_committed_chunks(self, tmp_path, monkeypatch):
+        errors = importlib.import_module("snowflake.connector.errors")
+        c, connection, paths, sleeps, _opened = self._setup(monkeypatch, count=5)
+        denied = self.RUN_URI + paths[self.SUB][3]
+
+        def on_get(source):
+            if source == denied:
+                raise errors.ProgrammingError(msg="not authorized", errno=2003)
+
+        connection.on_get = on_get
+        with pytest.raises(errors.ProgrammingError, match="not authorized"):
+            c.download_stdout_logs("job-1", tmp_path, max_workers=1)
+        self._settle()
+
+        assert sleeps == []
+        assert len(self._gets(connection, denied)) == 1
+        destination = tmp_path / self.SUB / "stdout.log"
+        assert not destination.exists()
+        partial = tmp_path / self.SUB / ".stdout.log.partial"
+        assert partial.read_bytes() == self._expected(self.SUB, range(3))
+        manifest = json.loads((tmp_path / self.SUB / ".stdout.log.partial.manifest.json").read_text())
+        assert manifest == {"bytes": partial.stat().st_size, "names": paths[self.SUB][:3], "version": 1}
+
+    def test_retries_are_bounded(self, tmp_path, monkeypatch):
+        errors = importlib.import_module("snowflake.connector.errors")
+        c, connection, paths, sleeps, _opened = self._setup(monkeypatch, count=2)
+        broken = self.RUN_URI + paths[self.SUB][0]
+
+        def on_get(source):
+            if source == broken:
+                raise errors.OperationalError(msg="network down")
+
+        connection.on_get = on_get
+        with pytest.raises(errors.OperationalError):
+            c.download_stdout_logs("job-1", tmp_path)
+        self._settle()
+
+        attempts = c._artifact_retry_policy.attempts
+        assert len(self._gets(connection, broken)) == attempts
+        assert len(sleeps) == attempts - 1
+
+    @pytest.mark.parametrize(
+        ("artifact_name", "method_name", "destination_name"),
+        [("stdout", "download_stdout_logs", "stdout.log"), ("metrics", "download_metrics", "gpu.jsonl")],
+    )
+    def test_interrupted_first_download_resumes_from_saved_chunks(
+        self, artifact_name, method_name, destination_name, tmp_path, monkeypatch
+    ):
+        c, connection, paths, _sleeps, _opened = self._setup(
+            monkeypatch, count=8, artifact_name=artifact_name
+        )
+        chunks = paths[self.SUB]
+        interrupt_at = self.RUN_URI + chunks[5]
+        interrupt = [True]
+
+        def on_get(source):
+            if source == interrupt_at and interrupt:
+                interrupt.clear()
+                raise KeyboardInterrupt
+
+        connection.on_get = on_get
+        download = getattr(c, method_name)
+        with pytest.raises(KeyboardInterrupt):
+            download("job-1", tmp_path, max_workers=3)
+        self._settle()
+
+        destination = tmp_path / self.SUB / destination_name
+        assert not destination.exists()
+        partial_manifest = json.loads(
+            (tmp_path / self.SUB / f".{destination_name}.partial.manifest.json").read_text()
+        )
+        assert partial_manifest["names"] == chunks[:5]
+
+        gets_before = len(self._gets(connection))
+        download("job-1", tmp_path, resume=True, max_workers=3)
+        resumed = self._gets(connection)[gets_before:]
+
+        assert sorted(cmd.split(" ")[1].strip("'") for cmd in resumed) == [
+            self.RUN_URI + path for path in chunks[5:]
+        ]
+        assert destination.read_bytes() == self._expected(self.SUB, range(8))
+        manifest = json.loads((tmp_path / self.SUB / f".{destination_name}.manifest.json").read_text())
+        assert manifest == {"bytes": destination.stat().st_size, "names": chunks, "version": 1}
+        assert not list((tmp_path / self.SUB).glob(f".{destination_name}.partial*"))
+
+    def test_periodic_checkpoint_survives_a_hard_kill(self, tmp_path, monkeypatch):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=7)
+        chunks = paths[self.SUB]
+        monkeypatch.setattr(c, "_DOWNLOAD_CHECKPOINT_CHUNKS", 2)
+        monkeypatch.setattr(c, "_DOWNLOAD_CHECKPOINT_SECONDS", 3600.0)
+        monkeypatch.setattr(c, "_DOWNLOAD_WINDOW_PER_WORKER", 1)
+        partial = tmp_path / self.SUB / ".stdout.log.partial"
+        partial_manifest = tmp_path / self.SUB / ".stdout.log.partial.manifest.json"
+        seen = {}
+        killed = [True]
+
+        def on_get(source):
+            if source == self.RUN_URI + chunks[4]:
+                seen["manifest"] = json.loads(partial_manifest.read_text())
+                seen["size"] = partial.stat().st_size
+            if source == self.RUN_URI + chunks[5] and killed:
+                killed.clear()
+                raise SystemExit("killed")
+
+        # A hard kill runs no cleanup: the file keeps whatever was written and
+        # the manifest stays at the last checkpoint.
+        def no_cleanup(writer):
+            writer._output.close()
+
+        monkeypatch.setattr(nc._artifact_download.ChunkWriter, "abort", no_cleanup)
+        connection.on_get = on_get
+        with pytest.raises(SystemExit):
+            c.download_stdout_logs("job-1", tmp_path, max_workers=1)
+        self._settle()
+
+        assert seen["manifest"]["names"] == chunks[:4]
+        assert seen["manifest"]["bytes"] <= seen["size"]
+        assert json.loads(partial_manifest.read_text())["names"] == chunks[:4]
+        assert partial.stat().st_size > seen["manifest"]["bytes"]
+
+        gets_before = len(self._gets(connection))
+        c.download_stdout_logs("job-1", tmp_path, resume=True, max_workers=1)
+        assert len(self._gets(connection)) - gets_before == 3
+        destination = tmp_path / self.SUB / "stdout.log"
+        assert destination.read_bytes() == self._expected(self.SUB, range(7))
+
+    def test_non_resume_run_restarts_an_interrupted_download(self, tmp_path, monkeypatch):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=4)
+        target = self.RUN_URI + paths[self.SUB][2]
+        interrupt = [True]
+
+        def on_get(source):
+            if source == target and interrupt:
+                interrupt.clear()
+                raise KeyboardInterrupt
+
+        connection.on_get = on_get
+        with pytest.raises(KeyboardInterrupt):
+            c.download_stdout_logs("job-1", tmp_path, max_workers=1)
+        self._settle()
+        gets_before = len(self._gets(connection))
+        c.download_stdout_logs("job-1", tmp_path, max_workers=1)
+        assert len(self._gets(connection)) - gets_before == 4
+        assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(self.SUB, range(4))
+
+    def test_resume_appends_to_completed_file_and_drops_stale_partial(self, tmp_path, monkeypatch):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=5)
+        chunks = paths[self.SUB]
+        listing = connection.list_rows[self.RUN_URI + "_stdout/"]
+        connection.list_rows[self.RUN_URI + "_stdout/"] = [
+            row for row in listing if row[0].removeprefix("/versions/RUN_ABC/") in chunks[:3]
+        ]
+        c.download_stdout_logs("job-1", tmp_path)
+        directory = tmp_path / self.SUB
+        (directory / ".stdout.log.partial").write_bytes(b"stale")
+        (directory / ".stdout.log.partial.manifest.json").write_text(
+            json.dumps({"bytes": 5, "names": chunks[:1], "version": 1})
+        )
+        connection.list_rows[self.RUN_URI + "_stdout/"] = listing
+        gets_before = len(self._gets(connection))
+
+        c.download_stdout_logs("job-1", tmp_path, resume=True)
+
+        assert len(self._gets(connection)) - gets_before == 2
+        assert (directory / "stdout.log").read_bytes() == self._expected(self.SUB, range(5))
+        assert not list(directory.glob(".stdout.log.partial*"))
+
+    def test_leftover_temp_files_are_removed(self, tmp_path, monkeypatch, caplog):
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=2)
+        directory = tmp_path / self.SUB
+        directory.mkdir(parents=True)
+        removed = [
+            directory / ".stdout-abc123.tmp",
+            directory / ".stdout.log.manifest-xyz.tmp",
+            directory / ".stdout.log.partial.manifest-xyz.tmp",
+            directory / ".manifest-old.tmp",
+        ]
+        kept = [
+            # Recently written: may belong to a download still running here.
+            directory / ".manifest-recent.tmp",
+            directory / ".stdout-recent.tmp",
+            directory / ".stdout.log.manifest-recent.tmp",
+            # Not ours to remove.
+            directory / ".gpu-metrics-abc.tmp",
+            directory / ".gpu.jsonl.manifest-abc.tmp",
+            directory / "notes.tmp",
+        ]
+        for path in removed + kept:
+            path.write_bytes(b"x")
+        old = time.time() - 2 * c._TEMP_ORPHAN_MIN_AGE_SECONDS
+        for path in removed + kept[3:]:
+            os.utime(path, (old, old))
+
+        with caplog.at_level(logging.DEBUG):
+            c.download_stdout_logs("job-1", tmp_path)
+
+        assert [path for path in removed if path.exists()] == []
+        assert caplog.text.count("removed leftover temporary file") == len(removed)
+        assert "could not remove leftover temporary file" not in caplog.text
+        assert all(path.exists() for path in kept)
+        assert (directory / "stdout.log").read_bytes() == self._expected(self.SUB, range(2))
+
+    def test_on_chunk_reports_each_committed_chunk(self, tmp_path, monkeypatch):
+        subs = [self.SUB, "job-1:training:1"]
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, subs=subs, count=3)
+        calls = []
+        c.download_stdout_logs(
+            "job-1", tmp_path, on_chunk=lambda *args: calls.append(args), max_workers=4
+        )
+        for sub in subs:
+            mine = [call for call in calls if call[0] == sub]
+            assert [call[1] for call in mine] == [0, 1, 2, 3]
+            assert {call[2] for call in mine} == {3}
+            assert mine[0][3] == 0
+            assert mine[-1][3] == (tmp_path / sub / "stdout.log").stat().st_size
+        assert calls[0][0] == self.SUB and calls[-1][0] == subs[1]
+
+    def test_sub_job_filter_downloads_only_selected(self, tmp_path, monkeypatch):
+        subs = [self.SUB, "job-1:training:1"]
+        c, connection, _paths, _sleeps, _opened = self._setup(monkeypatch, subs=subs, count=2)
+        result = c.download_stdout_logs("job-1", tmp_path, sub_job_ids=[subs[1]])
+        assert [entry["sub_job_id"] for entry in result] == [subs[1]]
+        assert not (tmp_path / self.SUB).exists()
+        assert all(subs[1] in cmd for cmd in self._gets(connection))
+
+    def test_sub_job_filter_rejects_unknown_sub_job_before_get(self, tmp_path, monkeypatch):
+        c, connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=2)
+        with pytest.raises(ValueError, match="job-1:sampling:0.*job-1:training:0"):
+            c.download_stdout_logs("job-1", tmp_path, sub_job_ids=["job-1:sampling:0"])
+        self._settle()
+        assert self._gets(connection) == []
+        assert connection.closed
+
+    @pytest.mark.parametrize("workers", [0, -1, True, 1.5])
+    def test_max_workers_must_be_positive_int(self, tmp_path, monkeypatch, workers):
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=1)
+        with pytest.raises(ValueError, match="max_workers"):
+            c.download_stdout_logs("job-1", tmp_path, max_workers=workers)
+        self._settle()
+
+    def test_damaged_chunk_is_fetched_again_then_kept(self, tmp_path, monkeypatch):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=4)
+        chunks = paths[self.SUB]
+        target = self.RUN_URI + chunks[1]
+        good = connection.content_by_uri[target]
+        # A truncated member writes part of its output before failing.
+        connection.content_by_uri[target] = good[:-6]
+
+        def on_get(source):
+            if source == target and len(self._gets(connection, target)) > 1:
+                connection.content_by_uri[target] = good
+
+        connection.on_get = on_get
+        result = c.download_stdout_logs("job-1", tmp_path, max_workers=2)
+
+        assert len(self._gets(connection, target)) == 2
+        assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(self.SUB, range(4))
+        assert "skipped_chunks" not in result[0] and "warnings" not in result[0]
+
+    @pytest.mark.parametrize("damage", [b"not gzip", "truncated"])
+    def test_damaged_chunk_is_skipped_and_recorded(self, tmp_path, monkeypatch, damage):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=4)
+        chunks = paths[self.SUB]
+        target = self.RUN_URI + chunks[2]
+        good = connection.content_by_uri[target]
+        connection.content_by_uri[target] = good[:-6] if damage == "truncated" else damage
+
+        result = c.download_stdout_logs("job-1", tmp_path)
+
+        destination = tmp_path / self.SUB / "stdout.log"
+        assert destination.read_bytes() == self._expected(self.SUB, [0, 1, 3])
+        assert len(self._gets(connection, target)) == 2
+        assert result[0]["chunk_count"] == 3
+        assert result[0]["skipped_chunks"] == [target]
+        [warning] = result[0]["warnings"]
+        assert warning.startswith(f"skipped chunk {target}: it is damaged")
+        assert warning.endswith("the saved file is missing that chunk's output")
+        manifest = json.loads((tmp_path / self.SUB / ".stdout.log.manifest.json").read_text())
+        assert manifest == {
+            "bytes": destination.stat().st_size,
+            "names": chunks,
+            "skipped": [chunks[2]],
+            "version": 1,
+        }
+
+        # Resume keeps the gap without fetching the damaged chunk again.
+        gets_before = len(self._gets(connection))
+        resumed = c.download_stdout_logs("job-1", tmp_path, resume=True)
+        assert len(self._gets(connection)) == gets_before
+        assert resumed[0]["skipped_chunks"] == [target]
+        assert "earlier download" in resumed[0]["warnings"][0]
+
+        # A full download retries it.
+        connection.content_by_uri[target] = good
+        full = c.download_stdout_logs("job-1", tmp_path)
+        assert destination.read_bytes() == self._expected(self.SUB, range(4))
+        assert "skipped_chunks" not in full[0]
+        assert "skipped" not in json.loads(
+            (tmp_path / self.SUB / ".stdout.log.manifest.json").read_text()
+        )
+
+    def test_strict_keeps_fail_fast_on_damaged_chunk(self, tmp_path, monkeypatch):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=3)
+        target = self.RUN_URI + paths[self.SUB][1]
+        connection.content_by_uri[target] = b"not gzip"
+        with pytest.raises(gzip.BadGzipFile):
+            c.download_stdout_logs("job-1", tmp_path, strict=True, max_workers=1)
+        self._settle()
+        assert len(self._gets(connection, target)) == 1
+        partial = tmp_path / self.SUB / ".stdout.log.partial"
+        assert partial.read_bytes() == self._expected(self.SUB, [0])
+
+    def test_strict_damaged_chunk_keeps_prefix_and_resume_refetches_rest(
+        self, tmp_path, monkeypatch
+    ):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=5)
+        chunks = paths[self.SUB]
+        target = self.RUN_URI + chunks[2]
+        good = connection.content_by_uri[target]
+        connection.content_by_uri[target] = good[:-6]  # truncated: writes, then fails
+        with pytest.raises(EOFError):
+            c.download_stdout_logs("job-1", tmp_path, strict=True, max_workers=3)
+        self._settle()
+        partial = tmp_path / self.SUB / ".stdout.log.partial"
+        assert partial.read_bytes() == self._expected(self.SUB, [0, 1])
+        connection.content_by_uri[target] = good
+        gets_before = len(self._gets(connection))
+        c.download_stdout_logs("job-1", tmp_path, resume=True, strict=True, max_workers=3)
+        resumed = self._gets(connection)[gets_before:]
+        assert sorted(cmd.split(" ")[1].strip("'") for cmd in resumed) == [
+            self.RUN_URI + path for path in chunks[2:]
+        ]
+        assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(
+            self.SUB, range(5)
+        )
+
+    def test_chunk_removed_after_listing_is_skipped_without_retries(
+        self, tmp_path, monkeypatch
+    ):
+        errors = importlib.import_module("snowflake.connector.errors")
+        c, connection, paths, sleeps, _opened = self._setup(monkeypatch, count=4)
+        gone = self.RUN_URI + paths[self.SUB][1]
+
+        def on_get(source):
+            if source == gone:
+                raise errors.OperationalError(msg="the file does not exist.", errno=253006)
+
+        connection.on_get = on_get
+        result = c.download_stdout_logs("job-1", tmp_path)
+
+        assert sleeps == []
+        assert len(self._gets(connection, gone)) == 1
+        assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(
+            self.SUB, [0, 2, 3]
+        )
+        assert result[0]["skipped_chunks"] == [gone]
+        assert "no longer exists" in result[0]["warnings"][0]
+
+        with pytest.raises(errors.OperationalError):
+            c.download_stdout_logs("job-1", tmp_path / "strict", strict=True)
+        self._settle()
+
+    def test_cancel_during_retry_backoff_returns_promptly_and_saves(
+        self, tmp_path, monkeypatch
+    ):
+        errors = importlib.import_module("snowflake.connector.errors")
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=6)
+        # Real, long backoff waits: only the cancel event can end them early.
+        c._artifact_retry_policy = nc._artifact_download.RetryPolicy(initial_delay=30.0)
+        chunks = paths[self.SUB]
+        failing = self.RUN_URI + chunks[3]
+        in_backoff = threading.Event()
+
+        def on_get(source):
+            if source == self.RUN_URI + chunks[1]:
+                assert in_backoff.wait(5)
+            if source == failing:
+                in_backoff.set()
+                raise errors.OperationalError(msg="network down")
+
+        def progress(sub_job_id, done, total, nbytes):
+            if done == 3:
+                raise nc.DownloadCancelled("leaving")
+
+        connection.on_get = on_get
+        started = time.monotonic()
+        with pytest.raises(nc.DownloadCancelled):
+            c.download_stdout_logs("job-1", tmp_path, max_workers=4, on_chunk=progress)
+        self._settle()
+        assert time.monotonic() - started < 5
+
+        deadline = time.monotonic() + 5
+        while any(t.name.startswith("cortex-training-download") for t in threading.enumerate()):
+            assert time.monotonic() < deadline, "download workers kept running"
+            time.sleep(0.05)
+        assert len(self._gets(connection, failing)) == 1
+        manifest = json.loads((tmp_path / self.SUB / ".stdout.log.partial.manifest.json").read_text())
+        assert manifest["names"] == chunks[:3]
+
+    def test_cancellation_is_not_reported_as_a_failure(self, tmp_path, monkeypatch):
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=3)
+        c._metric_emitter = MagicMock()
+
+        def progress(*_args):
+            raise nc.DownloadCancelled("stop")
+
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        with pytest.raises(nc.DownloadCancelled):
+            c.download_stdout_logs("job-1", tmp_path, on_chunk=progress)
+        self._settle()
+        c._metric_emitter.emit.assert_not_called()
+
+        monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "1")
+        with pytest.raises(nc.DownloadCancelled):
+            c.download_stdout_logs("job-1", tmp_path, on_chunk=progress)
+        self._settle()
+        operation, value = c._metric_emitter.emit.call_args.args
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert operation == "download_stdout_logs"
+        assert value["cancelled"] is True and value["success"] is False
+        assert "error_message" not in value and "error.type" not in attributes
+
+    def test_download_cancelled_is_public(self):
+        import cortex_training
+
+        assert cortex_training.DownloadCancelled is nc.DownloadCancelled
+        assert issubclass(nc.DownloadCancelled, Exception)
+
+    def test_failure_marks_whether_progress_was_saved(self, tmp_path, monkeypatch):
+        errors = importlib.import_module("snowflake.connector.errors")
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=3)
+        denied = {self.RUN_URI + paths[self.SUB][0]}
+
+        def on_get(source):
+            if source in denied:
+                raise errors.ProgrammingError(msg="denied", errno=2003)
+
+        connection.on_get = on_get
+        with pytest.raises(errors.ProgrammingError) as first:
+            c.download_stdout_logs("job-1", tmp_path, max_workers=1)
+        assert first.value.download_progress_saved is False
+
+        denied.clear()
+        denied.add(self.RUN_URI + paths[self.SUB][2])
+        with pytest.raises(errors.ProgrammingError) as second:
+            c.download_stdout_logs("job-1", tmp_path, max_workers=1)
+        assert second.value.download_progress_saved is True
+
+    def test_on_chunk_done_equals_total_only_after_commit(self, tmp_path, monkeypatch):
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=3)
+        destination = tmp_path / self.SUB / "stdout.log"
+        seen = []
+
+        def progress(sub_job_id, done, total, nbytes):
+            seen.append((done, destination.exists()))
+            if done == total:
+                assert destination.read_bytes() == self._expected(self.SUB, range(3))
+                assert destination.stat().st_size == nbytes
+
+        c.download_stdout_logs("job-1", tmp_path, on_chunk=progress)
+        assert seen == [(0, False), (1, False), (2, False), (3, True)]
+        seen.clear()
+        c.download_stdout_logs("job-1", tmp_path, on_chunk=progress, resume=True)
+        assert seen == [(3, True)]
+
+    @pytest.mark.parametrize("crash", ["before_data_replace", "between_replaces"])
+    def test_promote_crash_windows(self, tmp_path, monkeypatch, crash):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=3)
+        directory = tmp_path / self.SUB
+        destination = directory / "stdout.log"
+        manifest = directory / ".stdout.log.manifest.json"
+        real_replace = os.replace
+        crashed = []
+
+        def replace(src, dst):
+            target = destination if crash == "before_data_replace" else manifest
+            if Path(dst) == target and not crashed:
+                crashed.append(dst)
+                raise SystemExit("crash")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(nc.os, "replace", replace)
+        with pytest.raises(SystemExit):
+            c.download_stdout_logs("job-1", tmp_path)
+        self._settle()
+        monkeypatch.setattr(nc.os, "replace", real_replace)
+
+        gets_before = len(self._gets(connection))
+        c.download_stdout_logs("job-1", tmp_path, resume=True)
+        refetched = len(self._gets(connection)) - gets_before
+        assert destination.read_bytes() == self._expected(self.SUB, range(3))
+        assert json.loads(manifest.read_text())["names"] == paths[self.SUB]
+        assert not list(directory.glob(".stdout.log.partial*"))
+        if crash == "before_data_replace":
+            # The complete partial file is promoted without any GET.
+            assert refetched == 0
+        else:
+            # The new file has no manifest yet, so it is rebuilt (wasteful, safe).
+            assert refetched == 3
+
+    def test_reconnect_while_another_get_runs_on_the_old_connection(
+        self, tmp_path, monkeypatch
+    ):
+        errors = importlib.import_module("snowflake.connector.errors")
+        c, first, paths, _sleeps, _opened = self._setup(monkeypatch, count=4)
+        second = TestExecutionLogDownload.FakeArtifactConnection(
+            first.list_rows, first.content_by_uri
+        )
+        connections = iter([first, second])
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", lambda: next(connections))
+        chunks = paths[self.SUB]
+        slow = self.RUN_URI + chunks[0]
+        expiring = self.RUN_URI + chunks[1]
+        reopened = threading.Event()
+        old_still_open = []
+
+        def on_first_get(source):
+            if source == slow:
+                assert reopened.wait(5)
+                old_still_open.append(not first.closed)
+            if source == expiring:
+                raise errors.ProgrammingError(msg="session expired", errno=390112)
+
+        def on_second_get(source):
+            if source == expiring:
+                reopened.set()
+
+        first.on_get = on_first_get
+        second.on_get = on_second_get
+        c.download_stdout_logs("job-1", tmp_path, max_workers=2)
+
+        assert old_still_open == [True]
+        assert any(expiring in cmd for cmd in self._gets(second))
+        assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(
+            self.SUB, range(4)
+        )
+        assert first.closed and second.closed
+
+    def test_stress_many_chunks_with_random_latency(self, tmp_path, monkeypatch):
+        import random as random_module
+
+        subs = [self.SUB, "job-1:training:1", "job-1:sampling:0"]
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, subs=subs, count=170)
+        rng = random_module.Random(1234)
+        delays = {
+            self.RUN_URI + path: rng.random() * 0.004 for sub in subs for path in paths[sub]
+        }
+        connection.on_get = lambda source: time.sleep(delays[source])
+
+        result = c.download_stdout_logs("job-1", tmp_path, max_workers=32)
+
+        assert len(self._gets(connection)) == 510
+        for sub in subs:
+            assert (tmp_path / sub / "stdout.log").read_bytes() == self._expected(sub, range(170))
+        assert [entry["chunk_count"] for entry in result] == [170, 170, 170]
+
+    @pytest.mark.parametrize(
+        "skipped", [["not-listed.gz"], [{"x": 1}], "names"]
+    )
+    def test_manifest_with_invalid_skipped_list_is_rejected(self, tmp_path, skipped):
+        path = tmp_path / ".x.manifest.json"
+        path.write_text(json.dumps({"bytes": 1, "names": ["a.gz"], "skipped": skipped, "version": 1}))
+        assert nc._artifact_download.read_manifest(path) is None
+
+    # Newest chunk time in _setup(count=3): 2026-09-04 12:00:02 UTC.
+    NEWEST = datetime(2026, 9, 4, 12, 0, 2, tzinfo=timezone.utc).timestamp()
+
+    def _stale_setup(
+        self,
+        monkeypatch,
+        *,
+        status="RUNNING",
+        age_minutes=11,
+        server_age_minutes=None,
+        job_fields=None,
+        **kwargs,
+    ):
+        """``server_age_minutes`` sets the server's clock; None means no Date header."""
+        c, connection, paths, sleeps, opened = self._setup(monkeypatch, **kwargs)
+        status_calls = []
+
+        def job_for_upload_warnings(job_id):
+            status_calls.append(job_id)
+            if isinstance(status, Exception):
+                raise status
+            server_now = (
+                None if server_age_minutes is None else self.NEWEST + server_age_minutes * 60
+            )
+            return {"job_id": job_id, "status": status, **(job_fields or {})}, server_now
+
+        monkeypatch.setattr(c, "_job_for_upload_warnings", job_for_upload_warnings)
+        c._wall_clock = lambda: self.NEWEST + age_minutes * 60
+        return c, connection, paths, status_calls
+
+    def test_stale_stdout_warns_while_running(self, tmp_path, monkeypatch, caplog):
+        c, _connection, _paths, status_calls = self._stale_setup(monkeypatch, count=3)
+        with caplog.at_level(logging.WARNING):
+            result = c.download_stdout_logs("job-1", tmp_path)
+        [warning] = result[0]["warnings"]
+        assert warning.startswith(
+            f"newest saved stdout output for {self.SUB} is from 2026-09-04 12:00:02 UTC "
+            "(11 min ago) while the job is still running; uploads may be stalled. "
+            "Contact support if this persists."
+        )
+        assert warning in caplog.text
+        assert status_calls == ["job-1"]
+        assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(self.SUB, range(3))
+
+    @pytest.mark.parametrize(
+        ("status", "age_minutes", "stale_after"),
+        [
+            ("DONE", 60, 600),
+            ("failed", 60, 600),
+            ("JOB_STATE_CANCELLED", 60, 600),
+            ("RUNNING", 9, 600),
+            ("RUNNING", 60, None),
+            ("RUNNING", 60, 7200),
+            (RuntimeError("status unavailable"), 60, 600),
+        ],
+    )
+    def test_no_stale_warning(self, tmp_path, monkeypatch, status, age_minutes, stale_after):
+        c, _connection, _paths, _calls = self._stale_setup(
+            monkeypatch, status=status, age_minutes=age_minutes, count=3
+        )
+        result = c.download_stdout_logs("job-1", tmp_path, stale_after_seconds=stale_after)
+        assert "warnings" not in result[0]
+        assert result[0]["chunk_count"] == 3
+
+    def test_fresh_stdout_does_not_look_up_job_status(self, tmp_path, monkeypatch):
+        c, _connection, _paths, status_calls = self._stale_setup(
+            monkeypatch, age_minutes=1, count=3
+        )
+        c.download_stdout_logs("job-1", tmp_path)
+        assert status_calls == []
+
+    def test_stale_metrics_warning_has_no_stdout_hint(self, tmp_path, monkeypatch):
+        c, _connection, _paths, _calls = self._stale_setup(
+            monkeypatch, count=3, artifact_name="metrics"
+        )
+        [warning] = c.download_metrics("job-1", tmp_path)[0]["warnings"]
+        assert warning.startswith(f"newest saved GPU metrics for {self.SUB} is from")
+        assert "prints nothing" not in warning
+
+    def _metrics_missing_setup(self, monkeypatch, status="RUNNING", **kwargs):
+        kwargs.setdefault("age_minutes", 3)
+        c, connection, paths, status_calls = self._stale_setup(
+            monkeypatch,
+            status=status,
+            count=3,
+            artifact_name="metrics",
+            **kwargs,
+        )
+        # A second sub-job has saved stdout but no metrics.
+        stdout_only = "job-1:sampling:0"
+        connection.list_rows[self.RUN_URI + "_stdout/"] = [
+            (f"/versions/RUN_ABC/_stdout/{stdout_only}/console.20260904-120001.a.gz",)
+        ]
+        connection.list_rows[self.RUN_URI + "checkpoints/_stdout/"] = []
+        return c, connection, stdout_only
+
+    def test_running_job_with_stdout_but_no_metrics_warns(self, tmp_path, monkeypatch):
+        c, connection, stdout_only = self._metrics_missing_setup(monkeypatch)
+        result = c.download_metrics("job-1", tmp_path)
+        assert [entry["sub_job_id"] for entry in result] == [stdout_only, self.SUB]
+        assert result[0] == {
+            "sub_job_id": stdout_only,
+            "filename": "gpu.jsonl",
+            "saved_path": None,
+            "chunk_count": 0,
+            "first_artifact_uri": None,
+            "last_artifact_uri": None,
+            "warnings": [
+                f"no GPU metrics have been saved for {stdout_only} while the job is still "
+                "running, although its stdout output has been; metric uploads may be "
+                "stalled. Contact support if this persists."
+            ],
+        }
+        assert "warnings" not in result[1]
+        assert not (tmp_path / stdout_only).exists()
+        assert not any(stdout_only in cmd for cmd in self._gets(connection))
+
+        # Selecting that sub-job is not an error while the warning applies.
+        only = c.download_metrics("job-1", tmp_path, sub_job_ids=[stdout_only])
+        assert [entry["sub_job_id"] for entry in only] == [stdout_only]
+
+    def test_terminal_job_with_stdout_but_no_metrics_is_quiet(self, tmp_path, monkeypatch):
+        c, connection, stdout_only = self._metrics_missing_setup(monkeypatch, status="DONE")
+        result = c.download_metrics("job-1", tmp_path)
+        assert [entry["sub_job_id"] for entry in result] == [self.SUB]
+        assert not any(cmd == f"LIST '{self.RUN_URI}_stdout/'" for cmd in connection.commands)
+        with pytest.raises(ValueError, match="no metrics chunks"):
+            c.download_metrics("job-1", tmp_path, sub_job_ids=[stdout_only])
+        self._settle()
+
+    def _iso(self, minutes_after_newest):
+        stamp = datetime.fromtimestamp(self.NEWEST + minutes_after_newest * 60, tz=timezone.utc)
+        return stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @pytest.mark.parametrize("sub_status", ["DONE", "failed", "JOB_STATE_PENDING"])
+    def test_no_stall_warning_for_a_sub_job_that_is_not_running(
+        self, tmp_path, monkeypatch, sub_status
+    ):
+        fields = {"sub_jobs": [{"sub_job_id": self.SUB, "status": sub_status}]}
+        c, _connection, _paths, _calls = self._stale_setup(
+            monkeypatch, count=3, job_fields=fields
+        )
+        assert "warnings" not in c.download_stdout_logs("job-1", tmp_path)[0]
+
+    def test_stall_warning_for_a_running_sub_job(self, tmp_path, monkeypatch):
+        fields = {
+            "state_changed_at": self._iso(-60),
+            "sub_jobs": [
+                {"sub_job_id": self.SUB, "status": "RUNNING"},
+                {"sub_job_id": "job-1:sampling:0", "status": "DONE"},
+            ],
+        }
+        c, _connection, _paths, _calls = self._stale_setup(
+            monkeypatch, count=3, job_fields=fields
+        )
+        assert "11 min ago" in c.download_stdout_logs("job-1", tmp_path)[0]["warnings"][0]
+
+    def test_no_stall_warning_soon_after_the_job_started_running(self, tmp_path, monkeypatch):
+        # The newest chunk predates a restart five minutes ago.
+        c, _connection, _paths, _calls = self._stale_setup(
+            monkeypatch, count=3, job_fields={"state_changed_at": self._iso(6)}
+        )
+        assert "warnings" not in c.download_stdout_logs("job-1", tmp_path)[0]
+
+    @pytest.mark.parametrize(
+        ("local", "server", "warned"),
+        [(11, 2, None), (6, 12, "12 min ago"), (30, 11, "11 min ago"), (11, None, "11 min ago")],
+    )
+    def test_stall_age_uses_the_server_clock(
+        self, tmp_path, monkeypatch, local, server, warned
+    ):
+        c, _connection, _paths, _calls = self._stale_setup(
+            monkeypatch, count=3, age_minutes=local, server_age_minutes=server
+        )
+        warnings = c.download_stdout_logs("job-1", tmp_path)[0].get("warnings")
+        if warned is None:
+            assert warnings is None
+        else:
+            assert warned in warnings[0]
+
+    def test_no_missing_metrics_warning_right_after_the_sub_job_starts(
+        self, tmp_path, monkeypatch
+    ):
+        # Its first stdout chunk is from 12:00:01; one minute later is too soon.
+        c, _connection, stdout_only = self._metrics_missing_setup(
+            monkeypatch, age_minutes=1
+        )
+        result = c.download_metrics("job-1", tmp_path)
+        assert [entry["sub_job_id"] for entry in result] == [self.SUB]
+
+    def test_no_missing_metrics_warning_for_a_finished_sub_job(self, tmp_path, monkeypatch):
+        c, _connection, stdout_only = self._metrics_missing_setup(
+            monkeypatch,
+            job_fields={"sub_jobs": [{"sub_job_id": "job-1:sampling:0", "status": "DONE"}]},
+        )
+        result = c.download_metrics("job-1", tmp_path)
+        assert [entry["sub_job_id"] for entry in result] == [self.SUB]
+
+    def test_job_for_upload_warnings_reads_server_date(self):
+        c = _make_client()
+        response = _make_response({"status": "RUNNING"})
+        response.headers = {"Date": "Thu, 15 Oct 2026 01:52:53 GMT"}
+        c._session.get.return_value = response
+        job, server_now = c._job_for_upload_warnings("job-1")
+        assert job == {"status": "RUNNING"}
+        assert server_now == datetime(2026, 10, 15, 1, 52, 53, tzinfo=timezone.utc).timestamp()
+        response.headers = {}
+        assert c._job_for_upload_warnings("job-1")[1] is None
+
+    def test_status_lookup_failure_skips_warnings_but_finishes(self, tmp_path, monkeypatch):
+        c, _connection, _paths, calls = self._stale_setup(
+            monkeypatch, status=RuntimeError("boom"), count=3, artifact_name="metrics"
+        )
+        result = c.download_metrics("job-1", tmp_path)
+        assert calls == ["job-1"]
+        assert "warnings" not in result[0]
+        assert result[0]["chunk_count"] == 3
+
+    def test_named_sub_job_without_chunks_raises_no_chunks_error(self, tmp_path, monkeypatch):
+        import cortex_training
+
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=1)
+        with pytest.raises(cortex_training.NoChunksError) as raised:
+            c.download_stdout_logs("job-1", tmp_path, sub_job_ids=["job-1:sampling:0", self.SUB])
+        assert isinstance(raised.value, ValueError)
+        assert raised.value.sub_job_ids == ["job-1:sampling:0"]
+        assert raised.value.available == [self.SUB]
+
+    def test_spool_is_removed_after_cancel_once_abandoned_gets_finish(
+        self, tmp_path, monkeypatch
+    ):
+        spool_parent = tmp_path / "tmp"
+        spool_parent.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(spool_parent))
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=6)
+        chunks = paths[self.SUB]
+        release = threading.Event()
+        cancel_at = self.RUN_URI + chunks[1]
+
+        def on_get(source):
+            if source == cancel_at:
+                raise KeyboardInterrupt
+            if source == self.RUN_URI + chunks[3]:
+                # Still on the wire when the download gives up on it.
+                assert release.wait(5)
+
+        connection.on_get = on_get
+        with pytest.raises(KeyboardInterrupt):
+            c.download_stdout_logs("job-1", tmp_path / "out", max_workers=4)
+        assert list(spool_parent.iterdir()), "spool removed while a GET was still running"
+        release.set()
+        self._settle()
+        deadline = time.monotonic() + 5
+        while list(spool_parent.iterdir()):
+            assert time.monotonic() < deadline, list(spool_parent.rglob("*"))
+            time.sleep(0.01)
+
+    def test_spool_waits_for_the_fetch_the_writer_was_blocked_on(self, tmp_path, monkeypatch):
+        import signal
+
+        spool_parent = tmp_path / "tmp"
+        spool_parent.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(spool_parent))
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=4)
+        head = self.RUN_URI + paths[self.SUB][0]
+        release = threading.Event()
+
+        def on_get(source):
+            if source == head:
+                # Ctrl-C arrives while the writer waits on this very fetch.
+                signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
+                assert release.wait(5)
+
+        connection.on_get = on_get
+        with pytest.raises(KeyboardInterrupt):
+            c.download_stdout_logs("job-1", tmp_path / "out", max_workers=1)
+        time.sleep(0.3)
+        assert list(spool_parent.iterdir()), "spool removed while the head GET was running"
+        release.set()
+        self._settle()
+        deadline = time.monotonic() + 5
+        while list(spool_parent.iterdir()):
+            assert time.monotonic() < deadline, list(spool_parent.rglob("*"))
+            time.sleep(0.01)
+
+    def test_sweep_reports_only_directories_it_removed(self, tmp_path, monkeypatch, caplog):
+        spool_parent = tmp_path / "tmp"
+        spool_parent.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(spool_parent))
+        stuck = spool_parent / "cortex-training-stdout-artifacts-stuck"
+        stuck.mkdir()
+        stamp = time.time() - 7200
+        os.utime(stuck, (stamp, stamp))
+        monkeypatch.setattr(nc._artifact_download.shutil, "rmtree", lambda *a, **k: None)
+        with caplog.at_level(logging.DEBUG):
+            nc._artifact_download.Spool.sweep("cortex-training-stdout-artifacts-", 3600)
+        assert "could not remove leftover download directory" in caplog.text
+        assert "removed leftover download directory" not in caplog.text
+
+    def test_old_spool_directories_are_swept(self, tmp_path, monkeypatch):
+        spool_parent = tmp_path / "tmp"
+        spool_parent.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(spool_parent))
+        old = spool_parent / "cortex-training-stdout-artifacts-old"
+        recent = spool_parent / "cortex-training-stdout-artifacts-recent"
+        other = spool_parent / "cortex-training-metrics-artifacts-old"
+        for directory in (old, recent, other):
+            (directory / "chunk-x").mkdir(parents=True)
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=1)
+        stamp = time.time() - 2 * c._TEMP_ORPHAN_MIN_AGE_SECONDS
+        for directory in (old, other):
+            os.utime(directory, (stamp, stamp))
+        c.download_stdout_logs("job-1", tmp_path / "out")
+        assert sorted(path.name for path in spool_parent.iterdir()) == [other.name, recent.name]
+
+    def test_hung_get_is_abandoned_and_retried(self, tmp_path, monkeypatch):
+        c, connection, paths, sleeps, _opened = self._setup(monkeypatch, count=4)
+        hung = self.RUN_URI + paths[self.SUB][1]
+        release = threading.Event()
+        first = [True]
+
+        def on_get(source):
+            if source == hung and first:
+                first.clear()
+                assert release.wait(10)
+
+        connection.on_get = on_get
+        started = time.monotonic()
+        result = c.download_stdout_logs("job-1", tmp_path, transfer_timeout_seconds=0.5)
+        assert time.monotonic() - started < 5
+        destination = tmp_path / self.SUB / "stdout.log"
+        expected = self._expected(self.SUB, range(4))
+        assert destination.read_bytes() == expected
+        assert len(self._gets(connection, hung)) == 2
+        assert len(sleeps) == 1
+        assert result[0]["chunk_count"] == 4
+
+        # The abandoned attempt finishing later cannot touch the output.
+        release.set()
+        deadline = time.monotonic() + 5
+        while any(t.name == "cortex-training-transfer" for t in threading.enumerate()):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert destination.read_bytes() == expected
+        assert sorted(p.name for p in (tmp_path / self.SUB).iterdir()) == [
+            ".stdout.log.manifest.json",
+            "stdout.log",
+        ]
+
+    def test_hung_list_is_abandoned_and_retried(self, tmp_path, monkeypatch):
+        c, connection, _paths, sleeps, _opened = self._setup(monkeypatch, count=2)
+        cursor_cls = connection.Cursor
+        release = threading.Event()
+        first = [True]
+
+        class HangingCursor(cursor_cls):
+            def execute(self, statement):
+                if statement.startswith("LIST ") and first:
+                    first.clear()
+                    release.wait(10)
+                return super().execute(statement)
+
+        monkeypatch.setattr(connection, "cursor", lambda: HangingCursor(connection))
+        try:
+            c.download_stdout_logs("job-1", tmp_path, transfer_timeout_seconds=0.5)
+        finally:
+            release.set()
+        assert len(sleeps) == 1
+        assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(
+            self.SUB, range(2)
+        )
+
+    def test_run_bounded_gives_a_cancelled_attempt_a_short_grace(self, monkeypatch):
+        monkeypatch.setattr(nc._artifact_download, "CANCEL_GRACE_SECONDS", 0.3)
+        cancel = threading.Event()
+        cancel.set()
+        release = threading.Event()
+        started = time.monotonic()
+        with pytest.raises(nc.DownloadCancelled):
+            nc._artifact_download.run_bounded(
+                lambda: release.wait(10), timeout=None, cancel=cancel, description="GET x"
+            )
+        assert 0.2 < time.monotonic() - started < 3
+        release.set()
+        # A quick attempt still completes normally after cancel.
+        assert nc._artifact_download.run_bounded(
+            lambda: 7, timeout=1.0, cancel=cancel, description="GET y"
+        ) == 7
+
+    def test_run_bounded_reraises_the_attempt_error(self):
+        def fail():
+            raise KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            nc._artifact_download.run_bounded(fail, timeout=1.0, cancel=None, description="x")
+        assert nc._artifact_download.classify_artifact_error(
+            nc._artifact_download.TransferTimeout("slow")
+        ) == "retry"
+
+    def test_transfer_timeout_message_suggests_the_knobs(self):
+        with pytest.raises(nc._artifact_download.TransferTimeout) as raised:
+            nc._artifact_download.run_bounded(
+                lambda: time.sleep(1), timeout=0.05, cancel=None, description="GET x"
+            )
+        message = str(raised.value)
+        assert message.startswith("GET x did not finish within 0.05s.")
+        assert "--transfer-timeout" in message and "--parallel" in message
+
+    @pytest.mark.parametrize("value", [0, -1, True, "300"])
+    def test_transfer_timeout_must_be_positive(self, tmp_path, monkeypatch, value):
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=1)
+        with pytest.raises(ValueError, match="transfer_timeout_seconds"):
+            c.download_stdout_logs("job-1", tmp_path, transfer_timeout_seconds=value)
+
+    @pytest.mark.parametrize("value", [0, -5, True, "600"])
+    def test_stale_after_must_be_positive(self, tmp_path, monkeypatch, value):
+        c, _connection, _paths, _calls = self._stale_setup(monkeypatch, count=1)
+        with pytest.raises(ValueError, match="stale_after_seconds"):
+            c.download_stdout_logs("job-1", tmp_path, stale_after_seconds=value)
+        self._settle()
+
+    @pytest.mark.parametrize("missing", ["NonRetryableTlsError", "RevocationCheckError", "TooManyRequests"])
+    def test_classification_tolerates_connector_classes_missing_in_older_releases(
+        self, monkeypatch, missing
+    ):
+        errors = importlib.import_module("snowflake.connector.errors")
+        operational = errors.OperationalError(msg="network down")
+        permission = errors.ProgrammingError(msg="denied", errno=2003)
+        monkeypatch.delattr(errors, missing, raising=False)
+        classify = nc._artifact_download.classify_artifact_error
+        assert classify(operational) == "retry"
+        assert classify(permission) is None
+        assert classify(errors.ProgrammingError(msg="expired", errno=390112)) == "reconnect"
+
+    def test_classification_never_raises(self, monkeypatch):
+        class Weird(Exception):
+            errno = 253002
+
+            def __str__(self):
+                raise RuntimeError("unprintable")
+
+        assert nc._artifact_download.classify_artifact_error(Weird()) is None
+        errors = importlib.import_module("snowflake.connector.errors")
+        monkeypatch.setattr(errors, "OperationalError", "not a class")
+        assert nc._artifact_download.classify_artifact_error(ConnectionResetError()) == "retry"
+
+    @staticmethod
+    def _checkpoint_positions(tmp_path, monkeypatch, n, *, seconds_per_chunk=0.0):
+        """Chunk counts at which ChunkWriter wrote its manifest while appending n chunks."""
+        chunk = tmp_path / "chunk.gz"
+        chunk.write_bytes(gzip.compress(b"x\n"))
+        now = [0.0]
+        writes = []
+        real_write = nc._artifact_download.write_manifest
+
+        def record(path, names, nbytes, skipped=None):
+            writes.append(len(names))
+            real_write(path, names, nbytes, skipped)
+
+        monkeypatch.setattr(nc._artifact_download, "write_manifest", record)
+        writer = nc._artifact_download.ChunkWriter(
+            tmp_path / "out",
+            tmp_path / "out.manifest.json",
+            [],
+            0,
+            buffer_bytes=1024,
+            checkpoint_chunks=64,
+            checkpoint_seconds=5.0,
+            clock=lambda: now[0],
+        )
+        for index in range(n):
+            now[0] += seconds_per_chunk
+            writer.append(f"c{index:05d}.gz", chunk)
+        positions = list(writes)
+        writer.finish()
+        assert writes[-1] == n  # finish always records everything
+        assert (tmp_path / "out").read_bytes() == b"x\n" * n
+        return positions
+
+    @pytest.mark.parametrize(
+        ("n", "expected"),
+        [
+            (100, [64]),
+            (1000, [64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 711, 789, 876, 973]),
+            (
+                5000,
+                [64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 711, 789, 876, 973, 1081,
+                 1201, 1334, 1482, 1646, 1828, 2031, 2256, 2506, 2784, 3093, 3436, 3817,
+                 4241, 4712],
+            ),
+        ],
+    )
+    def test_checkpoint_cadence_by_chunk_count(self, tmp_path, monkeypatch, n, expected):
+        # Rule: checkpoint once pending >= max(64, n // 10) chunks, or after 5 s
+        # once pending >= n // 50. With a frozen clock only the first applies.
+        assert self._checkpoint_positions(tmp_path, monkeypatch, n) == expected
+
+    def test_checkpoint_cadence_by_time(self, tmp_path, monkeypatch):
+        positions = self._checkpoint_positions(
+            tmp_path, monkeypatch, 5000, seconds_per_chunk=1.0
+        )
+        # One chunk per second: every 5 s while n // 50 <= 5, then spacing
+        # follows n // 50 (for example 4787 -> 4884 -> 4983).
+        assert positions[:4] == [5, 10, 15, 20]
+        assert positions[-3:] == [4787, 4884, 4983]
+        assert len(positions) == 203
+        assert all(b - a >= max(5, b // 50) for a, b in zip(positions, positions[1:]))
+
+    def test_storage_refusal_logs_the_matched_text(self, caplog):
+        errors = importlib.import_module("snowflake.connector.errors")
+        exc = errors.OperationalError(msg="error: '403 Forbidden' from storage", errno=253002)
+        with caplog.at_level(logging.DEBUG):
+            assert nc._artifact_download.classify_artifact_error(exc) is None
+        assert "message matched '403'" in caplog.text
+
+    def test_error_classification(self):
+        errors = importlib.import_module("snowflake.connector.errors")
+        classify = nc._artifact_download.classify_artifact_error
+        assert classify(errors.OperationalError(msg="x")) == "retry"
+        assert classify(errors.ServiceUnavailableError(msg="x")) == "retry"
+        assert classify(errors.TooManyRequests(msg="x")) == "retry"
+        assert classify(errors.DatabaseError(msg="x", errno=603)) == "retry"
+        assert classify(ConnectionResetError()) == "retry"
+        assert classify(nc.requests.exceptions.ConnectionError()) == "retry"
+        assert classify(errors.ProgrammingError(msg="x", errno=390112)) == "reconnect"
+        assert classify(errors.OperationalError(msg="x", errno=390114)) == "reconnect"
+        assert classify(errors.ProgrammingError(msg="x", errno=2003)) is None
+        if hasattr(errors, "NonRetryableTlsError"):  # newer connector releases only
+            assert classify(errors.NonRetryableTlsError(msg="x")) is None
+        assert classify(RuntimeError("x")) is None
+        assert classify(gzip.BadGzipFile("x")) is None
+        assert classify(PermissionError("x")) is None
+        # File transfer errors that another attempt cannot fix.
+        assert classify(errors.OperationalError(msg="does not exist", errno=253006)) is None
+        assert classify(errors.ProgrammingError(msg="not a dir", errno=253005)) is None
+        assert classify(errors.OperationalError(msg="bad stage", errno=253004)) is None
+        denied = "While getting file(s) there was an error: '{}', this might be caused by your access"
+        for detail in ("403 Forbidden", "AccessDenied: Access Denied", "AuthorizationFailure"):
+            exc = errors.OperationalError(msg=denied.format(detail), errno=253002)
+            assert classify(exc) is None, detail
+        network = errors.OperationalError(msg=denied.format("ConnectionResetError(54)"), errno=253002)
+        assert classify(network) == "retry"
 
 
 # ─── _ensure_database ──────────────────────────────────────────────────

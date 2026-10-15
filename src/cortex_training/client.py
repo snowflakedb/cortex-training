@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import email.utils
 import functools
 import gzip
 import hashlib
@@ -51,13 +52,15 @@ import shutil
 import tempfile
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field
+from concurrent.futures import Future
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from datetime import datetime
 from datetime import timezone
@@ -81,6 +84,9 @@ from tenacity import stop_after_attempt
 from tenacity import wait_exponential_jitter
 from urllib3.exceptions import NewConnectionError
 
+from cortex_training import _artifact_download
+from cortex_training._artifact_download import DownloadCancelled
+from cortex_training._artifact_download import NoChunksError
 from cortex_training import wire
 from cortex_training.optimizer import normalize_optimizer_config
 from cortex_training.peft import normalize_lora_peft_config
@@ -98,8 +104,6 @@ _GPU_METRICS_CHUNK_RE = re.compile(
     r"^gpu\.(?P<timestamp>\d{8}-\d{6})\.(?P<suffix>[^./\\]+)\.gz$"
 )
 _STREAM_COPY_BUFFER_BYTES = 1024 * 1024
-_ARTIFACT_GET_WORKERS = 8
-_ARTIFACT_GET_MIN_CHUNKS = 128
 
 # Env var that unlocks create-job debug options. These are an internal-only
 # capability and are deliberately not documented for external use: the client
@@ -630,6 +634,13 @@ def _track_operation(operation: str):
             started = time.monotonic()
             try:
                 result = method(self, *args, **kwargs)
+            except DownloadCancelled:
+                # The caller asked to stop: not a failure.
+                if arguments is not None:
+                    self._emit_operation_outcome(
+                        operation, started, arguments, cancelled=True
+                    )
+                raise
             except Exception as exc:
                 # Errors wrapped after _send (e.g. chunk-group errors) still
                 # carry the failing response.
@@ -1915,8 +1926,13 @@ class CortexTrainingClient:
         *,
         result: Any = None,
         error: BaseException | None = None,
+        cancelled: bool = False,
     ) -> None:
-        """Emit one structured outcome without changing the operation result."""
+        """Emit one structured outcome without changing the operation result.
+
+        A cancelled operation is reported like a success (only when success
+        telemetry is enabled), with ``success`` false and ``cancelled`` true.
+        """
         if self._metric_emitter is None:
             return
         if error is None and not _success_telemetry_enabled():
@@ -1933,8 +1949,10 @@ class CortexTrainingClient:
                 "duration_ms": round((time.monotonic() - started) * 1000, 3),
                 "request_count": request_count,
                 "retry_count": max(attempt_count - request_count, 0),
-                "success": error is None,
+                "success": error is None and not cancelled,
             }
+            if cancelled:
+                value["cancelled"] = True
             attributes = _metric_identity(operation, arguments, result)
             if error is not None:
                 value["error_message"] = _safe_metric_error_message(error)
@@ -2744,7 +2762,10 @@ class CortexTrainingClient:
         """Download one exact experiment artifact and return its local path."""
         relative_path = _validate_artifact_relative_path(relative_path)
         target_dir.mkdir(parents=True, exist_ok=True)
-        target_uri = target_dir.resolve().as_uri() + "/"
+        # A raw path, not Path.as_uri(): percent-encoding (for example of ':' in a
+        # sub-job id) is not decoded by GET and names a directory that does not
+        # exist. Callers download into private temp directories.
+        target_uri = "file://" + target_dir.resolve().as_posix() + "/"
         cursor = connection.cursor()
         try:
             cursor.execute(
@@ -2831,90 +2852,251 @@ class CortexTrainingClient:
         finally:
             connection.close()
 
+    # Default number of concurrent chunk GETs. Each GET is mostly round-trip
+    # latency, so throughput scales with the number in flight.
+    _DOWNLOAD_DEFAULT_WORKERS = 16
+    # Fetched chunks waiting to be appended are capped at this many per worker,
+    # which bounds temporary disk use when one early chunk is slow.
+    _DOWNLOAD_WINDOW_PER_WORKER = 4
+    # The resume manifest is checkpointed after this many chunks or seconds,
+    # whichever comes first.
+    _DOWNLOAD_CHECKPOINT_CHUNKS = 64
+    _DOWNLOAD_CHECKPOINT_SECONDS = 5.0
+    # Leftover temp files are removed only once untouched for this long, so a
+    # concurrent download of the same directory is not broken.
+    _TEMP_ORPHAN_MIN_AGE_SECONDS = 3600.0
+    # A running job whose newest chunk is older than this gets a warning that
+    # uploads may be stalled.
+    _DOWNLOAD_STALE_AFTER_SECONDS = 600.0
+    # A single LIST or GET attempt that runs longer than this is abandoned and
+    # retried. A chunk GET normally takes well under a second.
+    _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS = 300.0
+    _wall_clock = staticmethod(time.time)
+    _artifact_retry_policy = _artifact_download.RetryPolicy()
+
     @staticmethod
     def _resume_manifest_path(destination: Path) -> Path:
         return destination.with_name("." + destination.name + ".manifest.json")
 
-    @classmethod
-    def _read_resume_manifest(cls, destination: Path) -> tuple[list[str], int] | None:
-        path = cls._resume_manifest_path(destination)
-        try:
-            doc = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return None
-        if not isinstance(doc, dict) or doc.get("version") != 1:
-            return None
-        names = doc.get("names")
-        nbytes = doc.get("bytes")
-        if (
-            not isinstance(names, list)
-            or not names
-            or not all(isinstance(name, str) and name for name in names)
-            or isinstance(nbytes, bool)
-            or not isinstance(nbytes, int)
-            or nbytes < 0
-        ):
-            return None
-        return list(names), nbytes
-
-    @classmethod
-    def _write_resume_manifest(cls, destination: Path, names: list[str], nbytes: int) -> None:
-        path = cls._resume_manifest_path(destination)
-        payload = json.dumps({"bytes": nbytes, "names": names, "version": 1}) + "\n"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".manifest-", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-
     @staticmethod
-    def _copy_gzip_member(downloaded: Path, output) -> None:
-        with downloaded.open("rb") as compressed:
-            with gzip.GzipFile(fileobj=compressed, mode="rb") as source:
-                shutil.copyfileobj(source, output, length=_STREAM_COPY_BUFFER_BYTES)
+    def _partial_paths(destination: Path) -> tuple[Path, Path]:
+        """Return the in-progress data file and its manifest for ``destination``."""
+        return (
+            destination.with_name("." + destination.name + ".partial"),
+            destination.with_name("." + destination.name + ".partial.manifest.json"),
+        )
 
     @staticmethod
     def _artifact_result(
         destination: Path,
         run_uri: str,
         names: list[str],
+        *,
+        skipped: list[str] | None = None,
+        warnings: list[str] | None = None,
     ) -> dict[str, Any]:
-        return {
+        """Summarize one sub-job's file; ``skipped``/``warnings`` only when non-empty."""
+        result: dict[str, Any] = {
             "sub_job_id": destination.parent.name,
             "filename": destination.name,
             "saved_path": str(destination),
-            "chunk_count": len(names),
+            "chunk_count": len(names) - len(skipped or []),
             "first_artifact_uri": run_uri + names[0],
             "last_artifact_uri": run_uri + names[-1],
         }
+        if skipped:
+            result["skipped_chunks"] = [run_uri + name for name in skipped]
+        if warnings:
+            result["warnings"] = list(warnings)
+        return result
 
-    def _download_gzip_member(
+    @classmethod
+    def _remove_orphan_temp_files(cls, destination: Path, temporary_prefix: str) -> None:
+        """Delete temp files a killed download left beside ``destination``."""
+        directory = destination.parent
+        if not directory.is_dir():
+            return
+        patterns = (
+            f"{temporary_prefix}*.tmp",
+            f".{destination.name}.manifest-*.tmp",
+            f".{destination.name}.partial.manifest-*.tmp",
+            ".manifest-*.tmp",
+        )
+        # Only files nobody has written to for a while: a download still
+        # running in the same directory keeps touching its temp files.
+        cutoff = time.time() - cls._TEMP_ORPHAN_MIN_AGE_SECONDS
+        for path in (path for pattern in patterns for path in directory.glob(pattern)):
+            try:
+                if not path.is_file() or path.stat().st_mtime >= cutoff:
+                    continue
+                path.unlink()
+                logger.info("removed leftover temporary file %s", path)
+            except OSError:
+                logger.debug("could not remove leftover temporary file %s", path, exc_info=True)
+
+    @staticmethod
+    def _resume_state(
+        data_path: Path,
+        manifest_path: Path,
+        chunk_paths: list[str],
+    ) -> _artifact_download.Manifest | None:
+        """Return the manifest if ``data_path`` can be extended in place."""
+        state = _artifact_download.read_manifest(manifest_path)
+        if state is None:
+            return None
+        if state.names != chunk_paths[: len(state.names)]:
+            logger.info(
+                "%s: the chunk list no longer extends the saved chunks; rebuilding",
+                data_path,
+            )
+            return None
+        try:
+            if not data_path.is_file() or data_path.stat().st_size < state.nbytes:
+                return None
+        except OSError:
+            return None
+        return state
+
+    def _plan_gzip_download(
         self,
-        connection: Any,
+        sub_job_id: str,
+        destination: Path,
+        chunk_paths: list[str],
+        *,
+        resume: bool,
+    ) -> _artifact_download.GzipPlan:
+        """Choose append, continue-partial, or rebuild for one sub-job.
+
+        Only reads the output directory; :meth:`_prepare_gzip_plan` makes the
+        changes once that sub-job's turn to be written comes.
+        """
+        partial, partial_manifest = self._partial_paths(destination)
+        manifest = self._resume_manifest_path(destination)
+        if resume:
+            state = self._resume_state(destination, manifest, chunk_paths)
+            if state is not None:
+                return _artifact_download.GzipPlan(
+                    sub_job_id,
+                    destination,
+                    destination,
+                    manifest,
+                    chunk_paths,
+                    state.names,
+                    state.nbytes,
+                    False,
+                    state.skipped,
+                )
+            state = self._resume_state(partial, partial_manifest, chunk_paths)
+            if state is not None:
+                return _artifact_download.GzipPlan(
+                    sub_job_id,
+                    destination,
+                    partial,
+                    partial_manifest,
+                    chunk_paths,
+                    state.names,
+                    state.nbytes,
+                    True,
+                    state.skipped,
+                )
+        return _artifact_download.GzipPlan(
+            sub_job_id, destination, partial, partial_manifest, chunk_paths, [], 0, True
+        )
+
+    def _prepare_gzip_plan(
+        self, plan: _artifact_download.GzipPlan, temporary_prefix: str
+    ) -> None:
+        """Clear what the plan replaces, just before its file is written."""
+        self._remove_orphan_temp_files(plan.destination, temporary_prefix)
+        partial, partial_manifest = self._partial_paths(plan.destination)
+        if not plan.promote:
+            # Appending to a completed file: an older partial rebuild is stale.
+            partial_manifest.unlink(missing_ok=True)
+            partial.unlink(missing_ok=True)
+        elif not plan.known:
+            # Drop the manifest before the writer truncates the partial file.
+            partial_manifest.unlink(missing_ok=True)
+
+    def _fetch_artifact_chunk(
+        self,
+        shared: _artifact_download.SharedConnection,
         run_uri: str,
         relative_path: str,
-        artifact_temp: Path,
-        output,
-    ) -> None:
-        downloaded = self._download_experiment_artifact(
-            connection,
-            run_uri,
-            relative_path,
-            artifact_temp,
+        spool_root: Path,
+        cancel: threading.Event | None = None,
+    ) -> Path:
+        """GET one chunk into its own temp directory, retrying transient errors."""
+
+        def attempt(connection: Any) -> Path:
+            target = Path(tempfile.mkdtemp(prefix="chunk-", dir=spool_root))
+            try:
+                return self._download_experiment_artifact(
+                    connection, run_uri, relative_path, target
+                )
+            except BaseException:
+                shutil.rmtree(target, ignore_errors=True)
+                raise
+
+        return _artifact_download.call_with_retry(
+            shared, self._artifact_retry_policy, f"GET {relative_path}", attempt, cancel
         )
-        try:
-            self._copy_gzip_member(downloaded, output)
-        finally:
-            downloaded.unlink(missing_ok=True)
+
+    def _commit_chunk(
+        self,
+        writer: _artifact_download.ChunkWriter,
+        relative_path: str,
+        fetched: Callable[[], Path],
+        fetch_again: Callable[[], Path],
+        *,
+        run_uri: str,
+        strict: bool,
+        warnings: list[str],
+    ) -> None:
+        """Append one fetched chunk, or skip it when it is gone or damaged.
+
+        A chunk removed after the listing is skipped. One that will not
+        decompress is fetched once more, then skipped. ``strict`` raises instead.
+        """
+        uri = run_uri + relative_path
+
+        def skip(reason: str) -> None:
+            message = f"skipped chunk {uri}: {reason}"
+            logger.warning(message)
+            warnings.append(message)
+            writer.skip(relative_path)
+
+        for attempt, fetch in enumerate((fetched, fetch_again)):
+            try:
+                downloaded = fetch()
+            except Exception as exc:
+                if strict or not _artifact_download.is_file_not_found(exc):
+                    raise
+                skip("it no longer exists in the run's stage (it was removed after it was listed)")
+                return
+            try:
+                writer.append(relative_path, downloaded)
+                return
+            except _artifact_download.CORRUPT_CHUNK_ERRORS as exc:
+                if strict:
+                    raise
+                if attempt:
+                    skip(
+                        f"it is damaged and could not be decompressed ({exc}); "
+                        "the saved file is missing that chunk's output"
+                    )
+                    return
+                logger.warning(
+                    "chunk %s could not be decompressed (%s); downloading it again", uri, exc
+                )
+            finally:
+                shutil.rmtree(downloaded.parent, ignore_errors=True)
+
+    def _promote_partial(self, plan: _artifact_download.GzipPlan) -> None:
+        """Replace the destination with a completed partial file."""
+        manifest = self._resume_manifest_path(plan.destination)
+        manifest.unlink(missing_ok=True)
+        os.replace(plan.data_path, plan.destination)
+        os.replace(plan.manifest_path, manifest)
 
     @staticmethod
     def _artifact_progress_status(
@@ -2948,258 +3130,385 @@ class CortexTrainingClient:
             raise
         self._report_artifact_progress(progress, "\n")
 
-    def _write_ordered_gzip_chunks(
+    def _write_gzip_plans(
         self,
-        connection: Any,
+        shared: _artifact_download.SharedConnection,
         run_uri: str,
-        artifact_temp: Path,
-        paths: list[str],
-        output,
-        on_chunk: Callable[[int], None] | None = None,
-    ) -> None:
-        """GET sessions are not shared across workers; bytes append in path order."""
-        if len(paths) < _ARTIFACT_GET_MIN_CHUNKS:
-            for index, relative_path in enumerate(paths, start=1):
-                self._download_gzip_member(
-                    connection,
-                    run_uri,
-                    relative_path,
-                    artifact_temp,
-                    output,
-                )
-                if on_chunk is not None:
-                    on_chunk(index)
-            return
-        pool = [connection]
-        try:
-            limit = min(_ARTIFACT_GET_WORKERS, len(paths))
-            warned = False
-            while len(pool) < limit:
-                try:
-                    extra = self._open_experiment_artifact_connection()
-                except Exception:
-                    if not warned:
-                        logger.warning(
-                            "could not open an extra session for artifact download; "
-                            "continuing with %d",
-                            len(pool),
-                        )
-                        warned = True
-                    break
-                if any(extra is existing for existing in pool):
-                    break
-                pool.append(extra)
-            self._write_gzip_chunk_batches(
-                pool, run_uri, artifact_temp, paths, output, on_chunk
-            )
-        finally:
-            for extra in pool[1:]:
-                try:
-                    extra.close()
-                except Exception:
-                    logger.warning("failed to close an extra artifact-download session")
-
-    def _write_gzip_chunk_batches(
-        self,
-        pool: list[Any],
-        run_uri: str,
-        artifact_temp: Path,
-        paths: list[str],
-        output,
-        on_chunk: Callable[[int], None] | None,
-    ) -> None:
-        batch_size = len(pool)
-        for start in range(0, len(paths), batch_size):
-            batch = paths[start : start + batch_size]
-            chunk_dirs = []
-            for offset, _relative_path in enumerate(batch):
-                chunk_dir = artifact_temp / f"chunk-{start + offset}"
-                chunk_dir.mkdir()
-                chunk_dirs.append(chunk_dir)
-            try:
-                with ThreadPoolExecutor(max_workers=len(batch)) as executor:
-                    futures = [
-                        executor.submit(
-                            self._download_experiment_artifact,
-                            pool[index],
-                            run_uri,
-                            relative_path,
-                            chunk_dir,
-                        )
-                        for index, (relative_path, chunk_dir) in enumerate(
-                            zip(batch, chunk_dirs)
-                        )
-                    ]
-                    for offset, (future, chunk_dir) in enumerate(
-                        zip(futures, chunk_dirs), start=1
-                    ):
-                        downloaded = future.result()
-                        self._copy_gzip_member(downloaded, output)
-                        shutil.rmtree(chunk_dir, ignore_errors=True)
-                        if on_chunk is not None:
-                            on_chunk(start + offset)
-            finally:
-                for chunk_dir in chunk_dirs:
-                    shutil.rmtree(chunk_dir, ignore_errors=True)
-
-    def _rebuild_gzip_file(
-        self,
-        connection: Any,
-        run_uri: str,
-        artifact_temp: Path,
-        destination: Path,
-        chunk_paths: list[str],
-        *,
-        temporary_prefix: str,
         artifact_name: str,
-        progress: Callable[[str], None] | None,
-    ) -> dict[str, Any]:
-        """Write every chunk to a temp file, then replace the destination.
+        plans: list[_artifact_download.GzipPlan],
+        *,
+        max_workers: int,
+        temporary_prefix: str,
+        progress: Callable[[str], None] | None = None,
+        on_chunk: Callable[[str, int, int, int], None] | None = None,
+        strict: bool = False,
+        warnings_by_sub_job: Mapping[str, list[str]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fetch every new chunk concurrently and append them in plan order.
 
-        The manifest is removed only after the temp file is fsynced, so a failed
-        chunk download leaves the previous manifest and destination in place.
+        Fetches run ahead of the writer across sub-job boundaries, up to a
+        bounded window, so a short sub-job never leaves workers idle.
+        ``warnings_by_sub_job`` is copied into each sub-job's result.
+
+        For each sub-job, ``progress`` gets a status line before anything in
+        the output directory changes, an update after each appended chunk, and
+        ``"\\n"`` once the manifest is written or the sub-job fails; a sub-job
+        with nothing new gets one line ending in a newline instead.
+        ``on_chunk`` gets ``(sub_job_id, done, total, bytes)`` counts, with
+        ``done == total`` only after the file is committed.
         """
-        sub_job_id = destination.parent.name
-        chunk_count = len(chunk_paths)
-
-        def report_chunk(index: int) -> None:
-            self._report_artifact_progress(
-                progress,
-                self._artifact_progress_status(
-                    artifact_name, index, chunk_count, sub_job_id
-                ),
+        work = [path for plan in plans for path in plan.new_paths]
+        window = max_workers * self._DOWNLOAD_WINDOW_PER_WORKER
+        results: list[dict[str, Any]] = []
+        cancel = threading.Event()
+        saved_progress = False
+        spool_prefix = f"cortex-training-{artifact_name}-artifacts-"
+        _artifact_download.Spool.sweep(spool_prefix, self._TEMP_ORPHAN_MIN_AGE_SECONDS)
+        with _artifact_download.Spool(spool_prefix) as spool:
+            spool_root = spool.path
+            pool = ThreadPoolExecutor(
+                max_workers=max_workers, thread_name_prefix="cortex-training-download"
             )
-
-        with self._artifact_progress_line(progress):
-            self._report_artifact_progress(
-                progress,
-                self._artifact_progress_status(artifact_name, 0, chunk_count, sub_job_id),
-            )
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            output = tempfile.NamedTemporaryFile(
-                mode="wb",
-                dir=str(destination.parent),
-                prefix=temporary_prefix,
-                suffix=".tmp",
-                delete=False,
-            )
-            temporary = Path(output.name)
+            pending: deque[Future[Path]] = deque()
+            # The fetch the writer is waiting on; it has left ``pending``.
+            head: Future[Path] | None = None
+            submitted = 0
             try:
-                self._write_ordered_gzip_chunks(
-                    connection,
-                    run_uri,
-                    artifact_temp,
-                    chunk_paths,
-                    output,
-                    report_chunk,
-                )
-                output.flush()
-                os.fsync(output.fileno())
-                output.close()
-                self._resume_manifest_path(destination).unlink(missing_ok=True)
-                os.replace(temporary, destination)
-                nbytes = destination.stat().st_size
-                self._write_resume_manifest(destination, chunk_paths, nbytes)
-            except BaseException:
-                if not output.closed:
-                    output.close()
-                temporary.unlink(missing_ok=True)
-                raise
-        return self._artifact_result(destination, run_uri, chunk_paths)
+                for plan in plans:
+                    total = len(plan.chunk_paths)
+                    new_total = len(plan.new_paths)
+                    warnings = list((warnings_by_sub_job or {}).get(plan.sub_job_id, []))
+                    if plan.skipped:
+                        warnings.append(
+                            f"{len(plan.skipped)} damaged chunk(s) skipped by an earlier "
+                            "download are still missing from the saved file; download "
+                            "again without resume to retry them"
+                        )
+                    if not new_total:
+                        self._report_artifact_progress(
+                            progress, f"{artifact_name}: no new chunks for {plan.sub_job_id}\n"
+                        )
 
-    def _append_gzip_chunks(
-        self,
-        connection: Any,
-        run_uri: str,
-        artifact_temp: Path,
-        destination: Path,
-        chunk_paths: list[str],
-        known: list[str],
-        committed: int,
-        *,
-        temporary_prefix: str,
-        artifact_name: str,
-        progress: Callable[[str], None] | None,
-    ) -> dict[str, Any]:
-        """Append chunk paths that sort after ``known``, or rebuild."""
-        sub_job_id = destination.parent.name
-        if known != chunk_paths[: len(known)]:
-            return self._rebuild_gzip_file(
-                connection,
-                run_uri,
-                artifact_temp,
-                destination,
-                chunk_paths,
-                temporary_prefix=temporary_prefix,
-                artifact_name=artifact_name,
-                progress=progress,
-            )
-        new_paths = chunk_paths[len(known) :]
-        try:
-            size = destination.stat().st_size
-        except OSError:
-            size = -1
-        if not destination.is_file() or size < committed:
-            return self._rebuild_gzip_file(
-                connection,
-                run_uri,
-                artifact_temp,
-                destination,
-                chunk_paths,
-                temporary_prefix=temporary_prefix,
-                artifact_name=artifact_name,
-                progress=progress,
-            )
-        if not new_paths:
-            self._report_artifact_progress(
-                progress,
-                f"{artifact_name}: no new chunks for {sub_job_id}\n",
-            )
-            if size > committed:
-                with destination.open("r+b") as output:
-                    output.truncate(committed)
-                    output.flush()
-                    os.fsync(output.fileno())
-            return self._artifact_result(destination, run_uri, known)
-        names = list(known) + new_paths
+                    def report(done: int, plan=plan, new_total=new_total) -> None:
+                        if new_total:
+                            self._report_artifact_progress(
+                                progress,
+                                self._artifact_progress_status(
+                                    artifact_name, done, new_total, plan.sub_job_id
+                                ),
+                            )
 
-        def report_chunk(index: int) -> None:
-            self._report_artifact_progress(
-                progress,
-                self._artifact_progress_status(
-                    artifact_name, index, len(new_paths), sub_job_id
-                ),
-            )
-
-        with self._artifact_progress_line(progress):
-            self._report_artifact_progress(
-                progress,
-                self._artifact_progress_status(
-                    artifact_name, 0, len(new_paths), sub_job_id
-                ),
-            )
-            with destination.open("r+b") as output:
-                output.seek(committed)
-                output.truncate(committed)
-                try:
-                    self._write_ordered_gzip_chunks(
-                        connection,
-                        run_uri,
-                        artifact_temp,
-                        new_paths,
-                        output,
-                        report_chunk,
+                    with self._artifact_progress_line(progress if new_total else None):
+                        # Reported before anything in the output directory changes.
+                        report(0)
+                        self._prepare_gzip_plan(plan, temporary_prefix)
+                        writer = _artifact_download.ChunkWriter(
+                            plan.data_path,
+                            plan.manifest_path,
+                            plan.known,
+                            plan.committed,
+                            buffer_bytes=_STREAM_COPY_BUFFER_BYTES,
+                            checkpoint_chunks=self._DOWNLOAD_CHECKPOINT_CHUNKS,
+                            checkpoint_seconds=self._DOWNLOAD_CHECKPOINT_SECONDS,
+                            skipped=plan.skipped,
+                        )
+                        saved_progress = saved_progress or bool(writer.names)
+                        try:
+                            if on_chunk is not None and len(writer.names) < total:
+                                on_chunk(plan.sub_job_id, len(writer.names), total, writer.offset)
+                            for done, relative_path in enumerate(plan.new_paths, start=1):
+                                while submitted < len(work) and len(pending) < window:
+                                    pending.append(
+                                        pool.submit(
+                                            self._fetch_artifact_chunk,
+                                            shared,
+                                            run_uri,
+                                            work[submitted],
+                                            spool_root,
+                                            cancel,
+                                        )
+                                    )
+                                    submitted += 1
+                                head = pending.popleft()
+                                self._commit_chunk(
+                                    writer,
+                                    relative_path,
+                                    head.result,
+                                    functools.partial(
+                                        self._fetch_artifact_chunk,
+                                        shared,
+                                        run_uri,
+                                        relative_path,
+                                        spool_root,
+                                        cancel,
+                                    ),
+                                    run_uri=run_uri,
+                                    strict=strict,
+                                    warnings=warnings,
+                                )
+                                saved_progress = True
+                                report(done)
+                                # done == total is reported once the file is committed.
+                                if on_chunk is not None and len(writer.names) < total:
+                                    on_chunk(
+                                        plan.sub_job_id, len(writer.names), total, writer.offset
+                                    )
+                            writer.finish()
+                        except BaseException:
+                            try:
+                                writer.abort()
+                            except Exception:
+                                logger.warning(
+                                    "could not save download progress for %s",
+                                    plan.destination,
+                                    exc_info=True,
+                                )
+                            raise
+                        if plan.promote:
+                            self._promote_partial(plan)
+                        if on_chunk is not None:
+                            on_chunk(plan.sub_job_id, total, total, writer.offset)
+                    results.append(
+                        self._artifact_result(
+                            plan.destination,
+                            run_uri,
+                            writer.names,
+                            skipped=writer.skipped,
+                            warnings=warnings,
+                        )
                     )
-                    output.flush()
-                    os.fsync(output.fileno())
-                    end = output.tell()
-                except BaseException:
-                    output.truncate(committed)
-                    output.flush()
-                    os.fsync(output.fileno())
-                    raise
-            self._write_resume_manifest(destination, names, end)
-        return self._artifact_result(destination, run_uri, names)
+            except BaseException as exc:
+                # Workers stop at their next attempt or backoff; only a GET
+                # already on the wire runs to completion, and it is not awaited.
+                cancel.set()
+                pool.shutdown(wait=False, cancel_futures=True)
+                spool.remove_after([*([head] if head is not None else []), *pending])
+                with contextlib.suppress(Exception):
+                    exc.download_progress_saved = saved_progress  # type: ignore[attr-defined]
+                raise
+            pool.shutdown(wait=True)
+        return results
+
+    def _list_gzip_chunks(
+        self,
+        shared: _artifact_download.SharedConnection,
+        run_uri: str,
+        run_name: str,
+        job_id: str,
+        artifact_name: str,
+        chunk_pattern: re.Pattern[str],
+        *,
+        report_merges: bool = True,
+    ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+        """Return each sub-job's chunk paths in time order, plus listing warnings.
+
+        Chunks normally live under ``_<name>/``; a run whose stage is anchored
+        under ``checkpoints/`` uses ``checkpoints/_<name>/``. If one sub-job has
+        chunks under both, they are merged by chunk name (which starts with the
+        chunk's time), and a chunk name present in both keeps the
+        ``_<name>/`` copy, so no output is dropped or repeated.
+        """
+        policy = self._artifact_retry_policy
+        artifact_roots = (f"_{artifact_name}", f"checkpoints/_{artifact_name}")
+        by_root: dict[str, dict[str, dict[str, str]]] = {}
+        for artifact_root in artifact_roots:
+            paths = _artifact_download.call_with_retry(
+                shared,
+                policy,
+                f"LIST {artifact_root}",
+                lambda connection, artifact_root=artifact_root: (
+                    self._list_experiment_artifacts(
+                        connection, run_uri, run_name, artifact_root
+                    )
+                ),
+            )
+            prefix = artifact_root + "/"
+            for relative_path in paths:
+                after_root = relative_path.removeprefix(prefix)
+                sub_job_id, separator, filename = after_root.partition("/")
+                if (
+                    not separator
+                    or sub_job_id in {"", ".", ".."}
+                    or not (
+                        sub_job_id == job_id
+                        or sub_job_id.startswith(f"{job_id}:")
+                    )
+                    or "/" in filename
+                    or "\\" in sub_job_id
+                    or chunk_pattern.fullmatch(filename) is None
+                ):
+                    continue
+                by_root.setdefault(sub_job_id, {}).setdefault(artifact_root, {})[
+                    filename
+                ] = relative_path
+
+        chunks: dict[str, list[str]] = {}
+        warnings: dict[str, list[str]] = {}
+        for sub_job_id, roots in by_root.items():
+            merged: dict[str, str] = {}
+            for artifact_root in reversed(artifact_roots):
+                merged.update(roots.get(artifact_root, {}))
+            chunks[sub_job_id] = [merged[name] for name in sorted(merged)]
+            if len(roots) > 1 and report_merges:
+                message = (
+                    f"{artifact_name} chunks for {sub_job_id} were saved under both "
+                    f"{artifact_roots[0]}/ and {artifact_roots[1]}/; they were merged "
+                    "in chunk time order"
+                )
+                logger.warning(message)
+                warnings[sub_job_id] = [message]
+        return chunks, warnings
+
+    # A metrics chunk is uploaded about once a minute; until a sub-job has run
+    # for twice that, having none yet is expected.
+    _MISSING_METRICS_GRACE_SECONDS = 120.0
+    # Allowance for a local clock behind the server's when deciding whether the
+    # job status is worth fetching; the decision itself uses the server's clock.
+    _STALE_PRECHECK_SKEW_SECONDS = 300.0
+
+    def _job_for_upload_warnings(self, job_id: str) -> tuple[dict, float | None]:
+        """Return the job and the server's clock (from the ``Date`` header), if any."""
+        resp = self._send("GET", f"{self._prefix}/{job_id}")
+        server_now = None
+        try:
+            server_now = email.utils.parsedate_to_datetime(resp.headers["Date"]).timestamp()
+        except Exception:
+            logger.debug("job response has no usable Date header", exc_info=True)
+        job = resp.json()
+        return (job if isinstance(job, dict) else {}), server_now
+
+    @staticmethod
+    def _parse_api_time(value: Any) -> float | None:
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+
+    @staticmethod
+    def _chunk_time(chunk_pattern: re.Pattern[str], relative_path: str) -> float | None:
+        """Return the UTC time in a chunk's name, or None if it has none."""
+        match = chunk_pattern.fullmatch(PurePosixPath(relative_path).name)
+        if match is None:
+            return None
+        try:
+            stamp = datetime.strptime(match.group("timestamp"), "%Y%m%d-%H%M%S")
+        except ValueError:
+            return None
+        return stamp.replace(tzinfo=timezone.utc).timestamp()
+
+    def _stale_upload_warnings(
+        self,
+        shared: _artifact_download.SharedConnection,
+        run_uri: str,
+        run_name: str,
+        job_id: str,
+        artifact_name: str,
+        chunk_pattern: re.Pattern[str],
+        chunks_by_sub_job: Mapping[str, list[str]],
+        wanted: set[str] | None,
+        stale_after_seconds: float | None,
+    ) -> dict[str, list[str]]:
+        """Warn when a running job's uploads look stalled; never raises.
+
+        Two signs: the newest chunk's name time is older than
+        ``stale_after_seconds``, or (for metrics) a sub-job has saved stdout but
+        no metrics at all. A sub-job is checked only while it (or, if the job
+        does not report sub-job status, the job) is ``running``, and only once
+        it has been running long enough for the sign to mean anything. Ages
+        use the server's clock when the response carries one.
+        """
+        if stale_after_seconds is None:
+            return {}
+        local_now = self._wall_clock()
+        candidates: dict[str, float] = {}
+        for sub_job_id, paths in chunks_by_sub_job.items():
+            if wanted is not None and sub_job_id not in wanted:
+                continue
+            newest = self._chunk_time(chunk_pattern, paths[-1])
+            if newest is not None and local_now - newest > max(
+                stale_after_seconds - self._STALE_PRECHECK_SKEW_SECONDS, 0
+            ):
+                candidates[sub_job_id] = newest
+        check_missing = artifact_name == "metrics"
+        if not candidates and not check_missing:
+            return {}
+        try:
+            job, server_now = self._job_for_upload_warnings(job_id)
+        except Exception:
+            logger.debug("job status lookup for upload warnings failed", exc_info=True)
+            return {}
+        if self._normalize_job_status(job.get("status")) != "running":
+            return {}
+        now = local_now if server_now is None else server_now
+        # When the job entered its current state; absent on older services.
+        running_since = self._parse_api_time(job.get("state_changed_at"))
+        sub_job_status = {
+            sub_job.get("sub_job_id"): self._normalize_job_status(sub_job.get("status"))
+            for sub_job in job.get("sub_jobs") or []
+            if isinstance(sub_job, dict) and sub_job.get("status")
+        }
+
+        def running_for(sub_job_id: str, started: float | None = None) -> float | None:
+            """Seconds the sub-job has been running, None if unknown, -1 if not running."""
+            status = sub_job_status.get(sub_job_id)
+            if status is not None and status != "running":
+                return -1.0
+            starts = [t for t in (running_since, started) if t is not None]
+            return now - max(starts) if starts else None
+
+        label = "stdout output" if artifact_name == "stdout" else "GPU metrics"
+        warnings: dict[str, list[str]] = {}
+        for sub_job_id, newest in candidates.items():
+            age = now - newest
+            ran = running_for(sub_job_id)
+            if age <= stale_after_seconds or (ran is not None and ran < stale_after_seconds):
+                continue
+            stamp = datetime.fromtimestamp(newest, tz=timezone.utc)
+            message = (
+                f"newest saved {label} for {sub_job_id} is from "
+                f"{stamp:%Y-%m-%d %H:%M:%S} UTC ({int(age // 60)} min ago) while the job "
+                "is still running; uploads may be stalled. Contact support if this persists."
+            )
+            if artifact_name == "stdout":
+                message += " A job that prints nothing for a while also looks like this."
+            warnings[sub_job_id] = [message]
+        if check_missing:
+            try:
+                stdout_chunks, _ = self._list_gzip_chunks(
+                    shared,
+                    run_uri,
+                    run_name,
+                    job_id,
+                    "stdout",
+                    _STDOUT_CHUNK_RE,
+                    report_merges=False,
+                )
+            except Exception:
+                logger.debug("stdout listing for upload warnings failed", exc_info=True)
+                stdout_chunks = {}
+            for sub_job_id, paths in stdout_chunks.items():
+                if sub_job_id in chunks_by_sub_job or (
+                    wanted is not None and sub_job_id not in wanted
+                ):
+                    continue
+                # The first stdout chunk is the latest evidence of when it started.
+                ran = running_for(sub_job_id, self._chunk_time(_STDOUT_CHUNK_RE, paths[0]))
+                if ran is not None and ran < self._MISSING_METRICS_GRACE_SECONDS:
+                    continue
+                warnings[sub_job_id] = [
+                    f"no GPU metrics have been saved for {sub_job_id} while the job is "
+                    "still running, although its stdout output has been; metric "
+                    "uploads may be stalled. Contact support if this persists."
+                ]
+        for messages in warnings.values():
+            for message in messages:
+                logger.warning(message)
+        return warnings
 
     def _download_gzip_artifacts(
         self,
@@ -3211,118 +3520,163 @@ class CortexTrainingClient:
         destination_name: str,
         temporary_prefix: str,
         resume: bool = False,
+        max_workers: int | None = None,
         progress: Callable[[str], None] | None = None,
+        on_chunk: Callable[[str, int, int, int], None] | None = None,
+        sub_job_ids: Iterable[str] | None = None,
+        strict: bool = False,
+        stale_after_seconds: float | None = _DOWNLOAD_STALE_AFTER_SECONDS,
+        transfer_timeout_seconds: float | None = _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS,
     ) -> list[dict[str, Any]]:
         """Reconstruct staged gzip chunks into one file per sub-job.
 
-        Each sub-job is committed before the next one starts. ``resume=True``
-        appends when the manifest names are a prefix of the sorted chunk list.
+        Chunks are fetched concurrently and appended in sorted name order. A
+        sub-job's destination is replaced only when every chunk is written;
+        until then progress is checkpointed to a hidden ``.partial`` file so
+        ``resume=True`` can continue an interrupted first download. With
+        ``resume=True`` a completed file is extended when its manifest names
+        are a prefix of the sorted chunk list, and rebuilt otherwise. A chunk
+        that will not decompress is downloaded once more and then skipped,
+        unless ``strict``.
         """
+        if max_workers is None:
+            max_workers = self._DOWNLOAD_DEFAULT_WORKERS
+        if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
+            raise ValueError("max_workers must be a positive integer")
+        wanted = None if sub_job_ids is None else set(sub_job_ids)
+        if wanted is not None and not wanted:
+            raise ValueError("sub_job_ids must name at least one sub-job")
+        if stale_after_seconds is not None and (
+            isinstance(stale_after_seconds, bool)
+            or not isinstance(stale_after_seconds, (int, float))
+            or stale_after_seconds <= 0
+        ):
+            raise ValueError("stale_after_seconds must be a positive number or None")
+        if transfer_timeout_seconds is not None and (
+            isinstance(transfer_timeout_seconds, bool)
+            or not isinstance(transfer_timeout_seconds, (int, float))
+            or not transfer_timeout_seconds > 0
+        ):
+            raise ValueError("transfer_timeout_seconds must be a positive number or None")
         run_uri, run_name = self._experiment_run_uri(job_id)
-        connection = self._open_experiment_artifact_connection()
+        shared = _artifact_download.SharedConnection(
+            self._open_experiment_artifact_connection, transfer_timeout_seconds
+        )
         root = Path(output_dir).expanduser()
-        artifact_roots = (f"_{artifact_name}", f"checkpoints/_{artifact_name}")
         try:
-            paths_by_root = {
-                artifact_root: self._list_experiment_artifacts(
-                    connection, run_uri, run_name, artifact_root
-                )
-                for artifact_root in artifact_roots
-            }
-            chunks_by_sub_job: dict[str, dict[str, Any]] = {}
-            for artifact_root, paths in paths_by_root.items():
-                prefix = artifact_root + "/"
-                for relative_path in paths:
-                    after_root = relative_path.removeprefix(prefix)
-                    sub_job_id, separator, filename = after_root.partition("/")
-                    if (
-                        not separator
-                        or sub_job_id in {"", ".", ".."}
-                        or not (
-                            sub_job_id == job_id
-                            or sub_job_id.startswith(f"{job_id}:")
-                        )
-                        or "/" in filename
-                        or "\\" in sub_job_id
-                        or chunk_pattern.fullmatch(filename) is None
-                    ):
-                        continue
-                    chunks = chunks_by_sub_job.get(sub_job_id)
-                    if chunks is None:
-                        chunks = {"artifact_root": artifact_root, "paths": []}
-                        chunks_by_sub_job[sub_job_id] = chunks
-                    elif chunks["artifact_root"] != artifact_root:
-                        raise ValueError(
-                            f"{artifact_name} chunks for {sub_job_id!r} appear "
-                            "under multiple artifact roots"
-                        )
-                    chunks["paths"].append(relative_path)
-
-            if not chunks_by_sub_job:
-                self._report_artifact_progress(
-                    progress, f"{artifact_name}: found 0 chunks\n"
-                )
-                return []
-
-            results: list[dict[str, Any]] = []
-            with tempfile.TemporaryDirectory(
-                prefix=f"cortex-training-{artifact_name}-artifacts-"
-            ) as temp:
-                artifact_temp = Path(temp)
-                for sub_job_id in sorted(chunks_by_sub_job):
-                    chunk_paths = sorted(chunks_by_sub_job[sub_job_id]["paths"])
-                    destination = root / sub_job_id / destination_name
-                    prior = self._read_resume_manifest(destination) if resume else None
-                    if prior is None:
-                        results.append(
-                            self._rebuild_gzip_file(
-                                connection,
-                                run_uri,
-                                artifact_temp,
-                                destination,
-                                chunk_paths,
-                                temporary_prefix=temporary_prefix,
-                                artifact_name=artifact_name,
-                                progress=progress,
-                            )
-                        )
-                        continue
-                    known, committed = prior
-                    results.append(
-                        self._append_gzip_chunks(
-                            connection,
-                            run_uri,
-                            artifact_temp,
-                            destination,
-                            chunk_paths,
-                            known,
-                            committed,
-                            temporary_prefix=temporary_prefix,
-                            artifact_name=artifact_name,
-                            progress=progress,
-                        )
+            chunks_by_sub_job, warnings_by_sub_job = self._list_gzip_chunks(
+                shared, run_uri, run_name, job_id, artifact_name, chunk_pattern
+            )
+            stale = self._stale_upload_warnings(
+                shared,
+                run_uri,
+                run_name,
+                job_id,
+                artifact_name,
+                chunk_pattern,
+                chunks_by_sub_job,
+                wanted,
+                stale_after_seconds,
+            )
+            for sub_job_id, messages in stale.items():
+                warnings_by_sub_job.setdefault(sub_job_id, []).extend(messages)
+            # Sub-jobs with a warning but no chunks yet still get a result entry.
+            unsaved = sorted(set(stale) - set(chunks_by_sub_job))
+            if wanted is not None:
+                missing = sorted(wanted - set(chunks_by_sub_job) - set(unsaved))
+                if missing:
+                    available = sorted(chunks_by_sub_job)
+                    raise NoChunksError(
+                        f"no {artifact_name} chunks for sub-job(s) "
+                        f"{', '.join(missing)}; sub-jobs with {artifact_name}: "
+                        f"{', '.join(available) or 'none'}",
+                        sub_job_ids=missing,
+                        available=available,
                     )
-            return results
+            plans = [
+                self._plan_gzip_download(
+                    sub_job_id,
+                    root / sub_job_id / destination_name,
+                    chunks_by_sub_job[sub_job_id],
+                    resume=resume,
+                )
+                for sub_job_id in sorted(chunks_by_sub_job)
+                if wanted is None or sub_job_id in wanted
+            ]
+            results: list[dict[str, Any]] = []
+            if not plans:
+                self._report_artifact_progress(progress, f"{artifact_name}: found 0 chunks\n")
+            else:
+                results = self._write_gzip_plans(
+                    shared,
+                    run_uri,
+                    artifact_name,
+                    plans,
+                    max_workers=max_workers,
+                    temporary_prefix=temporary_prefix,
+                    progress=progress,
+                    on_chunk=on_chunk,
+                    strict=strict,
+                    warnings_by_sub_job=warnings_by_sub_job,
+                )
+            results.extend(
+                {
+                    "sub_job_id": sub_job_id,
+                    "filename": destination_name,
+                    "saved_path": None,
+                    "chunk_count": 0,
+                    "first_artifact_uri": None,
+                    "last_artifact_uri": None,
+                    "warnings": warnings_by_sub_job[sub_job_id],
+                }
+                for sub_job_id in unsaved
+            )
+            return sorted(results, key=lambda result: result["sub_job_id"])
         finally:
-            connection.close()
+            shared.close()
 
+    @_track_operation("download_stdout_logs")
     def download_stdout_logs(
         self,
         job_id: str,
         output_dir: str | os.PathLike[str],
         *,
         resume: bool = False,
+        max_workers: int | None = None,
         progress: Callable[[str], None] | None = None,
+        on_chunk: Callable[[str, int, int, int], None] | None = None,
+        sub_job_ids: Iterable[str] | None = None,
+        strict: bool = False,
+        stale_after_seconds: float | None = _DOWNLOAD_STALE_AFTER_SECONDS,
+        transfer_timeout_seconds: float | None = _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS,
     ) -> list[dict[str, Any]]:
         """Reconstruct sealed console artifacts into one file per sub-job.
 
-        ``resume=True`` appends chunks that are not already recorded beside the
-        file. Two downloads of the same output directory at once are unsupported.
+        Chunks are fetched with up to ``max_workers`` concurrent GETs (default
+        16). ``resume=True`` appends chunks that are not already recorded beside
+        the file, and continues an interrupted download; progress is saved as
+        the download runs whether or not ``resume`` is set.
+
         ``progress`` receives status updates without a trailing newline, then
         ``"\\n"`` when that sub-job finishes or fails. A status that needs no
         updating (nothing new, no chunks) arrives as one message ending in a
-        newline. An error raised by ``progress`` stops the download. The return
-        value is unchanged.
+        newline. ``on_chunk`` is called as
+        ``on_chunk(sub_job_id, chunks_done, chunks_total, bytes)`` when a
+        sub-job starts and after each appended chunk; ``chunks_done ==
+        chunks_total`` arrives only after that sub-job's file is committed.
+        Both run on the calling thread. An error raised by either stops the
+        download, keeps the chunks already written for ``resume=True``, and is
+        re-raised; raise :class:`DownloadCancelled` to cancel without the call
+        being counted as a failure. The return value is unchanged.
+        ``sub_job_ids`` limits the download to those sub-jobs. A chunk that will
+        not decompress is downloaded once more and then skipped; it is listed in
+        that sub-job's ``skipped_chunks`` and ``warnings``. ``strict=True``
+        raises instead. While the job is running, a sub-job whose newest chunk is
+        older than ``stale_after_seconds`` (default 600; ``None`` disables) gets
+        a warning that uploads may be stalled; the download still completes.
+        A LIST or GET attempt still running after ``transfer_timeout_seconds``
+        (default 300; ``None`` disables) is abandoned and retried. Two
+        downloads of the same output directory at once are unsupported.
         """
         return self._download_gzip_artifacts(
             job_id,
@@ -3332,26 +3686,39 @@ class CortexTrainingClient:
             destination_name="stdout.log",
             temporary_prefix=".stdout-",
             resume=resume,
+            max_workers=max_workers,
             progress=progress,
+            on_chunk=on_chunk,
+            sub_job_ids=sub_job_ids,
+            strict=strict,
+            stale_after_seconds=stale_after_seconds,
+            transfer_timeout_seconds=transfer_timeout_seconds,
         )
 
+    @_track_operation("download_metrics")
     def download_metrics(
         self,
         job_id: str,
         output_dir: str | os.PathLike[str],
         *,
         resume: bool = False,
+        max_workers: int | None = None,
         progress: Callable[[str], None] | None = None,
+        on_chunk: Callable[[str, int, int, int], None] | None = None,
+        sub_job_ids: Iterable[str] | None = None,
+        strict: bool = False,
+        stale_after_seconds: float | None = _DOWNLOAD_STALE_AFTER_SECONDS,
+        transfer_timeout_seconds: float | None = _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS,
     ) -> list[dict[str, Any]]:
         """Reconstruct staged GPU metric chunks into one JSONL file per sub-job.
 
-        ``resume=True`` appends chunks that are not already recorded beside the
-        file. Two downloads of the same output directory at once are unsupported.
-        ``progress`` receives status updates without a trailing newline, then
-        ``"\\n"`` when that sub-job finishes or fails. A status that needs no
-        updating (nothing new, no chunks) arrives as one message ending in a
-        newline. An error raised by ``progress`` stops the download. The return
-        value is unchanged.
+        Accepts the same ``resume``, ``max_workers``, ``progress``, ``on_chunk``,
+        ``sub_job_ids``, ``strict``, ``stale_after_seconds``, and
+        ``transfer_timeout_seconds`` options as
+        :meth:`download_stdout_logs`. While the job is running, a sub-job with
+        saved stdout but no metrics gets a result entry with ``chunk_count`` 0,
+        ``saved_path`` ``None``, and a warning. Two downloads
+        of the same output directory at once are unsupported.
         """
         return self._download_gzip_artifacts(
             job_id,
@@ -3361,7 +3728,13 @@ class CortexTrainingClient:
             destination_name="gpu.jsonl",
             temporary_prefix=".gpu-metrics-",
             resume=resume,
+            max_workers=max_workers,
             progress=progress,
+            on_chunk=on_chunk,
+            sub_job_ids=sub_job_ids,
+            strict=strict,
+            stale_after_seconds=stale_after_seconds,
+            transfer_timeout_seconds=transfer_timeout_seconds,
         )
 
     # ─── Data-plane async operations ─────────────────────────────────────

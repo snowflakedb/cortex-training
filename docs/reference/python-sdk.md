@@ -53,7 +53,8 @@ Tracked operations:
   `get_capacity_breakdown`, `get_experiment_run`
 - Compute: `forward_backward`, `forward`, `generate`, `generate_stream`, `step`
 - Checkpoints and logs: `save`, `load`, `list_checkpoints`,
-  `export_checkpoint`, `delete_checkpoint`, `fetch_execution_logs`
+  `export_checkpoint`, `delete_checkpoint`, `fetch_execution_logs`,
+  `download_stdout_logs`, `download_metrics`
 - Multi-sub-job operations: `weight_sync`, `bootstrap_router_replay`,
   `router_replay_discard`, `reset_prefix_cache`
 - Async requests: `poll_request`, `get_request_status`, `cancel_request`
@@ -250,17 +251,30 @@ with 256 or fewer experts. See
 `stream_logs(job_id, follow=True, ...)` yields entries and keeps polling.
 `fetch_execution_logs(job_id)` downloads every log file for the job's experiment
 run and returns `{sub_job_id, filename, artifact_uri, content}` dicts.
-`download_stdout_logs(job_id, output_dir, *, resume=False, progress=None)` reconstructs persisted
-console chunks as `<output_dir>/<sub_job_id>/stdout.log`.
-`download_metrics(job_id, output_dir, *, resume=False, progress=None)` reconstructs GPU metric
-chunks as `<output_dir>/<sub_job_id>/gpu.jsonl`. The methods stay silent unless
+`download_stdout_logs(job_id, output_dir, *, resume=False, max_workers=None,
+progress=None, on_chunk=None, sub_job_ids=None, strict=False,
+stale_after_seconds=600, transfer_timeout_seconds=300)`
+reconstructs persisted console chunks as
+`<output_dir>/<sub_job_id>/stdout.log`.
+`download_metrics(...)`, with the same options, reconstructs GPU metric chunks
+as `<output_dir>/<sub_job_id>/gpu.jsonl`. Chunks are fetched `max_workers` at a
+time (default 16) on one Snowflake session and written in order. `resume=True`
+appends chunks that are not already recorded in the manifest beside that file
+and continues an interrupted download. The methods stay silent unless
 `progress` is passed. `progress` receives status updates without a trailing
 newline, then `"\n"` when that sub-job finishes or fails; a status that needs no
-updating arrives as one message ending in a newline. An error raised by
-`progress` stops the download. A large download may open additional Snowflake
-sessions for one sub-job, and each session can prompt for authentication.
-`resume=True` appends chunks
-that are not already recorded in the manifest beside that file. See
+updating arrives as one message ending in a newline.
+`on_chunk(sub_job_id, done, total, bytes)` reports counts instead, with
+`done == total` only after that sub-job's file is committed. Both run on the
+calling thread; an error raised by either stops the download and keeps the
+chunks already written. Raise `cortex_training.DownloadCancelled` to stop
+without the call counting as a failure. `sub_job_ids` limits the download; an
+entry with no chunks raises `cortex_training.NoChunksError`, a `ValueError`. A
+damaged chunk is fetched once more and then skipped and listed in the entry's
+`skipped_chunks` and `warnings`; `strict=True` raises instead. While the job is
+running, a sub-job whose newest chunk is older than `stale_after_seconds` (or,
+for metrics, one with stdout but no metrics) gets a warning that uploads may be
+stalled. See
 [GPU metrics download](rest-api.md#124-gpu-metrics-download) for the JSONL row
 schema.
 `get_experiment_run(job_id)` resolves the experiment/run names.

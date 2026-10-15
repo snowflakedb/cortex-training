@@ -430,6 +430,7 @@ The response shape consumed by this repository is flat at each sub-job:
   "reason": "",
   "created_at": "2026-07-20T18:00:00Z",
   "updated_at": "2026-07-20T18:01:00Z",
+  "state_changed_at": "2026-07-20T18:01:00Z",
   "submitted_by": "SOME_USER",
   "owner_role": "SOME_ROLE",
   "sub_jobs": [
@@ -450,6 +451,11 @@ The response shape consumed by this repository is flat at each sub-job:
 ```
 
 `wait_for_job()` repeatedly calls this endpoint until `running`.
+
+`state_changed_at` (UTC time the job entered its current `status`) is optional
+and may be absent. The client reads it only for the stalled-upload warnings in
+[section 12.3](#123-persisted-stdout-download); without it, those warnings skip
+the recent-start grace period and still require the sub-job to be `running`.
 
 `submitted_by` (submitting user's name) and `owner_role` (owning role's name)
 are best-effort and may be absent, e.g. if the user/role has since been
@@ -2229,31 +2235,122 @@ paths or object-store credentials.
 
 ### 12.3 Persisted stdout download
 
-`download_stdout_logs(job_id, output_dir, *, resume=False, progress=None)` downloads gzip chunks
-under `_stdout/{sub_job_id}/`, orders them by artifact name, and streams them
-into `<output_dir>/<sub_job_id>/stdout.log`. A large download may open
-additional Snowflake sessions to fetch one sub-job's chunks, and each of
-those sessions can prompt for authentication. Each sub-job is committed before
-the next one starts. A failed chunk leaves that sub-job's committed bytes
-and manifest in place. A hidden
-`.<filename>.manifest.json` beside the file records `version`, the sorted
-relative chunk paths, and the committed byte length.
+`download_stdout_logs(job_id, output_dir, *, resume=False, max_workers=None,
+progress=None, on_chunk=None, sub_job_ids=None, strict=False,
+stale_after_seconds=600, transfer_timeout_seconds=300)`
+downloads gzip chunks under
+`_stdout/{sub_job_id}/`, orders them by chunk name (which starts with the
+chunk's UTC time), and streams them into `<output_dir>/<sub_job_id>/stdout.log`.
+If a run has chunks for one sub-job under both `_stdout/` and
+`checkpoints/_stdout/`, the two lists are merged by chunk name and a name found
+in both keeps the `_stdout/` copy; the sub-job's result gets a warning.
 
-`resume=True` appends only when those paths are a prefix of the current sorted
-list and the file is at least that many bytes. A longer file is truncated back
-to the committed length. A missing or shorter file is rebuilt, as is a chunk
-list that is no longer a prefix of the sorted paths.
-Two downloads of the same output directory at once are unsupported.
-The method stays silent unless `progress` is passed. On a terminal, the CLI
-draws one updating line on stderr; a redirected stderr gets one final line per
-sub-job.
+Each chunk is one experiment artifact `GET` into a private temporary directory.
+Up to `max_workers` (default 16) run at once on one Connector session, each on
+its own cursor; fetches may finish in any order, but chunks are appended
+strictly in sorted name order. At most four fetched chunks per worker wait to
+be appended, which bounds temporary disk use. `LIST` and `GET` are retried with
+bounded exponential backoff on transient Connector, network, and service
+errors; a session or token expiry reopens the session. Each `LIST` or `GET`
+attempt is also limited to `transfer_timeout_seconds` (default 300; `None`
+removes the limit): the Connector's own storage read timeout allows many
+minutes per request and retries, so a stalled transfer could otherwise hold a
+download indefinitely. An attempt over the limit is abandoned and retried like
+any transient error; it only ever writes to its own temporary directory, so a
+late finish cannot change the output. Errors another attempt
+cannot fix fail immediately: missing privileges, a storage-side access refusal,
+an invalid stage or local path, and other statement errors. A chunk that no
+longer exists when it is fetched (it was removed after the listing) is skipped
+like a damaged chunk, below, and `strict=True` raises instead.
+
+A hidden `.<filename>.manifest.json` beside the file records `version`, the
+sorted relative chunk paths, and the committed byte length. While a sub-job is
+being rebuilt the output goes to a hidden `.<filename>.partial` file with its
+own `.<filename>.partial.manifest.json`; it replaces the destination only once
+every chunk is written, so a failed download leaves an earlier destination
+untouched. Manifests are checkpointed every 64 chunks or 5 seconds (for long
+downloads, at least every tenth of the chunks so far, which keeps manifest
+writes proportional to the chunk count) and when a download stops on an error
+or interrupt, and only after the data they describe is fsynced, so the recorded
+length never exceeds the file. Progress is saved
+whether or not `resume` is set. Fetched chunks wait in a private directory under
+the system temp directory. It is removed when the download returns, or after a
+cancel or error once the `GET`s that were already running finish. A directory
+left by a killed process is removed by a later download once it has not been
+written for an hour.
+
+`resume=True` first tries to extend the completed file, then a partial one. A
+file is extended only when its manifest paths are a prefix of the current
+sorted list and the file is at least that many bytes; anything past the
+recorded length is truncated first. Otherwise the sub-job is rebuilt from the
+first chunk, as it always is with `resume=False`. Leftover temporary files from
+a killed download are removed when the next download of that file starts, once
+they have not been written for an hour.
+
+A chunk that fails to decompress (bad gzip header, truncated member, corrupt
+data) is rolled back from the file, downloaded once more, and then skipped if it
+is still damaged. The manifest lists a skipped chunk both in `names` and in an
+optional `skipped` array, so resume does not fetch it again; a `resume=False`
+download retries it. `strict=True` raises on the first damaged chunk instead.
+
+Each result entry has `sub_job_id`, `filename`, `saved_path`, `chunk_count`
+(chunks written), `first_artifact_uri`, and `last_artifact_uri`, plus
+`skipped_chunks` (artifact URIs left out of the file) and `warnings`
+(customer-facing notices, also logged at WARNING) when either is non-empty.
+
+Stalled-upload warnings never fail the download. When a sub-job's newest chunk
+name time (UTC) may be more than `stale_after_seconds` old, the client reads the
+job with `GET /{job_id}`. It warns only if the job is `running`, the sub-job's
+own `status` (when the response lists it) is `running`, and the job has been in
+its current state (`state_changed_at`, when present) for at least
+`stale_after_seconds`. Ages are measured with the server's clock from the
+response's `Date` header; without one, the local clock is used, so a local
+clock that is off can cause or hide a warning. The sub-job's result then gets a
+warning such as "newest saved stdout output for SUB_JOB_ID is from
+2026-01-01 12:00:00 UTC (14 min ago) while the job is still running; uploads
+may be stalled. Contact support if this persists." `None` disables the check.
+
+The method stays silent unless `progress` is passed. `progress` receives, for
+each sub-job, a status line such as `stdout: [######--------------] 1/3
+SUB_JOB_ID` before anything in the output directory changes, an updated line
+after each appended chunk (counting only the chunks this call adds), and then
+`"\n"` once that sub-job's manifest is written or the sub-job fails. A sub-job
+with nothing new gets one message ending in a newline (`stdout: no new chunks
+for SUB_JOB_ID`), and a job with no chunks gets `stdout: found 0 chunks`. On a
+terminal, the CLI draws one updating line on stderr; a redirected stderr gets
+one final line per sub-job.
+
+`on_chunk(sub_job_id, chunks_done, chunks_total, bytes)` reports counts
+instead: it is called when a sub-job starts and after each appended chunk, with
+totals over the whole sub-job, and the call with `chunks_done == chunks_total`
+comes only after that sub-job's file is complete and committed. Both callbacks
+run on the calling thread. An error raised by either stops the download as
+below. To stop a download on purpose, raise
+`cortex_training.DownloadCancelled` from a callback: no new `GET` starts,
+workers waiting out a retry backoff stop at once, the chunks already written
+are kept for `resume=True`, and the exception is re-raised. Client telemetry
+records it as cancelled, not failed. If a download fails or is interrupted
+after saving any output, the exception carries
+`download_progress_saved = True`. `sub_job_ids` limits the download
+to those sub-jobs and raises `cortex_training.NoChunksError` (a `ValueError`
+with `sub_job_ids` and `available` attributes) before any `GET` if one has no
+chunks. Two downloads of the same output directory at once are unsupported.
 
 ### 12.4 GPU metrics download
 
-`download_metrics(job_id, output_dir, *, resume=False, progress=None)` applies the same
-reconstruction to `gpu.YYYYMMDD-HHMMSS.UUID.gz` chunks under
-`_metrics/{sub_job_id}/` and writes `<output_dir>/<sub_job_id>/gpu.jsonl`,
-including `resume`, `progress`, and the manifest beside that file.
+`download_metrics(job_id, output_dir, *, resume=False, max_workers=None,
+progress=None, on_chunk=None, sub_job_ids=None, strict=False,
+stale_after_seconds=600, transfer_timeout_seconds=300)`
+applies the same reconstruction to
+`gpu.YYYYMMDD-HHMMSS.UUID.gz` chunks under `_metrics/{sub_job_id}/` and writes
+`<output_dir>/<sub_job_id>/gpu.jsonl`, including the options, retries, and the
+manifests beside that file. Unless `stale_after_seconds` is `None`, it also reads
+the job status. While the job is running it lists `_stdout/` too, and a running
+sub-job that has had stdout chunks for at least two minutes (judged from its
+first stdout chunk and `state_changed_at`) but no metrics chunks is returned
+with `chunk_count` 0,
+`saved_path`, `first_artifact_uri`, and `last_artifact_uri` set to `null`, and a
+warning that metric uploads may be stalled. Such a sub-job may be named in `sub_job_ids` without an error.
 
 The reconstructed file contains the JSONL records emitted by the deployed
 training runtime. Version 2 GPU rows have no `kind` field and include:
