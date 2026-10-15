@@ -3312,3 +3312,50 @@ def test_format_error_does_not_repeat_request_id_already_in_message() -> None:
 
     assert message.count("sf-req-1") == 1
     assert "response body:" in message
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["download-log", "job-1", "--log-type", "stdout"],
+        ["download-metrics", "job-1"],
+    ],
+)
+def test_chunk_download_refuses_a_directory_the_tui_is_downloading(tmp_path, command):
+    fcntl = pytest.importorskip("fcntl")
+    out_dir = tmp_path / "stdout"
+    lock_path = tmp_path / ".stdout.lock"
+    stderr = io.StringIO()
+    client = FakeClient()
+    # A separate open file description stands in for the TUI process.
+    with open(lock_path, "a+b") as tui:
+        fcntl.flock(tui.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        rc = cli.main(
+            _base_args() + command + ["--output-dir", str(out_dir)],
+            client_factory=lambda _: client,
+            stdout=io.StringIO(),
+            stderr=stderr,
+        )
+    assert rc == 1
+    assert f"another download is using {out_dir}" in stderr.getvalue()
+    assert not out_dir.exists()
+
+
+def test_chunk_download_takes_a_free_tui_lock_and_creates_none(tmp_path):
+    client = FakeClient()
+    free = tmp_path / "free"
+    (tmp_path / ".free.lock").touch()
+    rc = cli.main(
+        _base_args() + ["download-metrics", "job-1", "--output-dir", str(free)],
+        client_factory=lambda _: client,
+        stdout=io.StringIO(),
+    )
+    assert rc == 0
+    plain = tmp_path / "plain"
+    rc = cli.main(
+        _base_args() + ["download-log", "job-1", "--log-type", "stdout", "--output-dir", str(plain)],
+        client_factory=lambda _: client,
+        stdout=io.StringIO(),
+    )
+    assert rc == 0
+    assert not (tmp_path / ".plain.lock").exists(), "a plain CLI download created a lock file"

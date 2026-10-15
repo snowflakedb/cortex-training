@@ -662,7 +662,9 @@ The download itself still completes.
 `--resume`, `--parallel`, `--sub-job`, `--strict`, `--stale-after-minutes`, and
 `--transfer-timeout` do not apply to execution logs,
 including `download-log` without `--log-type stdout`. Two downloads of the same
-directory at once are unsupported.
+directory at once are unsupported. If the TUI is downloading into the same
+directory (its cache, as named in a skipped-chunk warning), the command stops
+with an error instead of writing alongside it.
 
 ### Download GPU Metrics
 
@@ -682,7 +684,8 @@ progress on stderr, and Ctrl-C behave as for
 [persisted stdout](#download-persisted-stdout). While the job is running, a
 sub-job that has saved stdout but no GPU metrics is also listed, with
 `chunk_count` 0, `saved_path` `null`, and a warning that metric uploads may be
-stalled. Two downloads of the same directory at once are unsupported.
+stalled. Two downloads of the same directory at once are unsupported; a TUI
+download of the same directory is refused as for stdout.
 
 ### Job TUI
 

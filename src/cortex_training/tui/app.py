@@ -53,6 +53,7 @@ from textual.widgets import TabbedContent
 from textual.widgets import TabPane
 from textual.worker import get_current_worker
 
+from cortex_training._download_lock import DownloadLock
 from cortex_training.client import DownloadCancelled
 from cortex_training.client import NoChunksError
 from cortex_training.tui.format import entry_at_level
@@ -76,7 +77,6 @@ from cortex_training.tui.resource import format_bytes
 from cortex_training.tui.resource import format_percent
 from cortex_training.tui.resource import load_resource_data
 from cortex_training.tui.resource import render_chart
-from cortex_training.tui.saved_log import DownloadLock
 from cortex_training.tui.saved_log import read_saved_tail
 
 _ERROR_LOG = "~/.cortex-training-errors.log"

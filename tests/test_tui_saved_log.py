@@ -21,7 +21,7 @@ import time
 
 import pytest
 
-from cortex_training.tui.saved_log import DownloadLock
+from cortex_training._download_lock import DownloadLock
 from cortex_training.tui.saved_log import read_saved_tail
 
 

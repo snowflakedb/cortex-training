@@ -2035,7 +2035,7 @@ async def _run_quit_during_download(state):
 
 
 def test_quit_during_download_stops_it_and_frees_the_lock():
-    from cortex_training.tui.saved_log import DownloadLock
+    from cortex_training._download_lock import DownloadLock
 
     state = {"started": threading.Event(), "returned": threading.Event()}
     asyncio.run(_run_quit_during_download(state))

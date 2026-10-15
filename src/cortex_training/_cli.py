@@ -1443,13 +1443,38 @@ def _library_warnings_to(writer: _ArtifactProgressWriter) -> Iterator[None]:
         library.removeHandler(handler)
 
 
+@contextlib.contextmanager
+def _output_dir_lock(out_dir: Path) -> Iterator[None]:
+    """Refuse to share a directory with a running TUI download of it.
+
+    The TUI marks each cache directory it downloads into with a sibling lock
+    file. Only an existing lock file is honored, so a plain CLI download never
+    creates files outside its output directory.
+    """
+    from cortex_training._download_lock import DownloadLock
+
+    lock = DownloadLock(out_dir)
+    if not lock.lock_path.exists():
+        yield
+        return
+    if not lock.try_acquire():
+        raise RuntimeError(
+            f"another download is using {out_dir}; close that job's view in the "
+            "TUI or wait for its download to finish, then retry"
+        )
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 def _cmd_download_log(
     args: argparse.Namespace, client, stdout: TextIO, stderr: TextIO
 ) -> int:
     out_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.cwd()
     if args.log_type == "stdout":
         progress = _artifact_progress_writer(stderr)
-        with _library_warnings_to(progress):
+        with _output_dir_lock(out_dir), _library_warnings_to(progress):
             logs = client.download_stdout_logs(
                 args.job_id,
                 out_dir,
@@ -1485,7 +1510,7 @@ def _cmd_download_metrics(
 ) -> int:
     out_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.cwd()
     progress = _artifact_progress_writer(stderr)
-    with _library_warnings_to(progress):
+    with _output_dir_lock(out_dir), _library_warnings_to(progress):
         metrics = client.download_metrics(
             args.job_id,
             out_dir,
