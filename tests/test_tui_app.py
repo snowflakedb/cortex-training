@@ -52,6 +52,13 @@ def _isolated_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "_STALL_CHECKED_AT", {})
 
 
+def _cancel_name():
+    """The exception the TUI raises to cancel: the client's export, else its own."""
+    import cortex_training.tui.app as app_module
+
+    return app_module._cancel_exception().__name__
+
+
 def _client():
     c = MagicMock()
     c.list_jobs.return_value = [
@@ -1762,7 +1769,9 @@ async def _run_failure_then_retry():
     def download(job_id, output_dir, **kwargs):
         calls.append(1)
         if len(calls) == 1:
-            raise RuntimeError("stage unavailable")
+            exc = RuntimeError("stage unavailable")
+            exc.download_progress_saved = True
+            raise exc
         _write_stdout(output_dir, "7:training:0", "after retry\n")
         return []
 
@@ -1775,7 +1784,7 @@ async def _run_failure_then_retry():
             lambda: any("saved console download failed" in line for line in app.screen._shown_lines),
         )
         assert ok, "download failure was not shown in the pane"
-        assert "RuntimeError: stage unavailable" in "\n".join(app.screen._shown_lines)
+        assert "RuntimeError: stage unavailable; progress saved, r resumes" in "\n".join(app.screen._shown_lines)
         assert "r retries" in (app.sub_title or "")
         app.screen._refilter()
         for _ in range(5):
@@ -1880,7 +1889,7 @@ def test_progress_updates_status_and_leaving_cancels_download(monkeypatch, tmp_p
     state = {"started": threading.Event()}
     asyncio.run(_run_progress_status_and_cancel(state))
     assert state["resume"] is True
-    assert state.get("raised") == "_DownloadCancelled"
+    assert state.get("raised") == _cancel_name()
     assert not (tmp_path / "errors.log").exists(), "a cancel was logged as a failure"
 
 
@@ -1972,7 +1981,7 @@ def test_reopen_does_not_wait_forever_on_a_blocked_download(monkeypatch, tmp_pat
     monkeypatch.setattr(app_module, "_ERROR_LOG", str(tmp_path / "errors.log"))
     state = {"calls": 0, "started": threading.Event()}
     asyncio.run(_run_reopen_while_download_blocks(state))
-    assert state["raised"] == "_DownloadCancelled"
+    assert state["raised"] == _cancel_name()
     assert state["calls"] == 2
     assert not (tmp_path / "errors.log").exists()
 

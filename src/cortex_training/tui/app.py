@@ -1104,6 +1104,8 @@ class LogScreen(Screen):
             cancelled = True
         except Exception as exc:  # noqa: BLE001 - surfaced in the pane; keep the cache
             error = f"{type(exc).__name__}: {exc}"
+            if getattr(exc, "download_progress_saved", False):
+                error += "; progress saved, r resumes"
             try:
                 with open(os.path.expanduser(_ERROR_LOG), "a", encoding="utf-8") as handle:
                     handle.write(f"saved console {self._job_id} failed:\n{traceback.format_exc()}\n")
