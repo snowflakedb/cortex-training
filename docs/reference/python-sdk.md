@@ -295,6 +295,13 @@ before building the typed object; see
 carry a `.detail` dict for chunk-group failures. Polling raises `RuntimeError`
 on a failed/cancelled request and `TimeoutError` at the deadline.
 
+`DatabaseAccessError` (a subclass of `RuntimeError`) means the configured
+database or schema is not usable by the current role. It carries `.kind`
+(`"database"` or `"schema"`), `.name`, `.role` (None if unknown), `.exists`
+(True when Snowflake reports the object exists but the role has no privileges
+on it, None when the client cannot tell), and `.statement`, the
+`CREATE ... IF NOT EXISTS` statement that would set it up.
+
 ## Details not covered here
 
 For exact wire shapes, request framing, and schemas, see the
