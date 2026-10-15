@@ -5411,6 +5411,80 @@ class TestExecutionLogDownload:
         assert len(opened) == workers
         assert [conn.close_count for conn in opened] == [1] * workers
 
+    def test_parallel_progress_reports_on_caller_after_each_copy(
+        self, tmp_path, monkeypatch
+    ):
+        c, opened, _run_uri, _paths = self._parallel_stdout(monkeypatch, 20)
+        sub = "job-1:training:0"
+        caller = threading.get_ident()
+        copied = []
+        real_copy = c._copy_gzip_member
+
+        def copy(downloaded, output):
+            real_copy(downloaded, output)
+            copied.append(output.tell())
+
+        c._copy_gzip_member = copy
+        calls = []
+
+        def progress(message):
+            assert threading.get_ident() == caller
+            calls.append(message)
+            if message == "\n":
+                return
+            done = int(message.split("] ", 1)[1].split("/", 1)[0])
+            assert len(copied) == done
+
+        c.download_stdout_logs("job-1", tmp_path, progress=progress)
+        assert len(opened) > 1
+        status = c._artifact_progress_status
+        assert calls == [status("stdout", index, 20, sub) for index in range(21)] + ["\n"]
+        expected = b"".join(f"{index}\n".encode() for index in range(20))
+        assert (tmp_path / sub / "stdout.log").read_bytes() == expected
+
+    def test_parallel_progress_callback_error_cleans_up(self, tmp_path, monkeypatch):
+        c, opened, run_uri, paths = self._parallel_stdout(monkeypatch, 4)
+        sub = "job-1:training:0"
+        destination = tmp_path / sub / "stdout.log"
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"previous\n")
+        calls = []
+
+        def stop(message):
+            calls.append(message)
+            if " 2/" in message:
+                raise RuntimeError("stop")
+
+        with pytest.raises(RuntimeError, match="stop"):
+            c.download_stdout_logs("job-1", tmp_path, progress=stop)
+        assert calls[-1] == "\n"
+        assert destination.read_bytes() == b"previous\n"
+        assert not list(destination.parent.glob(".*.tmp"))
+        assert [conn.close_count for conn in opened] == [1] * len(opened)
+
+        c.download_stdout_logs("job-1", tmp_path)
+        committed = destination.read_bytes()
+        manifest = destination.with_name(".stdout.log.manifest.json")
+        manifest_before = manifest.read_text(encoding="utf-8")
+        listed = opened[0].list_rows[run_uri + "_stdout/"]
+        for index in range(4):
+            path = f"_stdout/{sub}/console.20260904-{index + 4:06d}.part.gz"
+            listed.append((f"/versions/RUN_ABC/{path}",))
+            opened[0].content_by_uri[run_uri + path] = gzip.compress(
+                f"{index + 4}\n".encode()
+            )
+        before = len(opened)
+        calls.clear()
+        with pytest.raises(RuntimeError, match="stop"):
+            c.download_stdout_logs("job-1", tmp_path, resume=True, progress=stop)
+        assert calls[0] == c._artifact_progress_status("stdout", 0, 4, sub)
+        assert calls[-1] == "\n"
+        assert destination.read_bytes() == committed
+        assert manifest.read_text(encoding="utf-8") == manifest_before
+        resume_connections = opened[before:]
+        assert resume_connections
+        assert [conn.close_count for conn in resume_connections] == [1] * len(resume_connections)
+
     def test_parallel_download_stays_serial_when_opener_returns_one_connection(
         self, tmp_path, monkeypatch
     ):
