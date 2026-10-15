@@ -2104,3 +2104,39 @@ def test_leaving_uses_the_clients_cancellation_exception_when_exported(monkeypat
     asyncio.run(_run_reopen_while_download_blocks(state))
     assert state["raised"] == "ClientCancelled"
     assert not (tmp_path / "errors.log").exists(), "the client's cancel was logged as a failure"
+
+
+async def _run_repaint_on_sub_job_done(release):
+    c = _client()
+    c.get_job.return_value = _terminal_job()
+
+    class _Downloads:
+        # No sub_job_ids support: the whole job downloads in one call.
+        def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None):
+            progress("7:sampling:0", 0, 2, 0)
+            _write_stdout(output_dir, "7:sampling:0", "sampling saved\n")
+            progress("7:sampling:0", 2, 2, 15)
+            progress("7:training:0", 0, 3, 0)
+            _write_stdout(output_dir, "7:training:0", "training saved\n")
+            progress("7:training:0", 3, 3, 15)
+            assert release.wait(timeout=5)
+            return []
+
+    c.download_stdout_logs = _Downloads().download_stdout_logs
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, lambda: "training saved" in app.screen._shown_lines)
+        assert ok, "selected sub-job was not shown when its file was committed"
+        assert app.screen._stdout_inflight
+        release.set()
+        ok = await _wait(pilot, app, lambda: app.screen._stdout_done)
+        assert ok
+        await _settle(app, pilot)
+
+
+def test_selected_sub_job_repaints_when_progress_reports_it_done():
+    release = threading.Event()
+    try:
+        asyncio.run(_run_repaint_on_sub_job_done(release))
+    finally:
+        release.set()

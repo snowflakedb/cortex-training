@@ -1034,8 +1034,9 @@ class LogScreen(Screen):
     def _stdout_progress(self, keep_waiting):
         """Build the client's ``progress`` callback (called on the download thread).
 
-        Status updates are throttled; raising once the view closes stops the
-        download, which keeps what it saved so the next open resumes.
+        Status updates are throttled; a finished sub-job is repainted if it is
+        selected. Raising once the view closes stops the download, which keeps
+        what it saved so the next open resumes.
         """
         last = [0.0]
         cancel = _cancel_exception()
@@ -1043,6 +1044,10 @@ class LogScreen(Screen):
         def progress(sub_job_id: str, chunks_done: int, chunks_total: int, bytes_done: int) -> None:
             if not keep_waiting():
                 raise cancel()
+            if chunks_total and chunks_done == chunks_total:
+                # The client sends done == total once that sub-job's file is
+                # committed, so the selected one can be shown before the rest.
+                self._post(self._accept_saved_sub_job, sub_job_id)
             now = time.monotonic()
             if chunks_done < chunks_total and now - last[0] < 0.25:
                 return
