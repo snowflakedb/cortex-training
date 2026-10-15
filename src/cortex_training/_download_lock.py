@@ -45,11 +45,14 @@ class DownloadLock:
     _LOCKS: dict[str, threading.Lock] = {}
 
     def __init__(self, root: Path):
-        self._root = Path(root)
-        key = str(self._root.resolve())
+        # Resolve first so ".", "./" or "a/.." name the same lock as the
+        # absolute path the TUI uses.
+        self._root = Path(root).expanduser().resolve()
         with self._GUARD:
-            self._thread_lock = self._LOCKS.setdefault(key, threading.Lock())
-        self._lock_path = self._root.with_name(f".{self._root.name}.lock")
+            self._thread_lock = self._LOCKS.setdefault(str(self._root), threading.Lock())
+        # The filesystem root has no sibling to hold a lock file; the TUI never
+        # downloads there, so it gets the in-process lock only.
+        self._lock_path = self._root.with_name(f".{self._root.name}.lock") if self._root.name else None
         self._handle = None
         self._held = False
 
@@ -83,7 +86,8 @@ class DownloadLock:
             time.sleep(poll_seconds)
 
     @property
-    def lock_path(self) -> Path:
+    def lock_path(self) -> Path | None:
+        """The sibling lock file, or ``None`` for the filesystem root."""
         return self._lock_path
 
     def try_acquire(self) -> bool:
@@ -97,7 +101,7 @@ class DownloadLock:
         return False
 
     def _try_file_lock(self) -> bool:
-        if fcntl is None:
+        if fcntl is None or self._lock_path is None:
             return True
         try:
             self._lock_path.parent.mkdir(parents=True, exist_ok=True)

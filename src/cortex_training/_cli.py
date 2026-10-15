@@ -1454,7 +1454,7 @@ def _output_dir_lock(out_dir: Path) -> Iterator[None]:
     from cortex_training._download_lock import DownloadLock
 
     lock = DownloadLock(out_dir)
-    if not lock.lock_path.exists():
+    if lock.lock_path is None or not lock.lock_path.exists():
         yield
         return
     if not lock.try_acquire():

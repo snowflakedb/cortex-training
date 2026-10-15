@@ -23,6 +23,7 @@ import logging
 import threading
 import time
 from datetime import date
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -3359,3 +3360,66 @@ def test_chunk_download_takes_a_free_tui_lock_and_creates_none(tmp_path):
     )
     assert rc == 0
     assert not (tmp_path / ".plain.lock").exists(), "a plain CLI download created a lock file"
+
+
+_CHUNK_COMMANDS = [
+    pytest.param(["download-log", "job-1", "--log-type", "stdout"], "stdout.log", id="download-log"),
+    pytest.param(["download-metrics", "job-1"], "gpu.jsonl", id="download-metrics"),
+]
+
+
+@pytest.mark.parametrize("command, filename", _CHUNK_COMMANDS)
+@pytest.mark.parametrize("output_dir", [None, ".", "./", "sub", "sub/../sub", "other/.."])
+def test_chunk_download_accepts_relative_and_default_output_dirs(tmp_path, monkeypatch, command, filename, output_dir):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "other").mkdir()
+    stderr = io.StringIO()
+    args = command + ([] if output_dir is None else ["--output-dir", output_dir])
+    rc = cli.main(_base_args() + args, client_factory=lambda _: FakeClient(), stdout=io.StringIO(), stderr=stderr)
+    assert rc == 0, stderr.getvalue()
+    expected = (tmp_path / (output_dir or ".")).resolve()
+    assert (expected / "job-1:training:0" / filename).is_file()
+    # No TUI lock existed, so none was created anywhere.
+    assert not list(tmp_path.glob(".*.lock")) and not list(tmp_path.parent.glob(f".{tmp_path.name}.lock"))
+
+
+@pytest.mark.parametrize("command, filename", _CHUNK_COMMANDS)
+@pytest.mark.parametrize("cwd, output_dir", [("cache", None), ("cache", "."), ("cache", "./"), (".", "cache"),
+                                             (".", "x/../cache"), ("x", "../cache")])
+def test_chunk_download_finds_the_tui_lock_from_any_spelling(tmp_path, monkeypatch, command, filename, cwd, output_dir):
+    from cortex_training._download_lock import DownloadLock
+
+    fcntl = pytest.importorskip("fcntl")
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (tmp_path / "x").mkdir()
+    monkeypatch.chdir(tmp_path / cwd)
+    tui_lock = DownloadLock(cache)
+    assert tui_lock.lock_path == tmp_path / ".cache.lock"
+    stderr = io.StringIO()
+    args = command + ([] if output_dir is None else ["--output-dir", output_dir])
+    # A separate open file description stands in for the TUI process.
+    with open(tui_lock.lock_path, "a+b") as tui:
+        fcntl.flock(tui.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        rc = cli.main(_base_args() + args, client_factory=lambda _: FakeClient(), stdout=io.StringIO(), stderr=stderr)
+    assert rc == 1
+    assert "another download is using" in stderr.getvalue()
+    assert not (cache / "job-1:training:0").exists()
+
+
+def test_download_lock_paths_are_resolved(tmp_path, monkeypatch):
+    from cortex_training._download_lock import DownloadLock
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "foo").mkdir()
+    absolute = DownloadLock(tmp_path / "cache").lock_path
+    assert absolute == tmp_path / ".cache.lock"
+    for spelling in ["cache", "./cache", "foo/../cache", str(tmp_path / "foo" / ".." / "cache")]:
+        assert DownloadLock(Path(spelling)).lock_path == absolute
+    assert DownloadLock(Path(".")).lock_path == tmp_path.parent / f".{tmp_path.name}.lock"
+    root = DownloadLock(Path("/"))
+    assert root.lock_path is None
+    assert root.try_acquire()
+    root.release()
+    with cli._output_dir_lock(Path("/")):
+        pass
