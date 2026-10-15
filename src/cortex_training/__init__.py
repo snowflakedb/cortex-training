@@ -24,6 +24,7 @@ from .client import ChunkGroupConflictError
 from .client import ChunkGroupError
 from .client import ChunkGroupRestartError
 from .client import CortexTrainingClient
+from .client import DatabaseAccessError
 from .client import DownloadCancelled
 from .client import NoChunksError
 from .client import Hardware
@@ -44,6 +45,7 @@ __all__ = [
     "ChunkGroupError",
     "ChunkGroupRestartError",
     "ChunkGroupConflictError",
+    "DatabaseAccessError",
     "DownloadCancelled",
     "NoChunksError",
     "InvalidPageToken",
