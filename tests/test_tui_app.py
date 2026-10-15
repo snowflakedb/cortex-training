@@ -36,6 +36,7 @@ from textual.widgets import Label  # noqa: E402
 from textual.widgets import Static  # noqa: E402
 from textual.widgets import TabbedContent  # noqa: E402
 
+from cortex_training.client import DownloadCancelled  # noqa: E402
 from cortex_training.tui.app import CortexTrainingLogTUI  # noqa: E402
 from cortex_training.tui.app import JobListScreen  # noqa: E402
 from cortex_training.tui.app import LogScreen  # noqa: E402
@@ -52,11 +53,27 @@ def _isolated_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "_STALL_CHECKED_AT", {})
 
 
-def _cancel_name():
-    """The exception the TUI raises to cancel: the client's export, else its own."""
-    import cortex_training.tui.app as app_module
+def _whole_job(download):
+    """Side effect for the whole-job download only; the TUI first fetches the
+    selected sub-job alone (``sub_job_ids``), which these tests do not model."""
 
-    return app_module._cancel_exception().__name__
+    def side_effect(job_id, output_dir, **kwargs):
+        if kwargs.get("sub_job_ids") is not None:
+            return []
+        return download(job_id, output_dir, **kwargs)
+
+    return side_effect
+
+
+def _raise(exc):
+    def download(*_args, **_kwargs):
+        raise exc
+
+    return download
+
+
+def _whole_job_calls(client):
+    return sum(1 for call in client.download_stdout_logs.call_args_list if call.kwargs.get("sub_job_ids") is None)
 
 
 def _client():
@@ -139,7 +156,7 @@ def test_app_without_job_id_shows_job_picker():
 async def _run_resource_tab(tmp_path):
     c = _client()
 
-    def download(job_id, output_dir, *, resume=False):
+    def download(job_id, output_dir, *, resume=False, **_kwargs):
         assert job_id == "7"
         assert resume is True
         _write_gpu_metrics(output_dir, "7:training:0", gpu_count=2)
@@ -298,7 +315,7 @@ def test_resource_parser_failure_does_not_leave_loading_stuck(tmp_path, monkeypa
 async def _run_resource_partial_download_failure():
     c = _client()
 
-    def download(job_id, output_dir, *, resume):
+    def download(job_id, output_dir, *, resume, **_kwargs):
         _write_gpu_metrics(output_dir, "7:training:0", gpu_count=2)
         raise RuntimeError("later sub-job failed")
 
@@ -329,7 +346,7 @@ async def _run_resource_partial_other_sub_job_retries():
     c = _client()
     calls = 0
 
-    def download(job_id, output_dir, *, resume):
+    def download(job_id, output_dir, *, resume, **_kwargs):
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -404,7 +421,7 @@ def test_resource_failed_refresh_keeps_cached_rows_and_error(tmp_path, monkeypat
 async def _run_resource_unsupported_warning():
     c = _client()
 
-    def download(job_id, output_dir, *, resume):
+    def download(job_id, output_dir, *, resume, **_kwargs):
         path = _write_gpu_metrics(output_dir, "7:training:0", gpu_count=1)
         row = json.loads(path.read_text(encoding="utf-8"))
         row["record_version"] = 1
@@ -438,7 +455,7 @@ def test_resource_all_unsupported_rows_show_warning(tmp_path, monkeypatch):
 async def _run_resource_narrow_no_samples():
     c = _client()
 
-    def download(job_id, output_dir, *, resume):
+    def download(job_id, output_dir, *, resume, **_kwargs):
         path = _write_gpu_metrics(output_dir, "7:training:0", gpu_count=1)
         row = json.loads(path.read_text(encoding="utf-8"))
         row["gpu_util_pct"] = None
@@ -482,7 +499,7 @@ def test_resource_narrow_table_no_samples_and_resize_is_local(tmp_path, monkeypa
 async def _run_resource_chart_fits_content_width():
     c = _client()
 
-    def download(job_id, output_dir, *, resume):
+    def download(job_id, output_dir, *, resume, **_kwargs):
         _write_gpu_metrics(output_dir, "7:training:0", gpu_count=1)
         return []
 
@@ -516,7 +533,7 @@ def test_resource_chart_accounts_for_widget_padding(tmp_path, monkeypatch):
 async def _run_resource_ignores_refresh_while_busy(started, release):
     c = _client()
 
-    def download(job_id, output_dir, *, resume):
+    def download(job_id, output_dir, *, resume, **_kwargs):
         started.set()
         assert release.wait(timeout=5)
         _write_gpu_metrics(output_dir, "7:training:0")
@@ -554,7 +571,7 @@ async def _run_resource_reopen_waits_for_lock(started, release):
     c = _client()
     calls = 0
 
-    def download(job_id, output_dir, *, resume):
+    def download(job_id, output_dir, *, resume, **_kwargs):
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -1244,7 +1261,7 @@ async def _run_terminal_shows_saved_file():
         _write_stdout(output_dir, "7:training:0", "saved line\n")
         return []
 
-    c.download_stdout_logs.side_effect = download
+    c.download_stdout_logs.side_effect = _whole_job(download)
     app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(pilot, app, lambda: "saved line" in app.screen._shown_lines)
@@ -1261,7 +1278,7 @@ def test_terminal_open_shows_downloaded_file(tmp_path, monkeypatch):
 async def _run_keeps_cache_when_download_fails():
     c = _client()
     c.get_job.return_value = _terminal_job()
-    c.download_stdout_logs.side_effect = RuntimeError("unavailable")
+    c.download_stdout_logs.side_effect = _whole_job(_raise(RuntimeError("unavailable")))
     app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(
@@ -1271,11 +1288,11 @@ async def _run_keeps_cache_when_download_fails():
         )
         assert ok, "cache line missing after a failed download"
         assert "No log output is available." not in app.screen._shown_lines
-        downloads = c.download_stdout_logs.call_count
+        downloads = _whole_job_calls(c)
         app.screen._refilter()
         for _ in range(5):
             await pilot.pause()
-        assert c.download_stdout_logs.call_count == downloads
+        assert _whole_job_calls(c) == downloads
         await _settle(app, pilot)
 
 
@@ -1295,7 +1312,7 @@ async def _run_empty_file_keeps_cache():
         _write_stdout(output_dir, "7:training:0", "")
         return []
 
-    c.download_stdout_logs.side_effect = download
+    c.download_stdout_logs.side_effect = _whole_job(download)
     app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(
@@ -1325,7 +1342,7 @@ async def _run_hidden_filter_shows_no_note(release, started):
         _write_stdout(output_dir, "7:training:0", "")
         return []
 
-    c.download_stdout_logs.side_effect = download
+    c.download_stdout_logs.side_effect = _whole_job(download)
     app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(pilot, app, lambda: "cached line" in app.screen._shown_lines and started.is_set())
@@ -1391,7 +1408,7 @@ async def _run_tail_error_after_finish_shows_file():
 
     c.get_job.side_effect = get_job
     c.tail_logs.side_effect = tail_logs
-    c.download_stdout_logs.side_effect = download
+    c.download_stdout_logs.side_effect = _whole_job(download)
     app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(pilot, app, lambda: "after finish" in app.screen._shown_lines)
@@ -1423,13 +1440,13 @@ async def _run_terminal_download_failure_keeps_cache():
 
     c.get_job.side_effect = get_job
     c.tail_logs.side_effect = RuntimeError("zone gone")
-    c.download_stdout_logs.side_effect = RuntimeError("unavailable")
+    c.download_stdout_logs.side_effect = _whole_job(_raise(RuntimeError("unavailable")))
     app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(
             pilot,
             app,
-            lambda: c.download_stdout_logs.called and "cached line" in app.screen._shown_lines,
+            lambda: _whole_job_calls(c) > 0 and "cached line" in app.screen._shown_lines,
         )
         assert ok, "failed saved-console download did not leave the cache"
         for _ in range(5):
@@ -1471,7 +1488,7 @@ async def _run_filter_during_download_once(release, started, calls):
         _write_stdout(output_dir, "7:training:0", "from file\n")
         return []
 
-    c.download_stdout_logs.side_effect = download
+    c.download_stdout_logs.side_effect = _whole_job(download)
     app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(pilot, app, started.is_set)
@@ -1514,7 +1531,7 @@ async def _run_switch_source_does_not_download_again():
         _write_stdout(output_dir, "7:training:0", "training line\n")
         return []
 
-    c.download_stdout_logs.side_effect = download
+    c.download_stdout_logs.side_effect = _whole_job(download)
     app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(pilot, app, lambda: app.screen._stdout_ready)
@@ -1541,7 +1558,7 @@ async def _run_missing_sibling_shows_note():
         _write_stdout(output_dir, "7:training:0", "training line\n")
         return []
 
-    c.download_stdout_logs.side_effect = download
+    c.download_stdout_logs.side_effect = _whole_job(download)
     app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(pilot, app, lambda: app.screen._stdout_ready)
@@ -1550,7 +1567,7 @@ async def _run_missing_sibling_shows_note():
         ok = await _wait(pilot, app, lambda: "No log output is available." in app.screen._shown_lines)
         assert ok, "empty sibling did not show the finished-view note"
         assert "training line" not in app.screen._shown_lines
-        assert c.download_stdout_logs.call_count == 1
+        assert _whole_job_calls(c) == 1
         await _settle(app, pilot)
 
 
@@ -1569,7 +1586,7 @@ async def _run_save_exports_file(tmp_path):
         path.write_bytes(payload)
         return []
 
-    c.download_stdout_logs.side_effect = download
+    c.download_stdout_logs.side_effect = _whole_job(download)
     app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(pilot, app, lambda: "file body" in app.screen._shown_lines)
@@ -1616,7 +1633,7 @@ async def _run_pause_holds_replacement(release, started):
         _write_stdout(output_dir, "7:training:0", "held line\n")
         return []
 
-    c.download_stdout_logs.side_effect = download
+    c.download_stdout_logs.side_effect = _whole_job(download)
     app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(pilot, app, lambda: "cached line" in app.screen._shown_lines and started.is_set())
@@ -1672,7 +1689,7 @@ async def _run_reopen_reuses_cache(release, calls):
         assert release.wait(timeout=5)
         return []
 
-    c.download_stdout_logs.side_effect = download
+    c.download_stdout_logs.side_effect = _whole_job(download)
     app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(pilot, app, lambda: "saved line" in app.screen._shown_lines)
@@ -1729,7 +1746,7 @@ async def _run_reopen_during_download(release, state):
                 state["active"] -= 1
         return []
 
-    c.download_stdout_logs.side_effect = download
+    c.download_stdout_logs.side_effect = _whole_job(download)
     app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(pilot, app, lambda: state["calls"] == 1)
@@ -1775,7 +1792,7 @@ async def _run_failure_then_retry():
         _write_stdout(output_dir, "7:training:0", "after retry\n")
         return []
 
-    c.download_stdout_logs.side_effect = download
+    c.download_stdout_logs.side_effect = _whole_job(download)
     app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(
@@ -1823,7 +1840,7 @@ async def _run_saved_console_read_off_ui_thread(seen):
             _write_stdout(output_dir, "7:training:0", "alpha\nbeta\n")
             return []
 
-        c.download_stdout_logs.side_effect = download
+        c.download_stdout_logs.side_effect = _whole_job(download)
         app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
         async with app.run_test() as pilot:
             ok = await _wait(pilot, app, lambda: "beta" in app.screen._shown_lines)
@@ -1854,7 +1871,9 @@ async def _run_progress_status_and_cancel(state):
 
     class _Downloads:
         # A real signature, so the TUI detects the optional progress kwarg.
-        def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None):
+        def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None, **kwargs):
+            if kwargs.get("sub_job_ids") is not None:
+                return []
             state["resume"] = resume
             try:
                 for i in range(1, 10000):
@@ -1863,7 +1882,7 @@ async def _run_progress_status_and_cancel(state):
                         state["started"].set()
                     time.sleep(0.005)
             except BaseException as exc:  # noqa: BLE001 - the TUI's cancel signal
-                state["raised"] = type(exc).__name__
+                state["raised"] = type(exc)
                 raise
             return []
 
@@ -1889,7 +1908,7 @@ def test_progress_updates_status_and_leaving_cancels_download(monkeypatch, tmp_p
     state = {"started": threading.Event()}
     asyncio.run(_run_progress_status_and_cancel(state))
     assert state["resume"] is True
-    assert state.get("raised") == _cancel_name()
+    assert issubclass(state.get("raised"), DownloadCancelled), "download was not cancelled"
     assert not (tmp_path / "errors.log").exists(), "a cancel was logged as a failure"
 
 
@@ -1898,7 +1917,9 @@ async def _run_selected_sub_job_first(release, calls):
     c.get_job.return_value = _terminal_job()
 
     class _Downloads:
-        def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None, sub_job_ids=None):
+        def download_stdout_logs(
+            self, job_id, output_dir, *, resume=False, progress=None, sub_job_ids=None, **_kwargs
+        ):
             calls.append(None if sub_job_ids is None else list(sub_job_ids))
             if sub_job_ids is not None:
                 for sid in sub_job_ids:
@@ -1942,7 +1963,9 @@ async def _run_reopen_while_download_blocks(state):
     class _Downloads:
         # The first download blocks (like a retry backoff that still polls the
         # callback) until the TUI cancels it; later ones finish at once.
-        def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None):
+        def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None, **kwargs):
+            if kwargs.get("sub_job_ids") is not None:
+                return []
             state["calls"] += 1
             if state["calls"] > 1:
                 _write_stdout(output_dir, "7:training:0", "second view\n")
@@ -1953,7 +1976,7 @@ async def _run_reopen_while_download_blocks(state):
                     progress("7:training:0", 0, 10, 0)
                     time.sleep(0.02)
             except BaseException as exc:  # noqa: BLE001 - the TUI's cancel signal
-                state["raised"] = type(exc).__name__
+                state["raised"] = type(exc)
                 raise
 
     c.download_stdout_logs = _Downloads().download_stdout_logs
@@ -1981,7 +2004,7 @@ def test_reopen_does_not_wait_forever_on_a_blocked_download(monkeypatch, tmp_pat
     monkeypatch.setattr(app_module, "_ERROR_LOG", str(tmp_path / "errors.log"))
     state = {"calls": 0, "started": threading.Event()}
     asyncio.run(_run_reopen_while_download_blocks(state))
-    assert state["raised"] == _cancel_name()
+    assert issubclass(state["raised"], DownloadCancelled), "download was not cancelled"
     assert state["calls"] == 2
     assert not (tmp_path / "errors.log").exists()
 
@@ -1991,7 +2014,9 @@ async def _run_quit_during_download(state):
     c.get_job.return_value = _terminal_job()
 
     class _Downloads:
-        def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None):
+        def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None, **kwargs):
+            if kwargs.get("sub_job_ids") is not None:
+                return []
             state["started"].set()
             try:
                 while True:
@@ -2100,28 +2125,15 @@ def test_metrics_stall_check_runs_at_most_once_per_window(monkeypatch):
     assert calls == [600, None, 600]
 
 
-def test_leaving_uses_the_clients_cancellation_exception_when_exported(monkeypatch, tmp_path):
-    import cortex_training.client as client_module
-    import cortex_training.tui.app as app_module
-
-    class ClientCancelled(Exception):
-        pass
-
-    monkeypatch.setattr(client_module, app_module._CLIENT_CANCEL_NAME, ClientCancelled, raising=False)
-    monkeypatch.setattr(app_module, "_ERROR_LOG", str(tmp_path / "errors.log"))
-    state = {"calls": 0, "started": threading.Event()}
-    asyncio.run(_run_reopen_while_download_blocks(state))
-    assert state["raised"] == "ClientCancelled"
-    assert not (tmp_path / "errors.log").exists(), "the client's cancel was logged as a failure"
-
-
 async def _run_repaint_on_sub_job_done(release):
     c = _client()
     c.get_job.return_value = _terminal_job()
 
     class _Downloads:
         # No sub_job_ids support: the whole job downloads in one call.
-        def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None):
+        def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None, **kwargs):
+            if kwargs.get("sub_job_ids") is not None:
+                return []
             progress("7:sampling:0", 0, 2, 0)
             _write_stdout(output_dir, "7:sampling:0", "sampling saved\n")
             progress("7:sampling:0", 2, 2, 15)

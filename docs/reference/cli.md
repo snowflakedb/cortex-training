@@ -742,9 +742,9 @@ redrawn with `\r` shows only its final state, and a line longer than 8 KiB
 shows only its end. Warnings from a download (for example skipped damaged
 chunks, or uploads that look stalled while the job runs) appear on the status
 line, and on the Resource tab, for the selected sub-job. The stalled-upload
-check runs on at most one GPU metrics refresh per job every five minutes. A stream error while the job
-is still running stays an error. The level key filters structured live lines
-and does not hide lines from that saved console.
+check runs on at most one GPU metrics refresh per job every five minutes. A
+stream error while the job is still running stays an error. The level key
+filters structured live lines and does not hide lines from that saved console.
 
 The TUI also writes two files into your home directory: saved logs from the `s`
 key (`~/cortex-training-<job8>-<source>.log`, where `<job8>` is the first eight

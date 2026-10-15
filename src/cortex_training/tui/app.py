@@ -25,7 +25,6 @@ never mutates job state.
 
 from __future__ import annotations
 
-import inspect
 import os
 import time
 import traceback
@@ -53,6 +52,7 @@ from textual.widgets import TabbedContent
 from textual.widgets import TabPane
 from textual.worker import get_current_worker
 
+from cortex_training.client import DownloadCancelled
 from cortex_training.tui.format import entry_at_level
 from cortex_training.tui.format import entry_matches
 from cortex_training.tui.format import format_job_config
@@ -80,28 +80,6 @@ from cortex_training.tui.saved_log import read_saved_tail
 _ERROR_LOG = "~/.cortex-training-errors.log"
 
 
-class _DownloadCancelled(BaseException):
-    """Raised from a download progress callback once its view has closed.
-
-    A ``BaseException`` (like ``KeyboardInterrupt``) so the client neither
-    retries it nor records the stop as a failed operation.
-    """
-
-
-# Name of the client's public cancellation exception, if it exports one.
-_CLIENT_CANCEL_NAME = "DownloadCancelled"
-
-
-def _cancel_exception() -> type[BaseException]:
-    """The client's public cancellation exception, when it exports one."""
-    from cortex_training import client as client_module
-
-    exc = getattr(client_module, _CLIENT_CANCEL_NAME, None)
-    if isinstance(exc, type) and issubclass(exc, BaseException):
-        return exc
-    return _DownloadCancelled
-
-
 # The client's stall check (one get_job plus listings) runs on at most one
 # metrics refresh per job in this window; other refreshes pass None to skip it.
 _STALL_CHECK_SECONDS = 300.0
@@ -118,7 +96,7 @@ def _take_stall_check(job_id: str) -> bool:
 
 
 def _result_warnings(results) -> dict[str, list[str]]:
-    """Per-sub-job ``warnings`` from a download result list (absent in older clients)."""
+    """Per-sub-job ``warnings`` from a download result list (only sub-jobs that have some)."""
     out: dict[str, list[str]] = {}
     for row in results if isinstance(results, list) else []:
         if not isinstance(row, dict):
@@ -136,16 +114,6 @@ def _warning_text(messages: list[str], limit: int = 100) -> str:
     first = messages[0] if len(messages[0]) <= limit else messages[0][: limit - 1] + "…"
     more = f" (+{len(messages) - 1} more)" if len(messages) > 1 else ""
     return f"warning: {first}{more}"
-
-
-def _accepts_kwarg(fn, name: str) -> bool:
-    """Whether ``fn`` takes keyword ``name`` (so optional client features can be
-    passed without breaking an older client)."""
-    try:
-        params = inspect.signature(fn).parameters
-    except (TypeError, ValueError):
-        return False
-    return name in params
 
 
 class JobListScreen(Screen):
@@ -584,14 +552,10 @@ class LogScreen(Screen):
             cached = load_resource_data(self._metrics_root)
             if (cached.sub_jobs or cached.ignored_rows_by_sub_job) and not worker.is_cancelled:
                 self._post(self._accept_cached_resource, cached)
-            download = self._client.download_metrics
-            kwargs = {"resume": True}
-            stall_checked = False
-            if _accepts_kwarg(download, "stale_after_seconds"):
-                stall_checked = _take_stall_check(self._job_id)
-                if not stall_checked:
-                    kwargs["stale_after_seconds"] = None
-            results = download(self._job_id, self._metrics_root, **kwargs)
+            # Omitting stale_after_seconds uses the client's default check.
+            stall_checked = _take_stall_check(self._job_id)
+            kwargs = {} if stall_checked else {"stale_after_seconds": None}
+            results = self._client.download_metrics(self._job_id, self._metrics_root, resume=True, **kwargs)
             if not worker.is_cancelled:
                 self._post(
                     self._accept_download_warnings,
@@ -1039,11 +1003,10 @@ class LogScreen(Screen):
         what it saved so the next open resumes.
         """
         last = [0.0]
-        cancel = _cancel_exception()
 
         def progress(sub_job_id: str, chunks_done: int, chunks_total: int, bytes_done: int) -> None:
             if not keep_waiting():
-                raise cancel()
+                raise DownloadCancelled()
             if chunks_total and chunks_done == chunks_total:
                 # The client sends done == total once that sub-job's file is
                 # committed, so the selected one can be shown before the rest.
@@ -1086,21 +1049,21 @@ class LogScreen(Screen):
         try:
             self._post(self._set_stdout_status, "saved console: downloading…")
             download = self._client.download_stdout_logs
-            kwargs = {"resume": True}
-            if _accepts_kwarg(download, "progress"):
-                kwargs["progress"] = self._stdout_progress(keep_waiting)
             # Saved consoles are fetched for finished jobs, where the stall
             # check cannot fire; skip its status lookup.
-            if _accepts_kwarg(download, "stale_after_seconds"):
-                kwargs["stale_after_seconds"] = None
-            if first and _accepts_kwarg(download, "sub_job_ids"):
+            kwargs = {
+                "resume": True,
+                "progress": self._stdout_progress(keep_waiting),
+                "stale_after_seconds": None,
+            }
+            if first:
                 results = download(self._job_id, self._stdout_root, sub_job_ids=[first], **kwargs)
                 self._post(self._accept_download_warnings, "stdout", _result_warnings(results), stall_checked=False)
                 self._post(self._accept_saved_sub_job, first)
             # With resume, a sub-job fetched above costs only a listing here.
             results = download(self._job_id, self._stdout_root, **kwargs)
             self._post(self._accept_download_warnings, "stdout", _result_warnings(results), stall_checked=False)
-        except (_DownloadCancelled, _cancel_exception()):
+        except DownloadCancelled:
             cancelled = True
         except Exception as exc:  # noqa: BLE001 - surfaced in the pane; keep the cache
             error = f"{type(exc).__name__}: {exc}"
