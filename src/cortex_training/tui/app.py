@@ -26,6 +26,7 @@ never mutates job state.
 from __future__ import annotations
 
 import os
+import shlex
 import time
 import traceback
 from datetime import datetime
@@ -98,12 +99,21 @@ def _mark_stall_checked(job_id: str) -> None:
 
 
 # The client suggests a non-resume download to retry skipped damaged chunks.
-# The TUI always resumes, so point at the CLI command that can do it instead.
+# The TUI always resumes, so name the CLI command that rebuilds this sub-job's
+# file in the TUI's own cache.
 _RESUME_HINT = "download again without resume to retry them"
-_TUI_RESUME_HINT = "retry them with `cortex-training download-log JOB_ID --log-type stdout` (without --resume)"
 
 
-def _result_warnings(results) -> dict[str, list[str]]:
+def _retry_command(kind: str, job_id: str, sub_job_id: str, output_dir: Path) -> str:
+    if kind == "stdout":
+        command = ["cortex-training", "download-log", job_id, "--log-type", "stdout"]
+    else:
+        command = ["cortex-training", "download-metrics", job_id]
+    command += ["--sub-job", sub_job_id, "--output-dir", str(output_dir)]
+    return " ".join(shlex.quote(part) for part in command)
+
+
+def _result_warnings(results, *, kind: str, job_id: str, output_dir: Path) -> dict[str, list[str]]:
     """Per-sub-job ``warnings`` from a download result list (only sub-jobs that have some)."""
     out: dict[str, list[str]] = {}
     for row in results if isinstance(results, list) else []:
@@ -112,7 +122,8 @@ def _result_warnings(results) -> dict[str, list[str]]:
         sid = row.get("sub_job_id")
         messages = row.get("warnings")
         if isinstance(sid, str) and isinstance(messages, list):
-            texts = [str(m).replace(_RESUME_HINT, _TUI_RESUME_HINT) for m in messages if m]
+            hint = f"retry them with `{_retry_command(kind, job_id, sid, output_dir)}` (no --resume)"
+            texts = [str(m).replace(_RESUME_HINT, hint) for m in messages if m]
             if texts:
                 out.setdefault(sid, []).extend(texts)
     return out
@@ -570,7 +581,7 @@ class LogScreen(Screen):
                 self._post(
                     self._accept_download_warnings,
                     "metrics",
-                    _result_warnings(results),
+                    _result_warnings(results, kind="metrics", job_id=self._job_id, output_dir=self._metrics_root),
                     stall_checked=stall_checked,
                 )
             fresh = load_resource_data(self._metrics_root)
@@ -1075,11 +1086,12 @@ class LogScreen(Screen):
                     # fetches the others, and the pane shows the empty note.
                     pass
                 else:
-                    self._post(self._accept_download_warnings, "stdout", _result_warnings(results), stall_checked=False)
+                    warnings = self._stdout_result_warnings(results)
+                    self._post(self._accept_download_warnings, "stdout", warnings, stall_checked=False)
                     self._post(self._accept_saved_sub_job, first)
             # With resume, a sub-job fetched above costs only a listing here.
             results = download(self._job_id, self._stdout_root, **kwargs)
-            self._post(self._accept_download_warnings, "stdout", _result_warnings(results), stall_checked=False)
+            self._post(self._accept_download_warnings, "stdout", self._stdout_result_warnings(results), stall_checked=False)
         except DownloadCancelled:
             cancelled = True
         except Exception as exc:  # noqa: BLE001 - surfaced in the pane; keep the cache
@@ -1094,6 +1106,9 @@ class LogScreen(Screen):
         finally:
             lock.release()
         self._post(self._finish_download, error is None and not cancelled, error)
+
+    def _stdout_result_warnings(self, results) -> dict[str, list[str]]:
+        return _result_warnings(results, kind="stdout", job_id=self._job_id, output_dir=self._stdout_root)
 
     def _accept_saved_sub_job(self, sub_job_id: str) -> None:
         """UI thread. One sub-job's console is committed; show it if selected."""

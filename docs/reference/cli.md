@@ -742,8 +742,9 @@ redrawn with `\r` shows only its final state, and a line longer than 8 KiB
 shows only its end. Warnings from a download (for example skipped damaged
 chunks, or uploads that look stalled while the job runs) appear on the status
 line, and on the Resource tab, for the selected sub-job. The TUI always
-resumes, so it keeps a skipped chunk skipped; `download-log` without
-`--resume` retries it. The stalled-upload check runs on at most one GPU
+resumes, so it keeps a skipped chunk skipped; its warning names the
+`download-log --log-type stdout` or `download-metrics` command, with
+`--sub-job` and `--output-dir` set to the TUI's cache, that retries it. The stalled-upload check runs on at most one GPU
 metrics refresh per job every five minutes (a refresh that fails does not
 count). A
 stream error while the job is still running stays an error. The level key

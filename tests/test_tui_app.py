@@ -2163,12 +2163,22 @@ def test_selected_sub_job_repaints_when_progress_reports_it_done():
         release.set()
 
 
-def test_skipped_chunk_hint_points_at_the_cli_not_a_resume_toggle():
+@pytest.mark.parametrize(
+    "kind, command",
+    [
+        ("stdout", "cortex-training download-log job-1 --log-type stdout"),
+        ("metrics", "cortex-training download-metrics job-1"),
+    ],
+)
+def test_skipped_chunk_hint_names_the_cli_command_for_the_tui_cache(kind, command, tmp_path):
+    import shlex
+
     from cortex_training.tui.app import _result_warnings
 
+    cache = tmp_path / "cache dir" / kind
     rows = [
         {
-            "sub_job_id": "7:training:0",
+            "sub_job_id": "job-1:training:0",
             "skipped_chunks": ["chunk"],
             "warnings": [
                 "1 damaged chunk(s) skipped by an earlier download are still missing from the saved file; "
@@ -2176,9 +2186,12 @@ def test_skipped_chunk_hint_points_at_the_cli_not_a_resume_toggle():
             ],
         }
     ]
-    (message,) = _result_warnings(rows)["7:training:0"]
-    assert "without resume to retry" not in message.replace("(without --resume)", "")
-    assert "cortex-training download-log JOB_ID --log-type stdout` (without --resume)" in message
+    (message,) = _result_warnings(rows, kind=kind, job_id="job-1", output_dir=cache)["job-1:training:0"]
+    assert "download again without resume" not in message
+    retry = message.split("`")[1]
+    assert retry == f"{command} --sub-job job-1:training:0 --output-dir {shlex.quote(str(cache))}"
+    # The quoted path survives a shell round trip, so the retry repairs the cached file.
+    assert shlex.split(retry)[-1] == str(cache)
 
 
 async def _run_failed_refresh_keeps_stall_check_due(calls):
