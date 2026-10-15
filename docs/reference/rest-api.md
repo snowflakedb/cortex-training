@@ -2161,7 +2161,9 @@ paths or object-store credentials.
 
 `download_stdout_logs(job_id, output_dir, *, resume=False)` downloads gzip chunks
 under `_stdout/{sub_job_id}/`, orders them by artifact name, and streams them
-into `<output_dir>/<sub_job_id>/stdout.log`. Each sub-job is committed before
+into `<output_dir>/<sub_job_id>/stdout.log`. A large download may open
+additional Snowflake sessions to fetch one sub-job's chunks, and each of
+those sessions can prompt for authentication. Each sub-job is committed before
 the next one starts. A failed chunk leaves that sub-job's committed bytes
 and manifest in place. A hidden
 `.<filename>.manifest.json` beside the file records `version`, the sorted

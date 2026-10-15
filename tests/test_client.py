@@ -35,6 +35,8 @@ import importlib
 import json
 import logging
 import sys
+import threading
+import time
 from datetime import date
 from datetime import datetime
 from datetime import timedelta
@@ -4833,11 +4835,14 @@ class TestEvents:
 
 class TestExecutionLogDownload:
     class FakeArtifactConnection:
-        def __init__(self, list_rows=None, content_by_uri=None):
+        def __init__(self, list_rows=None, content_by_uri=None, on_get=None):
             self.list_rows = list_rows or {}
             self.content_by_uri = content_by_uri or {}
             self.commands = []
             self.closed = False
+            self.close_count = 0
+            self.on_get = on_get
+            self.raise_on_close = False
 
         class Cursor:
             def __init__(self, connection):
@@ -4861,6 +4866,8 @@ class TestExecutionLogDownload:
                     target = Path(unquote(urlparse(target_uri).path))
                     target.mkdir(parents=True, exist_ok=True)
                     assert not list(target.iterdir())
+                    if self.connection.on_get is not None:
+                        self.connection.on_get(source)
                     (target / PurePosixPath(source).name).write_bytes(
                         self.connection.content_by_uri[source]
                     )
@@ -4879,7 +4886,10 @@ class TestExecutionLogDownload:
             return self.Cursor(self)
 
         def close(self):
+            self.close_count += 1
             self.closed = True
+            if self.raise_on_close:
+                raise RuntimeError("close failed")
 
     def test_sql_literal_and_artifact_path_validation(self):
         assert nc._sql_string_literal("snow://exp/O'Brien") == "'snow://exp/O''Brien'"
@@ -5340,6 +5350,299 @@ class TestExecutionLogDownload:
         gets_after = [cmd for cmd in connection.commands if cmd.startswith("GET ") and good in cmd]
         assert gets_after == gets_before
         assert (tmp_path / second_sub / "stdout.log").read_bytes() == b"later\n"
+
+    def _parallel_stdout(self, monkeypatch, count, *, bodies=None, on_get=None):
+        c = _make_client()
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        sub = "job-1:training:0"
+        paths = [
+            f"_stdout/{sub}/console.20260904-{index:06d}.part.gz"
+            for index in range(count)
+        ]
+        if bodies is None:
+            bodies = {
+                run_uri + path: gzip.compress(f"{index}\n".encode())
+                for index, path in enumerate(paths)
+            }
+        list_rows = {
+            run_uri + "_stdout/": [(f"/versions/RUN_ABC/{path}",) for path in paths],
+            run_uri + "checkpoints/_stdout/": [],
+        }
+        opened = []
+
+        def opener():
+            conn = self.FakeArtifactConnection(list_rows, bodies, on_get=on_get)
+            opened.append(conn)
+            return conn
+
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
+        monkeypatch.setattr(nc, "_ARTIFACT_GET_MIN_CHUNKS", 2)
+        return c, opened, run_uri, paths
+
+    def test_parallel_download_overlaps_and_keeps_sorted_order(
+        self, tmp_path, monkeypatch
+    ):
+        started = {"n": 0}
+        lock = threading.Lock()
+        released = {}
+        workers = nc._ARTIFACT_GET_WORKERS
+
+        def note_release():
+            released["n"] = started["n"]
+
+        barrier = threading.Barrier(workers, action=note_release, timeout=5)
+
+        def on_get(_source):
+            with lock:
+                started["n"] += 1
+                current = started["n"]
+            if current <= workers:
+                barrier.wait()
+
+        c, opened, _run_uri, _paths = self._parallel_stdout(
+            monkeypatch, 20, on_get=on_get
+        )
+        c.download_stdout_logs("job-1", tmp_path)
+        assert released["n"] == workers
+        expected = b"".join(f"{index}\n".encode() for index in range(20))
+        assert (tmp_path / "job-1:training:0" / "stdout.log").read_bytes() == expected
+        assert len(opened) == workers
+        assert [conn.close_count for conn in opened] == [1] * workers
+
+    def test_parallel_download_stays_serial_when_opener_returns_one_connection(
+        self, tmp_path, monkeypatch
+    ):
+        inflight = {"n": 0, "max": 0}
+        lock = threading.Lock()
+
+        def on_get(source):
+            with lock:
+                inflight["n"] += 1
+                inflight["max"] = max(inflight["max"], inflight["n"])
+            try:
+                if source.endswith("000000.part.gz"):
+                    time.sleep(0.2)
+            finally:
+                with lock:
+                    inflight["n"] -= 1
+
+        c, _opened, _run_uri, paths = self._parallel_stdout(
+            monkeypatch, 4, on_get=on_get
+        )
+        primary = self.FakeArtifactConnection(
+            {
+                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/_stdout/": [
+                    (f"/versions/RUN_ABC/{path}",) for path in paths
+                ],
+                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_stdout/": [],
+            },
+            {
+                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/" + path: gzip.compress(
+                    f"{index}\n".encode()
+                )
+                for index, path in enumerate(paths)
+            },
+            on_get=on_get,
+        )
+        monkeypatch.setattr(
+            c, "_open_experiment_artifact_connection", lambda: primary
+        )
+        c.download_stdout_logs("job-1", tmp_path)
+        assert inflight["max"] == 1
+        assert primary.close_count == 1
+        assert primary.closed
+        assert (tmp_path / "job-1:training:0" / "stdout.log").read_bytes() == b"0\n1\n2\n3\n"
+
+    def test_parallel_get_failure_keeps_previous_file(self, tmp_path, monkeypatch):
+        def on_get(source):
+            if source.endswith("000001.part.gz"):
+                raise RuntimeError("get failed")
+
+        c, opened, _run_uri, _paths = self._parallel_stdout(
+            monkeypatch, 4, on_get=on_get
+        )
+        destination = tmp_path / "job-1:training:0" / "stdout.log"
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"previous\n")
+        with pytest.raises(RuntimeError, match="get failed"):
+            c.download_stdout_logs("job-1", tmp_path)
+        assert destination.read_bytes() == b"previous\n"
+        assert opened
+        assert [conn.close_count for conn in opened] == [1] * len(opened)
+
+    def test_parallel_bad_gzip_on_resume_keeps_committed_prefix(
+        self, tmp_path, monkeypatch
+    ):
+        c, opened, run_uri, paths = self._parallel_stdout(monkeypatch, 1)
+        c.download_stdout_logs("job-1", tmp_path)
+        destination = tmp_path / "job-1:training:0" / "stdout.log"
+        committed = destination.read_bytes()
+        manifest = destination.with_name(".stdout.log.manifest.json")
+        names = json.loads(manifest.read_text())["names"]
+        later = [
+            f"_stdout/job-1:training:0/console.20260904-{index:06d}.part.gz"
+            for index in (1, 2)
+        ]
+        bodies = opened[0].content_by_uri
+        bodies[run_uri + later[0]] = gzip.compress(b"new\n")
+        bodies[run_uri + later[1]] = b"not gzip"
+        listed = opened[0].list_rows[run_uri + "_stdout/"]
+        listed.extend((f"/versions/RUN_ABC/{path}",) for path in later)
+        resume_opened = []
+
+        def opener():
+            conn = self.FakeArtifactConnection(
+                opened[0].list_rows, bodies
+            )
+            resume_opened.append(conn)
+            return conn
+
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
+        with pytest.raises(gzip.BadGzipFile):
+            c.download_stdout_logs("job-1", tmp_path, resume=True)
+        assert destination.read_bytes() == committed
+        assert json.loads(manifest.read_text())["names"] == names
+        assert len(resume_opened) > 1
+        assert [conn.close_count for conn in resume_opened] == [1] * len(resume_opened)
+
+    def test_parallel_download_continues_when_a_later_session_open_fails(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        c, _opened, _run_uri, paths = self._parallel_stdout(monkeypatch, 3)
+        created = []
+
+        def opener():
+            if len(created) >= 2:
+                raise RuntimeError("open failed")
+            conn = self.FakeArtifactConnection(
+                {
+                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/_stdout/": [
+                        (f"/versions/RUN_ABC/{path}",) for path in paths
+                    ],
+                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_stdout/": [],
+                },
+                {
+                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/" + path: gzip.compress(
+                        f"{index}\n".encode()
+                    )
+                    for index, path in enumerate(paths)
+                },
+            )
+            created.append(conn)
+            return conn
+
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
+        with caplog.at_level(logging.WARNING, logger=nc.__name__):
+            c.download_stdout_logs("job-1", tmp_path)
+        assert (tmp_path / "job-1:training:0" / "stdout.log").read_bytes() == b"0\n1\n2\n"
+        assert len(created) == 2
+        assert [conn.close_count for conn in created] == [1, 1]
+
+    def test_parallel_download_warns_when_the_first_extra_session_fails(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        c, _opened, _run_uri, paths = self._parallel_stdout(monkeypatch, 3)
+        primary = self.FakeArtifactConnection(
+            {
+                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/_stdout/": [
+                    (f"/versions/RUN_ABC/{path}",) for path in paths
+                ],
+                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_stdout/": [],
+            },
+            {
+                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/" + path: gzip.compress(
+                    f"{index}\n".encode()
+                )
+                for index, path in enumerate(paths)
+            },
+        )
+        calls = {"n": 0}
+
+        def opener():
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("open failed")
+            return primary
+
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
+        with caplog.at_level(logging.WARNING, logger=nc.__name__):
+            c.download_stdout_logs("job-1", tmp_path)
+        assert any(
+            "could not open an extra session" in record.message
+            for record in caplog.records
+        )
+        assert primary.close_count == 1
+        assert (tmp_path / "job-1:training:0" / "stdout.log").read_bytes() == b"0\n1\n2\n"
+
+    def test_parallel_close_failure_does_not_fail_the_download(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        c, _opened, _run_uri, paths = self._parallel_stdout(monkeypatch, 3)
+        created = []
+
+        def opener():
+            conn = self.FakeArtifactConnection(
+                {
+                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/_stdout/": [
+                        (f"/versions/RUN_ABC/{path}",) for path in paths
+                    ],
+                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_stdout/": [],
+                },
+                {
+                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/" + path: gzip.compress(
+                        f"{index}\n".encode()
+                    )
+                    for index, path in enumerate(paths)
+                },
+            )
+            if len(created) == 1:
+                conn.raise_on_close = True
+            created.append(conn)
+            return conn
+
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
+        with caplog.at_level(logging.WARNING, logger=nc.__name__):
+            c.download_stdout_logs("job-1", tmp_path)
+        assert (tmp_path / "job-1:training:0" / "stdout.log").read_bytes() == b"0\n1\n2\n"
+        assert [conn.close_count for conn in created] == [1, 1, 1]
+        assert any("failed to close" in record.message for record in caplog.records)
+
+    def test_parallel_get_error_survives_a_close_error(self, tmp_path, monkeypatch):
+        def on_get(source):
+            if source.endswith("000001.part.gz"):
+                raise RuntimeError("get failed")
+
+        c, _opened, _run_uri, paths = self._parallel_stdout(
+            monkeypatch, 3, on_get=on_get
+        )
+        created = []
+
+        def opener():
+            conn = self.FakeArtifactConnection(
+                {
+                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/_stdout/": [
+                        (f"/versions/RUN_ABC/{path}",) for path in paths
+                    ],
+                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_stdout/": [],
+                },
+                {
+                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/" + path: gzip.compress(
+                        f"{index}\n".encode()
+                    )
+                    for index, path in enumerate(paths)
+                },
+                on_get=on_get,
+            )
+            if created:
+                conn.raise_on_close = True
+            created.append(conn)
+            return conn
+
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
+        with pytest.raises(RuntimeError, match="get failed"):
+            c.download_stdout_logs("job-1", tmp_path)
+        assert [conn.close_count for conn in created] == [1] * len(created)
 
     def test_fetch_execution_logs_errors_when_experiment_run_missing_fields(self):
         c = _make_client(get_json={"experiment_name": "DB.SCH.EXP"})

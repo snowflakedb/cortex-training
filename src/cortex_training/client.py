@@ -52,6 +52,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Mapping
@@ -97,6 +98,8 @@ _GPU_METRICS_CHUNK_RE = re.compile(
     r"^gpu\.(?P<timestamp>\d{8}-\d{6})\.(?P<suffix>[^./\\]+)\.gz$"
 )
 _STREAM_COPY_BUFFER_BYTES = 1024 * 1024
+_ARTIFACT_GET_WORKERS = 8
+_ARTIFACT_GET_MIN_CHUNKS = 128
 
 # Env var that unlocks create-job debug options. These are an internal-only
 # capability and are deliberately not documented for external use: the client
@@ -2913,6 +2916,92 @@ class CortexTrainingClient:
         finally:
             downloaded.unlink(missing_ok=True)
 
+    def _write_ordered_gzip_chunks(
+        self,
+        connection: Any,
+        run_uri: str,
+        artifact_temp: Path,
+        paths: list[str],
+        output,
+    ) -> None:
+        """GET sessions are not shared across workers; bytes append in path order."""
+        if len(paths) < _ARTIFACT_GET_MIN_CHUNKS:
+            for relative_path in paths:
+                self._download_gzip_member(
+                    connection,
+                    run_uri,
+                    relative_path,
+                    artifact_temp,
+                    output,
+                )
+            return
+        pool = [connection]
+        try:
+            limit = min(_ARTIFACT_GET_WORKERS, len(paths))
+            warned = False
+            while len(pool) < limit:
+                try:
+                    extra = self._open_experiment_artifact_connection()
+                except Exception:
+                    if not warned:
+                        logger.warning(
+                            "could not open an extra session for artifact download; "
+                            "continuing with %d",
+                            len(pool),
+                        )
+                        warned = True
+                    break
+                if any(extra is existing for existing in pool):
+                    break
+                pool.append(extra)
+            self._write_gzip_chunk_batches(
+                pool, run_uri, artifact_temp, paths, output
+            )
+        finally:
+            for extra in pool[1:]:
+                try:
+                    extra.close()
+                except Exception:
+                    logger.warning("failed to close an extra artifact-download session")
+
+    def _write_gzip_chunk_batches(
+        self,
+        pool: list[Any],
+        run_uri: str,
+        artifact_temp: Path,
+        paths: list[str],
+        output,
+    ) -> None:
+        batch_size = len(pool)
+        for start in range(0, len(paths), batch_size):
+            batch = paths[start : start + batch_size]
+            chunk_dirs = []
+            for offset, _relative_path in enumerate(batch):
+                chunk_dir = artifact_temp / f"chunk-{start + offset}"
+                chunk_dir.mkdir()
+                chunk_dirs.append(chunk_dir)
+            try:
+                with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                    futures = [
+                        executor.submit(
+                            self._download_experiment_artifact,
+                            pool[index],
+                            run_uri,
+                            relative_path,
+                            chunk_dir,
+                        )
+                        for index, (relative_path, chunk_dir) in enumerate(
+                            zip(batch, chunk_dirs)
+                        )
+                    ]
+                    for future, chunk_dir in zip(futures, chunk_dirs):
+                        downloaded = future.result()
+                        self._copy_gzip_member(downloaded, output)
+                        shutil.rmtree(chunk_dir, ignore_errors=True)
+            finally:
+                for chunk_dir in chunk_dirs:
+                    shutil.rmtree(chunk_dir, ignore_errors=True)
+
     def _rebuild_gzip_file(
         self,
         connection: Any,
@@ -2938,14 +3027,13 @@ class CortexTrainingClient:
         )
         temporary = Path(output.name)
         try:
-            for relative_path in chunk_paths:
-                self._download_gzip_member(
-                    connection,
-                    run_uri,
-                    relative_path,
-                    artifact_temp,
-                    output,
-                )
+            self._write_ordered_gzip_chunks(
+                connection,
+                run_uri,
+                artifact_temp,
+                chunk_paths,
+                output,
+            )
             output.flush()
             os.fsync(output.fileno())
             output.close()
@@ -3007,14 +3095,13 @@ class CortexTrainingClient:
             output.seek(committed)
             output.truncate(committed)
             try:
-                for relative_path in new_paths:
-                    self._download_gzip_member(
-                        connection,
-                        run_uri,
-                        relative_path,
-                        artifact_temp,
-                        output,
-                    )
+                self._write_ordered_gzip_chunks(
+                    connection,
+                    run_uri,
+                    artifact_temp,
+                    new_paths,
+                    output,
+                )
                 output.flush()
                 os.fsync(output.fileno())
                 end = output.tell()

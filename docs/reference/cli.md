@@ -623,7 +623,9 @@ cortex-training download-log JOB_ID --log-type stdout --output-dir /path/to/logs
 The current working directory is used when `--output-dir` is omitted.
 `--resume` continues a stdout download already in that directory. It does not
 apply to execution logs, including `download-log` without `--log-type stdout`.
-Two downloads of the same directory at once are unsupported.
+A large download may open additional Snowflake sessions for one sub-job, and
+each session can prompt for authentication. Two downloads of the same
+directory at once are unsupported.
 
 ### Download GPU Metrics
 
@@ -637,8 +639,9 @@ cortex-training download-metrics JOB_ID --output-dir /path/to/metrics --resume
 
 The command prints the saved path, chunk count, and first/last logical artifact
 URIs for each reconstructed file. `--resume` continues a metrics download
-already in that directory. Two downloads of the same directory at once are
-unsupported.
+already in that directory. A large download may open additional Snowflake
+sessions for one sub-job, and each session can prompt for authentication.
+Two downloads of the same directory at once are unsupported.
 
 ### Job TUI
 
