@@ -46,6 +46,10 @@ def _isolated_cache(tmp_path, monkeypatch):
     # The saved console and caches live under the per-job cache dir; keep every
     # test (including those that do not set it themselves) out of ~/.cache.
     monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path / "isolated-cache"))
+    import cortex_training.tui.app as app_module
+
+    # The stall-check throttle is per process; start each test without one.
+    monkeypatch.setattr(app_module, "_STALL_CHECKED_AT", {})
 
 
 def _client():
@@ -2006,3 +2010,97 @@ def test_quit_during_download_stops_it_and_frees_the_lock():
     deadline = time.monotonic() + 5
     assert lock.acquire(lambda: time.monotonic() < deadline), "lock still held after quit"
     lock.release()
+
+
+async def _run_stdout_warnings(calls):
+    c = _client()
+    c.get_job.return_value = _terminal_job()
+
+    class _Downloads:
+        def download_stdout_logs(
+            self, job_id, output_dir, *, resume=False, progress=None, sub_job_ids=None, stale_after_seconds=600
+        ):
+            calls.append(stale_after_seconds)
+            _write_stdout(output_dir, "7:training:0", "saved\n")
+            return [
+                {"sub_job_id": "7:training:0", "warnings": ["1 damaged chunk was skipped"]},
+                {"sub_job_id": "7:sampling:0", "warnings": ["sampling warning"]},
+            ]
+
+    c.download_stdout_logs = _Downloads().download_stdout_logs
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, lambda: "warning: 1 damaged chunk was skipped" in (app.sub_title or ""))
+        assert ok, "download warning for the selected sub-job was not shown"
+        assert "saved" in app.screen._shown_lines
+        assert "sampling warning" not in (app.sub_title or "")
+        app.screen._start_tail("7:sampling:0")
+        ok = await _wait(pilot, app, lambda: "warning: sampling warning" in (app.sub_title or ""))
+        assert ok, "warnings did not follow the selected sub-job"
+        await _settle(app, pilot)
+
+
+def test_stdout_download_warnings_show_for_the_selected_sub_job():
+    calls = []
+    asyncio.run(_run_stdout_warnings(calls))
+    # Finished jobs skip the client's stall check (its status lookup is wasted).
+    assert calls and all(value is None for value in calls)
+
+
+async def _run_metrics_stall_check_throttled(calls, monkeypatch):
+    import cortex_training.tui.app as app_module
+
+    c = _client()
+
+    class _Downloads:
+        def download_metrics(self, job_id, output_dir, *, resume=False, stale_after_seconds=600):
+            calls.append(stale_after_seconds)
+            _write_gpu_metrics(output_dir, "7:training:0", gpu_count=1)
+            if stale_after_seconds is None:
+                return [{"sub_job_id": "7:training:0"}]
+            return [{"sub_job_id": "7:training:0", "warnings": ["uploads may be stalled"]}]
+
+    c.download_metrics = _Downloads().download_metrics
+
+    def status():
+        return str(app.screen.query_one("#resource-status", Static).render())
+
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(100, 36)) as pilot:
+        ok = await _wait(pilot, app, lambda: app.screen._current_source == "7:training:0")
+        assert ok
+        app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        ok = await _wait(pilot, app, lambda: len(calls) == 1 and "uploads may be stalled" in status())
+        assert ok, "stall warning was not shown on Resource"
+        assert "uploads may be stalled" in (app.sub_title or "")
+        app.screen.action_refresh_sources()
+        ok = await _wait(pilot, app, lambda: len(calls) == 2 and not app.screen._resource_loading)
+        assert ok, "r did not refresh metrics"
+        # The throttled refresh skipped the check but keeps its last answer.
+        assert "uploads may be stalled" in status()
+        monkeypatch.setattr(app_module, "_STALL_CHECK_SECONDS", 0.0)
+        app.screen.action_refresh_sources()
+        ok = await _wait(pilot, app, lambda: len(calls) == 3 and not app.screen._resource_loading)
+        assert ok
+        await _settle(app, pilot)
+
+
+def test_metrics_stall_check_runs_at_most_once_per_window(monkeypatch):
+    calls = []
+    asyncio.run(_run_metrics_stall_check_throttled(calls, monkeypatch))
+    assert calls == [600, None, 600]
+
+
+def test_leaving_uses_the_clients_cancellation_exception_when_exported(monkeypatch, tmp_path):
+    import cortex_training.client as client_module
+    import cortex_training.tui.app as app_module
+
+    class ClientCancelled(Exception):
+        pass
+
+    monkeypatch.setattr(client_module, app_module._CLIENT_CANCEL_NAME, ClientCancelled, raising=False)
+    monkeypatch.setattr(app_module, "_ERROR_LOG", str(tmp_path / "errors.log"))
+    state = {"calls": 0, "started": threading.Event()}
+    asyncio.run(_run_reopen_while_download_blocks(state))
+    assert state["raised"] == "ClientCancelled"
+    assert not (tmp_path / "errors.log").exists(), "the client's cancel was logged as a failure"

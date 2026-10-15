@@ -102,6 +102,42 @@ def _cancel_exception() -> type[BaseException]:
     return _DownloadCancelled
 
 
+# The client's stall check (one get_job plus listings) runs on at most one
+# metrics refresh per job in this window; other refreshes pass None to skip it.
+_STALL_CHECK_SECONDS = 300.0
+_STALL_CHECKED_AT: dict[str, float] = {}
+
+
+def _take_stall_check(job_id: str) -> bool:
+    now = time.monotonic()
+    last = _STALL_CHECKED_AT.get(job_id)
+    if last is not None and now - last < _STALL_CHECK_SECONDS:
+        return False
+    _STALL_CHECKED_AT[job_id] = now
+    return True
+
+
+def _result_warnings(results) -> dict[str, list[str]]:
+    """Per-sub-job ``warnings`` from a download result list (absent in older clients)."""
+    out: dict[str, list[str]] = {}
+    for row in results if isinstance(results, list) else []:
+        if not isinstance(row, dict):
+            continue
+        sid = row.get("sub_job_id")
+        messages = row.get("warnings")
+        if isinstance(sid, str) and isinstance(messages, list):
+            texts = [str(m) for m in messages if m]
+            if texts:
+                out.setdefault(sid, []).extend(texts)
+    return out
+
+
+def _warning_text(messages: list[str], limit: int = 100) -> str:
+    first = messages[0] if len(messages[0]) <= limit else messages[0][: limit - 1] + "…"
+    more = f" (+{len(messages) - 1} more)" if len(messages) > 1 else ""
+    return f"warning: {first}{more}"
+
+
 def _accepts_kwarg(fn, name: str) -> bool:
     """Whether ``fn`` takes keyword ``name`` (so optional client features can be
     passed without breaking an older client)."""
@@ -328,6 +364,10 @@ class LogScreen(Screen):
         self._stdout_error: str | None = None  # last failure; r retries
         self._stdout_status: str | None = None  # shown while downloading
         self._paint_gen = 0  # invalidates stale saved-console paints
+        # Client download warnings per sub-job (stall, skipped chunks, ...).
+        self._stdout_warnings: dict[str, list[str]] = {}
+        self._metrics_warnings: dict[str, list[str]] = {}
+        self._stall_warnings: dict[str, list[str]] = {}  # from the last metrics stall check
         self._held: tuple[list[str], bool] | None = None
         self._active_tab = "logs"
         self._log_focus_id = "sources"
@@ -476,7 +516,34 @@ class LogScreen(Screen):
             bits.append(self._stdout_status)
         elif self._stdout_error:
             bits.append("saved console download failed (r retries)")
+        warnings = self._source_warnings()
+        if warnings:
+            bits.append(_warning_text(warnings))
         self.app.sub_title = "  ·  ".join(bits)
+
+    def _source_warnings(self) -> list[str]:
+        """Client download warnings for the selected sub-job, deduplicated."""
+        source = self._current_source
+        if not source:
+            return []
+        merged: dict[str, None] = {}
+        for table in (self._stdout_warnings, self._stall_warnings, self._metrics_warnings):
+            merged.update(dict.fromkeys(table.get(source, [])))
+        return list(merged)
+
+    def _accept_download_warnings(self, kind: str, warnings: dict[str, list[str]], *, stall_checked: bool) -> None:
+        """UI thread. Record one download's warnings and refresh the status lines."""
+        if not self._screen_open:
+            return
+        if kind == "stdout":
+            self._stdout_warnings.update(warnings)
+        else:
+            self._metrics_warnings = warnings
+            if stall_checked:
+                self._stall_warnings = warnings
+        self._update_subtitle()
+        if self._resource_active():
+            self._render_resource()
 
     def _set_summary(self, text: str) -> None:
         try:
@@ -517,11 +584,21 @@ class LogScreen(Screen):
             cached = load_resource_data(self._metrics_root)
             if (cached.sub_jobs or cached.ignored_rows_by_sub_job) and not worker.is_cancelled:
                 self._post(self._accept_cached_resource, cached)
-            self._client.download_metrics(
-                self._job_id,
-                self._metrics_root,
-                resume=True,
-            )
+            download = self._client.download_metrics
+            kwargs = {"resume": True}
+            stall_checked = False
+            if _accepts_kwarg(download, "stale_after_seconds"):
+                stall_checked = _take_stall_check(self._job_id)
+                if not stall_checked:
+                    kwargs["stale_after_seconds"] = None
+            results = download(self._job_id, self._metrics_root, **kwargs)
+            if not worker.is_cancelled:
+                self._post(
+                    self._accept_download_warnings,
+                    "metrics",
+                    _result_warnings(results),
+                    stall_checked=stall_checked,
+                )
             fresh = load_resource_data(self._metrics_root)
             if not worker.is_cancelled:
                 self._post(self._finish_resource_refresh, fresh, None)
@@ -629,6 +706,9 @@ class LogScreen(Screen):
                 bits.append("no usable GPU metrics for this sub-job" if ignored else "no GPU metrics for this sub-job")
             if state:
                 bits.append(state)
+            warnings = self._source_warnings()
+            if warnings:
+                bits.append(escape(_warning_text(warnings)))
             if ignored:
                 bits.append(f"{ignored} unsupported row(s)")
             status.update("  ·  ".join(bits))
@@ -674,6 +754,9 @@ class LogScreen(Screen):
             bits.append(f"{ignored} unsupported row(s)")
         if state:
             bits.append(state)
+        warnings = self._source_warnings()
+        if warnings:
+            bits.append(escape(_warning_text(warnings)))
         status.update("  ·  ".join(bits))
         chart.update("no GPU samples in this range" if view.average_util_pct is None else render_chart(view, width))
 
@@ -1001,11 +1084,17 @@ class LogScreen(Screen):
             kwargs = {"resume": True}
             if _accepts_kwarg(download, "progress"):
                 kwargs["progress"] = self._stdout_progress(keep_waiting)
+            # Saved consoles are fetched for finished jobs, where the stall
+            # check cannot fire; skip its status lookup.
+            if _accepts_kwarg(download, "stale_after_seconds"):
+                kwargs["stale_after_seconds"] = None
             if first and _accepts_kwarg(download, "sub_job_ids"):
-                download(self._job_id, self._stdout_root, sub_job_ids=[first], **kwargs)
+                results = download(self._job_id, self._stdout_root, sub_job_ids=[first], **kwargs)
+                self._post(self._accept_download_warnings, "stdout", _result_warnings(results), stall_checked=False)
                 self._post(self._accept_saved_sub_job, first)
             # With resume, a sub-job fetched above costs only a listing here.
-            download(self._job_id, self._stdout_root, **kwargs)
+            results = download(self._job_id, self._stdout_root, **kwargs)
+            self._post(self._accept_download_warnings, "stdout", _result_warnings(results), stall_checked=False)
         except (_DownloadCancelled, _cancel_exception()):
             cancelled = True
         except Exception as exc:  # noqa: BLE001 - surfaced in the pane; keep the cache

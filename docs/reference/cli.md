@@ -739,7 +739,10 @@ end of a large console (up to 20,000 lines from at most its last 64 MiB, and
 only bytes the download has committed); `s` and `y` still export the whole
 file. As in a terminal, a carriage return rewinds the line, so a progress bar
 redrawn with `\r` shows only its final state, and a line longer than 8 KiB
-shows only its end. A stream error while the job
+shows only its end. Warnings from a download (for example skipped damaged
+chunks, or uploads that look stalled while the job runs) appear on the status
+line, and on the Resource tab, for the selected sub-job. The stalled-upload
+check runs on at most one GPU metrics refresh per job every five minutes. A stream error while the job
 is still running stays an error. The level key filters structured live lines
 and does not hide lines from that saved console.
 
