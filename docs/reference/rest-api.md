@@ -1134,6 +1134,31 @@ The backend can add fields such as log probabilities or action masks. For a
 request submitted by the same `CortexTrainingClient` instance, `poll_request()`
 converts tensor values under `results` back to Python lists.
 
+#### Per-token log probabilities
+
+On server versions that pass vLLM's `logprobs` and `prompt_logprobs` sampling
+options through, two optional `sampling_params` keys add log probabilities to
+each result:
+
+| Key | Result field | Contents |
+|---|---|---|
+| `logprobs: 0` | `logprobs` | One entry per generated token, aligned with `token_ids` |
+| `prompt_logprobs: 0` | `prompt_logprobs` | One entry per prompt token; the first entry is `null` because nothing precedes the first token |
+
+Each entry maps a token id to an object that includes `logprob`: the
+log probability of that token given everything before it. With `0`, the map
+holds only the token that actually appears at that position; a positive value
+`k` also includes the `k` most likely alternatives. The token id is a JSON
+object key, so it can arrive as a string.
+
+`prompt_logprobs` scores a known token sequence without decoding or
+re-tokenizing it: send the sequence as a pre-tokenized prompt with
+`max_tokens: 1` and read `prompt_logprobs[i]` as the log probability of prompt
+token `i`. The prompt must stay shorter than the sampling sub-job's
+`max_seq_len`. The
+[on-policy distillation recipe](../../recipes/distillation/README.md) scores
+student rollouts with a teacher this way.
+
 ### 6.7 Streaming generate - `POST /{job_id}/generate-stream`
 
 `generate_stream()` accepts the same logical fields as `generate()` and encodes
@@ -1953,8 +1978,9 @@ batch = {
 `context` and `processing` are open backend contracts. Their accepted keys,
 registered loss functions, and post-processors come from the deployed training
 backend, not the REST schema. The optional ratio controls of the `grpo` loss and
-its variants, described below, are an exception: their configuration keys, and
-the metrics named below, are listed here.
+its variants, and the `grpo` teacher term, both described below, are an
+exception: their configuration keys, context tensors, and the metrics named
+below, are listed here.
 
 Do not use `build_forward_backward_payload()` for this extended shape: that
 helper currently ignores `context` and `processing`.
@@ -2087,6 +2113,50 @@ enough to keep each worker's share in one call. Two rejections come later:
 ratio control without `use_cispo_loss` is rejected. A worker raises both when it
 resolves the loss, before any forward pass.
 
+#### Teacher term for on-policy distillation
+
+On server versions that include it, the `grpo` and `ap_grpo` losses accept a
+teacher term that adds, at every trained token, a clipped teacher-minus-policy
+log ratio to that token's advantage:
+
+```text
+advantage[i] += teacher_tau * clamp(teacher_log_probs_shifted[i] - log_prob[i],
+                                    -teacher_clip_negative, teacher_clip)
+```
+
+`log_prob[i]` is the training policy's own log probability, detached. With
+`context["advantages"]` all zero, this term is the whole signal and the update
+is an on-policy distillation step on reverse KL to the teacher; with task
+advantages, the two add.
+
+| Key | Meaning |
+|---|---|
+| `teacher_tau` | Finite, non-negative weight of the term. `0` (the default) turns it off |
+| `teacher_clip` | Finite, positive upper clip on the log ratio. Required when `teacher_tau > 0` |
+| `teacher_clip_negative` | Optional finite, non-negative magnitude of the lower clip. Defaults to `teacher_clip` |
+
+When `teacher_tau > 0`, `context` must carry `teacher_log_probs_shifted`: a
+floating-point tensor with the same shape as the prediction-aligned
+log probabilities, where position `i` holds the teacher's log probability of
+`input_ids[:, i + 1]` (see [section 10.4](#104-shifted-log-probability-convention)).
+Positions outside `loss_mask` are ignored, as are positions whose teacher value
+is not finite. The term also requires the default token-level
+`importance_sampling_level`, and with `token-mean` aggregation it rejects
+`sequence_loss_weights`. Configuration keys are checked by name, so a misspelled
+key fails the request instead of training without the term.
+
+With the term enabled, the `metrics` of the forward/backward result carry:
+
+| Metric | Meaning |
+|---|---|
+| `teacher_tau` | The weight that was applied |
+| `teacher_term_token_count` | Tokens that received the term |
+| `teacher_log_ratio_sum` | Sum of the unclipped teacher-minus-policy log ratios over those tokens |
+| `teacher_clipped_log_ratio_sum` | The same sum after clipping |
+
+`-teacher_log_ratio_sum / teacher_term_token_count` is a per-token estimate of
+the reverse KL from the policy to the teacher on the trained tokens.
+
 ### 10.4 Shifted log-probability convention
 
 ArcticTraining's RL adapter documents `_shifted` log-probability tensors as:
@@ -2161,7 +2231,9 @@ paths or object-store credentials.
 
 `download_stdout_logs(job_id, output_dir, *, resume=False, progress=None)` downloads gzip chunks
 under `_stdout/{sub_job_id}/`, orders them by artifact name, and streams them
-into `<output_dir>/<sub_job_id>/stdout.log`. Each sub-job is committed before
+into `<output_dir>/<sub_job_id>/stdout.log`. A large download may open
+additional Snowflake sessions to fetch one sub-job's chunks, and each of
+those sessions can prompt for authentication. Each sub-job is committed before
 the next one starts. A failed chunk leaves that sub-job's committed bytes
 and manifest in place. A hidden
 `.<filename>.manifest.json` beside the file records `version`, the sorted

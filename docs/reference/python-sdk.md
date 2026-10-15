@@ -257,7 +257,9 @@ chunks as `<output_dir>/<sub_job_id>/gpu.jsonl`. The methods stay silent unless
 `progress` is passed. `progress` receives status updates without a trailing
 newline, then `"\n"` when that sub-job finishes or fails; a status that needs no
 updating arrives as one message ending in a newline. An error raised by
-`progress` stops the download. `resume=True` appends chunks
+`progress` stops the download. A large download may open additional Snowflake
+sessions for one sub-job, and each session can prompt for authentication.
+`resume=True` appends chunks
 that are not already recorded in the manifest beside that file. See
 [GPU metrics download](rest-api.md#124-gpu-metrics-download) for the JSONL row
 schema.
