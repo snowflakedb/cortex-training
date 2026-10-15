@@ -13,7 +13,8 @@ cortex-training download-log JOB_ID --log-type stdout --output-dir /path/to/logs
 cortex-training download-log JOB_ID --log-type stdout --output-dir /path/to/logs --resume
 ```
 
-`--resume` continues a stdout download already in that directory. It does not
+`--resume` continues a stdout download already in that directory, including
+one that was interrupted, and fetches only what is missing. It does not
 apply to execution logs. On a terminal, stdout and GPU metrics progress is
 one stderr line that updates in place. A redirected stderr gets one final line
 per sub-job. The JSON result stays on stdout.

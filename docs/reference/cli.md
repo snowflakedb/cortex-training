@@ -621,13 +621,46 @@ cortex-training download-log JOB_ID --log-type stdout --output-dir /path/to/logs
 ```
 
 The current working directory is used when `--output-dir` is omitted.
-`--resume` continues a stdout download already in that directory. It does not
-apply to execution logs, including `download-log` without `--log-type stdout`.
-On a terminal, progress is one line on stderr that updates in place. A
-redirected stderr gets one final line per sub-job. Progress is not part of
-the JSON on stdout.
-A large download may open additional Snowflake sessions for one sub-job, and
-each session can prompt for authentication. Two downloads of the same
+`--resume` continues a stdout download already in that directory: it appends
+chunks written since the last download, and it continues a download that was
+interrupted or failed part way through. Progress is saved while every download
+runs, with or without `--resume`, so after an interruption rerun the same
+command with `--resume` to fetch only the remaining chunks. A run without
+`--resume` starts over.
+
+Chunks are fetched concurrently; `--parallel N` sets how many at once (default
+16) and output is still written in chunk order. `--sub-job SUB_JOB_ID`
+(repeatable) limits the download to those sub-jobs; naming a sub-job with no
+stdout chunks is an error. Transient connection and service errors are retried
+with backoff, and an expired session is reopened. A single fetch or listing
+that takes longer than `--transfer-timeout SECONDS` (default 300; `0` means no
+limit) is abandoned and retried. Errors a retry cannot fix,
+such as missing privileges, stop the download at once with a short `error:`
+line. On a terminal, progress is one line on stderr that updates in place, and
+`warning:` lines print above it. A redirected stderr gets one final line per
+sub-job. Progress is not part of the JSON on stdout. The download uses one
+Snowflake session for all of its concurrent fetches. Ctrl-C stops the download, keeps the chunks already written, and exits with
+status 130. After an error or Ctrl-C the CLI says whether anything was saved for
+`--resume` to continue from.
+
+A chunk that was removed from the run after it was listed is skipped. A chunk
+that cannot be decompressed is downloaded once more and, if it is still
+damaged, skipped: the rest of the file is written, the chunk is listed in that
+sub-job's `skipped_chunks`, and a `warning:` line goes to stderr. `--resume`
+keeps a skipped chunk skipped; a run without `--resume` tries it again.
+`--strict` stops on the first damaged chunk instead. Any notice about a
+sub-job is also listed in its `warnings` field in the JSON summary.
+
+While the job and that sub-job are running, a sub-job whose newest saved chunk
+is more than `--stale-after-minutes` old (default 10; `0` turns this off) gets
+a warning that uploads may be stalled. Chunk times come from the chunk names
+and are UTC, and are compared with the service's clock when it reports one.
+A job that prints nothing for a while also produces this warning for stdout.
+The download itself still completes.
+
+`--resume`, `--parallel`, `--sub-job`, `--strict`, `--stale-after-minutes`, and
+`--transfer-timeout` do not apply to execution logs,
+including `download-log` without `--log-type stdout`. Two downloads of the same
 directory at once are unsupported.
 
 ### Download GPU Metrics
@@ -641,13 +674,14 @@ cortex-training download-metrics JOB_ID --output-dir /path/to/metrics --resume
 ```
 
 The command prints the saved path, chunk count, and first/last logical artifact
-URIs for each reconstructed file. `--resume` continues a metrics download
-already in that directory. On a terminal, progress is one line on stderr
-that updates in place. A redirected stderr gets one final line per sub-job.
-Progress is not part of the JSON on stdout. A large download may open
-additional Snowflake sessions for one sub-job, and each session can prompt
-for authentication. Two downloads of the same directory at once are
-unsupported.
+URIs for each reconstructed file. `--resume`, `--parallel N`, `--sub-job
+SUB_JOB_ID`, `--strict`, `--stale-after-minutes`, `--transfer-timeout`,
+damaged chunks, retries,
+progress on stderr, and Ctrl-C behave as for
+[persisted stdout](#download-persisted-stdout). While the job is running, a
+sub-job that has saved stdout but no GPU metrics is also listed, with
+`chunk_count` 0, `saved_path` `null`, and a warning that metric uploads may be
+stalled. Two downloads of the same directory at once are unsupported.
 
 ### Job TUI
 
