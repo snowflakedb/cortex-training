@@ -2173,7 +2173,8 @@ to the committed length. A missing or shorter file is rebuilt, as is a chunk
 list that is no longer a prefix of the sorted paths.
 Two downloads of the same output directory at once are unsupported.
 The method stays silent unless `progress` is passed. On a terminal, the CLI
-draws one updating line on stderr.
+draws one updating line on stderr; a redirected stderr gets one final line per
+sub-job.
 
 ### 12.4 GPU metrics download
 

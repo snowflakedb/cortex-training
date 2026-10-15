@@ -2205,38 +2205,86 @@ def test_download_commands_write_progress_to_stderr(tmp_path):
     assert stderr.getvalue() == "metrics: found 1 chunks for job\n"
 
 
-def test_download_metrics_survives_stderr_oserror(tmp_path):
+class _TtyStderr(io.StringIO):
+    def isatty(self):
+        return True
+
+
+class _WriteFails(_TtyStderr):
+    def write(self, message):
+        raise BrokenPipeError(message)
+
+
+class _FlushFails(_TtyStderr):
+    def flush(self):
+        raise OSError("flush")
+
+
+@pytest.mark.parametrize("stream_cls", [_WriteFails, _FlushFails])
+@pytest.mark.parametrize(
+    "messages",
+    [["metrics: found 1 chunks for job\n"], ["metrics: [#] 1/1 job", "\n"]],
+)
+def test_download_metrics_survives_stderr_oserror(stream_cls, messages, tmp_path):
     class ProgressClient(FakeClient):
         def download_metrics(self, job_id, output_dir, *, resume=False, progress=None):
-            if progress is not None:
-                progress("metrics: found 1 chunks for job\n")
+            for message in messages:
+                progress(message)
             return super().download_metrics(job_id, output_dir, resume=resume, progress=None)
 
-    class WriteFails(io.StringIO):
+    stdout = io.StringIO()
+    rc = cli.main(
+        _base_args() + ["download-metrics", "job-1", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: ProgressClient(),
+        stdout=stdout,
+        stderr=stream_cls(),
+    )
+    assert rc == 0
+    assert json.loads(stdout.getvalue())["job_id"] == "job-1"
+
+
+def test_artifact_progress_writer_edges():
+    for stream in (_TtyStderr(), io.StringIO()):
+        write = cli._artifact_progress_writer(stream)
+        write("\n")
+        write("stdout: no new chunks for job\n")
+        assert stream.getvalue() == "stdout: no new chunks for job\n"
+
+    for error in (ValueError, OSError):
+
+        class IsattyFails(io.StringIO):
+            isatty_calls = 0
+
+            def isatty(self):
+                type(self).isatty_calls += 1
+                raise error("closed")
+
+        stream = IsattyFails()
+        write = cli._artifact_progress_writer(stream)
+        write("metrics: [#] 1/2 job")
+        write("metrics: [##] 2/2 job")
+        write("\n")
+        assert stream.getvalue() == "metrics: [##] 2/2 job\n"
+        assert IsattyFails.isatty_calls == 1
+
+    class FailsOnce(io.StringIO):
+        failed = False
+
         def write(self, message):
-            raise BrokenPipeError(message)
+            if not self.failed:
+                self.failed = True
+                raise BrokenPipeError(message)
+            return super().write(message)
 
-    class FlushFails(io.StringIO):
-        def flush(self):
-            raise OSError("flush")
-
-    for stderr in (WriteFails(), FlushFails()):
-        stdout = io.StringIO()
-        rc = cli.main(
-            _base_args() + ["download-metrics", "job-1", "--output-dir", str(tmp_path)],
-            client_factory=lambda _: ProgressClient(),
-            stdout=stdout,
-            stderr=stderr,
-        )
-        assert rc == 0
-        assert json.loads(stdout.getvalue())["job_id"] == "job-1"
+    stream = FailsOnce()
+    write = cli._artifact_progress_writer(stream)
+    write("metrics: [#] 1/1 job")
+    write("\n")
+    write("\n")
+    assert stream.getvalue() == ""
 
 
 def test_download_progress_is_one_terminal_line(tmp_path):
-    class Tty(io.StringIO):
-        def isatty(self):
-            return True
-
     class ProgressClient(FakeClient):
         def download_metrics(self, job_id, output_dir, *, resume=False, progress=None):
             if progress is not None:
@@ -2245,7 +2293,7 @@ def test_download_progress_is_one_terminal_line(tmp_path):
                 progress("\n")
             return super().download_metrics(job_id, output_dir, resume=resume, progress=None)
 
-    tty = Tty()
+    tty = _TtyStderr()
     rc = cli.main(
         _base_args() + ["download-metrics", "job-1", "--output-dir", str(tmp_path)],
         client_factory=lambda _: ProgressClient(),

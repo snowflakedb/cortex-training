@@ -34,6 +34,7 @@ import gzip
 import importlib
 import json
 import logging
+import os
 import sys
 from datetime import date
 from datetime import datetime
@@ -5408,10 +5409,27 @@ class TestExecutionLogDownload:
         monkeypatch.setattr(c, "_open_experiment_artifact_connection", lambda: connection)
         calls = []
         c.download_stdout_logs("job-1", tmp_path, progress=calls.append)
-        assert calls[0] == c._artifact_progress_status("stdout", 0, 1, "job-1:training:0")
-        assert calls[1] == c._artifact_progress_status("stdout", 1, 1, "job-1:training:0")
-        assert calls[2] == "\n"
-        assert calls[3] == c._artifact_progress_status("stdout", 0, 1, "job-1:training:1")
+        status = c._artifact_progress_status
+        assert calls == [
+            status("stdout", 0, 1, "job-1:training:0"),
+            status("stdout", 1, 1, "job-1:training:0"),
+            "\n",
+            status("stdout", 0, 1, "job-1:training:1"),
+            status("stdout", 1, 1, "job-1:training:1"),
+            "\n",
+        ]
+
+    def test_download_progress_status_format(self):
+        status = CortexTrainingClient._artifact_progress_status
+        assert status("metrics", 0, 3, "job:s:0") == (
+            "metrics: [--------------------] 0/3 job:s:0"
+        )
+        assert status("metrics", 1, 3, "job:s:0") == (
+            "metrics: [######--------------] 1/3 job:s:0"
+        )
+        assert status("metrics", 3, 3, "job:s:0") == (
+            "metrics: [####################] 3/3 job:s:0"
+        )
 
     def test_download_progress_resume_counts_new_chunks_only(self, tmp_path, monkeypatch):
         root = "_metrics"
@@ -5458,7 +5476,7 @@ class TestExecutionLogDownload:
         assert calls == [f"stdout: no new chunks for {sub}\n"]
         assert destination.read_bytes() == committed
 
-    def test_download_progress_found_line_error_skips_side_effects(self, tmp_path, monkeypatch):
+    def test_download_progress_callback_error_skips_side_effects(self, tmp_path, monkeypatch):
         root = "_stdout"
         sub = "job-1:training:0"
         first = f"{root}/{sub}/console.20260904-120001.a.gz"
@@ -5471,11 +5489,15 @@ class TestExecutionLogDownload:
         committed = destination.read_bytes()
         destination.write_bytes(committed + b"TORN")
 
-        def stop(_message):
+        calls = []
+
+        def stop(message):
+            calls.append(message)
             raise RuntimeError("stop")
 
         with pytest.raises(RuntimeError, match="stop"):
             c.download_stdout_logs("job-1", tmp_path / "fresh", progress=stop)
+        assert calls == [c._artifact_progress_status("stdout", 0, 1, sub), "\n"]
         assert not (tmp_path / "fresh" / sub).exists()
 
         connection.list_rows[run_uri + root + "/"].append((f"/versions/RUN_ABC/{second}",))
@@ -5528,14 +5550,143 @@ class TestExecutionLogDownload:
         calls.clear()
         with pytest.raises(RuntimeError, match="stop"):
             c.download_metrics("job-1", tmp_path, resume=True, progress=stop_on_second)
+        assert calls[-1] == "\n"
         assert destination.read_bytes() == committed
 
         fresh = tmp_path / "fresh"
         calls.clear()
         with pytest.raises(RuntimeError, match="stop"):
             c.download_metrics("job-1", fresh, progress=stop_on_second)
+        assert calls[-1] == "\n"
         assert not list((fresh / sub).glob(".*.tmp"))
         assert not (fresh / sub / "gpu.jsonl").exists()
+
+    def test_download_progress_setup_failures_close_line(self, tmp_path, monkeypatch):
+        root = "_stdout"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/console.20260904-120001.a.gz"
+        second = f"{root}/{sub}/console.20260904-120002.b.gz"
+        c, connection, run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "stdout", [first], {first: b"first\n"}
+        )
+        not_a_dir = tmp_path / "file"
+        not_a_dir.write_text("x")
+        calls = []
+        with pytest.raises(OSError):
+            c.download_stdout_logs("job-1", not_a_dir, progress=calls.append)
+        assert calls == [c._artifact_progress_status("stdout", 0, 1, sub), "\n"]
+
+        if os.geteuid() == 0:
+            pytest.skip("root ignores the read-only destination")
+        c.download_stdout_logs("job-1", tmp_path)
+        destination = tmp_path / sub / "stdout.log"
+        manifest = destination.with_name(".stdout.log.manifest.json")
+        before = manifest.read_text(encoding="utf-8")
+        connection.list_rows[run_uri + root + "/"].append((f"/versions/RUN_ABC/{second}",))
+        connection.content_by_uri[run_uri + second] = gzip.compress(b"second\n")
+        destination.chmod(0o444)
+        calls.clear()
+        try:
+            with pytest.raises(PermissionError):
+                c.download_stdout_logs("job-1", tmp_path, resume=True, progress=calls.append)
+        finally:
+            destination.chmod(0o644)
+        assert calls == [c._artifact_progress_status("stdout", 0, 1, sub), "\n"]
+        assert manifest.read_text(encoding="utf-8") == before
+        assert destination.read_bytes() == b"first\n"
+
+    def test_download_progress_success_newline_error_keeps_commit(self, tmp_path, monkeypatch):
+        root = "_metrics"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/gpu.20260904-120001.a.gz"
+        second = f"{root}/{sub}/gpu.20260904-120002.b.gz"
+        c, connection, run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "metrics", [first], {first: b"a\n"}
+        )
+
+        destination = tmp_path / sub / "gpu.jsonl"
+        manifest = destination.with_name(".gpu.jsonl.manifest.json")
+        seen = []
+
+        def fail_on_newline(message):
+            if message == "\n":
+                seen.append(json.loads(manifest.read_text(encoding="utf-8"))["names"])
+                raise RuntimeError("newline")
+
+        with pytest.raises(RuntimeError, match="newline"):
+            c.download_metrics("job-1", tmp_path, progress=fail_on_newline)
+        assert seen == [[first]]
+        assert destination.read_bytes() == b"a\n"
+        assert json.loads(manifest.read_text(encoding="utf-8"))["names"] == [first]
+
+        connection.list_rows[run_uri + root + "/"].append((f"/versions/RUN_ABC/{second}",))
+        connection.content_by_uri[run_uri + second] = gzip.compress(b"b\n")
+        with pytest.raises(RuntimeError, match="newline"):
+            c.download_metrics("job-1", tmp_path, resume=True, progress=fail_on_newline)
+        assert seen == [[first], [first, second]]
+        assert destination.read_bytes() == b"a\nb\n"
+        assert json.loads(manifest.read_text(encoding="utf-8"))["names"] == [first, second]
+        calls = []
+        c.download_metrics("job-1", tmp_path, resume=True, progress=calls.append)
+        assert calls == [f"metrics: no new chunks for {sub}\n"]
+
+    @pytest.mark.parametrize("newline_error", [RuntimeError, KeyboardInterrupt])
+    def test_download_progress_failure_newline_error_keeps_download_error(
+        self, newline_error, tmp_path, monkeypatch
+    ):
+        root = "_stdout"
+        sub = "job-1:training:0"
+        good = f"{root}/{sub}/console.20260904-120001.a.gz"
+        later = f"{root}/{sub}/console.20260904-120002.b.gz"
+        bad = f"{root}/{sub}/console.20260904-120003.c.gz"
+        c, connection, run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "stdout", [good], {good: b"good\n"}
+        )
+        destination = tmp_path / sub / "stdout.log"
+        fresh = tmp_path / "fresh"
+        seen = []
+
+        def fail_on_newline(message):
+            if message == "\n":
+                fresh_temps = list((fresh / sub).glob(".*.tmp"))
+                seen.append((destination.read_bytes(), fresh_temps))
+                raise newline_error("newline")
+
+        c.download_stdout_logs("job-1", tmp_path)
+        connection.list_rows[run_uri + root + "/"] += [
+            (f"/versions/RUN_ABC/{later}",),
+            (f"/versions/RUN_ABC/{bad}",),
+        ]
+        connection.content_by_uri[run_uri + later] = gzip.compress(b"later\n")
+        connection.content_by_uri[run_uri + bad] = b"not gzip"
+        with pytest.raises(gzip.BadGzipFile):
+            c.download_stdout_logs("job-1", tmp_path, resume=True, progress=fail_on_newline)
+        assert seen == [(b"good\n", [])]
+        assert destination.read_bytes() == b"good\n"
+
+        seen.clear()
+        with pytest.raises(gzip.BadGzipFile):
+            c.download_stdout_logs("job-1", fresh, progress=fail_on_newline)
+        assert [fresh_temps for _bytes, fresh_temps in seen] == [[]]
+        assert not list((fresh / sub).glob(".*.tmp"))
+        assert not (fresh / sub / "stdout.log").exists()
+
+    def test_download_progress_interrupt_closes_line(self, tmp_path, monkeypatch):
+        sub = "job-1:training:0"
+        first = f"_stdout/{sub}/console.20260904-120001.a.gz"
+        c, _connection, _run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "stdout", [first], {first: b"first\n"}
+        )
+
+        def interrupt(*_args):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(c, "_download_gzip_member", interrupt)
+        calls = []
+        with pytest.raises(KeyboardInterrupt):
+            c.download_stdout_logs("job-1", tmp_path, progress=calls.append)
+        assert calls == [c._artifact_progress_status("stdout", 0, 1, sub), "\n"]
+        assert not list((tmp_path / sub).glob(".*.tmp"))
 
     def test_download_progress_empty_and_directory_destination(self, tmp_path, monkeypatch):
         c, _connection, _run_uri = self._gzip_download(monkeypatch, tmp_path, "stdout", [], {})

@@ -2918,7 +2918,7 @@ class CortexTrainingClient:
         artifact_name: str, done: int, total: int, sub_job_id: str
     ) -> str:
         width = 20
-        filled = 0 if total == 0 else (width * done) // total
+        filled = (width * done) // total
         bar = "#" * filled + "-" * (width - filled)
         return f"{artifact_name}: [{bar}] {done}/{total} {sub_job_id}"
 
@@ -2927,14 +2927,23 @@ class CortexTrainingClient:
         if progress is not None:
             progress(message)
 
-    def _finish_artifact_progress(
-        self, progress: Callable[[str], None] | None, *, swallow: bool
-    ) -> None:
+    @contextlib.contextmanager
+    def _artifact_progress_line(
+        self, progress: Callable[[str], None] | None
+    ) -> Iterator[None]:
+        """Close the status line with ``"\\n"`` whether the body succeeds or fails.
+
+        On failure the download error wins over any error from the newline.
+        """
         try:
-            self._report_artifact_progress(progress, "\n")
-        except Exception:
-            if not swallow:
-                raise
+            yield
+        except BaseException:
+            try:
+                self._report_artifact_progress(progress, "\n")
+            except BaseException:
+                pass
+            raise
+        self._report_artifact_progress(progress, "\n")
 
     def _rebuild_gzip_file(
         self,
@@ -2955,49 +2964,47 @@ class CortexTrainingClient:
         """
         sub_job_id = destination.parent.name
         chunk_count = len(chunk_paths)
-        self._report_artifact_progress(
-            progress,
-            self._artifact_progress_status(artifact_name, 0, chunk_count, sub_job_id),
-        )
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        output = tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=str(destination.parent),
-            prefix=temporary_prefix,
-            suffix=".tmp",
-            delete=False,
-        )
-        temporary = Path(output.name)
-        try:
-            for index, relative_path in enumerate(chunk_paths, start=1):
-                self._download_gzip_member(
-                    connection,
-                    run_uri,
-                    relative_path,
-                    artifact_temp,
-                    output,
-                )
-                self._report_artifact_progress(
-                    progress,
-                    self._artifact_progress_status(
-                        artifact_name, index, chunk_count, sub_job_id
-                    ),
-                )
-            output.flush()
-            os.fsync(output.fileno())
-            output.close()
-            self._resume_manifest_path(destination).unlink(missing_ok=True)
-            os.replace(temporary, destination)
-            nbytes = destination.stat().st_size
-            self._write_resume_manifest(destination, chunk_paths, nbytes)
-        except BaseException:
-            self._finish_artifact_progress(progress, swallow=True)
-            if not output.closed:
+        with self._artifact_progress_line(progress):
+            self._report_artifact_progress(
+                progress,
+                self._artifact_progress_status(artifact_name, 0, chunk_count, sub_job_id),
+            )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            output = tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=str(destination.parent),
+                prefix=temporary_prefix,
+                suffix=".tmp",
+                delete=False,
+            )
+            temporary = Path(output.name)
+            try:
+                for index, relative_path in enumerate(chunk_paths, start=1):
+                    self._download_gzip_member(
+                        connection,
+                        run_uri,
+                        relative_path,
+                        artifact_temp,
+                        output,
+                    )
+                    self._report_artifact_progress(
+                        progress,
+                        self._artifact_progress_status(
+                            artifact_name, index, chunk_count, sub_job_id
+                        ),
+                    )
+                output.flush()
+                os.fsync(output.fileno())
                 output.close()
-            temporary.unlink(missing_ok=True)
-            raise
-        else:
-            self._finish_artifact_progress(progress, swallow=False)
+                self._resume_manifest_path(destination).unlink(missing_ok=True)
+                os.replace(temporary, destination)
+                nbytes = destination.stat().st_size
+                self._write_resume_manifest(destination, chunk_paths, nbytes)
+            except BaseException:
+                if not output.closed:
+                    output.close()
+                temporary.unlink(missing_ok=True)
+                raise
         return self._artifact_result(destination, run_uri, chunk_paths)
 
     def _append_gzip_chunks(
@@ -3054,43 +3061,41 @@ class CortexTrainingClient:
                     output.flush()
                     os.fsync(output.fileno())
             return self._artifact_result(destination, run_uri, known)
-        self._report_artifact_progress(
-            progress,
-            self._artifact_progress_status(
-                artifact_name, 0, len(new_paths), sub_job_id
-            ),
-        )
-        with destination.open("r+b") as output:
-            output.seek(committed)
-            output.truncate(committed)
-            try:
-                for index, relative_path in enumerate(new_paths, start=1):
-                    self._download_gzip_member(
-                        connection,
-                        run_uri,
-                        relative_path,
-                        artifact_temp,
-                        output,
-                    )
-                    self._report_artifact_progress(
-                        progress,
-                        self._artifact_progress_status(
-                            artifact_name, index, len(new_paths), sub_job_id
-                        ),
-                    )
-                output.flush()
-                os.fsync(output.fileno())
-                end = output.tell()
-            except BaseException:
-                self._finish_artifact_progress(progress, swallow=True)
-                output.truncate(committed)
-                output.flush()
-                os.fsync(output.fileno())
-                raise
-            else:
-                self._finish_artifact_progress(progress, swallow=False)
         names = list(known) + new_paths
-        self._write_resume_manifest(destination, names, end)
+        with self._artifact_progress_line(progress):
+            self._report_artifact_progress(
+                progress,
+                self._artifact_progress_status(
+                    artifact_name, 0, len(new_paths), sub_job_id
+                ),
+            )
+            with destination.open("r+b") as output:
+                output.seek(committed)
+                output.truncate(committed)
+                try:
+                    for index, relative_path in enumerate(new_paths, start=1):
+                        self._download_gzip_member(
+                            connection,
+                            run_uri,
+                            relative_path,
+                            artifact_temp,
+                            output,
+                        )
+                        self._report_artifact_progress(
+                            progress,
+                            self._artifact_progress_status(
+                                artifact_name, index, len(new_paths), sub_job_id
+                            ),
+                        )
+                    output.flush()
+                    os.fsync(output.fileno())
+                    end = output.tell()
+                except BaseException:
+                    output.truncate(committed)
+                    output.flush()
+                    os.fsync(output.fileno())
+                    raise
+            self._write_resume_manifest(destination, names, end)
         return self._artifact_result(destination, run_uri, names)
 
     def _download_gzip_artifacts(
@@ -3210,7 +3215,11 @@ class CortexTrainingClient:
 
         ``resume=True`` appends chunks that are not already recorded beside the
         file. Two downloads of the same output directory at once are unsupported.
-        ``progress`` receives status lines; the return value is unchanged.
+        ``progress`` receives status updates without a trailing newline, then
+        ``"\\n"`` when that sub-job finishes or fails. A status that needs no
+        updating (nothing new, no chunks) arrives as one message ending in a
+        newline. An error raised by ``progress`` stops the download. The return
+        value is unchanged.
         """
         return self._download_gzip_artifacts(
             job_id,
@@ -3235,7 +3244,11 @@ class CortexTrainingClient:
 
         ``resume=True`` appends chunks that are not already recorded beside the
         file. Two downloads of the same output directory at once are unsupported.
-        ``progress`` receives status lines; the return value is unchanged.
+        ``progress`` receives status updates without a trailing newline, then
+        ``"\\n"`` when that sub-job finishes or fails. A status that needs no
+        updating (nothing new, no chunks) arrives as one message ending in a
+        newline. An error raised by ``progress`` stops the download. The return
+        value is unchanged.
         """
         return self._download_gzip_artifacts(
             job_id,

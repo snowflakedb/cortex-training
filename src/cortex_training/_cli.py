@@ -1258,24 +1258,29 @@ def _cmd_weight_sync(args: argparse.Namespace, client, stdout: TextIO) -> int:
     return 0
 
 
-def _artifact_progress_writer(stderr: TextIO):
+def _artifact_progress_writer(stderr: TextIO) -> Callable[[str], None]:
     """Draw one updating terminal line. A redirected stderr gets the final line."""
-    latest: dict[str, str | None] = {"text": None}
+    try:
+        tty = stderr.isatty()
+    except (OSError, ValueError):
+        tty = False
+    latest: str | None = None
 
     def write(message: str) -> None:
+        nonlocal latest
         try:
             if message == "\n":
-                if stderr.isatty():
-                    stderr.write("\n")
-                elif latest["text"] is not None:
-                    stderr.write(latest["text"] + "\n")
-                latest["text"] = None
+                status, latest = latest, None
+                if status is None:
+                    return
+                stderr.write("\n" if tty else status + "\n")
             elif message.endswith("\n"):
                 stderr.write(message)
             else:
-                latest["text"] = message
-                if stderr.isatty():
-                    stderr.write("\r" + message)
+                latest = message
+                if not tty:
+                    return
+                stderr.write("\r" + message)
             stderr.flush()
         except OSError:
             return
