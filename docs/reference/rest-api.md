@@ -254,7 +254,17 @@ Redirects are never followed; a 307 or 308 is retried on the original URL.
 Capacity is the exception: it is attempted once with the shorter bounds
 documented in [section 5.4](#54-capacity---get-capacity).
 
-The default is ten retries after the first attempt, with exponential jitter.
+Retries use exponential jitter (0.5 seconds initial, 10 seconds cap). How
+long they last depends on the method:
+
+- **`GET`** (get job, list jobs, request status, list checkpoints, experiment
+  run): retries until `poll_retry_budget` (default 300 seconds) runs out,
+  ending no later than `poll_timeout` inside `poll_request()` /
+  `wait_for_job()`. A persistent `404` still stops after `max_retries`.
+- **`POST` / `DELETE`**: `max_retries` (default 10) retries after the first
+  attempt.
+
+`max_retries=0` disables all retries.
 
 Create-job uses the narrower connection-establishment retry predicate so an
 ambiguous response does not accidentally create a second server-assigned job.

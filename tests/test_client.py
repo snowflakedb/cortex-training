@@ -2104,6 +2104,138 @@ class TestCreateJob:
 # ─── CortexTrainingClient — transient HTTP retries ───────────────────────────
 
 
+class _Clock:
+    """Fake monotonic clock: ``time.sleep`` advances it instead of blocking."""
+
+    def __init__(self, monkeypatch):
+        self.t = 0.0
+        self.slept: list[float] = []
+        monkeypatch.setattr(nc.time, "monotonic", lambda: self.t)
+        monkeypatch.setattr(nc.time, "sleep", self._sleep)
+
+    def _sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.t += seconds
+
+    def unavailable_for(self, seconds: float, then_body, status: int = 503):
+        """Session side effect: ``status`` until ``seconds`` pass, then 200."""
+
+        def side_effect(*_args, **_kwargs):
+            if self.t < seconds:
+                return _make_error_response({"message": "service unavailable"}, status)
+            return _make_response(then_body)
+
+        return side_effect
+
+
+class TestPollRetryBudget:
+    """Reads retry for a time budget; writes keep the attempt cap."""
+
+    def test_rejects_non_positive_budget(self):
+        for bad in (0, -1.0):
+            with pytest.raises(ValueError, match="poll_retry_budget must be > 0"):
+                CortexTrainingClient(
+                    base_url="http://test.local",
+                    database="DB",
+                    schema="SCH",
+                    poll_retry_budget=bad,
+                )
+
+    def test_poll_request_survives_two_minutes_unavailable(self, monkeypatch):
+        clock = _Clock(monkeypatch)
+        c = _make_client()
+        c._session.get.side_effect = clock.unavailable_for(
+            120.0, {"status": "done", "result": {"loss": 1.5}}
+        )
+
+        assert c.poll_request("job-1", "req-1") == {"loss": 1.5}
+        assert c._session.get.call_count > c.max_retries + 1
+        assert clock.t >= 120.0
+        assert max(clock.slept) <= 10.0
+
+    def test_wait_for_job_survives_two_minutes_unavailable(self, monkeypatch):
+        clock = _Clock(monkeypatch)
+        c = _make_client()
+        c._session.get.side_effect = clock.unavailable_for(120.0, {"status": "running"})
+
+        assert c.wait_for_job("job-1")["status"] == "running"
+        assert c._session.get.call_count > c.max_retries + 1
+
+    def test_read_gives_up_when_budget_runs_out(self, monkeypatch):
+        clock = _Clock(monkeypatch)
+        c = _make_client()
+        c.poll_retry_budget = 90.0
+        c._session.get.side_effect = clock.unavailable_for(float("inf"), {})
+
+        with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+            c.get_job("job-1")
+
+        assert excinfo.value.response.status_code == 503
+        assert clock.t == pytest.approx(90.0)
+
+    def test_budget_is_capped_by_poll_timeout(self, monkeypatch):
+        clock = _Clock(monkeypatch)
+        c = _make_client()
+        c.poll_timeout = 45.0
+        c._session.get.side_effect = clock.unavailable_for(float("inf"), {})
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.poll_request("job-1", "req-1")
+
+        assert clock.t == pytest.approx(45.0)
+
+    def test_persistent_404_still_stops_at_max_retries(self, monkeypatch):
+        clock = _Clock(monkeypatch)
+        c = _make_client()
+        c._session.get.side_effect = clock.unavailable_for(float("inf"), {}, status=404)
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.get_request_status("job-1", "req-1")
+
+        assert c._session.get.call_count == c.max_retries + 1
+
+    def test_post_still_stops_at_max_retries(self, monkeypatch):
+        clock = _Clock(monkeypatch)
+        c = _make_client()
+        c._session.post.side_effect = clock.unavailable_for(float("inf"), {})
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.step("job-1")
+
+        assert c._session.post.call_count == c.max_retries + 1
+
+    def test_zero_max_retries_disables_read_retries(self, monkeypatch):
+        clock = _Clock(monkeypatch)
+        c = _make_client()
+        c.max_retries = 0
+        c._session.get.side_effect = clock.unavailable_for(float("inf"), {})
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.get_job("job-1")
+
+        assert c._session.get.call_count == 1
+
+    def test_each_retry_is_logged_with_elapsed_time(self, monkeypatch, caplog):
+        clock = _Clock(monkeypatch)
+        c = _make_client()
+        c._session.get.side_effect = clock.unavailable_for(30.0, {"jobs": []})
+
+        with caplog.at_level(logging.WARNING, logger=nc.logger.name):
+            assert c.list_jobs() == []
+
+        lines = [r.getMessage() for r in caplog.records if "retrying in" in r.getMessage()]
+        assert lines
+        assert lines[0].startswith("GET ")
+        assert "attempt 1 failed" in lines[0]
+        assert "limit 300s retry budget" in lines[-1]
+
+    def test_for_job_client_keeps_the_budget(self):
+        c = _make_client()
+        c.poll_retry_budget = 42.0
+        job_client = c.for_job({"database_name": "OTHER_DB", "schema_name": "PUBLIC"})
+        assert job_client.poll_retry_budget == 42.0
+
+
 class TestTransientHttpRetries:
     def test_307_and_308_are_transient(self):
         for status in (307, 308):

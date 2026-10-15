@@ -75,9 +75,9 @@ from pydantic import model_validator
 
 import requests
 from requests.adapters import HTTPAdapter
+from tenacity import RetryCallState
 from tenacity import Retrying
 from tenacity import retry_if_exception
-from tenacity import stop_after_attempt
 from tenacity import wait_exponential_jitter
 from urllib3.exceptions import NewConnectionError
 
@@ -304,6 +304,14 @@ class _DefaultTimeoutSession(requests.Session):
             timeout=self.default_timeout if timeout is None else timeout,
             **kwargs,
         )
+
+
+def _counts_toward_max_retries(exc: BaseException) -> bool:
+    """A persistent 404 likely means a bad id, so it keeps the attempt cap."""
+    if isinstance(exc, requests.exceptions.HTTPError):
+        resp = exc.response
+        return resp is not None and resp.status_code == 404
+    return False
 
 
 def _is_transient(exc: BaseException) -> bool:
@@ -1706,6 +1714,7 @@ class CortexTrainingClient:
         pool_maxsize: int = 1024,
         max_retries: int = 10,
         request_timeout: float | tuple[float, float] = _DEFAULT_REQUEST_TIMEOUT,
+        poll_retry_budget: float = 300.0,
     ):
         if poll_interval <= 0:
             raise ValueError("poll_interval must be > 0")
@@ -1719,6 +1728,8 @@ class CortexTrainingClient:
             raise ValueError("pool_maxsize must be > 0")
         if max_retries < 0:
             raise ValueError("max_retries must be >= 0")
+        if poll_retry_budget <= 0:
+            raise ValueError("poll_retry_budget must be > 0")
         self.request_timeout = _validated_request_timeout(request_timeout)
         self.base_url = base_url.rstrip("/")
         self.database = database
@@ -1729,6 +1740,9 @@ class CortexTrainingClient:
         self.poll_backoff_multiplier = poll_backoff_multiplier
         self.poll_max_interval = poll_max_interval
         self.max_retries = max_retries
+        self.poll_retry_budget = poll_retry_budget
+        # Per-thread poll deadline that also ends GET retries (see _poll_deadline).
+        self._poll_deadline_state = threading.local()
         self._fwd_bwd_send_count = 0
         self._fwd_bwd_request_debug: dict[str, dict[str, Any]] = {}
         self._generate_request_ids: set[str] = set()
@@ -2080,6 +2094,20 @@ class CortexTrainingClient:
         displayed_max_attempts = max_attempts + (
             1 if self._auth_provider is not None else 0
         )
+        # Reads are safe to repeat, so they retry for a time budget; writes
+        # keep the attempt cap since repeating them can apply them twice.
+        budget_deadline: float | None = None
+        budget_seconds = 0.0
+        if method.upper() == "GET" and max_retries is None and retry_limit > 0:
+            started = time.monotonic()
+            budget_deadline = started + self.poll_retry_budget
+            poll_deadline = getattr(self._poll_deadline_state, "deadline", None)
+            if poll_deadline is not None:
+                budget_deadline = min(budget_deadline, poll_deadline)
+            budget_seconds = max(budget_deadline - started, 0.0)
+        attempts_shown = (
+            "?" if budget_deadline is not None else str(displayed_max_attempts)
+        )
         try:
             state = self._operation_metric_state
             if getattr(state, "active", set()):
@@ -2101,12 +2129,12 @@ class CortexTrainingClient:
                     )
                 if debug_label is not None:
                     logger.debug(
-                        "%s sending %s %s attempt=%d/%d",
+                        "%s sending %s %s attempt=%d/%s",
                         debug_label,
                         method.upper(),
                         url,
                         attempt_no,
-                        displayed_max_attempts,
+                        attempts_shown,
                     )
 
                 request_kwargs = kwargs
@@ -2123,12 +2151,12 @@ class CortexTrainingClient:
                 except Exception as exc:
                     if debug_label is not None:
                         logger.debug(
-                            "%s request exception %s %s attempt=%d/%d: %s: %s",
+                            "%s request exception %s %s attempt=%d/%s: %s: %s",
                             debug_label,
                             method.upper(),
                             url,
                             attempt_no,
-                            displayed_max_attempts,
+                            attempts_shown,
                             type(exc).__name__,
                             exc,
                         )
@@ -2183,13 +2211,13 @@ class CortexTrainingClient:
                         else ""
                     )
                     logger.debug(
-                        "%s %s %s %s attempt=%d/%d status=%s%s body=%s",
+                        "%s %s %s %s attempt=%d/%s status=%s%s body=%s",
                         debug_label,
                         outcome,
                         method.upper(),
                         url,
                         attempt_no,
-                        displayed_max_attempts,
+                        attempts_shown,
                         status_code,
                         snowflake,
                         self._debug_response_summary(resp),
@@ -2228,13 +2256,68 @@ class CortexTrainingClient:
                     raise
                 return resp
 
+        backoff = wait_exponential_jitter(initial=0.5, max=10.0)
+        capped_failures = 0
+
+        def stop(retry_state: RetryCallState) -> bool:
+            nonlocal capped_failures
+            if budget_deadline is None:
+                return retry_state.attempt_number >= max_attempts
+            if time.monotonic() >= budget_deadline:
+                return True
+            outcome = retry_state.outcome
+            exc = outcome.exception() if outcome is not None else None
+            if exc is not None and _counts_toward_max_retries(exc):
+                capped_failures += 1
+                return capped_failures >= max_attempts
+            return False
+
+        def wait(retry_state: RetryCallState) -> float:
+            delay = backoff(retry_state)
+            if budget_deadline is not None:
+                delay = min(delay, max(budget_deadline - time.monotonic(), 0.0))
+            return delay
+
+        def log_retry(retry_state: RetryCallState) -> None:
+            outcome = retry_state.outcome
+            exc = outcome.exception() if outcome is not None else None
+            next_action = retry_state.next_action
+            if budget_deadline is not None:
+                limit = f"{budget_seconds:.0f}s retry budget"
+            else:
+                limit = f"{max_attempts} attempts"
+            logger.warning(
+                "%s %s: attempt %d failed (%s: %s); retrying in %.1fs "
+                "(%.0fs elapsed, limit %s)",
+                method.upper(),
+                url,
+                retry_state.attempt_number,
+                type(exc).__name__,
+                exc,
+                next_action.sleep if next_action is not None else 0.0,
+                retry_state.seconds_since_start,
+                limit,
+            )
+
         retryer = Retrying(
             retry=retry_if_exception(retry_on),
-            stop=stop_after_attempt(max_attempts),
-            wait=wait_exponential_jitter(initial=0.5, max=10.0),
+            stop=stop,
+            wait=wait,
+            before_sleep=log_retry,
             reraise=True,
         )
         return retryer(attempt)
+
+    @contextlib.contextmanager
+    def _poll_deadline(self, deadline: float) -> Iterator[None]:
+        """Stop GET retries on this thread once ``deadline`` (monotonic) passes."""
+        state = self._poll_deadline_state
+        outer = getattr(state, "deadline", None)
+        state.deadline = deadline if outer is None else min(outer, deadline)
+        try:
+            yield
+        finally:
+            state.deadline = outer
 
     # ─── Job management ──────────────────────────────────────────────────
 
@@ -2373,18 +2456,19 @@ class CortexTrainingClient:
         """Poll until the job reaches ``running``. Raises on terminal states or timeout."""
         deadline = time.monotonic() + self.poll_timeout
         delay = self.poll_interval
-        while time.monotonic() < deadline:
-            job = self.get_job(job_id)
-            status = self._normalize_job_status(job.get("status", ""))
-            if status == "running":
-                return job
-            if status in ("failed", "done", "cancelled", "canceled"):
-                reason = job.get("reason", "")
-                raise _server_failure(
-                    RuntimeError(f"Job {job_id} reached terminal state '{status}': {reason}"),
-                    failed=status == "failed",
-                )
-            delay = self._sleep_with_backoff(delay, deadline)
+        with self._poll_deadline(deadline):
+            while time.monotonic() < deadline:
+                job = self.get_job(job_id)
+                status = self._normalize_job_status(job.get("status", ""))
+                if status == "running":
+                    return job
+                if status in ("failed", "done", "cancelled", "canceled"):
+                    reason = job.get("reason", "")
+                    raise _server_failure(
+                        RuntimeError(f"Job {job_id} reached terminal state '{status}': {reason}"),
+                        failed=status == "failed",
+                    )
+                delay = self._sleep_with_backoff(delay, deadline)
         raise _server_failure(
             TimeoutError(f"Job {job_id} did not become running within {self.poll_timeout}s")
         )
@@ -2505,6 +2589,7 @@ class CortexTrainingClient:
             poll_max_interval=self.poll_max_interval,
             max_retries=self.max_retries,
             request_timeout=self.request_timeout,
+            poll_retry_budget=self.poll_retry_budget,
         )
         # Release the session and pool the constructor just opened.
         client._session.close()
@@ -4229,70 +4314,71 @@ class CortexTrainingClient:
         debug_label = self._debug_context_label(debug_context) if debug_context is not None else None
         result_chunks: list[bytes] = []
         cursor: str | None = None
-        while time.monotonic() < deadline:
-            status = self.get_request_status(job_id, request_id, cursor=cursor)
-            state = self._normalize_request_status(status.get("status", ""))
-            events = status.get("events") or []
-            received_chunk = False
-            for event in events:
-                with _server_payload():
-                    chunk = self._decode_result_chunk_event(event)
-                if chunk is not None:
-                    result_chunks.append(chunk)
-                    received_chunk = True
-            next_cursor = status.get("next_cursor")
-            if isinstance(next_cursor, str) and next_cursor:
-                cursor = next_cursor
-                # Drain available result chunks without backing off.
-                continue
-            if state in ("completed", "done", "succeeded"):
-                if result_chunks:
+        with self._poll_deadline(deadline):
+            while time.monotonic() < deadline:
+                status = self.get_request_status(job_id, request_id, cursor=cursor)
+                state = self._normalize_request_status(status.get("status", ""))
+                events = status.get("events") or []
+                received_chunk = False
+                for event in events:
                     with _server_payload():
-                        result = wire.decode_result_chunks(result_chunks)
-                    result = self._merge_transport_metrics(
-                        result,
-                        status.get("result") or {},
+                        chunk = self._decode_result_chunk_event(event)
+                    if chunk is not None:
+                        result_chunks.append(chunk)
+                        received_chunk = True
+                next_cursor = status.get("next_cursor")
+                if isinstance(next_cursor, str) and next_cursor:
+                    cursor = next_cursor
+                    # Drain available result chunks without backing off.
+                    continue
+                if state in ("completed", "done", "succeeded"):
+                    if result_chunks:
+                        with _server_payload():
+                            result = wire.decode_result_chunks(result_chunks)
+                        result = self._merge_transport_metrics(
+                            result,
+                            status.get("result") or {},
+                        )
+                    else:
+                        result = status.get("result") or {}
+                        with _server_payload():
+                            decoded = self._decode_result_payload(result)
+                        if decoded is not None:
+                            result = decoded
+                    result = self._normalize_generate_result_if_needed(request_id, result)
+                    result = self._normalize_forward_result_if_needed(request_id, result)
+                    if debug_label is not None:
+                        logger.debug(
+                            "%s completed state=%s result=%s",
+                            debug_label,
+                            state,
+                            self._debug_json_summary(result),
+                        )
+                        self._fwd_bwd_request_debug.pop(request_id, None)
+                    return result
+                if state in ("failed", "cancelled", "canceled"):
+                    error = status.get("error", "")
+                    if debug_label is not None:
+                        logger.debug(
+                            "%s failed state=%s error=%s body=%s",
+                            debug_label,
+                            state,
+                            error,
+                            self._debug_json_summary(status),
+                        )
+                        self._fwd_bwd_request_debug.pop(request_id, None)
+                    self._generate_request_ids.discard(request_id)
+                    self._forward_request_ids.discard(request_id)
+                    raise _server_failure(
+                        RuntimeError(f"Request {request_id} ended with state '{state}': {error}"),
+                        failed=state == "failed",
                     )
-                else:
-                    result = status.get("result") or {}
-                    with _server_payload():
-                        decoded = self._decode_result_payload(result)
-                    if decoded is not None:
-                        result = decoded
-                result = self._normalize_generate_result_if_needed(request_id, result)
-                result = self._normalize_forward_result_if_needed(request_id, result)
-                if debug_label is not None:
-                    logger.debug(
-                        "%s completed state=%s result=%s",
-                        debug_label,
-                        state,
-                        self._debug_json_summary(result),
-                    )
-                    self._fwd_bwd_request_debug.pop(request_id, None)
-                return result
-            if state in ("failed", "cancelled", "canceled"):
-                error = status.get("error", "")
-                if debug_label is not None:
-                    logger.debug(
-                        "%s failed state=%s error=%s body=%s",
-                        debug_label,
-                        state,
-                        error,
-                        self._debug_json_summary(status),
-                    )
-                    self._fwd_bwd_request_debug.pop(request_id, None)
-                self._generate_request_ids.discard(request_id)
-                self._forward_request_ids.discard(request_id)
-                raise _server_failure(
-                    RuntimeError(f"Request {request_id} ended with state '{state}': {error}"),
-                    failed=state == "failed",
-                )
-            if received_chunk:
-                # Defensive: if the server returns a chunk without next_cursor
-                # before terminal status, poll again immediately rather than
-                # sleeping.
-                continue
-            delay = self._sleep_with_backoff(delay, deadline)
+                if received_chunk:
+                    # Defensive: if the server returns a chunk without next_cursor
+                    # before terminal status, poll again immediately rather than
+                    # sleeping.
+                    continue
+                delay = self._sleep_with_backoff(delay, deadline)
         if debug_label is not None:
             logger.debug("%s timed out after %ss", debug_label, self.poll_timeout)
             self._fwd_bwd_request_debug.pop(request_id, None)
