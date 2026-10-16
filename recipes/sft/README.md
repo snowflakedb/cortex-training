@@ -160,10 +160,15 @@ shipped Qwen3.6 SFT configs still use the block, which older servers need.
 "model_options": {"lm_head": {"token_chunk_size": 8192, "cross_entropy": false}}
 ```
 
-On server versions that support `model_options`, dense Qwen3.5-family models
-(for example `Qwen/Qwen3.8-27B`) run with `numerics.fp32_parity` on by default,
-which raises GPU memory. To turn it off, add
-`"model_options": {"numerics": {"fp32_parity": false}}` to `training_config`.
+On server versions that support `model_options`, Qwen3.5-family models run
+with `numerics.fp32_parity` on by default: dense models (for example
+`Qwen/Qwen3.8-27B`) and Qwen3.5-MoE models with `EP_SIZE` > 1 (the
+Qwen3.6-35B-A3B configs). It raises GPU memory. To turn it off, add
+`"numerics": {"fp32_parity": false}` to the `model_options` entry of
+`training_config`, inside the same object if the config already has one (two
+`model_options` keys in one JSON object keep only the last), or set
+`"fp32_parity": false` in the `prime_rl` block of an `EP_SIZE` > 1 config; see
+[the REST API reference](../../docs/reference/rest-api.md#model_options).
 
 For dense long-context profiles, set an integer
 `fused_lm_head_token_chunk_size` in `training_config`. The server then computes
