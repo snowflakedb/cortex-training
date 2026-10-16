@@ -423,6 +423,10 @@ def _write_private_json(path: Path, doc: Mapping[str, Any]) -> None:
         raise
 
 
+class _LogEnded(Exception):
+    """Internal: the job ended while ``stream_logs`` was reading its log."""
+
+
 def _response_error_code(response: requests.Response | None) -> str | None:
     """The first structured service error code in ``response``'s JSON body."""
     if response is None:
@@ -1823,6 +1827,7 @@ class CortexTrainingClient:
         self._db_ensured = False
         # job_id -> monotonic time this client created it (see _definitive_not_found).
         self._recently_created_jobs: dict[str, float] = {}
+        self._recently_created_lock = threading.Lock()
         self._db_creating = False
         # Both are cleared on a for_job() child; see for_job().
         self._owns_session = True
@@ -2340,14 +2345,23 @@ class CortexTrainingClient:
         )
         return retryer(attempt)
 
-    def _note_created_job(self, job: Any) -> None:
-        job_id = job.get("job_id") if isinstance(job, dict) else None
-        if isinstance(job_id, str) and job_id:
-            created = self._recently_created_jobs
+    def _note_created_job(self, job: Any, body: Any = None) -> None:
+        """Remember a job this client just created; never raises, so it cannot
+        hide a create that succeeded."""
+        try:
+            job_id = job.get("job_id") if isinstance(job, dict) else None
+            if not (isinstance(job_id, str) and job_id) and isinstance(body, dict):
+                job_id = body.get("job_id")
+            if not (isinstance(job_id, str) and job_id):
+                return
             now = time.monotonic()
-            for stale in [jid for jid, at in created.items() if now - at > _RECENTLY_CREATED_SECONDS]:
-                created.pop(stale, None)
-            created[job_id] = now
+            with self._recently_created_lock:
+                created = self._recently_created_jobs
+                for stale in [jid for jid, at in created.items() if now - at > _RECENTLY_CREATED_SECONDS]:
+                    del created[stale]
+                created[job_id] = now
+        except Exception:
+            logger.debug("could not record a created job", exc_info=True)
 
     def _definitive_not_found(self, exc: BaseException) -> bool:
         """Whether ``exc`` is the service saying the job does not exist.
@@ -2364,11 +2378,15 @@ class CortexTrainingClient:
         if _response_error_code(response) != _JOB_NOT_FOUND_CODE:
             return False
         url = unquote(str(getattr(response, "url", "") or ""))
-        created = getattr(self, "_recently_created_jobs", {})
+        lock = getattr(self, "_recently_created_lock", None)
+        if lock is None:
+            return True
+        with lock:
+            created = list(self._recently_created_jobs.items())
         now = time.monotonic()
         return not any(
             now - at <= _RECENTLY_CREATED_SECONDS and f"/{job_id}" in url
-            for job_id, at in list(created.items())
+            for job_id, at in created
         )
 
     # ─── Job management ──────────────────────────────────────────────────
@@ -2482,7 +2500,7 @@ class CortexTrainingClient:
             )
         resp = self._send("POST", self._prefix, json=body, retry_on=_is_connect_error)
         job = resp.json()
-        self._note_created_job(job)
+        self._note_created_job(job, body)
         return job
 
     @staticmethod
@@ -3151,6 +3169,7 @@ class CortexTrainingClient:
                         info,
                         root / sub_job_id / filename,
                         sub_job_id=sub_job_id,
+                        filename=filename,
                         resume=resume,
                         progress=progress,
                     )
@@ -3168,16 +3187,19 @@ class CortexTrainingClient:
         destination: Path,
         *,
         sub_job_id: str,
+        filename: str,
         resume: bool,
         progress: Callable[[str], None] | None,
     ) -> dict[str, Any]:
+        """``filename`` is the path below the sub-job's log directory, which may
+        include subdirectories (``ray/worker.log``)."""
         artifact_uri = run_uri + relative_path
         manifest_path = destination.with_name("." + destination.name + ".artifact.json")
         identity = self._execution_log_identity(listed, artifact_uri)
-        label = f"execution logs: {sub_job_id}/{destination.name}"
+        label = f"execution logs: {sub_job_id}/{filename}"
         result = {
             "sub_job_id": sub_job_id,
-            "filename": destination.name,
+            "filename": filename,
             "artifact_uri": artifact_uri,
             "saved_path": str(destination),
         }
@@ -5348,9 +5370,12 @@ class CortexTrainingClient:
             hint = self._tail_hint(exc, job_id, sub_job_id, checked)
             if hint is None:
                 raise
-            raise requests.exceptions.HTTPError(
+            error = requests.exceptions.HTTPError(
                 f"{exc}. {hint}", response=exc.response, request=exc.request
-            ) from exc
+            )
+            # Lets stream_logs end a tail cleanly when the job ends under it.
+            error.job_ended = bool(checked.get("ended"))  # type: ignore[attr-defined]
+            raise error from exc
 
     def _tail_hint(
         self,
@@ -5361,7 +5386,7 @@ class CortexTrainingClient:
     ) -> str | None:
         """Explain a tail-logs failure that no retry can fix, else ``None``.
 
-        A 404 or 410 from tail-logs means the sub-job's session is not there.
+        A 404, 409 or 410 from tail-logs means the sub-job's session is not there.
         The job is looked up once per call: if it has ended, its live logs are
         gone; if ``sub_job_id`` is not one of its sub-jobs, it never had any.
         Otherwise (for example, a job still starting) the error stays retryable.
@@ -5369,7 +5394,7 @@ class CortexTrainingClient:
         if not isinstance(exc, requests.exceptions.HTTPError):
             return None
         response = exc.response
-        if response is None or response.status_code not in (404, 410):
+        if response is None or response.status_code not in (404, 409, 410):
             return None
         if _response_error_code(response) == _JOB_NOT_FOUND_CODE:
             return None
@@ -5385,6 +5410,7 @@ class CortexTrainingClient:
             return None
         status = self._normalize_job_status(job.get("status"))
         if status in _ENDED_JOB_STATES:
+            checked["ended"] = True
             return (
                 f"Job {job_id} is {status}, so its live logs are gone. Download the "
                 f"saved console with `cortex-training download-log {job_id} --log-type "
@@ -5407,10 +5433,12 @@ class CortexTrainingClient:
         follow: bool,
         cursor: str | None = None,
         poll_interval: float | None = None,
+        stop_at_eof: bool = False,
     ) -> Iterator[dict]:
         """Drive a cursor-paged tail: call ``fetch(cursor)`` for a page, yield
         its entries (under ``entries_key``), advance the cursor, and poll with
-        backoff. With ``follow`` False, stop at the first empty page.
+        backoff. With ``follow`` False, stop at the first empty page; with
+        ``stop_at_eof``, also stop at an empty page that reports ``eof``.
         """
         base_delay = poll_interval or self.poll_interval
         delay = base_delay
@@ -5424,9 +5452,8 @@ class CortexTrainingClient:
                 delay = base_delay  # made progress; poll again promptly
                 continue
             # An empty page means the reader has caught up. Without follow,
-            # stop there: some log backends never report eof while the
-            # source still exists.
-            if not follow:
+            # stop there: older deployments never report eof.
+            if not follow or (stop_at_eof and page.get("eof", False)):
                 return
             time.sleep(delay)
             delay = min(delay * self.poll_backoff_multiplier, self.poll_max_interval)
@@ -5448,20 +5475,45 @@ class CortexTrainingClient:
         for new entries until the caller stops iterating — suitable for a live
         tail. With ``follow=False`` it stops at the first empty page, once it
         has caught up with the log (whether or not the server reports ``eof``).
+
+        The stream also ends, without an error, once the log can grow no more:
+        at an empty page that reports ``eof``, or when the job ends after the
+        stream has read from it. A job that had already ended before the first
+        read raises, as :meth:`tail_logs` does.
         """
-        return self._stream_pages(
-            lambda cur: self.tail_logs(
-                job_id,
-                cursor=cur,
-                max_lines=max_lines,
-                sub_job_id=sub_job_id,
-                sub_job_type=sub_job_type,
-            ),
-            "entries",
-            follow=follow,
-            cursor=cursor,
-            poll_interval=poll_interval,
-        )
+        read_once = False
+
+        def fetch(cur: str | None) -> dict:
+            nonlocal read_once
+            try:
+                page = self.tail_logs(
+                    job_id,
+                    cursor=cur,
+                    max_lines=max_lines,
+                    sub_job_id=sub_job_id,
+                    sub_job_type=sub_job_type,
+                )
+            except requests.exceptions.HTTPError as exc:
+                if read_once and getattr(exc, "job_ended", False):
+                    raise _LogEnded() from exc
+                raise
+            read_once = True
+            return page
+
+        def entries() -> Iterator[dict]:
+            try:
+                yield from self._stream_pages(
+                    fetch,
+                    "entries",
+                    follow=follow,
+                    cursor=cursor,
+                    poll_interval=poll_interval,
+                    stop_at_eof=True,
+                )
+            except _LogEnded:
+                return
+
+        return entries()
 
     # ─── Zone scheduling events (read-only) ───────────────────────────────
 

@@ -309,6 +309,9 @@ def test_live_raw_line_renders_like_the_saved_console():
         (_JSON_LINE, "ERROR"),
         ('{"levelname": "WARNING", "message": "m"}', "WARNING"),
         ('{"msg": "no level"}', None),
+        ('{"level": 3, "msg": "game level"}', None),
+        ('{"level": "high", "msg": "priority"}', None),
+        ('{"level": "warning", "msg": "lower-case"}', "WARNING"),
         ('{"not json', None),
         (_VLLM_LINE, "WARNING"),
         ("INFO 01-01 00:00:00 [a.py:1] ok", "INFO"),
@@ -388,3 +391,12 @@ def test_local_clock_has_a_time_zone(monkeypatch):
     finally:
         monkeypatch.undo()
         time_module.tzset()
+
+
+def test_a_level_field_that_is_not_a_logging_level_never_hides_the_line():
+    stamp = "2026-01-01T00:00:00Z "
+    for line in ['{"level": 3, "msg": "m"}', '{"level": "high", "msg": "m"}', '{"level": null, "msg": "m"}']:
+        assert entry_at_level({"_raw": stamp + line}, "ERROR")
+    assert entry_at_level({"level": "high", "msg": "structured"}, "ERROR")
+    assert entry_at_level({"level": 7, "msg": "structured"}, "ERROR")
+    assert not entry_at_level({"level": "info", "msg": "structured"}, "ERROR")

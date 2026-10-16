@@ -2368,3 +2368,23 @@ async def _run_resource_age_is_humanized(tmp_path):
 
 def test_resource_last_sample_age_is_humanized(tmp_path):
     asyncio.run(_run_resource_age_is_humanized(tmp_path))
+
+
+
+async def _run_no_end_time_no_upload_hint():
+    c = _client()
+    c.get_job.return_value = _terminal_job()  # no state_changed_at
+    c.download_stdout_logs.side_effect = _whole_job(lambda job_id, output_dir, **kwargs: [])
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen) and "FAILED" in (app.sub_title or ""))
+        assert ok
+        for _ in range(5):
+            await pilot.pause()
+        assert app.screen._ended_at is None
+        assert "may still be uploading" not in (app.sub_title or "")
+        await _settle(app, pilot)
+
+
+def test_an_ended_job_without_an_end_time_gets_no_upload_hint():
+    asyncio.run(_run_no_end_time_no_upload_hint())

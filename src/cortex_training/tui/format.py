@@ -62,7 +62,8 @@ def line_level(line: str) -> str | None:
             doc = None
         if isinstance(doc, dict):
             level = doc.get("level") or doc.get("levelname")
-            return str(level) if level else None
+            # Only a logging level counts; any other "level" field is just data.
+            return str(level).upper() if isinstance(level, str) and level.upper() in _LEVELS else None
     match = _TEXT_LEVEL.match(_ANSI.sub("", stripped))
     return match.group(1) if match else None
 
@@ -477,6 +478,7 @@ def entry_at_level(entry: Any, min_level: Any) -> bool:
         lvl = entry.get("level")
         if not lvl and "_raw" in entry:
             lvl = line_level(split_runtime_time(str(entry["_raw"]))[1])
-    if not lvl:
-        return True
-    return _LEVELS.get(str(lvl).upper(), 0) >= floor
+    rank = _LEVELS.get(str(lvl).upper()) if lvl else None
+    if rank is None:
+        return True  # no level, or a value that is not a logging level
+    return rank >= floor

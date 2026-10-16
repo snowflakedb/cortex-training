@@ -1527,16 +1527,23 @@ precision, UTC) at which the container runtime received the line, one space,
 then the line exactly as the process printed it. A line the process printed as
 JSON stays a JSON string inside `_raw`; the saved console from
 [section 12.3](#123-persisted-stdout-download) has the same lines without the
-leading time. A page holds at most 2000 entries or 256 KiB. `cursor` omitted
+leading time. Newer deployments may also add `ts` (that time) and `line` (the
+line without it) to each entry; `_raw` is unchanged, and clients should ignore
+fields they do not use. A page holds at most 2000 entries or 256 KiB. `cursor` omitted
 with `max_lines` set returns the newest `max_lines` lines; `cursor` omitted
 without `max_lines` reads from the start.
 
-The server currently reports `eof: false` for as long as the pod exists, so do
-not wait for `eof: true`. `stream_logs()` repeatedly calls this operation: with
-`follow=False` it stops at the first empty page, once it has caught up with the
-log; with `follow=True` it keeps polling.
+`eof: true` means the head pod can never log again: it is gone, it has reached
+a terminal phase, or it is being deleted and its container has exited.
+Deployments from before that change never send it, and report `eof: false` for
+as long as the pod exists, so clients must not depend on it. `stream_logs()`
+repeatedly calls this operation: with `follow=False` it stops at the first
+empty page, once it has caught up with the log; with `follow=True` it keeps
+polling. Either way it stops at an empty page that reports `eof: true`, and it
+ends without an error when the job ends after the stream has read from it (the
+tail then answers 404, 409 or 410).
 
-A finished job's pods are gone, so `tail-logs` answers 404 or 410. The client
+A finished job's pods are gone, so `tail-logs` answers 404, 409 or 410. The client
 then reads the job once and, if it has ended, raises at once with a pointer to
 the saved console (`cortex-training download-log JOB_ID --log-type stdout`, or
 `download_stdout_logs()`). A `sub_job_id` that is not one of the job's

@@ -1221,7 +1221,9 @@ class LogScreen(Screen):
         status = job.get("status") if isinstance(job, dict) else None
         if not status or is_active_status(status):
             return
-        ended_at = parse_api_time(job.get("state_changed_at")) or time.time()
+        ended_at = parse_api_time(job.get("state_changed_at"))
+        if ended_at is None:
+            return  # without the end time, do not guess (as the client does)
         self._ended_at = ended_at
         remaining = self._RECENTLY_ENDED_SECONDS - (time.time() - ended_at)
         if remaining > 0:

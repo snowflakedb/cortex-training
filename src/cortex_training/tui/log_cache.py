@@ -370,8 +370,8 @@ def cached_pages(
             cursor = new_cursor
         if not follow:
             # An empty page means we've drained everything available right now.
-            # Stop rather than poll forever — independent of the server's eof
-            # flag (the pod-logs backend never sets eof=True). This is the
+            # Stop rather than poll forever, without relying on the server's
+            # eof flag, which older deployments never set. This is the
             # "terminal job: replay + drain once, then stop" path.
             return
         sleep(delay)

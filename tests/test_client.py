@@ -7255,30 +7255,52 @@ class TestChunkedArtifactDownload:
     def test_spool_waits_for_the_fetch_the_writer_was_blocked_on(self, tmp_path, monkeypatch):
         import signal
 
+        # A process started in the background by a non-interactive shell
+        # inherits SIGINT as ignored, and Python then never raises
+        # KeyboardInterrupt for it. Install the default handler for this test.
+        previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+        try:
+            self._spool_waits_for_the_blocked_fetch(tmp_path, monkeypatch, signal)
+        finally:
+            signal.signal(signal.SIGINT, previous)
+
+    def _spool_waits_for_the_blocked_fetch(self, tmp_path, monkeypatch, signal):
         spool_parent = tmp_path / "tmp"
         spool_parent.mkdir()
         monkeypatch.setattr(tempfile, "tempdir", str(spool_parent))
         c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=4)
         head = self.RUN_URI + paths[self.SUB][0]
         release = threading.Event()
+        get_finished = threading.Event()
+        timed_out = []
 
         def on_get(source):
             if source == head:
-                # Ctrl-C arrives while the writer waits on this very fetch.
-                signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
-                assert release.wait(5)
+                try:
+                    # Ctrl-C arrives while the writer waits on this very fetch.
+                    signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
+                    # Bounded generously: under load the main thread can take a
+                    # while to unwind the interrupt before it releases us.
+                    if not release.wait(30):
+                        timed_out.append(source)
+                finally:
+                    get_finished.set()
 
         connection.on_get = on_get
         with pytest.raises(KeyboardInterrupt):
             c.download_stdout_logs("job-1", tmp_path / "out", max_workers=1)
-        time.sleep(0.3)
+        # The interrupted download has returned, but the head GET is still
+        # inside on_get: give a premature cleanup time to happen, then check.
+        assert not get_finished.wait(0.3)
         assert list(spool_parent.iterdir()), "spool removed while the head GET was running"
         release.set()
+        assert get_finished.wait(30)
         self._settle()
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 30
         while list(spool_parent.iterdir()):
             assert time.monotonic() < deadline, list(spool_parent.rglob("*"))
             time.sleep(0.01)
+        assert timed_out == []
 
     def test_sweep_reports_only_directories_it_removed(self, tmp_path, monkeypatch, caplog):
         spool_parent = tmp_path / "tmp"
@@ -8093,11 +8115,80 @@ class TestStreamStopsWithoutEof:
         monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
         c = _make_client()
         c._session.post.side_effect = [
-            _make_response({"entries": [], "next_cursor": "c0", "eof": True}),
+            _make_response({"entries": [], "next_cursor": "c0", "eof": False}),
             _make_response({"entries": [{"msg": "late"}], "next_cursor": "c1", "eof": False}),
         ]
         stream = c.stream_logs("j1", sub_job_id="sj-0", follow=True)
         assert next(stream)["msg"] == "late"
+
+    def test_follow_true_ends_at_an_empty_eof_page(self, monkeypatch):
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        c = _make_client()
+        c._session.post.side_effect = [
+            _make_response({"entries": [{"msg": "a"}], "next_cursor": "c1", "eof": True}),
+            _make_response({"entries": [], "next_cursor": "c1", "eof": True}),
+            AssertionError("polled past eof"),
+        ]
+        assert [e["msg"] for e in c.stream_logs("j1", sub_job_id="sj-0", follow=True)] == ["a"]
+
+    def test_entries_with_extra_fields_still_render(self):
+        from cortex_training.tui.format import format_log_entry
+
+        entry = {"_raw": "2026-01-01T00:00:00Z hello", "ts": "2026-01-01T00:00:00Z", "line": "hello"}
+        assert format_log_entry(entry) == "hello"
+
+
+class TestStreamEndsWhenTheJobEnds:
+    @pytest.fixture(autouse=True)
+    def _no_waits(self, monkeypatch):
+        monkeypatch.setattr(nc, "wait_exponential_jitter", lambda **kwargs: lambda retry_state: 0)
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+
+    def _job(self, status):
+        return _make_response({"job_id": "j1", "status": status, "sub_jobs": [{"sub_job_id": "j1:s:0"}]})
+
+    @pytest.mark.parametrize("status_code", [404, 409, 410])
+    def test_a_following_stream_ends_cleanly_when_the_job_ends(self, status_code):
+        c = _make_client()
+        c.max_retries = 10
+        c._session.post.side_effect = [
+            _make_response({"entries": [{"msg": "a"}], "next_cursor": "c1", "eof": False}),
+            _make_response({"entries": [], "next_cursor": "c1", "eof": False}),
+            _not_found("517604", "session s not found", status=status_code),
+            AssertionError("polled after the job ended"),
+        ]
+        c._session.get.return_value = self._job("CANCELLED")
+        assert [e["msg"] for e in c.stream_logs("j1", sub_job_id="j1:s:0", follow=True)] == ["a"]
+        assert c._session.get.call_count == 1
+
+    def test_a_job_that_ended_before_the_first_read_still_raises(self):
+        c = _make_client()
+        c._session.post.return_value = _not_found("517604", "session s not found")
+        c._session.get.return_value = self._job("TERMINATED")
+        with pytest.raises(nc.requests.exceptions.HTTPError, match="download-log j1 --log-type stdout"):
+            list(c.stream_logs("j1", sub_job_id="j1:s:0", follow=True))
+
+    def test_other_errors_mid_stream_still_raise(self):
+        c = _make_client()
+        c.max_retries = 0
+        c._session.post.side_effect = [
+            _make_response({"entries": [{"msg": "a"}], "next_cursor": "c1", "eof": False}),
+            _make_error_response({"message": "bad"}, 400),
+        ]
+        stream = c.stream_logs("j1", sub_job_id="j1:s:0", follow=True)
+        assert next(stream)["msg"] == "a"
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            next(stream)
+
+    def test_tail_logs_marks_an_ended_job_error(self):
+        c = _make_client()
+        c._session.post.return_value = _not_found("517604", "session s not found", status=409)
+        c._session.get.return_value = self._job("FAILED")
+        with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+            c.tail_logs("j1", sub_job_id="j1:s:0")
+        assert excinfo.value.job_ended is True
+        assert excinfo.value.response.status_code == 409
+        assert c._session.post.call_count == 1  # a 409 on an ended job is not retried
 
 
 # ─── Streamed execution-log download ─────────────────────────────────────────
@@ -8350,3 +8441,83 @@ def test_wait_for_job_keeps_polling_through_starting_states(monkeypatch):
     ]
     assert c.wait_for_job("job-1")["status"] == "RUNNING"
     assert c._session.get.call_count == 4
+
+
+class TestCreatedJobBookkeeping:
+    def test_concurrent_creates_on_one_client_never_raise(self, monkeypatch):
+        import sys
+        import threading
+
+        c = _make_client()
+        counter = iter(range(10**9))
+        lock = threading.Lock()
+
+        def post(*_args, **_kwargs):
+            with lock:
+                n = next(counter)
+            return _make_response({"job_id": f"job-{n}"})
+
+        c._session.post.side_effect = post
+        # A large map makes each pruning pass long enough to be interrupted.
+        c._recently_created_jobs.update({f"old-{i}": time.monotonic() for i in range(20000)})
+        errors, created = [], []
+        old_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        try:
+            def worker():
+                try:
+                    for _ in range(200):
+                        created.append(c.create_job_from_body(_SAMPLING_BODY)["job_id"])
+                except BaseException as exc:  # noqa: BLE001 - recorded for the assertion
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=worker) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(60)
+        finally:
+            sys.setswitchinterval(old_interval)
+        assert errors == []
+        assert len(set(created)) == 800
+        assert all(job_id in c._recently_created_jobs for job_id in created)
+
+    def test_recording_a_create_never_hides_its_result(self):
+        c = _make_client(post_json={"job_id": "srv-1"})
+
+        class Broken(dict):
+            def items(self):
+                raise RuntimeError("boom")
+
+        c._recently_created_jobs = Broken()
+        assert c.create_job_from_body(_SAMPLING_BODY) == {"job_id": "srv-1"}
+
+    def test_a_response_without_job_id_falls_back_to_the_requested_one(self):
+        c = _make_client(post_json={"status": "PENDING"})
+        c.create_job_from_body({**_SAMPLING_BODY, "job_id": "client-chosen"})
+        assert "client-chosen" in c._recently_created_jobs
+
+
+
+def test_execution_log_filenames_keep_their_subdirectories(tmp_path, monkeypatch):
+    setup = TestDownloadExecutionLogs()
+    files = {
+        "job-1:sampling:0/ray/worker.log": (b"worker\n", "a"),
+        "job-1:sampling:0/execution.jsonl": (b"e\n", "b"),
+    }
+    c, _connection = setup._setup(monkeypatch, files)
+    messages = []
+    result = c.download_execution_logs("job-1", tmp_path, progress=messages.append)
+    assert [(r["filename"], r["saved_path"]) for r in result] == [
+        ("execution.jsonl", str(tmp_path / "job-1:sampling:0" / "execution.jsonl")),
+        ("ray/worker.log", str(tmp_path / "job-1:sampling:0" / "ray" / "worker.log")),
+    ]
+    assert (tmp_path / "job-1:sampling:0" / "ray" / "worker.log").read_bytes() == b"worker\n"
+    # The same names fetch_execution_logs reports.
+    assert [r["filename"] for r in result] == sorted(
+        f["filename"] for f in c.fetch_execution_logs("job-1")
+    )
+    assert any("execution logs: job-1:sampling:0/ray/worker.log: saved" in m for m in messages)
+    # Resume finds the nested file's record.
+    again = c.download_execution_logs("job-1", tmp_path, resume=True)
+    assert [r["unchanged"] for r in again] == [True, True]
