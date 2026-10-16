@@ -798,9 +798,10 @@ def _capacity_breakdown_dimensions(dimensions: Any) -> tuple[str, ...]:
 def _capacity_breakdown(
     body: Mapping[str, Any], dimensions: tuple[str, ...]
 ) -> dict[str, Any]:
-    """Normalize ``breakdown``. A dimension without ``status`` (or ``"OK"``)
-    is OK and has no ``status`` key; ``DISABLED`` is kept; anything else,
-    including a missing dimension, is ``UNAVAILABLE`` with no groups."""
+    """Normalize ``breakdown``, trusting the data over the status label:
+    groups are kept whenever the server sends them, and ``status`` is passed
+    through as sent. Only a missing status is derived: ``OK`` with groups,
+    ``UNAVAILABLE`` without (also for a dimension the server left out)."""
     raw = body.get("breakdown")
     if not isinstance(raw, dict):
         raw = {}
@@ -812,21 +813,17 @@ def _capacity_breakdown(
     for dimension in dict.fromkeys(dimensions):
         section = raw.get(f"by_{dimension}")
         if not isinstance(section, dict):
-            section = {"status": "UNAVAILABLE"}
-        status = section.get("status", "OK")
+            section = {}
         groups = section.get("groups")
-        if status == "OK" and not isinstance(groups, list):
-            status = "UNAVAILABLE"
-        elif status not in ("OK", "DISABLED"):
-            status = "UNAVAILABLE"
-        rendered: dict[str, Any] = {} if status == "OK" else {"status": status}
-        if status != "OK":
-            rendered["groups"] = []
+        has_groups = isinstance(groups, list) and bool(groups)
+        status = section.get("status") or ("OK" if has_groups else "UNAVAILABLE")
+        if not has_groups:
+            rendered_groups = []
         elif dimension == "job_type":
-            rendered["groups"] = _capacity_job_type_groups(groups)
+            rendered_groups = _capacity_job_type_groups(groups)
         else:
-            rendered["groups"] = [_capacity_submitted_by_group(group) for group in groups]
-        breakdown[f"by_{dimension}"] = rendered
+            rendered_groups = [_capacity_submitted_by_group(group) for group in groups]
+        breakdown[f"by_{dimension}"] = {"status": status, "groups": rendered_groups}
     return breakdown
 
 
@@ -2581,10 +2578,10 @@ class CortexTrainingClient:
 
         ``breakdown`` holds ``job_count``, ``truncated``,
         ``unsupported_dimensions``, and ``by_job_type`` / ``by_submitted_by``
-        for the requested dimensions. Each has ``groups``, which add up to
-        ``in_use_gpus`` and ``pending_gpus``, or, when the split is not
-        available, a ``status`` (``DISABLED`` or ``UNAVAILABLE``) and empty
-        ``groups``. Missing counts are 0; on non-``USER`` groups
+        for the requested dimensions. Each has a ``status`` (``OK``,
+        ``DISABLED``, ``UNAVAILABLE``, or any newer value the server sends)
+        and ``groups``; under ``OK`` the groups add up to ``in_use_gpus`` and
+        ``pending_gpus``. Missing counts are 0; on non-``USER`` groups
         ``submitted_by`` is ``None`` and ``is_caller`` is ``False``.
 
         See ``docs/reference/rest-api.md`` section 5.4 for every field.

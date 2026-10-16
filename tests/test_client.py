@@ -2723,6 +2723,7 @@ _CAPACITY_BREAKDOWN_BODY = {
         "job_count": 6,
         "truncated": False,
         "by_job_type": {
+            "status": "OK",
             "groups": [
                 {"job_type": "TRAINING", "in_use_gpus": 28, "pending_gpus": 16, "sub_job_count": 5},
                 {"job_type": "SAMPLING", "in_use_gpus": 16, "pending_gpus": 0, "sub_job_count": 2},
@@ -2730,6 +2731,7 @@ _CAPACITY_BREAKDOWN_BODY = {
             ],
         },
         "by_submitted_by": {
+            "status": "OK",
             "groups": [
                 {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
                  "in_use_gpus": 24, "pending_gpus": 0, "job_count": 2},
@@ -2799,6 +2801,7 @@ class TestCapacityBreakdown:
             "breakdown": {
                 "job_count": 1,
                 "by_job_type": {
+                    "status": "OK",
                     "groups": [{"job_type": "TRAINING", "in_use_gpus": 8, "sub_job_count": 1}],
                 },
             },
@@ -2809,7 +2812,7 @@ class TestCapacityBreakdown:
         ]["by_job_type"]
 
         assert c._session.get.call_args.kwargs["params"] == {"breakdown": "job_type"}
-        assert "status" not in by_job_type
+        assert by_job_type["status"] == "OK"
         assert by_job_type["groups"][0]["in_use_gpus"] == 8
 
     @pytest.mark.parametrize(
@@ -2847,6 +2850,7 @@ class TestCapacityBreakdown:
                 "truncated": False,
                 "unsupported_dimensions": [],
                 "by_job_type": {
+                    "status": "OK",
                     "groups": [
                         {"job_type": "TRAINING", "in_use_gpus": 28, "pending_gpus": 16, "sub_job_count": 5},
                         {"job_type": "SAMPLING", "in_use_gpus": 16, "pending_gpus": 0, "sub_job_count": 2},
@@ -2854,6 +2858,7 @@ class TestCapacityBreakdown:
                     ],
                 },
                 "by_submitted_by": {
+                    "status": "OK",
                     "groups": [
                         {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
                          "in_use_gpus": 24, "pending_gpus": 0, "job_count": 2},
@@ -2875,6 +2880,7 @@ class TestCapacityBreakdown:
             "breakdown": {
                 "job_count": 3,
                 "by_job_type": {
+                    "status": "OK",
                     "groups": [
                         {"job_type": "JOB_TYPE_SAMPLING", "in_use_gpus": 8, "sub_job_count": 1},
                         {"job_type": "TRAINING", "pending_gpus": 16, "sub_job_count": 2},
@@ -2891,6 +2897,7 @@ class TestCapacityBreakdown:
             "truncated": False,
             "unsupported_dimensions": [],
             "by_job_type": {
+                "status": "OK",
                 "groups": [
                     {"job_type": "TRAINING", "in_use_gpus": 0, "pending_gpus": 16, "sub_job_count": 2},
                     {"job_type": "SAMPLING", "in_use_gpus": 8, "pending_gpus": 0, "sub_job_count": 1},
@@ -2908,6 +2915,7 @@ class TestCapacityBreakdown:
             "breakdown": {
                 "job_count": 2,
                 "by_job_type": {
+                    "status": "OK",
                     "groups": [
                         {"job_type": "TRAINING", "in_use_gpus": 8, "sub_job_count": 1},
                         {"job_type": "JOB_TYPE_TRAINING", "in_use_gpus": 2, "sub_job_count": 1},
@@ -2932,6 +2940,7 @@ class TestCapacityBreakdown:
             "breakdown": {
                 "job_count": 5,
                 "by_submitted_by": {
+                    "status": "OK",
                     "groups": [
                         {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
                          "in_use_gpus": 8, "job_count": 1},
@@ -2975,6 +2984,7 @@ class TestCapacityBreakdown:
                 "job_count": 7,
                 "truncated": False,
                 "by_submitted_by": {
+                    "status": "OK",
                     "groups": [
                         {"kind": "USER", "submitted_by": "DAVE", "is_caller": False,
                          "in_use_gpus": 16, "pending_gpus": 8, "job_count": 2},
@@ -2996,6 +3006,7 @@ class TestCapacityBreakdown:
         ]["by_submitted_by"]
 
         assert by_submitted_by == {
+            "status": "OK",
             "groups": [
                 {"kind": "USER", "submitted_by": "DAVE", "is_caller": False,
                  "in_use_gpus": 16, "pending_gpus": 8, "job_count": 2},
@@ -3034,6 +3045,7 @@ class TestCapacityBreakdown:
                 "job_count": 1,
                 "truncated": False,
                 "by_job_type": {
+                    "status": "OK",
                     "groups": [{"job_type": "TRAINING", "in_use_gpus": 8, "sub_job_count": 1}],
                 },
             },
@@ -3042,42 +3054,32 @@ class TestCapacityBreakdown:
         breakdown = c.get_capacity_breakdown()["breakdown"]
 
         assert breakdown["unsupported_dimensions"] == ["submitted_by"]
-        assert "status" not in breakdown["by_job_type"]
+        assert breakdown["by_job_type"]["status"] == "OK"
         assert breakdown["by_submitted_by"] == {"status": "UNAVAILABLE", "groups": []}
 
-    @pytest.mark.parametrize(
-        ("sent", "expected"),
-        [("DISABLED", "DISABLED"), ("UNAVAILABLE", "UNAVAILABLE"), ("UNSUPPORTED", "UNAVAILABLE")],
-    )
-    def test_status_other_than_ok_is_kept_without_groups(self, sent, expected):
-        # An older server's UNSUPPORTED reads as UNAVAILABLE.
+    @pytest.mark.parametrize("status", ["DISABLED", "UNAVAILABLE", "UNSUPPORTED", "SOMETHING_NEW", 1])
+    def test_status_is_passed_through_as_sent(self, status):
         c = _make_client(get_json={
             "in_use_gpus": 8,
             "breakdown": {
                 "unsupported_dimensions": [],
-                "by_job_type": {
-                    "status": sent,
-                    "groups": [{"job_type": "TRAINING", "in_use_gpus": 8, "sub_job_count": 1}],
-                },
-                "by_submitted_by": {
-                    "status": sent,
-                    "groups": [{"kind": "OTHER", "in_use_gpus": 8, "job_count": 1}],
-                },
+                "by_job_type": {"status": status, "groups": []},
+                "by_submitted_by": {"status": status, "groups": []},
             },
         })
 
         breakdown = c.get_capacity_breakdown()["breakdown"]
 
-        assert breakdown["by_job_type"] == {"status": expected, "groups": []}
-        assert breakdown["by_submitted_by"] == {"status": expected, "groups": []}
+        assert breakdown["by_job_type"] == {"status": status, "groups": []}
+        assert breakdown["by_submitted_by"] == {"status": status, "groups": []}
 
-    def test_explicit_ok_from_an_older_server_is_hidden(self):
+    def test_groups_are_kept_whatever_the_status(self):
+        # The data decides, so a status this client does not know cannot hide a split.
         c = _make_client(get_json={
             "in_use_gpus": 8,
             "breakdown": {
-                "job_count": 1,
                 "by_job_type": {
-                    "status": "OK",
+                    "status": "SOMETHING_NEW",
                     "groups": [{"job_type": "TRAINING", "in_use_gpus": 8, "sub_job_count": 1}],
                 },
             },
@@ -3087,36 +3089,27 @@ class TestCapacityBreakdown:
             "by_job_type"
         ]
 
-        assert "status" not in by_job_type
-        assert by_job_type["groups"][0]["in_use_gpus"] == 8
+        assert by_job_type["status"] == "SOMETHING_NEW"
+        assert by_job_type["groups"][0] == {
+            "job_type": "TRAINING", "in_use_gpus": 8, "pending_gpus": 0, "sub_job_count": 1,
+        }
 
-    @pytest.mark.parametrize(
-        "section_status",
-        [{"status": "SOMETHING_NEW"}, {"status": None}, {"status": 1}],
-        ids=["unknown", "null", "not-a-string"],
-    )
-    def test_status_this_client_does_not_know_fails_closed_as_unavailable(
-        self, section_status
-    ):
+    @pytest.mark.parametrize("status", [None, ""], ids=["null", "empty"])
+    def test_missing_status_is_ok_when_groups_are_sent(self, status):
+        section = {"groups": [{"job_type": "TRAINING", "in_use_gpus": 8, "sub_job_count": 1}]}
+        if status is not None:
+            section["status"] = status
         c = _make_client(get_json={
             "in_use_gpus": 8,
-            "breakdown": {
-                "unsupported_dimensions": [],
-                "by_job_type": {
-                    **section_status,
-                    "groups": [{"job_type": "TRAINING", "in_use_gpus": 8, "sub_job_count": 1}],
-                },
-                "by_submitted_by": {
-                    **section_status,
-                    "groups": [{"kind": "OTHER", "in_use_gpus": 8, "job_count": 1}],
-                },
-            },
+            "breakdown": {"job_count": 1, "by_job_type": section},
         })
 
-        breakdown = c.get_capacity_breakdown()["breakdown"]
+        by_job_type = c.get_capacity_breakdown(dimensions=("job_type",))["breakdown"][
+            "by_job_type"
+        ]
 
-        assert breakdown["by_job_type"] == {"status": "UNAVAILABLE", "groups": []}
-        assert breakdown["by_submitted_by"] == {"status": "UNAVAILABLE", "groups": []}
+        assert by_job_type["status"] == "OK"
+        assert by_job_type["groups"][0]["in_use_gpus"] == 8
 
     def test_section_without_status_or_groups_fails_closed_as_unavailable(self):
         c = _make_client(get_json={"in_use_gpus": 8, "breakdown": {"by_job_type": {}}})
@@ -3138,6 +3131,7 @@ class TestCapacityBreakdown:
                 "job_count": 7,
                 "truncated": True,
                 "by_submitted_by": {
+                    "status": "OK",
                     "groups": [
                         {"kind": "OTHER", "in_use_gpus": 48, "job_count": 5},
                         {"kind": "UNATTRIBUTED", "pending_gpus": 16, "job_count": 2},
@@ -3153,6 +3147,7 @@ class TestCapacityBreakdown:
             "truncated": True,
             "unsupported_dimensions": [],
             "by_submitted_by": {
+                "status": "OK",
                 "groups": [
                     {"kind": "OTHER", "submitted_by": None, "is_caller": False,
                      "in_use_gpus": 48, "pending_gpus": 0, "job_count": 5},

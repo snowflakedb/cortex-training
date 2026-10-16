@@ -627,6 +627,7 @@ requested dimension reports `DISABLED`. Example for `?breakdown=job_type,submitt
     "job_count": 6,
     "truncated": false,
     "by_job_type": {
+      "status": "OK",
       "groups": [
         {"job_type": "TRAINING", "in_use_gpus": 28, "pending_gpus": 16,
          "sub_job_count": 5},
@@ -637,6 +638,7 @@ requested dimension reports `DISABLED`. Example for `?breakdown=job_type,submitt
       ]
     },
     "by_submitted_by": {
+      "status": "OK",
       "groups": [
         {"kind": "USER", "submitted_by": "YOUR_USER", "is_caller": true,
          "in_use_gpus": 24, "pending_gpus": 0, "job_count": 2},
@@ -654,20 +656,21 @@ requested dimension reports `DISABLED`. Example for `?breakdown=job_type,submitt
 
 - `unsupported_dimensions`: always present, possibly empty.
 - `job_count`: jobs behind `in_use_gpus` and `pending_gpus`, including those
-  holding no GPUs. Present only when a dimension has its split.
+  holding no GPUs. Present only when a dimension is `OK`.
 - `truncated`: the account had more jobs than the server attributes one by
-  one; the rest count as `UNATTRIBUTED`. Present only when a dimension has its
-  split.
+  one; the rest count as `UNATTRIBUTED`. Present only when a dimension is `OK`.
 - `by_job_type` / `by_submitted_by`: present only when requested.
 
-A dimension with its split has only `groups`, which add up to `in_use_gpus`
-and `pending_gpus`. Otherwise it has a `status` and empty `groups`, still with
-HTTP `200` and the six totals unchanged:
+Each dimension has a `status` and `groups`. Every status comes with HTTP
+`200` and the six totals unchanged:
 
 | `status` | Meaning |
 |---|---|
-| `DISABLED` | Not enabled for the account. |
-| `UNAVAILABLE` | Cannot be computed for this request, including when the service does not support it yet. Treat unknown statuses the same way. |
+| `OK` | `groups` adds up to `in_use_gpus` and `pending_gpus`. |
+| `DISABLED` | Not enabled for the account. `groups` is empty. |
+| `UNAVAILABLE` | Cannot be computed for this request, including when the service does not support it yet. `groups` is empty. |
+
+Read the split from `groups`; a newer service may add statuses.
 
 `by_job_type.groups[]`: `TRAINING`, `SAMPLING` and `LOG_PROBABILITY` first,
 then any other type (`UNSPECIFIED` or `UNKNOWN` when the service cannot name
@@ -690,10 +693,12 @@ then by name, then `OTHER`, then `UNATTRIBUTED`. Find the caller's row by
 or schema names.
 
 `get_capacity_breakdown(hardware=None, *, dimensions=("job_type",
-"submitted_by"))` sends this parameter. It fills missing counts with `0`,
-reports a dimension missing from the response (including from a server
-without this parameter) as `UNAVAILABLE`, and always lists the three known
-job types when the split is available. The CLI exposes it as
+"submitted_by"))` sends this parameter. It keeps `groups` whenever the server
+sends them and passes `status` through as sent. A missing `status` reads as
+`OK` with groups and `UNAVAILABLE` without, and a dimension missing from the
+response (including from a server without this parameter) is `UNAVAILABLE`.
+It fills missing counts with `0` and always lists the three known job types
+when there are groups. The CLI exposes it as
 [`capacity --breakdown`](cli.md#capacity-breakdown).
 
 ### 5.5 Cancel job - `POST /{job_id}:cancel`

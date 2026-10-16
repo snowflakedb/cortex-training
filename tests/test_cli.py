@@ -1397,6 +1397,7 @@ def test_capacity_breakdown_prints_the_real_client_result_with_sorted_keys():
             "truncated": False,
             "by_job_type": {"status": "DISABLED", "groups": []},
             "by_submitted_by": {
+                "status": "OK",
                 "groups": [
                     {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
                      "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
@@ -1440,6 +1441,7 @@ def test_capacity_breakdown_prints_the_real_client_result_with_sorted_keys():
             "unsupported_dimensions": [],
             "by_job_type": {"status": "DISABLED", "groups": []},
             "by_submitted_by": {
+                "status": "OK",
                 "groups": [
                     {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
                      "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
@@ -1474,6 +1476,7 @@ def test_capacity_breakdown_prints_visible_user_rows_in_server_order():
             "job_count": 5,
             "truncated": False,
             "by_submitted_by": {
+                "status": "OK",
                 "groups": [
                     {"kind": "USER", "submitted_by": "CAROL", "is_caller": False,
                      "in_use_gpus": 16, "pending_gpus": 8, "job_count": 2},
@@ -1501,6 +1504,7 @@ def test_capacity_breakdown_prints_visible_user_rows_in_server_order():
         "breakdown": "submitted_by",
     }
     assert json.loads(out)["breakdown"]["by_submitted_by"] == {
+        "status": "OK",
         "groups": [
             {"kind": "USER", "submitted_by": "CAROL", "is_caller": False,
              "in_use_gpus": 16, "pending_gpus": 8, "job_count": 2},
