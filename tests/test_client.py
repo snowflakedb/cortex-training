@@ -5993,6 +5993,12 @@ class TestExecutionLogDownload:
 class TestChunkedArtifactDownload:
     """Parallel fetch, ordered commit, retries, and durable progress."""
 
+    @pytest.fixture(autouse=True)
+    def _default_telemetry_env(self, monkeypatch):
+        # Telemetry defaults are part of what these tests check.
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        monkeypatch.delenv(nc.DISABLE_TELEMETRY_ENV, raising=False)
+
     RUN_URI = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
     SUB = "job-1:training:0"
 
@@ -6599,7 +6605,7 @@ class TestChunkedArtifactDownload:
             "artifact": "stdout",
             "max_workers": 16,
             "resume": False,
-            "resume_mode": "rebuild",
+            "resume_mode": "fresh",
             "sub_job_count": 1,
             "chunk_count": 3,
             "chunks_skipped": 0,
@@ -6729,6 +6735,50 @@ class TestChunkedArtifactDownload:
         assert value["file_count"] == 1 and value["bytes_read"] == 8
         assert value["list_ms"] >= 0 and value["fetch_ms"] >= 0
         assert value["success"] is True
+
+    @pytest.mark.parametrize("setting", ["no", "off", "false", "2"])
+    def test_any_explicit_non_truthy_setting_turns_download_successes_off(
+        self, tmp_path, monkeypatch, setting
+    ):
+        monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, setting)
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=1)
+        c._metric_emitter = MagicMock()
+        c.download_stdout_logs("job-1", tmp_path)
+        c._metric_emitter.emit.assert_not_called()
+
+    def test_download_failures_are_still_sent_with_success_telemetry_off(
+        self, tmp_path, monkeypatch
+    ):
+        errors = importlib.import_module("snowflake.connector.errors")
+        monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "0")
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=2)
+
+        def on_get(source):
+            raise errors.ProgrammingError(msg="denied", errno=2003)
+
+        connection.on_get = on_get
+        c._metric_emitter = MagicMock()
+        with pytest.raises(errors.ProgrammingError):
+            c.download_stdout_logs("job-1", tmp_path)
+        self._settle()
+        value, _attributes = self._emitted(c)
+        assert value["success"] is False and value["artifact"] == "stdout"
+
+    def test_interrupting_another_operation_sends_nothing_by_default(self):
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        c._session.post.side_effect = KeyboardInterrupt
+        with pytest.raises(KeyboardInterrupt):
+            c.step("job-1")
+        c._metric_emitter.emit.assert_not_called()
+
+    def test_rebuilding_an_existing_file_reports_rebuild(self, tmp_path, monkeypatch):
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=1)
+        c.download_stdout_logs("job-1", tmp_path)
+        c._metric_emitter = MagicMock()
+        c.download_stdout_logs("job-1", tmp_path)
+        value, _attributes = self._emitted(c)
+        assert value["resume_mode"] == "rebuild"
 
     def test_download_cancelled_is_public(self):
         import cortex_training

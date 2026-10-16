@@ -64,8 +64,11 @@ Tracked operations:
 
 Each emitted event body contains `success`, `duration_ms`, `request_count`,
 `attempt_count`, and `retry_count`. Failures also include a bounded
-`error_message` with common credential patterns redacted, and a cancelled
-operation (`DownloadCancelled` or Ctrl-C) has `cancelled: true`.
+`error_message` with common credential patterns redacted. A cancelled
+operation has `cancelled: true`: `DownloadCancelled`, or Ctrl-C
+(`KeyboardInterrupt`) during any tracked operation. Cancellations are sent
+under the same rule as successes, so by default only for the three download
+operations.
 
 Download events add these body fields:
 
@@ -77,7 +80,7 @@ Download events add these body fields:
 | `chunk_count` / `chunks_skipped` | Chunks this call appended or skipped; skipped ones are also counted in `chunk_count` |
 | `bytes_written` | Bytes this call added to the output files |
 | `max_workers` | Concurrent GETs used |
-| `resume` / `resume_mode` | Whether `resume` was passed, and what happened: `rebuild`, `append`, `partial` (continued an interrupted download), `mixed` across sub-jobs, or `none` |
+| `resume` / `resume_mode` | Whether `resume` was passed, and what happened: `fresh` (no earlier file), `rebuild` (replaced an earlier file), `append`, `partial` (continued an interrupted download), `mixed` across sub-jobs, or `none` |
 | `artifact_retry_count` / `transfer_timeout_count` | Retried `LIST`/`GET` attempts, and attempts abandoned after `transfer_timeout_seconds` |
 | `cancelled` | The download was stopped by its caller |
 | `file_count` / `bytes_read` | Files and bytes read (`fetch_execution_logs`) |

@@ -333,3 +333,14 @@ def test_consecutive_failures_disable_further_network_calls():
 
     emitter.emit("event")
     assert token_provider.get_token.call_count == 3
+
+
+def test_second_interrupt_during_exit_flush_is_quiet(monkeypatch):
+    from cortex_training import telemetry
+
+    class Interrupted:
+        def close(self, timeout):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(telemetry, "_EMITTERS", {Interrupted()})
+    telemetry._flush_emitters_at_exit()  # returns instead of raising

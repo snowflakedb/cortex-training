@@ -3737,7 +3737,13 @@ class CortexTrainingClient:
             ]
             values["sub_job_count"] = len(plans)
             modes = {
-                "append" if not plan.promote else "partial" if plan.known else "rebuild"
+                "append"
+                if not plan.promote
+                else "partial"
+                if plan.known
+                else "rebuild"
+                if plan.destination.exists()
+                else "fresh"
                 for plan in plans
             }
             values["resume_mode"] = modes.pop() if len(modes) == 1 else "mixed" if modes else "none"
