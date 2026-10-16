@@ -22,6 +22,7 @@ optional TUI dependency installed.
 from __future__ import annotations
 
 import json
+import re
 import textwrap
 from datetime import datetime
 from datetime import timezone
@@ -31,12 +32,60 @@ EVENTS_SOURCE_ID = "__events__"
 EVENTS_LABEL = "▸ scheduling events"
 
 
+# Live tail lines arrive as {"_raw": "<RFC 3339 time> <line>"}: the time the
+# container runtime saw the line, then the line exactly as the process wrote it.
+_RUNTIME_TIME = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})) "
+)
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# A plain-text line that starts with a level, optionally after "(actor pid=...)"
+# prefixes, as Python logging and vLLM print them.
+_TEXT_LEVEL = re.compile(r"^(?:\([^)]*\)\s*)*(DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL|FATAL)\b")
+
+
+def split_runtime_time(text: str) -> tuple[str | None, str]:
+    """Split a leading container-runtime timestamp off a live log line."""
+    match = _RUNTIME_TIME.match(text)
+    if match is None:
+        return None, text
+    return match.group(1), text[match.end():]
+
+
+def line_level(line: str) -> str | None:
+    """The level a console line was logged at: a JSON line's ``level`` field,
+    or a level word at the start of a text line. ``None`` if neither."""
+    stripped = line.strip()
+    if stripped.startswith("{"):
+        try:
+            doc = json.loads(stripped)
+        except ValueError:
+            doc = None
+        if isinstance(doc, dict):
+            level = doc.get("level") or doc.get("levelname")
+            return str(level) if level else None
+    match = _TEXT_LEVEL.match(_ANSI.sub("", stripped))
+    return match.group(1) if match else None
+
+
+def entry_time(entry: Any) -> str | None:
+    """When a log entry was written: its runtime timestamp or ``ts`` field."""
+    if not isinstance(entry, dict):
+        return None
+    if "_raw" in entry:
+        return split_runtime_time(str(entry["_raw"]))[0]
+    ts = entry.get("ts")
+    return str(ts) if ts else None
+
+
 def format_log_entry(entry: Any) -> str:
-    """Render one log entry (a parsed JSONL object or ``{"_raw": ...}``)."""
+    """Render one log entry (a parsed JSONL object or ``{"_raw": ...}``).
+
+    A raw live line is shown without its runtime timestamp, exactly as it
+    appears in the saved console."""
     if not isinstance(entry, dict):
         return str(entry)
     if "_raw" in entry:
-        text = str(entry["_raw"])
+        text = split_runtime_time(str(entry["_raw"]))[1]
         return text + " …[truncated]" if entry.get("_truncated") else text
     ts = str(entry.get("ts", "")).strip()
     level = str(entry.get("level", "")).strip()
@@ -203,9 +252,48 @@ def job_status_color(status: Any) -> str:
     return ""
 
 
+def format_size(nbytes: float | None) -> str:
+    """A file size with the unit chosen to fit: ``512 B``, ``1.1 MiB``."""
+    if nbytes is None:
+        return "—"
+    value = float(nbytes)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if abs(value) < 1024:
+            return f"{int(value)} B" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TiB"
+
+
+def format_age(seconds: float) -> str:
+    """A duration in its two largest units: ``45s``, ``12m 5s``, ``2d 3h``."""
+    total = max(0, int(seconds))
+    days, rest = divmod(total, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, secs = divmod(rest, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def local_clock(epoch: float | None = None) -> str:
+    """Local ``HH:MM:SS`` with the time zone, e.g. ``14:03:07 PDT``."""
+    stamp = datetime.now().astimezone() if epoch is None else datetime.fromtimestamp(epoch).astimezone()
+    return stamp.strftime("%H:%M:%S %Z").strip()
+
+
+def parse_api_time(raw: Any) -> float | None:
+    """Epoch seconds for an ISO-8601 API time such as ``state_changed_at``."""
+    epoch = _created_epoch(raw)
+    return None if epoch == float("-inf") else epoch
+
+
 def format_created_at(raw: Any) -> str:
     """Render an ISO-8601 created_at (e.g. ``2026-06-13T18:49:54Z``) as local
-    ``YYYY-MM-DD HH:MM``. Returns ``""`` for missing/unparseable values."""
+    ``YYYY-MM-DD HH:MM TZ``. Returns ``""`` for missing/unparseable values."""
     if not raw:
         return ""
     s = str(raw).strip()
@@ -217,7 +305,7 @@ def format_created_at(raw: Any) -> str:
         return ""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M %Z").strip()
 
 
 def _created_epoch(raw: Any) -> float:
@@ -375,15 +463,20 @@ _LEVELS = {
 
 
 def entry_at_level(entry: Any, min_level: Any) -> bool:
-    """Whether a structured entry is at or above min_level. Entries without a
-    parseable level (raw stdout lines) always pass, so the filter only trims
-    lower-severity *structured* logs and never hides raw output."""
+    """Whether an entry is at or above min_level. A raw line's level comes from
+    its JSON ``level`` field or a leading level word (see :func:`line_level`).
+    Entries without a parseable level always pass, so the filter only trims
+    lower-severity logs and never hides other output."""
     if not min_level:
         return True
     floor = _LEVELS.get(str(min_level).upper())
     if floor is None:
         return True
-    lvl = entry.get("level") if isinstance(entry, dict) else None
+    lvl = None
+    if isinstance(entry, dict):
+        lvl = entry.get("level")
+        if not lvl and "_raw" in entry:
+            lvl = line_level(split_runtime_time(str(entry["_raw"]))[1])
     if not lvl:
         return True
     return _LEVELS.get(str(lvl).upper(), 0) >= floor

@@ -251,6 +251,18 @@ The general request path retries connection/time-out failures and HTTP:
 
 Redirects are never followed; a 307 or 308 is retried on the original URL.
 
+A 404 is retried because a job can be briefly invisible right after it is
+created. Two 404s are not retried, so they fail at once:
+
+- A 404 whose body has error code `517601` ("Training job ... not found"),
+  unless this client created that job in the last 120 seconds. A mistyped job
+  id therefore fails immediately instead of after the full backoff.
+- A `tail-logs` 404 or 410 for a job that has ended, or for a `sub_job_id` that
+  is not one of the job's sub-jobs (see [section 7.8](#78-tail-logs)).
+
+A 404 without a service error code, such as one from a gateway, is still
+retried.
+
 Capacity is the exception: it is attempted once with the shorter bounds
 documented in [section 5.4](#54-capacity---get-capacity).
 
@@ -1501,14 +1513,35 @@ Response:
 
 ```json
 {
-  "entries": [],
+  "entries": [
+    {"_raw": "2026-01-01T00:00:00.123456789Z first line of output"},
+    {"_raw": "2026-01-01T00:00:00.123498765Z {\"ts\": \"...\", \"level\": \"INFO\", \"msg\": \"...\"}"}
+  ],
   "next_cursor": "cursor-1",
-  "eof": true
+  "eof": false
 }
 ```
 
-`stream_logs()` repeatedly calls this operation. With `follow=False`, it stops
-at an empty EOF page; with `follow=True`, it keeps polling.
+Each entry is `{"_raw": "<time> <line>"}`: the RFC 3339 time (nanosecond
+precision, UTC) at which the container runtime received the line, one space,
+then the line exactly as the process printed it. A line the process printed as
+JSON stays a JSON string inside `_raw`; the saved console from
+[section 12.3](#123-persisted-stdout-download) has the same lines without the
+leading time. A page holds at most 2000 entries or 256 KiB. `cursor` omitted
+with `max_lines` set returns the newest `max_lines` lines; `cursor` omitted
+without `max_lines` reads from the start.
+
+The server currently reports `eof: false` for as long as the pod exists, so do
+not wait for `eof: true`. `stream_logs()` repeatedly calls this operation: with
+`follow=False` it stops at the first empty page, once it has caught up with the
+log; with `follow=True` it keeps polling.
+
+A finished job's pods are gone, so `tail-logs` answers 404 or 410. The client
+then reads the job once and, if it has ended, raises at once with a pointer to
+the saved console (`cortex-training download-log JOB_ID --log-type stdout`, or
+`download_stdout_logs()`). A `sub_job_id` that is not one of the job's
+sub-jobs also fails at once and lists the job's sub-jobs. A job that is still
+starting keeps the normal retries.
 
 ### 7.9 Unsupported zone-events client helper
 
@@ -2211,7 +2244,45 @@ serve empty, non-EOF pages during placement while the pod is still appearing.
 
 ### 12.2 Full execution-log download
 
-`fetch_execution_logs(job_id)`:
+`download_execution_logs(job_id, output_dir, *, resume=False, sub_job_ids=None,
+progress=None, transfer_timeout_seconds=300)` saves every file below a
+`/_logs/{sub_job_id}/` subtree to `<output_dir>/<sub_job_id>/<filename>`
+without holding it in memory. Each file is downloaded into a hidden
+`.execution-log-*.tmp` directory beside its destination, made readable only by
+its owner (mode `0600`), and then moved into place, so an interrupted download
+leaves any earlier copy as it was. A file present under both `_logs/` and
+`checkpoints/_logs/` keeps the `_logs/` copy.
+
+A staged execution-log file is replaced as a whole while the job runs, and
+`GET` cannot fetch part of one. With `resume=True`, a file whose staged size and
+checksum (from `LIST`) match those recorded beside the earlier copy, in
+`.<filename>.artifact.json`, is not fetched again; a changed file is
+downloaded in full. `transfer_timeout_seconds` bounds each `GET` attempt and is
+raised for a large file to its size at 512 KiB/s. `progress` receives one
+status line per file, ending in `"\n"`, in the same form as for persisted
+stdout. A name in `sub_job_ids` with no execution logs raises
+`NoChunksError`, which lists the sub-jobs that have some.
+
+Return:
+
+```python
+[
+    {
+        "sub_job_id": "job-id:training:0",
+        "filename": "execution.jsonl",
+        "artifact_uri": "snow://experiment/DB.SCHEMA.EXPERIMENT/versions/RUN/_logs/job-id:training:0/execution.jsonl",
+        "saved_path": "/path/to/output/job-id:training:0/execution.jsonl",
+        "bytes": 309000000,
+        "unchanged": False,
+    }
+]
+```
+
+`unchanged` is `True` when `resume` kept the earlier copy.
+
+`fetch_execution_logs(job_id)` returns the same files with their bodies in
+memory. An execution log can be hundreds of megabytes, so prefer
+`download_execution_logs()` for anything but small jobs. It:
 
 1. Calls `GET /{job_id}/experiment-run`.
 2. For profile clients, opens an independent connection from the same
@@ -2361,6 +2432,18 @@ with `chunk_count` 0,
 `saved_path`, `first_artifact_uri`, and `last_artifact_uri` set to `null`, and a
 warning that metric uploads may be stalled. Such a sub-job may be named in `sub_job_ids` without an error.
 
+For a job that has ended, each sub-job with stdout chunks but no metrics
+chunks gets the same kind of entry, with a warning that no GPU metrics were
+saved for it: jobs that ran on images from before GPU metrics were uploaded, or
+that ended before their first metrics upload, have none. An empty result is
+therefore never silent about a sub-job that has output.
+
+While a job is running, and for 120 seconds after it ends (judged from
+`state_changed_at`), its last chunks may still be arriving. A stdout or
+metrics download in that window gets a warning per sub-job saying so; download
+again with `resume=True` a minute or two later to pick them up. These job
+lookups are skipped when `stale_after_seconds` is `None`.
+
 The reconstructed file contains the JSONL records emitted by the deployed
 training runtime. Version 2 GPU rows have no `kind` field and include:
 
@@ -2385,8 +2468,23 @@ training runtime. Version 2 GPU rows have no `kind` field and include:
 One row represents one GPU at one scrape. Gauge values are used as-is rather
 than differenced. JSON `null` means unmeasured and is distinct from `0.0`.
 `global_gpu_index` is unique only inside a sub-job, so consumers loading more
-than one file also group by `sub_job_id`. A future mixed stream can distinguish
-GPU rows with `kind: "gpu"`; consumers should ignore kinds they do not support.
+than one file also group by `sub_job_id`.
+
+The same file also carries one host row per worker per scrape, with
+`"kind": "system"` and `record_version` `3`:
+
+| Field | Meaning |
+|---|---|
+| `kind` | `"system"` |
+| `record_version` | `3` |
+| `sub_job_id`, `sample_ts`, `worker_num`, `seq`, `seq_epoch`, `sample_interval_s` | As for GPU rows |
+| `cpu_util_pct` | Host CPU utilization percentage gauge |
+| `cpu_count` | Logical CPUs on the host |
+| `mem_used_bytes` / `mem_total_bytes` | Host memory in use and installed |
+
+A row without `kind` is a GPU row; a later GPU row may carry `kind: "gpu"`.
+Consumers should select rows by `kind` and ignore kinds they do not support.
+The TUI's Resource tab uses GPU rows only.
 
 ### 12.5 Zone scheduling events
 

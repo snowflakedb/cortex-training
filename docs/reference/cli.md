@@ -601,15 +601,26 @@ Pull every log file the job's experiment run produced. Each sub-job's
 
 ```bash
 cortex-training download-log JOB_ID --output-dir /path/to/dir
+cortex-training download-log JOB_ID --output-dir /path/to/dir --resume
 ```
 
 Files are written as `<output_dir>/<sub_job_id>/<filename>` so siblings
-do not collide. When `--output-dir` is omitted, the current working
-directory is used instead. The CLI also prints a JSON summary listing
-each `saved_path`.
+do not collide, readable only by you. When `--output-dir` is omitted, the
+current working directory is used instead. Each file goes straight to disk, so
+a large log does not need as much memory, and replaces the earlier copy only
+once it is complete. Progress is one line per file on stderr. The CLI also
+prints a JSON summary listing each `saved_path` and its `bytes`.
 
-Programmatic access is `CortexTrainingClient.fetch_execution_logs(job_id)`,
-which returns a list of `{sub_job_id, filename, artifact_uri, content}` dicts.
+A running job rewrites its execution log as a whole, so a file cannot be
+fetched in part. `--resume` skips a file whose size and checksum are unchanged
+since the last download into that directory (`unchanged: true` in the summary)
+and downloads a changed file in full. `--sub-job SUB_JOB_ID` (repeatable)
+limits the download, and `--transfer-timeout SECONDS` bounds each file's
+fetch, raised for a large file to allow 512 KiB/s.
+
+Programmatic access is `CortexTrainingClient.download_execution_logs(job_id,
+output_dir)`. `fetch_execution_logs(job_id)` returns
+`{sub_job_id, filename, artifact_uri, content}` dicts with every body in memory.
 
 ### Download Persisted Stdout
 
@@ -629,8 +640,8 @@ runs, with or without `--resume`, so after an interruption rerun the same
 command with `--resume` to fetch only the remaining chunks. A run without
 `--resume` starts over.
 
-Chunks are fetched concurrently; `--parallel N` sets how many at once (default
-16) and output is still written in chunk order. `--sub-job SUB_JOB_ID`
+Chunks are fetched concurrently; `--parallel N` sets how many at once (1 to
+128, default 16) and output is still written in chunk order. `--sub-job SUB_JOB_ID`
 (repeatable) limits the download to those sub-jobs; naming a sub-job with no
 stdout chunks is an error. Transient connection and service errors are retried
 with backoff, and an expired session is reopened. A single fetch or listing
@@ -653,15 +664,18 @@ keeps a skipped chunk skipped; a run without `--resume` tries it again.
 sub-job is also listed in its `warnings` field in the JSON summary.
 
 While the job and that sub-job are running, a sub-job whose newest saved chunk
-is more than `--stale-after-minutes` old (default 10; `0` turns this off) gets
-a warning that uploads may be stalled. Chunk times come from the chunk names
-and are UTC, and are compared with the service's clock when it reports one.
-A job that prints nothing for a while also produces this warning for stdout.
-The download itself still completes.
+is more than `--stale-after-minutes` old (default 10) gets a warning that
+uploads may be stalled. Chunk times come from the chunk names and are UTC, and
+are compared with the service's clock when it reports one. A job that prints
+nothing for a while also produces this warning for stdout. For two minutes
+after a job ends, each sub-job gets a warning that its last chunks may still be
+uploading; run the command again with `--resume` shortly afterwards to pick
+them up. These checks read the job's status once, alongside the download;
+`--stale-after-minutes 0` turns them all off. The download itself still
+completes.
 
-`--resume`, `--parallel`, `--sub-job`, `--strict`, `--stale-after-minutes`, and
-`--transfer-timeout` do not apply to execution logs,
-including `download-log` without `--log-type stdout`. Two downloads of the same
+`--parallel`, `--strict`, and `--stale-after-minutes` do not apply to
+execution logs, including `download-log` without `--log-type stdout`. Two downloads of the same
 directory at once are unsupported. If the TUI is downloading into the same
 directory (its cache, as named in a skipped-chunk warning), the command stops
 with an error instead of writing alongside it.
@@ -684,7 +698,9 @@ progress on stderr, and Ctrl-C behave as for
 [persisted stdout](#download-persisted-stdout). While the job is running, a
 sub-job that has saved stdout but no GPU metrics is also listed, with
 `chunk_count` 0, `saved_path` `null`, and a warning that metric uploads may be
-stalled. Two downloads of the same directory at once are unsupported; a TUI
+stalled. After the job has ended, such a sub-job is listed the same way with a
+warning that no GPU metrics were saved for it (for example, because the job ran
+on an image from before GPU metrics were uploaded). Two downloads of the same directory at once are unsupported; a TUI
 download of the same directory is refused as for stdout.
 
 ### Job TUI
@@ -747,11 +763,20 @@ chunks, or uploads that look stalled while the job runs) appear on the status
 line, and on the Resource tab, for the selected sub-job. The TUI always
 resumes, so it keeps a skipped chunk skipped; its warning names the
 `download-log --log-type stdout` or `download-metrics` command, with
-`--sub-job` and `--output-dir` set to the TUI's cache, that retries it. The stalled-upload check runs on at most one GPU
-metrics refresh per job every five minutes (a refresh that fails does not
-count). A
-stream error while the job is still running stays an error. The level key
-filters structured live lines and does not hide lines from that saved console.
+`--sub-job` and `--output-dir` set to the TUI's cache, that retries it. The
+stalled-upload check runs on at most one GPU metrics refresh per job every five
+minutes (a refresh that fails does not count). For two minutes after a job
+ends, the status line also says its last output may still be uploading; `r`
+fetches what has arrived since. A stream error while the job is still running
+stays an error.
+
+Live lines are shown as the process printed them, without the time the server
+adds in front, so they read like the saved console. The level key keeps lines
+at or above the chosen level, judged from a JSON line's `level` field or a
+leading level word such as `WARNING` (as Python logging and vLLM print it);
+lines with no level are always shown. It does not hide lines from the saved
+console. Times in the TUI are local and carry the time zone, while the CLI,
+the JSON output, and chunk names use UTC.
 
 The TUI also writes two files into your home directory: saved logs from the `s`
 key (`~/cortex-training-<job8>-<source>.log`, where `<job8>` is the first eight

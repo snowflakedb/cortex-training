@@ -58,12 +58,16 @@ from cortex_training.client import DownloadCancelled
 from cortex_training.client import NoChunksError
 from cortex_training.tui.format import entry_at_level
 from cortex_training.tui.format import entry_matches
+from cortex_training.tui.format import format_age
 from cortex_training.tui.format import format_job_config
 from cortex_training.tui.format import format_job_row
 from cortex_training.tui.format import format_log_entry
+from cortex_training.tui.format import format_size
 from cortex_training.tui.format import is_active_status
 from cortex_training.tui.format import job_matches
 from cortex_training.tui.format import job_status_color
+from cortex_training.tui.format import local_clock
+from cortex_training.tui.format import parse_api_time
 from cortex_training.tui.format import sort_jobs
 from cortex_training.tui.format import source_label
 from cortex_training.tui.format import wrap_log_line
@@ -242,7 +246,7 @@ class JobListScreen(Screen):
             lv.append(ListItem(Label(f"[error] {error}")))
             return
         self._all_jobs = sort_jobs(jobs)
-        self._last_refreshed = time.strftime("%H:%M:%S")
+        self._last_refreshed = local_clock()
         self._update_subtitle()
         await self._render_jobs()
 
@@ -321,6 +325,8 @@ class LogScreen(Screen):
     _SOURCES_MAX = 140
     _SOURCES_STEP = 8
     _LEVEL_CYCLE = [None, "INFO", "WARNING", "ERROR"]
+    # A job's last log and metric chunks can land this long after it ends.
+    _RECENTLY_ENDED_SECONDS = 120
 
     def __init__(self, client, job_id, *, sub_job_id=None, poll_interval=1.0, job_status=None):
         super().__init__()
@@ -340,7 +346,8 @@ class LogScreen(Screen):
         self._current_source = None  # source currently being tailed
         self._shown_lines: list[str] = []  # unwrapped lines on screen (for re-wrap)
         self._wrap_width = -1  # content width the buffer is wrapped to
-        self._last_update = None  # local HH:MM:SS of the last live line
+        self._last_update = None  # local time of the last live line
+        self._ended_at: float | None = None  # epoch seconds the job ended, if it has
         self._screen_open = True
         # A finished job's saved console is downloaded (incrementally, with
         # resume) into the shared per-job cache, so reopening reuses it.
@@ -499,6 +506,11 @@ class LogScreen(Screen):
             bits.append("PAUSED")
         if self._last_update:
             bits.append(f"updated {self._last_update}")
+        ended_for = None if self._ended_at is None else time.time() - self._ended_at
+        if ended_for is not None and ended_for < self._RECENTLY_ENDED_SECONDS:
+            bits.append(
+                f"ended {format_age(ended_for)} ago; its last output may still be uploading (r refreshes)"
+            )
         if self._stdout_status:
             bits.append(self._stdout_status)
         elif self._stdout_error:
@@ -733,7 +745,7 @@ class LogScreen(Screen):
             f"{view.gpu_count} GPU(s)",
             f"avg {average}",
             f"fb {framebuffer} ({view.fb_gpu_count}/{view.gpu_count} GPUs)",
-            f"last sample {age}s ago",
+            f"last sample {format_age(age)} ago",
         ]
         if ignored:
             bits.append(f"{ignored} unsupported row(s)")
@@ -898,6 +910,7 @@ class LogScreen(Screen):
             self._job_status = job.get("status")
             if not self._resource_range_selected:
                 self._resource_range = "15m" if is_active_status(self._job_status) else "all"
+        self._note_job_end(job)
         if job:
             self._job_reason = job.get("reason")  # clears a stale reason on refresh
             # The summary line is reserved for static config; status/reason go
@@ -1038,7 +1051,7 @@ class LogScreen(Screen):
             last[0] = now
             self._post(
                 self._set_stdout_status,
-                f"saved console: {sub_job_id} {chunks_done}/{chunks_total} chunks, {format_bytes(bytes_done)}",
+                f"saved console: {sub_job_id} {chunks_done}/{chunks_total} chunks, {format_size(bytes_done)}",
             )
 
         return on_chunk
@@ -1187,7 +1200,7 @@ class LogScreen(Screen):
                 lines = tail.lines
                 if tail.truncated:
                     lines = [
-                        f"— showing the end of a {format_bytes(tail.size)} console; "
+                        f"— showing the end of a {format_size(tail.size)} console; "
                         "s saves the full file —"
                     ] + lines
                 empty_note = False
@@ -1201,6 +1214,18 @@ class LogScreen(Screen):
         if not self._screen_open or gen != self._paint_gen:
             return
         self._replace_body(lines, empty_note=empty_note)
+
+    def _note_job_end(self, job: dict) -> None:
+        """Remember when a finished job ended, and refresh the status line once
+        the hint that its last output may still be uploading no longer applies."""
+        status = job.get("status") if isinstance(job, dict) else None
+        if not status or is_active_status(status):
+            return
+        ended_at = parse_api_time(job.get("state_changed_at")) or time.time()
+        self._ended_at = ended_at
+        remaining = self._RECENTLY_ENDED_SECONDS - (time.time() - ended_at)
+        if remaining > 0:
+            self._post(self.set_timer, remaining + 1, self._update_subtitle)
 
     def _apply_terminal_status(self, status: str, reason: str | None) -> None:
         self._job_status = status
@@ -1282,7 +1307,7 @@ class LogScreen(Screen):
             if not self._post(self._write_replay, lines):
                 return
             if kind == "live":
-                self._last_update = time.strftime("%H:%M:%S")
+                self._last_update = local_clock()
                 if not self._post(self._update_subtitle):
                     return
 
@@ -1311,6 +1336,7 @@ class LogScreen(Screen):
         if worker.is_cancelled or not self._screen_open:
             return True
         reason = job.get("reason") if isinstance(job, dict) and "reason" in job else None
+        self._note_job_end({**job, "status": status})
         if not self._post(self._apply_terminal_status, status, reason):
             return True
         self._post(self._resume_after_finish)

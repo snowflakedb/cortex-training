@@ -70,6 +70,7 @@ from pathlib import PurePosixPath
 from typing import Any
 from typing import TypeVar
 from urllib.parse import quote
+from urllib.parse import unquote
 
 from pydantic import BaseModel
 from pydantic import ConfigDict
@@ -171,10 +172,20 @@ def _success_telemetry_enabled(operation: str | None = None) -> bool:
 #                             URL, and `Location` is never followed.
 #   404 Not Found           - a just-created job may not be visible yet, so a
 #                             valid id can 404 briefly and succeed on retry.
-# Note the trade-off on 404: a *mistyped* job id is also retried (up to
-# `max_retries`, with backoff) before the error surfaces. Every other 4xx is
-# excluded because it signals a client/config error that won't fix itself.
+#                             A 404 that names the job as not found (code
+#                             517601) is final unless this client created that
+#                             job moments ago (see `_definitive_not_found`), so
+#                             a mistyped id fails at once. Other 404s, such as
+#                             a gateway's, are still retried.
+# Every other 4xx is excluded because it signals a client/config error that
+# won't fix itself.
 _TRANSIENT_STATUSES = {429, 500, 502, 503, 504, 404, 409, 307, 308}
+_JOB_NOT_FOUND_CODE = "517601"
+# Job states after which a sub-job's pods, and so its live logs, are gone.
+_ENDED_JOB_STATES = frozenset({"failed", "done", "cancelled", "canceled", "terminated"})
+# A job this client created is retried on "not found" for this long, to ride
+# out the service's read-after-create window.
+_RECENTLY_CREATED_SECONDS = 120.0
 _SESSION_EXPIRED_CODES = frozenset({"390111", "390112", "390114"})
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {
@@ -380,6 +391,49 @@ def _is_session_auth_expired_response(response: requests.Response) -> bool:
     return response.status_code == 401 and not structured_code_seen
 
 
+def _format_artifact_bytes(nbytes: int) -> str:
+    """``1.1 MiB``-style size, with the unit chosen to fit."""
+    value = float(nbytes)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024 or unit == "GiB":
+            return f"{int(value)} B" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GiB"
+
+
+def _write_private_json(path: Path, doc: Mapping[str, Any]) -> None:
+    """Atomically replace ``path`` with ``doc`` as JSON, readable only by its owner."""
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + "-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(doc, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _response_error_code(response: requests.Response | None) -> str | None:
+    """The first structured service error code in ``response``'s JSON body."""
+    if response is None:
+        return None
+    try:
+        body = response.json()
+    except Exception:
+        return None
+    for candidate in _iter_error_dicts(body):
+        code = candidate.get("code") or candidate.get("error_code")
+        if code is not None:
+            return str(code)
+    return None
+
+
 def _chunk_group_error_detail(response: requests.Response | None) -> dict | None:
     if response is None:
         return None
@@ -575,15 +629,9 @@ def _metric_error_attributes(exc: BaseException) -> dict[str, Any]:
     status_code = getattr(response, "status_code", None)
     if isinstance(status_code, int):
         attributes["error.http_status"] = status_code
-    try:
-        body = response.json()
-    except Exception:
-        return attributes
-    for candidate in _iter_error_dicts(body):
-        code = candidate.get("code") or candidate.get("error_code")
-        if code is not None:
-            attributes["error.code"] = str(code)
-            break
+    code = _response_error_code(response)
+    if code is not None:
+        attributes["error.code"] = code
     return attributes
 
 
@@ -1769,6 +1817,8 @@ class CortexTrainingClient:
         self._artifact_connection_factory: Callable[[], Any] | None = None
         self._auth_provider: SnowflakeProfileAuth | None = None
         self._db_ensured = False
+        # job_id -> monotonic time this client created it (see _definitive_not_found).
+        self._recently_created_jobs: dict[str, float] = {}
         self._db_creating = False
         # Both are cleared on a for_job() child; see for_job().
         self._owns_session = True
@@ -2275,13 +2325,47 @@ class CortexTrainingClient:
                     raise
                 return resp
 
+        def should_retry(exc: BaseException) -> bool:
+            return retry_on(exc) and not self._definitive_not_found(exc)
+
         retryer = Retrying(
-            retry=retry_if_exception(retry_on),
+            retry=retry_if_exception(should_retry),
             stop=stop_after_attempt(max_attempts),
             wait=wait_exponential_jitter(initial=0.5, max=10.0),
             reraise=True,
         )
         return retryer(attempt)
+
+    def _note_created_job(self, job: Any) -> None:
+        job_id = job.get("job_id") if isinstance(job, dict) else None
+        if isinstance(job_id, str) and job_id:
+            created = self._recently_created_jobs
+            now = time.monotonic()
+            for stale in [jid for jid, at in created.items() if now - at > _RECENTLY_CREATED_SECONDS]:
+                created.pop(stale, None)
+            created[job_id] = now
+
+    def _definitive_not_found(self, exc: BaseException) -> bool:
+        """Whether ``exc`` is the service saying the job does not exist.
+
+        The service names a missing job with code 517601. That answer is final,
+        except for a job this client created within ``_RECENTLY_CREATED_SECONDS``,
+        which may not be visible yet.
+        """
+        if not isinstance(exc, requests.exceptions.HTTPError):
+            return False
+        response = exc.response
+        if response is None or response.status_code != 404:
+            return False
+        if _response_error_code(response) != _JOB_NOT_FOUND_CODE:
+            return False
+        url = unquote(str(getattr(response, "url", "") or ""))
+        created = getattr(self, "_recently_created_jobs", {})
+        now = time.monotonic()
+        return not any(
+            now - at <= _RECENTLY_CREATED_SECONDS and f"/{job_id}" in url
+            for job_id, at in list(created.items())
+        )
 
     # ─── Job management ──────────────────────────────────────────────────
 
@@ -2393,7 +2477,9 @@ class CortexTrainingClient:
                 f"{DEBUG_OPTIONS_ENV}=1 to send a request with a `debug` block"
             )
         resp = self._send("POST", self._prefix, json=body, retry_on=_is_connect_error)
-        return resp.json()
+        job = resp.json()
+        self._note_created_job(job)
+        return job
 
     @staticmethod
     def _normalize_job_status(status) -> str:
@@ -2752,6 +2838,22 @@ class CortexTrainingClient:
         artifact_root: str,
     ) -> list[str]:
         """List safe run-relative file paths below ``artifact_root``."""
+        return sorted(
+            CortexTrainingClient._list_experiment_artifact_files(
+                connection, run_uri, run_name, artifact_root
+            )
+        )
+
+    @staticmethod
+    def _list_experiment_artifact_files(
+        connection: Any,
+        run_uri: str,
+        run_name: str,
+        artifact_root: str,
+    ) -> dict[str, dict[str, Any]]:
+        """Map each safe run-relative path below ``artifact_root`` to what LIST
+        reported about it: ``size``, ``md5`` and ``last_modified`` (``None``
+        when a column is missing)."""
         root = artifact_root.strip("/") + "/"
         _validate_artifact_relative_path(root.removesuffix("/"))
         cursor = connection.cursor()
@@ -2763,7 +2865,7 @@ class CortexTrainingClient:
             cursor.close()
 
         run_prefix = f"/versions/{run_name}/"
-        paths: list[str] = []
+        files: dict[str, dict[str, Any]] = {}
         for row in rows:
             name = row[0] if row else None
             if not isinstance(name, str) or not name.startswith(run_prefix):
@@ -2778,8 +2880,14 @@ class CortexTrainingClient:
                     "experiment artifact LIST returned a file outside the "
                     f"requested root {root!r}: {relative_path!r}"
                 )
-            paths.append(relative_path)
-        return sorted(set(paths))
+            # LIST columns: name, size, md5, last_modified.
+            size = row[1] if len(row) > 1 and isinstance(row[1], int) and not isinstance(row[1], bool) else None
+            files[relative_path] = {
+                "size": size,
+                "md5": str(row[2]) if len(row) > 2 and row[2] else None,
+                "last_modified": str(row[3]) if len(row) > 3 and row[3] else None,
+            }
+        return files
 
     @staticmethod
     def _download_experiment_artifact(
@@ -2912,8 +3020,221 @@ class CortexTrainingClient:
     # A single LIST or GET attempt that runs longer than this is abandoned and
     # retried. A chunk GET normally takes well under a second.
     _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS = 300.0
+    # An execution-log GET may take at least its size at this rate before the
+    # transfer timeout gives up on it.
+    _EXECUTION_LOG_MIN_BYTES_PER_SECOND = 512 * 1024
     _wall_clock = staticmethod(time.time)
     _artifact_retry_policy = _artifact_download.RetryPolicy()
+
+    @staticmethod
+    def _execution_log_target(job_id: str, relative_path: str) -> tuple[str, str] | None:
+        """``(sub_job_id, filename)`` for an execution log path of ``job_id``, else None."""
+        for root in ("_logs/", "checkpoints/_logs/"):
+            if relative_path.startswith(root):
+                after_logs = relative_path.removeprefix(root)
+                break
+        else:
+            return None
+        sub_job_id, separator, filename = after_logs.partition("/")
+        if (
+            not separator
+            or not filename
+            or not (sub_job_id == job_id or sub_job_id.startswith(f"{job_id}:"))
+            or sub_job_id in {".", ".."}
+            or "\\" in sub_job_id
+        ):
+            return None
+        return sub_job_id, filename
+
+    @staticmethod
+    def _execution_log_identity(listed: Mapping[str, Any], artifact_uri: str) -> dict[str, Any] | None:
+        """What identifies one version of a staged log file, if LIST reported enough."""
+        if listed.get("size") is None or not (listed.get("md5") or listed.get("last_modified")):
+            return None
+        return {
+            "artifact_uri": artifact_uri,
+            "size": listed["size"],
+            "md5": listed.get("md5"),
+            "last_modified": listed.get("last_modified"),
+        }
+
+    @_track_operation("download_execution_logs")
+    def download_execution_logs(
+        self,
+        job_id: str,
+        output_dir: str | os.PathLike[str],
+        *,
+        resume: bool = False,
+        sub_job_ids: Iterable[str] | None = None,
+        progress: Callable[[str], None] | None = None,
+        transfer_timeout_seconds: float | None = _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS,
+    ) -> list[dict[str, Any]]:
+        """Save every execution log file to ``<output_dir>/<sub_job_id>/<filename>``.
+
+        Unlike :meth:`fetch_execution_logs`, file bodies are never held in
+        memory: each file is downloaded straight to disk, made readable only by
+        its owner (mode 0600), and then moved into place, so an interrupted
+        download leaves the previous copy untouched. A path present under both
+        ``_logs/`` and ``checkpoints/_logs/`` keeps the ``_logs/`` copy.
+
+        With ``resume=True`` a file whose staged size and checksum match the
+        copy saved by an earlier download is not fetched again. A staged log
+        file is replaced as a whole when it changes, so a changed file is
+        downloaded in full.
+
+        ``transfer_timeout_seconds`` bounds each GET attempt, raised for a large
+        file to its size at 512 KiB/s. ``progress`` gets one status line per
+        file, ending in ``"\\n"``. Each
+        result is ``{"sub_job_id", "filename", "artifact_uri", "saved_path",
+        "bytes", "unchanged"}``, where ``unchanged`` means resume kept the saved
+        copy.
+        """
+        if isinstance(sub_job_ids, (str, bytes)):
+            raise TypeError("sub_job_ids must be an iterable of sub-job ids, not a single string")
+        wanted = None if sub_job_ids is None else set(sub_job_ids)
+        if wanted is not None and not wanted:
+            raise ValueError("sub_job_ids must name at least one sub-job")
+        if transfer_timeout_seconds is not None and (
+            isinstance(transfer_timeout_seconds, bool)
+            or not isinstance(transfer_timeout_seconds, (int, float))
+            or not transfer_timeout_seconds > 0
+        ):
+            raise ValueError("transfer_timeout_seconds must be a positive number or None")
+        run_uri, run_name = self._experiment_run_uri(job_id)
+        root = Path(output_dir).expanduser()
+        shared = _artifact_download.SharedConnection(
+            self._open_experiment_artifact_connection, transfer_timeout_seconds
+        )
+        policy = self._artifact_retry_policy
+        try:
+            targets: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
+            # "_logs/" last, so its copy wins over "checkpoints/_logs/".
+            for artifact_root in ("checkpoints/_logs", "_logs"):
+                listed = _artifact_download.call_with_retry(
+                    shared,
+                    policy,
+                    f"LIST {artifact_root}",
+                    lambda connection, artifact_root=artifact_root: (
+                        self._list_experiment_artifact_files(
+                            connection, run_uri, run_name, artifact_root
+                        )
+                    ),
+                )
+                for relative_path, info in listed.items():
+                    target = self._execution_log_target(job_id, relative_path)
+                    if target is not None:
+                        targets[target] = (relative_path, info)
+            if wanted is not None:
+                found = {sub_job_id for sub_job_id, _ in targets}
+                targets = {key: value for key, value in targets.items() if key[0] in wanted}
+                missing = sorted(wanted - found)
+                if missing:
+                    raise NoChunksError(
+                        f"no execution logs for sub-job(s) {', '.join(missing)}; "
+                        f"sub-jobs with execution logs: {', '.join(sorted(found)) or 'none'}",
+                        sub_job_ids=missing,
+                        available=sorted(found),
+                    )
+            if not targets:
+                self._report_artifact_progress(progress, "execution logs: found 0 files\n")
+            results = []
+            for (sub_job_id, filename), (relative_path, info) in sorted(targets.items()):
+                results.append(
+                    self._save_execution_log(
+                        shared,
+                        run_uri,
+                        relative_path,
+                        info,
+                        root / sub_job_id / filename,
+                        sub_job_id=sub_job_id,
+                        resume=resume,
+                        progress=progress,
+                    )
+                )
+            return results
+        finally:
+            shared.close()
+
+    def _save_execution_log(
+        self,
+        shared: _artifact_download.SharedConnection,
+        run_uri: str,
+        relative_path: str,
+        listed: Mapping[str, Any],
+        destination: Path,
+        *,
+        sub_job_id: str,
+        resume: bool,
+        progress: Callable[[str], None] | None,
+    ) -> dict[str, Any]:
+        artifact_uri = run_uri + relative_path
+        manifest_path = destination.with_name("." + destination.name + ".artifact.json")
+        identity = self._execution_log_identity(listed, artifact_uri)
+        label = f"execution logs: {sub_job_id}/{destination.name}"
+        result = {
+            "sub_job_id": sub_job_id,
+            "filename": destination.name,
+            "artifact_uri": artifact_uri,
+            "saved_path": str(destination),
+        }
+        if resume and identity is not None:
+            try:
+                saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+                size = destination.stat().st_size
+            except (OSError, ValueError):
+                saved, size = None, None
+            if saved == identity and size == identity["size"]:
+                self._report_artifact_progress(progress, f"{label}: unchanged\n")
+                return {**result, "bytes": size, "unchanged": True}
+        expected = "" if listed.get("size") is None else f" ({_format_artifact_bytes(listed['size'])})"
+        with self._artifact_progress_line(progress):
+            self._report_artifact_progress(progress, f"{label}: downloading{expected}")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            self._remove_orphan_execution_log_spools(destination.parent)
+            spool = Path(tempfile.mkdtemp(prefix=".execution-log-", suffix=".tmp", dir=destination.parent))
+            # One file can be hundreds of MB: allow its GET time in proportion.
+            base_timeout = shared.transfer_timeout
+            if base_timeout is not None and listed.get("size"):
+                shared.transfer_timeout = max(base_timeout, listed["size"] / self._EXECUTION_LOG_MIN_BYTES_PER_SECOND)
+            try:
+                downloaded = _artifact_download.call_with_retry(
+                    shared,
+                    self._artifact_retry_policy,
+                    f"GET {relative_path}",
+                    lambda connection: self._fetch_execution_log(connection, run_uri, relative_path, spool),
+                )
+                os.chmod(downloaded, 0o600)
+                manifest_path.unlink(missing_ok=True)
+                os.replace(downloaded, destination)
+            finally:
+                shared.transfer_timeout = base_timeout
+                shutil.rmtree(spool, ignore_errors=True)
+            size = destination.stat().st_size
+            if identity is not None and size == identity["size"]:
+                _write_private_json(manifest_path, identity)
+            self._report_artifact_progress(progress, f"{label}: saved {_format_artifact_bytes(size)}")
+        return {**result, "bytes": size, "unchanged": False}
+
+    @classmethod
+    def _remove_orphan_execution_log_spools(cls, directory: Path) -> None:
+        """Delete download directories a killed execution-log download left behind."""
+        cutoff = time.time() - cls._TEMP_ORPHAN_MIN_AGE_SECONDS
+        for path in directory.glob(".execution-log-*.tmp"):
+            try:
+                if path.is_dir() and path.stat().st_mtime < cutoff:
+                    shutil.rmtree(path)
+                    logger.info("removed leftover temporary directory %s", path)
+            except OSError:
+                logger.debug("could not remove leftover temporary directory %s", path, exc_info=True)
+
+    def _fetch_execution_log(self, connection: Any, run_uri: str, relative_path: str, spool: Path) -> Path:
+        """One GET attempt into a fresh directory under ``spool``."""
+        target = Path(tempfile.mkdtemp(prefix="get-", dir=spool))
+        try:
+            return self._download_experiment_artifact(connection, run_uri, relative_path, target)
+        except BaseException:
+            shutil.rmtree(target, ignore_errors=True)
+            raise
 
     @staticmethod
     def _resume_manifest_path(destination: Path) -> Path:
@@ -3454,6 +3775,9 @@ class CortexTrainingClient:
     # Allowance for a local clock behind the server's when deciding whether the
     # job status is worth fetching; the decision itself uses the server's clock.
     _STALE_PRECHECK_SKEW_SECONDS = 300.0
+    # A job's last chunks can land this long after it ends; a download in that
+    # window says so.
+    _RECENTLY_ENDED_SECONDS = 120.0
 
     def _job_for_upload_warnings(self, job_id: str) -> tuple[dict, float | None]:
         """Return the job and the server's clock (from the ``Date`` header), if any."""
@@ -3514,6 +3838,10 @@ class CortexTrainingClient:
         does not report sub-job status, the job) is ``running``, and only once
         it has been running long enough for the sign to mean anything. Ages
         use the server's clock when the response carries one.
+
+        For metrics of a job that has ended, a sub-job with saved stdout but no
+        metrics gets a warning saying why there may be none, so an empty
+        result is not silent.
         """
         if stale_after_seconds is None:
             return {}
@@ -3528,14 +3856,32 @@ class CortexTrainingClient:
             ):
                 candidates[sub_job_id] = newest
         check_missing = artifact_name == "metrics"
-        if not candidates and not check_missing:
+        # A chunk this recent means the job may have only just ended.
+        recent_cutoff = local_now - self._RECENTLY_ENDED_SECONDS - self._STALE_PRECHECK_SKEW_SECONDS
+        recently_active = any(
+            (stamp := self._chunk_time(chunk_pattern, paths[-1])) is not None and stamp >= recent_cutoff
+            for sub_job_id, paths in chunks_by_sub_job.items()
+            if paths and (wanted is None or sub_job_id in wanted)
+        )
+        if not candidates and not check_missing and not recently_active:
             return {}
         try:
             job, server_now = self._job_for_upload_warnings(job_id)
         except Exception:
             logger.debug("job status lookup for upload warnings failed", exc_info=True)
             return {}
-        if self._normalize_job_status(job.get("status")) != "running":
+        status = self._normalize_job_status(job.get("status"))
+        if status in _ENDED_JOB_STATES:
+            warnings = self._recently_ended_warnings(
+                job, local_now if server_now is None else server_now, artifact_name, chunks_by_sub_job, wanted
+            )
+            if check_missing:
+                for sub_job_id, messages in self._ended_without_metrics_warnings(
+                    shared, run_uri, run_name, job_id, chunks_by_sub_job, wanted
+                ).items():
+                    warnings.setdefault(sub_job_id, []).extend(messages)
+            return warnings
+        if status != "running":
             return {}
         now = local_now if server_now is None else server_now
         # When the job entered its current state; absent on older services.
@@ -3604,6 +3950,62 @@ class CortexTrainingClient:
         for messages in warnings.values():
             for message in messages:
                 logger.warning(message)
+        return warnings
+
+    def _recently_ended_warnings(
+        self,
+        job: Mapping[str, Any],
+        now: float,
+        artifact_name: str,
+        chunks_by_sub_job: Mapping[str, list[str]],
+        wanted: set[str] | None,
+    ) -> dict[str, list[str]]:
+        """Say that a job that ended moments ago may still be uploading."""
+        ended_at = self._parse_api_time(job.get("state_changed_at"))
+        if ended_at is None or now - ended_at >= self._RECENTLY_ENDED_SECONDS:
+            return {}
+        label = "stdout output" if artifact_name == "stdout" else "GPU metrics"
+        warnings: dict[str, list[str]] = {}
+        for sub_job_id in sorted(chunks_by_sub_job):
+            if wanted is not None and sub_job_id not in wanted:
+                continue
+            message = (
+                f"the job ended {max(0, int(now - ended_at))}s ago, so the last {label} for "
+                f"{sub_job_id} may still be uploading; download again with resume in a "
+                "minute or two to pick it up."
+            )
+            logger.warning(message)
+            warnings[sub_job_id] = [message]
+        return warnings
+
+    def _ended_without_metrics_warnings(
+        self,
+        shared: _artifact_download.SharedConnection,
+        run_uri: str,
+        run_name: str,
+        job_id: str,
+        metrics_by_sub_job: Mapping[str, list[str]],
+        wanted: set[str] | None,
+    ) -> dict[str, list[str]]:
+        """Explain each sub-job of an ended job that saved stdout but no metrics."""
+        try:
+            stdout_chunks, _ = self._list_gzip_chunks(
+                shared, run_uri, run_name, job_id, "stdout", _STDOUT_CHUNK_RE, report_merges=False
+            )
+        except Exception:
+            logger.debug("stdout listing for missing-metrics warnings failed", exc_info=True)
+            return {}
+        warnings: dict[str, list[str]] = {}
+        for sub_job_id in sorted(stdout_chunks):
+            if sub_job_id in metrics_by_sub_job or (wanted is not None and sub_job_id not in wanted):
+                continue
+            message = (
+                f"no GPU metrics were saved for {sub_job_id}, although its stdout output "
+                "was. Jobs that ran on images from before GPU metrics were uploaded, or "
+                "that ended before their first metrics upload, have none."
+            )
+            logger.warning(message)
+            warnings[sub_job_id] = [message]
         return warnings
 
     def _download_gzip_artifacts(
@@ -4910,19 +5312,83 @@ class CortexTrainingClient:
         ``sub_job_id`` (or ``sub_job_type`` when unambiguous). Returns
         ``{"entries": [...], "next_cursor": str, "eof": bool}``. Re-call with
         ``next_cursor`` to continue; an empty ``cursor`` reads from the start.
+
+        A finished job's pods are gone, so this raises at once, with a pointer
+        to :meth:`download_stdout_logs` for the saved console; so does a
+        ``sub_job_id`` that is not part of the job.
         """
         payload: dict = {}
         if cursor is not None:
             payload["cursor"] = cursor
         if max_lines is not None:
             payload["max_lines"] = max_lines
-        return self._operation(
-            job_id,
-            "tail-logs",
-            payload=payload,
-            sub_job_id=sub_job_id,
-            sub_job_type=sub_job_type,
-        )
+        checked: dict[str, Any] = {}
+
+        def retry_on(exc: BaseException) -> bool:
+            return _is_transient(exc) and self._tail_hint(exc, job_id, sub_job_id, checked) is None
+
+        try:
+            return self._operation(
+                job_id,
+                "tail-logs",
+                payload=payload,
+                sub_job_id=sub_job_id,
+                sub_job_type=sub_job_type,
+                retry_on=retry_on,
+            )
+        except requests.exceptions.HTTPError as exc:
+            hint = self._tail_hint(exc, job_id, sub_job_id, checked)
+            if hint is None:
+                raise
+            raise requests.exceptions.HTTPError(
+                f"{exc}. {hint}", response=exc.response, request=exc.request
+            ) from exc
+
+    def _tail_hint(
+        self,
+        exc: BaseException,
+        job_id: str,
+        sub_job_id: str | None,
+        checked: dict[str, Any],
+    ) -> str | None:
+        """Explain a tail-logs failure that no retry can fix, else ``None``.
+
+        A 404 or 410 from tail-logs means the sub-job's session is not there.
+        The job is looked up once per call: if it has ended, its live logs are
+        gone; if ``sub_job_id`` is not one of its sub-jobs, it never had any.
+        Otherwise (for example, a job still starting) the error stays retryable.
+        """
+        if not isinstance(exc, requests.exceptions.HTTPError):
+            return None
+        response = exc.response
+        if response is None or response.status_code not in (404, 410):
+            return None
+        if _response_error_code(response) == _JOB_NOT_FOUND_CODE:
+            return None
+        if "job" not in checked:
+            try:
+                checked["job"] = self.get_job(job_id)
+            except Exception:
+                logger.debug("job lookup for a tail-logs error failed", exc_info=True)
+                checked["job"] = None
+        job = checked["job"]
+        if not isinstance(job, dict):
+            return None
+        status = self._normalize_job_status(job.get("status"))
+        if status in _ENDED_JOB_STATES:
+            return (
+                f"Job {job_id} is {status}, so its live logs are gone. Download the "
+                f"saved console with `cortex-training download-log {job_id} --log-type "
+                "stdout` (SDK: download_stdout_logs)"
+            )
+        known = [
+            str(sub.get("sub_job_id") or sub.get("id"))
+            for sub in job.get("sub_jobs") or []
+            if isinstance(sub, dict) and (sub.get("sub_job_id") or sub.get("id"))
+        ]
+        if sub_job_id and known and sub_job_id not in known:
+            return f"Sub-job {sub_job_id} is not part of job {job_id}; its sub-jobs are: {', '.join(known)}"
+        return None
 
     def _stream_pages(
         self,
@@ -4935,7 +5401,7 @@ class CortexTrainingClient:
     ) -> Iterator[dict]:
         """Drive a cursor-paged tail: call ``fetch(cursor)`` for a page, yield
         its entries (under ``entries_key``), advance the cursor, and poll with
-        backoff. With ``follow`` False, stop once a page reports ``eof``.
+        backoff. With ``follow`` False, stop at the first empty page.
         """
         base_delay = poll_interval or self.poll_interval
         delay = base_delay
@@ -4948,7 +5414,10 @@ class CortexTrainingClient:
             if entries:
                 delay = base_delay  # made progress; poll again promptly
                 continue
-            if page.get("eof", False) and not follow:
+            # An empty page means the reader has caught up. Without follow,
+            # stop there: some log backends never report eof while the
+            # source still exists.
+            if not follow:
                 return
             time.sleep(delay)
             delay = min(delay * self.poll_backoff_multiplier, self.poll_max_interval)
@@ -4968,7 +5437,8 @@ class CortexTrainingClient:
 
         Drains the log then, with ``follow=True`` (the default), keeps polling
         for new entries until the caller stops iterating — suitable for a live
-        tail. With ``follow=False`` it stops once the log reports ``eof``.
+        tail. With ``follow=False`` it stops at the first empty page, once it
+        has caught up with the log (whether or not the server reports ``eof``).
         """
         return self._stream_pages(
             lambda cur: self.tail_logs(

@@ -218,6 +218,44 @@ class FakeClient:
             },
         ]
 
+    def download_execution_logs(
+        self,
+        job_id,
+        output_dir,
+        *,
+        resume=False,
+        sub_job_ids=None,
+        progress=None,
+        transfer_timeout_seconds=300.0,
+    ):
+        self.execution_log_options = {
+            "output_dir": output_dir,
+            "resume": resume,
+            "sub_job_ids": sub_job_ids,
+            "transfer_timeout_seconds": transfer_timeout_seconds,
+        }
+        saved = []
+        for log in self.fetch_execution_logs(job_id):
+            if sub_job_ids is not None and log["sub_job_id"] not in sub_job_ids:
+                continue
+            path = output_dir / log["sub_job_id"] / log["filename"]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(log["content"], encoding="utf-8")
+            if progress is not None:
+                progress(f"execution logs: {log['sub_job_id']}/{log['filename']}: saved")
+                progress("\n")
+            saved.append(
+                {
+                    "sub_job_id": log["sub_job_id"],
+                    "filename": log["filename"],
+                    "artifact_uri": log["artifact_uri"],
+                    "saved_path": str(path),
+                    "bytes": path.stat().st_size,
+                    "unchanged": False,
+                }
+            )
+        return saved
+
     def download_stdout_logs(
         self,
         job_id,
@@ -2130,18 +2168,24 @@ def test_download_log_writes_each_log_under_sub_job_dir(tmp_path):
             "filename": "execution.jsonl",
             "artifact_uri": "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_logs/job-1:training:0/execution.jsonl",
             "saved_path": str(training_dir / "execution.jsonl"),
+            "bytes": (training_dir / "execution.jsonl").stat().st_size,
+            "unchanged": False,
         },
         {
             "sub_job_id": "job-1:training:0",
             "filename": "server.log",
             "artifact_uri": "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_logs/job-1:training:0/server.log",
             "saved_path": str(training_dir / "server.log"),
+            "bytes": (training_dir / "server.log").stat().st_size,
+            "unchanged": False,
         },
         {
             "sub_job_id": "job-1:sampling:0",
             "filename": "execution.jsonl",
             "artifact_uri": "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_logs/job-1:sampling:0/execution.jsonl",
             "saved_path": str(sampling_dir / "execution.jsonl"),
+            "bytes": (sampling_dir / "execution.jsonl").stat().st_size,
+            "unchanged": False,
         },
     ]
 
@@ -2186,21 +2230,38 @@ def test_download_log_resume_reaches_stdout_download(tmp_path):
     assert client.stdout_resume is True
 
 
-def test_download_log_resume_rejects_execution_logs(tmp_path):
-    stderr = io.StringIO()
-
-    def client_factory(_args):
-        raise AssertionError("client constructed before the --resume check")
-
+def test_download_log_execution_options_reach_the_streaming_download(tmp_path):
+    client = FakeClient()
     rc = cli.main(
-        _base_args() + ["download-log", "job-1", "--resume", "--output-dir", str(tmp_path)],
-        client_factory=client_factory,
+        _base_args()
+        + [
+            "download-log", "job-1", "--resume", "--sub-job", "job-1:sampling:0",
+            "--transfer-timeout", "60", "--output-dir", str(tmp_path),
+        ],
+        client_factory=lambda _: client,
         stdout=io.StringIO(),
-        stderr=stderr,
+        stderr=io.StringIO(),
     )
+    assert rc == 0
+    assert client.execution_log_options == {
+        "output_dir": tmp_path,
+        "resume": True,
+        "sub_job_ids": ["job-1:sampling:0"],
+        "transfer_timeout_seconds": 60.0,
+    }
+    assert not (tmp_path / "job-1:training:0").exists()
 
-    assert rc == 1
-    assert "--resume applies to --log-type stdout" in stderr.getvalue()
+
+def test_download_log_execution_transfer_timeout_zero_means_no_limit(tmp_path):
+    client = FakeClient()
+    rc = cli.main(
+        _base_args() + ["download-log", "job-1", "--transfer-timeout", "0", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: client,
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+    assert rc == 0
+    assert client.execution_log_options["transfer_timeout_seconds"] is None
 
 
 def test_download_metrics_resume_reaches_client(tmp_path):
@@ -2279,10 +2340,8 @@ def test_download_log_stdout_defaults_leave_parallel_to_client(tmp_path):
     "flag",
     [
         ["--parallel", "2"],
-        ["--sub-job", "job-1:training:0"],
         ["--strict"],
         ["--stale-after-minutes", "5"],
-        ["--transfer-timeout", "60"],
     ],
 )
 def test_download_log_chunk_flags_reject_execution_logs(tmp_path, flag):
@@ -2311,6 +2370,22 @@ def test_download_metrics_rejects_bad_parallel(tmp_path, value, capsys):
             stdout=io.StringIO(),
         )
     assert "positive integer" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", [["download-metrics", "job-1"], ["download-log", "job-1", "--log-type", "stdout"]])
+def test_parallel_is_capped(tmp_path, command, capsys):
+    with pytest.raises(SystemExit):
+        cli.main(_base_args() + command + ["--parallel", "129"], client_factory=lambda _: FakeClient(), stdout=io.StringIO())
+    assert "--parallel: must be at most 128, got 129" in capsys.readouterr().err
+    client = FakeClient()
+    rc = cli.main(
+        _base_args() + command + ["--parallel", "128", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: client,
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+    assert rc == 0
+    assert client.download_options["max_workers"] == 128
 
 
 def _interrupted(saved):
@@ -2691,7 +2766,7 @@ def test_download_progress_is_one_terminal_line(tmp_path):
     assert plain.getvalue() == "metrics: [####################] 2/2 job\n"
 
 
-def test_execution_log_download_writes_no_progress(tmp_path):
+def test_execution_log_download_reports_each_file(tmp_path):
     stderr = io.StringIO()
     rc = cli.main(
         _base_args() + ["download-log", "job-1", "--output-dir", str(tmp_path)],
@@ -2700,7 +2775,11 @@ def test_execution_log_download_writes_no_progress(tmp_path):
         stderr=stderr,
     )
     assert rc == 0
-    assert stderr.getvalue() == ""
+    assert stderr.getvalue().splitlines() == [
+        "execution logs: job-1:training:0/execution.jsonl: saved",
+        "execution logs: job-1:training:0/server.log: saved",
+        "execution logs: job-1:sampling:0/execution.jsonl: saved",
+    ]
 
 
 def test_download_warning_does_not_break_the_progress_line():

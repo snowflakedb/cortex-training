@@ -1891,6 +1891,7 @@ async def _run_progress_status_and_cancel(state):
     async with app.run_test() as pilot:
         ok = await _wait(pilot, app, lambda: re.search(r"\d+/10000 chunks", app.sub_title or ""))
         assert ok, "download progress did not reach the status line"
+        assert re.search(r"\d+/10000 chunks, \d+\.\d (KiB|MiB)", app.sub_title), app.sub_title
         app.pop_screen()
         for _ in range(5):
             await pilot.pause()
@@ -2272,3 +2273,98 @@ def test_selected_sub_job_without_chunks_falls_through_to_the_whole_job(monkeypa
     asyncio.run(_run_selected_sub_job_without_chunks(c))
     gets = [cmd for cmd in connection.commands if cmd.startswith("GET ")]
     assert len(gets) == 3
+
+
+async def _run_live_raw_lines_render_and_filter():
+    c = _client()
+    stamp = "2026-01-01T00:00:00.123456789Z "
+    c.tail_logs.return_value = {
+        "entries": [
+            {"_raw": stamp + '{"level": "INFO", "msg": "drain_metrics"}'},
+            {"_raw": stamp + "(EngineCore pid=7) WARNING 01-01 00:00:00 [a.py:1] slow"},
+            {"_raw": stamp + '{"level": "ERROR", "msg": "boom"}'},
+            {"_raw": stamp + "plain line"},
+        ],
+        "next_cursor": "1",
+        "eof": True,
+    }
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, lambda: "plain line" in getattr(app.screen, "_shown_lines", []))
+        assert ok, "live lines were not shown"
+        screen = app.screen
+        assert not any(line.startswith("2026-01-01T00:00:00") for line in screen._shown_lines)
+        assert '{"level": "ERROR", "msg": "boom"}' in screen._shown_lines
+        screen.action_cycle_level()  # INFO
+        screen.action_cycle_level()  # WARNING
+        screen.action_cycle_level()  # ERROR
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: "plain line" in screen._shown_lines and '{"level": "INFO", "msg": "drain_metrics"}' not in screen._shown_lines,
+        )
+        assert ok, "the level filter did not apply to live lines"
+        assert '{"level": "ERROR", "msg": "boom"}' in screen._shown_lines
+        assert not any("WARNING 01-01" in line for line in screen._shown_lines)
+        await _settle(app, pilot)
+
+
+def test_live_raw_lines_drop_the_runtime_time_and_honor_the_level_filter():
+    asyncio.run(_run_live_raw_lines_render_and_filter())
+
+
+async def _run_recently_ended_hint(state_changed_at, expect_hint):
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
+    c = _client()
+    c.get_job.return_value = {
+        **_terminal_job(),
+        "state_changed_at": _dt.fromtimestamp(state_changed_at, tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    c.download_stdout_logs.side_effect = _whole_job(lambda job_id, output_dir, **kwargs: [])
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen) and app.screen._ended_at is not None)
+        assert ok
+        await _wait(pilot, app, lambda: "FAILED" in (app.sub_title or ""))
+        hint = "its last output may still be uploading (r refreshes)"
+        assert (hint in (app.sub_title or "")) is expect_hint, app.sub_title
+        if expect_hint:
+            assert re.search(r"ended \d+s ago", app.sub_title)
+        await _settle(app, pilot)
+
+
+def test_a_just_ended_job_says_its_last_output_may_still_be_uploading():
+    asyncio.run(_run_recently_ended_hint(time.time() - 30, True))
+
+
+def test_a_long_ended_job_has_no_upload_hint():
+    asyncio.run(_run_recently_ended_hint(time.time() - 3 * 86400, False))
+
+
+async def _run_resource_age_is_humanized(tmp_path):
+    c = _client()
+
+    def download(job_id, output_dir, *, resume=False, **_kwargs):
+        _write_gpu_metrics(output_dir, "7:training:0", gpu_count=1)
+        return []
+
+    c.download_metrics.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(140, 36)) as pilot:
+        ok = await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen) and app.screen._current_source == "7:training:0")
+        assert ok
+        app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+
+        def status():
+            return str(app.screen.query_one("#resource-status", Static).render())
+
+        ok = await _wait(pilot, app, lambda: "last sample" in status())
+        assert ok, status()
+        assert re.search(r"last sample \d+d \d+h ago", status()), status()
+        await _settle(app, pilot)
+
+
+def test_resource_last_sample_age_is_humanized(tmp_path):
+    asyncio.run(_run_resource_age_is_humanized(tmp_path))

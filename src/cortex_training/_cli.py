@@ -581,10 +581,11 @@ def build_parser(
         "--resume",
         action="store_true",
         help=(
-            "Continue an earlier stdout download in the output directory and "
-            "fetch only output that is not already saved, including output an "
-            "interrupted download already saved. Two downloads of the same "
-            "directory at once are unsupported."
+            "Continue an earlier download in the output directory and fetch "
+            "only what is not already saved. For stdout that includes output an "
+            "interrupted download already saved; for execution logs, files "
+            "unchanged since the last download are skipped. Two downloads of "
+            "the same directory at once are unsupported."
         ),
     )
     _add_chunk_download_arguments(download_log, "--log-type stdout")
@@ -1289,6 +1290,17 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+# More concurrent fetches than this only add load; the default is 16.
+_MAX_PARALLEL = 128
+
+
+def _parallel_count(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > _MAX_PARALLEL:
+        raise argparse.ArgumentTypeError(f"must be at most {_MAX_PARALLEL}, got {parsed}")
+    return parsed
+
+
 def _non_negative_float(value: str) -> float:
     try:
         parsed = float(value)
@@ -1303,10 +1315,10 @@ def _add_chunk_download_arguments(parser: argparse.ArgumentParser, applies_to: s
     suffix = f" Applies to {applies_to}." if applies_to else ""
     parser.add_argument(
         "--parallel",
-        type=_positive_int,
+        type=_parallel_count,
         default=None,
         metavar="N",
-        help=f"Number of chunks to fetch at once (default: 16).{suffix}",
+        help=f"Number of chunks to fetch at once, 1 to {_MAX_PARALLEL} (default: 16).{suffix}",
     )
     parser.add_argument(
         "--sub-job",
@@ -1314,7 +1326,7 @@ def _add_chunk_download_arguments(parser: argparse.ArgumentParser, applies_to: s
         action="append",
         default=None,
         metavar="SUB_JOB_ID",
-        help=f"Download only this sub-job. Repeat for more than one.{suffix}",
+        help="Download only this sub-job. Repeat for more than one.",
     )
     parser.add_argument(
         "--strict",
@@ -1331,7 +1343,8 @@ def _add_chunk_download_arguments(parser: argparse.ArgumentParser, applies_to: s
         metavar="MINUTES",
         help=(
             "Warn when a running job's newest saved chunk is older than this "
-            f"(default: 10; 0 turns the warning off).{suffix}"
+            "(default: 10). 0 turns off this and the other job-status notices "
+            f"(a just-ended job, missing GPU metrics).{suffix}"
         ),
     )
     parser.add_argument(
@@ -1340,8 +1353,8 @@ def _add_chunk_download_arguments(parser: argparse.ArgumentParser, applies_to: s
         default=300.0,
         metavar="SECONDS",
         help=(
-            "Give up on and retry a single chunk fetch or listing that takes "
-            f"longer than this (default: 300; 0 means no limit).{suffix}"
+            "Give up on and retry a single file or chunk fetch, or listing, that "
+            "takes longer than this (default: 300; 0 means no limit)."
         ),
     )
 
@@ -1487,19 +1500,15 @@ def _cmd_download_log(
         )
         return 0
 
-    logs = client.fetch_execution_logs(args.job_id)
-    saved = []
-    for log in logs:
-        file_path = out_dir / (log["sub_job_id"] or "unknown") / log["filename"]
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(log["content"], encoding="utf-8")
-        saved.append(
-            {
-                "sub_job_id": log["sub_job_id"],
-                "filename": log["filename"],
-                "artifact_uri": log["artifact_uri"],
-                "saved_path": str(file_path),
-            }
+    progress = _artifact_progress_writer(stderr)
+    with _library_warnings_to(progress):
+        saved = client.download_execution_logs(
+            args.job_id,
+            out_dir,
+            resume=args.resume,
+            sub_job_ids=args.sub_job_ids,
+            progress=progress,
+            transfer_timeout_seconds=args.transfer_timeout or None,
         )
     _print_json({"job_id": args.job_id, "logs": saved}, stdout, compact=args.compact)
     return 0
@@ -1573,13 +1582,11 @@ def _run(
         return _cmd_submit(args, None, stdout, stdin)
 
     if args.command == "download-log" and args.log_type != "stdout":
+        # Execution logs are whole files, not chunks.
         for flag, value in (
-            ("--resume", args.resume),
             ("--parallel", args.parallel),
-            ("--sub-job", args.sub_job_ids),
             ("--strict", args.strict),
             ("--stale-after-minutes", args.stale_after_minutes != 10.0),
-            ("--transfer-timeout", args.transfer_timeout != 300.0),
         ):
             if value:
                 raise ValueError(f"{flag} applies to --log-type stdout, not execution logs")
