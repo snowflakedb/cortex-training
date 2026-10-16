@@ -5371,7 +5371,8 @@ class CortexTrainingClient:
             return None
         if "job" not in checked:
             try:
-                checked["job"] = self.get_job(job_id)
+                # Tried once: the lookup only improves the error.
+                checked["job"] = self._send("GET", f"{self._prefix}/{job_id}", max_retries=0).json()
             except Exception:
                 logger.debug("job lookup for a tail-logs error failed", exc_info=True)
                 checked["job"] = None

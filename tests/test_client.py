@@ -8058,6 +8058,16 @@ class TestTailOnEndedJobs:
         assert "download-log" not in str(excinfo.value)
         assert c._session.post.call_count == 3
 
+    def test_the_job_lookup_is_tried_once(self):
+        c = _make_client()
+        c.max_retries = 2
+        c._session.post.return_value = _not_found("517604", "session s not found")
+        c._session.get.return_value = _make_error_response({"message": "unavailable"}, 503)
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+        assert c._session.get.call_count == 1
+        assert c._session.post.call_count == 3
+
 
 class TestStreamStopsWithoutEof:
     def test_follow_false_stops_at_the_first_empty_page_without_eof(self, monkeypatch):
