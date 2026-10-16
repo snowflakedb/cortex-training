@@ -3780,8 +3780,12 @@ class CortexTrainingClient:
     _RECENTLY_ENDED_SECONDS = 120.0
 
     def _job_for_upload_warnings(self, job_id: str) -> tuple[dict, float | None]:
-        """Return the job and the server's clock (from the ``Date`` header), if any."""
-        resp = self._send("GET", f"{self._prefix}/{job_id}")
+        """Return the job and the server's clock (from the ``Date`` header), if any.
+
+        Tried once: the lookup only adds notices, and it runs in the background,
+        where a retried failure would keep logging after the download returned.
+        """
+        resp = self._send("GET", f"{self._prefix}/{job_id}", max_retries=0)
         server_now = None
         try:
             server_now = email.utils.parsedate_to_datetime(resp.headers["Date"]).timestamp()

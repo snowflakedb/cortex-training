@@ -8295,3 +8295,25 @@ def test_execution_log_get_time_limit_scales_with_file_size(tmp_path, monkeypatc
     c.download_execution_logs("job-1", tmp_path, transfer_timeout_seconds=2)
     assert ("GET", 10.0) in seen
     assert all(timeout == 2 for kind, timeout in seen if kind == "LIST")
+
+
+
+def test_stall_check_job_lookup_is_tried_once_and_stays_quiet_after_the_download(tmp_path, monkeypatch, caplog):
+    c, _connection, _paths, _sleeps, _opened = TestChunkedArtifactDownload()._setup(
+        monkeypatch, count=2, artifact_name="metrics"
+    )
+    calls = []
+
+    def unavailable(*_args, **_kwargs):
+        calls.append(time.monotonic())
+        return _make_error_response({"message": "control plane unavailable"}, 503)
+
+    c._session.get.side_effect = unavailable
+    with caplog.at_level(logging.WARNING):
+        result = c.download_metrics("job-1", tmp_path)
+        returned = time.time()
+        time.sleep(1.0)  # long enough for a retrying lookup to have logged again
+    assert [entry["sub_job_id"] for entry in result] == [TestChunkedArtifactDownload.SUB]
+    assert len(calls) == 1
+    assert [r.getMessage() for r in caplog.records if r.created > returned] == []
+    assert not any("retrying" in r.getMessage() for r in caplog.records)
