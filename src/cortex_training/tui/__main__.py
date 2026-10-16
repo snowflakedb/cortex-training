@@ -23,6 +23,7 @@ flags, then a named or configured-default Snowflake connection profile.
 from __future__ import annotations
 
 import argparse
+import functools
 import os
 import re
 from pathlib import Path
@@ -76,6 +77,29 @@ def textual_problem() -> str | None:
         return (f"the TUI needs textual {floor} or later, and {installed} is installed: "
                 f"pip install --upgrade '{_TEXTUAL_REQUIREMENT}'")
     return None
+
+
+@functools.lru_cache(maxsize=None)
+def textual_is_floor() -> bool:
+    """Whether the installed Textual is TEXTUAL_FLOOR itself, the release the TUI is
+    written and tested against (read once).
+
+    What relies on Textual's internals does so on that release only (the job
+    list's fast fill, ``_JobTable.replace_rows`` in ``app.py``): any other one,
+    a later 8.x too, may keep them otherwise.
+    """
+    from importlib import metadata
+
+    try:
+        return metadata.version("textual") == ".".join(map(str, TEXTUAL_FLOOR))
+    except metadata.PackageNotFoundError:
+        return False
+
+
+def _escaped(text: str) -> str:
+    """``text`` for one error line on stderr: each character a terminal would act on
+    (control, format and other unprintable ones) becomes its escape, such as ``\\x1b``."""
+    return "".join(ch if ch.isprintable() or ch == "\n" else ascii(ch)[1:-1] for ch in text)
 
 
 def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.ArgumentParser:
@@ -194,9 +218,22 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     # config file's poll_interval applies unless --poll-interval is given; with
     # neither, the TUI's default does, not the CLI's.
     explicit_poll = args.poll_interval is not None
-    args = cli._resolve_args(args)
+    try:
+        args = cli._resolve_args(args)
+        # What the resolved arguments don't say, from the TUI's one read of the
+        # config file they came from (the CLI's resolution reads it for itself):
+        # whether it sets poll_interval, and the host or base URL it gives by
+        # itself (for the commands the TUI shows to copy).
+        config = _selected_config(cli, args)
+        configured = cli._config_float(config, "poll_interval")
+        from_config = _config_connection(cli, config)
+    except (OSError, ValueError, RuntimeError) as exc:
+        # A config the TUI can't use (a value of the wrong type, such as a quoted
+        # poll_interval, JSON that doesn't parse, an unknown key, a file that isn't
+        # there), or flags that don't go together: one error line, as the CLI gives,
+        # not a traceback. Escaped: it can quote the file's keys.
+        parser.exit(2, f"{parser.prog}: error: {_escaped(str(exc))}\n")
     if not explicit_poll:
-        configured = _configured_poll_interval(cli, args)
         args.poll_interval = _POLL_INTERVAL_DEFAULT if configured is None else configured
     try:
         args = cli._normalize_connection_args(args)
@@ -228,38 +265,27 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     # list so the user can choose one.
     app = CortexTrainingLogTUI(client, args.job_id, sub_job_id=args.sub_job_id, poll_interval=args.poll_interval,
                                schema_only=args.schema_only)
-    app.sign_in = _sign_in(cli, args)  # for the commands the TUI shows to copy
-    from cortex_training.tui.log_cache import begin_session
-    from cortex_training.tui.log_cache import end_session
-
-    # What this session downloads (logs, consoles, telemetry) goes when it ends: q, a
-    # crash, kill or a closed terminal (the app exits on those as on q). The next start
-    # removes what a session that was killed outright left.
-    session = begin_session()
-    try:
-        app.run()
-    finally:
-        end_session(session)
+    app.sign_in = _sign_in(cli, args, from_config)  # for the commands the TUI shows to copy
+    app.run()
     return app.return_code or 0  # non-zero when the app stopped on an unhandled error
 
 
-def _sign_in(cli, args) -> dict:
+def _sign_in(cli, args, from_config: dict) -> dict:
     """How the TUI's client connects, from the resolved arguments, for the
     commands it shows to copy (``views.sign_in_options``).
 
     It never holds the PAT. ``config`` is the config file read, as an
     absolute path, so a copied command finds it from any directory.
     ``host_in_config`` (a PAT) and ``base_url_in_config`` say whether that file
-    by itself gives the host or base URL the client uses; when a flag or the
-    environment set or overrode it, the copied command names it after
-    ``--config FILE`` (``views.sign_in_options``).
+    by itself gives the host or base URL the client uses (``from_config``, see
+    :func:`_config_connection`); when a flag or the environment set or overrode
+    it, the copied command names it after ``--config FILE`` (``views.sign_in_options``).
     """
     if args.use_connection_profile:
         return {"kind": "profile"}
     config = None
     if getattr(args, "_legacy_config_selected", False) and args.config:
         config = str(Path(args.config).expanduser().resolve())
-    from_config = _config_connection(cli, config)
     if args.base_url:
         return {"kind": "url", "config": config, "base_url": args.base_url,
                 "base_url_in_config": from_config.get("base_url") == args.base_url}
@@ -268,16 +294,19 @@ def _sign_in(cli, args) -> dict:
             "host_in_config": bool(host) and from_config.get("host") == host}
 
 
-def _config_connection(cli, config: str | None) -> dict:
-    """What ``--config FILE`` gives by itself, as the CLI reads it: its ``base_url``
-    and PAT ``host`` (normalized); empty without one."""
-    if not config:
+def _selected_config(cli, args) -> dict:
+    """The config file the resolved arguments came from, as the CLI reads it; empty
+    for a connection profile, or flags and env only."""
+    if not getattr(args, "_legacy_config_selected", False) or not args.config:
         return {}
-    try:
-        values = cli._load_config(config)
-        base_url, host = cli._config_str(values, "base_url"), cli._config_str(values, "host")
-    except (OSError, ValueError):  # it was read a moment ago; if not now, name the host and base URL anyway
-        return {}
+    return cli._load_config(args.config)
+
+
+def _config_connection(cli, values: dict) -> dict:
+    """What the config file (``values``, see :func:`_selected_config`) gives by
+    itself, as the CLI reads it: its ``base_url`` and PAT ``host`` (normalized),
+    None where it gives neither."""
+    base_url, host = cli._config_str(values, "base_url"), cli._config_str(values, "host")
     if base_url and not cli._has_url_scheme(base_url) and host is None:
         base_url, host = None, base_url  # the CLI reads a base URL without a scheme as the PAT host
     return {"base_url": base_url, "host": cli._normalize_host(host) if host else None}
@@ -296,13 +325,6 @@ def _demo_account_list() -> str | None:
         reasons = ", ".join(sorted((*AccountJobListUnavailable.REASONS, UNAVAILABLE)))
         raise ValueError(f"{DEBUG_ACCOUNT_LIST_ENV} must be ok or one of {reasons}, got {value!r}")
     return value
-
-
-def _configured_poll_interval(cli, args) -> float | None:
-    """The poll_interval of the config file the resolved arguments came from, if it sets one."""
-    if not getattr(args, "_legacy_config_selected", False) or not args.config:
-        return None  # a connection profile, or flags and env only
-    return cli._config_float(cli._load_config(args.config), "poll_interval")
 
 
 def _run_demo(args, app_class, *, account_list: str | None = None) -> int:

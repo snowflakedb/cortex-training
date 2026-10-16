@@ -7,7 +7,8 @@ The TUI takes the mouse, so a terminal's own selection and its copy key (Cmd-C)
 see nothing; and Textual's copy writes OSC 52, which many terminals ignore. So a
 copy here also goes to this machine's clipboard through its own tool (pbcopy,
 wl-copy, xclip or xsel), unless the session runs over SSH, where that tool would
-copy on the remote machine and only OSC 52 can reach the user's.
+copy on the remote machine and only OSC 52 can reach the user's. That tool can
+take seconds (see :func:`copy_local`), so the app runs it on a worker thread.
 """
 
 from __future__ import annotations
@@ -36,6 +37,10 @@ def _commands() -> list:
 
 def copy_local(text: str) -> bool:
     """Put ``text`` on this machine's clipboard; False where no tool can (or over SSH).
+
+    It waits for each tool it tries, up to three seconds apiece (xclip with a
+    ``DISPLAY`` that is gone waits that long), so the TUI calls it on a worker
+    thread, never the one that draws the screen.
 
     With ``CORTEX_TRAINING_TUI_CLIPBOARD_FILE`` set, the text goes to that file
     instead (for tests and debugging, which must not touch the real clipboard).

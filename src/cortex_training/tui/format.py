@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pure formatting helpers for the Cortex Training log/event TUI.
+"""Pure formatting helpers for the Cortex Training TUI.
 
 Kept free of any ``textual`` import so they can be unit-tested without the
 optional TUI dependency installed.
@@ -30,10 +30,6 @@ from typing import Any
 from typing import Optional
 
 from rich.cells import cell_len
-
-EVENTS_SOURCE_ID = "__events__"
-EVENTS_LABEL = "▸ scheduling events"
-
 
 def format_log_entry(entry: Any) -> str:
     """Render one log entry (a parsed JSONL object or ``{"_raw": ...}``)."""
@@ -69,13 +65,18 @@ def _cells(text: str) -> int:
     return len(text) if text.isascii() else cell_len(text)
 
 
-def _fit_cells(text: str, room: int) -> str:
-    """The longest start of ``text`` that fits in ``room`` terminal cells.
+def cut_cells(text: str, room: int) -> str:
+    """The longest start of ``text`` that fits in ``room`` terminal cells, never
+    splitting a character; ``""`` when even the first one is wider.
 
     Each candidate start is measured whole, so wide characters count two cells
     and combining marks or joined emoji stay with the character before them.
+    (Not ``rich.cells.chop_cells``: before rich 13.7 it returns its pieces in
+    reverse order.)
     """
-    if text.isascii():
+    if room <= 0 or not text:
+        return ""
+    if text.isascii() and text[:room + 1].isprintable():  # a cell per character
         return text[:room]
     # text[:fits] fits; text[:too_long] doesn't (or is all of it). Grow the
     # bound first, so a long line costs about one row's worth of measuring.
@@ -101,7 +102,7 @@ def _wrap_pieces(text: str, room: int, later: int) -> list[str]:
     """
     pieces: list[str] = []
     while True:
-        head = _fit_cells(text, room) or text[:1]  # a wide character in a one-cell row still shows
+        head = cut_cells(text, room) or text[:1]  # a wide character in a one-cell row still shows
         if len(head) >= len(text):
             break  # the rest fits
         if text[len(head):len(head) + 1] == " ":
@@ -174,13 +175,17 @@ def _more_rows_note(hidden: int, room: int) -> str:
     return "…"
 
 
-# ─── Log lines as the pane shows them ────────────────────────────────────────
+# ─── Text safe to draw ───────────────────────────────────────────────────────
+
+# One rule for the text the TUI draws and didn't write (log lines, and the
+# strings in the service's job records): _drawable. printable, safe_text (how
+# the Logs pane draws a line) and one_line (one row) all go through it.
 
 # A terminal escape sequence, from its ESC: CSI (colours, cursor moves), OSC
 # (clipboard and title writes) up to BEL or ST, or to the end of the line when
 # unterminated, DCS / SOS / PM / APC up to ST, and two-byte escapes such as
 # ESC 7 or ESC ( B. A terminal acts on these instead of showing them. (The
-# 8-bit forms start with a C1 control, which _UNSAFE replaces.)
+# 8-bit forms start with a C1 control, which _CONTROL_CHARS replaces.)
 _ESCAPE = re.compile(
     r"\x1b(?:\[[0-?]*[ -/]*[@-~]"
     r"|\][^\x07\x1b\n]*(?:\x07|\x1b\\)?"
@@ -190,9 +195,23 @@ _ESCAPE = re.compile(
 # What is left that a terminal would act on, or that reorders or hides the text
 # around it: C0 and C1 controls other than newline, the Unicode bidi marks,
 # embeddings, overrides and isolates, and the invisible zero-width space, word
-# joiner and byte-order mark. (Zero-width joiners stay: emoji and several
-# scripts use them.) Each is shown as U+FFFD.
-_UNSAFE = re.compile("[\x00-\x09\x0b-\x1f\x7f-\x9f؜​‎‏‪-‮⁠⁦-⁩﻿]")
+# joiner and byte-order mark. Each is shown as U+FFFD. (Zero-width joiners stay
+# where scripts use them; between emoji, see _JOINED_EMOJI.)
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200b\u200e\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]")
+# A zero-width joiner between two emoji (a technologist, a family, a rainbow flag)
+# makes one glyph where the terminal joins them and two where it doesn't (tmux and
+# many terminals), and the TUI can't tell which: it counts one, a terminal that
+# draws two runs the row past its columns and leaves stale cells. Without the
+# joiner every terminal draws the emoji side by side, at the width counted.
+_EMOJI = "\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF"
+_JOINED_EMOJI = re.compile(f"(?<=[{_EMOJI}\ufe0f])\u200d(?=[{_EMOJI}])")
+# Combining marks from the generic diacritic blocks kept on one character. Real
+# text stacks one or two; a run of hundreds (so-called zalgo text) is drawn by
+# the terminal over the rows above and below it.
+MAX_COMBINING_MARKS = 4
+_MARK = "[\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f]"
+_EXCESS_MARKS = re.compile(f"({_MARK}{{{MAX_COMBINING_MARKS}}}){_MARK}+")
+_LINE_BREAKS = re.compile("\r\n|[\r\n\u2028\u2029]")
 _TAB_CELLS = 4
 
 
@@ -206,12 +225,100 @@ def _strip_escapes(s: str) -> str:
         out.append(s[pos:at])
         match = _ESCAPE.match(s, at)
         if match is None:
-            out.append("�")
+            out.append("\ufffd")
             pos = at + 1
         else:
             pos = match.end()
     out.append(s[pos:])
     return "".join(out)
+
+
+def _newlines(s: str) -> str:
+    """``s`` with each ``\\r\\n`` and Unicode line or paragraph separator as a newline."""
+    return s.replace("\r\n", "\n").replace("\u2028", "\n").replace("\u2029", "\n")
+
+
+def _drawable(s: str) -> str:
+    """``s`` with nothing left that a terminal would act on, or that would reorder
+    or hide the text around it.
+
+    Escape sequences are removed whole (see ``_ESCAPE``). ``\\r\\n`` and the
+    Unicode line and paragraph separators become newlines, and a tab four
+    spaces. Every other control, bidi or invisible character (``_CONTROL_CHARS``,
+    a lone carriage return too) becomes U+FFFD, the joiner between two emoji is
+    dropped (see ``_JOINED_EMOJI``), and a character keeps at most
+    :data:`MAX_COMBINING_MARKS` combining diacritics.
+    """
+    s = _strip_escapes(s)
+    if s.isascii() and s.isprintable():  # nearly every string: nothing to do
+        return s
+    s = _newlines(s).replace("\t", " " * _TAB_CELLS)
+    # isprintable() is false for every character _CONTROL_CHARS matches, for the
+    # joiner and for a newline: the regexes run only on the strings that may need them.
+    if not s.isprintable():
+        s = _CONTROL_CHARS.sub("\ufffd", s)
+        if "\u200d" in s:
+            s = _JOINED_EMOJI.sub("", s)
+    return s if s.isascii() else _EXCESS_MARKS.sub(r"\1", s)
+
+
+def printable(text: Any) -> str:
+    """``text`` safe to draw: escape sequences removed, tabs as spaces, Unicode
+    line separators as newlines, other control or bidi characters replaced with
+    U+FFFD, the joiner between two emoji dropped (see ``_JOINED_EMOJI``), and at
+    most :data:`MAX_COMBINING_MARKS` combining diacritics on one character.
+
+    A string with nothing to replace is returned as it is.
+    """
+    s = text if isinstance(text, str) else str(text)
+    return s if s.isascii() and s.isprintable() else _printable(s)
+
+
+@functools.lru_cache(maxsize=4096)  # a list render cleans each job's comment several times
+def _printable(s: str) -> str:
+    return _drawable(s)
+
+
+def safe_text(text: Any) -> str:
+    """``text`` safe to draw as the Logs pane draws a log line: as :func:`printable`
+    makes it, except that a line that rewrites itself with carriage returns (a
+    progress bar) shows its last state, and a tab moves on to the next stop of
+    four cells, as a terminal shows them.
+
+    Not cached: copying a log cleans all of it at once.
+    """
+    s = _strip_escapes(str(text))  # first: an escape sequence takes no cells
+    if "\r" in s or "\u2028" in s or "\u2029" in s:
+        s = _newlines(s)
+        if "\r" in s:
+            s = "\n".join(_overwritten(line) for line in s.split("\n"))
+    if "\t" in s:
+        s = s.expandtabs(_TAB_CELLS)
+    return _drawable(s)
+
+
+def _overwritten(line: str) -> str:
+    """What a terminal shows of a line that rewrites itself with carriage
+    returns (a progress bar): its last non-empty part."""
+    parts = [part for part in line.split("\r") if part]
+    return parts[-1] if parts else ""
+
+
+def one_line(text: Any, width: int = 0) -> str:
+    """``text`` safe for a one-row line, as :func:`printable` makes it, with each
+    line break as `` / `` and each tab as a space; ``width`` > 0 cuts the row to
+    that many terminal cells, ending in ``…``.
+
+    Escape sequences go before the line breaks do, so one left unterminated
+    ends with its own line, as it does in a log line.
+    """
+    row = printable(_LINE_BREAKS.sub(" / ", _strip_escapes(str(text))).replace("\t", " "))
+    if width > 0 and cell_len(row) > width:
+        return cut_cells(row, max(1, width - 1)).rstrip() + "…"
+    return row
+
+
+# ─── Log lines as the pane shows them ────────────────────────────────────────
 
 # The service sends a live line as "<RFC 3339 timestamp> <line>"; Ray may put
 # "(Actor pid=N, ip=...)" groups in front of a JSON log record.
@@ -220,28 +327,6 @@ _RECORD = re.compile(r"((?:\([^()\n]*\) )*)(\{.*\})\s*", re.DOTALL)
 _RECORD_TIME_FIELDS = ("ts", "time", "timestamp", "asctime")
 _RECORD_LEVEL_FIELDS = ("level", "levelname", "severity")
 _RECORD_LOGGER_FIELDS = ("logger", "name")
-
-
-def safe_text(text: Any) -> str:
-    """``text`` safe to draw: escape sequences removed, tabs as spaces, Unicode
-    line separators as newlines, other control or bidi characters as U+FFFD."""
-    s = _strip_escapes(str(text))
-    if "\r" in s or " " in s or " " in s:
-        s = s.replace("\r\n", "\n").replace(" ", "\n").replace(" ", "\n")
-        if "\r" in s:
-            s = "\n".join(_overwritten(line) for line in s.split("\n"))
-    if "\t" in s:
-        s = s.expandtabs(_TAB_CELLS)
-    # isprintable() is false for every character _UNSAFE matches (and for a
-    # newline): the regex runs only on the few lines that may need it.
-    return s if s.isprintable() else _UNSAFE.sub("�", s)
-
-
-def _overwritten(line: str) -> str:
-    """What a terminal shows of a line that rewrites itself with carriage
-    returns (a progress bar): its last non-empty part."""
-    parts = [part for part in line.split("\r") if part]
-    return parts[-1] if parts else ""
 
 
 @functools.lru_cache(maxsize=4096)
@@ -416,27 +501,6 @@ def lines_after(saved_tail: list, live: list) -> Optional[list]:
     return None
 
 
-def format_event(ev: Any) -> str:
-    """Render one zone scheduling event."""
-    if not isinstance(ev, dict):
-        return str(ev)
-    parts = []
-    ts = str(ev.get("ts", "")).strip()
-    if ts:
-        parts.append(ts)
-    parts.append(str(ev.get("kind", "event")))
-    if zone := ev.get("zone"):
-        parts.append(f"zone={zone}")
-    frm, to = ev.get("from"), ev.get("to")
-    if frm or to:
-        parts.append(f"{frm or '?'}→{to or '?'}")
-    if sub := ev.get("sub_job_id"):
-        parts.append(f"sub_job={sub}")
-    if detail := ev.get("detail"):
-        parts.append(str(detail))
-    return " ".join(parts)
-
-
 def source_label(source: Any) -> str:
     """Side-panel label for a sub-job source.
 
@@ -471,8 +535,6 @@ ACTIVE_STATUSES = {
     "creating",
 }
 
-_ACTIVE_STATUSES = ACTIVE_STATUSES  # the older private name
-
 _TERMINAL_STATUSES = {
     "failed",
     "cancelled",
@@ -494,44 +556,11 @@ def is_active_status(status: Any) -> bool:
     if not status:
         return True
     s = str(status).lower().removeprefix("job_state_")
-    if s in _ACTIVE_STATUSES:
+    if s in ACTIVE_STATUSES:
         return True
     if s in _TERMINAL_STATUSES:
         return False
     return True
-
-
-def format_job_row(job: Any) -> str:
-    """One job-picker row with │-separated columns: status │ created │ id │ types."""
-    if not isinstance(job, dict):
-        return str(job)
-    jid = job.get("job_id") or job.get("id") or "?"
-    status = str(job.get("status", "")).strip() or "?"
-    status = status.removeprefix("JOB_STATE_")
-    created = format_created_at(job.get("created_at")) or "—"
-    # Fixed-width columns + separators so fields stay visually distinct.
-    row = f"{status:<10} │ {created:<16} │ {jid}"
-    subs = job.get("sub_jobs") or []
-    types = [s.get("job_type") or s.get("type") for s in subs if isinstance(s, dict)]
-    types = [t for t in types if t]
-    if not types and job.get("job_type"):
-        types = [job["job_type"]]
-    if types:
-        row += f" │ {', '.join(map(str, types))}"
-    return row
-
-
-def job_status_color(status: Any) -> str:
-    """Subtle accent for a job's *status word only* (empty = default color).
-
-    Deliberately minimal: a gentle green marks live jobs so you can spot the one
-    you're running; every other status (failed/cancelled/terminated/unknown)
-    keeps the default foreground — no alarm colors.
-    """
-    s = str(status or "").strip().lower().removeprefix("job_state_")
-    if s in _ACTIVE_STATUSES:
-        return "green"
-    return ""
 
 
 # Times a service sends for one that was never set: Go's zero time (0001-01-01),
@@ -583,25 +612,6 @@ def format_created_at(raw: Any) -> str:
     return local_time(dt) if dt else ""
 
 
-def _created_epoch(raw: Any) -> float:
-    """Parse a created_at into epoch seconds for sorting. Missing, unparseable or
-    out-of-range values sort oldest (``-inf``)."""
-    dt = parse_ts(raw)
-    return dt.timestamp() if dt else float("-inf")
-
-
-def sort_jobs(jobs: Any) -> list:
-    """Order jobs for the picker newest-first by created_at. Ties keep their
-    original order (stable); jobs without a parseable created_at sort last."""
-    if not isinstance(jobs, list):
-        return []
-    return sorted(
-        [j for j in jobs if isinstance(j, dict)],
-        key=lambda job: _created_epoch(job.get("created_at")),
-        reverse=True,
-    )
-
-
 # ─── Job summary (whitelisted create-job params) ─────────────────────────────
 
 # Only the parameters a customer passes to SubJobConfig.training_job /
@@ -637,10 +647,6 @@ def subjob_config(sj: dict) -> dict:
     return {}
 
 
-_num = compact_number  # the older private names
-_subjob_config = subjob_config
-
-
 def _job_config_segments(job: dict) -> list:
     """Per-sub-job static config segments (type / model / whitelisted params)."""
     segs = []
@@ -653,20 +659,20 @@ def _job_config_segments(job: dict) -> list:
             seg.append(jt)
         if sj.get("model_name"):
             seg.append(str(sj["model_name"]))
-        cfg = _subjob_config(sj)
+        cfg = subjob_config(sj)
         for key, label in _SUMMARY_CONFIG_KEYS:
             if cfg.get(key) is not None:
-                seg.append(f"{label}={_num(cfg[key])}")
+                seg.append(f"{label}={compact_number(cfg[key])}")
         opt = cfg.get("optimizer")
         if isinstance(opt, dict):
             o = [str(opt["name"])] if opt.get("name") else []
             if opt.get("lr") is not None:
-                o.append(f"lr={_num(opt['lr'])}")
+                o.append(f"lr={compact_number(opt['lr'])}")
             if o:
                 seg.append("opt=" + "/".join(o))
         for key, label in _SUMMARY_SUBJOB_KEYS:
             if sj.get(key) is not None:
-                seg.append(f"{label}={_num(sj[key])}")
+                seg.append(f"{label}={compact_number(sj[key])}")
         if seg:
             segs.append(" ".join(seg))
     return segs
@@ -681,37 +687,7 @@ def format_job_config(job: Any) -> str:
     return "  ·  ".join(_job_config_segments(job))
 
 
-def format_job_summary(job: Any) -> str:
-    """One-line summary of a job's create-time config (whitelisted) + status.
-
-    Shows only the parameters the customer passed to create_job that are
-    present, so it stays compact. Failure/cancel ``reason`` is appended.
-    """
-    if not isinstance(job, dict):
-        return ""
-    status = (str(job.get("status", "")).strip() or "?").removeprefix("JOB_STATE_")
-    parts = [status, *_job_config_segments(job)]
-    if job.get("reason"):
-        parts.append(f"reason: {job['reason']}")
-    return "  ·  ".join(p for p in parts if p)
-
-
 # ─── Search / filter helpers ─────────────────────────────────────────────────
-
-
-def job_matches(job: Any, query: str) -> bool:
-    """Case-insensitive match of query against a job's id, status, sub-job
-    types and model names. Empty query matches everything."""
-    if not query:
-        return True
-    if not isinstance(job, dict):
-        return False
-    hay = [str(job.get("job_id") or job.get("id") or ""), str(job.get("status") or "")]
-    for sj in job.get("sub_jobs") or []:
-        if isinstance(sj, dict):
-            hay.append(str(sj.get("job_type") or sj.get("type") or ""))
-            hay.append(str(sj.get("model_name") or ""))
-    return query.lower() in " ".join(hay).lower()
 
 
 def entry_matches(entry: Any, query: str) -> bool:
@@ -860,49 +836,3 @@ def format_execution_record(record: Any) -> list:
         if text.strip():
             out.extend(f"    {line}" for line in text.splitlines())
     return out
-
-
-# Characters a terminal would act on (ESC starts an escape sequence), or that
-# reorder or hide the text around them: C0/C1 controls other than newline, the
-# Unicode bidi marks, embeddings, overrides and isolates, and the invisible
-# zero-width space, word joiner and byte-order mark. (Zero-width joiners stay
-# where scripts use them; between emoji, see _JOINED_EMOJI.)
-_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200b\u200e\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]")
-# A zero-width joiner between two emoji (a technologist, a family, a rainbow flag)
-# makes one glyph where the terminal joins them and two where it doesn't (tmux and
-# many terminals), and the TUI can't tell which: it counts one, a terminal that
-# draws two runs the row past its columns and leaves stale cells. Without the
-# joiner every terminal draws the emoji side by side, at the width counted.
-_EMOJI = "\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF"
-_JOINED_EMOJI = re.compile(f"(?<=[{_EMOJI}\ufe0f])\u200d(?=[{_EMOJI}])")
-# Combining marks from the generic diacritic blocks kept on one character. Real
-# text stacks one or two; a run of hundreds (so-called zalgo text) is drawn by
-# the terminal over the rows above and below it.
-MAX_COMBINING_MARKS = 4
-_MARK = "[\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f]"
-_EXCESS_MARKS = re.compile(f"({_MARK}{{{MAX_COMBINING_MARKS}}}){_MARK}+")
-_LINE_BREAKS = re.compile("\r\n|[\r\n\u2028\u2029]")
-
-
-def printable(text: Any) -> str:
-    """``text`` safe to draw: tabs as spaces, Unicode line separators as
-    newlines, other control or bidi characters replaced with U+FFFD, the
-    joiner between two emoji dropped (see ``_JOINED_EMOJI``), and at most
-    :data:`MAX_COMBINING_MARKS` combining diacritics on one character."""
-    return _printable(text if isinstance(text, str) else str(text))
-
-
-@functools.lru_cache(maxsize=4096)  # a list render cleans each job's comment several times
-def _printable(s: str) -> str:
-    s = s.replace("\r\n", "\n").replace("\u2028", "\n").replace("\u2029", "\n").replace("\t", "    ")
-    return _EXCESS_MARKS.sub(r"\1", _JOINED_EMOJI.sub("", _CONTROL_CHARS.sub("\ufffd", s)))
-
-
-def one_line(text: Any) -> str:
-    """``text`` safe for a one-row status line.
-
-    Line breaks become `` / ``, a tab a space, and every other character
-    :func:`printable` replaces (controls, bidi marks, zero-width characters)
-    the replacement character U+FFFD.
-    """
-    return printable(_LINE_BREAKS.sub(" / ", str(text)).replace("\t", " "))

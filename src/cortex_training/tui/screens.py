@@ -21,9 +21,8 @@ whole job or one sub-job.
 
 Everything here is read-only against the service. The only writes are local:
 job display names (:class:`~cortex_training.tui.stores.AliasStore`) and the GPU
-telemetry download cache. A job's name is its local alias, else the first line
-of the ``comment`` it was created with, else its id; the preview shows the
-whole comment too.
+telemetry download cache. A job's name is its local alias, else its id; the
+preview shows its whole ``comment`` too.
 """
 
 from __future__ import annotations
@@ -430,12 +429,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
         now = _now()
         rows = []
         name = self._display_name
-        if not name:
-            hint = "no name · press n to name this job"
-        elif v.alias_of(job, self._aliases.all()):
-            hint = "local name on this machine · n renames"
-        else:
-            hint = "from the job's comment"
+        hint = "local name on this machine · n renames" if name else "no name · press n to name this job"
         name_hint = f"  [dim]({hint})[/dim]"
         # Keep the one-line name and its hint on one line of the preview (cells, not characters).
         name = v.one_line(name, max(20, self._value_width() - v.cell_width(hint) - 4)) if name else name
@@ -788,7 +782,6 @@ class JobSummaryScreen(FollowsPointer, Screen):
 
         def done(value):
             if value is not None:
-                # A name that only repeats the comment's first line stores no alias.
                 self._aliases.set(self._job_id, v.alias_to_store(self._job, value))
                 self._refresh_view()
 
@@ -933,19 +926,27 @@ class JobDetailScreen(LogScreen):
 
     @work(thread=True, exclusive=True, group="status")
     def _fetch_status(self) -> None:
+        # Numbered as it is sent: a read that answers after a later one is dropped (see _take_job).
+        # One the next tick's read replaced (exclusive) still counts: with a slow service every
+        # read can take longer than a tick, and dropping those would drop them all.
+        seq = self._next_job_read()
         try:
             job = self._client.get_job(self._job_id)
         except Exception:  # noqa: BLE001 - keep the current view; the next tick retries
             return
-        if isinstance(job, dict) and job.get("status"):
-            self._post(self._apply_status, job)
+        if isinstance(job, dict) and job.get("status") and self._screen_open:
+            self._post(self._apply_status, job, seq)
 
-    def _apply_status(self, job: dict) -> None:
+    def _apply_status(self, job: dict, seq: int) -> None:
+        if not self._screen_open:
+            return
         ended = is_active_status(self._job_status) and not is_active_status(job.get("status"))
         # Status, reason and sub-job statuses come from this job as they are now:
         # a reason the service stopped sending (a job that left pending) is gone.
-        # (_take_job also redraws the summary line from it.)
-        self._take_job(job)
+        # (_take_job also redraws the summary line from it.) An older answer than
+        # the one on screen changes nothing.
+        if not self._take_job(job, seq):
+            return
         if ended and self._current_source:
             # Show the saved console now, as the tail would after its next error.
             self._start_tail(self._current_source, user=False)

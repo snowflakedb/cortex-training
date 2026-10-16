@@ -152,9 +152,6 @@ class Listing:
     jobs: list
     scope: ListScope
 
-    def __len__(self) -> int:
-        return len(self.jobs)
-
 
 def _jobs(count: int) -> str:
     return f"{count:,} job" + ("" if count == 1 else "s")

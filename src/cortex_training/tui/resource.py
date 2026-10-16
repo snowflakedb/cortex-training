@@ -19,13 +19,15 @@ at one scrape; a system row (``"kind": "system"``) is one node's CPU and memory
 at one scrape. Each kind is read into its own series of units: its GPUs
 (``global_gpu_index``) or its nodes (``worker_num``).
 
-Metrics are discovered, not listed. Every numeric field of a row is one, except
-the fields that identify or count rows: names ending in ``_index``, ``_num``,
-``_version`` or ``_interval_s``, and ``seq``. A field that is null in every row
-has nothing to chart. A node's ``cpu_count`` and ``mem_total_bytes`` stay the
-same through a job, so the System view names them in its header and charts
-neither. Each kind also derives its memory used %: a GPU's
-``fb_used / (fb_used + fb_free)``, a node's ``mem_used / mem_total``.
+Metrics are discovered, not listed: a numeric field is one when its name
+(``[a-z0-9_]+``) ends in a unit suffix, ``_pct``, ``_bytes``, ``_watts`` or
+``_c`` (see :func:`is_metric_field`). A number without one (an id, a count, a
+duration or a counter, such as ``seq``, ``pid`` or ``*_total``) has no average
+worth charting, and a field that is null in every row has nothing to chart. A
+node's ``cpu_count`` and ``mem_total_bytes`` stay the same through a job, so the
+System view names them in its header and charts neither. Each kind also derives
+its memory used %: a GPU's ``fb_used / (fb_used + fb_free)``, a node's
+``mem_used / mem_total``.
 :class:`KindResource` is one kind of one sub-job: its metrics in the order they
 are shown, its units, and a :class:`KindView` per window for each unit and for
 the mean across units, with every metric's chart and stats.
@@ -319,18 +321,22 @@ class ResourceData:
 
 # ─── metric names, units and scales ──────────────────────────────────────────
 
-# A metric's unit, by its field's suffix.
+# A metric's unit, by its field's suffix. Only a field with one is a metric: a gauge,
+# whose average over a window means something. Any other number in a row identifies
+# or counts something (global_gpu_index, seq, a pid, cpu_count), is a duration
+# (sample_interval_s, an uptime) or a counter that only grows (*_total, ECC and XID
+# error counts); averaged as a gauge, it would chart nonsense.
 _UNIT_SUFFIXES = (("_pct", "%"), ("_bytes", "GiB"), ("_watts", "W"), ("_c", "°C"))
+# A metric's field: its name is made into the metric's, which the terminal draws, so
+# only plain lowercase words, and an escape sequence in a field's name never reaches it.
+_METRIC_FIELD_RE = re.compile(r"[a-z0-9_]+")
 # Words a metric's name spells differently from its field.
 _NAME_WORDS = {"gpu": "GPU", "cpu": "CPU", "sm": "SM", "dram": "DRAM", "fb": "GPU memory", "mem": "memory"}
-# Fields that identify or count rows, never metrics.
-_NOT_METRIC_SUFFIXES = ("_index", "_num", "_version", "_interval_s")
-_NOT_METRICS = frozenset({"seq", "kind", "sub_job_id", "sample_ts"})
 
 
 def is_metric_field(name: object) -> bool:
-    """Whether a field can be a metric: anything but the fields that identify or count rows."""
-    return type(name) is str and name not in _NOT_METRICS and not name.endswith(_NOT_METRIC_SUFFIXES)
+    """Whether a field is a metric: a name of ``[a-z0-9_]`` that ends in a unit suffix (:func:`metric_unit`)."""
+    return type(name) is str and _METRIC_FIELD_RE.fullmatch(name) is not None and metric_unit(name) != ""
 
 
 def _split_unit(field_name: str) -> tuple[str, str]:
@@ -547,12 +553,28 @@ def _manifest_bytes(path: Path) -> int | None:
     return None if manifest is None else manifest[1]
 
 
-def cached_metric_sources(metrics_root: Path) -> list[str]:
+def _printable_name(name: str) -> bool:
+    """Whether ``name`` is safe to draw as it is: no control, bidi or zero-width
+    character (``str.isprintable``), and nothing :func:`views.printable` changes."""
+    return name.isprintable() and views.printable(name) == name
+
+
+def _metric_files(metrics_root: Path) -> list[Path]:
+    """Each ``<sub_job_id>/gpu.jsonl`` under ``metrics_root``, in name order.
+
+    The directory's name is the sub-job's id, which the TUI draws, and it comes
+    from the stage's listing. One that isn't printable as it is (an escape
+    sequence, say) is no sub-job's id, so it is passed over rather than shown.
+    """
     try:
         paths = sorted(metrics_root.glob("*/gpu.jsonl"))
     except OSError:
         return []
-    return [path.parent.name for path in paths if _manifest_bytes(path) is not None]
+    return [path for path in paths if _printable_name(path.parent.name)]
+
+
+def cached_metric_sources(metrics_root: Path) -> list[str]:
+    return [path.parent.name for path in _metric_files(metrics_root) if _manifest_bytes(path) is not None]
 
 
 # ─── per-unit and per-kind state ─────────────────────────────────────────────
@@ -575,7 +597,7 @@ class _Kind:
     bridge: bool  # carry a unit across one missed scrape (see _BRIDGE_INTERVALS)
     value_note: bool  # derive how often the headline values change
     # Fields that stay the same through a job: the header names them (node_allocation_text),
-    # and they get no chart or stats row.
+    # and they get no chart or stats row. They are read even without a unit (cpu_count).
     constant: tuple[str, ...] = ()
 
 
@@ -587,7 +609,7 @@ _KIND_SPECS = {GPU: _GPU_KIND, SYSTEM: _SYSTEM_KIND}
 
 
 class _Field:
-    """One metric slot of a series: a numeric field of its rows, or the derived memory used %."""
+    """One slot of a series: a metric's field, one the header names, or the derived memory used %."""
 
     __slots__ = ("key", "unit", "low", "high", "factor", "derived", "rank", "seen")
 
@@ -777,10 +799,11 @@ class _Series:
     def _replan(self, doc: dict) -> _Plan:
         spec = self.spec
         keys = list(doc)
-        # Strings are never metrics, so a field holding one (an id, an epoch) is left out of
-        # rows of this shape; a null field stays in, since a later row may measure it. The
-        # derived memory % keeps its own key: a field of that name would be the same quantity.
-        metric_keys = [key for key in keys if is_metric_field(key) and key != spec.memory
+        # The metrics' fields and the ones the header names. Strings are never metrics, so a
+        # field holding one (an id, an epoch) is left out of rows of this shape; a null field
+        # stays in, since a later row may measure it. The derived memory % keeps its own key:
+        # a field of that name would be the same quantity.
+        metric_keys = [key for key in keys if (is_metric_field(key) or key in spec.constant) and key != spec.memory
                        and (doc[key] is None or type(doc[key]) in (float, int))]
         chosen = set(metric_keys)
         order = metric_keys + [key for key in keys if key not in chosen]
@@ -1832,21 +1855,21 @@ def _snapshot(series: _Series, partial: bool) -> KindResource:
     hold_s = max(_REPORTING_TOLERANCE_S, 3 * (interval or series.min_interval or 0))
     capture = _Capture(series, hold_s)
     slots = series.charted()
-    native = _Native(series, hold_s, slots)
+    # The fields the header names are in each unit's newest values, but in no chart or stats row.
+    shown = [slot for slot in slots if series.fields[slot].key not in spec.constant]
+    native = _Native(series, hold_s, shown)
     raw_covers_job = series.raw_start <= series.chart_start
     frames = {
         name: (
-            _raw_frame(series, name, duration, capture, native, hold_s, slots)
+            _raw_frame(series, name, duration, capture, native, hold_s, shown)
             if duration is not None or raw_covers_job
-            else _binned_frame(series, name, capture, native, slots)
+            else _binned_frame(series, name, capture, native, shown)
         )
         for name, duration in RANGES.items()
     }
     metrics = []
-    for slot in slots:
+    for slot in shown:
         column = series.fields[slot]
-        if column.key in spec.constant:
-            continue
         if column.unit == "%":
             scale = 100.0
         else:
@@ -1965,11 +1988,7 @@ class ResourceLoader:
         older bytes are read.
         """
         present: dict[str, tuple[Path, list[str], int, bool]] = {}
-        try:
-            paths = sorted(self.metrics_root.glob("*/gpu.jsonl"))
-        except OSError:
-            paths = []
-        for path in paths:
+        for path in _metric_files(self.metrics_root):
             manifest = _read_manifest(path)
             if manifest is not None:
                 present[path.parent.name] = (path, *manifest)
@@ -2240,15 +2259,6 @@ def resource_loader(metrics_root: Path) -> ResourceLoader:
         while len(_LOADERS) > _MAX_LOADERS:
             _LOADERS.popitem(last=False)
         return loader
-
-
-def forget_resource_loaders(metrics_roots) -> None:
-    """Drop the shared loaders of cache directories whose files were removed, and
-    with them what was read from those files."""
-    keys = {str(Path(root).resolve()) for root in metrics_roots}
-    with _LOADERS_GUARD:
-        for key in keys:
-            _LOADERS.pop(key, None)
 
 
 # ─── GPU type and allocation ─────────────────────────────────────────────────
@@ -2584,11 +2594,6 @@ def format_age(seconds: float) -> str:
     return f"{seconds // 86400}d {seconds % 86400 // 3600}h"
 
 
-def sampling_text(sub_job: KindResource, now: datetime) -> str:
-    """``scraped every 5 s (values change about every 1m)  ·  newest 40 s ago (12:34:56)``."""
-    return f"{scrape_text(sub_job)}  ·  {freshness_text(sub_job, now)}"
-
-
 def scrape_text(sub_job: KindResource, *, notes: bool = True) -> str:
     """``scraped every 5 s (values change about every 1m)``; ``notes=False``: ``scraped every 5 s``.
 
@@ -2644,19 +2649,6 @@ def window_label(name: str) -> str:
     return "whole job" if name == "all" else f"last {name}"
 
 
-def metric_title(view: KindView, name: str, width: int | None = None) -> str:
-    """``training #0 · power (W) · last 10m · mean of 8 GPUs`` (``name`` is what goes before the window).
-
-    Wider than ``width``, it leaves out what the values are (the stats name it),
-    then ends in ``…`` where it is cut; it never wraps.
-    """
-    base = f"{name} · {window_label(view.name)}"
-    full = f"{base} · {view.label}" if view.label else base
-    if width is None or len(full) <= width:
-        return full
-    return base if len(base) <= width else views.fit_cells(base, max(1, width))
-
-
 _STAT_NAMES = ("min", "avg", "max", "latest")
 # In place of the stats a sub-job's older samples are needed for: while they download,
 # and once a download has ended without them (it failed; the header says why).
@@ -2674,28 +2666,10 @@ def window_complete(sub_job: KindResource, view: KindView) -> bool:
     )
 
 
-def metric_stats_text(view: KindView, whole: KindView | None, metrics, *, width: int, partial: bool = False,
-                      window_partial: bool = False, missing: str = LOADING_OLDER) -> str:
-    """Min / avg / max / latest of every metric in ``metrics``, over the view's window and over the whole job.
-
-    One row per metric, its values in the metric's unit (:func:`format_value`).
-    ``whole`` is the same unit's (or the mean's) ``"all"`` view. ``partial``: the
-    whole job's history is not read yet; ``window_partial``: nor is the window's;
-    their stats read ``missing`` instead. A min or max that only bounds the true
-    value reads ``≤`` or ``≥``. The widest layout that fits ``width`` is used: the
-    metrics' names, their short names, then a row per metric and scope with the
-    names cut to fit. The scope titles name what the values are (``mean of 8
-    GPUs``, ``GPU 3``), and so does the first line of the narrow layout.
-    """
-    lines = _stats_lines(view, whole, metrics, width=width, partial=partial, window_partial=window_partial,
-                         missing=missing, hues=None)
-    return "\n".join("".join(text for text, _style in line) for line in lines)
-
-
 def metric_stats_spans(view: KindView, whole: KindView | None, metrics, *, width: int, partial: bool = False,
                        window_partial: bool = False, missing: str = LOADING_OLDER,
                        hues=None) -> list[list[tuple[str, str]]]:
-    """:func:`metric_stats_text` as lines of ``(text, style)`` spans: each metric's
+    """The stats block as lines of ``(text, style)`` spans: each metric's
     name in its chart's colour (``hues``, in the metrics' order; :func:`chart_hue`
     without), the latest values bold, the column heads muted."""
     metrics = list(metrics)
@@ -2706,7 +2680,7 @@ def metric_stats_spans(view: KindView, whole: KindView | None, metrics, *, width
 
 def _stats_lines(view: KindView, whole: KindView | None, metrics, *, width: int, partial: bool,
                  window_partial: bool, missing: str, hues) -> list[list[tuple[str, str]]]:
-    """The lines of :func:`metric_stats_text`, as ``(text, style)`` spans (styled with ``hues``)."""
+    """The stats block's lines, as ``(text, style)`` spans (styled with ``hues``)."""
     metrics = list(metrics)
     window_partial = window_partial or (partial and view.name == "all")
     scopes = [(window_label(view.name), None if window_partial else view)]

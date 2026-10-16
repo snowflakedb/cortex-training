@@ -554,16 +554,6 @@ class DemoClient:
         end = start + len(page)
         return {"jobs": page, "next_page_token": f"demo-{seal}.{end}" if end < len(rows) else None}
 
-    def iter_jobs(self, **filters):
-        """Every job of the account-wide list, page after page (the filters of :meth:`list_jobs_page`)."""
-        token = None
-        while True:
-            page = self.list_jobs_page(**filters, page_token=token)
-            yield from page["jobs"]
-            token = page["next_page_token"]
-            if token is None:
-                return
-
     def for_job(self, job: dict) -> "DemoClient":
         """A view of this client bound to ``job``'s database and schema, as ``CortexTrainingClient.for_job``."""
         view = copy.copy(self)  # shares the jobs, stores and caches
@@ -598,11 +588,8 @@ class DemoClient:
         return older + [first + k * interval for k in range(int((total - first) // interval) + 1)]
 
     def download_metrics(self, job_id: str, output_dir, *, resume: bool = False, priority=(),
-                         newest_first_seconds=None, on_commit=None) -> list:
-        """The client's download, generated: ``priority`` sub-jobs first, ``on_commit`` after each file.
-
-        Each file is written whole, so there is no partial, newest-first commit.
-        """
+                         on_commit=None) -> list:
+        """The client's download, generated: ``priority`` sub-jobs first, ``on_commit`` after each file."""
         job = self._on_stage(job_id)
         refused = self._experiment_refusal(job)
         if refused is not None:
@@ -679,7 +666,7 @@ class DemoClient:
                                 encoding="utf-8")
             written.append({"sub_job_id": sid, "path": str(path)})
             if on_commit is not None:
-                on_commit({**written[-1], "complete": True})
+                on_commit(dict(written[-1]))
         return written
 
     def _system_row(self, rng: random.Random, sid: str, node: int, gpus: int, t: float, phase: float, stamp: str,
@@ -965,5 +952,3 @@ class DemoClient:
                         "content": "".join(json.dumps(r) + "\n" for r in records)})
         return out
 
-    def close(self) -> None:
-        pass

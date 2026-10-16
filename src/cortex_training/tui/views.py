@@ -38,8 +38,10 @@ from rich.cells import cell_len
 
 from cortex_training.tui.format import ACTIVE_STATUSES
 from cortex_training.tui.format import compact_number
+from cortex_training.tui.format import cut_cells
 from cortex_training.tui.format import subjob_config
 from cortex_training.tui.format import local_time
+from cortex_training.tui.format import one_line as _one_row
 from cortex_training.tui.format import parse_ts  # noqa: F401 - views.parse_ts for the screens
 from cortex_training.tui.format import printable
 from cortex_training.tui.format import source_label
@@ -220,10 +222,11 @@ def is_unknown(job: Any) -> bool:
 # ─── names and comments ──────────────────────────────────────────────────────
 
 NAME_WIDTH = 80  # a one-line name is cut to this many terminal cells
-# printable (from format.py, so the Logs tab's one-line helper uses the same rule)
-# replaces the characters a terminal would act on, or that reorder or hide the
-# text around them, with U+FFFD, and keeps at most format.MAX_COMBINING_MARKS
-# combining diacritics on one character.
+# printable, cut_cells and one_line come from format.py, so the Logs tab draws by
+# the same rule: escape sequences are removed whole, the other characters a
+# terminal would act on, or that reorder or hide the text around them, become
+# U+FFFD, and a character keeps at most format.MAX_COMBINING_MARKS combining
+# diacritics.
 
 
 def collapse(text: Any) -> str:
@@ -238,7 +241,7 @@ def printable_data(value: Any) -> Any:
     to replace is returned as it is, so a large job list costs little.
     """
     if isinstance(value, str):
-        return value if value.isprintable() else printable(value)
+        return printable(value)
     if isinstance(value, dict):
         return {printable_data(key): printable_data(item) for key, item in value.items()}
     if isinstance(value, list):
@@ -253,34 +256,12 @@ def cell_width(text: str) -> int:
     return cell_len(text)
 
 
-def _cut_cells(text: str, width: int) -> str:
-    """The longest start of ``text`` that fits in ``width`` cells, never splitting
-    a character; ``""`` when even the first one is wider.
-
-    Each candidate start is measured whole with ``cell_len`` (a binary search on
-    its length), so wide and combining characters count as the terminal draws
-    them. (Not ``rich.cells.chop_cells``: before rich 13.7 it returns its pieces
-    in reverse order.)
-    """
-    if width <= 0 or not text:
-        return ""
-    if cell_len(text) <= width:
-        return text
-    fits, too_long = 0, len(text)  # text[:fits] fits in width; text[:too_long] does not
-    while too_long - fits > 1:
-        mid = (fits + too_long) // 2
-        if cell_len(text[:mid]) <= width:
-            fits = mid
-        else:
-            too_long = mid
-    return text[:fits]
-
-
 def fit_cells(text: str, width: int) -> str:
-    """``text`` cut to at most ``width`` terminal cells, ending in ``…`` when cut."""
+    """``text`` cut to at most ``width`` terminal cells, ending in ``…`` when cut
+    (see :func:`cortex_training.tui.format.cut_cells`)."""
     if cell_len(text) <= width:
         return text
-    return _cut_cells(text, width - 1).rstrip() + "…"
+    return cut_cells(text, width - 1).rstrip() + "…"
 
 
 def wrap_cells(line: str, width: int) -> list:
@@ -308,10 +289,10 @@ def wrap_cells(line: str, width: int) -> list:
                 rows.append(row.rstrip())
                 row = ""
                 continue
-            head = _cut_cells(token, width - cell_len(row))
+            head = cut_cells(token, width - cell_len(row))
             if not head:  # not even one character fits after the indent
                 row = ""
-                head = _cut_cells(token, width) or token[0]
+                head = cut_cells(token, width) or token[0]
             rows.append(row + head)
             row, token = "", token[len(head):]
     rows.append(row.rstrip())
@@ -335,7 +316,8 @@ def first_line(text: Any) -> str:
 
 
 def one_line(text: Any, width: int = NAME_WIDTH) -> str:
-    """The first non-blank line of ``text``, whitespace collapsed, ellipsized.
+    """The first non-blank line of ``text``, whitespace collapsed, ellipsized:
+    :func:`cortex_training.tui.format.one_line` of that line, at ``width`` cells.
 
     The ellipsis marks a line cut at ``width`` terminal cells and also a text
     that goes on past its first line.
@@ -343,10 +325,7 @@ def one_line(text: Any, width: int = NAME_WIDTH) -> str:
     lines = _text_lines(text)
     if not lines:
         return ""
-    first, more = lines[0], len(lines) > 1
-    if cell_len(first) > (width - 2 if more else width):
-        return _cut_cells(first, max(1, width - 1)).rstrip() + "…"
-    return f"{first} …" if more else first
+    return _one_row(lines[0] + (" …" if len(lines) > 1 else ""), max(1, width))
 
 
 def comment_of(job: Any) -> str:
@@ -361,42 +340,31 @@ def alias_of(job: dict, aliases: Optional[dict] = None) -> str:
 
 
 def display_name(job: dict, aliases: Optional[dict] = None) -> str:
-    """Local alias first, then the first line of the server-side ``comment``;
-    empty when neither."""
-    return alias_of(job, aliases) or one_line(comment_of(job))
+    """The job's local alias (set with ``n``), or ``""``. The server-side
+    ``comment`` is shown as the job's comment, never as its name."""
+    return alias_of(job, aliases)
 
 
 def search_name(job: dict, aliases: Optional[dict] = None) -> str:
-    """The name search matches: the job's whole local alias, else the whole first
-    line of its comment. Unlike :func:`display_name` it is never cut, so the end
-    of a long (or wide-character) name can be found too."""
-    return first_line((aliases or {}).get(job_id_of(job)) or "") or first_line(comment_of(job))
+    """The name search matches: the job's whole local alias. Unlike
+    :func:`display_name` it is never cut, so the end of a long (or wide-character)
+    name can be found too."""
+    return first_line((aliases or {}).get(job_id_of(job)) or "")
 
 
 def rename_prompt(job: dict, aliases: Optional[dict] = None) -> tuple:
-    """``(value, placeholder)`` for the rename prompt.
-
-    It starts with the job's alias, whole. Without one it starts empty, and the
-    placeholder shows the first line of the comment, which is already the job's
-    name, so Enter keeps that name instead of copying it into an alias.
-    """
-    alias = first_line((aliases or {}).get(job_id_of(job)) or "")
-    comment = first_line(comment_of(job))
-    return alias, fit_cells(comment, 70) if comment else "e.g. qwen3-8b lora sweep #3"
+    """``(value, placeholder)`` for the rename prompt: it starts with the job's
+    alias, whole, or empty with an example as the placeholder."""
+    return first_line((aliases or {}).get(job_id_of(job)) or ""), "e.g. qwen3-8b lora sweep #3"
 
 
 def alias_to_store(job: dict, typed: Any) -> str:
-    """The alias to keep for a name typed in the rename prompt; ``""`` for none.
-
-    A name that only repeats the first line of the job's comment is not kept:
-    without an alias, that line is the job's name already.
-    """
-    name = collapse(typed)
-    return "" if name == first_line(comment_of(job)) else name
+    """The alias to keep for a name typed in the rename prompt; ``""`` for none."""
+    return collapse(typed)
 
 
 def shown_name(job: dict, aliases: Optional[dict] = None) -> str:
-    """What the list and preview call a job: its display name, else its job id."""
+    """What the list and preview call a job: its local alias, else its job id."""
     return display_name(job, aliases) or job_id_of(job)
 
 
@@ -501,10 +469,6 @@ def _gpu_count(cfg: dict) -> int:
     (JSON's ``1e999`` reads as infinity)."""
     count = _as_float(cfg.get("n_gpus"))
     return int(count) if count is not None else 0
-
-
-def sub_job_gpus(sj: dict) -> int:
-    return _gpu_count(subjob_config(sj))
 
 
 _CONFIG_KEYS = {"training": "training_config", "sampling": "inference_config", "log_prob": "inference_config"}
@@ -671,8 +635,8 @@ def summary_fields(job: dict, name: str, now: datetime) -> list:
     """(label, value) rows for the job preview, in display order.
 
     ``name`` is the one-line display name; without one the row shows the job
-    id. A job with a ``comment`` also gets a ``Comment`` row with all of it,
-    unless the name already shows all of it. A time the job record lacks is
+    id. A job with a ``comment`` also gets a ``Comment`` row with all of it.
+    A time the job record lacks is
     ``—``, with no "ago" after it.
     """
     models = job_models(job)
@@ -690,7 +654,7 @@ def summary_fields(job: dict, name: str, now: datetime) -> list:
     updated, ago = fmt_ts(job.get("updated_at")), fmt_ago(job.get("updated_at"), now)
     return [
         ("Name", name or job_id_of(job)),
-        *([("Comment", comment)] if comment and comment != name else []),
+        *([("Comment", comment)] if comment else []),
         ("Job ID", job_id_of(job)),
         *([("Location", location)] if location else []),
         ("Status", status_word(job.get("status")).upper()),
@@ -822,7 +786,6 @@ _FIELD_ALIASES = {
     "database_name": "db",
     "schema_name": "schema",
 }
-_OPS = (">=", "<=", "!=", ":", "=", ">", "<")
 _TOKEN = re.compile(r"^([A-Za-z_][\w.]*)(>=|<=|!=|:|=|>|<)(.+)$")
 # One search token: runs of anything but blanks and quotes, and quoted pieces.
 _RAW_TOKEN = re.compile(r"""(?:[^\s"']+|"[^"]*"|'[^']*')+""")
@@ -1260,9 +1223,6 @@ def sql_identifier(name: str) -> str:
     ``CortexTrainingClient.for_job``'s rule: ``TEAM_DB`` stays bare, ``ml`` becomes ``"ml"``.
     """
     return name if _PLAIN_IDENTIFIER.fullmatch(name) else '"' + name.replace('"', '""') + '"'
-
-
-_sql_identifier = sql_identifier  # the older private name
 
 
 def identifier_name(text: str) -> str:

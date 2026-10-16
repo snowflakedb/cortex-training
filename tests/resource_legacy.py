@@ -22,7 +22,6 @@ from cortex_training.tui.resource import KindView
 from cortex_training.tui.resource import Metric
 from cortex_training.tui.resource import ResourceData
 from cortex_training.tui.resource import SeriesStats
-from cortex_training.tui.resource import metric_stats_text
 from cortex_training.tui.resource import render_metric_chart
 
 BUSY, MEMORY = "gpu_util_pct", "fb_used_pct"
@@ -145,7 +144,3 @@ def gpu_jobs(data: ResourceData) -> dict[str, SubJob]:
     return {sub_job_id: legacy(kinds[GPU]) for sub_job_id, kinds in data.kinds.items() if GPU in kinds}
 
 
-def stats_text(view: RangeView, whole: RangeView | None, **options) -> str:
-    """The Resources stats block of the busy and memory rows alone, for ``view``'s window and the whole job."""
-    metrics = [view.metrics[BUSY], view.metrics[MEMORY]]
-    return metric_stats_text(view.kind_view, whole.kind_view if whole is not None else None, metrics, **options)

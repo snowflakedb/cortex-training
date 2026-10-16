@@ -181,6 +181,10 @@ class LogCache:
 
     DEFAULT_MAX_BYTES = 50 * 1024 * 1024
     DEFAULT_MAX_LINES = 100_000
+    # A source's file past max_bytes is cut to this share of it. Cut to just under
+    # max_bytes, the next append took it over again, and every append rewrote (and
+    # fsynced) the whole file; this leaves room for a fifth of the budget first.
+    TRIM_TO = 0.8
 
     def __init__(
         self,
@@ -304,9 +308,6 @@ class LogCache:
                 total -= 1  # torn last line / corruption: skip
         return out, total
 
-    def load(self, source_id: str, *, limit: Optional[int] = None) -> Tuple[list, Optional[str]]:
-        return self.load_entries(source_id, limit=limit), self.get_cursor(source_id)
-
     def cached_sources(self) -> list:
         """Source ids that have cached log data on disk for this job. Lets the
         TUI show previously-viewed sources (and replay them) even when a live
@@ -335,14 +336,17 @@ class LogCache:
                 lines = f.readlines()
         except OSError:
             return
-        # Keep the newest max_lines, then drop from the front until within bytes.
-        kept = deque(lines, maxlen=self._max_lines)
-        kept = list(kept)
-        budget = self._max_bytes
+        # Keep the newest max_lines, then drop from the front until within the share
+        # of max_bytes a trim leaves (TRIM_TO): about a fifth of the file, in one cut
+        # (a pop from the front per line moved every line after it, each time).
+        kept = list(deque(lines, maxlen=self._max_lines))
+        budget = int(self._max_bytes * self.TRIM_TO)
         total = sum(len(s.encode("utf-8")) for s in kept)
-        while kept and total > budget:
-            total -= len(kept[0].encode("utf-8"))
-            kept.pop(0)
+        start = 0
+        while start < len(kept) and total > budget:
+            total -= len(kept[start].encode("utf-8"))
+            start += 1
+        kept = kept[start:]
         # The cursor is intentionally NOT touched: history is bounded but the
         # resume position is preserved, so reopen still delta-fetches correctly.
         _atomic_write_text(path, "".join(kept))
@@ -405,102 +409,6 @@ def prune_consoles(*, root: Optional[Path] = None, keep: Optional[Path] = None,
         total -= size
         removed.append(console)
     return removed
-
-
-def prune_metrics(*, keep: Path, root: Optional[Path] = None) -> list:
-    """Remove the cached telemetry (``jobs/<job>/metrics/``) of every job but the
-    one in ``keep``, so the cache holds the telemetry of the job being viewed only.
-    Best effort: what can't be removed now goes next time. Returns the removed
-    directories, resolved."""
-    jobs = (root if root is not None else cache_root()) / "jobs"
-    keep_path = keep.resolve()
-    removed = []
-    for metrics in jobs.glob("*/metrics"):
-        try:
-            path = metrics.resolve()
-        except OSError:
-            continue
-        if path == keep_path:
-            continue
-        shutil.rmtree(path, ignore_errors=True)
-        removed.append(path)
-    return removed
-
-
-# One empty file per running TUI (named by its pid), so the last one to exit can tell
-# that no other still reads the cache before it removes what was downloaded.
-_SESSIONS = ".sessions"
-
-
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # it exists; another user's
-    except OSError:
-        return False
-    return True
-
-
-def _other_sessions(root: Path) -> list:
-    """The pids of the other TUIs still running on this cache; markers of ended ones go."""
-    live = []
-    for marker in (root / _SESSIONS).glob("*"):
-        try:
-            pid = int(marker.name)
-        except ValueError:
-            continue
-        if pid == os.getpid():
-            continue
-        if _pid_alive(pid):
-            live.append(pid)
-        else:
-            try:
-                marker.unlink()
-            except OSError:
-                pass
-    return live
-
-
-def remove_downloads(root: Optional[Path] = None) -> None:
-    """Remove every job's downloaded data (``jobs/``: logs, saved consoles,
-    telemetry, tail cursors). Local job names (``aliases.json``) stay."""
-    shutil.rmtree((root if root is not None else cache_root()) / "jobs", ignore_errors=True)
-
-
-def begin_session(root: Optional[Path] = None) -> Optional[Path]:
-    """Mark this TUI as running on the cache. With no other TUI running, first
-    remove what a session that couldn't clean up (one that was killed) left.
-    Returns this session's marker, for :func:`end_session`."""
-    root = root if root is not None else cache_root()
-    try:
-        if not _other_sessions(root):
-            remove_downloads(root)
-        folder = root / _SESSIONS
-        folder.mkdir(parents=True, exist_ok=True)
-        marker = folder / str(os.getpid())
-        marker.touch()
-        return marker
-    except OSError:
-        return None
-
-
-def end_session(marker: Optional[Path], root: Optional[Path] = None) -> None:
-    """This TUI is done: unmark it and, when no other TUI still runs on the cache,
-    remove every job's downloaded data."""
-    root = root if root is not None else cache_root()
-    if marker is not None:
-        try:
-            marker.unlink()
-        except OSError:
-            pass
-    try:
-        if not _other_sessions(root):
-            remove_downloads(root)
-    except OSError:
-        pass
 
 
 def _note_persist_error(exc: BaseException) -> None:

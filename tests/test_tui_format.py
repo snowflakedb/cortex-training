@@ -18,14 +18,8 @@
 from cortex_training.tui.format import entry_at_level
 from cortex_training.tui.format import entry_matches
 from cortex_training.tui.format import format_created_at
-from cortex_training.tui.format import format_event
 from cortex_training.tui.format import format_job_config
-from cortex_training.tui.format import format_job_row
-from cortex_training.tui.format import format_job_summary
 from cortex_training.tui.format import format_log_entry
-from cortex_training.tui.format import job_matches
-from cortex_training.tui.format import job_status_color
-from cortex_training.tui.format import sort_jobs
 from cortex_training.tui.format import source_label
 from cortex_training.tui.format import wrap_log_line
 
@@ -58,29 +52,6 @@ def test_format_non_dict_entry():
     assert format_log_entry("already a string") == "already a string"
 
 
-def test_format_event_full():
-    out = format_event(
-        {
-            "ts": "2026-06-12T00:01:00Z",
-            "kind": "zone_transition",
-            "zone": "training-1",
-            "from": "creating",
-            "to": "ready",
-            "sub_job_id": "s:training:0",
-            "detail": "zone_manager=zm-1",
-        }
-    )
-    assert "zone_transition" in out
-    assert "zone=training-1" in out
-    assert "creating→ready" in out
-    assert "sub_job=s:training:0" in out
-    assert "zone_manager=zm-1" in out
-
-
-def test_format_event_minimal():
-    assert format_event({"kind": "route_added"}) == "route_added"
-
-
 def test_source_label_names_the_component():
     # Sources are sub-jobs: "<type> #<index>", type from job_type or the id.
     assert source_label({"sub_job_id": "u:training:0", "job_type": "training"}) == "training #0"
@@ -94,35 +65,6 @@ def test_source_label_falls_back_to_server_label_then_id():
     assert source_label({"source_id": "weird"}) == "weird"
 
 
-def test_format_job_row():
-    row = format_job_row(
-        {
-            "job_id": "abc-123",
-            "status": "RUNNING",
-            "created_at": "2026-06-13T18:49:54Z",
-            "sub_jobs": [{"job_type": "training"}, {"job_type": "sampling"}],
-        }
-    )
-    assert "RUNNING" in row and "abc-123" in row and "training" in row and "sampling" in row
-    assert "2026-06-1" in row  # created date shown (tz may shift the day by ±1)
-    assert "│" in row  # column separators present
-    # JOB_STATE_ prefix stripped; type shown; missing created → placeholder column
-    no_ts = format_job_row({"id": "j", "status": "JOB_STATE_FAILED", "job_type": "training"})
-    assert no_ts.startswith("FAILED") and "training" in no_ts and "│" in no_ts and "—" in no_ts
-    assert format_job_row({"job_id": "j"}).startswith("?")  # missing status
-
-
-def test_job_status_color():
-    # Subtle: only live jobs get a hue (green); everything else stays default.
-    assert job_status_color("RUNNING") == "green"
-    assert job_status_color("JOB_STATE_PENDING") == "green"
-    assert job_status_color("FAILED") == ""
-    assert job_status_color("CANCELLED") == ""
-    assert job_status_color("TERMINATED") == ""
-    assert job_status_color(None) == ""
-    assert job_status_color("weird") == ""
-
-
 def test_format_created_at():
     import re
 
@@ -131,55 +73,6 @@ def test_format_created_at():
     assert format_created_at(None) == ""
     assert format_created_at("") == ""
     assert format_created_at("not-a-date") == ""
-
-
-def test_sort_jobs_newest_first():
-    jobs = [
-        {"job_id": "old", "created_at": "2026-06-10T00:00:00Z"},
-        {"job_id": "new", "created_at": "2026-06-13T00:00:00Z"},
-        {"job_id": "mid", "created_at": "2026-06-11T00:00:00Z"},
-        {"job_id": "none"},  # missing created_at -> sorts last
-    ]
-    order = [j["job_id"] for j in sort_jobs(jobs)]
-    assert order == ["new", "mid", "old", "none"]
-    assert sort_jobs("not a list") == []
-
-
-def test_sort_jobs_stable_on_equal_timestamps():
-    jobs = [
-        {"job_id": "first", "created_at": "2026-06-12T00:00:00Z"},
-        {"job_id": "second", "created_at": "2026-06-12T00:00:00Z"},
-    ]
-    # equal created_at keeps original order (stable)
-    assert [j["job_id"] for j in sort_jobs(jobs)] == ["first", "second"]
-
-
-def test_format_job_summary():
-    job = {
-        "status": "RUNNING",
-        "sub_jobs": [
-            {
-                "job_type": "TRAINING",
-                "model_name": "Qwen/Qwen3-0.6B",
-                "training_config": {
-                    "n_gpus": 1.0,
-                    "max_seq_len": 128.0,
-                    "train_batch_size": 1.0,
-                    "optimizer": {"name": "adamw", "lr": 1e-5},
-                },
-            }
-        ],
-    }
-    s = format_job_summary(job)
-    assert s.startswith("RUNNING")
-    assert "training" in s and "Qwen/Qwen3-0.6B" in s
-    assert "gpus=1" in s and "seq=128" in s and "bs=1" in s
-    assert "opt=adamw/lr=1e-05" in s
-    assert "gbs=" not in s and "clip=" not in s  # only what was passed
-    # failure reason is appended
-    failed = {"status": "FAILED", "reason": "oom killed", "sub_jobs": []}
-    assert format_job_summary(failed).endswith("reason: oom killed")
-    assert format_job_summary("not a dict") == ""
 
 
 def test_format_job_config_is_config_only():
@@ -205,15 +98,6 @@ def test_format_job_config_is_config_only():
     assert "gpus=1" in s and "seq=128" in s and "opt=adamw/lr=1e-05" in s
     assert "FAILED" not in s and "reason" not in s  # status/reason live on the subtitle
     assert format_job_config("not a dict") == ""
-
-
-def test_job_matches():
-    job = {"job_id": "abc-123", "status": "RUNNING", "sub_jobs": [{"job_type": "training", "model_name": "Qwen3"}]}
-    assert job_matches(job, "") is True
-    assert job_matches(job, "abc") and job_matches(job, "run")
-    assert job_matches(job, "qwen") and job_matches(job, "training")
-    assert not job_matches(job, "sampling")
-    assert job_matches("not a dict", "q") is False
 
 
 def test_entry_matches():

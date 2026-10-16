@@ -21,8 +21,9 @@ hardware), and the TUI draws all of it on a terminal. A string that carries an
 escape sequence would act there: retitle the window, write the clipboard
 (OSC 52), or hide the rest of the screen. So the TUI reads them through
 :func:`printable_client`, which returns every string in them, dict keys too,
-through :func:`cortex_training.tui.views.printable`: control, bidi and
-zero-width characters become U+FFFD before any screen sees them.
+through :func:`cortex_training.tui.format.printable`: escape sequences are
+removed whole, and control, bidi and zero-width characters become U+FFFD,
+before any screen sees them.
 
 Log lines don't go through these reads; the Logs tab draws them itself. Like
 ``views.py`` this never imports ``textual``.
@@ -59,8 +60,6 @@ class PrintableClient:
             return value
         if name in _RECORD_READS:
             return _printable_answer(value)
-        if name == "iter_jobs":
-            return _printable_rows(value)
         if name == "for_job":
             return _printable_child(value)
         return value
@@ -79,11 +78,6 @@ def printable_client(client: Any) -> Any:
     return PrintableClient(client)
 
 
-def unwrapped(client: Any) -> Any:
-    """The client a :class:`PrintableClient` wraps; any other client as it is."""
-    return client.wrapped if isinstance(client, PrintableClient) else client
-
-
 # functools.wraps keeps each method's signature for inspect.signature: the job
 # list passes retry bounds to list_jobs only when the client's method takes them.
 def _printable_answer(method):
@@ -92,15 +86,6 @@ def _printable_answer(method):
         return printable_data(method(*args, **kwargs))
 
     return read
-
-
-def _printable_rows(method):
-    @functools.wraps(method)
-    def rows(*args, **kwargs):
-        for row in method(*args, **kwargs):
-            yield printable_data(row)
-
-    return rows
 
 
 def _printable_child(method):

@@ -35,7 +35,6 @@ import inspect
 import os
 import shlex
 import shutil
-import signal
 import tempfile
 import threading
 import time
@@ -96,6 +95,8 @@ from textual.widgets._toast import ToastRack
 from textual.widgets.data_table import RowKey
 from textual.worker import get_current_worker
 
+from cortex_training import DownloadCancelled
+from cortex_training import NoChunksError
 from cortex_training.tui import format as log_format
 from cortex_training.tui import log_cache
 from cortex_training.tui import views
@@ -131,7 +132,6 @@ from cortex_training.tui.log_cache import cached_log_pages
 from cortex_training.tui.log_cache import catching_up
 from cortex_training.tui.log_cache import job_cache_dir
 from cortex_training.tui.log_cache import prune_consoles
-from cortex_training.tui.log_cache import prune_metrics
 from cortex_training.tui.log_cache import touch_console
 from cortex_training.tui.log_style import LogHighlighter
 from cortex_training.tui.log_style import line_kind
@@ -152,7 +152,6 @@ from cortex_training.tui.resource import cached_metric_sources
 from cortex_training.tui.resource import chart_hue
 from cortex_training.tui.resource import format_value
 from cortex_training.tui.resource import freshness_text
-from cortex_training.tui.resource import forget_resource_loaders
 from cortex_training.tui.resource import gpu_allocation
 from cortex_training.tui.resource import has_metric_samples
 from cortex_training.tui.resource import headline_metric
@@ -989,7 +988,8 @@ class _JobTable(PickableTable):
         without add_row's work per row, nor the idle pass's measure of each new row
         (the larger part of the time a few thousand rows took to fill): every
         column has a fixed width and every row one line, so there is nothing to
-        measure, and that pass only sets the table's size.
+        measure, and that pass only sets the table's size. Where that shortcut
+        isn't safe (see :meth:`_fills_fast`) it does exactly that instead.
         """
         if not self._fills_fast():
             self.clear()
@@ -1020,9 +1020,15 @@ class _JobTable(PickableTable):
         self.check_idle()
 
     def _fills_fast(self) -> bool:
-        """Whether :meth:`replace_rows` may set the rows directly: this Textual keeps
-        them as it expects, and no column sizes itself to its cells."""
-        return (_Row is not None and all(hasattr(self, name) for name in self._FAST_FILL)
+        """Whether :meth:`replace_rows` may set the rows directly: the installed
+        Textual is the release it was written and tested against (``TEXTUAL_FLOOR``,
+        the floor pyproject.toml sets), whose DataTable keeps them as it expects, and
+        no column sizes itself to its cells. Any other release, a later 8.x too, gets
+        the rows through DataTable's own methods: were its internals to change, the
+        shortcut would corrupt the table rather than fail."""
+        from cortex_training.tui.__main__ import textual_is_floor
+
+        return (_Row is not None and textual_is_floor() and all(hasattr(self, name) for name in self._FAST_FILL)
                 and not any(column.auto_width for column in self.columns.values()))
 
     _FAST_FILL = ("_data", "_row_locations", "_require_update_dimensions", "_update_count", "_highlight_cursor")
@@ -1044,8 +1050,8 @@ class JobListScreen(FollowsPointer, Screen):
     marker, or →/← on its row, unfolds or folds it, and ``e`` unfolds or folds
     every job. Live jobs start unfolded.
 
-    A job's name is its local alias, else the first line of its server
-    ``comment``, else its id. Search matches aliases, comments, partial ids and
+    A job's name is its local alias, else its id; its server ``comment`` shows
+    after it, dimmed. Search matches aliases, comments, partial ids and
     locations (case-insensitive) and takes ``field<op>value`` filters over the
     training configuration; see :func:`cortex_training.tui.views.parse_query`.
     """
@@ -1284,11 +1290,6 @@ class JobListScreen(FollowsPointer, Screen):
                 at_created, at_updated = labels.index("Created"), labels.index("Updated")
                 columns[at_created], columns[at_updated] = columns[at_updated], columns[at_created]
         return _ListLayout(tuple(columns), compact)
-
-    @property
-    def _name_width(self) -> int:
-        """The Name column's width (0 before the columns exist)."""
-        return dict(self._layout.columns).get("Name", 0) if self._layout is not None else 0
 
     def _set_columns(self, table: DataTable, layout: _ListLayout) -> None:
         """Set the table's columns up for ``layout`` (clearing it) when they aren't the ones it has."""
@@ -1611,7 +1612,6 @@ class JobListScreen(FollowsPointer, Screen):
 
         def done(value):
             if value is not None:
-                # A name that only repeats the comment's first line stores no alias.
                 self._aliases.set(jid, views.alias_to_store(job, value))
                 self._render_jobs(keep=jid)
 
@@ -1638,12 +1638,6 @@ class JobListScreen(FollowsPointer, Screen):
             self._search_timer.stop()
             self._search_timer = None
         self._render_jobs()
-
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
-        # Enter in the box runs action_submit_search first; this covers a submit
-        # from anywhere else (a test, or a future binding of the Input's own).
-        if event.input.id == "jobfilter":
-            await self.action_submit_search()
 
     @work(thread=True, group="jobs")
     def _load_jobs(self, manual: bool = False, account: bool = False, asked: bool = False) -> None:
@@ -1770,21 +1764,15 @@ class JobListScreen(FollowsPointer, Screen):
 
     @staticmethod
     def _name_cell(job: dict, aliases: dict, unfolded: bool | None = None) -> _FixedCell:
-        """The Name cell: the alias (then the comment, kept visible), else the
-        comment's first line, else the job id; after a ▾ or ▸ marker for a job
-        that unfolds (``unfolded`` True or False; None: it has nothing to unfold).
-        Plain text, never markup."""
+        """The Name cell: the job's local alias, else its job id, then its comment
+        (dimmed) when it has one; after a ▾ or ▸ marker for a job that unfolds
+        (``unfolded`` True or False; None: it has nothing to unfold). Plain text,
+        never markup."""
         alias = views.alias_of(job, aliases)
         comment = views.one_line(views.comment_of(job))
-        # An alias that only repeats the comment's first line is shown once.
-        if alias and views.first_line(aliases.get(views.job_id_of(job))) != views.first_line(views.comment_of(job)):
-            parts = [(alias, "bold")]
-            if comment:
-                parts.append((f"  {comment}", "grey62"))
-        elif comment:
-            parts = [(comment, "bold")]
-        else:
-            parts = [(views.job_id_of(job), "grey50")]
+        parts = [(alias, "bold")] if alias else [(views.job_id_of(job), "grey50")]
+        if comment:
+            parts.append((f"  {comment}", "grey62"))
         if unfolded is not None:
             parts.insert(0, ("▾ " if unfolded else "▸ ", "grey50"))
         # The column cuts a long name: it ends in "…" there, as everywhere a name is cut.
@@ -2062,9 +2050,15 @@ class JobListScreen(FollowsPointer, Screen):
     def _older_matches(self, query, aliases: dict) -> list:
         """Ids of the jobs older than six months (hidden) that ``query`` matches, newest first."""
         now = self._clock()
-        old = [j for j in self._all_jobs if not views.within_retention(j, now)]
         home = self._clients.home
-        found = [j for j in old if views.job_matches_query(j, query, views.search_name(j, aliases), home=home)]
+        found = []
+        for job in self._all_jobs:
+            if views.within_retention(job, now):
+                continue
+            # Each keystroke searches them again: their search text is kept, as the shown jobs' is.
+            name = views.search_name(job, aliases)
+            if views.job_matches_query(job, query, name, home=home, hay=self._haystack(job, name)):
+                found.append(job)
         return [views.job_id_of(j) for j in views.sort_job_list(found, "created", True)]
 
     # ─── the table ───────────────────────────────────────────────────────────
@@ -2350,12 +2344,23 @@ def _fit_line(parts: list[list[tuple[str, int]]], order: list[int], width: int, 
     return line.truncate(width, ellipsis=True) if line.cell_length > width else line
 
 
+def _quiet_download(method) -> dict:
+    """``stale_after_seconds=None`` for a client whose download takes it. The TUI says
+    itself when a job's samples stop, so the client's stall check (a job read and a
+    listing on every call) is skipped."""
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return {}
+    return {"stale_after_seconds": None} if "stale_after_seconds" in parameters else {}
+
+
 class FittedFooter(Footer):
     """The footer, each key in it shown whole or not at all.
 
     Textual's footer cuts what doesn't fit at the command palette's key, docked
     at its right, mid-word (``a All G``). Here the keys that would be cut are
-    left out instead, from the right; a group of keys (``1234 Tabs``) goes as one.
+    left out instead, from the right; a group of keys (``23 Tabs``) goes as one.
     ``?`` still lists every key.
     """
 
@@ -2510,6 +2515,18 @@ class LogScreen(FollowsPointer, Screen):
         ("t tab", "t tab"),
     )
 
+    class _Note(str):
+        """One of the TUI's own lines in the log pane (a wait, a restart, where the live
+        tail begins), never log content. It is its text, as a str (the buffers, the filter
+        and save see it so); what marks it is the object, not the text, so a log line that
+        reads the same is still drawn, tagged and counted as a log line."""
+
+        __slots__ = ()
+
+    class _CallbackError(Exception):
+        """A callback a worker ran on the UI thread (see _post) raised: a bug in this view, not
+        a failure of the request the worker made. The callback's exception is its ``__cause__``."""
+
     def __init__(self, client, job_id, *, sub_job_id=None, poll_interval=1.0, job_status=None):
         super().__init__()
         self._client = client
@@ -2527,9 +2544,9 @@ class LogScreen(FollowsPointer, Screen):
         self._min_level = None  # None | INFO | WARNING | ERROR
         self._paused = False  # auto-scroll paused?
         self._current_source = None  # source currently being tailed
-        self._shown_lines: list[str] = []  # unwrapped lines on screen (for re-wrap)
+        self._shown_lines: list[str] = []  # unwrapped lines on screen (for re-wrap); the TUI's are _Notes
         self._wrap_width = -1  # content width the buffer is wrapped to (-1: unknown or mixed)
-        self._banners: set[str] = {"— live —"}  # the TUI's own status lines in the log pane
+        self._rewrap_timer = None  # wraps the pane again once a resize settles (see _schedule_rewrap)
         self._filter_timer = None
         self._last_line_at: str | None = None  # "last line HH:MM:SS": the newest live line's own time
         self._unmounted = False
@@ -2537,6 +2554,11 @@ class LogScreen(FollowsPointer, Screen):
         self._console_dir = job_cache_dir(job_id) / "console"
         self._state_changed_at = None  # when the job entered its current (terminal) state
         self._job_created_at = None  # ties a kept console to this job, not a reused id
+        # Each get_job is numbered as it is sent (see _next_job_read); the view takes an
+        # answer only if no read sent after it has been taken (see _take_job).
+        self._job_reads = 0
+        self._job_reads_lock = threading.Lock()
+        self._job_seq = 0  # the number of the read whose answer the view shows (0: none yet)
         self._stdout_inflight = False
         self._stdout_ready = False
         self._stdout_have: set[str] = set()  # sub-jobs whose saved console is in while the rest download
@@ -2636,7 +2658,6 @@ class LogScreen(FollowsPointer, Screen):
         self._apply_sources_width()
         self._update_subtitle()
         self._load_sources()
-        self._prune_other_metrics()
         after_refresh(self, self._focus_active_tab)
         self.set_interval(self._IDLE_CHECK_SECONDS, self._check_idle)
 
@@ -2750,18 +2771,30 @@ class LogScreen(FollowsPointer, Screen):
         after_refresh(self, self._rewrap)  # log pane width changed
 
     def on_resize(self, event) -> None:
-        # Reflow only the in-memory views; resize never performs I/O.
+        # Reflow only the in-memory views; resize never performs I/O. The log is
+        # wrapped again once the size settles (see _schedule_rewrap).
         self._apply_sources_width()  # fitted again, and never wider than the screen allows
-        after_refresh(self, self._rewrap)
+        self._schedule_rewrap()
         if self._resource_active():
             after_refresh(self, self._render_resource)
 
     def _tabs_resized(self) -> None:
         """The tabs changed size, with or without the terminal (see :class:`JobTabs`):
         wrap the log pane's lines and draw the charts again for the new width."""
-        after_refresh(self, self._rewrap)
+        self._schedule_rewrap()
         if self._resource_active():
             after_refresh(self, self._render_resource)
+
+    # A drag-resize sends one size after another: the pane is wrapped again once
+    # the size has held this long, for the width it ends on (the lines look as
+    # they would after the last size alone).
+    _REWRAP_SETTLE_SECONDS = 0.15
+
+    def _schedule_rewrap(self) -> None:
+        """UI thread. Wrap the log pane again for its new width once a resize settles (see _rewrap)."""
+        if self._rewrap_timer is not None:
+            self._rewrap_timer.stop()
+        self._rewrap_timer = self.set_timer(self._REWRAP_SETTLE_SECONDS, partial(after_refresh, self, self._rewrap))
 
     def action_refresh_sources(self) -> None:
         if self._resource_active():
@@ -2835,9 +2868,6 @@ class LogScreen(FollowsPointer, Screen):
     # can take a minute more: a newest sample older than this (or six sampling
     # intervals, if longer) means no new samples are arriving.
     _RESOURCE_STALE_SECONDS = 180
-    # A first download commits the chunks covering the window on screen (plus this
-    # much, for workers whose chunks trail each other) before the rest of the history.
-    _RESOURCE_NEWEST_SLACK_SECONDS = 180
     # The panel's two views, and what the header calls each view's telemetry.
     _RESOURCE_VIEWS = {GPU: "GPU Resources", SYSTEM: "System Resources"}
     _RESOURCE_WHAT = {GPU: "GPU metrics", SYSTEM: "system metrics"}
@@ -2927,8 +2957,7 @@ class LogScreen(FollowsPointer, Screen):
                 accept(cached)
 
             def committed(_result: dict) -> None:
-                # Each sub-job is painted as it lands, the one on screen first; a cold
-                # one lands twice, its newest chunks before the rest of its history.
+                # Each sub-job is painted as it lands, the one on screen first.
                 if worker.is_cancelled or not self._screen_open:
                     return
                 data = load()
@@ -2936,16 +2965,13 @@ class LogScreen(FollowsPointer, Screen):
                     accept(data)
 
             source = self._resource_source()
-            window = RANGES.get(self._resource_range)
             self._client.download_metrics(
                 self._job_id,
                 self._metrics_root,
                 resume=True,
                 priority=[source] if source else [],
-                newest_first_seconds=(
-                    window.total_seconds() + self._RESOURCE_NEWEST_SLACK_SECONDS if window is not None else None
-                ),
                 on_commit=committed,
+                **_quiet_download(self._client.download_metrics),
             )
             if worker.is_cancelled or not self._screen_open:
                 return  # the screen closed during the download; the next one to open reads it
@@ -3665,11 +3691,13 @@ class LogScreen(FollowsPointer, Screen):
             self._held = None
             if held is not None:
                 lines, empty_note = held
-                self._clear_pane()
                 if lines:
-                    self._write_lines(lines)
-                elif empty_note:
-                    self._write_line(self._no_log_output())
+                    # Wrapped off the UI thread (see _repaint): a console can be 20,000 lines.
+                    self._repaint([(None, line) for line in lines])
+                else:
+                    self._clear_pane()
+                    if empty_note:
+                        self._write_line(self._no_log_output())
                 self._render_log_status()
             if self._logview is not None:
                 self._logview.scroll_end(animate=False)
@@ -3679,8 +3707,8 @@ class LogScreen(FollowsPointer, Screen):
         """Apply the filter and level to what this view already has; never re-tail.
 
         A saved console is re-read from its local file; a live or cached tail is
-        repainted from the lines it has received. Either way it lands on the
-        newest lines.
+        repainted from the lines it has received. Either way the work is done
+        off the UI thread, and it lands on the newest lines.
         """
         if not self._current_source:
             return
@@ -3693,10 +3721,8 @@ class LogScreen(FollowsPointer, Screen):
         if self._saved_shown(self._current_source):
             self._paint_saved()
         else:
-            self._clear_pane()
-            self._write_lines([line for entry, line in self._entries if self._visible(entry, line)])
-            if self._entries_dropped:
-                self._pane_truncated = True  # older lines left the buffer before this repaint
+            # Older lines may have left the buffer before this repaint.
+            self._repaint(list(self._entries), self._filter, self._min_level, truncated=bool(self._entries_dropped))
         if self._logview is not None:
             self._logview.scroll_end(animate=False)
         self._render_log_status()
@@ -3769,31 +3795,54 @@ class LogScreen(FollowsPointer, Screen):
     def action_save_log(self) -> None:
         if not self._logs_active():
             return
-        self._save_log()
+        target = self._export_target()  # what the pane shows now, for the worker
+        if target is not None:
+            self._save_log(*target)
 
     @work(thread=True, exclusive=True, group="export")
-    def _save_log(self) -> None:
-        exported = self._take_export()
-        if exported is None:
-            return
-        src, file_path, text = exported
-        if not text:
-            # Nothing yet: never write (or overwrite an earlier save with) an empty file.
-            self._post(self._show_export_note, "nothing to save yet for this sub-job")
-            return
-        count = len(text.splitlines())
+    def _save_log(self, src: str, file_path: str, shown: list[str]) -> None:
+        """Worker thread. Save what :meth:`_export_target` named: the saved console at
+        ``file_path`` copied as it is, never read into memory (it can be gigabytes), else
+        the lines the tail cached, else ``shown``."""
         path = self._export_name(src)
         try:
             if file_path:
-                with open(path, "wb") as handle:
-                    handle.write(Path(file_path).read_bytes())
+                if not os.path.getsize(file_path):  # emptied since: as for an empty log, below
+                    self._post(self._show_export_note, "nothing to save yet for this sub-job")
+                    return
+                shutil.copyfile(file_path, path)
+                count = self._count_lines(path)
             else:
+                text = self._exported_text(src, "", shown)
+                if not text:
+                    # Nothing yet: never write (or overwrite an earlier save with) an empty file.
+                    self._post(self._show_export_note, "nothing to save yet for this sub-job")
+                    return
                 with open(path, "w", encoding="utf-8") as handle:
                     handle.write(text + "\n")
+                count = len(text.splitlines())
             msg = f"saved {self._count(count, 'line')} to {path}"
         except OSError as exc:  # noqa: BLE001
             msg = f"save failed: {exc}"
         self._post(self._show_export_note, msg)
+
+    # What ends a line for str.splitlines(), besides \r\n.
+    _LINE_BREAKS = ("\n", "\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\N{LINE SEPARATOR}",
+                    "\N{PARAGRAPH SEPARATOR}")
+
+    @classmethod
+    def _count_lines(cls, path: str) -> int:
+        """Worker thread. ``len(text.splitlines())`` for the file at ``path`` decoded as the
+        pane decodes it, read a block at a time rather than whole (a console can be
+        gigabytes). ``newline=""`` leaves each line break as it is."""
+        count, last = 0, ""
+        with open(path, encoding="utf-8", errors="replace", newline="") as handle:
+            while block := handle.read(1 << 20):
+                count += sum(block.count(mark) for mark in cls._LINE_BREAKS) - block.count("\r\n")
+                if last == "\r" and block.startswith("\n"):
+                    count -= 1  # one \r\n, split between two blocks
+                last = block[-1]
+        return count + (last != "" and last not in cls._LINE_BREAKS)  # a last line without a break
 
     @work(thread=True, exclusive=True, group="copy")
     def _copy_log(self) -> None:
@@ -3832,20 +3881,19 @@ class LogScreen(FollowsPointer, Screen):
         else:
             self.app.copy_everything(self, "the Resources tab")
 
-    @work(thread=True, group="prune-metrics")
-    def _prune_other_metrics(self) -> None:
-        # One job's telemetry on disk at a time: opening this job removes every other
-        # job's (it downloads again when that job's Resources tab is next shown).
-        removed = prune_metrics(root=self._metrics_root.parent.parent.parent, keep=self._metrics_root)
-        forget_resource_loaders(removed)
+    def _load_sources(self) -> None:
+        """UI thread. Read the job, then show its sub-jobs (see _read_sources)."""
+        # The row this screen was opened with (the list's or the preview's copy), as it is now.
+        self._read_sources(dict(getattr(self, "_job", None) or {}))
 
     @work(thread=True, exclusive=True, group="sources")
-    def _load_sources(self) -> None:
+    def _read_sources(self, row: dict) -> None:
         worker = get_current_worker()
         # Fetch the job once (GS metadata — survives after the zone is gone) for
         # the summary header, status (drives follow/cache), and the sub-job list.
         failed: Exception | None = None
         self._post(self._job_read_began)
+        seq = self._next_job_read()
         try:
             job = self._client.get_job(self._job_id) or {}
         except Exception as exc:  # noqa: BLE001 - best-effort; said in the pane when nothing else can show
@@ -3857,20 +3905,15 @@ class LogScreen(FollowsPointer, Screen):
             job = {}
         # An answer without a status or sub-jobs ({}) says no more than a failed call.
         answered = bool(job.get("status") or job.get("sub_jobs"))
-        if job.get("status"):
-            self._job_status = job.get("status")
         if answered:
-            self._job_reason = job.get("reason")  # clears a stale reason on refresh
-            self._state_changed_at = job.get("state_changed_at")
-            self._job_created_at = job.get("created_at")
-            self._take_job_details(job)
-            # The summary line (static config; status and reason go on the subtitle)
-            # is the screen's to draw: JobDetailScreen draws its own, without a flash of this one.
-            self._post(self._on_job_loaded, job)
-        self._post(self._update_subtitle)
-        # get_job failed or answered nothing: the row this screen was opened with (the
-        # list's or the preview's copy) still names the sub-jobs, or says the status is unavailable.
-        listed = job if answered else (getattr(self, "_job", None) or {})
+            # Status, reason and times are the UI thread's to take, in the order the reads
+            # were sent (see _take_job). The summary line (static config; status and reason
+            # go on the subtitle) is the screen's to draw: JobDetailScreen draws its own,
+            # without a flash of this one.
+            self._post(self._take_job, job, seq)
+        # get_job failed or answered nothing: the row this screen was opened with still
+        # names the sub-jobs, or says the status is unavailable.
+        listed = job if answered else row
 
         # Each sub-job is a tailable source (its zone-manager / Ray-head pod,
         # whose stdout already includes worker output via Ray log_to_driver).
@@ -3984,7 +4027,10 @@ class LogScreen(FollowsPointer, Screen):
         self._sub_job_missing = False
         self._no_sources = why[1] if why is not None else None
         items = [s for s in sources if s.get("sub_job_id")]
-        self._sub_job_status = {s["sub_job_id"]: s["status"] for s in items if s.get("status")}
+        if not self._job_seq:
+            # No get_job answer taken yet: the row the view was opened with says how the
+            # sub-jobs are. Once one is, _take_job keeps them as the newest answer says.
+            self._sub_job_status = {s["sub_job_id"]: s["status"] for s in items if s.get("status")}
         self._forget_failed_execution_logs()  # r retries an execution log that couldn't be read
         if why is not None:
             self._clear_pane()
@@ -4036,10 +4082,11 @@ class LogScreen(FollowsPointer, Screen):
         """How a buffered line is shown: a log line's display text (see
         ``format.display_line``), the TUI's own notes only made safe to draw.
         The buffer (and save and copy) keep the line as it came."""
+        if isinstance(line, self._Note):
+            return safe_text(line)  # never cached: the cache is by text, and a log line may read the same
         text = self._display_cache.get(line)
         if text is None:
-            text = safe_text(line) if line in self._banners else display_line(line)
-            self._display_cache[line] = text
+            text = self._display_cache[line] = display_line(line)
         return text
 
     def _line_prefixes(self) -> tuple[str, str]:
@@ -4048,7 +4095,7 @@ class LogScreen(FollowsPointer, Screen):
 
     def _prefixes(self, line: str) -> tuple[str, str]:
         """The row prefixes of ``line``: none for the TUI's own notes."""
-        return ("", "") if line in self._banners else self._line_prefixes()
+        return ("", "") if isinstance(line, self._Note) else self._line_prefixes()
 
     def _wrap(self, line: str, width: int) -> list[str]:
         """The rows ``line`` takes in a pane ``width`` cells wide."""
@@ -4071,9 +4118,32 @@ class LogScreen(FollowsPointer, Screen):
 
         Only teardown-class errors (``RuntimeError`` — NoActiveAppError and
         "event loop is closed" both derive from it) are swallowed; a real bug in
-        ``fn`` (Attribute/Type/Key/…) still propagates to ``_tail``'s handler so
-        it gets logged rather than silently stopping the tail."""
-        return call_on_screen(self, fn, *args, **kwargs)
+        ``fn`` (Attribute/Type/Key/…) comes back as a ``_CallbackError``, so a
+        worker never takes it for its own request failing (see _tail)."""
+        failed: list[Exception] = []
+
+        async def run():
+            try:
+                result = fn(*args, **kwargs)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:  # noqa: BLE001 - handed to the worker below
+                if isinstance(exc, RuntimeError) or (isinstance(exc, NoMatches) and not on_stack(self)):
+                    raise  # teardown, or a screen popped meanwhile: call_on_screen drops them
+                failed.append(exc)
+
+        delivered = call_on_screen(self, run)
+        if failed:
+            raise self._CallbackError(getattr(fn, "__qualname__", repr(fn))) from failed[0]
+        return delivered
+
+    def _ask(self, fn, *args):
+        """Worker thread. ``fn(*args)`` run on the UI thread, and what it returns: how a worker
+        reads the view as it is now, rather than its attributes from another thread. None once
+        the app is gone (see _post)."""
+        answer: list = []
+        self._post(lambda: answer.append(fn(*args)))
+        return answer[0] if answer else None
 
     def _saved_shown(self, source: str | None) -> bool:
         """Whether ``source`` shows its saved console: the whole job's download is in,
@@ -4095,34 +4165,32 @@ class LogScreen(FollowsPointer, Screen):
         root = "" if self._stage is None else self._stage.name
         return Path(root) / sub_job_id / "stdout.log"
 
-    def _console_may_be_incomplete(self) -> bool:
+    def _console_may_be_incomplete(self, seen: float | None, ended_at) -> bool:
         """Any thread. The job ended too recently for its console's last chunks to be uploaded for sure.
 
-        True when ``state_changed_at`` (when the job entered its terminal state)
-        is under _KEEP_CONSOLE_AFTER_SECONDS ago, or when this view had the
-        job running that recently, whatever the timestamps say.
+        True when ``ended_at`` (its ``state_changed_at``: when the job entered its
+        terminal state) is under _KEEP_CONSOLE_AFTER_SECONDS ago, or when this view
+        had the job running that recently (``seen``), whatever the timestamps say.
         """
-        seen = self._active_seen_at
         if seen is not None and time.monotonic() - seen < self._KEEP_CONSOLE_AFTER_SECONDS:
             return True
-        ended = views.parse_ts(self._state_changed_at)
+        ended = views.parse_ts(ended_at)
         if ended is None:
             return False
         return (datetime.now(timezone.utc) - ended).total_seconds() < self._KEEP_CONSOLE_AFTER_SECONDS
 
-    def _keep_console(self) -> None:
-        """Worker thread. Copy a downloaded console into the job's cache for the next open."""
-        ended = views.parse_ts(self._state_changed_at)
-        if self._stage is None or ended is None or not self._job_created_at:
+    def _keep_console(self, plan: LogScreen._Download) -> None:
+        """Worker thread. Copy the console ``plan`` downloaded into the job's cache for the next open."""
+        if not plan.root or views.parse_ts(plan.ended_at) is None or not plan.created_at:
             return
-        if self._console_may_be_incomplete():
+        if self._console_may_be_incomplete(plan.seen, plan.ended_at):
             return  # it may still be missing its last chunks: download it again next time
         tmp = None
         try:
             self._console_dir.parent.mkdir(parents=True, exist_ok=True)
             tmp = Path(tempfile.mkdtemp(prefix=".console-", dir=str(self._console_dir.parent)))
-            shutil.copytree(self._stage.name, tmp, dirs_exist_ok=True)
-            (tmp / ".complete").write_text(str(self._job_created_at), encoding="utf-8")
+            shutil.copytree(plan.root, tmp, dirs_exist_ok=True)
+            (tmp / ".complete").write_text(str(plan.created_at), encoding="utf-8")
             shutil.rmtree(self._console_dir, ignore_errors=True)
             os.replace(tmp, self._console_dir)
             tmp = None
@@ -4182,7 +4250,7 @@ class LogScreen(FollowsPointer, Screen):
         self._entries: deque[tuple[object, str]] = deque(maxlen=self._MAX_LINES)
         self._entries_dropped = 0
         self._display_cache: dict[str, str] = {}  # raw line -> what the pane shows (see _display)
-        self._export_note: str | None = None  # what s or y last did
+        self._export_note: str | None = None  # what s last did
         self._download_note: str | None = None  # the saved console's download progress, or its failure
         self._tail_error: str | None = None  # the live tail stopped on this error (the status line says so)
         self._tail_request: tuple[int, float] | None = None  # (tail gen, monotonic start) of the call in flight
@@ -4193,6 +4261,13 @@ class LogScreen(FollowsPointer, Screen):
         self._saved_matched_none = False  # the saved console has lines, but none pass the filter and level
         self._shown_rows: list[int] = []  # wrapped rows of each _shown_lines line
         self._rows_total = 0
+        self._shown_logs = 0  # the log lines among _shown_lines (the rest are the TUI's notes)
+        # A repaint of the pane being filtered and wrapped off the UI thread (see _repaint),
+        # the lines written meanwhile (shown again after its own), and its generation: a
+        # repaint that lands after a newer one, or after the pane was cleared, is dropped.
+        self._repaint_job: LogScreen._Repaint | None = None
+        self._repaint_pending: list[str] = []
+        self._repaint_gen = 0
         self._pane_truncated = False  # the pane no longer holds the source's oldest lines
         self._head_missing = False  # the tail (or its cache) never had the log's first lines
         self._saved_dropped = 0  # matching saved-console lines past _MAX_LINES
@@ -4364,6 +4439,7 @@ class LogScreen(FollowsPointer, Screen):
         # is over (the tail can notice the end before the status check does).
         self._waiting = self._waiting_note = None
         self._restart_note = None
+        self._cancel_repaint()  # what a repaint on its way would show, this paint replaces
         self._paint_gen += 1
         self._repainting = True
         self._prepare_saved(self._paint_gen, source, self._stdout_path(source), self._filter, self._min_level,
@@ -4380,7 +4456,7 @@ class LogScreen(FollowsPointer, Screen):
         self._display_cache.update(displays)
         # The TUI's own lines (shown untagged), after the console's.
         # A job that never got GPUs has no saved logs still to come.
-        notes = ([self._recent_console_note(console=console, newer=len(newer))]
+        notes = ([self._Note(self._recent_console_note(console=console, newer=len(newer)))]
                  if self._stdout_recent and not self._never_started() else [])
         empty = False
         if console:
@@ -4388,9 +4464,9 @@ class LogScreen(FollowsPointer, Screen):
             extra: list[str] = []
             if newer:
                 # Shown before the switch, and the console doesn't have them yet: keep them on screen.
-                banner = (f"— {self._count(len(newer), 'newer line')} from the live tail, not in the saved "
-                          "console yet" + ("; lines between the two may be missing" if gap else "") + " —")
-                self._banners.add(banner)
+                banner = self._Note(f"— {self._count(len(newer), 'newer line')} from the live tail, not in the "
+                                    "saved console yet" + ("; lines between the two may be missing" if gap else "")
+                                    + " —")
                 extra = [banner, *newer]
             self._saved_matched_none = total > 0 and not matched and not newer
         else:
@@ -4398,9 +4474,8 @@ class LogScreen(FollowsPointer, Screen):
             extra = self._execution_log_lines(source)
             empty = not total and not extra
             if empty and notes:
-                notes.insert(0, self._no_log_output())
+                notes.insert(0, self._Note(self._no_log_output()))
             self._saved_matched_none = total > 0 and not chunks
-        self._banners.update(notes)
         if self._paused:
             # Shown once the pause ends (p).
             self._held = ([line for line, _, _ in chunks] + extra + notes, empty)
@@ -4465,34 +4540,55 @@ class LogScreen(FollowsPointer, Screen):
         statuses = {}
         for sj in job.get("sub_jobs") or []:
             if isinstance(sj, dict):
-                sid = sj.get("sub_job_id") or sj.get("id")  # as _load_sources reads it
+                sid = sj.get("sub_job_id") or sj.get("id")  # as _read_sources reads it
                 if sid and sj.get("status"):
                     statuses[sid] = sj["status"]
         return statuses
 
+    def _next_job_read(self) -> int:
+        """Any thread. The number of a get_job about to be sent: a read sent later has a larger one."""
+        with self._job_reads_lock:
+            self._job_reads += 1
+            return self._job_reads
+
     def _take_job_details(self, job: dict) -> None:
-        """Any thread. What a fresh get_job says besides status and reason."""
+        """UI thread. What a fresh get_job says besides status and reason."""
         self._job_reason_details = job.get("reason_details") or None
         if job.get("status") and is_active_status(job["status"]):
             self._active_seen_at = time.monotonic()  # it hadn't ended yet
 
-    def _take_job(self, job: dict) -> None:
-        """UI thread. A fresh get_job replaces this view's status, reason, times and sub-job statuses."""
-        if not isinstance(job, dict) or not job.get("status"):
-            return
+    def _take_job(self, job: dict, seq: int | None = None) -> bool:
+        """UI thread. A fresh get_job replaces this view's status, reason, times and sub-job statuses.
+
+        ``seq`` numbers the read (see _next_job_read). Reads can answer out of order (one
+        that retries a slow service takes minutes), so an answer to a read sent before the
+        one the view shows is dropped; so is an answer that has the job live after the view
+        saw it end, which a job never comes back from. Returns whether ``job`` was taken.
+        """
+        if not isinstance(job, dict) or not (job.get("status") or job.get("sub_jobs")):
+            return False
+        if seq is not None and seq < self._job_seq:
+            return False  # a read sent later has answered already
+        if job.get("status") and is_active_status(job["status"]) and not is_active_status(self._job_status):
+            return False  # an older answer, whatever its number: the job has ended
+        if seq is not None:
+            self._job_seq = seq
         self._sub_job_status = self._sub_statuses(job)
         self._take_job_details(job)
         # A job that ended while the view was open has a new state_changed_at,
         # which decides whether its console is kept (_keep_console).
         self._state_changed_at = job.get("state_changed_at")
         self._job_created_at = job.get("created_at")
-        status = job["status"]
+        status = job.get("status") or self._job_status  # (an answer without one leaves it)
         reason = job.get("reason") or ""  # omitted: the job has no reason now
         if status != self._job_status or reason != (self._job_reason or ""):
             self._apply_terminal_status(status, reason)
+        else:
+            self._update_subtitle()  # its reason_details may have changed
         # The rest of the view (the summary line's reason and reason_details) as
         # the job is now: the tail can see the job end before the status check does.
         self._on_job_loaded(job)
+        return True
 
     @classmethod
     def _effective_status(cls, job_status, sub_job_status) -> str:
@@ -4698,22 +4794,33 @@ class LogScreen(FollowsPointer, Screen):
         worker = get_current_worker()
         # A terminal job's zone is gone, so the operation API would error: serve
         # cache, then one saved-console download. A running/unknown job follows live.
+        # A _CallbackError is a bug in this view showing what came, not a failed read:
+        # no get_job is sent to tell what it means (see _view_failed).
         try:
-            self._stream(worker, sub_job_id, gen, live=live)
-        except Exception as exc:  # noqa: BLE001 - surfaced in the UI
-            if worker.is_cancelled:
-                pass
-            elif live:
+            try:
+                self._stream(worker, sub_job_id, gen, live=live)
+            except self._CallbackError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - surfaced in the UI
+                if worker.is_cancelled:
+                    pass
+                elif live:
+                    self._post(self._tail_ended, gen)
+                    self._after_tail_error(worker, sub_job_id, gen, exc)
+                    return
+                elif not download:
+                    self._report_tail_error(sub_job_id, exc, gen)
+                    return
+            if live:
                 self._post(self._tail_ended, gen)
-                self._after_tail_error(worker, sub_job_id, gen, exc)
-                return
-            elif not download:
-                self._report_tail_error(sub_job_id, exc, gen)
-                return
-        if live:
-            self._post(self._tail_ended, gen)
-        if download:
-            self._run_download(sub_job_id)
+        except self._CallbackError as exc:
+            # (The saved console replaces a terminal job's cache replay in a moment.)
+            self._view_failed(sub_job_id, exc, gen, live=live, quiet=download)
+        if download:  # claimed for this tail (see _claim_stdout): it runs whatever the replay met
+            try:
+                self._run_download(sub_job_id)
+            except self._CallbackError as exc:
+                self._view_failed(sub_job_id, exc, gen, live=False)
 
     def _tail_ended(self, gen: int) -> None:
         if gen == self._tail_gen:
@@ -4875,7 +4982,7 @@ class LogScreen(FollowsPointer, Screen):
         # A saved console is the whole log: what the tail missed doesn't count there.
         if not (self._pane_truncated or (self._head_missing and not saved) or (saved and self._saved_dropped > 0)):
             return None
-        shown = sum(1 for line in self._shown_lines if line not in self._banners)  # log lines, not the TUI's notes
+        shown = self._shown_logs  # log lines, not the TUI's notes (kept as lines come and go: see _write_chunks)
         if not shown:
             return None
         full = f"{self._cli(f'download-log {shlex.quote(str(self._job_id))} --log-type stdout')} for the full log"
@@ -4900,9 +5007,9 @@ class LogScreen(FollowsPointer, Screen):
 
     def _no_match_note(self) -> str | None:
         """Say so when the filter or level hides every line the pane has for this sub-job."""
-        if not (self._filter or self._min_level) or self._repainting:
-            return None
-        if any(line not in self._banners for line in self._shown_lines):
+        if not (self._filter or self._min_level) or self._repainting or self._repaint_job is not None:
+            return None  # (the pane shows the lines before the repaint on its way)
+        if self._shown_logs:
             return None
         if not (self._saved_shown(self._current_source) and self._saved_matched_none) and not any(
                 entry is not None for entry, _ in self._entries):
@@ -4955,9 +5062,9 @@ class LogScreen(FollowsPointer, Screen):
         except Exception:  # noqa: BLE001
             pass
 
-    def _report_tail_error(self, sub_job_id: str, exc: BaseException, gen: int) -> None:
-        """Worker thread."""
-        self._log_traceback(f"tail {sub_job_id} failed")
+    def _report_tail_error(self, sub_job_id: str, exc: BaseException, gen: int, *, label: str | None = None) -> None:
+        """Worker thread. ``label``: what the error log calls the traceback."""
+        self._log_traceback(label or f"tail {sub_job_id} failed")
         error = views.describe_error(exc)
         self._post(
             self._show_tail_error,
@@ -4965,6 +5072,24 @@ class LogScreen(FollowsPointer, Screen):
             f"[error] tail {sub_job_id} failed: {error}  (r retries · full traceback: {_ERROR_LOG})",
             error,
         )
+
+    def _view_failed(self, sub_job_id: str, exc: Exception, gen: int, *, live: bool, quiet: bool = False) -> None:
+        """Worker thread, inside the ``except``: a callback the tail ran on the UI thread raised.
+
+        That is a bug in this view, not a failed request, so no get_job is sent to
+        tell what it means (see _after_tail_error). Its traceback goes to the error
+        log, and the tail stops as on any other error (``quiet``: the error log only).
+        """
+        label = f"tail {sub_job_id}: a bug in the TUI while showing its log"
+        if quiet:
+            self._log_traceback(label)
+            return
+        try:
+            if live:
+                self._post(self._tail_ended, gen)
+            self._report_tail_error(sub_job_id, exc.__cause__ or exc, gen, label=label)
+        except self._CallbackError:
+            pass  # the view can't say so either: the traceback is in the error log
 
     def _show_tail_error(self, gen: int, line: str, error: str = "") -> None:
         """UI thread. Only into the pane of the tail that failed, not one the viewer switched to since."""
@@ -4997,53 +5122,60 @@ class LogScreen(FollowsPointer, Screen):
         """
         if worker.is_cancelled or not self._screen_open:
             return
+        seq = self._next_job_read()
         try:
             job = self._client.get_job(self._job_id) or {}
         except Exception:  # noqa: BLE001 - a running job keeps the tail error
+            job = None
+        if job is None:
             if not worker.is_cancelled and self._screen_open:
-                self._report_tail_error(sub_job_id, exc, gen)
+                self._report_tail_error(sub_job_id, exc, gen)  # (the tail's traceback, not the read's)
             return
         if worker.is_cancelled or not self._screen_open:
             return
-        fresh = isinstance(job, dict) and bool(job.get("status"))
-        status = job.get("status") if fresh else self._job_status
-        if is_active_status(status):
-            if fresh:
-                self._post(self._take_job, job)
-            sub_status = self._sub_statuses(job).get(sub_job_id) if fresh else self._sub_job_status.get(sub_job_id)
-            word = self._effective_status(status, sub_status)
-            text = views.describe_error(exc)
+        # Decided on the UI thread, by the view's newest status: this answer's, unless
+        # an answer to a read sent later is on screen already (see _take_job).
+        step = self._ask(self._tail_failed, gen, sub_job_id, job, seq, views.describe_error(exc))
+        if step is None:
+            return
+        what, detail = step
+        if what == "error":
+            self._report_tail_error(sub_job_id, exc, gen)
+        elif what == "wait" and detail:
+            self._log_traceback(detail)
+        elif what == "download":
+            self._run_download(detail)
+
+    def _tail_failed(self, gen: int, sub_job_id: str, job, seq: int, text: str) -> tuple[str, str] | None:
+        """UI thread. What a live tail's failure (``text``) means, now that get_job answered
+        ``job`` (read ``seq``); see _after_tail_error. Returns what the tail's worker does
+        next: ``("error", "")`` report it, ``("wait", label)`` log it under ``label`` (none:
+        it is logged already) for the wait shown, ``("download", source)`` fetch the saved
+        console (claimed here), or None."""
+        if not self._screen_open:
+            return None
+        self._take_job(job, seq)
+        if is_active_status(self._job_status):
+            word = self._tail_status(sub_job_id)
             if self._NOT_ROUTED in text:
-                if sub_job_id not in self._unrouted_logged:  # the next answers would only repeat it
-                    self._unrouted_logged.add(sub_job_id)
-                    self._log_traceback(f"tail {sub_job_id} waiting (not routed yet)")
-                self._post(self._wait_after_error, gen, sub_job_id, "not-routed")
+                why, label = "not-routed", f"tail {sub_job_id} waiting (not routed yet)"
+                if sub_job_id in self._unrouted_logged:
+                    label = ""  # the next answers would only repeat it
+                self._unrouted_logged.add(sub_job_id)
             elif word in self._NOT_RUNNING_YET:
-                self._log_traceback(f"tail {sub_job_id} waiting ({word})")
-                self._post(self._wait_after_error, gen, sub_job_id, word)
+                why, label = word, f"tail {sub_job_id} waiting ({word})"
             elif self._PENDING_PLACEMENT in text:
-                self._log_traceback(f"tail {sub_job_id} waiting (pending placement, status {word})")
-                self._post(self._wait_after_error, gen, sub_job_id, "pending-placement")
+                why, label = "pending-placement", f"tail {sub_job_id} waiting (pending placement, status {word})"
             else:
-                self._report_tail_error(sub_job_id, exc, gen)
-            return
+                return "error", ""
+            self._wait_after_error(gen, sub_job_id, why)
+            return "wait", label
         # The job ended: show its saved console now.
-        if fresh:
-            if not self._post(self._take_job, job):
-                return
-        elif not self._post(self._apply_terminal_status, status, None):
-            return
-        if worker.is_cancelled or not self._screen_open:
-            return
-        try:
-            claimed = self.app.call_from_thread(self._claim_stdout)
-        except RuntimeError:
-            return
-        if not claimed:
+        if not self._claim_stdout():
             if self._saved_shown(self._current_source):
-                self._post(self._paint_saved)
-            return
-        self._run_download(self._current_source or "")
+                self._paint_saved()
+            return None
+        return "download", self._current_source or ""
 
     def _wait_after_error(self, gen: int, sub_job_id: str, why: str) -> None:
         """UI thread. The tail stopped because ``sub_job_id`` hasn't started: show the wait."""
@@ -5074,42 +5206,29 @@ class LogScreen(FollowsPointer, Screen):
             self._set_waiting("stopped", f"waiting: {name} is {why.upper()}; the tail starts again once it is running")
 
     def _run_download(self, sub_job_id: str) -> None:
-        # The saved console is the whole job's output, minutes for a long job: start it
-        # only once Logs is on screen, so a look at another tab doesn't pay for it.
-        while self._screen_open and self._tail_hidden():
-            time.sleep(0.25)
-        # r on a console fetched moments after the job ended: only the chunks uploaded since.
-        again = self._stdout_again
-        first = self._current_source or sub_job_id
-        # A client that can fetch one sub-job: the one on screen first, painted
-        # as soon as it is in, then the rest (resumed: that one is done).
-        by_sub_job = self._downloads_by_sub_job()
-        if self._screen_open:
-            self._post(self._download_started, first if by_sub_job else None)
-        if not self._screen_open:
-            if not self._post(self._finish_download, False):
-                self._cleanup_stage()
-            return
+        """Worker thread. The saved-console download this view claimed (see _claim_stdout):
+        _finish_download gives the claim back whatever happens, and the error log tells a bug
+        in this view (a _CallbackError) from a failed download."""
         ok = False
         problem = None
         recent = False
-        root = "" if self._stage is None else self._stage.name
-        resume = {"resume": True} if again else {}
         try:
-            if by_sub_job:
-                # Resumed in this view's own directory: a sub-job fetched already only gets newer chunks.
-                self._client.download_stdout_logs(self._job_id, root, sub_job_ids=[first], resume=True,
-                                                  chunk_progress=self._download_progress(first=True))
-                if not self._post(self._first_console_in, first, self._console_may_be_incomplete()):
-                    self._cleanup_stage()
-                    return
-                self._client.download_stdout_logs(self._job_id, root, resume=True,
-                                                  chunk_progress=self._download_progress(first=False))
-            else:
-                self._client.download_stdout_logs(self._job_id, root, **resume)
-            ok = True
-            recent = self._console_may_be_incomplete()
-            self._keep_console()
+            # The saved console is the whole job's output, minutes for a long job: start it
+            # only once Logs is on screen, so a look at another tab doesn't pay for it.
+            while self._screen_open and self._tail_hidden():
+                time.sleep(0.25)
+            # A client that can fetch one sub-job: the one on screen first, painted
+            # as soon as it is in, then the rest (resumed: that one is done).
+            by_sub_job = self._downloads_by_sub_job()
+            plan = self._ask(self._download_started, sub_job_id, by_sub_job) if self._screen_open else None
+            if plan is not None and self._fetch_consoles(plan):
+                ok = True
+                recent = self._console_may_be_incomplete(plan.seen, plan.ended_at)
+                self._keep_console(plan)
+        except DownloadCancelled:
+            pass  # the view closed; the next one resumes from what was saved
+        except self._CallbackError:
+            self._log_traceback(f"saved log {sub_job_id}: a bug in the TUI while showing it")
         except Exception as exc:  # noqa: BLE001 - keep the cache; record the traceback
             # Saved consoles are SQL on the job's Experiment: say so when the role can't read it.
             problem = views.access_hint(exc, "saved logs")
@@ -5117,25 +5236,66 @@ class LogScreen(FollowsPointer, Screen):
         if not self._post(self._finish_download, ok, problem, recent):
             self._cleanup_stage()
 
+    @dataclass(frozen=True)
+    class _Download:
+        """What a saved-console download fetches, as the view was when it started (see _download_started)."""
+
+        first: str | None  # the sub-job on screen, fetched before the others (None: the whole job at once)
+        again: bool  # only the chunks uploaded since the last download (r, moments after the job ended)
+        root: str  # the view's temporary directory, downloaded into
+        others: bool  # the job has other sub-jobs, fetched after ``first``
+        seen: float | None  # when a get_job last had the job live (monotonic seconds)
+        ended_at: object  # the job's state_changed_at
+        created_at: object  # ... and its created_at (see _keep_console)
+
+    def _fetch_consoles(self, plan: LogScreen._Download) -> bool:
+        """Worker thread. Download the saved consoles ``plan`` names; False once the app went away meanwhile."""
+        quiet = _quiet_download(self._client.download_stdout_logs)
+        if plan.first is None:
+            # r on a console fetched moments after the job ended: only the chunks uploaded since.
+            self._client.download_stdout_logs(self._job_id, plan.root, **quiet,
+                                              **({"resume": True} if plan.again else {}))
+            return True
+        # Resumed in this view's own directory: a sub-job fetched already only gets newer chunks.
+        try:
+            self._client.download_stdout_logs(self._job_id, plan.root, sub_job_ids=[plan.first], resume=True,
+                                              on_chunk=self._download_progress(first=True, others=plan.others), **quiet)
+        except NoChunksError:
+            pass  # the sub-job on screen saved no console (yet): the others still come
+        if not self._post(self._first_console_in, plan.first,
+                          self._console_may_be_incomplete(plan.seen, plan.ended_at)):
+            return False
+        self._client.download_stdout_logs(self._job_id, plan.root, resume=True,
+                                          on_chunk=self._download_progress(first=False, others=plan.others), **quiet)
+        return True
+
     def _downloads_by_sub_job(self) -> bool:
-        """Whether this client's download_stdout_logs takes sub_job_ids and progress
+        """Whether this client's download_stdout_logs takes sub_job_ids and on_chunk
         (an older client, or the demo's, downloads the whole job at once)."""
         try:
             parameters = inspect.signature(self._client.download_stdout_logs).parameters
         except (TypeError, ValueError):
             return False
-        return "sub_job_ids" in parameters and "progress" in parameters
+        return "sub_job_ids" in parameters and "on_chunk" in parameters
 
     # How often the download's chunk count is redrawn on the status line.
     _PROGRESS_SECONDS = 0.25
 
-    def _download_started(self, first: str | None) -> None:
-        """UI thread. A saved-console download starts: say so in the pane. ``first``: the
-        sub-job it fetches before the others (None: the whole job comes at once)."""
+    def _download_started(self, sub_job_id: str, by_sub_job: bool) -> LogScreen._Download | None:
+        """UI thread. A saved-console download starts: say so in the pane, and return what it
+        fetches, as the view is now. ``by_sub_job``: the client fetches the sub-job on screen
+        (else ``sub_job_id``) before the others; otherwise the whole job comes at once. None
+        once the view has closed."""
+        if not self._screen_open:
+            return None
+        first = (self._current_source or sub_job_id) if by_sub_job else None
         self._stdout_first = first
         self._stdout_others = first is not None and any(
             sid != first for sid in (*self._source_by_item.values(), *self._sub_job_status))
         self._write_line(self._download_banner(self._current_source))
+        return self._Download(first, self._stdout_again, "" if self._stage is None else self._stage.name,
+                              self._stdout_others, self._active_seen_at, self._state_changed_at,
+                              self._job_created_at)
 
     def _download_banner(self, source: str | None) -> str:
         """UI thread. The pane's line for ``source`` while the saved consoles download."""
@@ -5156,14 +5316,17 @@ class LogScreen(FollowsPointer, Screen):
             return f"— downloading {name}'s {one} first, then the other sub-jobs' ({mine} among them) —"
         return f"— downloading the other sub-jobs' {many} ({mine} among them) —"
 
-    def _download_progress(self, *, first: bool):
-        """Worker thread. The client's per-chunk callback: the chunk count on the status line, a few times a second."""
+    def _download_progress(self, *, first: bool, others: bool):
+        """Worker thread. The client's per-chunk callback: the chunk count on the status line, a few times a second.
+        ``others``: the job has sub-jobs fetched after the first."""
         last = [0.0]
-        others = self._stdout_others  # set by _download_started, before the download
 
-        def progress(sub_job_id: str, done: int, total: int) -> None:
+        def progress(sub_job_id: str, done: int, total: int, _bytes: int = 0) -> None:
+            if not self._screen_open:
+                # The view closed: the client stops at this chunk and keeps what it saved.
+                raise DownloadCancelled("the saved-console view closed")
             now = time.monotonic()
-            if done < total and now - last[0] < self._PROGRESS_SECONDS:
+            if last[0] < 0 or (done < total and now - last[0] < self._PROGRESS_SECONDS):
                 return
             last[0] = now
             name = views.sub_job_label(sub_job_id)
@@ -5172,7 +5335,12 @@ class LogScreen(FollowsPointer, Screen):
                         + (" (the other sub-jobs' come after it)" if others else ""))
             else:
                 text = f"downloading the other sub-jobs' saved consoles: {name}, chunk {done:,} of {total:,}"
-            self._post(self._show_download_note, text)
+            try:
+                self._post(self._show_download_note, text)
+            except self._CallbackError:
+                # A bug in drawing the count: it must not fail the download, which this call is part of.
+                last[0] = -1.0  # no more counts
+                self._log_traceback("showing a saved console's download progress failed (a bug in the TUI)")
 
         return progress
 
@@ -5245,9 +5413,7 @@ class LogScreen(FollowsPointer, Screen):
         if source not in self._exec_inflight:
             self._exec_inflight.add(source)
             self._load_execution_log(source)
-        note = "— no saved console for this sub-job; reading its execution log for the error —"
-        self._banners.add(note)
-        return [note]
+        return [self._Note("— no saved console for this sub-job; reading its execution log for the error —")]
 
     @work(thread=True, group="execution-log")
     def _load_execution_log(self, source: str) -> None:
@@ -5289,8 +5455,8 @@ class LogScreen(FollowsPointer, Screen):
 
     def _apply_execution_log(self, source: str, notes: list[str], records: list, failed: bool) -> None:
         self._exec_inflight.discard(source)
-        self._banners.update(notes)
-        self._exec_logs[source] = (notes, records)
+        # Its header is the TUI's own line; the records' lines are the log's.
+        self._exec_logs[source] = ([self._Note(note) for note in notes], records)
         if failed:
             self._exec_failed.add(source)
         if source == self._current_source and self._saved_shown(source):
@@ -5316,9 +5482,9 @@ class LogScreen(FollowsPointer, Screen):
 
     def _write_line(self, line: str) -> None:
         # Single lines are the TUI's own status lines, never log content.
-        self._banners.add(line)
-        self._buffer([(None, line)])
-        self._write_lines([line])
+        note = line if isinstance(line, self._Note) else self._Note(line)
+        self._buffer([(None, note)])
+        self._write_lines([note])
         if self._pane_truncated:
             self._render_log_status()  # it pushed a log line out: "last N lines" changes
 
@@ -5327,13 +5493,26 @@ class LogScreen(FollowsPointer, Screen):
         # Log.write_lines splits each piece on every line boundary (not just \n).
         return sum(len(piece.splitlines()) for piece in pieces)
 
+    @classmethod
+    def _log_lines(cls, lines) -> int:
+        """How many of ``lines`` are log lines, not the TUI's notes."""
+        return sum(1 for line in lines if not isinstance(line, cls._Note))
+
     def _clear_pane(self) -> None:
         # The pane is drawn again (another sub-job, filter or level): a highlight on the
-        # old lines would sit over other text, at the same line numbers.
-        self.clear_selection()
+        # old lines would sit over other text, at the same line numbers. A repaint on its
+        # way (see _repaint) was for what the pane showed before.
+        self._cancel_repaint()
+        self._reset_pane()
+
+    def _reset_pane(self, *, keep_selection: bool = False) -> None:
+        """Empty the pane and its buffers (see _clear_pane; a repaint that lands does it too)."""
+        if not keep_selection:
+            self.clear_selection()
         self._shown_lines = []
         self._shown_rows = []
         self._rows_total = 0
+        self._shown_logs = 0
         self._pane_truncated = False
         if self._logview is not None:
             self._logview.clear()
@@ -5354,6 +5533,7 @@ class LogScreen(FollowsPointer, Screen):
             drop += 1
         self._rows_total = total
         if drop:
+            self._shown_logs -= self._log_lines(lines[:drop])
             del lines[:drop]
             del rows[:drop]
             if not self._pane_truncated:
@@ -5366,6 +5546,10 @@ class LogScreen(FollowsPointer, Screen):
         # detached Log starts a Textual worker that crashes the app.
         if lv is None or not lines or not self._screen_open:
             return
+        if self._repaint_job is not None:
+            # Shown now, and again after the lines of the repaint on its way, which
+            # replaces what the pane shows when it lands (see _repaint).
+            self._repaint_pending.extend(lines)
         w = self._content_width()
         # A batch is wrapped from its newest line back, only as far as the
         # pane's line and row budgets reach: a repaint of a long log would
@@ -5384,9 +5568,11 @@ class LogScreen(FollowsPointer, Screen):
         chunks.reverse()
         self._write_chunks(chunks, w, cut=len(chunks) < len(lines))
 
-    def _write_chunks(self, chunks: list[tuple[str, list[str], int]], width: int, *, cut: bool = False) -> None:
+    def _write_chunks(self, chunks: list[tuple[str, list[str], int]], width: int, *, cut: bool = False,
+                      kinds: list | None = None) -> None:
         """UI thread. Append lines already wrapped to ``width``: (line, its rows, row count) each.
-        ``cut``: older lines of the same batch didn't fit."""
+        ``cut``: older lines of the same batch didn't fit; ``kinds``: each line's row kind, when
+        it was worked out with the wrapping (see _write_rows)."""
         lv = self._logview
         if lv is None or not chunks or not self._screen_open:
             return
@@ -5407,6 +5593,7 @@ class LogScreen(FollowsPointer, Screen):
         added = sum(rows for _, _, rows in chunks)
         self._shown_lines.extend(line for line, _, _ in chunks)
         self._shown_rows.extend(rows for _, _, rows in chunks)
+        self._shown_logs += self._log_lines(line for line, _, _ in chunks)
         self._rows_total += added
         if cut and not self._pane_truncated:
             self._pane_truncated = True
@@ -5417,7 +5604,7 @@ class LogScreen(FollowsPointer, Screen):
         lv.max_lines = max(1, self._rows_total)
         # One write_lines call per page keeps the UI responsive under
         # high-velocity logs (vs. a cross-thread hop + write per line).
-        self._write_rows(lv, wrapped, chunks, scroll_end=follow)
+        self._write_rows(lv, wrapped, chunks, scroll_end=follow, kinds=kinds)
         if follow and before + added > lv.max_lines:
             # Once full, Log drops its oldest rows and repaints only the rows past
             # its old end, which that has moved out of view, and a view already
@@ -5426,15 +5613,18 @@ class LogScreen(FollowsPointer, Screen):
         if len(self._display_cache) > 4 * self._MAX_LINES:
             self._prune_display_cache()
 
-    def _write_rows(self, lv: Log, rows: list[str], chunks, *, scroll_end: bool) -> None:
-        """Write ``rows`` (the pieces of ``chunks``: (line, its rows, row count) each) to the pane."""
+    def _write_rows(self, lv: Log, rows: list[str], chunks, *, scroll_end: bool, kinds: list | None = None) -> None:
+        """Write ``rows`` (the pieces of ``chunks``: (line, its rows, row count) each) to the pane.
+        ``kinds``: each chunk's row kind (see line_kind), worked out here when not given."""
         if not isinstance(lv, _LogPane):
             lv.write_lines(rows, scroll_end=scroll_end)
             return
-        kinds = []
-        for line, _pieces, count in chunks:
-            kinds += [line_kind(self._display(line), note=line in self._banners)] * count
-        lv.write_rows(rows, kinds, scroll_end=scroll_end)
+        if kinds is None:
+            kinds = [line_kind(self._display(line), note=isinstance(line, self._Note)) for line, _, _ in chunks]
+        row_kinds: list[str | None] = []
+        for kind, (_line, _pieces, count) in zip(kinds, chunks):
+            row_kinds += [kind] * count
+        lv.write_rows(rows, row_kinds, scroll_end=scroll_end)
 
     def _prune_display_cache(self) -> None:
         """Keep the display text of the lines this view still has, and drop the rest."""
@@ -5443,50 +5633,151 @@ class LogScreen(FollowsPointer, Screen):
         self._display_cache = {line: text for line, text in self._display_cache.items() if line in keep}
 
     def _rewrap(self) -> None:
-        """Re-wrap the on-screen buffer after the pane width changes."""
+        """Re-wrap the on-screen buffer after the pane width changes (off the UI thread: see _repaint)."""
         lv = self._logview
         if lv is None or not self._screen_open:
             return
         w = self._content_width()
-        if w <= 0 or w == self._wrap_width:
+        job = self._repaint_job
+        if w <= 0 or w == (job.width if job is not None else self._wrap_width):
             return
-        self._wrap_width = w
-        # A paused reader keeps their place: the line at the top of the view stays there
-        # (the one a re-wrap still scrolling to it named, when two come close together).
-        top_line = None
-        if self._paused:
-            top_line = self._pending_top if self._pending_top is not None else self._line_at_row(
-                int(lv.scroll_offset.y))
-        before = len(self._shown_lines)
-        # Re-wrap from the newest line back, as many lines as the widget's rows hold.
+        if job is not None:
+            # A repaint is on its way (a new filter's, say): it is made again for this width.
+            self._repaint(job.pairs, job.query, job.level, rewrap=job.rewrap, truncated=job.truncated, top=job.top,
+                          keep_pending=True)
+        elif not self._shown_lines:
+            self._wrap_width = w  # nothing to wrap
+        else:
+            # A paused reader keeps their place: the line at the top of the view stays there
+            # (the one a re-wrap still scrolling to it named, when two come close together).
+            top = None
+            if self._paused:
+                top = self._pending_top if self._pending_top is not None else self._line_at_row(
+                    int(lv.scroll_offset.y))
+            self._repaint([(None, line) for line in self._shown_lines], rewrap=True, truncated=self._pane_truncated,
+                          top=top)
+
+    # ─── repaints: the pane's lines filtered and wrapped off the UI thread ──
+    @dataclass(frozen=True)
+    class _Repaint:
+        """A repaint of the log pane on its way (see _repaint)."""
+
+        pairs: list  # (entry, line) each, oldest first
+        query: str  # the filter, and the level, they must pass
+        level: object
+        width: int  # the pane width they are wrapped to
+        rewrap: bool  # the lines on screen, at a new width (a highlight on them stays, as it always has)
+        truncated: bool  # the pane doesn't hold the source's oldest lines, whatever this repaint fits
+        top: int | None  # a paused reader's line (an index into pairs), back at the top of the view after
+
+    def _repaint(self, pairs: list, query: str = "", level=None, *, rewrap: bool = False, truncated: bool = False,
+                 top: int | None = None, keep_pending: bool = False) -> None:
+        """UI thread. Show the ``pairs`` ((entry, line) each, oldest first, the TUI's notes among
+        them) that pass ``query`` and ``level``, filtered and wrapped off the UI thread
+        (_prepare_rows) and shown by _apply_rows: the pane's 20,000 lines take a while, and keys
+        keep working meanwhile. Until then the pane keeps what it shows; the lines written
+        meanwhile (a page of the tail) show at once, and again after the repaint's when it
+        lands (``keep_pending``: those written since the repaint this one replaces, too).
+        ``rewrap``: the lines on screen, at a new width; ``truncated``: the pane doesn't hold the
+        source's oldest lines, whatever this one fits; ``top``: the line of ``pairs`` a paused
+        reader had at the top of the view."""
+        if not keep_pending:
+            self._repaint_pending = []
+        self._repaint_gen += 1
+        self._repaint_job = job = self._Repaint(pairs, query, level, self._content_width(), rewrap, truncated, top)
+        # The worker reads none of the view's state: what it needs is passed as it is now.
+        self._prepare_rows(self._repaint_gen, job, self._line_prefixes(), dict(self._display_cache))
+
+    def _cancel_repaint(self) -> None:
+        """UI thread. Drop the repaint on its way, and the lines kept for after it: the pane is drawn anew."""
+        if self._repaint_job is not None:
+            self._repaint_job = None
+            self._repaint_gen += 1
+        self._repaint_pending = []
+
+    @work(thread=True, exclusive=True, group="wrap")
+    def _prepare_rows(self, gen: int, job: LogScreen._Repaint, prefixes: tuple[str, str], known: dict) -> None:
+        """Worker thread. Filter and wrap ``job``'s lines for the pane; _apply_rows shows them.
+        ``known``: the display cache's texts (see _display)."""
+        worker = get_current_worker()
+        wrapped = self._wrap_pairs(job.pairs, job.query, job.level, job.width, prefixes, known,
+                                   lambda: worker.is_cancelled)
+        if wrapped is not None and not worker.is_cancelled:
+            self._post(self._apply_rows, gen, *wrapped)
+
+    @classmethod
+    def _wrap_pairs(cls, pairs: list, query: str, level, width: int, prefixes: tuple[str, str], known: dict,
+                    cancelled) -> tuple[list, list, dict, bool] | None:
+        """Any thread. The newest of ``pairs`` that pass ``query`` and ``level`` (the TUI's notes
+        always do), wrapped to ``width`` from the newest back as far as the pane's line and row
+        budgets reach. Returns ``(chunks, kinds, displays, cut)`` for _write_chunks: each kept
+        line's rows and row kind (see line_kind), the display text of the log lines ``known``
+        lacked, and whether an older line that passes didn't fit; None once ``cancelled()``."""
+        first, rest = prefixes
+        query = query.lower()
         chunks: list[tuple[str, list[str], int]] = []
+        kinds: list[str | None] = []
+        displays: dict[str, str] = {}
         total = 0
-        for line in reversed(self._shown_lines):
-            chunk = self._wrap(line, w)
-            rows = self._row_count(chunk)
-            if chunks and total + rows > self._MAX_ROWS:
+        cut = False
+        for n, (entry, line) in enumerate(reversed(pairs)):
+            if n % 1024 == 0 and cancelled():
+                return None
+            note = isinstance(line, cls._Note)
+            if not note and not ((not query or query in line.lower()) and entry_at_level(entry, level)):
+                continue
+            if len(chunks) >= cls._MAX_LINES:
+                cut = True
                 break
-            chunks.append((line, chunk, rows))
+            if note:  # as _display and _prefixes show it
+                text = safe_text(line)
+                pieces = wrap_log_line(text, width, max_rows=cls._MAX_ROWS_PER_LINE)
+            else:
+                text = known.get(line)
+                if text is None:
+                    text = displays.get(line)
+                    if text is None:
+                        text = displays[line] = display_line(line)
+                pieces = wrap_log_line(text, width, first=first, rest=rest, max_rows=cls._MAX_ROWS_PER_LINE)
+            rows = cls._row_count(pieces)
+            if chunks and total + rows > cls._MAX_ROWS:
+                cut = True
+                break
+            chunks.append((line, pieces, rows))
+            kinds.append(line_kind(text, note=note))
             total += rows
         chunks.reverse()
-        if len(chunks) < len(self._shown_lines) and not self._pane_truncated:
-            self._pane_truncated = True
-            self._render_log_status()
-        self._shown_lines = [line for line, _, _ in chunks]
-        self._shown_rows = [rows for _, _, rows in chunks]
-        self._rows_total = total
-        lv.clear()
-        lv.max_lines = max(1, total)
+        kinds.reverse()
+        return chunks, kinds, displays, cut
+
+    def _apply_rows(self, gen: int, chunks: list, kinds: list, displays: dict, cut: bool) -> None:
+        """UI thread. Show what _prepare_rows filtered and wrapped, then the lines written meanwhile,
+        unless a newer repaint, or a clear, superseded it."""
+        job = self._repaint_job
+        lv = self._logview
+        if gen != self._repaint_gen or job is None or lv is None or not self._screen_open:
+            return
+        self._repaint_job = None
+        pending, self._repaint_pending = self._repaint_pending, []
+        self._display_cache.update(displays)
+        self._reset_pane(keep_selection=job.rewrap)
+        self._wrap_width = job.width
         # One write for the whole buffer: a call per row took seconds at 20,000 lines.
-        self._write_rows(lv, [piece for _, chunk, _ in chunks for piece in chunk], chunks, scroll_end=False)
-        # Re-wrapping clears + repaints (resetting scroll to the top), so snap
-        # back to the tail unless the user has paused to read history; then back
-        # to the line they were reading (the oldest kept, if that one was dropped).
+        self._write_chunks(chunks, job.width, cut=cut, kinds=kinds)
+        if job.truncated and not self._pane_truncated:
+            self._pane_truncated = True  # older lines had left the view before this repaint
+        self._write_lines(pending)
+        # The pane was emptied, which leaves it at its top: back to the tail unless the reader has
+        # paused to read history; then back to the line they were reading (the oldest kept, if
+        # that one was dropped).
         if not self._paused:
             lv.scroll_end(animate=False)
-        elif top_line is not None:
-            self._pending_top = max(0, top_line - (before - len(chunks)))
+        elif job.top is not None:
+            self._pending_top = max(0, job.top - (len(job.pairs) - len(chunks)))
             after_refresh(self, self._scroll_to_pending_top)
+        if job.width != self._content_width():
+            after_refresh(self, self._rewrap)  # the pane changed width meanwhile
+        self._render_log_status()
 
     def _scroll_to_pending_top(self) -> None:
         """After a re-wrap's layout: put the paused reader's line back at the top of the view."""
@@ -5550,7 +5841,7 @@ class CortexTrainingLogTUI(App):
     PromptScreen { align: center middle; }
     #prompt { width: 80; height: auto; border: thick $accent; background: $surface; padding: 1 2; }
     #prompt-hint { color: $text-muted; }
-    /* Text-selection highlight: reuse the picker's subtle "blurred cursor"
+    /* Text-selection highlight: reuse the table's subtle "blurred cursor"
        shade so it's visible but not a heavy saturated block. */
     LogScreen > .screen--selection {
         background: $block-cursor-blurred-background;
@@ -5600,7 +5891,10 @@ class CortexTrainingLogTUI(App):
         self._press_moved = False
         self._copy_selection = False
         self._copy_note: Notification | None = None  # the last copy's note (see copy_out)
-        self._copy_noted = False  # while copy_out copies: it says what it copied itself
+        self._copy_what: str | None = None  # while copy_out copies: what its note calls the text
+        # This machine's clipboard takes one copy at a time, in order (see _copy_locally).
+        self._copy_lock = threading.Lock()
+        self._copies = 0  # copies started so far: the last one is the one the clipboard keeps
         self._press_input: Input | None = None  # a text box a left-button press went to
         self._press_table = False  # a press on a table, which tells its own clicks from its drags
         self._dragged = False  # the last press moved before its release
@@ -5613,31 +5907,54 @@ class CortexTrainingLogTUI(App):
             return False  # a letter in a search, filter or prompt
         return True
 
-    def copy_to_clipboard(self, text: str) -> bool:
+    def copy_to_clipboard(self, text: str) -> None:
         """The terminal's clipboard (OSC 52, which some terminals ignore) and this
-        machine's (see :mod:`cortex_training.tui.clipboard`). True when this machine's
-        took it. Nothing to copy leaves the clipboard as it was. Textual's own copies
-        (ctrl+c in a text box) come here too, and say so as the TUI's do."""
+        machine's (see :mod:`cortex_training.tui.clipboard`), then a note saying so.
+        Nothing to copy leaves the clipboard as it was. Textual's own copies (ctrl+c
+        in a text box) come here too, and say so as the TUI's do.
+
+        OSC 52 goes out at once. This machine's clipboard is written on a worker
+        thread, and the note comes when that is done: its tool can take seconds
+        (xclip waits out its timeout when ``DISPLAY`` is gone), and on this thread
+        the screen froze for as long."""
         if not text:
-            return False
+            return
         super().copy_to_clipboard(text)
-        local = copy_local(text)
-        if not self._copy_noted:
-            self._note_copy(copied_note(f"{len(text):,} characters", local), local)
-        return local
+        self._copies += 1
+        self._copy_locally(text, self._copy_what or f"{len(text):,} characters", self._copies)
+
+    @work(thread=True, group="clipboard")
+    def _copy_locally(self, text: str, what: str, copy: int) -> None:
+        """Worker thread: put ``text`` on this machine's clipboard, then show the note
+        for it (``what`` names it). Copies take turns, in the order they were made, so
+        the clipboard ends with the last; one that a newer copy replaced while it
+        waited is skipped, and the newer one's note follows."""
+        with self._copy_lock:
+            if copy != self._copies:
+                return
+            local = copy_local(text)
+            # Still in turn: the next copy's note can't come before this one's.
+            try:
+                self.call_from_thread(self._note_copy, copied_note(what, local), local)
+            except RuntimeError:  # the app stopped meanwhile
+                pass
 
     _COPY_NOTE_SECONDS = 3
     _BLOCK_COPY_SECONDS = 0.15  # after a click, when a double or triple click's block is copied
     _SENT_NOTE_SECONDS = 8  # the note when only the terminal's clipboard got it: longer, with a tip
 
     def copy_out(self, text: str, what: str) -> None:
-        """Copy ``text`` and say so: ``what`` names it ("3 lines")."""
-        self._copy_noted = True
+        """Copy ``text`` and say so once it is copied: ``what`` names it ("3 lines")."""
+        text = safe_text(text)
+        self._copy_what = what
         try:
-            local = self.copy_to_clipboard(safe_text(text))
+            self.copy_to_clipboard(text)
         finally:
-            self._copy_noted = False
-        self._note_copy(copied_note(what, local), local)
+            self._copy_what = None
+        if not text:
+            # Nothing to copy, so no worker runs: the note is the one for a copy only
+            # the terminal's clipboard took.
+            self._note_copy(copied_note(what, False), False)
 
     def _note_copy(self, message: str, local: bool = True) -> None:
         note = Notification(message, timeout=self._COPY_NOTE_SECONDS if local else self._SENT_NOTE_SECONDS)
@@ -5751,13 +6068,6 @@ class CortexTrainingLogTUI(App):
         # Before any screen starts a worker: quit must not wait for them.
         loop = asyncio.get_running_loop()
         loop.set_default_executor(_DaemonThreadExecutor())
-        # kill and a closed terminal end the app as q does, so what the run downloaded
-        # is still removed when it ends (see __main__).
-        for signum in (signal.SIGTERM, signal.SIGHUP):
-            try:
-                loop.add_signal_handler(signum, self.exit)
-            except (NotImplementedError, RuntimeError, ValueError):
-                pass  # not the main thread, or no such signal here
         if self._freezes_heap():
             # What the imports made (most of the heap until a list arrives) is
             # frozen before any screen exists, so the collections while the first

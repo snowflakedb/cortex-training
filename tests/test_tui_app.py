@@ -971,6 +971,120 @@ def test_picker_filter():
     asyncio.run(_run_picker_filter())
 
 
+def test_a_search_builds_each_hidden_older_job_s_search_text_once(monkeypatch):
+    # A search that matches no job of the last six months names the older jobs it
+    # matches. Their search text is kept as the shown jobs' is, not built again on
+    # every keystroke.
+    from collections import Counter
+
+    from cortex_training.tui import views
+
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    c = _client()
+    c.list_jobs.return_value = [{"job_id": "7", "status": "RUNNING", "created_at": now.isoformat()}] + [
+        {"job_id": f"old-{i}", "status": "FAILED", "comment": f"older run {i}",
+         "created_at": (now - timedelta(days=400 + i)).isoformat()}
+        for i in range(3)
+    ]
+    built = Counter()
+    search_haystack = views.search_haystack
+
+    def counted(job, name):
+        built[views.job_id_of(job)] += 1
+        return search_haystack(job, name)
+
+    monkeypatch.setattr(views, "search_haystack", counted)
+
+    async def run():
+        app = CortexTrainingLogTUI(c, poll_interval=0.01, now=now)
+        async with app.run_test(size=(140, 40)) as pilot:
+            ok = await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._job_by_item)
+            assert ok, "jobs did not load"
+            screen = app.screen
+            for text in ("older", "older r", "older ru", "older run"):
+                screen.query_one("#jobfilter", Input).value = text
+                ok = await _wait(pilot, app, lambda: f"“{text}”" in (screen._nomatch or ""))
+                assert ok, f"no message for {text!r}: {screen._nomatch!r}"
+            assert {jid: built[jid] for jid in ("old-0", "old-1", "old-2")} == {"old-0": 1, "old-1": 1, "old-2": 1}
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def test_job_table_fills_the_same_through_datatable_s_own_methods(monkeypatch):
+    # replace_rows sets DataTable's rows directly only on the Textual it was written
+    # and tested against (TEXTUAL_FLOOR); any other release gets clear() and
+    # add_row(), which must leave the very same table.
+    from textual.app import App
+
+    from cortex_training.tui import __main__ as tui_main
+    from cortex_training.tui.app import _cell
+    from cortex_training.tui.app import _JobTable
+
+    class Tables(App):
+        CSS = "DataTable { height: 8; }"
+
+        def compose(self):
+            yield _JobTable(id="fast", cursor_type="row", fixed_columns=1)
+            yield _JobTable(id="own", cursor_type="row", fixed_columns=1)
+
+    def rows(count, tag):
+        return [(f"{tag}-{i}", (_cell(f"{tag} {i}"), _cell(f"{i * 7}"))) for i in range(count)]
+
+    def state(table):
+        return (table.row_count, [row.key.value for row in table.ordered_rows],
+                [[str(cell) for cell in table.get_row_at(i)] for i in range(table.row_count)],
+                table.cursor_coordinate, table.virtual_size,
+                [table.render_line(y).text for y in range(table.size.height)])
+
+    async def run():
+        app = Tables()
+        async with app.run_test(size=(40, 20)) as pilot:
+            fast, own = app.query_one("#fast", _JobTable), app.query_one("#own", _JobTable)
+            for table in (fast, own):
+                table.add_column("Name", width=8, key="Name")
+                table.add_column("N", width=4, key="N")
+            assert fast._fills_fast() is tui_main.textual_is_floor()
+            monkeypatch.setattr(own, "_fills_fast", lambda: False)
+            for plan in (rows(30, "a"), rows(5, "b"), [], rows(12, "c")):
+                fast.replace_rows(plan)
+                own.replace_rows(plan)
+                await pilot.pause()
+                assert state(fast) == state(own)
+            fast.move_cursor(row=9)
+            own.move_cursor(row=9)
+            fast.replace_rows(rows(20, "d"))
+            own.replace_rows(rows(20, "d"))
+            await pilot.pause()
+            assert state(fast) == state(own)
+            # Any other Textual: the rows go in through DataTable's own methods.
+            monkeypatch.setattr(tui_main, "textual_is_floor", lambda: False)
+            assert not fast._fills_fast()
+
+    asyncio.run(run())
+
+
+def test_textual_is_floor_is_that_release_only(monkeypatch):
+    from importlib import metadata
+
+    from cortex_training.tui import __main__ as tui_main
+
+    floor = ".".join(map(str, tui_main.TEXTUAL_FLOOR))
+
+    def missing(name):
+        raise metadata.PackageNotFoundError(name)
+
+    try:
+        with monkeypatch.context() as m:
+            for installed, expected in ((floor, True), (f"{floor}.post1", False), (f"{floor}rc1", False),
+                                        ("8.3.0", False), ("9.0.0", False), (None, False)):
+                m.setattr(metadata, "version", missing if installed is None else lambda name, v=installed: v)
+                tui_main.textual_is_floor.cache_clear()
+                assert tui_main.textual_is_floor() is expected, installed
+    finally:
+        tui_main.textual_is_floor.cache_clear()  # read again from the installed Textual
+
+
 async def _run_logscreen_controls():
     app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
     async with app.run_test() as pilot:
@@ -1207,16 +1321,216 @@ async def _run_wrap_and_select():
         assert len(s._logview._lines) - before == len(wrap_log_line(s._display("x" * 60), 10))
         assert s._shown_lines[-1] == "x" * 60  # buffer keeps the unwrapped, untagged line
 
-        # Re-wrap on width change: widening collapses each buffered line to one.
+        # Re-wrap on width change: widening collapses each buffered line to one. The
+        # lines are wrapped off the UI thread, so the pane changes a moment later.
         s._content_width = lambda: 200
         s._rewrap()
+        ok = await _wait(pilot, app, lambda: s._repaint_job is None and s._wrap_width == 200)
+        assert ok, "the re-wrap did not land"
         assert len(s._logview._lines) == len(s._shown_lines)
-        assert s._wrap_width == 200
         await _settle(app, pilot)
 
 
 def test_log_wrap_and_selectable():
     asyncio.run(_run_wrap_and_select())
+
+
+async def _pause_until(pilot, predicate, seconds=3.0):
+    for _ in range(int(seconds / 0.05)):
+        if predicate():
+            return True
+        await pilot.pause(0.05)
+    return predicate()
+
+
+async def _settled_pane(pilot, screen):
+    """Let a re-wrap the screen started while it opened (its sources panel was sized) land."""
+    await pilot.pause(2 * LogScreen._REWRAP_SETTLE_SECONDS)
+    assert await _pause_until(pilot, lambda: screen._repaint_job is None)
+
+
+async def _open_live_tail(app, pilot):
+    ok = await _wait(
+        pilot,
+        app,
+        lambda: isinstance(app.screen, LogScreen)
+        and app.screen._current_source == "7:training:0"
+        and len(app.screen.query("#sources ListItem")) == 2,
+    )
+    assert ok, "log screen / initial tail did not start"
+    await _settled_pane(pilot, app.screen)
+    return app.screen
+
+
+def _live_page(screen, lines):
+    """Hand ``screen`` one page of its live tail, as the tail's worker does."""
+    screen._on_page(screen._tail_gen, "live", [{"_raw": line} for line in lines], list(lines))
+
+
+def test_rewrap_and_refilter_run_off_the_ui_thread_and_keep_lines_that_come_meanwhile(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+
+    async def run():
+        started, release = threading.Event(), threading.Event()
+        original = LogScreen._wrap_pairs.__func__
+
+        def slow(cls, *args):
+            started.set()
+            assert release.wait(timeout=5)
+            return original(cls, *args)
+
+        app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
+        async with app.run_test() as pilot:
+            s = await _open_live_tail(app, pilot)
+            _live_page(s, [f"step-{i:02d} loss=0.5 " + "x" * 40 for i in range(30)])
+            await _settled_pane(pilot, s)
+            monkeypatch.setattr(LogScreen, "_wrap_pairs", classmethod(slow))
+            rows = list(s._logview.lines)
+            s._content_width = lambda: 30
+            s._rewrap()  # returns at once: the lines are wrapped by a worker
+            assert await _pause_until(pilot, started.is_set)
+            assert s._repaint_job is not None and list(s._logview.lines) == rows
+            _live_page(s, ["came during the repaint"])  # shown at once, and kept after it
+            assert s._shown_lines[-1] == "came during the repaint" and s._logview.lines[:len(rows)] == rows
+            release.set()
+            assert await _pause_until(pilot, lambda: s._repaint_job is None and s._wrap_width == 30)
+            assert s._shown_lines[-1] == "came during the repaint"
+            assert s._shown_lines.count("came during the repaint") == 1
+            assert sum(s._shown_rows) == len(s._logview.lines)
+            assert all(len(row) <= 30 for row in s._logview.lines)
+            # A filter repaints off the UI thread too, from the lines the tail received.
+            started.clear()
+            release.clear()
+            s.query_one("#logfilter", Input).value = "step-07"
+            assert await _pause_until(pilot, started.is_set)
+            assert any("step-03" in line for line in s._shown_lines)  # the old lines, until it lands
+            release.set()
+            assert await _pause_until(pilot, lambda: s._repaint_job is None
+                                      and not any("step-03" in line for line in s._shown_lines))
+            assert [line for line in s._shown_lines if "step-" in line] == ["step-07 loss=0.5 " + "x" * 40]
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def test_a_drag_resize_wraps_the_log_once_for_the_width_it_ends_on(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+
+    async def run():
+        widths = []
+        original = LogScreen._wrap_pairs.__func__
+
+        def counted(cls, pairs, query, level, width, *rest):
+            widths.append(width)
+            return original(cls, pairs, query, level, width, *rest)
+
+        app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
+        async with app.run_test() as pilot:
+            s = await _open_live_tail(app, pilot)
+            _live_page(s, [f"line {i} " + "y" * 60 for i in range(20)])
+            await _settled_pane(pilot, s)
+            monkeypatch.setattr(LogScreen, "_wrap_pairs", classmethod(counted))
+            for width in (50, 45, 40, 35):
+                s._content_width = lambda width=width: width
+                LogScreen.on_resize(s, None)  # as Textual calls it, for each size of a drag
+            assert await _pause_until(pilot, lambda: s._wrap_width == 35 and s._repaint_job is None)
+            assert widths == [35]
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def test_a_log_line_that_reads_like_a_note_is_still_a_log_line(tmp_path, monkeypatch):
+    from cortex_training.tui.log_style import NOTE_KIND
+
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+
+    async def run():
+        app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
+        async with app.run_test() as pilot:
+            s = await _open_live_tail(app, pilot)
+            logs = s._shown_logs
+            _live_page(s, ["— live —"])  # a log line with the text of the TUI's own note
+            assert s._shown_logs == logs + 1
+            assert s._logview.lines[-1].startswith("training:0 │ ")  # tagged as the sub-job's
+            assert s._logview.row_kinds[-1] != NOTE_KIND
+            s._write_line("— live —")  # the TUI's own note
+            assert s._shown_logs == logs + 1
+            assert s._logview.lines[-1] == "— live —" and s._logview.row_kinds[-1] == NOTE_KIND
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def test_the_scrollback_count_follows_the_lines_as_they_come_and_go(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(LogScreen, "_MAX_LINES", 10)
+
+    async def run():
+        app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
+        async with app.run_test() as pilot:
+            s = await _open_live_tail(app, pilot)
+
+            def logs():
+                return sum(not isinstance(line, LogScreen._Note) for line in s._shown_lines)
+
+            _live_page(s, [f"line {i}" for i in range(6)])
+            s._write_line("— a note —")
+            _live_page(s, [f"line {i}" for i in range(6, 12)])  # the oldest go past _MAX_LINES
+            assert s._pane_truncated and s._shown_logs == logs() == 9
+            assert s._scrollback_note().startswith("last 9 lines · ")
+            s._content_width = lambda: 25
+            s._rewrap()
+            assert await _pause_until(pilot, lambda: s._repaint_job is None and s._wrap_width == 25)
+            assert s._shown_logs == logs() == 9 and s._scrollback_note().startswith("last 9 lines · ")
+            s._clear_pane()
+            assert s._shown_logs == 0
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def test_counting_a_saved_console_streams_it_and_counts_its_lines_as_before(tmp_path):
+    block = 1 << 20  # what _count_lines reads at a time
+    payloads = [
+        b"",
+        b"one",
+        b"one\n",
+        b"one\r\ntwo\rthree\n\nfive",
+        "vt\x0bff\x0cfs\x1cgs\x1drs\x1enel\x85ls\N{LINE SEPARATOR}ps\N{PARAGRAPH SEPARATOR}end".encode(),
+        b"bad \xff\xfe bytes\n\x85 alone",  # not UTF-8: replaced, as the pane decodes it
+        b"x" * (block - 1) + b"\r\nlast",  # one \r\n across the first block's end
+        b"x" * (block - 1) + b"\r",
+        b"x" * (block - 1) + "\N{LINE SEPARATOR}after".encode(),  # a break of three bytes across it
+    ]
+    for n, payload in enumerate(payloads):
+        path = tmp_path / f"console-{n}.log"
+        path.write_bytes(payload)
+        before = len(payload.decode("utf-8", errors="replace").splitlines())  # what the save counted
+        assert LogScreen._count_lines(str(path)) == before, payload[-16:]
+
+
+def test_save_writes_the_sub_job_shown_when_s_was_pressed(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from cortex_training.tui.log_cache import LogCache
+
+    LogCache("7").append_entries("head:server", [{"_raw": "alpha"}, {"_raw": "beta"}])
+
+    async def run():
+        app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
+        async with app.run_test() as pilot:
+            s = await _open_live_tail(app, pilot)
+            s._current_source = "head:server"
+            s.action_save_log()
+            s._current_source = "7:sampling:0"  # the view moves on before the worker runs
+            saved = tmp_path / "cortex-training-7-head-server.log"
+            assert await _pause_until(pilot, lambda: s._export_note is not None)
+            assert saved.read_text(encoding="utf-8") == "alpha\nbeta\n"
+            assert s._export_note == f"saved 2 lines to {saved}"
+            await _settle(app, pilot)
+
+    asyncio.run(run())
 
 
 def _write_stdout(output_dir, sub_job_id, text):
@@ -1436,6 +1750,94 @@ async def _run_tail_error_after_finish_shows_file():
 
 def test_tail_error_after_terminal_status_shows_file_once():
     asyncio.run(_run_tail_error_after_finish_shows_file())
+
+
+def test_a_slow_job_read_never_brings_an_ended_job_back(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    from cortex_training.tui.screens import JobDetailScreen
+
+    started, release = threading.Event(), threading.Event()
+    c = _client()
+    reads = {"n": 0}
+
+    def get_job(_job_id):
+        reads["n"] += 1
+        if reads["n"] == 1:  # the view's first read, still retrying a slow service
+            started.set()
+            assert release.wait(timeout=5)
+            return {"status": "RUNNING", "sub_jobs": [
+                {"sub_job_id": "7:training:0", "job_type": "training", "status": "RUNNING"}]}
+        return {"status": "FAILED", "sub_jobs": []}
+
+    c.get_job.side_effect = get_job
+
+    async def run():
+        app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+        async with app.run_test() as pilot:
+            ok = await _wait(pilot, app, lambda: isinstance(app.screen, JobDetailScreen) and started.is_set())
+            assert ok
+            s = app.screen
+            # A read sent later (the status check) answers first: the job has failed.
+            s._apply_status({"status": "FAILED", "reason": "sub_job_failed", "sub_jobs": [
+                {"sub_job_id": "7:training:0", "job_type": "training", "status": "FAILED"}]}, s._next_job_read())
+            assert s._job_status == "FAILED" and app.sub_title.startswith("FAILED")
+            release.set()  # ... and then the first read answers, with the job still running
+            ok = await _wait(pilot, app, lambda: s._current_source == "7:training:0")
+            assert ok
+            for _ in range(10):
+                await pilot.pause()
+            assert s._job_status == "FAILED" and app.sub_title.startswith("FAILED")
+            assert s._sub_job_status == {"7:training:0": "FAILED"}
+            assert not s._tail_live
+            c.tail_logs.assert_not_called()  # never a tail of the dead job: its saved console instead
+            # However it is numbered, an answer that has the ended job live is an older copy.
+            assert not s._take_job({"status": "RUNNING", "sub_jobs": []}, s._next_job_read())
+            assert s._job_status == "FAILED"
+            await _settle(app, pilot)
+
+    try:
+        asyncio.run(run())
+    finally:
+        release.set()
+
+
+def test_a_bug_in_showing_a_page_sends_no_job_read(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    import cortex_training.tui.log_cache as log_cache_module
+
+    errors = tmp_path / "errors.log"
+    monkeypatch.setattr(log_cache_module, "error_log_path", lambda: str(errors))
+    c = _client()
+    c.tail_logs.side_effect = lambda *a, **k: {"entries": [{"_raw": "a line"}], "next_cursor": "C1", "eof": False}
+    on_page = LogScreen._on_page
+
+    def broken(self, gen, kind, entries, lines):
+        if kind == "live" and entries:
+            raise TypeError("a bug in drawing the page")
+        return on_page(self, gen, kind, entries, lines)
+
+    monkeypatch.setattr(LogScreen, "_on_page", broken)
+
+    async def run():
+        app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+        async with app.run_test() as pilot:
+            ok = await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen)
+                             and any(line.startswith("[error] tail") for line in app.screen._shown_lines))
+            assert ok, "the tail did not stop"
+            s = app.screen
+            # Said as before, but the job isn't read again to tell what a failed request meant.
+            assert s._shown_lines[-1].startswith(
+                "[error] tail 7:training:0 failed: TypeError: a bug in drawing the page")
+            assert s._tail_error.startswith("tail stopped: TypeError: a bug in drawing the page")
+            assert not s._tail_live
+            for _ in range(10):
+                await pilot.pause()
+            assert c.get_job.call_count == 1  # the view's own first read only
+            logged = errors.read_text(encoding="utf-8")
+            assert "a bug in the TUI while showing its log" in logged and "TypeError: a bug in drawing" in logged
+            await _settle(app, pilot)
+
+    asyncio.run(run())
 
 
 async def _run_terminal_download_failure_keeps_cache():
@@ -1740,12 +2142,6 @@ async def _run_job_detail_tabs(mounts):
         # GPU telemetry loads only when its tab is shown.
         c.download_metrics.assert_not_called()
 
-        await pilot.press("4")  # no Checkpoints tab here: 4 does nothing
-        await pilot.pause()
-        assert tabs.active == "logs"
-        await pilot.press("1")  # no Metrics tab here: 1 does nothing
-        await pilot.pause()
-        assert tabs.active == "logs"
         await pilot.press("3")
         ok = await _wait(pilot, app, lambda: tabs.active == "resource" and c.download_metrics.call_count == 1)
         assert ok
@@ -1809,6 +2205,95 @@ def test_job_search_shows_markup_like_text_literally():
                 pilot, app, lambda: "“[/b] [x]”" in str(app.screen.query_one("#nomatch", Static).render())
             )
             assert ok
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def _notes(app) -> list:
+    return [note.message for note in app._notifications]
+
+
+async def _wait_seconds(pilot, predicate, seconds=5.0) -> bool:
+    import time
+
+    deadline = time.monotonic() + seconds
+    while not predicate():
+        if time.monotonic() > deadline:
+            return False
+        await pilot.pause(0.02)
+    return True
+
+
+def test_a_copy_never_waits_for_this_machine_s_clipboard_tool(monkeypatch):
+    # A clipboard tool that hangs (xclip waits out its timeout when DISPLAY is gone)
+    # froze the screen for as long: it runs on a worker now, and its note follows.
+    import time
+
+    import cortex_training.tui.app as app_module
+    from cortex_training.tui.clipboard import copied_note
+
+    release = threading.Event()
+    tried = []
+
+    def hung_tool(text):
+        tried.append(text)
+        release.wait(10)
+        return True
+
+    monkeypatch.setattr(app_module, "copy_local", hung_tool)
+
+    async def run():
+        app = CortexTrainingLogTUI(_client(), poll_interval=0.01)
+        async with app.run_test() as pilot:
+            started = time.monotonic()
+            app.copy_out("some \x1b[31mtext", "9 characters")
+            assert time.monotonic() - started < 1
+            assert app.clipboard == "some text"  # OSC 52 went out at once, without the escape sequence
+            assert await _wait_seconds(pilot, lambda: tried == ["some text"])
+            await pilot.pause(0.1)
+            assert _notes(app) == []  # nothing is said until the copy is done
+            release.set()
+            assert await _wait_seconds(pilot, lambda: _notes(app) == ["copied 9 characters"]), _notes(app)
+            app.copy_to_clipboard("abc")  # Textual's own copies (ctrl+c in a text box) are said too
+            assert await _wait_seconds(pilot, lambda: _notes(app) == ["copied 3 characters"]), _notes(app)
+            app.copy_out("\x1b[0m", "the escape")  # nothing left to copy: no tool runs, and the note is as it was
+            assert _notes(app) == [copied_note("the escape", False)]
+            assert tried == ["some text", "abc"]
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def test_copies_reach_the_clipboard_in_turn_and_the_last_one_stays(monkeypatch, tmp_path):
+    import cortex_training.tui.app as app_module
+    from cortex_training.tui.clipboard import copy_local
+
+    clip = tmp_path / "clip.txt"
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CLIPBOARD_FILE", str(clip))  # never the real clipboard
+    release = threading.Event()
+    tried = []
+
+    def first_one_hangs(text):
+        tried.append(text)
+        if len(tried) == 1:
+            release.wait(10)
+        return copy_local(text)
+
+    monkeypatch.setattr(app_module, "copy_local", first_one_hangs)
+
+    async def run():
+        app = CortexTrainingLogTUI(_client(), poll_interval=0.01)
+        async with app.run_test() as pilot:
+            app.copy_out("one", "the first")
+            assert await _wait_seconds(pilot, lambda: tried == ["one"])
+            app.copy_out("two", "the second")
+            app.copy_out("three", "the third")
+            release.set()
+            assert await _wait_seconds(pilot, lambda: _notes(app) == ["copied the third"]), _notes(app)
+            assert tried == ["one", "three"]  # "two" was replaced before its turn came
+            assert clip.read_text(encoding="utf-8") == "three"
+            assert app.clipboard == "three"
             await _settle(app, pilot)
 
     asyncio.run(run())
@@ -2038,7 +2523,7 @@ def test_markup_like_names_and_server_text_render_literally():
             assert "ablation [/no-warmup" in str(app.screen.query_one("#preview", Static).render())
             app.push_screen(JobDetailScreen(c, "7", job=job, initial_tab="logs"))
             ok = await _wait(pilot, app, lambda: isinstance(app.screen, JobDetailScreen)
-                             and "ablation [/no-warmup" in str(app.screen.query_one("#summary", Static).render()))
+                             and "org/model [/v2" in str(app.screen.query_one("#summary", Static).render()))
             assert ok
             assert app.return_code is None
             await _settle(app, pilot)
@@ -2068,6 +2553,83 @@ def test_quit_without_job_id_derives_it_from_sub_job_id_and_reports_crashes(monk
     assert rc == 1  # the app's return code, not a blanket 0
     with pytest.raises(SystemExit):
         tui_main.run(["--sub-job-id", "not-a-sub-job-id", "--base-url", "http://localhost:1", "--database", "DB"])
+
+
+@pytest.mark.parametrize(
+    "config, message, usage",
+    [
+        ({"base_url": "http://localhost:1", "database": "DB", "poll_interval": "2"},
+         "config poll_interval must be a number", False),
+        ({"base_url": "http://localhost:1", "database": "DB", "verify_ssl": "yes"},
+         "config verify_ssl must be a boolean", False),
+        ({"base_url": "http://localhost:1", "\x1b]52;c;eA==\x07": 1}, "unknown config key(s): \\x1b]52;c;eA==\\x07",
+         False),
+        ("{not json", "invalid JSON in config", False),
+        (None, "No such file or directory", False),
+        # Never a traceback, this one keeps the usage above its error line, as it always has.
+        ({"base_url": "localhost:1", "database": "DB"}, "base_url must start with http:// or https://", True),
+    ],
+)
+def test_a_config_the_tui_cannot_use_is_an_error_not_a_traceback(tmp_path, monkeypatch, capsys, config, message,
+                                                                 usage):
+    from cortex_training.tui import __main__ as tui_main
+
+    class NeverStarts:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("the TUI started")
+
+    for name in ("CORTEX_TRAINING_CONNECTION", "CORTEX_TRAINING_BASE_URL", "CORTEX_TRAINING_HOST", "SNOWFLAKE_HOST",
+                 "CORTEX_TRAINING_PAT", "SNOWFLAKE_PAT"):
+        monkeypatch.delenv(name, raising=False)  # a PAT would make the bare base_url a host
+    monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", NeverStarts)
+    path = tmp_path / "config.json"
+    if config is not None:
+        path.write_text(config if isinstance(config, str) else json.dumps(config), encoding="utf-8")
+    with pytest.raises(SystemExit) as exit_:
+        tui_main.run(["--config", str(path)])
+    assert exit_.value.code == 2
+    err = capsys.readouterr().err
+    lines = err.splitlines()
+    if usage:
+        assert lines[0].startswith("usage: cortex-training tui"), err
+    else:
+        assert len(lines) == 1, err  # one line: no usage, no traceback
+    assert lines[-1].startswith("cortex-training tui: error: ") and message in lines[-1], err
+    assert "\x1b" not in err and "\x07" not in err  # a key from the file can't act on the terminal
+
+
+def test_the_config_sets_the_poll_interval_and_names_what_it_gives_in_the_sign_in(tmp_path, monkeypatch):
+    import cortex_training._cli as cli
+    from cortex_training.tui import __main__ as tui_main
+
+    seen = []
+
+    class FakeApp:
+        return_code = 0
+        sign_in = None
+
+        def __init__(self, client, job_id, *, sub_job_id=None, poll_interval=1.0, schema_only=False):
+            self.poll_interval = poll_interval
+
+        def run(self):
+            seen.append((self.poll_interval, self.sign_in))
+
+    reads = []
+    load_config = cli._load_config
+    monkeypatch.setattr(cli, "_load_config", lambda path: reads.append(path) or load_config(path))
+    monkeypatch.delenv("CORTEX_TRAINING_CONNECTION", raising=False)
+    monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", FakeApp)
+    monkeypatch.setattr("cortex_training._cli.build_client", lambda args, cls: MagicMock())
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"base_url": "http://localhost:1", "database": "DB", "poll_interval": 2}),
+                    encoding="utf-8")
+    sign_in = {"kind": "url", "config": str(path.resolve()), "base_url": "http://localhost:1",
+               "base_url_in_config": True}
+    assert tui_main.run(["--config", str(path)]) == 0
+    assert seen == [(2.0, sign_in)]
+    assert len(reads) == 2  # the CLI's resolution, then the TUI's one read for what that doesn't say
+    assert tui_main.run(["--config", str(path), "--poll-interval", "3", "--base-url", "http://other:2"]) == 0
+    assert seen[-1] == (3.0, {**sign_in, "base_url": "http://other:2", "base_url_in_config": False})
 
 
 def test_resource_refresh_skips_the_reparse_when_nothing_new_arrived(monkeypatch):

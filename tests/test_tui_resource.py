@@ -409,3 +409,66 @@ def test_chart_uses_fixed_scale_labels_and_fits_narrow_width(tmp_path):
     assert all(len(line) == 120 for line in wide)
     assert wide[0].index("▁") == wide[2].index(view.start.astimezone().strftime("%H:%M"))
     assert wide[2].endswith(view.end.astimezone().strftime("%H:%M"))
+
+
+def test_only_gauges_named_with_a_unit_are_metrics():
+    for name in ("gpu_util_pct", "fb_free_bytes", "power_watts", "gpu_temp_c", "sm_active_pct", "mem_used_bytes"):
+        assert resource_module.is_metric_field(name), name
+    # Ids, counts, durations and counters: averaged over a window as gauges, they would chart nonsense.
+    for name in ("pid", "uptime_s", "cpu_count", "seq", "seq_epoch", "worker_num", "global_gpu_index",
+                 "record_version", "sample_interval_s", "xid_errors_total", "ecc_dbe_volatile_total",
+                 "ecc_sbe_count", "_pct", None, 7):
+        assert not resource_module.is_metric_field(name), name
+    # A field's name is drawn as the metric's: only plain lowercase words, never an escape sequence.
+    for name in ("\x1b]52;c;aGk=\x07_pct", "util\x1b[2J_pct", "GPU_util_pct", "gpu util_pct", "gpu-util_pct",
+                 "gpu_util_pct\n", "gpü_util_pct", "\u202egpu_util_pct"):
+        assert not resource_module.is_metric_field(name), repr(name)
+
+
+def test_unitless_fields_get_no_chart_and_the_header_still_names_cpus_and_memory(tmp_path):
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    rows = []
+    for i in range(3):
+        at = start + timedelta(seconds=5 * i)
+        gpu = _row(at, 0, 40)
+        gpu.update(power_watts=300.0, pid=99, xid_errors_total=0, ecc_sbe_volatile_total=2 * i)
+        gpu["\x1b]0;retitled\x07_pct"] = 50.0
+        rows.append(gpu)
+        rows.append({
+            "kind": "system", "record_version": 3, "sample_ts": at.isoformat().replace("+00:00", "Z"),
+            "worker_num": 0, "seq": i, "seq_epoch": "e", "sample_interval_s": 5.0, "cpu_util_pct": 25.0,
+            "cpu_count": 88.0, "mem_used_bytes": float(86 * 1024**3), "mem_total_bytes": float(860 * 1024**3),
+            "pid": 4242 + i, "uptime_s": 60.0 + 5 * i, "ctx_switches_total": 1000 * i,
+        })
+    _write_metrics(tmp_path, "job:training:0", rows)
+
+    data = load_resource_data(tmp_path)
+    assert data.ignored_rows == 0
+    gpu = data.kind("job:training:0", resource_module.GPU)
+    system = data.kind("job:training:0", resource_module.SYSTEM)
+    assert [metric.key for metric in gpu.metrics] == [
+        "gpu_util_pct", "fb_used_pct", "fb_used_bytes", "fb_free_bytes", "power_watts"]
+    # The memory used % is derived; the CPUs and the memory limit only go in the header.
+    assert [metric.key for metric in system.metrics] == ["cpu_util_pct", "mem_used_pct", "mem_used_bytes"]
+    for resource in (gpu, system):
+        keys = {metric.key for metric in resource.metrics}
+        for unit in (None, 0):
+            view = resource.view("all", unit)
+            assert set(view.charts) == set(view.stats) == keys
+    assert system.view("10m").stats["mem_used_pct"].latest == 10.0
+    assert resource_module.node_allocation_text(system) == "nodes: 1 reporting  ·  88 CPUs  ·  860 GiB each"
+
+
+def test_sub_job_directories_with_unprintable_names_are_passed_over(tmp_path):
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    _write_metrics(tmp_path, "job:training:0", [_row(now, 0, 10)])
+    # A sub-job's id is its directory's name, drawn on the terminal: an escape sequence, a
+    # line break, a bidi override or a pile of combining marks is no sub-job's id.
+    for name in ("job:training:1\x1b]52;c;aGk=\x07", "job:\x1b[2Jtraining:2", "job:training:3\n",
+                 "job\u202e:training:4", "job:training:5" + "\u0301" * 10):
+        _write_metrics(tmp_path, name, [_row(now, 0, 20), "{bad json"])
+
+    assert resource_module.cached_metric_sources(tmp_path) == ["job:training:0"]
+    data = load_resource_data(tmp_path)
+    assert list(data.kinds) == ["job:training:0"]
+    assert data.ignored_rows_by_sub_job == {}

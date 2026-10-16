@@ -794,6 +794,15 @@ cortex-training tui \
   --database CORTEX_TRAINING_DB --schema PUBLIC
 ```
 
+A config the TUI can't use, such as one with a value of the wrong type (a
+quoted number: `"poll_interval": "2"`), JSON that doesn't parse, an unknown
+key, or a path that isn't there, stops it before it starts, with one line on
+stderr and exit status 2:
+
+```text
+cortex-training tui: error: config poll_interval must be a number
+```
+
 Pass `--sub-job-id JOB_ID:training:0` to scope the job details to one matching
 sub-job; without `JOB_ID`, it opens that sub-job's job. An unmatched id is
 shown as an error, with the job's sub-job ids, rather than falling back to a
@@ -974,15 +983,13 @@ switches to every location, by "a lists every database and schema". A walk
 cut short with no job to show says "The account-wide list returned no jobs to
 show in its first 20 pages; more may exist" instead.
 
-A job's display name is its local name if you set one, else the first line of
-its server `comment` (see `submit --comment`; trimmed, and cut with `…` when it
-is long or has more lines), else its job id. Press `n` on a job to give it a
-local name (up to 80 characters); the prompt starts from the local name, or
-empty with the comment's first line shown as a hint, and saving that line (or
-nothing) keeps the job named by its comment. Local names persist in `aliases.json` in the TUI cache
-directory, are shared by every TUI session on that machine, and are not
-visible to anyone else. A job with both shows the local name first and its
-comment after it, dimmed. Names and comments are measured in terminal cells,
+A job's display name is its local name if you set one, else its job id. Press
+`n` on a job to give it a local name (up to 80 characters); the prompt starts
+from the local name, if it has one. Local names persist in `aliases.json` in
+the TUI cache directory, are shared by every TUI session on that machine, and
+are not visible to anyone else. A job's server `comment` shows after its name,
+dimmed (trimmed, and cut with `…` when it is long or has more lines); it is
+never the job's name. Names and comments are measured in terminal cells,
 so wide (CJK, emoji) text is cut and wrapped to fit too.
 
 A job whose status is `unknown` has no live state: the service could not reach
@@ -998,8 +1005,8 @@ ids derived from the job id as `JOB_ID:TYPE:INDEX` (only for an `unknown` row;
 a config without a type is listed as `config #N`). `tui JOB_ID --sub-job-id
 ID` on such a job tries that sub-job even when it can't be listed.
 
-Search with `/`. Plain words match display name, the whole comment (also when
-a local name is shown), job id (partial), sub-job id, status, owner, GPU type,
+Search with `/`. Plain words match the local name, the whole comment, job id
+(partial), sub-job id, status, owner, GPU type,
 job type (as the Type column shows it, `train+sample`, and as the API spells
 it, `log_probability`) and model, and all words must match. Matching ignores
 case and Unicode spelling: an accented letter typed either way (`é` as one
@@ -1014,7 +1021,7 @@ field. `field<op>value` filters narrow further:
 
 | Field | Meaning |
 |-------|---------|
-| `name`, `id`, `status`, `owner`, `type` | display name or comment, job id, status, user or role, `training`/`sampling`/`log_prob` |
+| `name`, `id`, `status`, `owner`, `type` | local name, job id, status, user or role, `training`/`sampling`/`log_prob` |
 | `model`, `method`, `dtype` | model name (`=` takes it whole, `Qwen/Qwen3-8B`, or as the Model column shows it, `Qwen3-8B`), `full` or `lora`, dtype |
 | `gpu`, `gpus` | GPU type (`H200`, `B200`, `B300`), requested GPU count |
 | `optimizer`, `lr`, `batch`, `seq` | optimizer name, learning rate, train batch size, max sequence length |
@@ -1084,8 +1091,8 @@ clears a search or goes back.
 
 #### Job preview
 
-Opening a job shows its one-line name (and where it comes from: the local
-name, the job's comment, or none yet), its comment wrapped to the screen, id,
+Opening a job shows its local name (or that it has none yet), its comment
+wrapped to the screen, id,
 status (live, historical, or `? status unavailable` for an `unknown` job),
 model, type, owner (`role ROLE` when no submitting user is recorded), requested
 GPUs, creation time, elapsed time, and last update. Every field shows when the preview opens: the
@@ -1111,8 +1118,6 @@ cut, when it has the room.
 - **Last update** is the job's `updated_at` and how long ago that was. A time
   up to 5 minutes ahead of this computer's clock reads `just now`, and one
   further ahead says how far ahead it is; a record without one shows `—`.
-- **Comment** is left out when the name already shows all of it (a one-line
-  comment that fits).
 
 Below the fields, a line says where the job stands: running; waiting
 (`pending`, `placing` or `initializing`, each with what it waits for unless the
@@ -1245,17 +1250,21 @@ for the next tab.
     view, the nodes' CPUs and memory). On the second, the why of the skipped
     rows, the values-change note and the newest sample's time go first, and a
     state's longer words: `cached · refresh failed: …` becomes `refresh
-    failed: …`, and `older samples failed to load: …` becomes `older samples
     failed: …`.
     Then the skipped rows and the scrape interval go. An error keeps room for
     its first 40 characters where it can. The second line keeps room for
     `cached · refreshing…` and for the age to grow, so a refresh starting, or
     the age passing a minute, changes nothing else on it.
-  - Every numeric field of a row is a metric, charted without a list of
-    names, so a field a newer service adds gets its chart and stats row with
-    no change here. A field that identifies or counts rows (a name ending in
-    `_index`, `_num`, `_version` or `_interval_s`, and `seq`) is not one, nor
-    is text, nor a field that is null in every row (the SM gauges today). Each
+  - A numeric field is a metric when its name ends in a unit suffix: `_pct`,
+    `_bytes`, `_watts` or `_c`, a gauge in `%`, `GiB`, `W` or `°C`. Metrics
+    are charted without a list of names, so a gauge a newer service adds in
+    one of those units gets its chart and stats row with no change here. A
+    number without a unit is not charted, since its average over a window
+    means nothing: an id or a count (`global_gpu_index`, `worker_num`, `seq`,
+    a process id), a duration (`sample_interval_s`, an uptime) or a counter
+    that only grows (a `_total` field, ECC and XID error counts). Nor is a
+    field whose name has anything but lowercase letters, digits and `_`, nor
+    text, nor a field that is null in every row (the SM gauges today). Each
     view starts with its utilization and a derived memory use: **GPU util %**
     (`gpu_util_pct`, the share of time a kernel was running on the GPU, which
     says how busy it was, not how saturated) and **GPU memory used %**
@@ -1265,8 +1274,8 @@ for the next tab.
     `GPU memory free (GiB)`, `power (W)`, `GPU temp (°C)`, `tensor active %`
     and `DRAM active %`, or `memory used (GiB)`. A node's `cpu_count` and
     `mem_total_bytes` stay the same through a job, so the header names them
-    (above) and they get no chart or stats row. A name comes from its field: the unit suffix (`_pct`, `_bytes`,
-    `_watts`, `_c`) becomes `%`, `GiB`, `W` or `°C`, and `gpu`, `cpu`, `sm`
+    (above) and they get no chart or stats row. A name comes from its field:
+    the unit suffix becomes `%`, `GiB`, `W` or `°C`, and `gpu`, `cpu`, `sm`
     and `dram` are capitalized.
   - The stats block has a row per metric, in that order: the min, average,
     max and latest over the selected window and over the whole job, in the
@@ -1343,20 +1352,9 @@ for the next tab.
     fails keeps what is cached and says `cached · refresh failed: …` in the
     warning color, with the error cut to fit the line; the TUI's error log has
     it in full. A job with no sub-jobs says so instead.
-    It is cached under `jobs/<job>/metrics/` in the TUI cache directory, for
-    one job at a time: opening a job's details removes every other job's
-    cached telemetry, which downloads again when that job's Resources tab is
-    next shown (logs and saved consoles stay). The
+    It is cached under `jobs/<job>/metrics/` in the TUI cache directory. The
     selected sub-job downloads first, and each sub-job shows as soon as its
-    chunks are in. The first open of a job on a machine downloads the selected
-    sub-job's chunks for the window on screen (plus three minutes) first and
-    shows them, with the whole job's stats `loading older samples…`, while the
-    rest of its history downloads; later opens download only the new chunks.
-    If that download fails, the header says `older samples failed to load: …`
-    in the warning color, and the stats that need the older samples read
-    `older samples not loaded` (so do the chart titles of a window that needs
-    them) until a refresh gets them: `r`, or on a live job the 30-second
-    refresh.
+    chunks are in; later opens download only the new chunks.
     Each refresh reads only what the download appended, and the first read of
     a long job's cache shows the selected sub-job's newest samples before the
     rest of its history.
@@ -1370,18 +1368,15 @@ stays on the selected sub-job. The tail
 polls only while the Logs tab is on screen: on another tab
 it stops and later resumes from where it left
 off, so no lines are lost. While a job runs, its status is also re-read every
-60 seconds, so the view switches to the saved console when the job ends.
-Logs are cached locally while the TUI runs, so reopening a job in the same
-session replays instantly without re-fetching from the server: under
-`~/.cache/cortex-training/jobs/<job>/` (or `$XDG_CACHE_HOME`), overridable with
-`CORTEX_TRAINING_TUI_CACHE_DIR`. The same directory holds display names and
-telemetry. When the TUI ends (`q`, a crash, `kill`, or a closed terminal), it
-removes everything it downloaded: every job's logs, saved consoles, telemetry
-and tail cursors (`jobs/`); display names stay. While another TUI still runs
-on the same cache, the one that ends leaves the cache to it, and the last one
-to end removes it. A TUI killed outright (`kill -9`) can't clean up, so the
-next one to start removes what it left. `--debug` uses a temporary cache of its
-own, removed when it ends.
+60 seconds, so the view switches to the saved console when the job ends. A read
+that answers after a later one (a slow one, with the client's retries) is
+ignored, and so is any answer that still has the job running once the view has
+seen it end.
+Logs are cached locally, so reopening a job replays instantly without
+re-fetching from the server: under `~/.cache/cortex-training/jobs/<job>/` (or
+`$XDG_CACHE_HOME`), overridable with `CORTEX_TRAINING_TUI_CACHE_DIR`. The same
+directory holds display names and telemetry. `--debug` uses a temporary cache
+of its own, removed when it ends.
 
 The pane draws each line as text only: escape sequences in a line (colours,
 cursor moves, clipboard or title writes) are removed and other control
@@ -1499,9 +1494,8 @@ sub-job's first, shown as soon as it is in, then the others' in the
 background, with the chunk count on the status line meanwhile. The pane says
 which sub-job's console comes first, and, for a sub-job you select before its
 console is in, that it comes with the others'. A job that ended more than 10
-minutes earlier keeps that console in the cache (`jobs/<job>/console/`) for
-the rest of the session, so reopening it is instant (the cache is emptied when
-the TUI ends). The
+minutes earlier keeps that console in the cache (`jobs/<job>/console/`), so
+reopening it is instant. The
 kept consoles of all jobs take at most 1 GiB together: past that, the ones
 opened least recently are removed (and downloaded again if opened). A
 console fetched sooner, for example right after the job ended while the view
@@ -1532,8 +1526,11 @@ is not found for job ...`), the line adds that it may no longer exist.
 
 The filter (`/`) and the level key apply to the lines the view already has:
 changing either repaints the pane and never restarts the tail or sends a
-request. A saved console is searched whole, off the screen's thread, so keys
-keep working while a long one repaints. The level key hides lines below the
+request. A saved console is searched whole, and a live tail's lines are
+filtered again, off the screen's thread, so keys keep working while a long log
+repaints. The same goes for wrapping the pane's lines again when its width
+changes; during a resize, that waits until the size has held for a moment.
+The level key hides lines below the
 chosen level, reading the level from a structured entry or from the line
 itself (a JSON `level` field, or a word such as `INFO` or `ERROR`); lines with
 no recognizable level always stay, and a record that carries an error or an
@@ -1576,9 +1573,11 @@ The TUI takes the mouse, so the terminal's own selection and its copy key
 (`pbcopy` on macOS; `wl-copy`, `xclip` or `xsel` on Linux) and to the
 terminal's (OSC 52, which reaches your own computer's clipboard over SSH,
 where some terminals ignore it). Escape sequences and control characters are
-removed, and a one-line note at the right end of the title row says what was
-copied (`copied 12 lines`), for three seconds; when only the terminal's
-clipboard could take it, the note says so, with a tip, for eight. To select
+removed. The screen never waits for that tool (`xclip` can take seconds to
+give up on a display that is gone): once it is done, a one-line note at the
+right end of the title row says what was copied (`copied 12 lines`), for three
+seconds; when only the terminal's clipboard could take it, the note says so,
+with a tip, for eight. To select
 with the terminal itself instead, hold a key while dragging: Option in iTerm2,
 Fn in macOS Terminal, Option in VS Code's terminal once
 `terminal.integrated.macOptionClickForcesSelection` is on. With the keys
