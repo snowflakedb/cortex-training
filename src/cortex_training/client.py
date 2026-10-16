@@ -46,6 +46,7 @@ import inspect
 import json
 import logging
 import math
+import numbers
 import os
 import re
 import shutil
@@ -63,6 +64,7 @@ from concurrent.futures import Future
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from datetime import datetime
+from datetime import timedelta
 from datetime import timezone
 from enum import Enum
 from pathlib import Path
@@ -88,7 +90,6 @@ from urllib3.exceptions import NewConnectionError
 from cortex_training import _artifact_download
 from cortex_training._artifact_download import DownloadCancelled
 from cortex_training._artifact_download import NoChunksError
-from cortex_training import wire
 from cortex_training.optimizer import normalize_optimizer_config
 from cortex_training.peft import normalize_lora_peft_config
 from cortex_training.snowflake_auth import SnowflakeProfileAuth
@@ -97,6 +98,16 @@ from cortex_training.telemetry import CachedSessionTokenProvider
 from cortex_training.telemetry import OtlpMetricEmitter
 
 logger = logging.getLogger(__name__)
+
+
+def __getattr__(name: str) -> Any:
+    # cortex_training.client.wire, as before: the frame codec imports PyTorch, so
+    # this module imports it where a frame is encoded or decoded, on first use.
+    if name == "wire":
+        import importlib
+
+        return importlib.import_module("cortex_training.wire")
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 _STDOUT_CHUNK_RE = re.compile(
     r"^console\.(?P<timestamp>\d{8}-\d{6})\.(?P<suffix>[^./\\]+)\.gz$"
@@ -190,6 +201,10 @@ _ENDED_JOB_STATES = frozenset(
 # A job this client created is retried on "not found" for this long, to ride
 # out the service's read-after-create window.
 _RECENTLY_CREATED_SECONDS = 120.0
+# The service answers 500 with this message when the caller's role can't
+# resolve the job's linked Experiment. That is a permission answer, not a
+# transient failure, so retrying it only delays the error by a minute.
+_EXPERIMENT_ACCESS_DENIED = "Linked experiment is not found or not authorized"
 _SESSION_EXPIRED_CODES = frozenset({"390111", "390112", "390114"})
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {
@@ -345,8 +360,19 @@ def _is_transient(exc: BaseException) -> bool:
         return True
     if isinstance(exc, requests.exceptions.HTTPError):
         resp = exc.response
-        return resp is not None and resp.status_code in _TRANSIENT_STATUSES
+        if resp is None or resp.status_code not in _TRANSIENT_STATUSES:
+            return False
+        return not _is_experiment_access_denied(resp)
     return False
+
+
+def _is_experiment_access_denied(response: requests.Response) -> bool:
+    """Whether an error body says the caller can't resolve the job's Experiment."""
+    try:
+        text = response.text
+    except Exception:
+        return False
+    return isinstance(text, str) and _EXPERIMENT_ACCESS_DENIED in text
 
 
 def _iter_error_dicts(value: Any, *, depth: int = 0) -> Iterator[dict]:
@@ -496,11 +522,17 @@ _SECRET_IN_ERROR_RE = re.compile(
     r"[\"']?\s*[:=]\s*)"
     r"(?:\"[^\"]*\"|'[^']*'|\S+)"
 )
+# A URL's query string carries what the caller sent, such as the account-level
+# list's filters and page token, so it is cut from every telemetry message.
+_URL_QUERY_IN_ERROR_RE = re.compile(r"((?:https?://|/)[^\s?#]*)\?[^\s#]*", re.IGNORECASE)
 
 
 def _safe_metric_error_message(exc: BaseException) -> str:
-    """Return a bounded, single-line error message with obvious secrets redacted."""
-    message = " ".join(str(exc).split())
+    """Return a bounded, single-line error message without URL queries or obvious secrets."""
+    # Cut before redacting so the patterns never scan an unbounded message;
+    # cutting cannot expose more of a URL query or a secret than redaction would.
+    message = " ".join(str(exc).split())[: 4 * _METRIC_ERROR_MESSAGE_LIMIT]
+    message = _URL_QUERY_IN_ERROR_RE.sub(r"\1?<redacted>", message)
     message = _SECRET_IN_ERROR_RE.sub(r"\1<redacted>", message)
     return message[:_METRIC_ERROR_MESSAGE_LIMIT]
 
@@ -756,11 +788,365 @@ def _is_chunk_post_transient(exc: BaseException) -> bool:
     return _is_transient(exc)
 
 
+# ─── Account-level job list ──────────────────────────────────────────────
+
+# One fixed path, whatever ``endpoint`` says; a listed job is reached through
+# its own schema with for_job().
+_ACCOUNT_JOBS_PATH = "/api/v2/cortex-training"
+_ACCOUNT_JOBS_MAX_PAGE_SIZE = 1000
+# `done` used to be a group, and the service now answers 400 for it; `terminal`
+# replaced it and also takes `failed`. The client keeps `done`'s old meaning by
+# sending what it stood for. Legacy DONE rows match no filter on this route.
+_ACCOUNT_STATUS_ALIASES = {"done": ("cancelled", "terminated")}
+# The service's message when the route is deployed but not enabled for the
+# account. Any other 404 means the route is missing; the service sends those
+# with an empty body.
+_ACCOUNT_LIST_NOT_ENABLED_MESSAGE = "account-level job listing is not enabled for this account"
+_INVALID_PAGE_TOKEN_MESSAGE = "invalid page_token"
+# How much of the service's error message an exception's own message quotes.
+_SERVICE_MESSAGE_LIMIT = 300
+
+
+class AccountJobListUnavailable(requests.exceptions.HTTPError):
+    """The account-level job list is not available to this caller.
+
+    Raised by :meth:`CortexTrainingClient.list_jobs_page` and
+    :meth:`CortexTrainingClient.iter_jobs` at once, without retries. ``reason``
+    is one of:
+
+    - ``"not_deployed"``: 404 without the service's not-enabled error, normally
+      with an empty body: the service does not have the route yet. With some
+      other body, a proxy in front of the service may have answered instead.
+    - ``"disabled"``: 404 whose JSON body says account-level job listing is not
+      enabled for this account.
+    - ``"forbidden"``: 403. When the answer carries the service's reason, the
+      message quotes it: Cortex Training is not enabled for the account, its
+      trial has ended, or, under a ``status`` filter, the service was refused
+      a status lookup. A 403 without one can also come from a network policy
+      or a proxy in front of the service.
+    - ``"rest_disabled"``: 405. The Cortex Training REST API is turned off for
+      the account.
+
+    ``not_deployed`` and ``disabled`` concern this route only, so
+    :meth:`CortexTrainingClient.list_jobs` still lists the configured schema.
+    ``forbidden`` and ``rest_disabled`` mostly come from gates the per-schema
+    routes share, so expect those to fail the same way. A subclass of
+    ``requests.HTTPError``, so code that catches that keeps working;
+    ``response`` is the service's answer, and ``str()`` is one line, which can
+    quote the service's own message.
+    """
+
+    NOT_DEPLOYED = "not_deployed"
+    DISABLED = "disabled"
+    FORBIDDEN = "forbidden"
+    REST_DISABLED = "rest_disabled"
+    REASONS = frozenset({NOT_DEPLOYED, DISABLED, FORBIDDEN, REST_DISABLED})
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        response: requests.Response | None = None,
+        request: requests.Request | requests.PreparedRequest | None = None,
+    ):
+        super().__init__(message, response=response, request=request)
+        self.reason = reason
+
+    def __reduce__(self):
+        # copy and pickle rebuild an exception from its args, which leave out
+        # the keyword-only reason.
+        return (functools.partial(type(self), reason=self.reason), self.args, self.__dict__)
+
+
+class InvalidPageToken(requests.exceptions.HTTPError):
+    """The service could not open a ``page_token``: 400 ``Invalid page_token``.
+
+    It happens, for example, after the service rotates the key that seals its
+    tokens. Start the walk again from the first page.
+    :meth:`CortexTrainingClient.iter_jobs` does that once by itself.
+    """
+
+
+def _error_body_candidates(response: requests.Response) -> Iterator[dict]:
+    try:
+        body = response.json()
+    except Exception:
+        return iter(())
+    return _iter_error_dicts(body)
+
+
+def _service_error_message(response: requests.Response) -> str | None:
+    """The message in the service's JSON error body, on one bounded line."""
+    for candidate in _error_body_candidates(response):
+        message = candidate.get("message")
+        if isinstance(message, str) and message.strip():
+            message = " ".join(message.split())
+            if len(message) > _SERVICE_MESSAGE_LIMIT:
+                message = message[: _SERVICE_MESSAGE_LIMIT - 3] + "..."
+            return message
+    return None
+
+
+def _has_body(response: requests.Response) -> bool:
+    try:
+        return bool((response.content or b"").strip())
+    except Exception:
+        return True
+
+
+def _account_list_unavailable_message(reason: str, response: requests.Response) -> str:
+    """Why the account-level list is unavailable, claiming no more than the answer shows."""
+    if reason == AccountJobListUnavailable.NOT_DEPLOYED:
+        if not _has_body(response):
+            return (
+                "account-level job listing is not available on this service yet: "
+                "GET /api/v2/cortex-training answered 404 with no error body, so "
+                "the route is not deployed"
+            )
+        # A body without the service's error: often a proxy's or gateway's page,
+        # which says nothing about whether the route is deployed.
+        return (
+            "account-level job listing is not available: GET /api/v2/cortex-training "
+            "answered 404 without the service's not-enabled error; the route may not "
+            "be deployed yet, or a proxy in front of the service answered"
+        )
+    if reason == AccountJobListUnavailable.DISABLED:
+        return (
+            "account-level job listing is not enabled for this account (HTTP 404); "
+            "Snowflake enables it per account"
+        )
+    if reason == AccountJobListUnavailable.FORBIDDEN:
+        message = _service_error_message(response)
+        if message is not None:
+            return f"account-level job listing was refused (HTTP 403): {message}"
+        return (
+            "account-level job listing was refused (HTTP 403) with no error "
+            "message: a network policy or a proxy may have blocked the request, "
+            "or Cortex Training is not enabled for this account or its trial has "
+            "ended"
+        )
+    return (
+        "account-level job listing is unavailable: the Cortex Training REST API "
+        "is turned off for this account (HTTP 405)"
+    )
+
+
+def _says_account_list_not_enabled(response: requests.Response) -> bool:
+    return any(
+        isinstance(candidate.get("message"), str)
+        and _ACCOUNT_LIST_NOT_ENABLED_MESSAGE in candidate["message"].lower()
+        for candidate in _error_body_candidates(response)
+    )
+
+
+def _says_invalid_page_token(response: requests.Response) -> bool:
+    # A prefix, should the service add detail. Not "page_token does not match
+    # the request filters": that one is a caller sending different filters,
+    # which a restart would only hide.
+    return any(
+        isinstance(candidate.get("message"), str)
+        and candidate["message"].strip().lower().startswith(_INVALID_PAGE_TOKEN_MESSAGE)
+        for candidate in _error_body_candidates(response)
+    )
+
+
+def _account_list_unavailable_reason(response: requests.Response) -> str | None:
+    status_code = getattr(response, "status_code", None)
+    if status_code == 405:
+        return AccountJobListUnavailable.REST_DISABLED
+    if status_code == 403:
+        return AccountJobListUnavailable.FORBIDDEN
+    if status_code != 404:
+        return None
+    if _says_account_list_not_enabled(response):
+        return AccountJobListUnavailable.DISABLED
+    return AccountJobListUnavailable.NOT_DEPLOYED
+
+
+def _account_list_error(
+    exc: requests.exceptions.HTTPError, *, page_token_sent: bool
+) -> requests.exceptions.HTTPError | None:
+    """The typed error for an account-list failure, or None to raise ``exc`` as is."""
+    response = exc.response
+    if response is None:
+        return None
+    reason = _account_list_unavailable_reason(response)
+    if reason is not None:
+        error: requests.exceptions.HTTPError = AccountJobListUnavailable(
+            _account_list_unavailable_message(reason, response),
+            reason=reason,
+            response=response,
+            request=exc.request,
+        )
+    elif (
+        page_token_sent
+        and response.status_code == 400
+        and _says_invalid_page_token(response)
+    ):
+        error = InvalidPageToken(
+            "the service could not open page_token (HTTP 400 Invalid page_token); "
+            "start again from the first page",
+            response=response,
+            request=exc.request,
+        )
+    else:
+        return None
+    _add_snowflake_request_id_to_error(error, _response_snowflake_request_id(response))
+    return error
+
+
+def _optional_filter(value: Any, name: str) -> str | None:
+    """A string filter, or None when it is None or empty, as the service reads it."""
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string, got {type(value).__name__}")
+    return value
+
+
+def _account_status_param(status: str | Iterable[str] | None) -> str | None:
+    """The ``status`` query value: a comma list with ``done`` spelled out.
+
+    Words keep their case (the service ignores it); empty words and repeats are
+    dropped, and an empty list means no filter, as it does on the service.
+    """
+    if status is None:
+        return None
+    if isinstance(status, str):
+        words: Iterable[Any] = status.split(",")
+    elif isinstance(status, Iterable):
+        words = status
+    else:
+        raise ValueError(
+            f"status must be a string or a list of strings, got {type(status).__name__}"
+        )
+    sent: list[str] = []
+    seen: set[str] = set()
+    for word in words:
+        if not isinstance(word, str):
+            raise ValueError(
+                f"status must be a string or a list of strings, got a {type(word).__name__} in it"
+            )
+        word = word.strip()
+        if not word:
+            continue
+        for value in _ACCOUNT_STATUS_ALIASES.get(word.lower(), (word,)):
+            if value.lower() not in seen:
+                seen.add(value.lower())
+                sent.append(value)
+    return ",".join(sent) or None
+
+
+def _is_whole_number(value: Any) -> bool:
+    """An int, or another integral type such as numpy's, but not a bool."""
+    return isinstance(value, numbers.Integral) and not isinstance(value, bool)
+
+
+def _account_page_size(page_size: Any) -> int:
+    if not _is_whole_number(page_size):
+        raise ValueError(
+            f"page_size must be an int, got {type(page_size).__name__} {page_size!r}"
+        )
+    if not 1 <= page_size <= _ACCOUNT_JOBS_MAX_PAGE_SIZE:
+        raise ValueError(
+            f"page_size must be between 1 and {_ACCOUNT_JOBS_MAX_PAGE_SIZE}, got {page_size}"
+        )
+    return int(page_size)
+
+
+def _account_page_bounds(
+    max_retries: Any, request_timeout: Any
+) -> tuple[int | None, tuple[float, float] | None]:
+    """Validated per-call ``max_retries`` and ``request_timeout`` (one page of
+    the account-level list, or one ``list_jobs``); None keeps the client's."""
+    if max_retries is not None:
+        if not _is_whole_number(max_retries) or max_retries < 0:
+            raise ValueError(f"max_retries must be an int >= 0, got {max_retries!r}")
+        max_retries = int(max_retries)
+    timeout = None if request_timeout is None else _validated_request_timeout(request_timeout)
+    return max_retries, timeout
+
+
+def _account_jobs_page(body: Any) -> dict:
+    """``{"jobs": [...], "next_page_token": str | None}`` from a page's JSON body."""
+    if not isinstance(body, dict):
+        raise _server_failure(
+            ValueError("the account-level job list answered with a non-object JSON body")
+        )
+    jobs = body.get("jobs")
+    if jobs is None:
+        jobs = []
+    if not isinstance(jobs, list):
+        raise _server_failure(
+            ValueError("the account-level job list answered with a non-list 'jobs'")
+        )
+    token = body.get("next_page_token")
+    return {"jobs": jobs, "next_page_token": token if isinstance(token, str) and token else None}
+
+
 def _is_account_list_transient(exc: BaseException) -> bool:
-    # The account-level job list answers 404 when it is not enabled for the
-    # account, which no retry fixes.
+    # 403, 404 and 405 are the gates in front of the account-level list, which
+    # no retry opens.
     if isinstance(exc, requests.exceptions.HTTPError):
-        if exc.response is not None and exc.response.status_code == 404:
+        if exc.response is not None and exc.response.status_code in (403, 404, 405):
+            return False
+    return _is_transient(exc)
+
+
+def _is_tail_logs_transient(exc: BaseException) -> bool:
+    # tail-logs answers 409 while the job is not running (still pending
+    # placement, or ended) and 404 once its session is gone. Neither clears on
+    # the backoff a retry would spend, so the answer is left to the caller:
+    # _is_session_pending tells a following tail which of the two it is.
+    if isinstance(exc, requests.exceptions.HTTPError):
+        if exc.response is not None and exc.response.status_code in (404, 409):
+            return False
+    return _is_transient(exc)
+
+
+# tail-logs' 409 for a job the service has not placed yet. It answers 409 both
+# before placement and once the session is over, and only the message tells them
+# apart ("... is pending placement: quota_filled" against "... has been
+# cancelled: cancelled_by_client").
+_SESSION_PENDING_PLACEMENT = "is pending placement"
+
+
+def _is_session_pending(exc: BaseException) -> bool:
+    """Whether ``exc`` is tail-logs' 409 for a job that has yet to start.
+
+    A following tail waits this one out, there being no log to read yet (see
+    :meth:`CortexTrainingClient.stream_logs`). Every other failure is the
+    caller's, the 409 for a session that is over included: that log is complete,
+    and a caller with a saved copy to fall back on has to see it end.
+    """
+    if not isinstance(exc, requests.exceptions.HTTPError):
+        return False
+    response = exc.response
+    if response is None or getattr(response, "status_code", None) != 409:
+        return False
+    try:
+        text = response.text
+    except Exception:  # noqa: BLE001 - an unreadable body is not the pending answer
+        return False
+    return isinstance(text, str) and _SESSION_PENDING_PLACEMENT in text.lower()
+
+
+# The service answers 500 "Linked experiment is not found for job ..." from the
+# experiment-run route (and "... or not authorized for the training job" from
+# others) when it can't resolve the job's Experiment for the caller's role.
+_LINKED_EXPERIMENT_NOT_FOUND = "Linked experiment is not found"
+
+
+def _is_experiment_run_transient(exc: BaseException) -> bool:
+    # A retry can't make the job's Experiment readable; it only delays the
+    # error by a minute.
+    if isinstance(exc, requests.exceptions.HTTPError) and exc.response is not None:
+        try:
+            text = exc.response.text
+        except Exception:  # noqa: BLE001 - an unreadable body falls back to the general rules
+            text = ""
+        if isinstance(text, str) and _LINKED_EXPERIMENT_NOT_FOUND in text:
             return False
     return _is_transient(exc)
 
@@ -1578,6 +1964,7 @@ def build_forward_backward_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
 
 def serialize_forward_backward_args(args: tuple = (), kwargs: dict[str, Any] | None = None) -> bytes:
     """Serialize ``{"args": args, "kwargs": kwargs}`` for Cortex Training fwd-bwd."""
+    from cortex_training import wire  # torch loads on first use, not at import
     if not isinstance(args, tuple):
         raise ValueError("forward-backward args must be a tuple")
     if kwargs is None:
@@ -1702,20 +2089,85 @@ def _sql_identifier(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
-def _created_param(value: date | datetime | str | None) -> str | None:
-    """Render a ``created_after`` / ``created_before`` query value.
+# The strings created_after / created_before take: YYYY-MM-DD, or
+# YYYY-MM-DDTHH:MM[:SS[.fraction]] with "T" or a space between date and time,
+# and an optional "Z" or +HH[:MM] / -HH[:MM] offset.
+_CREATED_BOUND_RE = re.compile(
+    r"(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})"
+    r"(?:[Tt ](?P<hour>[0-9]{2}):(?P<minute>[0-9]{2})"
+    r"(?::(?P<second>[0-9]{2})(?:[.,](?P<fraction>[0-9]+))?)?"
+    r"(?P<offset>[Zz]|[+-][0-9]{2}(?::?[0-9]{2})?)?)?"
+)
 
-    A ``datetime`` becomes UTC RFC 3339 (a naive one is taken as UTC), a
-    ``date`` stays ``YYYY-MM-DD`` (UTC midnight on the server), and a string is
-    sent as given.
+
+def _parse_created_bound(text: str, name: str) -> datetime:
+    """``text`` as a datetime; naive when it names no offset."""
+    problem = (
+        f"{name} must be YYYY-MM-DD, or YYYY-MM-DDTHH:MM[:SS[.fraction]] (a space "
+        f"may replace the T) with an optional Z or +HH[:MM] / -HH[:MM] offset; "
+        f"got {text!r}"
+    )
+    match = _CREATED_BOUND_RE.fullmatch(text.strip())
+    if match is None:
+        raise ValueError(problem)
+    try:
+        day = date.fromisoformat(match["date"])
+        if match["hour"] is None:
+            return datetime(day.year, day.month, day.day)
+        zone = None
+        offset = match["offset"]
+        if offset in ("Z", "z"):
+            zone = timezone.utc
+        elif offset:
+            digits = offset[1:].replace(":", "")
+            hours, minutes = int(digits[:2]), int(digits[2:] or 0)
+            if minutes >= 60:
+                raise ValueError(f"offset minutes out of range: {offset}")
+            shift = timedelta(hours=hours, minutes=minutes)
+            zone = timezone(-shift if offset[0] == "-" else shift)
+        return datetime(
+            day.year,
+            day.month,
+            day.day,
+            int(match["hour"]),
+            int(match["minute"]),
+            int(match["second"] or 0),
+            # Microseconds are the finest a datetime holds; later digits go.
+            int((match["fraction"] or "")[:6].ljust(6, "0")),
+            tzinfo=zone,
+        )
+    except ValueError as exc:
+        raise ValueError(problem) from exc
+
+
+def _created_param(value: date | datetime | str | None, name: str) -> str | None:
+    """Render a ``created_after`` / ``created_before`` value as RFC 3339 in UTC with ``Z``.
+
+    A ``date``, or a ``YYYY-MM-DD`` string, is midnight UTC. A naive
+    ``datetime``, or a string without an offset, is taken as UTC. ``None`` and
+    ``""`` mean no bound.
     """
+    if value is None or value == "":
+        return None
     if isinstance(value, datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-    if isinstance(value, date):
-        return value.isoformat()
-    return value
+        moment = value
+    elif isinstance(value, date):
+        moment = datetime(value.year, value.month, value.day)
+    elif isinstance(value, str):
+        moment = _parse_created_bound(value, name)
+    else:
+        raise ValueError(
+            f"{name} must be a date, a datetime or a string, got {type(value).__name__}"
+        )
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    try:
+        moment = moment.astimezone(timezone.utc)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{name} is out of range once converted to UTC: {value!r}") from exc
+    # A plain datetime, so a subclass's own isoformat() can't change the form.
+    plain = datetime(*moment.timetuple()[:6], moment.microsecond)
+    return plain.isoformat() + "Z"
 
 
 def _validate_artifact_relative_path(path: str) -> str:
@@ -1838,6 +2290,20 @@ class CortexTrainingClient:
         adapter = HTTPAdapter(pool_connections=pool_maxsize, pool_maxsize=pool_maxsize)
         self._session.mount("https://", adapter)
         self._session.mount("http://", adapter)
+
+    @property
+    def auto_create_database(self) -> bool:
+        """Whether a request answered "database or schema not found" creates them and retries.
+
+        True by default. Set it to False for a client that only reads, as the TUI
+        does: the error is then raised as it is. A :meth:`for_job` client never
+        creates one.
+        """
+        return self._auto_create_database
+
+    @auto_create_database.setter
+    def auto_create_database(self, value: bool) -> None:
+        self._auto_create_database = bool(value)
 
     @classmethod
     def from_pat(
@@ -2550,11 +3016,32 @@ class CortexTrainingClient:
         return resp.json()
 
     @_track_operation("list_jobs")
-    def list_jobs(self, status: str | None = None) -> list:
+    def list_jobs(
+        self,
+        status: str | None = None,
+        *,
+        max_retries: int | None = None,
+        request_timeout: float | tuple[float, float] | None = None,
+    ) -> list:
+        """List the jobs of this client's database and schema.
+
+        ``max_retries`` (retries after the first attempt; ``0`` means one
+        attempt) and ``request_timeout`` (seconds, or a ``(connect, read)``
+        pair) bound this one call, as on :meth:`list_jobs_page`; None keeps
+        the client's own (10 retries, 30 s to connect and 600 s to read, by
+        default).
+        """
+        max_retries, timeout = _account_page_bounds(max_retries, request_timeout)
         params = {}
         if status is not None:
             params["status"] = status
-        resp = self._send("GET", self._prefix, params=params)
+        resp = self._send(
+            "GET",
+            self._prefix,
+            params=params,
+            max_retries=max_retries,
+            **({} if timeout is None else {"timeout": timeout}),
+        )
         return resp.json().get("jobs", [])
 
     def iter_jobs(
@@ -2562,87 +3049,248 @@ class CortexTrainingClient:
         *,
         database: str | None = None,
         schema: str | None = None,
-        status: str | list[str] | None = None,
+        status: str | Iterable[str] | None = None,
         submitted_by: str | None = None,
         created_after: date | datetime | str | None = None,
         created_before: date | datetime | str | None = None,
         page_size: int = 100,
+        max_retries: int | None = None,
+        request_timeout: float | tuple[float, float] | None = None,
     ) -> Iterator[dict]:
         """Yield the jobs the caller can see across the account, newest first.
 
-        Reads the account-level ``GET /api/v2/{endpoint}`` route rather than
-        this client's schema, and follows ``next_page_token`` until the server
-        returns none; a page may hold fewer than ``page_size`` rows, even none.
-        Arguments are checked on the call, pages fetched as you iterate:
-        ``page_size`` is 1 to 1000, and ``schema`` needs ``database`` with it.
-        The server applies every filter: ``database`` / ``schema`` narrow the
-        scope, ``status`` is one status or a list of them (``active`` and
-        ``done`` name groups), ``submitted_by`` takes a user name, and
-        ``created_after`` (inclusive) / ``created_before`` (exclusive) take a
-        ``date``, a ``datetime`` (sent in UTC; naive is taken as UTC) or a
-        string sent as-is. Rows also carry ``database_name`` and
-        ``schema_name``; use :meth:`for_job` for per-job calls on one.
+        Reads :meth:`list_jobs_page` page after page as you iterate, with the
+        same filters each time, until no ``next_page_token`` is left; a page can
+        hold fewer than ``page_size`` jobs, or none, before the end. The
+        arguments are those of :meth:`list_jobs_page` without ``page_token``,
+        and are checked on the call. ``max_retries`` and ``request_timeout``
+        bound each page, not the whole walk.
 
-        A 404 means account-level listing is not enabled for this account, and
-        is raised at once rather than retried.
+        If the service stops accepting the page token partway (400 ``Invalid
+        page_token``, for example after it rotated the key that seals tokens),
+        the walk starts again from the first page, once, and skips the jobs it
+        already yielded, by ``job_id``. Jobs created since the walk began then
+        come after older jobs already yielded, so sort by ``created_at`` when
+        order matters. A second such answer raises :class:`InvalidPageToken`.
+        Other failures raise as :meth:`list_jobs_page` describes, on the page
+        that fails.
         """
-        if not 1 <= page_size <= 1000:
-            raise ValueError(f"page_size must be between 1 and 1000, got {page_size}")
+        params = self._account_jobs_params(
+            database=database,
+            schema=schema,
+            status=status,
+            submitted_by=submitted_by,
+            created_after=created_after,
+            created_before=created_before,
+            page_size=page_size,
+        )
+        max_retries, timeout = _account_page_bounds(max_retries, request_timeout)
+        return self._iter_account_jobs(params, max_retries, timeout)
+
+    def list_jobs_page(
+        self,
+        *,
+        database: str | None = None,
+        schema: str | None = None,
+        status: str | Iterable[str] | None = None,
+        submitted_by: str | None = None,
+        created_after: date | datetime | str | None = None,
+        created_before: date | datetime | str | None = None,
+        page_size: int = 100,
+        page_token: str | None = None,
+        max_retries: int | None = None,
+        request_timeout: float | tuple[float, float] | None = None,
+    ) -> dict:
+        """Read one page of the jobs the caller can see across the account.
+
+        Returns ``{"jobs": [...], "next_page_token": str | None}``. Jobs come
+        newest first and also carry ``database_name`` and ``schema_name``; use
+        :meth:`for_job` for per-job calls on one. For the next page, pass
+        ``next_page_token`` back as ``page_token`` with the same filters
+        (``page_size`` may change), so compute a moving bound such as
+        ``created_after`` once per walk; ``None`` means there is no next page.
+        The service examines at most 5,000 jobs per call, so a page can hold
+        fewer than ``page_size`` jobs, or none, and still carry a token.
+
+        This reads the account-level ``GET /api/v2/cortex-training``, a fixed
+        path whatever this client's ``endpoint`` is, and never creates a
+        database. The service applies every filter, and ``None`` or ``""``
+        means none:
+
+        - ``database``, ``schema``: SQL identifier rules apply (unquoted is
+          case-insensitive, ``"quoted"`` is exact); ``schema`` needs
+          ``database``.
+        - ``status``: a comma-separated string or a list of ``pending``,
+          ``placing``, ``initializing``, ``running``, ``failed``,
+          ``cancelled``, ``terminated`` and the groups ``active`` (``pending``
+          through ``running``) and ``terminal`` (``cancelled``, ``terminated``,
+          ``failed``). ``done``, which the service no longer takes, is sent as
+          ``cancelled,terminated``, its older meaning. Under any status filter
+          the service leaves out jobs whose live status it can't read; without
+          one they come back as ``UNKNOWN`` with a ``reason``. The per-schema
+          :meth:`list_jobs` reads ``status`` its own way.
+        - ``submitted_by``: a user name, by SQL identifier rules. A name that
+          matches no active user in the account is a 400.
+        - ``created_after`` (inclusive), ``created_before`` (exclusive): a
+          ``date`` (midnight UTC), a ``datetime`` (naive means UTC), or a
+          string: ``YYYY-MM-DD``, or ``YYYY-MM-DDTHH:MM[:SS[.fraction]]`` (a
+          space may replace the ``T``) with an optional ``Z`` or
+          ``+HH[:MM]`` / ``-HH[:MM]`` offset (none means UTC). Sent as RFC
+          3339 in UTC with ``Z``.
+        - ``page_size``: an int from 1 to 1000.
+
+        The page uses this client's ``max_retries`` (10 by default, so up to
+        11 attempts) and ``request_timeout`` (30 s to connect and 600 s to
+        read, by default) unless bounded here: ``max_retries`` counts retries
+        after the first attempt, and ``request_timeout`` is seconds or a
+        ``(connect, read)`` pair. Connection errors, timeouts, and 307, 308,
+        409, 429, 500, 502, 503 and 504 answers are retried. Bound
+        interactive calls: under a status filter the service can wait up to
+        300 s on a failing status lookup before it fails the page.
+
+        Raises, with the arguments checked before any request:
+
+        - :class:`AccountJobListUnavailable` for 403, 404 and 405, without a
+          retry;
+        - :class:`InvalidPageToken` for 400 ``Invalid page_token``;
+        - ``requests.HTTPError`` for any other failed answer, including other
+          400s;
+        - ``requests.ConnectionError`` or ``requests.Timeout`` once retries
+          are spent;
+        - ``ValueError`` for bad arguments, or a page body that is not a job
+          list.
+
+        All but the last are ``requests.RequestException``, an ``OSError``.
+        """
+        params = self._account_jobs_params(
+            database=database,
+            schema=schema,
+            status=status,
+            submitted_by=submitted_by,
+            created_after=created_after,
+            created_before=created_before,
+            page_size=page_size,
+        )
+        page_token = _optional_filter(page_token, "page_token")
+        if page_token is not None:
+            params["page_token"] = page_token
+        max_retries, timeout = _account_page_bounds(max_retries, request_timeout)
+        return self._list_jobs_page(params, max_retries, timeout)
+
+    @staticmethod
+    def _account_jobs_params(
+        *,
+        database: Any,
+        schema: Any,
+        status: Any,
+        submitted_by: Any,
+        created_after: Any,
+        created_before: Any,
+        page_size: Any,
+    ) -> dict:
+        """The account-level list's query parameters, checked before any request."""
+        database = _optional_filter(database, "database")
+        schema = _optional_filter(schema, "schema")
         if schema is not None and database is None:
             raise ValueError(
-                "iter_jobs(schema=...) needs database=... with it: a schema name "
-                "alone does not name one schema."
+                "schema=... needs database=... with it: a schema name alone does "
+                "not name one schema."
             )
-        if status is not None and not isinstance(status, str):
-            status = ",".join(status)
         query = {
             "database": database,
             "schema": schema,
-            "status": status,
-            "submitted_by": submitted_by,
-            "created_after": _created_param(created_after),
-            "created_before": _created_param(created_before),
-            "limit": page_size,
+            "status": _account_status_param(status),
+            "submitted_by": _optional_filter(submitted_by, "submitted_by"),
+            "created_after": _created_param(created_after, "created_after"),
+            "created_before": _created_param(created_before, "created_before"),
+            "limit": _account_page_size(page_size),
         }
-        params = {key: value for key, value in query.items() if value is not None}
-        return self._iter_account_jobs(params)
+        return {key: value for key, value in query.items() if value is not None}
 
-    def _iter_account_jobs(self, params: dict) -> Iterator[dict]:
+    def _iter_account_jobs(
+        self,
+        params: dict,
+        max_retries: int | None,
+        timeout: tuple[float, float] | None,
+    ) -> Iterator[dict]:
+        yielded: set[str] = set()
+        restarted = False
+        token: str | None = None
         while True:
-            page = self._list_account_jobs_page(params)
-            yield from page.get("jobs", [])
-            token = page.get("next_page_token")
-            if not token:
+            page_params = params if token is None else {**params, "page_token": token}
+            try:
+                page = self._iter_jobs_page(page_params, max_retries, timeout)
+            except InvalidPageToken:
+                if restarted:
+                    raise
+                restarted = True
+                token = None
+                logger.info(
+                    "account-level job list: the service could not open the page "
+                    "token, so the walk starts again from the first page"
+                )
+                continue
+            for job in page["jobs"]:
+                job_id = job.get("job_id") if isinstance(job, dict) else None
+                if isinstance(job_id, str):
+                    if job_id in yielded:
+                        continue
+                    yielded.add(job_id)
+                yield job
+            token = page["next_page_token"]
+            if token is None:
                 return
-            params = {**params, "page_token": token}
 
-    # Tracked per page: around the generator, _track_operation would record
-    # iter_jobs as finished before its first request.
+    # One event per page, named for the public call that read it. Tracked per
+    # page: around the generator, _track_operation would record iter_jobs as
+    # finished before its first request.
     @_track_operation("iter_jobs")
-    def _list_account_jobs_page(self, params: dict) -> dict:
+    def _iter_jobs_page(
+        self,
+        params: dict,
+        max_retries: int | None,
+        timeout: tuple[float, float] | None,
+    ) -> dict:
+        return self._get_account_jobs_page(params, max_retries, timeout)
+
+    @_track_operation("list_jobs_page")
+    def _list_jobs_page(
+        self,
+        params: dict,
+        max_retries: int | None,
+        timeout: tuple[float, float] | None,
+    ) -> dict:
+        return self._get_account_jobs_page(params, max_retries, timeout)
+
+    def _get_account_jobs_page(
+        self,
+        params: dict,
+        max_retries: int | None,
+        timeout: tuple[float, float] | None,
+    ) -> dict:
         try:
             resp = self._send(
                 "GET",
-                f"{self.base_url}/api/v2/{self.endpoint}",
+                f"{self.base_url}{_ACCOUNT_JOBS_PATH}",
                 params=params,
                 retry_on=_is_account_list_transient,
+                max_retries=max_retries,
                 # The path names no database, so a not-found error here is not
                 # about the configured one.
                 ensure_database=False,
+                **({} if timeout is None else {"timeout": timeout}),
             )
         except requests.exceptions.HTTPError as exc:
-            if exc.response is None or exc.response.status_code != 404:
+            error = _account_list_error(exc, page_token_sent="page_token" in params)
+            if error is None:
                 raise
-            raise requests.exceptions.HTTPError(
-                "account-level job listing is not enabled for this account",
-                request=exc.request,
-                response=exc.response,
-            ) from exc
-        return resp.json()
+            raise error from exc
+        with _server_payload():
+            return _account_jobs_page(resp.json())
 
     def for_job(self, job: dict) -> "CortexTrainingClient":
         """Return a client bound to ``job``'s schema, for per-job calls on a
-        row from :meth:`iter_jobs`.
+        row from :meth:`iter_jobs` or :meth:`list_jobs_page`.
 
         The new client borrows this client's session, auth and telemetry, so
         keep this one open and close it rather than the new one. It never
@@ -2776,8 +3424,12 @@ class CortexTrainingClient:
         """Return ``{experiment_name, experiment_run_name}`` for ``job_id``.
 
         Backed by the endpoint ``/cortex-training/{job_id}/experiment-run``.
+        A 500 saying ``Linked experiment is not found`` (the caller's role
+        can't resolve the job's Experiment) is raised at once, not retried.
         """
-        resp = self._send("GET", f"{self._prefix}/{job_id}/experiment-run")
+        resp = self._send(
+            "GET", f"{self._prefix}/{job_id}/experiment-run", retry_on=_is_experiment_run_transient
+        )
         return resp.json()
 
     def _query_sql_row(self, statement: str) -> list[Any]:
@@ -2942,7 +3594,13 @@ class CortexTrainingClient:
         return downloaded
 
     @_track_operation("fetch_execution_logs")
-    def fetch_execution_logs(self, job_id: str) -> list[dict[str, str]]:
+    def fetch_execution_logs(
+        self,
+        job_id: str,
+        *,
+        sub_job_id: str | None = None,
+        filename: str | None = None,
+    ) -> list[dict[str, str]]:
         """Download every log file under the job's experiment run stage.
 
         Returns a list of
@@ -2950,6 +3608,10 @@ class CortexTrainingClient:
         entries, one per object found under a ``_logs/<sub_job_id>/`` subtree
         in the run's stage. Filenames such as ``execution.jsonl`` and
         ``server.log`` are both included; bodies are decoded as UTF-8.
+
+        ``sub_job_id`` and ``filename``, when given, download only the files
+        of that sub-job and with that name (for example one sub-job's
+        ``execution.jsonl``); the rest are listed but not fetched.
 
         ``artifact_uri`` is the logical ``snow://`` URI. Files are retrieved
         through Snowflake's supported experiment artifact ``LIST``/``GET``
@@ -2981,16 +3643,18 @@ class CortexTrainingClient:
                         after_logs = relative_path.removeprefix("checkpoints/_logs/")
                     else:
                         continue
-                    sub_job_id, separator, filename = after_logs.partition("/")
+                    file_sub_job, separator, file_name = after_logs.partition("/")
                     if (
                         not separator
-                        or not filename
+                        or not file_name
                         or not (
-                            sub_job_id == job_id
-                            or sub_job_id.startswith(f"{job_id}:")
+                            file_sub_job == job_id
+                            or file_sub_job.startswith(f"{job_id}:")
                         )
-                        or sub_job_id in {".", ".."}
-                        or "\\" in sub_job_id
+                        or file_sub_job in {".", ".."}
+                        or "\\" in file_sub_job
+                        or (sub_job_id is not None and file_sub_job != sub_job_id)
+                        or (filename is not None and file_name != filename)
                     ):
                         continue
                     downloaded = self._download_experiment_artifact(
@@ -3009,8 +3673,8 @@ class CortexTrainingClient:
                         downloaded.unlink(missing_ok=True)
                     results.append(
                         {
-                            "sub_job_id": sub_job_id,
-                            "filename": filename,
+                            "sub_job_id": file_sub_job,
+                            "filename": file_name,
                             "artifact_uri": artifact_uri,
                             "content": content,
                         }
@@ -3548,6 +4212,7 @@ class CortexTrainingClient:
         on_chunk: Callable[[str, int, int, int], None] | None = None,
         strict: bool = False,
         warnings_by_sub_job: Mapping[str, list[str]] | None = None,
+        on_commit: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Fetch every new chunk concurrently and append them in plan order.
 
@@ -3560,7 +4225,8 @@ class CortexTrainingClient:
         ``"\\n"`` once the manifest is written or the sub-job fails; a sub-job
         with nothing new gets one line ending in a newline instead.
         ``on_chunk`` gets ``(sub_job_id, done, total, bytes)`` counts, with
-        ``done == total`` only after the file is committed.
+        ``done == total`` only after the file is committed. ``on_commit`` then
+        gets a copy of that sub-job's result entry.
         """
         work = [path for plan in plans for path in plan.new_paths]
         window = max_workers * self._DOWNLOAD_WINDOW_PER_WORKER
@@ -3626,6 +4292,8 @@ class CortexTrainingClient:
                                     warnings=warnings,
                                 )
                             )
+                            if on_commit is not None:
+                                on_commit(dict(results[-1]))
                             continue
                         writer = _artifact_download.ChunkWriter(
                             plan.data_path,
@@ -3708,6 +4376,8 @@ class CortexTrainingClient:
                             warnings=warnings,
                         )
                     )
+                    if on_commit is not None:
+                        on_commit(dict(results[-1]))
                 # Inside the handler, so an interrupt here is still marked saved.
                 pool.shutdown(wait=True)
                 spool.remove_after([])
@@ -4055,6 +4725,8 @@ class CortexTrainingClient:
         strict: bool = False,
         stale_after_seconds: float | None = _DOWNLOAD_STALE_AFTER_SECONDS,
         transfer_timeout_seconds: float | None = _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS,
+        priority: Iterable[str] = (),
+        on_commit: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Reconstruct staged gzip chunks into one file per sub-job.
 
@@ -4066,6 +4738,10 @@ class CortexTrainingClient:
         are a prefix of the sorted chunk list, and rebuilt otherwise. A chunk
         that will not decompress is downloaded once more and then skipped,
         unless ``strict``.
+
+        Sub-jobs are written in id order, those named in ``priority`` first
+        (in that order); the returned list stays in id order. ``on_commit``
+        gets a copy of each sub-job's result entry once its file is committed.
         """
         if max_workers is None:
             max_workers = self._DOWNLOAD_DEFAULT_WORKERS
@@ -4076,6 +4752,9 @@ class CortexTrainingClient:
         wanted = None if sub_job_ids is None else set(sub_job_ids)
         if wanted is not None and not wanted:
             raise ValueError("sub_job_ids must name at least one sub-job")
+        if isinstance(priority, (str, bytes)):
+            raise TypeError("priority must be an iterable of sub-job ids, not a single string")
+        first = {sub_job_id: rank for rank, sub_job_id in enumerate(dict.fromkeys(priority or ()))}
         if stale_after_seconds is not None and (
             isinstance(stale_after_seconds, bool)
             or not isinstance(stale_after_seconds, (int, float))
@@ -4168,6 +4847,9 @@ class CortexTrainingClient:
                 for sub_job_id in sorted(chunks_by_sub_job)
                 if wanted is None or sub_job_id in wanted
             ]
+            # Those named in priority first, in that order; the sort is stable,
+            # so the rest stay in id order.
+            plans.sort(key=lambda plan: first.get(plan.sub_job_id, len(first)))
             values["sub_job_count"] = len(plans)
             modes = {
                 "append"
@@ -4197,6 +4879,7 @@ class CortexTrainingClient:
                         on_chunk=on_chunk,
                         strict=strict,
                         warnings_by_sub_job=warnings_by_sub_job,
+                        on_commit=on_commit,
                     )
                 finally:
                     values["fetch_ms"] = round((time.monotonic() - started) * 1000, 3)
@@ -4257,6 +4940,8 @@ class CortexTrainingClient:
         strict: bool = False,
         stale_after_seconds: float | None = _DOWNLOAD_STALE_AFTER_SECONDS,
         transfer_timeout_seconds: float | None = _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS,
+        priority: Iterable[str] = (),
+        on_commit: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Reconstruct sealed console artifacts into one file per sub-job.
 
@@ -4272,11 +4957,15 @@ class CortexTrainingClient:
         ``on_chunk(sub_job_id, chunks_done, chunks_total, bytes)`` when a
         sub-job starts and after each appended chunk; ``chunks_done ==
         chunks_total`` arrives only after that sub-job's file is committed.
-        Both run on the calling thread. An error raised by either stops the
-        download, keeps the chunks already written for ``resume=True``, and is
-        re-raised; raise :class:`DownloadCancelled` to cancel without the call
-        being counted as a failure. The return value is unchanged.
-        ``sub_job_ids`` limits the download to those sub-jobs. A chunk that will
+        ``on_commit`` is then called with a copy of that sub-job's result
+        entry. All three run on the calling thread. An error raised by any of
+        them stops the download, keeps the chunks already written for
+        ``resume=True``, and is re-raised; raise :class:`DownloadCancelled` to
+        cancel without the call being counted as a failure. The return value
+        is unchanged.
+        ``sub_job_ids`` limits the download to those sub-jobs. Sub-jobs named
+        in ``priority`` are downloaded first, in that order, then the rest in
+        id order; the returned list is in id order either way. A chunk that will
         not decompress is downloaded once more and then skipped; it is listed in
         that sub-job's ``skipped_chunks`` and ``warnings``. ``strict=True``
         raises instead. While the job is running, a sub-job whose newest chunk is
@@ -4301,6 +4990,8 @@ class CortexTrainingClient:
             strict=strict,
             stale_after_seconds=stale_after_seconds,
             transfer_timeout_seconds=transfer_timeout_seconds,
+            priority=priority,
+            on_commit=on_commit,
         )
 
     @_track_operation("download_metrics")
@@ -4317,12 +5008,14 @@ class CortexTrainingClient:
         strict: bool = False,
         stale_after_seconds: float | None = _DOWNLOAD_STALE_AFTER_SECONDS,
         transfer_timeout_seconds: float | None = _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS,
+        priority: Iterable[str] = (),
+        on_commit: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Reconstruct staged GPU metric chunks into one JSONL file per sub-job.
 
         Accepts the same ``resume``, ``max_workers``, ``progress``, ``on_chunk``,
-        ``sub_job_ids``, ``strict``, ``stale_after_seconds``, and
-        ``transfer_timeout_seconds`` options as
+        ``sub_job_ids``, ``strict``, ``stale_after_seconds``,
+        ``transfer_timeout_seconds``, ``priority``, and ``on_commit`` options as
         :meth:`download_stdout_logs`. While the job is running, a sub-job with
         saved stdout but no metrics gets a result entry with ``chunk_count`` 0,
         ``saved_path`` ``None``, and a warning. Two downloads
@@ -4343,6 +5036,8 @@ class CortexTrainingClient:
             strict=strict,
             stale_after_seconds=stale_after_seconds,
             transfer_timeout_seconds=transfer_timeout_seconds,
+            priority=priority,
+            on_commit=on_commit,
         )
 
     # ─── Data-plane async operations ─────────────────────────────────────
@@ -4377,6 +5072,7 @@ class CortexTrainingClient:
 
         ``op`` only names the caller in the length-check error message.
         """
+        from cortex_training import wire  # torch loads on first use, not at import
         self._check_prompt_lengths(op, job_id, prompts)
         # Packed after validation so the check above still reads plain lists,
         # and so a rejected prompt is never converted for nothing.
@@ -4501,6 +5197,7 @@ class CortexTrainingClient:
         allow_group_restart: bool = False,
         debug_context: dict[str, Any] | None = None,
     ) -> dict:
+        from cortex_training import wire  # torch loads on first use, not at import
         chunks = wire.encode_byte_chunks(
             frame,
             kind="request",
@@ -4833,6 +5530,7 @@ class CortexTrainingClient:
         sub_job_type: str | None = None,
     ) -> dict:
         """Send a DSSST1 frame through ``/operation``, byte-chunked if oversized."""
+        from cortex_training import wire  # torch loads on first use, not at import
         max_json_bytes = _operation_max_json_bytes()
         # The server assembler rejects total_chunks <= 1, so a fitting frame
         # is posted raw.
@@ -5089,6 +5787,7 @@ class CortexTrainingClient:
 
     @staticmethod
     def _decode_result_payload(result: dict) -> dict | None:
+        from cortex_training import wire  # torch loads on first use, not at import
         if not isinstance(result, dict):
             return None
         if result.get("wire_format") != wire.WIRE_FORMAT_VERSION:
@@ -5162,6 +5861,7 @@ class CortexTrainingClient:
         :meth:`_decode_result_payload` already handles. An older backend
         returns ``{"job_id", "payload_b64"}`` with no ``wire_format``.
         """
+        from cortex_training import wire  # torch loads on first use, not at import
         if request_id not in self._forward_request_ids:
             return result
         self._forward_request_ids.discard(request_id)
@@ -5204,6 +5904,7 @@ class CortexTrainingClient:
     @_track_operation("poll_request")
     def poll_request(self, job_id: str, request_id: str) -> dict:
         """Poll until the async request completes. Returns the result dict."""
+        from cortex_training import wire  # torch loads on first use, not at import
         deadline = time.monotonic() + self.poll_timeout
         delay = self.poll_interval
         debug_context = self._fwd_bwd_request_debug.get(request_id)
@@ -5341,11 +6042,18 @@ class CortexTrainingClient:
         already includes worker output (Ray ``log_to_driver``); identify it via
         ``sub_job_id`` (or ``sub_job_type`` when unambiguous). Returns
         ``{"entries": [...], "next_cursor": str, "eof": bool}``. Re-call with
-        ``next_cursor`` to continue; an empty ``cursor`` reads from the start.
+        ``next_cursor`` to continue. Without a cursor (``None`` or empty),
+        ``max_lines`` tails the log's last lines; with neither, the read starts
+        at the beginning of the log.
 
-        A finished job's pods are gone, so this raises at once, with a pointer
-        to :meth:`download_stdout_logs` for the saved console; so does a
-        ``sub_job_id`` that is not part of the job.
+        A 409 (the job is pending placement, or no longer running) or a 404
+        (its session is gone) is raised at once instead of being retried:
+        neither clears on a retry. The 409's message says which it is, and
+        :meth:`get_job` confirms it; :meth:`stream_logs` waits out a job that
+        has yet to be placed. A finished job's pods are gone, so for one the
+        error points to :meth:`download_stdout_logs` for the saved console; it
+        also names a ``sub_job_id`` that is not part of the job. See
+        ``docs/reference/rest-api.md`` section 7.8.
         """
         payload: dict = {}
         if cursor is not None:
@@ -5353,10 +6061,6 @@ class CortexTrainingClient:
         if max_lines is not None:
             payload["max_lines"] = max_lines
         checked: dict[str, Any] = {}
-
-        def retry_on(exc: BaseException) -> bool:
-            return _is_transient(exc) and self._tail_hint(exc, job_id, sub_job_id, checked) is None
-
         try:
             return self._operation(
                 job_id,
@@ -5364,7 +6068,7 @@ class CortexTrainingClient:
                 payload=payload,
                 sub_job_id=sub_job_id,
                 sub_job_type=sub_job_type,
-                retry_on=retry_on,
+                retry_on=_is_tail_logs_transient,
             )
         except requests.exceptions.HTTPError as exc:
             hint = self._tail_hint(exc, job_id, sub_job_id, checked)
@@ -5384,12 +6088,13 @@ class CortexTrainingClient:
         sub_job_id: str | None,
         checked: dict[str, Any],
     ) -> str | None:
-        """Explain a tail-logs failure that no retry can fix, else ``None``.
+        """Explain a tail-logs failure, else ``None``.
 
         A 404, 409 or 410 from tail-logs means the sub-job's session is not there.
         The job is looked up once per call: if it has ended, its live logs are
         gone; if ``sub_job_id`` is not one of its sub-jobs, it never had any.
-        Otherwise (for example, a job still starting) the error stays retryable.
+        Otherwise (for example, a job still starting) there is nothing to add.
+        The 409 that says the job is pending placement needs no lookup.
         """
         if not isinstance(exc, requests.exceptions.HTTPError):
             return None
@@ -5397,6 +6102,9 @@ class CortexTrainingClient:
         if response is None or response.status_code not in (404, 409, 410):
             return None
         if _response_error_code(response) == _JOB_NOT_FOUND_CODE:
+            return None
+        if _is_session_pending(exc):
+            # The job has yet to start, so it has no log to point at.
             return None
         if "job" not in checked:
             try:
@@ -5439,11 +6147,23 @@ class CortexTrainingClient:
         its entries (under ``entries_key``), advance the cursor, and poll with
         backoff. With ``follow`` False, stop at the first empty page; with
         ``stop_at_eof``, also stop at an empty page that reports ``eof``.
+
+        While ``follow`` and the job has yet to be placed, the poll waits on the
+        same backoff rather than failing (see :func:`_is_session_pending`).
         """
         base_delay = poll_interval or self.poll_interval
         delay = base_delay
         while True:
-            page = fetch(cursor)
+            try:
+                page = fetch(cursor)
+            except requests.exceptions.HTTPError as exc:
+                # Nothing to read until the job is placed; a tail that follows
+                # waits for it, one draining the log once reports the answer.
+                if not (follow and _is_session_pending(exc)):
+                    raise
+                time.sleep(delay)
+                delay = min(delay * self.poll_backoff_multiplier, self.poll_max_interval)
+                continue
             cursor = page.get("next_cursor", cursor)
             entries = page.get(entries_key) or []
             for entry in entries:
@@ -5476,10 +6196,17 @@ class CortexTrainingClient:
         tail. With ``follow=False`` it stops at the first empty page, once it
         has caught up with the log (whether or not the server reports ``eof``).
 
+        Following a job the service has not placed yet is waiting, not an
+        error: there is no log to read, so the poll backs off and tries again
+        until the job starts. With ``follow=False`` that answer raises, the
+        caller having asked to drain the log once.
+
         The stream also ends, without an error, once the log can grow no more:
         at an empty page that reports ``eof``, or when the job ends after the
-        stream has read from it. A job that had already ended before the first
-        read raises, as :meth:`tail_logs` does.
+        stream has read from it. A session that was already over before the
+        first read (the 409 for a cancelled or finished job, or the 404 once it
+        is forgotten) raises, as :meth:`tail_logs` does; the job's saved log
+        outlives its session.
         """
         read_once = False
 

@@ -334,6 +334,10 @@ def cached_pages(
     ``live=False`` replays the cache and stops without ever calling ``fetch`` —
     used for terminal jobs whose zone is gone, so the operation API (which would
     500) is never hit.
+
+    While ``follow`` and the job has yet to be placed, ``fetch``'s answer is a
+    wait, not an error: the poll backs off and tries again. A session that is
+    over still raises, so the caller can fall back to the saved log.
     """
     cancelled = is_cancelled or (lambda: False)
 
@@ -348,7 +352,19 @@ def cached_pages(
     while True:
         if cancelled():
             return
-        page = fetch(cursor)
+        try:
+            page = fetch(cursor)
+        except Exception as exc:  # noqa: BLE001 - re-raised unless it is the wait below
+            # A job still waiting to be placed has no log yet. Following one
+            # waits for it; a session that is over is the caller's to handle,
+            # which is how the TUI hands off to the job's saved log.
+            from cortex_training.client import _is_session_pending
+
+            if not (follow and _is_session_pending(exc)):
+                raise
+            sleep(delay)
+            delay = min(delay * backoff_multiplier, max_interval)
+            continue
         new_cursor = page.get("next_cursor", cursor)
         entries = page.get(entries_key) or []
         if entries:

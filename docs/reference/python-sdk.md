@@ -52,7 +52,9 @@ constructing the emitter.
 Tracked operations:
 
 - Job lifecycle: `create_job`, `wait_for_job`, `get_job`, `list_jobs`,
-  `iter_jobs` (one event per page), `cancel_job`, `get_capacity`,
+  `iter_jobs` (one event per page; a walk that restarts after an expired page
+  token also records the rejected page, as a failure with `error.type`
+  `InvalidPageToken`), `list_jobs_page`, `cancel_job`, `get_capacity`,
   `get_capacity_breakdown`, `get_experiment_run`
 - Compute: `forward_backward`, `forward`, `generate`, `generate_stream`, `step`
 - Checkpoints and logs: `save`, `load`, `list_checkpoints`,
@@ -64,7 +66,8 @@ Tracked operations:
 
 Each emitted event body contains `success`, `duration_ms`, `request_count`,
 `attempt_count`, and `retry_count`. Failures also include a bounded
-`error_message` with common credential patterns redacted. A cancelled
+`error_message` with URL query strings (such as list filters and page tokens)
+and common credential patterns redacted. A cancelled
 operation has `cancelled: true`: `DownloadCancelled`, or Ctrl-C
 (`KeyboardInterrupt`) during any tracked operation. Cancellations are sent
 under the same rule as successes, so by default only for the three download
@@ -121,12 +124,13 @@ operation.
 
 | Method | Returns | Notes |
 |---|---|---|
-| `create_job(sub_jobs, job_id=None, experiment_name=None, hardware=None)` | `job_id` | Validates each `SubJobConfig` client-side first. Only `training` and `sampling` sub-jobs can be submitted: a job takes zero or one `training` sub-job and any number of `sampling` sub-jobs. `hardware` is `H200`, `B200`, or `B300` (the `Hardware` enum or its string); omitted means `H200` |
+| `create_job(sub_jobs, job_id=None, experiment_name=None, hardware=None, idle_timeout_seconds=None, pending_timeout_seconds=None)` | `job_id` | Validates each `SubJobConfig` client-side first. Only `training` and `sampling` sub-jobs can be submitted: a job takes zero or one `training` sub-job and any number of `sampling` sub-jobs. `hardware` is `H200`, `B200`, or `B300` (the `Hardware` enum or its string); omitted means `H200` |
 | `create_job_from_body(body)` | response dict | For callers that already hold the REST JSON. Enforces the same one-training-sub-job and no-`log_probability` rules before sending |
 | `get_job(job_id)` | job dict | Includes `sub_jobs` with their configs |
-| `list_jobs(status=None)` | list of jobs | Returns the inner list, not the envelope |
-| `iter_jobs(*, database=None, schema=None, status=None, submitted_by=None, created_after=None, created_before=None, page_size=100)` | iterator of jobs | Jobs across the account that the caller can see, newest first, following page tokens; each also carries `database_name` and `schema_name`. The server applies every filter. Arguments are checked on the call: `page_size` is 1 to 1000, and `schema` needs `database` with it. A 404 means account-level listing is not enabled for the account. See [REST API section 5.3](rest-api.md#across-the-account---get-apiv2endpoint) |
-| `for_job(job)` | `CortexTrainingClient` | Bound to a job from `iter_jobs` for per-job calls. Borrows this client's session, auth, and telemetry, so keep this one open; closing the returned client is a no-op. Never creates the job's database |
+| `list_jobs(status=None, *, max_retries=None, request_timeout=None)` | list of jobs | Returns the inner list, not the envelope. `max_retries` and `request_timeout` bound this one call, as on `list_jobs_page` |
+| `list_jobs_page(*, database=None, schema=None, status=None, submitted_by=None, created_after=None, created_before=None, page_size=100, page_token=None, max_retries=None, request_timeout=None)` | `{"jobs": [...], "next_page_token": str \| None}` | One page of the jobs across the account that the caller can see, newest first; each job also carries `database_name` and `schema_name`. Pass `next_page_token` back as `page_token`, with the same filters, for the next page; `None` means no more. A page can be short or empty and still have a token. The server applies every filter; `None` and `""` mean none. `status` is a comma list or a list, with the groups `active` and `terminal` (`cancelled`, `terminated`, `failed`); `done` is sent as `cancelled,terminated`. Creation bounds take a `date`, a `datetime`, or a string, `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM[:SS[.fraction]]` (a space may replace the `T`) with an optional `Z` or `+HH[:MM]` / `-HH[:MM]` offset; naive means UTC, and they are sent as RFC 3339 UTC with `Z`. Arguments are checked on the call: `page_size` is an `int` from 1 to 1000, and `schema` needs `database`. `max_retries` (retries after the first attempt) and `request_timeout` (seconds, or `(connect, read)`) bound this page; omitted, the client's 10 retries and 30 s / 600 s apply. Raises `AccountJobListUnavailable` (`reason`: `not_deployed`, `disabled`, `forbidden`, `rest_disabled`) for 404, 403 and 405 without retrying, and `InvalidPageToken` when the service can no longer open `page_token`; both subclass `requests.HTTPError`. Other failed answers raise `requests.HTTPError`, connection errors and timeouts raise `requests.ConnectionError` or `requests.Timeout` once retries are spent, and bad arguments or a page body that is not a job list raise `ValueError`; catch `requests.RequestException` and `ValueError` for all of them. See [REST API section 5.3](rest-api.md#across-the-account---get-apiv2cortex-training) |
+| `iter_jobs(*, database=None, schema=None, status=None, submitted_by=None, created_after=None, created_before=None, page_size=100, max_retries=None, request_timeout=None)` | iterator of jobs | `list_jobs_page` page after page as you iterate, with the same filters, following page tokens to the end, and raising as it does on the page that fails. Arguments are checked on the call, and the bounds apply to each page. When the service can no longer open a page token, the walk restarts from the first page once, skipping jobs already yielded by `job_id`, so jobs created since the walk began then come after older ones; a second time raises `InvalidPageToken` |
+| `for_job(job)` | `CortexTrainingClient` | Bound to a job from `iter_jobs` or `list_jobs_page` for per-job calls. Borrows this client's session, auth, and telemetry, so keep this one open; closing the returned client is a no-op. Never creates the job's database |
 | `wait_for_job(job_id)` | job dict | Polls until `running`; raises once the job has ended (`failed`, `cancelled`, `terminated`) or on timeout |
 | `cancel_job(job_id)` | `None` | Idempotent while cancelling/cancelled |
 | `get_capacity(hardware=None)` | capacity dict | `has_reservation`, `max_total_gpus`, `reserved_gpus`, `in_use_gpus`, `pending_gpus`, `available_gpus`, scoped to `hardware` (omitted means the server default, H200). The CLI `capacity` command queries every type unless `--hardware` is set. `max_total_gpus` is the canonical ceiling (`-1` uncapped); `reserved_gpus` is deprecated |
@@ -274,18 +278,31 @@ with 256 or fewer experts. See
 `tail_logs(job_id, ...)` returns one cursor page of `{"_raw": "<time> <line>"}`
 entries (see [REST API section 7.8](rest-api.md#78-tail-logs));
 `stream_logs(job_id, follow=True, ...)` yields entries and keeps polling, and
-with `follow=False` stops at the first empty page. On a job that has ended,
-`tail_logs` raises at once and points at `download_stdout_logs`.
+with `follow=False` stops at the first empty page. `tail_logs` raises a 404 or
+409 at once instead of retrying it: the job isn't running (pending placement,
+or ended) or its session is gone, and `get_job()` says which. On a job that has
+ended, the error points at `download_stdout_logs`. While it follows,
+`stream_logs` waits out the `is pending placement` 409 rather than raising it:
+there is no log to read until the job starts, so it polls again on the same
+backoff. A `stream_logs` that has already read from a job that then ends stops
+there without an error; a session that was over before the first read (the
+other 409s, and the 404 once it is forgotten) raises, the job's saved log
+outliving its session. With `follow=False` every one of them raises. See
+[Tail logs](rest-api.md#78-tail-logs) for the cursor and what each answer
+means.
 `download_execution_logs(job_id, output_dir, *, resume=False,
 sub_job_ids=None, progress=None, transfer_timeout_seconds=300)` saves every
 execution log file as `<output_dir>/<sub_job_id>/<filename>` (mode `0600`)
 without holding it in memory; with `resume=True` it skips files unchanged since
-the last download. `fetch_execution_logs(job_id)` returns the same files as
-`{sub_job_id, filename, artifact_uri, content}` dicts, in memory. See
-[REST API section 12.2](rest-api.md#122-full-execution-log-download).
+the last download. `fetch_execution_logs(job_id, *, sub_job_id=None,
+filename=None)` returns the same files as
+`{sub_job_id, filename, artifact_uri, content}` dicts, in memory, or only
+those of one sub-job or with one name (the rest are listed but not fetched).
+See [REST API section 12.2](rest-api.md#122-full-execution-log-download).
 `download_stdout_logs(job_id, output_dir, *, resume=False, max_workers=None,
 progress=None, on_chunk=None, sub_job_ids=None, strict=False,
-stale_after_seconds=600, transfer_timeout_seconds=300)`
+stale_after_seconds=600, transfer_timeout_seconds=300, priority=(),
+on_commit=None)`
 reconstructs persisted console chunks as
 `<output_dir>/<sub_job_id>/stdout.log`.
 `download_metrics(...)`, with the same options, reconstructs GPU metric chunks
@@ -298,11 +315,15 @@ are logged as warnings on the `cortex_training` logger. `progress` receives stat
 newline, then `"\n"` when that sub-job finishes or fails; a status that needs no
 updating arrives as one message ending in a newline.
 `on_chunk(sub_job_id, done, total, bytes)` reports counts instead, with
-`done == total` only after that sub-job's file is committed. Both run on the
-calling thread; an error raised by either stops the download and keeps the
+`done == total` only after that sub-job's file is committed.
+`on_commit(entry)` then gets a copy of that sub-job's result entry, so a reader
+can open one file while the others download. All three run on the calling
+thread; an error raised by any of them stops the download and keeps the
 chunks already written. Raise `cortex_training.DownloadCancelled` to stop
 without the call counting as a failure. `sub_job_ids` limits the download; an
-entry with no chunks raises `cortex_training.NoChunksError`, a `ValueError`. A
+entry with no chunks raises `cortex_training.NoChunksError`, a `ValueError`.
+Sub-jobs named in `priority` are downloaded first, in that order, then the
+rest in id order; the returned list is in id order either way. A
 damaged chunk is fetched once more and then skipped and listed in the entry's
 `skipped_chunks` and `warnings`; `strict=True` raises instead. While the job is
 running, a sub-job whose newest chunk is older than `stale_after_seconds` (or,
@@ -310,7 +331,10 @@ for metrics, one with stdout but no metrics) gets a warning that uploads may be
 stalled. See
 [GPU metrics download](rest-api.md#124-gpu-metrics-download) for the JSONL row
 schema.
-`get_experiment_run(job_id)` resolves the experiment/run names.
+`get_experiment_run(job_id)` resolves the experiment/run names. It raises a 500
+saying `Linked experiment is not found` at once, without retries: the role
+can't resolve the job's Experiment, which the readers above all need. See
+[Experiment run](rest-api.md#56-experiment-run---get-job_idexperiment-run).
 
 ## Building payloads
 

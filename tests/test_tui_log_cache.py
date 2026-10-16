@@ -15,9 +15,11 @@
 
 """Unit tests for the TUI log cache (no ``textual`` dependency)."""
 
+import json
 from pathlib import Path
 
 import pytest
+import requests
 
 from cortex_training.tui.log_cache import LogCache
 from cortex_training.tui.log_cache import cache_root
@@ -241,6 +243,61 @@ def test_cached_pages_follow_keeps_polling_past_eof(tmp_path):
     out = _drive(c, "s", client, follow=True, is_cancelled=cancelled)
     assert out == []
     assert client.calls >= 2  # kept polling despite eof (follow=True)
+
+
+# ─── cached_pages: a job that has yet to be placed ───────────────────────
+
+# The two answers tail-logs gives with a 409, which only the message tells apart.
+_PENDING = "Cortex training operation failed: session JOB_ID is pending placement: quota_filled"
+_CANCELLED = "Cortex training operation failed: session JOB_ID has been cancelled: cancelled_by_client"
+
+
+class _Failing:
+    """tail_logs raising the service's ``status`` and ``message`` ``times`` times, then answering ``page``."""
+
+    def __init__(self, status, message, times=1, page=None):
+        resp = requests.Response()
+        resp.status_code, resp.encoding = status, "utf-8"
+        resp._content = json.dumps({"message": message, "code": "510200"}).encode()
+        self.error = requests.exceptions.HTTPError(response=resp)
+        self.times, self.page, self.calls = times, page, 0
+
+    def tail_logs(self, job_id, source_id, *, cursor=None, sub_job_id=None):
+        self.calls += 1
+        if self.calls <= self.times:
+            raise self.error
+        return self.page
+
+
+def test_cached_pages_follow_waits_for_a_job_that_is_not_placed_yet(tmp_path):
+    # Opening the Logs tab on a pending job used to write an [error] line.
+    client = _Failing(409, _PENDING, times=2, page={"entries": [{"n": 1}], "next_cursor": "C1", "eof": False})
+    pages = cached_pages(
+        _cache(tmp_path),
+        "s",
+        lambda cur: client.tail_logs("j", "s", cursor=cur),
+        entries_key="entries",
+        follow=True,
+        poll_interval=0.0,
+        sleep=lambda *_: None,
+    )
+    assert next(pages) == ("live", [{"n": 1}])
+    assert client.calls == 3  # two waits, then the page
+
+
+@pytest.mark.parametrize(
+    ("status", "message", "follow"),
+    [
+        (409, _CANCELLED, True),  # the session is over: the TUI falls back to the saved log
+        (404, "session not found", True),
+        (409, _PENDING, False),  # draining the log once, there is nothing to wait for
+    ],
+)
+def test_cached_pages_raises_anything_but_that_wait(tmp_path, status, message, follow):
+    client = _Failing(status, message)
+    with pytest.raises(requests.exceptions.HTTPError):
+        _drive(_cache(tmp_path), "s", client, follow=follow)
+    assert client.calls == 1
 
 
 def test_cached_pages_cancel_during_replay(tmp_path):

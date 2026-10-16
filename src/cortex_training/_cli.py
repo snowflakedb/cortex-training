@@ -57,8 +57,10 @@ _CONFIG_ALIASES = {
 _LOGIN_STATE_ENV = "CORTEX_TRAINING_LOGIN_FILE"
 
 # The statuses each `list --status` word matches, as on the account-level
-# route: pending excludes placing, done takes the DONE older jobs show, and
-# UNKNOWN rows match nothing.
+# route: pending excludes placing, and UNKNOWN rows match nothing. done keeps
+# its older meaning, cancelled and terminated; the account-level route no
+# longer takes the word, so the client sends those two for it there, and only
+# this local filter can also keep the DONE that older jobs show.
 _LIST_STATUS_FILTERS = {
     "pending": {"pending"},
     "placing": {"placing"},
@@ -393,8 +395,8 @@ def build_parser(
         help=(
             "Comma-separated statuses to keep: "
             + ", ".join(_LIST_STATUS_FILTERS)
-            + ". active is pending through running; done is cancelled, terminated, "
-            "and the DONE that older jobs show."
+            + ". active is pending through running; done is cancelled and "
+            "terminated, plus, without --all, the DONE that older jobs show."
         ),
     )
     list_jobs.add_argument(
@@ -637,7 +639,7 @@ def build_parser(
     if include_tui:
         subparsers.add_parser(
             "tui",
-            help="Open the read-only Cortex Training logs and resources TUI.",
+            help="Open the read-only Cortex Training job TUI.",
         )
 
     return parser
@@ -909,6 +911,12 @@ def build_client(args: argparse.Namespace, cortex_training_client_cls):
         "poll_interval": args.poll_interval,
         "poll_timeout": args.poll_timeout,
     }
+    # The TUI bounds every read (`cortex-training tui` sets these); the CLI
+    # commands keep the client's defaults.
+    for option in ("max_retries", "request_timeout"):
+        value = getattr(args, option, None)
+        if value is not None:
+            kwargs[option] = value
     if args.base_url:
         return cortex_training_client_cls(base_url=args.base_url, **kwargs)
     if args.use_connection_profile:
@@ -1000,27 +1008,41 @@ def _request_sent_pat(response: Any) -> bool:
 
 
 def _format_error(exc: BaseException) -> str:
+    message = str(exc)
+    parts = [message]
+    body = ""
     response = getattr(exc, "response", None)
-    if response is None:
-        return str(exc)
+    if response is not None:
+        request_id = getattr(response, "headers", {}).get("x-snowflake-request-id")
+        if request_id and request_id not in message:
+            parts.append(f"snowflake request id: {request_id}")
 
-    parts = [str(exc)]
-    request_id = getattr(response, "headers", {}).get("x-snowflake-request-id")
-    if request_id and request_id not in parts[0]:
-        parts.append(f"snowflake request id: {request_id}")
+        body = getattr(response, "text", "") or ""
+        body = body.strip() if isinstance(body, str) else ""
+        if body:
+            shown = body if len(body) <= 4000 else body[:4000] + "...<truncated>"
+            parts.append(f"response body: {shown}")
+        if getattr(response, "status_code", None) == 401 and _request_sent_pat(response):
+            from cortex_training.snowflake_auth import credentials_rejected_hint
 
-    body = (getattr(response, "text", "") or "").strip()
-    if body:
-        if len(body) > 4000:
-            body = body[:4000] + "...<truncated>"
-        parts.append(f"response body: {body}")
-    if getattr(response, "status_code", None) == 401 and _request_sent_pat(response):
-        from cortex_training.snowflake_auth import credentials_rejected_hint
-
-        parts.append(
-            credentials_rejected_hint("Snowflake rejected your credentials (HTTP 401).")
-        )
+            parts.append(
+                credentials_rejected_hint("Snowflake rejected your credentials (HTTP 401).")
+            )
+    hint = _experiment_access_hint(f"{message}\n{body}")
+    if hint:
+        parts.append(hint)
     return "\n".join(parts)
+
+
+def _experiment_access_hint(text: str) -> str | None:
+    """The ``hint:`` line when ``text``, an error and its body, says the role can't read the Experiment."""
+    if _EXPERIMENT_ACCESS_DENIED in text:
+        return _EXPERIMENT_ACCESS_HINT
+    if _LINKED_EXPERIMENT_NOT_FOUND in text:
+        return _EXPERIMENT_GONE_HINT
+    if _EXPERIMENT_SQL_DENIED.search(text):
+        return _EXPERIMENT_SQL_HINT
+    return None
 
 
 def _cmd_submit(
@@ -1533,6 +1555,41 @@ def _cmd_download_metrics(
     return 0
 
 
+# Duplicated from client.py rather than imported, like the log-probability
+# aliases above: formatting an error must not import the client (and torch).
+# The service answers 500 when it can't resolve the job's Experiment for the
+# caller's role. The checkpoint routes word it this way...
+_EXPERIMENT_ACCESS_DENIED = "Linked experiment is not found or not authorized"
+# ... and the experiment-run lookup that saved logs and GPU metrics start with
+# says "Linked experiment is not found for job <job id>", which also covers an
+# Experiment that no longer exists. Both start with this.
+_LINKED_EXPERIMENT_NOT_FOUND = "Linked experiment is not found"
+_EXPERIMENT_ACCESS_HINT = (
+    "hint: this role can't read the job's Experiment, where its saved logs, GPU "
+    "metrics and checkpoints live. Ask for access to the Experiment, or use the "
+    "role that created the job."
+)
+_EXPERIMENT_GONE_HINT = (
+    "hint: this role can't read the job's Experiment, or it no longer exists; the "
+    "job's saved logs, GPU metrics and checkpoints live there. Ask for access to "
+    "the Experiment, or use the role that created the job."
+)
+# Snowflake refusing the SQL LIST or GET that download-log and download-metrics
+# run on the Experiment: the role reaches the service but has no privileges on
+# the Experiment (a MONITOR-only role, say). Only these words: an error about a
+# schema or a warehouse that merely mentions an experiment is not this.
+_EXPERIMENT_SQL_DENIED = re.compile(
+    r"insufficient privileges to operate on experiment\b"
+    r"|\bexperiment(?:\s+run)?\s+(?:'[^']*'|\"[^\"]*\"|[^\s'\"]+)\s+does not exist or not authorized",
+    re.IGNORECASE,
+)
+_EXPERIMENT_SQL_HINT = (
+    "hint: this role has no privileges on the job's Experiment, where its saved logs "
+    "and GPU metrics are read with SQL. Ask for access to the Experiment, or use the "
+    "role that created the job; the checkpoints command doesn't need it."
+)
+
+
 def _is_unsupported_hardware(exc: BaseException) -> bool:
     """Whether a capacity lookup failed only because the account lacks that GPU type."""
     response = getattr(exc, "response", None)
@@ -1694,6 +1751,8 @@ def main(
         )
         return 1
     except Exception as exc:
+        # Snowflake refusing the SQL on a job's Experiment, or a failed login:
+        # one error line (and hint), not a traceback.
         if not _is_connector_error(exc):
             raise
         print(f"error: {_format_connector_error(exc)}", file=stderr)
@@ -1734,6 +1793,9 @@ def _format_connector_error(exc: BaseException) -> str:
     query_id = getattr(exc, "sfqid", None)
     if query_id and str(query_id) not in message:
         message += f"\nsnowflake query id: {query_id}"
+    hint = _experiment_access_hint(message)
+    if hint:
+        message += f"\n{hint}"
     return message
 
 

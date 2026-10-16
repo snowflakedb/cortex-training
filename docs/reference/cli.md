@@ -178,7 +178,7 @@ cortex-training fwd-bwd --help
 - [Forward-backward and optimizer steps](#run-a-forward-backward-smoke-test)
 - [Load checkpoints](#load-a-checkpoint-into-a-running-job) and [initialize sampling](#start-sampling-from-a-training-checkpoint)
 - [Generate](#run-a-generate-smoke-test) and [sync weights](#sync-training-weights)
-- [Download logs](#download-execution-logs), [stdout](#download-persisted-stdout), and [metrics](#download-gpu-metrics)
+- [Download logs](#download-execution-logs), [stdout](#download-persisted-stdout), [metrics](#download-gpu-metrics), and [roles and access](#roles-and-access)
 - [Job TUI](#job-tui), [JSON output and help](#json-output-and-help), and [troubleshooting](#troubleshooting)
 
 `cortex-training` submits and manages Cortex Training jobs through the Cortex
@@ -302,7 +302,7 @@ cortex-training wait JOB_ID
 | Flag | Takes | Notes |
 |---|---|---|
 | `--all` | nothing | lists jobs across every schema in the account that you can see, not just the configured one |
-| `--status` | comma list of `pending`, `placing`, `initializing`, `running`, `failed`, `cancelled`, `terminated`, `active`, `done` | `active` is `pending` through `running`; `done` is `cancelled`, `terminated`, and the `done` that older jobs show; `pending` does not include `placing`. Matched against a row's status in any form the server sends, including `JOB_STATE_RUNNING` and aliases such as `canceled`, `completed`, `succeeded`, `error`, `queued`, `creating` |
+| `--status` | comma list of `pending`, `placing`, `initializing`, `running`, `failed`, `cancelled`, `terminated`, `active`, `done` | `active` is `pending` through `running`; `done` is `cancelled` and `terminated`, plus, without `--all`, the `done` that older jobs show; `pending` does not include `placing`. Matched against a row's status in any form the server sends, including `JOB_STATE_RUNNING` and aliases such as `canceled`, `completed`, `succeeded`, `error`, `queued`, `creating` |
 | `--user` | user name | SQL name rules: unquoted means its uppercase form, `"quoted"` means exactly that name |
 | `--since` | `YYYY-MM-DD` | a UTC day; keeps jobs created on or after it |
 | `--until` | `YYYY-MM-DD` | a UTC day; keeps jobs created on or before it, so `--since D --until D` means "on day D" |
@@ -311,7 +311,7 @@ cortex-training wait JOB_ID
 Without `--all`, the CLI fetches the configured schema's jobs and applies the
 filters itself, leaving out a job with no `created_at` when `--since` or
 `--until` is set. With `--all`, the server applies them across the account
-([REST API reference section 5.3](rest-api.md#across-the-account---get-apiv2endpoint));
+([REST API reference section 5.3](rest-api.md#across-the-account---get-apiv2cortex-training));
 where account-level listing is not enabled for the account, the command fails
 with `account-level job listing is not enabled for this account`. A bad
 `--status`, `--since`, `--until`, or `--limit`, or an empty `--user`, exits
@@ -702,6 +702,35 @@ stalled. After the job has ended, such a sub-job is listed the same way with a
 warning that no GPU metrics were saved for it (for example, because the job ran
 on an image from before GPU metrics were uploaded). Two downloads of the same directory at once are unsupported; a TUI
 download of the same directory is refused as for stdout.
+
+### Roles And Access
+
+`checkpoints` is a REST call: a role with only
+`MONITOR` on the account can list a job's checkpoints. The
+checkpoint files are stored on the job's Experiment too, but the service reads
+them there for you. Saved logs and GPU metrics are read with SQL on the job's
+Experiment instead (`download-log`, `download-metrics`), so they need
+privileges on that Experiment, and a `MONITOR`-only role can't read them.
+
+When the service can't resolve the job's Experiment for your role, it answers
+500, in one of two wordings. The experiment-run lookup that `download-log` and
+`download-metrics` start with, before any SQL runs, says `Linked experiment is
+not found for job JOB_ID`: the role can't see the Experiment, or it no longer
+exists. `checkpoints` says `Linked experiment is not
+found or not authorized for the training job`. The client retries neither, so
+the command fails at once and adds `hint: this role can't read the job's
+Experiment ...` (with `or it no longer exists` for the first wording). Ask for
+access to the Experiment, or use the role that created the job.
+
+A role the service lets through that has no privileges on the Experiment, such
+as a `MONITOR`-only one, gets Snowflake's refusal of the SQL instead:
+`Experiment '...' does not exist or not authorized`, or `Insufficient
+privileges to operate on experiment '...'`. `download-log` and
+`download-metrics` print Snowflake's message after `error:`, with its
+`snowflake query id:` when it has one and without a traceback, add
+`hint: this role has no privileges on the job's Experiment ...`, and exit with
+status 1; `checkpoints` still works. See
+[REST API reference section 2.5](rest-api.md#25-roles-and-access).
 
 ### Job TUI
 

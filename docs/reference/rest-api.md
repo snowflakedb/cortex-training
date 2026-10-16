@@ -111,10 +111,11 @@ https://{account_host}/api/v2/statements
 ```
 
 So is the account-level job list
-([section 5.3](#across-the-account---get-apiv2endpoint)):
+([section 5.3](#across-the-account---get-apiv2cortex-training)), at a fixed
+path that `endpoint` does not change:
 
 ```text
-https://{account_host}/api/v2/{endpoint}
+https://{account_host}/api/v2/cortex-training
 ```
 
 If you point the client at a server that exposes the endpoint under a
@@ -160,6 +161,39 @@ Raw `torch.save`/pickle is not the current binary protocol. See
 Responses may include `x-snowflake-request-id`. Include it when diagnosing an
 HTTP failure. When the response carries it, the Python client prefixes
 raised HTTP errors with `[snowflake request id: <id>]`.
+
+### 2.5 Roles and access
+
+Listing a job's checkpoints ([section 5.7](#57-list-checkpoints---get-job_idcheckpoints))
+and exporting them ([section 5.8](#58-export-checkpoint)) are REST calls: a
+role with only `MONITOR` on the account can make them. The checkpoint files
+are stored on the job's Experiment, but these routes read them for the caller.
+
+Saved logs and GPU metrics need more. `fetch_execution_logs()`,
+`download_stdout_logs()` and `download_metrics()` resolve the job's experiment
+run ([section 5.6](#56-experiment-run---get-job_idexperiment-run)) and then run
+SQL `LIST` and `GET` on its `snow://experiment/...` artifacts
+([section 12](#12-logs-and-events)). That SQL needs privileges on the job's
+Experiment, so a `MONITOR`-only role can't read saved logs or GPU metrics.
+
+When the service can't resolve the job's Experiment for the caller's role, it
+answers `500`, worded per route:
+
+| Route | Message |
+|---|---|
+| Experiment run ([section 5.6](#56-experiment-run---get-job_idexperiment-run)), which saved logs and GPU metrics start with, before any SQL runs | `Linked experiment is not found for job <job id>`: the role can't see the Experiment, or it no longer exists |
+| List and export checkpoints ([section 5.7](#57-list-checkpoints---get-job_idcheckpoints), [section 5.8](#58-export-checkpoint)) | `Linked experiment is not found or not authorized for the training job` |
+
+Both start with `Linked experiment is not found`. A retry gets the same
+answer, so the client raises either at once ([section 3.5](#35-retries)). Ask
+for access to the Experiment, or use the role that created the job.
+
+A role that the service answers but that has no privileges on the Experiment
+gets past the experiment-run lookup, and Snowflake then refuses the SQL `LIST`
+with `Experiment '<name>' does not exist or not authorized` (or
+`Insufficient privileges to operate on experiment '<name>'`), raised as the
+Snowflake Connector's `ProgrammingError` ([section 12.2](#122-full-execution-log-download)).
+The checkpoint routes still work for that role.
 
 ---
 
@@ -257,14 +291,25 @@ created. Two 404s are not retried, so they fail at once:
 - A 404 whose body has error code `517601` ("Training job ... not found"),
   unless this client created that job in the last 120 seconds. A mistyped job
   id therefore fails immediately instead of after the full backoff.
-- A `tail-logs` 404 or 410 for a job that has ended, or for a `sub_job_id` that
-  is not one of the job's sub-jobs (see [section 7.8](#78-tail-logs)).
+- Any 404 from `tail-logs`, below.
 
 A 404 without a service error code, such as one from a gateway, is still
 retried.
 
+An error whose body says `Linked experiment is not found or not authorized` is
+not retried, whatever its status (the service sends it as a `500`): the
+caller's role can't resolve the job's Experiment, and a retry gets the same
+answer ([section 2.5](#25-roles-and-access)). It is raised on the first attempt
+instead of after about a minute of retries.
+
 Capacity is the exception: it is attempted once with the shorter bounds
 documented in [section 5.4](#54-capacity---get-capacity).
+
+`tail-logs` doesn't retry 404 or 409: from it they mean the job isn't running
+(still pending placement, or ended) or that its session is gone, and neither
+clears on a retry. `get_job()` tells which; see [section 7.8](#78-tail-logs).
+The experiment-run lookup doesn't retry a 500 that says `Linked experiment is
+not found`; see [section 5.6](#56-experiment-run---get-job_idexperiment-run).
 
 The default is ten retries after the first attempt, with exponential jitter.
 
@@ -327,7 +372,7 @@ These calls are outside the Cortex Training prefix:
 
 | REST path | HTTP | Client use | Purpose |
 |---|---|---|---|
-| `/api/v2/{endpoint}` | `GET` | `iter_jobs` | List jobs across the account ([section 5.3](#across-the-account---get-apiv2endpoint)) |
+| `/api/v2/cortex-training` | `GET` | `list_jobs_page`, `iter_jobs` | List jobs across the account ([section 5.3](#across-the-account---get-apiv2cortex-training)) |
 | `/api/v2/statements` | `POST` | artifact download methods | Resolve the current Snowflake identity |
 
 ---
@@ -363,7 +408,7 @@ REST body:
     }
   ],
   "experiment_name": "optional-experiment",
-  "hardware": "B200"
+  "hardware": "B200",
   "idle_timeout_seconds": 1800,
   "pending_timeout_seconds": 86400
 }
@@ -438,6 +483,7 @@ The response shape consumed by this repository is flat at each sub-job:
 ```json
 {
   "job_id": "job-id",
+  "hardware": "H200",
   "status": "running",
   "reason": "",
   "created_at": "2026-07-20T18:00:00Z",
@@ -469,6 +515,11 @@ and may be absent. The client reads it only for the stalled-upload warnings in
 [section 12.3](#123-persisted-stdout-download); without it, those warnings skip
 the recent-start grace period and still require the sub-job to be `running`.
 
+`hardware` is the GPU type every sub-job runs on (see
+[GPU hardware](#gpu-hardware---hardware)); a job created without one reports the
+default, `H200`. List jobs carries it too. The TUI's Resources tab names it in
+its header.
+
 `submitted_by` (submitting user's name) and `owner_role` (owning role's name)
 are best-effort and may be absent, e.g. if the user/role has since been
 dropped or the requesting role no longer has access to it. Both fields also
@@ -490,28 +541,45 @@ REST response:
 ```
 
 `CortexTrainingClient.list_jobs()` returns only the `jobs` list, not the outer object.
-The client forwards the status string without validating an enum.
+The client forwards the status string without validating an enum. Like the
+account-level list's pages, `list_jobs()` takes `max_retries` and
+`request_timeout` to bound the call, for example
+`list_jobs(max_retries=2, request_timeout=(10, 45))`; without them it retries
+and times out as in [section 3.5](#35-retries).
 
-#### Across the account - `GET /api/v2/{endpoint}`
+This route reads `status` differently from the account-level list below. It
+takes one state, which the service matches itself, with no groups or comma
+lists; `pending` also returns `placing` jobs; an unknown word returns an empty
+list instead of 400; and `done` is accepted but can leave out finished jobs.
+The CLI's `list` without `--all` therefore sends no `status` and filters the
+rows itself, with the account-level meanings
+([CLI reference](cli.md#manage-existing-jobs)).
+
+#### Across the account - `GET /api/v2/cortex-training`
 
 Lists the jobs the caller can see in every database and schema of the account,
-newest first, one page at a time. The path is outside the per-schema prefix:
-`https://{account_host}/api/v2/{endpoint}`. It returns 404 where account-level
-listing is not enabled for the account. Jobs in dropped databases or schemas
-are not listed. Every other job call stays on the per-schema routes.
+newest first, one page at a time. The path is fixed, whatever the client's
+`endpoint` is, and outside the per-schema prefix:
+`https://{account_host}/api/v2/cortex-training`. A job is listed when the
+caller can see the job, its schema and its database; jobs in dropped databases
+or schemas are not listed. Every other job call stays on the per-schema routes.
 
-Optional query parameters:
+The route answers only where the service has it and has enabled it for the
+account. Until then it returns 404; see
+[Account-level list errors](#account-level-list-errors).
+
+Optional query parameters; an empty value counts as absent:
 
 | Parameter | Value |
 |---|---|
 | `database` | Only jobs in this database. SQL identifier rules apply: an unquoted name is case-insensitive, a `"quoted"` one exact. A database the caller cannot see returns 400. |
 | `schema` | Only jobs in this schema of `database`, by the same rules. Requires `database`: a schema name alone does not name one schema, and sending it without `database` returns 400. A schema the caller cannot see returns 400. |
-| `status` | Comma-separated and case-insensitive: `pending`, `placing`, `initializing`, `running`, `failed`, `cancelled`, `terminated`, and the groups `active` (`pending` through `running`) and `done` (`cancelled`, `terminated`, and the `done` that older jobs show). `pending` does not include `placing`. Any other value returns 400. |
-| `submitted_by` | Only jobs submitted by this user, by SQL identifier rules. Jobs with no recorded submitter never match, and an unknown user matches no jobs. |
-| `created_after` | Inclusive lower bound on creation time: an RFC 3339 timestamp, or `YYYY-MM-DD` for midnight UTC. Must be earlier than `created_before`. |
+| `status` | Comma-separated and case-insensitive: `pending`, `placing`, `initializing`, `running`, `failed`, `cancelled`, `terminated`, and the groups `active` (`pending`, `placing`, `initializing`, `running`) and `terminal` (`cancelled`, `terminated`, `failed`). `pending` does not include `placing`. Any other value returns 400, `done` included: `terminal` replaced it. A job whose live status cannot be read never matches. |
+| `submitted_by` | Only jobs submitted by this user, by SQL identifier rules. Jobs with no recorded submitter never match. A name that matches no active user in the account, for example a mistyped or dropped user, returns 400 `submitted_by user not found or not authorized`. |
+| `created_after` | Inclusive lower bound on creation time: an RFC 3339 timestamp with a `T` and an offset, such as `2026-10-01T08:00:00Z`, or `YYYY-MM-DD` for midnight UTC. A space instead of the `T`, or no offset, returns 400. Must be earlier than `created_before`. |
 | `created_before` | Exclusive upper bound on creation time, in the same forms. |
 | `limit` | Page size, 1 to 1000. Defaults to 100. |
-| `page_token` | The previous page's `next_page_token`. Send it with the same filters; different filters return 400. |
+| `page_token` | The previous page's `next_page_token`. Send it with the same filters; `limit` may change. |
 
 The creation bounds compare with the time the service recorded the job, which
 can differ slightly from the job's `created_at`.
@@ -533,17 +601,101 @@ REST response:
 ```
 
 Each job carries the per-schema list's fields plus `database_name` and
-`schema_name`. A page can hold fewer than `limit` jobs, or none, and still carry
-`next_page_token`; keep requesting until it is absent. The token is opaque:
-pass it back unchanged. A job whose live status cannot be read while `status`
-is set is left out, uncounted, so a page's size is not a count of what matched.
+`schema_name`, unquoted as stored: double-quote them to address the job unless
+they are plain uppercase identifiers, as `for_job(job)` does. Jobs come newest
+first by the service's job id, which follows creation order to within clock
+skew.
 
-`CortexTrainingClient.iter_jobs(...)` takes the same filters, with `page_size`
-for `limit`, checks its arguments on the call, and yields jobs across pages as
-you iterate. It raises a 404 at once instead of retrying it, and never creates
-the configured database. `for_job(job)` returns a client bound to a listed
-job's `database_name` and `schema_name`; it borrows the parent's session and
-creates no database either.
+Pages and tokens:
+
+- Each call examines at most 5,000 jobs, so a page can hold fewer than `limit`
+  jobs, or none, and still carry `next_page_token`. Keep requesting until the
+  token is absent. Nothing is indexed by status, submitter or creation time, so
+  a selective filter over a long history takes many calls; with
+  `created_after`, the walk ends soon after it passes that time.
+- `next_page_token` is opaque and sealed by the service: pass it back
+  unchanged, with the same filters. A token sent with other filters returns 400
+  `page_token does not match the request filters`, so compute a moving bound
+  such as `created_after` once per walk. A token the service can no longer
+  open, for example after it rotated the key that seals tokens, returns 400
+  `Invalid page_token`; start again from the first page.
+
+A job whose live status cannot be read while `status` is set is left out,
+uncounted, so a page's size is not a count of what matched. If the status
+lookup itself fails, the whole page fails, usually with 503, 504 or 500, after
+the service has waited up to 300 seconds for it.
+
+##### Account-level list errors
+
+| Answer | Meaning |
+|---|---|
+| 400 | A bad filter or page token. The message says which, for example `status must be a comma-separated list of ...`, `Invalid database or schema scope`, `submitted_by user not found or not authorized`, or `Invalid page_token`. |
+| 403 | Cortex Training is not enabled for the account, or its trial has ended; the per-schema routes answer the same. Under a `status` filter, a 403 can also come from a status lookup the service was refused. The service's 403s carry a JSON error that says which; a 403 without one did not come from these checks, and a network policy or a proxy in front of the service can send one. |
+| 404 with an empty body | The service does not have this route yet. |
+| 404 with JSON `Account-level job listing is not enabled for this account` | The route is there but not enabled for the account. Snowflake enables it per account. |
+| 405 with an empty body | The Cortex Training REST API is turned off for the account; the per-schema routes answer the same. |
+| 409, 429, 500, 502, 503, 504 | Transient, or a failed status lookup under a `status` filter. |
+
+##### Client methods
+
+`CortexTrainingClient.list_jobs_page(...)` reads one page and returns
+`{"jobs": [...], "next_page_token": str | None}`; pass the token back as
+`page_token`, with the same filters, for the next page. `iter_jobs(...)` takes
+the same filters without `page_token` and yields jobs across pages as you
+iterate. Both take `page_size` for `limit`, check their arguments on the call,
+treat `None` and `""` alike, and never create the configured database:
+
+- `page_size` must be an `int` from 1 to 1000; a `bool` or a `float` raises
+  `ValueError`.
+- `status` is a comma-separated string or a list. `done`, which the service no
+  longer takes, is sent as `cancelled,terminated`, its older meaning. Legacy
+  `DONE` rows match no filter here, so they show up only in unfiltered lists.
+- `created_after` and `created_before` take a `date` (midnight UTC), a
+  `datetime`, or a string: `YYYY-MM-DD`, or `YYYY-MM-DDTHH:MM[:SS[.fraction]]`
+  (a space may replace the `T`) with an optional `Z` or `+HH[:MM]` /
+  `-HH[:MM]` offset. A naive `datetime`, or a string without an offset, means
+  UTC. They are sent as RFC 3339 in UTC with `Z`, such as
+  `2026-10-01T06:30:00Z`.
+
+403, 404 and 405 raise `AccountJobListUnavailable` at once, without a retry.
+It subclasses `requests.HTTPError`, and its `reason` is `not_deployed` (a 404
+without the not-enabled error, normally with an empty body; with some other
+body, such as a proxy's page, the message says a proxy may have answered),
+`disabled` (the JSON 404), `forbidden` (403) or `rest_disabled` (405). Its
+message is one line, and for a 403 it quotes the service's reason when the
+answer carries one. A 400 `Invalid page_token` raises `InvalidPageToken`, also
+an `HTTPError`: `iter_jobs` then restarts from the first page once by itself,
+skipping the jobs it already yielded by `job_id`, and raises on a second one.
+After such a restart, jobs created since the walk began come after older jobs
+already yielded, so sort by `created_at` when order matters.
+
+Other failed answers, other 400s included, raise `requests.HTTPError`.
+Connection errors and timeouts raise `requests.ConnectionError` or
+`requests.Timeout` once retries are spent. A page body that is not a job list
+raises `ValueError`, and so do bad arguments, which are checked before any
+request. Catch `requests.RequestException` (an `OSError`) and `ValueError` to
+handle them all.
+
+Each page is retried and timed out like the client's other calls: by default
+up to ten retries after the first attempt, on connection errors, timeouts, 307,
+308, 409, 429, 500, 502, 503 and 504, with a 30-second connect and a 600-second
+read timeout ([section 3.5](#35-retries)). One failing page under a `status`
+filter can therefore take many minutes. Both methods take `max_retries`
+(retries after the first attempt; `0` means one attempt) and `request_timeout`
+(seconds, or a `(connect, read)` pair) to bound each page, for example
+`list_jobs_page(max_retries=2, request_timeout=(10, 45))`. The job TUI's list
+reads the configured schema (`list_jobs` with those bounds) until `a` asks for
+every location. It then reads pages of 500 with those bounds, `created_after`
+six months back and no `status`, at most 2,000 jobs or 20 pages per refresh;
+when it stops with jobs left, it also reads `status=active` with the same
+bounds, so active jobs created before the newest ones are listed. If this list
+is unavailable when `a` asks for it, the TUI stays on the configured schema and
+says why. On `not_deployed` or `disabled` after it was shown, the TUI lists the
+configured schema in its place and asks again at most every 10 minutes
+([CLI reference](cli.md#job-list)).
+
+`for_job(job)` returns a client bound to a listed job's `database_name` and
+`schema_name`; it borrows the parent's session and creates no database either.
 
 ### 5.4 Capacity - `GET /capacity`
 
@@ -738,6 +890,15 @@ Terminated or failed jobs return a precondition/conflict-style error.
 
 `fetch_execution_logs()` uses these values to locate the run's stage.
 
+When the service can't resolve the job's Experiment for the caller, this route
+answers 500 `Linked experiment is not found for job <job id>`: the caller's
+role can't see the Experiment, or it no longer exists. (The checkpoint routes
+word the same failure `Linked experiment is not found or not authorized for
+the training job`.) A retry can't change either answer, so
+`get_experiment_run()` raises a 500 whose message starts `Linked experiment is
+not found` at once. Other failures keep the retries of
+[section 3.5](#35-retries).
+
 ### 5.7 List checkpoints - `GET /{job_id}/checkpoints`
 
 ```json
@@ -753,6 +914,9 @@ Terminated or failed jobs return a precondition/conflict-style error.
   ]
 }
 ```
+
+A role with only `MONITOR` on the account can list checkpoints
+([section 2.5](#25-roles-and-access)).
 
 `list_checkpoints()` returns only the `checkpoints` list. The CLI exposes this
 method with a required job id and restores the server-shaped JSON envelope:
@@ -790,7 +954,8 @@ No body.
 }
 ```
 
-The URLs are short-lived.
+The URLs are short-lived. A role with only `MONITOR` on the account can export
+([section 2.5](#25-roles-and-access)).
 
 ### 5.9 Delete checkpoint
 
@@ -1509,6 +1674,15 @@ job's sub-jobs.
 }
 ```
 
+`cursor` is opaque: pass back the previous page's `next_cursor`. Without a
+cursor (omitted or empty), `max_lines` tails the log's last lines; with
+neither, the read starts at the beginning of the container log, which for a
+long-running job is hours of output. With a cursor, `max_lines` caps the
+entries on that page. The service currently bounds both: at most 2,000 lines
+for `max_lines`, and at most 2,000 entries and 256 KiB of log per page. These
+bounds may change; a client should follow `next_cursor` rather than rely on
+them.
+
 Response:
 
 ```json
@@ -1529,9 +1703,8 @@ JSON stays a JSON string inside `_raw`; the saved console from
 [section 12.3](#123-persisted-stdout-download) has the same lines without the
 leading time. Newer deployments may also add `ts` (that time) and `line` (the
 line without it) to each entry; `_raw` is unchanged, and clients should ignore
-fields they do not use. A page holds at most 2000 entries or 256 KiB. `cursor` omitted
-with `max_lines` set returns the newest `max_lines` lines; `cursor` omitted
-without `max_lines` reads from the start.
+fields they do not use. The service currently cuts a line over 64 KiB, and
+that entry carries `"_truncated": true`.
 
 `eof: true` means the head pod can never log again: it is gone, it has reached
 a terminal phase, or it is being deleted and its container has exited.
@@ -1543,12 +1716,57 @@ polling. Either way it stops at an empty page that reports `eof: true`, and it
 ends without an error when the job ends after the stream has read from it (the
 tail then answers 404, 409 or 410).
 
-A finished job's pods are gone, so `tail-logs` answers 404, 409 or 410. The client
-then reads the job once and, if it has ended, raises at once with a pointer to
-the saved console (`cortex-training download-log JOB_ID --log-type stdout`, or
-`download_stdout_logs()`). A `sub_job_id` that is not one of the job's
-sub-jobs also fails at once and lists the job's sub-jobs. A job that is still
-starting keeps the normal retries.
+While the job can't serve logs, the operation answers:
+
+| Answer | When |
+|---|---|
+| 200, no entries, same cursor | The job is `placing` or `initializing` and the sub-job's head pod isn't up yet |
+| 400 `sub_job_id ... does not belong to session ...` | The service isn't routing to that sub-job yet, while its job starts |
+| 409 `session ... is pending placement: <reason>` | The job is `pending` |
+| 409 `session ... has been cancelled`, `has been terminated`, or `has failed: <reason>` | The job is no longer running |
+| 404 | The job's session is gone, some time after the job ended |
+
+The client raises 404 and 409 from this call at once, without the retries
+other calls get ([section 3.5](#35-retries)). A tail that follows
+(`stream_logs(follow=True)`, and the TUI's Logs tab) takes the `is pending
+placement` 409 as a wait rather than an error: there is no log to read until the
+job starts, so it polls again on the same backoff. With `follow=False` that 409
+raises, the caller having asked to drain the log once.
+
+The other 409s and the 404 mean the log is complete. For them, and for a 410,
+the client reads the job once (`GET /{job_id}`, not retried) to explain the
+error: a finished job's pods are gone, so for a job that has ended the error
+points to the saved console (`cortex-training download-log JOB_ID --log-type
+stdout`, or `download_stdout_logs()`), and a `sub_job_id` that is not one of the
+job's sub-jobs is named, with the job's sub-jobs listed. A 404 with code
+`517601` (no such job) is raised as it is. A `stream_logs()` that has already
+read from a job that has ended stops there without an error; otherwise the
+error is raised, which is how the TUI hands off to the job's saved log.
+
+On some service versions, a log line of 256 KiB or more is never delivered and
+holds the cursor: later pages come back empty with the same `next_cursor` while
+the job keeps logging. A read without a cursor and with a small `max_lines`
+gets past the line once it is older than that window. A quiet log looks the
+same until it logs again, so the TUI makes that read when a running job's tail
+hasn't moved for 45 seconds, and continues from it only when it has lines the
+tail hasn't shown and the old cursor still brings nothing. It then leaves out
+the lines it already showed and marks the gap. A window that still reaches the
+stuck line brings nothing new, so the TUI shrinks it (200, then 50, then 10
+lines) on later reads; getting past the line can take a few of them.
+
+The TUI saves each sub-job's last `next_cursor` and resumes from it. If the
+service answers a read with a saved cursor with 400 (other than the "does not
+belong to session" answer above), the TUI drops that cursor and reads the
+log's end without one. While pages come back full (1,000 entries or 128 KiB
+and more), it sends the next read after 0.2 seconds instead of its poll
+interval, until it catches up.
+
+On a running job, each `tail-logs` call currently counts as activity on the
+job: it restarts the job's idle timer
+([`idle_timeout_seconds`](#idle_timeout_seconds)) and moves its `updated_at`.
+A viewer that keeps polling keeps an idle job alive. Calls while the job is
+`placing` or `initializing` don't count. The TUI's live tail pauses after 15
+minutes with no input while the job runs.
 
 ### 7.9 Unsupported zone-events client helper
 
@@ -2248,6 +2466,9 @@ uses the `tail-logs` operation described in [section 7.8](#78-tail-logs).
 
 The server reads the selected sub-job's zone-manager/head-pod stdout. It can
 serve empty, non-EOF pages during placement while the pod is still appearing.
+[Section 7.8](#78-tail-logs) lists what it answers while the job isn't
+running, the cursor that stops on some service versions, and why a polling
+viewer keeps a job active.
 
 ### 12.2 Full execution-log download
 
@@ -2287,9 +2508,10 @@ Return:
 
 `unchanged` is `True` when `resume` kept the earlier copy.
 
-`fetch_execution_logs(job_id)` returns the same files with their bodies in
-memory. An execution log can be hundreds of megabytes, so prefer
-`download_execution_logs()` for anything but small jobs. It:
+`fetch_execution_logs(job_id, *, sub_job_id=None, filename=None)` returns the
+same files with their bodies in memory. An execution log can be hundreds of
+megabytes, so prefer `download_execution_logs()` for anything but small jobs.
+It:
 
 1. Calls `GET /{job_id}/experiment-run`.
 2. For profile clients, opens an independent connection from the same
@@ -2298,6 +2520,21 @@ memory. An execution log can be hundreds of megabytes, so prefer
    statements API and opens an equivalent Connector session.
 4. Uses experiment artifact `LIST` and `GET` to download every object below a
    `/_logs/{sub_job_id}/` subtree.
+
+`sub_job_id` and `filename`, when given, download only the matching files, for
+example one sub-job's `execution.jsonl`. Its records are JSON lines with `ts`,
+`level`, `logger` and `msg`; a failure record can also carry an `error`
+message or a traceback. A job that fails while it is created or starts up may
+have no saved console ([section 12.3](#123-persisted-stdout-download)); its
+execution log still records the error, and the TUI shows those records
+instead.
+
+These reads, like the console and GPU-metrics downloads below, use SQL on the
+job's Experiment. A role with no privilege on that Experiment gets
+`does not exist or not authorized` from the `LIST`. When the service can't
+resolve the Experiment at all, the experiment-run route answers 500
+`Linked experiment is not found for job ...`, which the client raises without
+retrying ([section 5.6](#56-experiment-run---get-job_idexperiment-run)).
 
 Return:
 
@@ -2319,8 +2556,8 @@ paths or object-store credentials.
 
 `download_stdout_logs(job_id, output_dir, *, resume=False, max_workers=None,
 progress=None, on_chunk=None, sub_job_ids=None, strict=False,
-stale_after_seconds=600, transfer_timeout_seconds=300)`
-downloads gzip chunks under
+stale_after_seconds=600, transfer_timeout_seconds=300, priority=(),
+on_commit=None)` downloads gzip chunks under
 `_stdout/{sub_job_id}/`, orders them by chunk name (which starts with the
 chunk's UTC time), and streams them into `<output_dir>/<sub_job_id>/stdout.log`.
 If a run has chunks for one sub-job under both `_stdout/` and
@@ -2410,8 +2647,11 @@ one final line per sub-job.
 `on_chunk(sub_job_id, chunks_done, chunks_total, bytes)` reports counts
 instead: it is called when a sub-job starts and after each appended chunk, with
 totals over the whole sub-job, and the call with `chunks_done == chunks_total`
-comes only after that sub-job's file is complete and committed. Both callbacks
-run on the calling thread. An error raised by either stops the download as
+comes only after that sub-job's file is complete and committed.
+`on_commit(entry)` is called right after that with a copy of the sub-job's
+result entry, also for a sub-job whose file needed nothing new, so a reader can
+open one file while the others download. The callbacks run on the calling
+thread. An error raised by any of them stops the download as
 below. To stop a download on purpose, raise
 `cortex_training.DownloadCancelled` from a callback: no new `GET` starts,
 workers waiting out a retry backoff stop at once, the chunks already written
@@ -2421,18 +2661,23 @@ after saving any output, the exception carries
 `download_progress_saved = True`. `sub_job_ids` limits the download
 to those sub-jobs and raises `cortex_training.NoChunksError` (a `ValueError`
 with `sub_job_ids` and `available` attributes) before any `GET` if one has no
-chunks. Two downloads of the same output directory at once are unsupported.
+chunks. Sub-jobs are written in id order, except that those named in
+`priority` come first, in that order (their chunks are also fetched first); a
+name in `priority` without chunks is ignored. The returned list is in id order
+either way. Two downloads of the same output directory at once are unsupported.
 
 ### 12.4 GPU metrics download
 
 `download_metrics(job_id, output_dir, *, resume=False, max_workers=None,
 progress=None, on_chunk=None, sub_job_ids=None, strict=False,
-stale_after_seconds=600, transfer_timeout_seconds=300)`
-applies the same reconstruction to
+stale_after_seconds=600, transfer_timeout_seconds=300, priority=(),
+on_commit=None)` applies the same reconstruction to
 `gpu.YYYYMMDD-HHMMSS.UUID.gz` chunks under `_metrics/{sub_job_id}/` and writes
 `<output_dir>/<sub_job_id>/gpu.jsonl`, including the options, retries, and the
-manifests beside that file. Unless `stale_after_seconds` is `None`, it also reads
-the job status. While the job is running it lists `_stdout/` too, and a running
+manifests beside that file. With `priority` and `on_commit`, a reader can show
+the sub-job on screen as soon as its file is written, before the others.
+Unless `stale_after_seconds` is `None`, it also reads the job status. While the
+job is running it lists `_stdout/` too, and a running
 sub-job that has had stdout chunks for at least two minutes (judged from its
 first stdout chunk and `state_changed_at`) but no metrics chunks is returned
 with `chunk_count` 0,
@@ -2463,12 +2708,12 @@ training runtime. Version 2 GPU rows have no `kind` field and include:
 | `local_gpu_index` | GPU index within one worker; it repeats across workers |
 | `global_gpu_index` | GPU identity within one sub-job; group GPU series by this field |
 | `gpu_uuid` | Device UUID reported by the GPU runtime |
-| `gpu_util_pct` | GPU utilization percentage gauge |
-| `fb_used_bytes` / `fb_free_bytes` | Used and free framebuffer bytes |
+| `gpu_util_pct` | DCGM GPU utilization: the percentage of the interval in which a kernel was running on the GPU. It says how busy the GPU was, not how saturated |
+| `fb_used_bytes` / `fb_free_bytes` | Used and free framebuffer bytes; memory used is `fb_used / (fb_used + fb_free)` |
 | `power_watts` | Board power gauge |
 | `gpu_temp_c` | GPU temperature gauge |
-| `sm_active_pct` / `sm_occupancy_pct` | Optional SM activity gauges |
-| `tensor_active_pct` / `dram_active_pct` | Optional tensor and DRAM activity gauges |
+| `sm_active_pct` / `sm_occupancy_pct` | Optional DCGM profiling gauges for SM activity; often `null` where profiling metrics aren't collected (`null` is not `0`) |
+| `tensor_active_pct` / `dram_active_pct` | Optional DCGM profiling gauges for tensor and DRAM activity; often `null`, like the SM gauges |
 | `seq` / `seq_epoch` | Sample sequence and its opaque generation |
 | `sample_interval_s` | Sampling interval in seconds |
 
@@ -2477,21 +2722,28 @@ than differenced. JSON `null` means unmeasured and is distinct from `0.0`.
 `global_gpu_index` is unique only inside a sub-job, so consumers loading more
 than one file also group by `sub_job_id`.
 
-The same file also carries one host row per worker per scrape, with
-`"kind": "system"` and `record_version` `3`:
+Deployments that collect CPU and memory also write version 3 system rows to the
+same file, one per node per scrape, with these fields in this order:
 
 | Field | Meaning |
 |---|---|
 | `kind` | `"system"` |
-| `record_version` | `3` |
-| `sub_job_id`, `sample_ts`, `worker_num`, `seq`, `seq_epoch`, `sample_interval_s` | As for GPU rows |
-| `cpu_util_pct` | Host CPU utilization percentage gauge |
-| `cpu_count` | Logical CPUs on the host |
-| `mem_used_bytes` / `mem_total_bytes` | Host memory in use and installed |
+| `record_version` | Row schema version; currently `3` |
+| `sub_job_id` | Sub-job that produced the sample |
+| `sample_ts` | RFC3339 UTC scrape time, as for GPU rows |
+| `worker_num` | The node: the same numbering as the GPU rows' `worker_num` |
+| `seq` / `seq_epoch` | Sample sequence and its opaque generation |
+| `sample_interval_s` | Sampling interval in seconds |
+| `cpu_util_pct` | The node's CPU time as a percentage of its CPU limit (0 to 100) |
+| `cpu_count` | The node's CPU limit |
+| `mem_used_bytes` | Memory the node's processes use, not counting the page cache |
+| `mem_total_bytes` | The node's memory limit |
 
-A row without `kind` is a GPU row; a later GPU row may carry `kind: "gpu"`.
-Consumers should select rows by `kind` and ignore kinds they do not support.
-The TUI's Resource tab uses GPU rows only.
+A file can hold system rows and no GPU rows, and a node can miss a scrape's
+system row while its GPU rows of that scrape are there. A row without `kind` is
+a GPU row; a later GPU row may carry `kind: "gpu"`. Consumers should select
+rows by `kind` and ignore kinds they do not support. The TUI's Resource tab
+uses GPU rows only.
 
 ### 12.5 Zone scheduling events
 
