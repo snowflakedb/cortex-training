@@ -1833,59 +1833,61 @@ Notes on single keys:
   block `prime_rl.fused_lm_head_token_chunk_size`. `lm_head.fp32` combines
   with fused cross-entropy `true`, `false` or `liger`.
 - Fractional token weights: a plain SFT job whose `loss_mask` has values other
-  than 0 and 1 needs non-fused cross-entropy and, on every route, the chunked
-  LM head off, because the loss then needs the full logits. Leave
+  than 0 and 1 needs non-fused cross-entropy and, on every route, the chunked LM
+  head off, because the loss then needs the full logits. Leave
   `lm_head.token_chunk_size` and `fused_lm_head_token_chunk_size` unset (with
-  `ep_size` > 1 also `prime_rl.fused_lm_head_token_chunk_size`), and with
-  `ep_size` > 1 set `lm_head.cross_entropy` to `false`, as fused cross-entropy
-  defaults to `liger` there.
+  `ep_size` > 1 also `prime_rl.fused_lm_head_token_chunk_size`). To turn fused
+  cross-entropy off, set `lm_head.cross_entropy` to `false` with `ep_size` > 1,
+  or the block entry `prime_rl.fused_cross_entropy` to `false` with
+  `model_provider` `prime_rl` and `ep_size` 1 or omitted; with `model_provider`
+  `liger`, use `huggingface`.
 - On server versions that have it, `numerics.fp32_parity` is on by default
-  (`true`), so a job that sends no `model_options` runs it. It applies to
-  Qwen3.5-MoE models with `ep_size` > 1 and to dense Qwen3.5-family models
-  (Hugging Face `model_type` `qwen3_5` or `qwen3_5_text`, for example
-  Qwen3.8-27B) with `ep_size` 1 or omitted. With `true` the residual adds,
-  partial rotary embedding and GatedDeltaNet beta gate are evaluated in fp32,
-  as vLLM does. With `false` they are evaluated in the input dtype, as before
-  the option existed. Other dense models accept the key and are not changed by
+  (`true`), so a job that sends no `model_options` runs it, and its
+  log-probabilities and loss differ from those of a server version that predates
+  the option. It applies to Qwen3.5-MoE models with `ep_size` > 1 and to dense
+  Qwen3.5-family models (Hugging Face `model_type` `qwen3_5` or `qwen3_5_text`,
+  for example Qwen3.8-27B) with `ep_size` 1 or omitted. With `true` the residual
+  adds, partial rotary embedding and GatedDeltaNet beta gate are evaluated in
+  fp32, as vLLM does. With `false` they are evaluated in the input dtype, as
+  before the option existed, so the trainer's log-probabilities can differ more
+  from the sampler's. Other dense models accept the key and are not changed by
   it, except that with sequence parallelism the GatedDeltaNet beta gate of any
-  model follows it (so with the default it is evaluated in fp32 there too).
-  With `ep_size` > 1 a model that is not Qwen3.5-MoE rejects the key when the
-  sub-job starts. To turn the path off, send
-  `"model_options": {"numerics": {"fp32_parity": false}}`. A server version
-  that has the option but not `model_options` support ignores that map: a
-  dense job cannot turn the path off there, and an `ep_size` > 1 job sends
-  `prime_rl.fp32_parity: false`.
+  model follows it (so with the default it is evaluated in fp32 there too). With
+  `ep_size` > 1 a model that is not Qwen3.5-MoE rejects the key when the sub-job
+  starts. To turn the path off, send `"model_options": {"numerics":
+  {"fp32_parity": false}}`. A server version that has the option but not
+  `model_options` support ignores that map: a dense job cannot turn the path off
+  there, and an `ep_size` > 1 job sends `prime_rl.fp32_parity: false`.
 - Memory of `numerics.fp32_parity`: with full activation checkpointing (every
   layer: `activation_checkpointing` with `ep_size` 1 or omitted, an `ac_config`
   block of mode `full` and `freq` 1 with `ep_size` > 1), every decoder layer
   after the first holds its residual at the layer boundary as a second tensor,
-  so GPU memory rises. For
-  Qwen3.8-27B with `sp_size` 4 and `mb_spec.max_tokens_per_mb` 131072 (calls of
-  about 120000 tokens), peak allocated memory was about 92 GiB per GPU without
-  it and 104 GiB with it, on GPUs with 139.8 GiB. The device uses more than the
-  allocator reports (12 to 15 GiB more for one 262144-token row at `sp_size`
-  8), so leave headroom. With a budget of 262144 (calls of about 240000
-  tokens, 60000 per GPU) the job with the option ran out of memory; the same
-  job without it was not measured. Memory follows, approximately, the tokens
-  each GPU holds in a call, which is the call's tokens divided by `sp_size`.
-  `mb_spec.max_tokens_per_mb` (default `10240`, see the `extra_training` knobs
-  above) limits how many rows share a call, but a row longer than it runs in a
-  call of its own, so for such rows lowering the budget does not help: a
-  larger `sp_size` (at most 8 for Qwen3.8), or turning the option off, lowers
-  the memory.
-  On a dense Qwen3.5-family model with `liger` on, of the decoder-layer and
-  final norms only the first layer's input norm still runs Liger's RMSNorm
-  kernel while this option is on.
+  so GPU memory rises. For Qwen3.8-27B with rows of 40000 tokens, `sp_size` 4
+  and `mb_spec.max_tokens_per_mb` 131072 (calls of about 120000 tokens), peak
+  allocated memory was about 92 GiB per GPU with the option set to `false` and
+  104 GiB with it on (the default), on GPUs with 139.8 GiB. The device uses more
+  than the allocator reports (12 to 15 GiB more for one 262144-token row at
+  `sp_size` 8), so leave headroom. With `sp_size` 4 and a budget of 262144
+  (calls of about 240000 tokens, 60000 per GPU) the job with the option on ran
+  out of memory; the same job with it off was not measured. Memory follows,
+  approximately, the tokens each GPU holds in a call, which is the call's tokens
+  divided by `sp_size`. `mb_spec.max_tokens_per_mb` (default `10240`, see the
+  `extra_training` knobs above) limits how many rows share a call, but a row
+  longer than it runs in a call of its own, so for such rows lowering the budget
+  does not help: a larger `sp_size` (at most 8 for Qwen3.8), or turning the
+  option off, lowers the memory. On a dense Qwen3.5-family model with `liger`
+  on, of the decoder-layer and final norms only the first layer's input norm
+  still runs Liger's RMSNorm kernel while this option is on.
 - `numerics.fp32_residual` (experimental, default `false`) also keeps the
-  residual stream in fp32 between decoder layers, instead of rounding it to
-  the dtype of each layer's output. It applies only to dense Qwen3.5-family
-  models with `ep_size` 1 or omitted; other dense models accept the key and
-  are not changed by it, and with `ep_size` > 1 it fails at startup. `true` is
-  rejected, when the sub-job starts, if `numerics.fp32_parity` is `false`. It
-  needs more memory again (about 122 GiB per GPU allocated in the example
-  above) and, together with `numerics.fp32_parity`, made forward/backward
-  about 6% slower in our tests on that model, measured against a run on a
-  different server build, so treat the figure as approximate.
+  residual stream in fp32 between decoder layers, instead of rounding it to the
+  dtype of each layer's output. It applies only to dense Qwen3.5-family models
+  with `ep_size` 1 or omitted; other dense models accept the key and are not
+  changed by it, and with `ep_size` > 1 it fails at startup. `true` is rejected,
+  when the sub-job starts, if `numerics.fp32_parity` is `false`. It needs more
+  memory again (about 122 GiB per GPU allocated in the example above) and,
+  together with `numerics.fp32_parity`, ran forward/backward about 6% slower on
+  that model than a run on a different server build, so treat the figure as
+  approximate.
 - The Sets column names top-level fields for `numerics.fp32_parity` (with
   `ep_size` 1 or omitted) and `numerics.fp32_residual`. They carry the key to
   the dense model: send the key, not the field. A field sent without its key
@@ -1920,7 +1922,11 @@ sent, the first in the order `activation_checkpointing`,
 `checkpointing.freq=1` is accepted. Different values are rejected.
 `liger=false` together with `model_provider="liger"` is rejected the same way.
 With `ep_size` above 1 the `fp32_parity` field is not compared: the key writes
-`prime_rl.fp32_parity`, and the key is compared with that entry.
+`prime_rl.fp32_parity`, and the key is compared with that entry. The shipped
+dense training configs send `model_provider` `huggingface`, and the Qwen3.5 and
+Qwen3.8 ones a `fused_lm_head_token_chunk_size` of 8192, so `liger: true`, or a
+`lm_head.token_chunk_size` other than 8192, is rejected as a conflict until you
+change or remove that field.
 
 **Each sub-job on its own.** The server validates each sub-job's map alone and
 never copies a key from one sub-job to another. A key that runs on both sides,
@@ -2002,9 +2008,10 @@ effect, so do not translate such an entry mechanically: for example, a block
 `lm_head.token_chunk_size` of 4096 turns the chunked LM head on, and a block
 `fp32_parity` of `false` does nothing, while `numerics.fp32_parity` set to
 `false` turns the fp32 path off. Conversely, the keys for the block entries
-`ep_comm_backend`, `deepep_*`, `moe_use_grouped_mm` and `sparse_mla_backend`,
-and for the `mode` and `targets` parts of `ac_config`, fail a dense job when it
-starts, so do not translate those entries for one.
+`ep_comm_backend`, `deepep_*`, `moe_use_grouped_mm`, `sparse_mla_backend`,
+`fused_cross_entropy` and `optimization_dtype`, and for the `mode` and
+`targets` parts of `ac_config`, fail a dense job when it starts, so do not
+translate those entries for one.
 
 **`seq_len`.** On server versions with this behavior, with `ep_size` > 1 the
 server sets the sequence length the model is built for from the sub-job's
