@@ -40,8 +40,11 @@ and read timeout, or a `(connect, read)` pair. `from_connection_name` and
 ## Client metrics
 
 Snowflake profile and PAT clients automatically emit one best-effort event
-when an essential operation fails. Set
-`CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY=1` to also emit successful outcomes.
+when an essential operation fails. `download_stdout_logs`, `download_metrics`,
+and `fetch_execution_logs` also emit successful and cancelled outcomes by
+default, because they are infrequent and their timing is the point. Set
+`CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY=1` to emit successful outcomes for
+every operation, or `=0` to emit only failures for every operation.
 Local or mock clients constructed with an explicit `base_url` treat
 `emit_metric` as a no-op. Set `CORTEX_TRAINING_DISABLE_TELEMETRY=1` to skip
 constructing the emitter.
@@ -61,7 +64,25 @@ Tracked operations:
 
 Each emitted event body contains `success`, `duration_ms`, `request_count`,
 `attempt_count`, and `retry_count`. Failures also include a bounded
-`error_message` with common credential patterns redacted. Queryable attributes
+`error_message` with common credential patterns redacted, and a cancelled
+operation (`DownloadCancelled` or Ctrl-C) has `cancelled: true`.
+
+Download events add these body fields:
+
+| Field | Meaning |
+|---|---|
+| `artifact` | `stdout`, `metrics`, or `execution_logs` |
+| `list_ms` / `fetch_ms` | Time listing the run's artifacts, and fetching and writing them |
+| `sub_job_count` | Sub-jobs written (`download_stdout_logs` / `download_metrics`) |
+| `chunk_count` / `chunks_skipped` | Chunks this call appended or skipped; skipped ones are also counted in `chunk_count` |
+| `bytes_written` | Bytes this call added to the output files |
+| `max_workers` | Concurrent GETs used |
+| `resume` / `resume_mode` | Whether `resume` was passed, and what happened: `rebuild`, `append`, `partial` (continued an interrupted download), `mixed` across sub-jobs, or `none` |
+| `artifact_retry_count` / `transfer_timeout_count` | Retried `LIST`/`GET` attempts, and attempts abandoned after `transfer_timeout_seconds` |
+| `cancelled` | The download was stopped by its caller |
+| `file_count` / `bytes_read` | Files and bytes read (`fetch_execution_logs`) |
+
+On failure the fields describe the work done before it. Queryable attributes
 include available `job_id`, sub-job identifiers, `request_id`,
 `checkpoint_id`, `error.type`, HTTP status, and server error code.
 Two attributes carry Snowflake request IDs:

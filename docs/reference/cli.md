@@ -808,9 +808,10 @@ CORTEX_TRAINING_ENDPOINT
 ```
 
 `CORTEX_TRAINING_DISABLE_TELEMETRY` (truthy) skips OTLP client metrics on
-Snowflake profile and PAT clients. `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY`
-(truthy) also emits successful outcomes for essential operations; failures
-are emitted by default. See the [Python SDK reference](python-sdk.md#client-metrics).
+Snowflake profile and PAT clients. Failures are emitted by default, and so are
+successful downloads (`download-log`, `download-metrics`) with their timings.
+`CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY` set truthy also emits successful
+outcomes for every other essential operation; set falsy, it emits failures only. See the [Python SDK reference](python-sdk.md#client-metrics).
 
 `CORTEX_TRAINING_DISABLE_TENSOR_PROMPTS` (truthy) sends pre-tokenized prompts
 as JSON lists inside the request frame instead of as tensors. The request body

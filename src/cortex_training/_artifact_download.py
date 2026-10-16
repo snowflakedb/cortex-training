@@ -233,12 +233,23 @@ class SharedConnection:
 
     def __init__(self, opener: Callable[[], Any], transfer_timeout: float | None = None):
         self.transfer_timeout = transfer_timeout
+        # Counted for client telemetry: retried attempts, and attempts that ran
+        # past ``transfer_timeout``.
+        self.retry_count = 0
+        self.transfer_timeout_count = 0
         self._opener = opener
         self._lock = threading.Lock()
         self._connection = opener()
         self._generation = 0
         self._replaced: list[Any] = []
         self._closed = False
+
+    def note_attempt_failure(self, exc: BaseException, *, retried: bool) -> None:
+        with self._lock:
+            if retried:
+                self.retry_count += 1
+            if isinstance(exc, TransferTimeout):
+                self.transfer_timeout_count += 1
 
     def current(self) -> tuple[Any, int]:
         with self._lock:
@@ -367,7 +378,9 @@ def call_with_retry(
                 # being removed under an in-flight GET) are not worth reporting.
                 raise DownloadCancelled(f"{description} cancelled") from exc
             kind = classify_artifact_error(exc)
-            if kind is None or attempt >= policy.attempts:
+            retried = kind is not None and attempt < policy.attempts
+            shared.note_attempt_failure(exc, retried=retried)
+            if not retried:
                 raise
             delay = policy.delay(attempt)
             logger.warning(

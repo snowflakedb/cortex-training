@@ -6565,13 +6565,14 @@ class TestChunkedArtifactDownload:
         def progress(*_args):
             raise nc.DownloadCancelled("stop")
 
-        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        # Explicitly turning success telemetry off also silences cancellations.
+        monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "0")
         with pytest.raises(nc.DownloadCancelled):
             c.download_stdout_logs("job-1", tmp_path, on_chunk=progress)
         self._settle()
         c._metric_emitter.emit.assert_not_called()
 
-        monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "1")
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
         with pytest.raises(nc.DownloadCancelled):
             c.download_stdout_logs("job-1", tmp_path, on_chunk=progress)
         self._settle()
@@ -6580,6 +6581,154 @@ class TestChunkedArtifactDownload:
         assert operation == "download_stdout_logs"
         assert value["cancelled"] is True and value["success"] is False
         assert "error_message" not in value and "error.type" not in attributes
+
+    def _emitted(self, c, operation="download_stdout_logs"):
+        calls = [call for call in c._metric_emitter.emit.call_args_list if call.args[0] == operation]
+        assert len(calls) == 1, calls
+        return calls[0].args[1], calls[0].kwargs["attributes"]
+
+    def test_download_success_telemetry_is_on_by_default(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=3)
+        c._metric_emitter = MagicMock()
+        c.download_stdout_logs("job-1", tmp_path)
+        value, attributes = self._emitted(c)
+        size = (tmp_path / self.SUB / "stdout.log").stat().st_size
+        varying = ("duration_ms", "list_ms", "fetch_ms", "attempt_count", "request_count")
+        assert {key: value[key] for key in value if key not in varying} == {
+            "artifact": "stdout",
+            "max_workers": 16,
+            "resume": False,
+            "resume_mode": "rebuild",
+            "sub_job_count": 1,
+            "chunk_count": 3,
+            "chunks_skipped": 0,
+            "bytes_written": size,
+            "artifact_retry_count": 0,
+            "transfer_timeout_count": 0,
+            "cancelled": False,
+            "retry_count": 0,
+            "success": True,
+        }
+        assert value["list_ms"] >= 0 and value["fetch_ms"] >= 0
+        assert value["duration_ms"] >= value["fetch_ms"]
+        # Identity only: per-download detail stays in the value, not attributes.
+        assert attributes == {"job_id": "job-1"}
+
+        # Other operations keep successes opt-in.
+        c._metric_emitter.reset_mock()
+        c._session.post.return_value = _make_response({"request_id": "r1"})
+        c.step("job-1")
+        c._metric_emitter.emit.assert_not_called()
+
+        monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "0")
+        c.download_stdout_logs("job-1", tmp_path / "quiet")
+        c._metric_emitter.emit.assert_not_called()
+
+    def test_download_telemetry_for_resume_append_and_skipped_chunks(self, tmp_path, monkeypatch):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=4)
+        chunks = paths[self.SUB]
+        listing = connection.list_rows[self.RUN_URI + "_stdout/"]
+        connection.list_rows[self.RUN_URI + "_stdout/"] = [
+            row for row in listing if row[0].removeprefix("/versions/RUN_ABC/") in chunks[:2]
+        ]
+        c.download_stdout_logs("job-1", tmp_path)
+        connection.list_rows[self.RUN_URI + "_stdout/"] = listing
+        connection.content_by_uri[self.RUN_URI + chunks[3]] = b"not gzip"
+        c._metric_emitter = MagicMock()
+        before = (tmp_path / self.SUB / "stdout.log").stat().st_size
+        result = c.download_stdout_logs("job-1", tmp_path, resume=True, max_workers=2)
+        value, _attributes = self._emitted(c)
+        after = (tmp_path / self.SUB / "stdout.log").stat().st_size
+        assert result[0]["skipped_chunks"] == [self.RUN_URI + chunks[3]]
+        assert value["resume"] is True and value["resume_mode"] == "append"
+        assert value["chunk_count"] == 2 and value["chunks_skipped"] == 1
+        assert value["bytes_written"] == after - before > 0
+        assert value["max_workers"] == 2 and value["success"] is True
+
+    def test_download_failure_telemetry_counts_retries_and_progress(self, tmp_path, monkeypatch):
+        errors = importlib.import_module("snowflake.connector.errors")
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=4)
+        chunks = paths[self.SUB]
+        flaky = [errors.OperationalError(msg="reset")]
+
+        def on_get(source):
+            if source == self.RUN_URI + chunks[1] and flaky:
+                raise flaky.pop()
+            if source == self.RUN_URI + chunks[2]:
+                raise errors.ProgrammingError(msg="denied", errno=2003)
+
+        connection.on_get = on_get
+        c._metric_emitter = MagicMock()
+        with pytest.raises(errors.ProgrammingError):
+            c.download_stdout_logs("job-1", tmp_path, max_workers=1)
+        self._settle()
+        value, attributes = self._emitted(c)
+        assert value["success"] is False and value["cancelled"] is False
+        assert "denied" in value["error_message"]
+        assert value["chunk_count"] == 2  # committed before the failure
+        assert value["artifact_retry_count"] == 1
+        assert value["transfer_timeout_count"] == 0
+        assert attributes["error.type"] == "ProgrammingError"
+
+    def test_download_telemetry_counts_transfer_timeouts(self, tmp_path, monkeypatch):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=2)
+        hung = self.RUN_URI + paths[self.SUB][0]
+        release = threading.Event()
+        first = [True]
+
+        def on_get(source):
+            if source == hung and first:
+                first.clear()
+                release.wait(10)
+
+        connection.on_get = on_get
+        c._metric_emitter = MagicMock()
+        try:
+            c.download_stdout_logs("job-1", tmp_path, transfer_timeout_seconds=0.3)
+        finally:
+            release.set()
+        value, _attributes = self._emitted(c)
+        assert value["transfer_timeout_count"] == 1
+        assert value["artifact_retry_count"] == 1
+        assert value["success"] is True
+
+    def test_interrupted_download_reports_cancelled(self, tmp_path, monkeypatch):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=4)
+        target = self.RUN_URI + paths[self.SUB][2]
+
+        def on_get(source):
+            if source == target:
+                raise KeyboardInterrupt
+
+        connection.on_get = on_get
+        c._metric_emitter = MagicMock()
+        with pytest.raises(KeyboardInterrupt):
+            c.download_stdout_logs("job-1", tmp_path, max_workers=1)
+        self._settle()
+        value, _attributes = self._emitted(c)
+        assert value["cancelled"] is True and value["success"] is False
+        assert value["chunk_count"] == 2
+        assert "error_message" not in value
+
+    def test_fetch_execution_logs_success_telemetry(self, monkeypatch):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c = _make_client()
+        run_uri = self.RUN_URI
+        path = "_logs/job-1:training:0/execution.jsonl"
+        connection = TestExecutionLogDownload.FakeArtifactConnection(
+            {run_uri + "_logs/": [(f"/versions/RUN_ABC/{path}",)], run_uri + "checkpoints/_logs/": []},
+            {run_uri + path: b'{"a":1}\n'},
+        )
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", lambda: connection)
+        c._metric_emitter = MagicMock()
+        c.fetch_execution_logs("job-1")
+        value, _attributes = self._emitted(c, "fetch_execution_logs")
+        assert value["artifact"] == "execution_logs"
+        assert value["file_count"] == 1 and value["bytes_read"] == 8
+        assert value["list_ms"] >= 0 and value["fetch_ms"] >= 0
+        assert value["success"] is True
 
     def test_download_cancelled_is_public(self):
         import cortex_training

@@ -139,9 +139,24 @@ def _telemetry_disabled() -> bool:
     return _env_flag_enabled(DISABLE_TELEMETRY_ENV)
 
 
-def _success_telemetry_enabled() -> bool:
-    """True when successful automatic operation outcomes should be emitted."""
-    return _env_flag_enabled(ENABLE_SUCCESS_TELEMETRY_ENV)
+# Downloads are rare, long, and user-visible, so their successful outcomes (with
+# timings) are emitted unless the environment says otherwise. Other operations
+# can run thousands of times per job and stay failure-only by default.
+_SUCCESS_TELEMETRY_BY_DEFAULT = frozenset(
+    {"download_stdout_logs", "download_metrics", "fetch_execution_logs"}
+)
+
+
+def _success_telemetry_enabled(operation: str | None = None) -> bool:
+    """True when successful automatic operation outcomes should be emitted.
+
+    An explicit ``CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY`` value wins for every
+    operation; unset, only the operations in ``_SUCCESS_TELEMETRY_BY_DEFAULT``
+    emit successes.
+    """
+    if os.environ.get(ENABLE_SUCCESS_TELEMETRY_ENV, "").strip():
+        return _env_flag_enabled(ENABLE_SUCCESS_TELEMETRY_ENV)
+    return operation in _SUCCESS_TELEMETRY_BY_DEFAULT
 
 
 # HTTP statuses worth retrying: the request was well-formed, so the same call
@@ -631,10 +646,11 @@ def _track_operation(operation: str):
             state.attempt_count = 0
             state.request_count = 0
             state.snowflake_request_ids = []
+            state.values = {}
             started = time.monotonic()
             try:
                 result = method(self, *args, **kwargs)
-            except DownloadCancelled:
+            except (DownloadCancelled, KeyboardInterrupt):
                 # The caller asked to stop: not a failure.
                 if arguments is not None:
                     self._emit_operation_outcome(
@@ -670,6 +686,7 @@ def _track_operation(operation: str):
                 state.attempt_count = 0
                 state.request_count = 0
                 state.snowflake_request_ids = []
+                state.values = {}
 
         return wrapped
 
@@ -1927,10 +1944,12 @@ class CortexTrainingClient:
 
         A cancelled operation is reported like a success (only when success
         telemetry is enabled), with ``success`` false and ``cancelled`` true.
+        Values an operation recorded with :meth:`_operation_values` are added to
+        the value; the common fields take precedence.
         """
         if self._metric_emitter is None:
             return
-        if error is None and not _success_telemetry_enabled():
+        if error is None and not _success_telemetry_enabled(operation):
             return
         try:
             attempt_count = int(
@@ -1939,7 +1958,10 @@ class CortexTrainingClient:
             request_count = int(
                 getattr(self._operation_metric_state, "request_count", 0)
             )
-            value: dict[str, Any] = {
+            value: dict[str, Any] = dict(
+                getattr(self._operation_metric_state, "values", None) or {}
+            )
+            value |= {
                 "attempt_count": attempt_count,
                 "duration_ms": round((time.monotonic() - started) * 1000, 3),
                 "request_count": request_count,
@@ -1963,6 +1985,18 @@ class CortexTrainingClient:
             self.emit_metric(operation, value, attributes=attributes)
         except Exception:
             logger.debug("client operation metric construction failed", exc_info=True)
+
+    def _operation_values(self) -> dict[str, Any]:
+        """Extra outcome values for the operation running on this thread.
+
+        Write numbers, booleans, and short fixed strings only. Outside a
+        tracked operation this returns a dict nobody reads.
+        """
+        state = getattr(self, "_operation_metric_state", None)
+        values = getattr(state, "values", None) if state is not None else None
+        if not isinstance(values, dict) or not getattr(state, "active", None):
+            return {}
+        return values
 
     @staticmethod
     def _debug_json_summary(value: Any, *, limit: int = 2000) -> str:
@@ -2791,9 +2825,12 @@ class CortexTrainingClient:
         through Snowflake's supported experiment artifact ``LIST``/``GET``
         interface; no object-store credentials are exposed to the caller.
         """
+        values = self._operation_values()
+        values.update(artifact="execution_logs", file_count=0, bytes_read=0)
         run_uri, run_name = self._experiment_run_uri(job_id)
         connection = self._open_experiment_artifact_connection()
         try:
+            started = time.monotonic()
             paths: list[str] = []
             for artifact_root in ("_logs", "checkpoints/_logs"):
                 paths.extend(
@@ -2802,6 +2839,8 @@ class CortexTrainingClient:
                     )
                 )
 
+            values["list_ms"] = round((time.monotonic() - started) * 1000, 3)
+            started = time.monotonic()
             results: list[dict[str, str]] = []
             with tempfile.TemporaryDirectory(prefix="cortex-training-execution-logs-") as temp:
                 temp_root = Path(temp)
@@ -2832,7 +2871,9 @@ class CortexTrainingClient:
                     )
                     artifact_uri = run_uri + relative_path
                     try:
+                        values["bytes_read"] += downloaded.stat().st_size
                         content = downloaded.read_text(encoding="utf-8")
+                        values["file_count"] += 1
                     finally:
                         downloaded.unlink(missing_ok=True)
                     results.append(
@@ -2843,6 +2884,7 @@ class CortexTrainingClient:
                             "content": content,
                         }
                     )
+            values["fetch_ms"] = round((time.monotonic() - started) * 1000, 3)
             return results
         finally:
             connection.close()
@@ -3174,6 +3216,9 @@ class CortexTrainingClient:
         """
         work = [path for plan in plans for path in plan.new_paths]
         window = max_workers * self._DOWNLOAD_WINDOW_PER_WORKER
+        values = self._operation_values()
+        for key in ("chunk_count", "chunks_skipped", "bytes_written"):
+            values.setdefault(key, 0)
         results: list[dict[str, Any]] = []
         cancel = threading.Event()
         # A resumed plan starts from output an earlier download saved.
@@ -3262,6 +3307,7 @@ class CortexTrainingClient:
                                     )
                                     submitted += 1
                                 head = pending.popleft()
+                                offset, skipped = writer.offset, len(writer.skipped)
                                 self._commit_chunk(
                                     writer,
                                     relative_path,
@@ -3279,6 +3325,9 @@ class CortexTrainingClient:
                                     warnings=warnings,
                                 )
                                 saved_progress = True
+                                values["chunk_count"] += 1
+                                values["chunks_skipped"] += len(writer.skipped) - skipped
+                                values["bytes_written"] += writer.offset - offset
                                 report(done)
                                 # done == total is reported once the file is committed.
                                 if on_chunk is not None and len(writer.names) < total:
@@ -3606,6 +3655,22 @@ class CortexTrainingClient:
             or not transfer_timeout_seconds > 0
         ):
             raise ValueError("transfer_timeout_seconds must be a positive number or None")
+        values = self._operation_values()
+        values.update(
+            artifact=artifact_name,
+            max_workers=max_workers,
+            resume=resume,
+            resume_mode="none",
+            sub_job_count=0,
+            chunk_count=0,
+            chunks_skipped=0,
+            bytes_written=0,
+            list_ms=0.0,
+            fetch_ms=0.0,
+            artifact_retry_count=0,
+            transfer_timeout_count=0,
+            cancelled=False,
+        )
         run_uri, run_name = self._experiment_run_uri(job_id)
         shared = _artifact_download.SharedConnection(
             self._open_experiment_artifact_connection, transfer_timeout_seconds
@@ -3615,9 +3680,11 @@ class CortexTrainingClient:
         # True once output is on disk that a resumed download would keep.
         saved = False
         try:
+            started = time.monotonic()
             chunks_by_sub_job, warnings_by_sub_job = self._list_gzip_chunks(
                 shared, run_uri, run_name, job_id, artifact_name, chunk_pattern
             )
+            values["list_ms"] = round((time.monotonic() - started) * 1000, 3)
             # The stall check reads the job status (one REST call, plus a
             # stdout listing for metrics); it runs while chunks are fetched so
             # it adds no time to the download.
@@ -3668,22 +3735,32 @@ class CortexTrainingClient:
                 for sub_job_id in sorted(chunks_by_sub_job)
                 if wanted is None or sub_job_id in wanted
             ]
+            values["sub_job_count"] = len(plans)
+            modes = {
+                "append" if not plan.promote else "partial" if plan.known else "rebuild"
+                for plan in plans
+            }
+            values["resume_mode"] = modes.pop() if len(modes) == 1 else "mixed" if modes else "none"
             results: list[dict[str, Any]] = []
             if not plans:
                 self._report_artifact_progress(progress, f"{artifact_name}: found 0 chunks\n")
             else:
-                results = self._write_gzip_plans(
-                    shared,
-                    run_uri,
-                    artifact_name,
-                    plans,
-                    max_workers=max_workers,
-                    temporary_prefix=temporary_prefix,
-                    progress=progress,
-                    on_chunk=on_chunk,
-                    strict=strict,
-                    warnings_by_sub_job=warnings_by_sub_job,
-                )
+                started = time.monotonic()
+                try:
+                    results = self._write_gzip_plans(
+                        shared,
+                        run_uri,
+                        artifact_name,
+                        plans,
+                        max_workers=max_workers,
+                        temporary_prefix=temporary_prefix,
+                        progress=progress,
+                        on_chunk=on_chunk,
+                        strict=strict,
+                        warnings_by_sub_job=warnings_by_sub_job,
+                    )
+                finally:
+                    values["fetch_ms"] = round((time.monotonic() - started) * 1000, 3)
                 saved = True
             stale = stale_warnings()
             for result in results:
@@ -3708,6 +3785,8 @@ class CortexTrainingClient:
             )
             return sorted(results, key=lambda result: result["sub_job_id"])
         except BaseException as exc:
+            if isinstance(exc, (DownloadCancelled, KeyboardInterrupt)):
+                values["cancelled"] = True
             # An interrupt in the stall-check wait comes after every file is
             # committed; one from the writes carries its own flag.
             saved = saved or getattr(exc, "download_progress_saved", False)
@@ -3716,6 +3795,8 @@ class CortexTrainingClient:
         finally:
             # Stop a stall check that is still running before its session goes.
             stall_cancel.set()
+            values["artifact_retry_count"] = shared.retry_count
+            values["transfer_timeout_count"] = shared.transfer_timeout_count
             try:
                 shared.close()
             except BaseException as exc:
