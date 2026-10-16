@@ -24,10 +24,39 @@ cortex-training capacity
 python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json
 
+# Qwen3-4B-Instruct-2507 full-parameter, 256K context
+python -m recipes.rl.math_grpo.train \
+  config=/path/to/config.json \
+  job_config=configs/qwen3_4b_instruct.json
+
 # Qwen3-8B full-parameter
 python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json \
   job_config=configs/qwen3_8b_full.json
+
+# Qwen3.5-9B full-parameter, 256K context
+python -m recipes.rl.math_grpo.train \
+  config=/path/to/config.json \
+  job_config=configs/qwen35_9b_full.json
+
+# Gemma 3 4B IT, MedGemma 4B IT, and MedGemma 1.5 4B IT.
+# Full-parameter, 128K context.
+python -m recipes.rl.math_grpo.train \
+  config=/path/to/config.json \
+  job_config=configs/gemma3_4b.json
+
+python -m recipes.rl.math_grpo.train \
+  config=/path/to/config.json \
+  job_config=configs/medgemma_4b.json
+
+python -m recipes.rl.math_grpo.train \
+  config=/path/to/config.json \
+  job_config=configs/medgemma15_4b.json
+
+# Gemma 4 31B IT full-parameter, 256K context
+python -m recipes.rl.math_grpo.train \
+  config=/path/to/config.json \
+  job_config=configs/gemma4_31b.json
 
 # Qwen3.6-35B-A3B LoRA
 python -m recipes.rl.math_grpo.train \
@@ -47,12 +76,49 @@ python -m recipes.rl.math_grpo.train \
   job_config=configs/qwen38_27b_full.json \
   weight_sync_bucket_size=3221225472 \
   max_tokens=2048
+
+# Qwen3-30B-A3B full-parameter
+python -m recipes.rl.math_grpo.train \
+  config=/path/to/config.json \
+  job_config=configs/qwen3_30b_a3b.json
+
+# Qwen3.8-Flash-Next full-parameter, 256K context
+python -m recipes.rl.math_grpo.train \
+  config=/path/to/config.json \
+  job_config=configs/qwen38_flash_next.json
 ```
 
 `config=` is the Snowflake connection file. Adapt from
 `examples/config/connection.json.template`.
 
 The default job body is `configs/qwen3_8b_lora.json`. The default run will be finished within 1h.
+
+Other full-parameter job bodies are:
+
+- `configs/qwen3_4b_instruct.json`: Qwen3-4B-Instruct-2507, 8 training GPUs, SP8, 8 sampling GPUs at TP8, 256K. One optimizer step and an 8-token sample completed on H200.
+- `configs/qwen35_9b_full.json`: Qwen3.5-9B, 8 training GPUs, SP8, 8 sampling GPUs at TP8, 256K. One optimizer step and an 8-token sample completed on H200.
+- `configs/gemma3_4b.json`, `configs/medgemma_4b.json`, and `configs/medgemma15_4b.json`: Gemma 3 4B IT, MedGemma 4B IT, and MedGemma 1.5 4B IT. Each is 8 training GPUs, SP8, 8 sampling GPUs at TP8, 128K. The training block matches the SFT recipe. All three are Gemma 3 conditional-generation checkpoints. MedGemma 4B IT and MedGemma 1.5 4B IT each completed one optimizer step, weight sync, and an 8-token post-sync sample on H200. On Transformers 5, vLLM's Gemma 3 mapper has to send `model.vision_tower.` to `vision_tower.vision_model.`. `google/gemma-3-4b-it` uses this same mesh; that checkpoint was not run because its Hugging Face license grant is still pending.
+- `configs/gemma4_31b.json`: Gemma 4 31B IT, 8 training GPUs, SP8, 8 sampling GPUs at TP8, 256K. The training block matches the SFT recipe. One optimizer step and an 8-token sample completed on H200. Sliding layers use head size 256; full-attention layers use head size 512. Long sequences use flex attention, and shorter sequences use math attention.
+- `configs/qwen3_30b_a3b.json`
+- `configs/glm45_air.json`
+- `configs/nemotron3_nano_30b.json`: Nemotron-3-Nano, 8 training GPUs, SP8, EP4, 8 sampling GPUs at TP8, 256K. The training mesh matches the SFT recipe, which completed an AdamW step on H200. Sampling was not probed.
+- `configs/nemotron35_lightning_30b.json`: Nemotron-3.5-Lightning, same 256K mesh as Nano. MTP weights are not trained.
+- `configs/glm53_flash.json` (FP8 weights)
+- `configs/glm53_flash_bf16.json`
+- `configs/qwen38_flash_next.json`
+
+The training block of each renamed RL recipe matches its SFT recipe.
+`qwen38_flash_next.json` keeps the 16-GPU
+sampler at TP8, `weight_format: vllm`, and router replay. Its training mesh
+is 16 GPUs, SP16, EP8, `qsa_flex`, and a 256K context.
+`glm53_flash.json` uses the same 32-GPU, SP32, EP16, UCCL
+training mesh as the SFT recipe, including the tiled MLP chunk of 1024.
+Its sampler stays at 8 GPUs and TP8 with a 256K context. The completed
+evidence is the training optimizer step; sampling was not probed.
+`glm53_flash_bf16.json` uses a 64-GPU, SP64, EP32, UCCL
+training mesh with tiled MLP chunk 512. Its sampler remains 8 GPUs and TP8.
+The BF16 mesh is an unproven capacity estimate based on the FP8 run; that
+checkpoint has not completed its own 256K step.
 
 ## Customizability
 
@@ -65,6 +131,7 @@ python -m recipes.rl.math_grpo.train \
   group_size=GROUP_SIZE \
   max_steps=MAX_STEPS \
   n_test=N_TEST \
+  weight_sync_format=WEIGHT_SYNC_FORMAT \
   weight_sync_bucket_size=WEIGHT_SYNC_BUCKET_SIZE_BYTES \
   wandb_project=WANDB_PROJECT \
   sf_tracking=SF_TRACKING
@@ -76,9 +143,11 @@ LoRA, GPU counts, sequence length, and MoE live in the job-config JSON. Set
 to Snowflake experiment tracking after
 `uv pip install "snowflake-ml-python>=1.19.0"`.
 
-`weight_sync_bucket_size` optionally overrides the transfer-bucket size in
-bytes. When omitted, the recipe leaves the field out and uses the server
-default. Set it above the largest individual model tensor.
+`weight_sync_format` optionally selects `vllm` or `hf` for full-model
+synchronization; LoRA jobs always use `lora`. `weight_sync_bucket_size`
+optionally overrides the transfer-bucket size in bytes. When omitted, the
+recipe leaves the field out and uses the server default. Set it above the
+largest individual model tensor.
 
 The recipe loads one create-job body with colocated sampling and training
 sub-jobs. Pass a shipped example or a copy with `job_config=JOB_CONFIG`.

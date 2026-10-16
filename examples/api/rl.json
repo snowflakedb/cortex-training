@@ -26,11 +26,11 @@
         },
         "ep_size": 8,
         "gradient_clipping": 1.0,
+        "model_provider": "prime_rl",
         "max_seq_len": 128,
         "mb_spec": {
           "max_tokens_per_mb": 10240
         },
-        "model_provider": "prime_rl",
         "n_gpus": 8,
         "nccl_debug": false,
         "optimizer": {

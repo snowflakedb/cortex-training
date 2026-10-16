@@ -147,9 +147,49 @@ The target list above is for dense Qwen models. For
 `v_proj`, and `o_proj`). PrimeRL does not yet support LoRA on routed experts;
 `gate_proj`, `up_proj`, and `down_proj` do not select those parameters.
 The shipped Qwen3.6 configs use sequence parallel size 8 and logical batch 1
-to run at the model's 262K context limit.
+to run at the model's 262K context limit. `qwen3_4b_instruct.json` and
+`qwen35_9b_full.json` do the same for dense Qwen3-4B-Instruct-2507 and
+Qwen3.5-9B: 8 GPUs, SP8, and the checkpoint limit of 262144 tokens. One
+AdamW step completed for each on H200. The Qwen3.5-9B LoRA config stays
+at 65536 tokens. `gemma3_4b.json`, `medgemma_4b.json`, and `medgemma15_4b.json` train
+`google/gemma-3-4b-it`, `google/medgemma-4b-it`, and
+`google/medgemma-1.5-4b-it` on 8 GPUs, SP8, at the checkpoint limit of
+131072 tokens. All three are Gemma 3 conditional-generation models and
+share that mesh. `gemma4_31b.json` trains
+`google/gemma-4-31B-it` on the same 8-GPU SP8 mesh. One AdamW step at
+262144 tokens completed on H200.
+Sliding layers use head size 256 and 16 KV heads; full-attention layers
+use head size 512 and 4 KV heads, and sequence parallel replicates those
+4 KV heads across the 8 ranks. FlashAttention stops at head size 256, so
+the full-attention layers run with flex attention.
 
-For dense long-context profiles, set an integer
+### MoE models
+
+Full-parameter recipes. Renamed files use 256K, or the model's position
+limit when that limit is lower. The filename records sequence parallel,
+expert parallel, GPU count, and that length. The matching RL training block
+uses the same mesh. These recipes set `model_provider` to `prime_rl`.
+The Nemotron-3-Nano and Nemotron-3.5-Lightning SFT and RL training
+recipes are 256K on 8 GPUs, SP8, EP4. Their sampling and inference
+configs are 8 GPUs at TP8 and 256K. Both
+GLM-5.3-Flash recipes set `ep_comm_backend` to `uccl` because cross-node
+EP16 does not complete with DeepEP.
+
+- `glm45_air.json`: GLM-4.5-Air, 8 GPUs, SP8, EP4, 128K
+- `qwen38_flash_next.json`: Qwen3.8-Flash-Next, 16 GPUs, SP16, EP8, 256K, `qsa_flex`
+- `qwen3_30b_a3b.json`: Qwen3-30B-A3B, 4 GPUs, SP1, EP4, 40K (model maximum)
+- `nemotron3_nano_30b.json`: Nemotron-3-Nano-30B-A3B-BF16, 8 GPUs, SP8, EP4, 256K. One AdamW step completed on H200, including a packed batch. Mamba context parallel resets at sequence boundaries.
+- `nemotron35_lightning_30b.json`: Nemotron-3.5-Lightning-30B-A3B-BF16, 8 GPUs, SP8, EP4, 256K. One AdamW step completed on H200, including a packed batch. MTP weights are not trained.
+- `glm53_flash.json`: GLM-5.3-Flash FP8 weights, 32 GPUs, SP32, EP16, 256K, UCCL, tiled MLP chunk 1024. One optimizer step completed on H200 with about 3 GiB of device headroom.
+- `glm53_flash_bf16.json`: GLM-5.3-Flash-BF16, 64 GPUs, SP64, EP32, 256K, UCCL, tiled MLP chunk 512. This is an unproven capacity estimate based on the FP8 run; the BF16 checkpoint has not completed its own 256K step.
+
+```bash
+python -m recipes.sft.conversational.train \
+  config=/path/to/config.json \
+  job_config=configs/qwen38_flash_next.json
+```
+
+For dense long-context profiles, an integer
 `fused_lm_head_token_chunk_size` in `training_config`. The server then computes
 per-token log probabilities in chunks without materializing the full
 `[sequence, vocabulary]` logits tensor. The setting saves memory and does not
@@ -172,14 +212,39 @@ python -m recipes.sft.conversational.train \
   config=/path/to/config.json \
   job_config=configs/qwen3_8b_lora.json
 
+# Qwen3-4B-Instruct-2507 full-parameter, 256K context, 8 GPUs, SP8
+python -m recipes.sft.conversational.train \
+  config=/path/to/config.json \
+  job_config=configs/qwen3_4b_instruct.json
+
 # Qwen3.5-9B LoRA / full
 python -m recipes.sft.conversational.train \
   config=/path/to/config.json \
   job_config=configs/qwen35_9b_lora.json
 
+# Qwen3.5-9B full-parameter, 256K context, 8 GPUs, SP8
 python -m recipes.sft.conversational.train \
   config=/path/to/config.json \
   job_config=configs/qwen35_9b_full.json
+
+# Gemma 3 4B IT, MedGemma 4B IT, and MedGemma 1.5 4B IT.
+# Full-parameter, 128K context, 8 GPUs, SP8.
+python -m recipes.sft.conversational.train \
+  config=/path/to/config.json \
+  job_config=configs/gemma3_4b.json
+
+python -m recipes.sft.conversational.train \
+  config=/path/to/config.json \
+  job_config=configs/medgemma_4b.json
+
+python -m recipes.sft.conversational.train \
+  config=/path/to/config.json \
+  job_config=configs/medgemma15_4b.json
+
+# Gemma 4 31B IT full-parameter, 256K context, 8 GPUs, SP8
+python -m recipes.sft.conversational.train \
+  config=/path/to/config.json \
+  job_config=configs/gemma4_31b.json
 
 # Qwen3.8-27B LoRA / full
 python -m recipes.sft.conversational.train \
