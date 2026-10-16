@@ -735,7 +735,7 @@ class Hardware(str, Enum):
     """GPU hardware for create job and capacity.
 
     Wire values match the REST ``hardware`` field; see
-    ``docs/reference/rest-api.md`` sections 5.1 and 5.4. Omitting it defaults to
+    ``docs/reference/rest-api.md`` sections 5.1 and 5.5. Omitting it defaults to
     H200 on the server. Unknown values are rejected client-side.
     """
 
@@ -2397,6 +2397,12 @@ class CortexTrainingClient:
         resp = self._send("GET", self._prefix, params=params)
         return resp.json().get("jobs", [])
 
+    @_track_operation("list_models")
+    def list_models(self) -> list:
+        """Return active models configured for new jobs."""
+        resp = self._send("GET", f"{self._prefix}/models")
+        return resp.json().get("models", [])
+
     def iter_jobs(
         self,
         *,
@@ -2553,7 +2559,7 @@ class CortexTrainingClient:
           ceiling headroom capped by what is schedulable. ``0`` does not mean
           blocked: a submit within the ceiling is still accepted and queued.
 
-        See ``docs/reference/rest-api.md`` section 5.4 for the authoritative
+        See ``docs/reference/rest-api.md`` section 5.5 for the authoritative
         field list, and :meth:`get_capacity_breakdown` to split ``in_use_gpus``
         and ``pending_gpus`` by sub-job type or by submitting user.
         """

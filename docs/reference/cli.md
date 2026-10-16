@@ -109,6 +109,7 @@ cortex-training get JOB_ID
 cortex-training wait JOB_ID                   # Wait until running, not finished
 cortex-training cancel JOB_ID
 cortex-training checkpoints JOB_ID
+cortex-training models                        # Active configured models
 cortex-training capacity                      # Every GPU type your account supports
 cortex-training capacity --hardware H200
 ```
@@ -174,7 +175,7 @@ cortex-training fwd-bwd --help
 ## Detailed Reference
 
 - [Connection config](#connection-config), [login](#login), and [environment variables](#environment-variables)
-- [Submit](#submit-a-job), [manage jobs](#manage-existing-jobs), and [GPU capacity](#show-current-gpu-capacity)
+- [Submit](#submit-a-job), [manage jobs](#manage-existing-jobs), [available models](#list-available-models), and [GPU capacity](#show-current-gpu-capacity)
 - [Forward-backward and optimizer steps](#run-a-forward-backward-smoke-test)
 - [Load checkpoints](#load-a-checkpoint-into-a-running-job) and [initialize sampling](#start-sampling-from-a-training-checkpoint)
 - [Generate](#run-a-generate-smoke-test) and [sync weights](#sync-training-weights)
@@ -321,6 +322,18 @@ with status 2 before connecting.
 `wait` waits for the job to reach **running**, not for training to finish.
 See [Manage Jobs](../guides/operations/manage-jobs.md) for the operational workflow.
 
+### List Available Models
+
+List active models configured for new jobs:
+
+```bash
+cortex-training models
+```
+
+The command prints `{"models": [{"name": "..."}]}`. This is a policy catalog,
+not a cache-readiness guarantee; a submitted job may wait while model sync
+completes.
+
 ### Show Current GPU Capacity
 
 Print the caller account's reserved GPU capacity and current usage, separated
@@ -364,7 +377,7 @@ names the supported types.
 `max_total_gpus` is the canonical ceiling and supersedes the deprecated
 `reserved_gpus`. `in_use_gpus` counts only GPUs the account holds; queued work
 is reported separately in `pending_gpus`. See
-[REST API reference section 5.4](rest-api.md#54-capacity---get-capacity) and
+[REST API reference section 5.5](rest-api.md#55-capacity---get-capacity) and
 [GPU hardware](../concepts/hardware.md).
 
 #### Capacity Breakdown

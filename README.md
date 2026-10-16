@@ -55,6 +55,7 @@ Recipes are built from step-level CLI primitives. Use them directly for full con
 
 ```bash
 cortex-training submit job.json          # create a job
+cortex-training models                   # list active configured models
 cortex-training fwd-bwd payload.json     # run a forward-backward pass
 cortex-training step --lr 1e-4           # optimizer step
 cortex-training generate --prompt "..."  # sample from the model
