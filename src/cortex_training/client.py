@@ -2826,7 +2826,7 @@ class CortexTrainingClient:
         interface; no object-store credentials are exposed to the caller.
         """
         values = self._operation_values()
-        values.update(artifact="execution_logs", file_count=0, bytes_read=0)
+        values.update(artifact="execution_logs", file_count=0, bytes_read=0, cancelled=False)
         run_uri, run_name = self._experiment_run_uri(job_id)
         connection = self._open_experiment_artifact_connection()
         try:
@@ -2871,9 +2871,10 @@ class CortexTrainingClient:
                     )
                     artifact_uri = run_uri + relative_path
                     try:
-                        values["bytes_read"] += downloaded.stat().st_size
+                        size = downloaded.stat().st_size
                         content = downloaded.read_text(encoding="utf-8")
                         values["file_count"] += 1
+                        values["bytes_read"] += size
                     finally:
                         downloaded.unlink(missing_ok=True)
                     results.append(
@@ -3659,7 +3660,7 @@ class CortexTrainingClient:
         values.update(
             artifact=artifact_name,
             max_workers=max_workers,
-            resume=resume,
+            resume=bool(resume),
             resume_mode="none",
             sub_job_count=0,
             chunk_count=0,

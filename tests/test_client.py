@@ -6734,7 +6734,24 @@ class TestChunkedArtifactDownload:
         assert value["artifact"] == "execution_logs"
         assert value["file_count"] == 1 and value["bytes_read"] == 8
         assert value["list_ms"] >= 0 and value["fetch_ms"] >= 0
-        assert value["success"] is True
+        assert value["success"] is True and value["cancelled"] is False
+
+        # A file that does not decode is not counted as read.
+        connection.content_by_uri[run_uri + path] = b"\xff\xfe not utf-8"
+        c._metric_emitter.reset_mock()
+        with pytest.raises(UnicodeDecodeError):
+            c.fetch_execution_logs("job-1")
+        value, _attributes = self._emitted(c, "fetch_execution_logs")
+        assert value["success"] is False
+        assert value["file_count"] == 0 and value["bytes_read"] == 0
+        assert value["cancelled"] is False
+
+    def test_download_telemetry_sends_resume_as_a_bool(self, tmp_path, monkeypatch):
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=1)
+        c._metric_emitter = MagicMock()
+        c.download_stdout_logs("job-1", tmp_path, resume=1)
+        value, _attributes = self._emitted(c)
+        assert value["resume"] is True
 
     @pytest.mark.parametrize("setting", ["no", "off", "false", "2"])
     def test_any_explicit_non_truthy_setting_turns_download_successes_off(

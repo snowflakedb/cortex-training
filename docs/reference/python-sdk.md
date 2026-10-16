@@ -82,8 +82,8 @@ Download events add these body fields:
 | `max_workers` | Concurrent GETs used |
 | `resume` / `resume_mode` | Whether `resume` was passed, and what happened: `fresh` (no earlier file), `rebuild` (replaced an earlier file), `append`, `partial` (continued an interrupted download), `mixed` across sub-jobs, or `none` |
 | `artifact_retry_count` / `transfer_timeout_count` | Retried `LIST`/`GET` attempts, and attempts abandoned after `transfer_timeout_seconds` |
-| `cancelled` | The download was stopped by its caller |
-| `file_count` / `bytes_read` | Files and bytes read (`fetch_execution_logs`) |
+| `cancelled` | The call was stopped by its caller; sent on every download and execution-log event |
+| `file_count` / `bytes_read` | Files read and decoded, and their size (`fetch_execution_logs`) |
 
 On failure the fields describe the work done before it. Queryable attributes
 include available `job_id`, sub-job identifiers, `request_id`,
