@@ -33,8 +33,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import time
+from collections import OrderedDict
 from collections import deque
 from datetime import datetime
 from datetime import timezone
@@ -56,9 +58,40 @@ _NAMESPACE = "cortex-training"
 # poll_max_interval. Kept module-level so a test/mock client need not carry them.
 _POLL_BACKOFF_MULTIPLIER = 1.25
 _POLL_MAX_INTERVAL = 6.0
+_HOLD_CHECK_SECONDS = 0.25  # how soon a held tail notices it may poll again
 
-_ERROR_LOG = os.path.expanduser("~/.cortex-training-errors.log")
+# A stuck tail: on some service versions a log line of 256 KiB or more is never
+# delivered, and every later page comes back empty with the same cursor while
+# the job keeps logging. A quiet log looks the same, so a tail that has not moved
+# for STALL_SECONDS (over at least STALL_POLLS polls) reads the end of the log.
+# When that end has lines the tail hasn't shown and the cursor still brings
+# nothing, the tail is stuck: it goes on from the end, without the lines already
+# shown. When the cursor does bring lines, the log was only quiet, and they are
+# shown in order from the cursor instead. The window shrinks while reads of the
+# end bring nothing new: a quiet log then costs only a small read, and a window
+# that still reaches back to the oversized line soon stops reaching it.
+STALL_SECONDS = 45.0
+STALL_POLLS = 3
+RESTART_LINES = (200, 50, 10)
+_RECENT_KEYS = 5000  # entries remembered for that dedupe; far more than one restart window
+
+# A page this full says the log runs ahead of the tail (the service's pages
+# currently hold at most 2,000 entries and 256 KiB): the next read goes out
+# after CATCH_UP_SECONDS instead of the poll interval, until a page isn't.
+CATCH_UP_ENTRIES = 1000
+CATCH_UP_BYTES = 128 * 1024
+CATCH_UP_SECONDS = 0.2
+
+# The TUI's one error log: tracebacks of what it shows as one-line errors. Messages
+# name it ERROR_LOG_NAME; writers open error_log_path().
+ERROR_LOG_NAME = "~/.cortex-training-errors.log"
+_ERROR_LOG = os.path.expanduser(ERROR_LOG_NAME)
 _persist_warned = False
+
+
+def error_log_path() -> str:
+    """The error log file every part of the TUI appends to."""
+    return _ERROR_LOG
 
 # Filename-safe byte set; everything else (incl. ':' '/' '%') is %XX-escaped so
 # a source_id collapses to a single, reversible path component.
@@ -189,14 +222,27 @@ class LogCache:
         return None
 
     def set_cursor(self, source_id: str, cursor: Optional[str]) -> None:
+        self._update_source(source_id, cursor=cursor)
+
+    def _update_source(self, source_id: str, **fields: Any) -> None:
         doc = self._read_cursors()
         sources = doc.setdefault("sources", {})
-        sources[source_id] = {
-            "cursor": cursor,
-            "updated": datetime.now(timezone.utc).isoformat(),
-        }
+        entry = sources.get(source_id)
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        entry.update(fields, updated=datetime.now(timezone.utc).isoformat())
+        sources[source_id] = entry
         doc["version"] = 1
         _atomic_write_text(self._cursors_path(), json.dumps(doc, sort_keys=True) + "\n")
+
+    def head_missing(self, source_id: str) -> bool:
+        """Whether this cache lacks the start of the source's log: its first
+        fetch read only the log's last lines, or old lines were rotated out."""
+        entry = self._read_cursors().get("sources", {}).get(source_id)
+        return isinstance(entry, dict) and entry.get("head_missing") is True
+
+    def set_head_missing(self, source_id: str) -> None:
+        if not self.head_missing(source_id):
+            self._update_source(source_id, head_missing=True)
 
     # ---- entries ----
     def append_entries(self, source_id: str, entries: Iterable[Any]) -> int:
@@ -217,23 +263,46 @@ class LogCache:
         return n
 
     def load_entries(self, source_id: str, *, limit: Optional[int] = None) -> list:
+        """The cached entries, oldest first. A torn or corrupt line is skipped; bytes
+        that aren't UTF-8 (the file was damaged outside the client) read as U+FFFD."""
+        return self.load_newest(source_id, limit=limit)[0]
+
+    def load_newest(self, source_id: str, *, limit: Optional[int] = None) -> Tuple[list, int]:
+        """The newest ``limit`` cached entries (all without a limit), and how many the cache
+        holds. A torn or corrupt line is skipped and not counted; bytes that aren't UTF-8
+        read as U+FFFD."""
         path = self._jsonl_path(source_id)
         if not path.exists():
-            return []
+            return [], 0
         sink: Any = deque(maxlen=limit) if limit else []
+        total = 0
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
                 for line in f:
                     line = line.strip()
                     if not line:
                         continue
+                    if limit:
+                        # Only the newest ``limit`` are kept: parse them alone, at the end.
+                        sink.append(line)
+                        total += 1
+                        continue
                     try:
                         sink.append(json.loads(line))
+                        total += 1
                     except ValueError:
                         continue  # torn last line / corruption: skip
         except OSError:
-            return []
-        return list(sink)
+            return [], 0
+        if not limit:
+            return list(sink), total
+        out = []
+        for line in sink:
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                total -= 1  # torn last line / corruption: skip
+        return out, total
 
     def load(self, source_id: str, *, limit: Optional[int] = None) -> Tuple[list, Optional[str]]:
         return self.load_entries(source_id, limit=limit), self.get_cursor(source_id)
@@ -262,7 +331,7 @@ class LogCache:
         except OSError:
             return
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
         except OSError:
             return
@@ -277,6 +346,161 @@ class LogCache:
         # The cursor is intentionally NOT touched: history is bounded but the
         # resume position is preserved, so reopen still delta-fetches correctly.
         _atomic_write_text(path, "".join(kept))
+        if len(kept) < len(lines):
+            try:
+                self.set_head_missing(source_id)  # the oldest lines are gone
+            except OSError:
+                pass
+
+
+# Saved consoles the TUI keeps for finished jobs (jobs/<job>/console/), all jobs
+# together: past this, the ones used least recently are removed.
+CONSOLE_CACHE_MAX_BYTES = 1024 ** 3
+CONSOLE_MARKER = ".complete"  # written last into a kept console; its mtime is when it was last used
+
+
+def _tree_bytes(path: Path) -> int:
+    total = 0
+    for child in path.rglob("*"):
+        try:
+            if child.is_file():
+                total += child.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def touch_console(console_dir: Path) -> None:
+    """Mark a kept console as just used (it is the last to be removed)."""
+    try:
+        os.utime(console_dir / CONSOLE_MARKER)
+    except OSError:
+        pass
+
+
+def prune_consoles(*, root: Optional[Path] = None, keep: Optional[Path] = None,
+                   max_bytes: Optional[int] = None) -> list:
+    """Remove kept consoles, least recently used first, until the rest fit in
+    ``max_bytes`` (default CONSOLE_CACHE_MAX_BYTES); never ``keep`` (the one
+    just kept), nor one without its marker (still being written). Returns the
+    removed directories."""
+    max_bytes = CONSOLE_CACHE_MAX_BYTES if max_bytes is None else max_bytes
+    jobs = (root if root is not None else cache_root()) / "jobs"
+    kept = []
+    for console in jobs.glob("*/console"):
+        try:
+            used = (console / CONSOLE_MARKER).stat().st_mtime
+        except OSError:
+            continue
+        kept.append((used, _tree_bytes(console), console))
+    total = sum(size for _, size, _ in kept)
+    removed = []
+    keep_path = keep.resolve() if keep is not None else None
+    for _, size, console in sorted(kept, key=lambda item: item[0]):
+        if total <= max_bytes:
+            break
+        if keep_path is not None and console.resolve() == keep_path:
+            continue
+        shutil.rmtree(console, ignore_errors=True)
+        total -= size
+        removed.append(console)
+    return removed
+
+
+def prune_metrics(*, keep: Path, root: Optional[Path] = None) -> list:
+    """Remove the cached telemetry (``jobs/<job>/metrics/``) of every job but the
+    one in ``keep``, so the cache holds the telemetry of the job being viewed only.
+    Best effort: what can't be removed now goes next time. Returns the removed
+    directories, resolved."""
+    jobs = (root if root is not None else cache_root()) / "jobs"
+    keep_path = keep.resolve()
+    removed = []
+    for metrics in jobs.glob("*/metrics"):
+        try:
+            path = metrics.resolve()
+        except OSError:
+            continue
+        if path == keep_path:
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        removed.append(path)
+    return removed
+
+
+# One empty file per running TUI (named by its pid), so the last one to exit can tell
+# that no other still reads the cache before it removes what was downloaded.
+_SESSIONS = ".sessions"
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # it exists; another user's
+    except OSError:
+        return False
+    return True
+
+
+def _other_sessions(root: Path) -> list:
+    """The pids of the other TUIs still running on this cache; markers of ended ones go."""
+    live = []
+    for marker in (root / _SESSIONS).glob("*"):
+        try:
+            pid = int(marker.name)
+        except ValueError:
+            continue
+        if pid == os.getpid():
+            continue
+        if _pid_alive(pid):
+            live.append(pid)
+        else:
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+    return live
+
+
+def remove_downloads(root: Optional[Path] = None) -> None:
+    """Remove every job's downloaded data (``jobs/``: logs, saved consoles,
+    telemetry, tail cursors). Local job names (``aliases.json``) stay."""
+    shutil.rmtree((root if root is not None else cache_root()) / "jobs", ignore_errors=True)
+
+
+def begin_session(root: Optional[Path] = None) -> Optional[Path]:
+    """Mark this TUI as running on the cache. With no other TUI running, first
+    remove what a session that couldn't clean up (one that was killed) left.
+    Returns this session's marker, for :func:`end_session`."""
+    root = root if root is not None else cache_root()
+    try:
+        if not _other_sessions(root):
+            remove_downloads(root)
+        folder = root / _SESSIONS
+        folder.mkdir(parents=True, exist_ok=True)
+        marker = folder / str(os.getpid())
+        marker.touch()
+        return marker
+    except OSError:
+        return None
+
+
+def end_session(marker: Optional[Path], root: Optional[Path] = None) -> None:
+    """This TUI is done: unmark it and, when no other TUI still runs on the cache,
+    remove every job's downloaded data."""
+    root = root if root is not None else cache_root()
+    if marker is not None:
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+    try:
+        if not _other_sessions(root):
+            remove_downloads(root)
+    except OSError:
+        pass
 
 
 def _note_persist_error(exc: BaseException) -> None:
@@ -285,7 +509,7 @@ def _note_persist_error(exc: BaseException) -> None:
         return
     _persist_warned = True
     try:
-        with open(_ERROR_LOG, "a", encoding="utf-8") as f:
+        with open(error_log_path(), "a", encoding="utf-8") as f:
             f.write("log cache persistence disabled (%s: %s)\n" % (type(exc).__name__, exc))
     except OSError:
         pass
@@ -305,6 +529,72 @@ def _safe_set_cursor(cache: LogCache, source_id: str, cursor: Optional[str]) -> 
         _note_persist_error(exc)
 
 
+def catching_up(entries: list) -> bool:
+    """Whether a page is full enough that the log is likely ahead of the tail."""
+    if len(entries) >= CATCH_UP_ENTRIES:
+        return True
+    size = 0
+    for entry in entries:
+        raw = entry.get("_raw") if isinstance(entry, dict) else None
+        size += len(raw) if isinstance(raw, str) else 0
+    return size >= CATCH_UP_BYTES
+
+
+def _refuses_cursor(exc: BaseException) -> bool:
+    """A 400 for a read with a cursor that isn't about the sub-job (``does not
+    belong to session``, while it starts): the service doesn't take the cursor."""
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) != 400:
+        return False
+    try:
+        body = response.json()
+        message = str(body.get("message") or "") if isinstance(body, dict) else ""
+    except Exception:  # noqa: BLE001 - not JSON
+        message = str(getattr(response, "text", "") or "")
+    return "does not belong to session" not in message
+
+
+def entry_key(entry: Any) -> str:
+    """Identity of a log entry for dedupe.
+
+    A live line is ``{"_raw": "<RFC3339 nanosecond timestamp> <line>"}``, so its
+    text is unique; other shapes compare by their canonical JSON.
+    """
+    if isinstance(entry, dict) and isinstance(entry.get("_raw"), str):
+        return entry["_raw"]
+    try:
+        return json.dumps(entry, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return repr(entry)
+
+
+class _RecentKeys:
+    """The keys of the last ``limit`` entries yielded, oldest dropped first."""
+
+    def __init__(self, limit: int) -> None:
+        self._keys: "OrderedDict[str, None]" = OrderedDict()
+        self._limit = limit
+
+    def add_all(self, entries: Iterable[Any]) -> None:
+        for entry in entries:
+            key = entry_key(entry)
+            self._keys[key] = None
+            self._keys.move_to_end(key)
+        while len(self._keys) > self._limit:
+            self._keys.popitem(last=False)
+
+    def unseen(self, entries: Iterable[Any]) -> list:
+        """The entries not yielded yet, in order and each once. Nothing is remembered."""
+        out: list = []
+        keys: set = set()
+        for entry in entries:
+            key = entry_key(entry)
+            if key not in self._keys and key not in keys:
+                keys.add(key)
+                out.append(entry)
+        return out
+
+
 def cached_pages(
     cache: LogCache,
     source_id: str,
@@ -317,8 +607,15 @@ def cached_pages(
     sleep: Callable[[float], None] = time.sleep,
     replay_limit: Optional[int] = None,
     is_cancelled: Optional[Callable[[], bool]] = None,
+    hold: Optional[Callable[[], bool]] = None,
     backoff_multiplier: float = _POLL_BACKOFF_MULTIPLIER,
     max_interval: float = _POLL_MAX_INTERVAL,
+    restart: Optional[Callable[[int], dict]] = None,
+    can_restart: Optional[Callable[[], bool]] = None,
+    stall_seconds: Optional[float] = None,
+    stall_polls: Optional[int] = None,
+    clock: Callable[[], float] = time.monotonic,
+    tail_window: Optional[int] = None,
 ) -> Iterator[Tuple[str, list]]:
     """Replay the cached entries, then (when ``live``) resume ``fetch`` from the
     saved cursor.
@@ -331,59 +628,194 @@ def cached_pages(
     the advancing cursor persisted; on a crash between the two we re-fetch a few
     lines next time rather than skip any.
 
+    A read with a cursor that the service refuses with a 400 (a cursor saved
+    by an older service, say) would fail every later read too: the cursor is
+    dropped, the log's end is read instead, and its entries not yielded yet
+    come as ``("reset", entries)``; a gap may lie between the two. A page full
+    enough that the log runs ahead (see :func:`catching_up`) is followed by
+    the next read after ``CATCH_UP_SECONDS`` instead of ``poll_interval``;
+    the empty page that ends such a run yields ``("caught-up", [])``.
+
+    ``("partial", [])`` says that what was and will be yielded doesn't reach
+    back to the log's first line: the replay held only the newest
+    ``replay_limit`` of the cached entries, or the cache never had the start
+    (its first fetch read the last lines only; it is remembered). ``tail_window`` is
+    how many of the log's last lines a fetch without a cursor reads. That
+    window comes a page at a time, and it is all in once a page isn't full
+    (see :func:`catching_up`): that page reached the log's end. When the pages
+    up to that one bring ``tail_window`` entries, older lines were left out;
+    when they bring fewer, the window held the whole log, however busy (the
+    lines written meanwhile come on later pages).
+
     ``live=False`` replays the cache and stops without ever calling ``fetch`` —
     used for terminal jobs whose zone is gone, so the operation API (which would
     500) is never hit.
 
-    While ``follow`` and the job has yet to be placed, ``fetch``'s answer is a
-    wait, not an error: the poll backs off and tries again. A session that is
-    over still raises, so the caller can fall back to the saved log.
+    While ``hold()`` is true no fetch is sent; the saved cursor resumes the tail
+    where it stopped once it turns false. Time spent held never counts as a
+    stall.
+
+    With ``restart`` (following only), a tail whose pages have been empty and
+    whose cursor has not moved for ``stall_seconds`` and at least
+    ``stall_polls`` polls (default ``STALL_SECONDS`` and ``STALL_POLLS``)
+    calls ``restart(n)`` for a fresh page of the log's last ``n`` lines. The
+    stall clock runs only while there is a cursor (a fetch without one tails
+    the log's end anyway) and ``can_restart()`` is true. When that page has
+    entries not yielded yet, the cursor is read once more: if it still brings
+    nothing, the tail is stuck, so the new entries are yielded as
+    ``("restart", entries)`` and the tail continues from the restart's cursor;
+    if it brings entries (or moves), the log was only quiet, and that page is
+    yielded as ``"live"`` in place of the restart. A restart that brings
+    nothing new keeps the current cursor and makes the next window smaller
+    (see ``RESTART_LINES``).
     """
     cancelled = is_cancelled or (lambda: False)
+    held = hold or (lambda: False)
+    restarting = restart is not None and live and follow
+    seen = _RecentKeys(_RECENT_KEYS) if restarting else None
+    stall_seconds = STALL_SECONDS if stall_seconds is None else stall_seconds
+    stall_polls = STALL_POLLS if stall_polls is None else stall_polls
 
-    cached, cursor = cache.load(source_id, limit=replay_limit)
+    cached, total = cache.load_newest(source_id, limit=replay_limit)
+    cursor = cache.get_cursor(source_id)
+    partial = total > len(cached) or (bool(cached) and cache.head_missing(source_id))
+    if partial and not cancelled():
+        yield ("partial", [])
     if cached and not cancelled():
+        if seen is not None:
+            seen.add_all(cached)
         yield ("cache", cached)
 
     if not live:
         return  # cache-only (terminal job): never touch the operation API
 
     delay = poll_interval
+    counted: Optional[int] = None  # entries since a fetch without a cursor, until the tail catches up
+    reset_cursor: Optional[str] = None  # the cursor a refused one was replaced with (refused too: give up)
+    behind = False  # the last page was full: the log runs ahead of the tail
+    still_since = clock()  # when the tail last moved (entries, or a new cursor)
+    empty_polls = 0
+    window = 0  # index into RESTART_LINES
     while True:
         if cancelled():
             return
-        try:
-            page = fetch(cursor)
-        except Exception as exc:  # noqa: BLE001 - re-raised unless it is the wait below
-            # A job still waiting to be placed has no log yet. Following one
-            # waits for it; a session that is over is the caller's to handle,
-            # which is how the TUI hands off to the job's saved log.
-            from cortex_training.client import _is_session_pending
-
-            if not (follow and _is_session_pending(exc)):
-                raise
-            sleep(delay)
-            delay = min(delay * backoff_multiplier, max_interval)
+        if held():
+            sleep(_HOLD_CHECK_SECONDS)
+            delay = poll_interval  # resume promptly
+            still_since, empty_polls = clock(), 0
             continue
+        page = None
+        if seen is not None:
+            if not cursor or (can_restart is not None and not can_restart()):
+                # Not a stall: without a cursor each fetch tails the log's end,
+                # and a job that isn't running yet isn't stuck behind a line.
+                still_since, empty_polls = clock(), 0
+            elif empty_polls >= stall_polls and clock() - still_since >= stall_seconds:
+                still_since, empty_polls = clock(), 0
+                end = restart(RESTART_LINES[window])
+                fresh = seen.unseen(end.get(entries_key) or [])
+                if not fresh:
+                    # The log's newest lines were shown already: it is only quiet.
+                    window = min(window + 1, len(RESTART_LINES) - 1)
+                    sleep(delay)
+                    continue
+                # The log's end has lines this tail hasn't shown. Lines that only
+                # just arrived come from the cursor, in order; a stuck cursor
+                # still brings nothing.
+                page = fetch(cursor)
+                if not page.get(entries_key) and page.get("next_cursor", cursor) == cursor:
+                    window = 0
+                    # An empty cursor would make the next poll re-read the log's tail.
+                    cursor = end.get("next_cursor") or cursor
+                    seen.add_all(fresh)
+                    _safe_append(cache, source_id, fresh)
+                    _safe_set_cursor(cache, source_id, cursor)
+                    if cancelled():
+                        return
+                    yield ("restart", fresh)
+                    delay = poll_interval
+                    sleep(delay)
+                    continue
+                # It moved: the log was only quiet. That page replaces the restart below.
+        if page is None:
+            if tail_window and not cursor and counted is None:
+                counted = 0  # this fetch reads only the log's last ``tail_window`` lines
+            try:
+                page = fetch(cursor)
+            except Exception as exc:
+                if not cursor or cursor == reset_cursor or not _refuses_cursor(exc):
+                    raise
+                # Drop it (here and in the cache, so r and the next open don't
+                # send it again), and go on from the log's end.
+                _safe_set_cursor(cache, source_id, None)
+                end = fetch(None)
+                fresh = end.get(entries_key) or []
+                if seen is not None:
+                    fresh = seen.unseen(fresh)
+                    seen.add_all(fresh)
+                cursor = reset_cursor = end.get("next_cursor") or None
+                if fresh:
+                    _safe_append(cache, source_id, fresh)
+                _safe_set_cursor(cache, source_id, cursor)
+                still_since, empty_polls, window = clock(), 0, 0
+                if cancelled():
+                    return
+                yield ("reset", fresh)
+                delay = poll_interval
+                sleep(delay)
+                continue
         new_cursor = page.get("next_cursor", cursor)
         entries = page.get(entries_key) or []
+        if counted is not None:
+            # The window comes oldest first, a page at a time. A page that
+            # isn't full reached the end of the log as it was then, so the
+            # window is in; the lines a busy log writes after the window was
+            # cut come on pages after that one, and aren't counted.
+            counted += len(entries)
+            if counted >= (tail_window or 0):
+                counted = None
+                if not partial:
+                    partial = True
+                    try:
+                        cache.set_head_missing(source_id)
+                    except OSError as exc:
+                        _note_persist_error(exc)
+                    if cancelled():
+                        return
+                    yield ("partial", [])
+            elif not catching_up(entries):
+                counted = None  # the window held the whole log, from its first line
         if entries:
             _safe_append(cache, source_id, entries)  # entries first...
             _safe_set_cursor(cache, source_id, new_cursor)  # ...then cursor
             cursor = new_cursor
+            if seen is not None:
+                seen.add_all(entries)
+            still_since, empty_polls, window = clock(), 0, 0
             if cancelled():
                 return
             yield ("live", entries)  # whole page in one batch
             # Throttle floor: even when the source is busy, wait at least
             # poll_interval before the next request. Biases toward server
             # reliability over log freshness — caps the rate at ~1 req/s per
-            # source per viewer regardless of how chatty the source is.
+            # source per viewer regardless of how chatty the source is. A
+            # full page means the log runs ahead of the tail: catch up at a
+            # few reads a second, so the view doesn't fall further behind.
             delay = poll_interval
-            sleep(delay)
+            behind = catching_up(entries)
+            sleep(min(delay, CATCH_UP_SECONDS) if behind else delay)
             continue
+        if behind:
+            behind = False
+            if cancelled():
+                return
+            yield ("caught-up", [])  # the read after full pages brought nothing: the tail is at the log's end
         if new_cursor != cursor:
             _safe_set_cursor(cache, source_id, new_cursor)
             cursor = new_cursor
+            still_since, empty_polls, window = clock(), 0, 0
+        else:
+            empty_polls += 1
         if not follow:
             # An empty page means we've drained everything available right now.
             # Stop rather than poll forever, without relying on the server's
@@ -406,22 +838,32 @@ def cached_log_pages(
     replay_limit: Optional[int] = 2000,
     tail_lines: Optional[int] = 2000,
     is_cancelled: Optional[Callable[[], bool]] = None,
+    hold: Optional[Callable[[], bool]] = None,
+    can_restart: Optional[Callable[[], bool]] = None,
 ) -> Iterator[Tuple[str, list]]:
     """``cached_pages`` wired to ``client.tail_logs`` for a sub-job's logs. The
     cache is keyed by ``sub_job_id``.
 
-    First open (no cached cursor) tails the last ``tail_lines`` lines via
-    ``max_lines`` instead of streaming the whole pod log from the beginning — a
-    long-running job can have hours of backlog, and reading it all is a slow,
-    heavy catch-up storm on the server. Reopens resume from the saved
-    cursor (delta-only), so ``max_lines`` is sent only on that first request.
+    A fetch without a cursor (first open, or an empty cursor saved while the
+    job was placing) tails the last ``tail_lines`` lines via ``max_lines``: an
+    empty cursor without ``max_lines`` reads the whole pod log from the start,
+    and a long-running job can have hours of backlog, a slow, heavy catch-up
+    storm on the server. Reopens resume from the saved cursor (delta-only), so
+    ``max_lines`` is sent only while there is no cursor.
+
+    ``can_restart`` turns on the stuck-tail restart (see ``cached_pages``):
+    while it returns true, a tail that stopped moving is restarted from the
+    end of the log.
     """
 
     def fetch(cursor: Optional[str]) -> dict:
         kw: dict = {"cursor": cursor, "sub_job_id": sub_job_id}
-        if cursor is None and tail_lines:
-            kw["max_lines"] = tail_lines  # first fetch: tail recent, not from start
+        if not cursor and tail_lines:
+            kw["max_lines"] = tail_lines  # no cursor yet: tail recent, not from start
         return client.tail_logs(job_id, **kw)
+
+    def restart(lines: int) -> dict:
+        return client.tail_logs(job_id, cursor=None, max_lines=lines, sub_job_id=sub_job_id)
 
     return cached_pages(
         cache,
@@ -433,4 +875,8 @@ def cached_log_pages(
         live=live,
         replay_limit=replay_limit,
         is_cancelled=is_cancelled,
+        hold=hold,
+        restart=restart if can_restart is not None else None,
+        can_restart=can_restart,
+        tail_window=tail_lines,
     )

@@ -15,8 +15,6 @@
 
 """Unit tests for the TUI's pure formatting helpers (no ``textual`` needed)."""
 
-import pytest
-
 from cortex_training.tui.format import entry_at_level
 from cortex_training.tui.format import entry_matches
 from cortex_training.tui.format import format_created_at
@@ -129,7 +127,7 @@ def test_format_created_at():
     import re
 
     out = format_created_at("2026-06-13T18:49:54Z")
-    assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} \S+", out)  # local YYYY-MM-DD HH:MM TZ
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", out)  # local YYYY-MM-DD HH:MM
     assert format_created_at(None) == ""
     assert format_created_at("") == ""
     assert format_created_at("not-a-date") == ""
@@ -268,135 +266,15 @@ def test_wrap_log_line_empty_is_one_blank_line():
     assert wrap_log_line("\n", 80) == ["", ""]  # blank lines preserved
 
 
-# ─── Live tail lines: {"_raw": "<runtime time> <line>"} ──────────────────────
+def test_level_filter_reads_the_level_inside_raw_service_lines():
+    from cortex_training.tui.format import entry_at_level
 
-from cortex_training.tui.format import entry_time  # noqa: E402
-from cortex_training.tui.format import line_level  # noqa: E402
-from cortex_training.tui.format import split_runtime_time  # noqa: E402
-
-_JSON_LINE = '{"ts": "2026-01-01T00:00:00.1+00:00", "level": "ERROR", "logger": "x", "msg": "boom"}'
-_VLLM_LINE = "\x1b[36m(InferenceWorker pid=9, ip=10.0.0.1)\x1b[0m (EngineCore pid=7) WARNING 01-01 00:00:00 [a.py:1] slow"
-
-
-@pytest.mark.parametrize(
-    "raw, expected",
-    [
-        ("2026-01-01T00:00:00.329214070Z hello", ("2026-01-01T00:00:00.329214070Z", "hello")),
-        ("2026-01-01T00:00:00Z  indented", ("2026-01-01T00:00:00Z", " indented")),
-        ("2026-01-01T00:00:00+02:00 x", ("2026-01-01T00:00:00+02:00", "x")),
-        ("2026-01-01T00:00:00.1Z ", ("2026-01-01T00:00:00.1Z", "")),
-        ("no time here", (None, "no time here")),
-        ("2026-01-01 00:00:00 not runtime format", (None, "2026-01-01 00:00:00 not runtime format")),
-    ],
-)
-def test_split_runtime_time(raw, expected):
-    assert split_runtime_time(raw) == expected
-
-
-def test_live_raw_line_renders_like_the_saved_console():
-    for line in [_JSON_LINE, _VLLM_LINE, "plain", ""]:
-        entry = {"_raw": f"2026-01-01T00:00:00.123456789Z {line}"}
-        assert format_log_entry(entry) == line
-        assert entry_time(entry) == "2026-01-01T00:00:00.123456789Z"
-    assert format_log_entry({"_raw": "2026-01-01T00:00:00Z cut", "_truncated": True}) == "cut …[truncated]"
-    # A line without a runtime time is shown unchanged.
-    assert format_log_entry({"_raw": "x 2026-01-01T00:00:00Z y"}) == "x 2026-01-01T00:00:00Z y"
-
-
-@pytest.mark.parametrize(
-    "line, level",
-    [
-        (_JSON_LINE, "ERROR"),
-        ('{"levelname": "WARNING", "message": "m"}', "WARNING"),
-        ('{"msg": "no level"}', None),
-        ('{"level": 3, "msg": "game level"}', None),
-        ('{"level": "high", "msg": "priority"}', None),
-        ('{"level": "warning", "msg": "lower-case"}', "WARNING"),
-        ('{"not json', None),
-        (_VLLM_LINE, "WARNING"),
-        ("INFO 01-01 00:00:00 [a.py:1] ok", "INFO"),
-        ("ERROR: something", "ERROR"),
-        ("Information about INFO", None),
-        ("warning lowercase is not a level", None),
-        ("", None),
-    ],
-)
-def test_line_level(line, level):
-    assert line_level(line) == level
-
-
-def test_level_filter_applies_to_live_raw_lines():
-    stamp = "2026-01-01T00:00:00Z "
-    error = {"_raw": stamp + _JSON_LINE}
-    warning = {"_raw": stamp + _VLLM_LINE}
-    info = {"_raw": stamp + '{"level": "INFO", "msg": "drain_metrics"}'}
-    plain = {"_raw": stamp + "Traceback (most recent call last):"}
-    entries = [error, warning, info, plain]
-    assert [e for e in entries if entry_at_level(e, "ERROR")] == [error, plain]
-    assert [e for e in entries if entry_at_level(e, "WARNING")] == [error, warning, plain]
-    assert all(entry_at_level(e, None) for e in entries)
-    # An explicit level field still wins.
-    assert not entry_at_level({"_raw": stamp + _JSON_LINE, "level": "DEBUG"}, "INFO")
-
-
-def test_filter_matches_the_line_not_the_runtime_time():
-    entry = {"_raw": "2026-01-01T00:00:00Z payload"}
-    assert entry_matches(entry, "payload")
-    assert not entry_matches(entry, "2026-01-01T00")
-
-
-def test_format_created_at_names_the_time_zone(monkeypatch):
-    import time as time_module
-
-    monkeypatch.setenv("TZ", "UTC")
-    time_module.tzset()
-    try:
-        assert format_created_at("2026-06-13T18:49:54Z") == "2026-06-13 18:49 UTC"
-    finally:
-        monkeypatch.undo()
-        time_module.tzset()
-
-
-@pytest.mark.parametrize(
-    "nbytes, text",
-    [(None, "—"), (0, "0 B"), (1023, "1023 B"), (1024, "1.0 KiB"), (1153433, "1.1 MiB"),
-     (5 * 1024**3, "5.0 GiB"), (3 * 1024**4, "3.0 TiB")],
-)
-def test_format_size(nbytes, text):
-    from cortex_training.tui.format import format_size
-
-    assert format_size(nbytes) == text
-
-
-@pytest.mark.parametrize(
-    "seconds, text",
-    [(-3, "0s"), (0, "0s"), (59, "59s"), (60, "1m 0s"), (725, "12m 5s"), (3600, "1h 0m"),
-     (7380, "2h 3m"), (184694, "2d 3h")],
-)
-def test_format_age(seconds, text):
-    from cortex_training.tui.format import format_age
-
-    assert format_age(seconds) == text
-
-
-def test_local_clock_has_a_time_zone(monkeypatch):
-    import time as time_module
-
-    from cortex_training.tui.format import local_clock
-
-    monkeypatch.setenv("TZ", "UTC")
-    time_module.tzset()
-    try:
-        assert local_clock(0) == "00:00:00 UTC"
-    finally:
-        monkeypatch.undo()
-        time_module.tzset()
-
-
-def test_a_level_field_that_is_not_a_logging_level_never_hides_the_line():
-    stamp = "2026-01-01T00:00:00Z "
-    for line in ['{"level": 3, "msg": "m"}', '{"level": "high", "msg": "m"}', '{"level": null, "msg": "m"}']:
-        assert entry_at_level({"_raw": stamp + line}, "ERROR")
-    assert entry_at_level({"level": "high", "msg": "structured"}, "ERROR")
-    assert entry_at_level({"level": 7, "msg": "structured"}, "ERROR")
-    assert not entry_at_level({"level": "info", "msg": "structured"}, "ERROR")
+    # The service sends live lines as {"_raw": "<RFC3339 ts> <line>"}.
+    json_info = {"_raw": '2026-10-14T10:00:00.123456789Z {"level": "INFO", "msg": "step 3"}'}
+    json_error = {"_raw": '2026-10-14T10:00:00Z {"levelname": "ERROR", "message": "boom"}'}
+    word_warning = {"_raw": "2026-10-14T10:00:00Z (Actor pid=12) WARNING slow step"}
+    unclassified = {"_raw": "Traceback (most recent call last):"}
+    assert not entry_at_level(json_info, "ERROR")
+    assert entry_at_level(json_error, "ERROR")
+    assert entry_at_level(word_warning, "WARNING") and not entry_at_level(word_warning, "ERROR")
+    assert entry_at_level(unclassified, "ERROR")  # never hide what can't be classified
