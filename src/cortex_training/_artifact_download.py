@@ -217,6 +217,10 @@ class RetryPolicy:
         return cancel is not None and cancel.is_set()
 
 
+class SessionClosed(RuntimeError):
+    """The download's session was closed; a late attempt must not reopen it."""
+
+
 class SharedConnection:
     """One connector connection shared by worker threads, reopened on expiry.
 
@@ -234,14 +238,19 @@ class SharedConnection:
         self._connection = opener()
         self._generation = 0
         self._replaced: list[Any] = []
+        self._closed = False
 
     def current(self) -> tuple[Any, int]:
         with self._lock:
+            if self._closed:
+                raise SessionClosed("the artifact download session is closed")
             return self._connection, self._generation
 
     def reopen(self, generation: int) -> None:
         """Replace the connection unless another thread already did."""
         with self._lock:
+            if self._closed:
+                raise SessionClosed("the artifact download session is closed")
             if generation != self._generation:
                 return
             fresh = self._opener()
@@ -251,6 +260,7 @@ class SharedConnection:
 
     def close(self) -> None:
         with self._lock:
+            self._closed = True
             replaced, self._replaced = self._replaced, []
             current = self._connection
         # A close error must not fail a finished download or hide its real error.

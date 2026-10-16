@@ -7250,6 +7250,85 @@ class TestChunkedArtifactDownload:
         assert "warnings" not in result[0]
         assert result[0]["chunk_count"] == 2
 
+    @pytest.mark.parametrize("download_fails", [True, False])
+    def test_late_stall_check_never_reopens_the_session(
+        self, tmp_path, monkeypatch, caplog, download_fails
+    ):
+        errors = importlib.import_module("snowflake.connector.errors")
+        base = TestExecutionLogDownload.FakeArtifactConnection
+
+        class ClosingConnection(base):
+            class Cursor(base.Cursor):
+                def execute(self, statement):
+                    if self.connection.closed:
+                        raise errors.DatabaseError(msg="Connection is closed", errno=250002)
+                    if statement.startswith("GET ") and download_fails:
+                        raise errors.ProgrammingError(msg="invalid stage location", errno=253004)
+                    return super().execute(statement)
+
+            def cursor(self):
+                return self.Cursor(self)
+
+        c, connection, _paths, _calls = self._stale_setup(
+            monkeypatch, count=1, artifact_name="metrics"
+        )
+        opened = []
+
+        def opener():
+            conn = ClosingConnection(connection.list_rows, connection.content_by_uri)
+            opened.append(conn)
+            return conn
+
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
+        monkeypatch.setattr(c, "_STALL_CHECK_WAIT_SECONDS", 0.1)
+        real_lookup = c._job_for_upload_warnings
+        finished = threading.Event()
+
+        def slow_lookup(job_id):
+            # Outlives both a failed download and the wait cap.
+            time.sleep(0.4)
+            try:
+                return real_lookup(job_id)
+            finally:
+                finished.set()
+
+        monkeypatch.setattr(c, "_job_for_upload_warnings", slow_lookup)
+        with caplog.at_level(logging.DEBUG):
+            if download_fails:
+                with pytest.raises(errors.ProgrammingError):
+                    c.download_metrics("job-1", tmp_path)
+            else:
+                c.download_metrics("job-1", tmp_path)
+            returned = len(caplog.records)
+            assert finished.wait(5)
+            deadline = time.monotonic() + 5
+            while any(t.name == "cortex-training-stall-check" for t in threading.enumerate()):
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+        assert len(opened) == 1
+        assert all(conn.closed for conn in opened)
+        late = [r for r in caplog.records[returned:] if r.levelno >= logging.WARNING]
+        assert late == []
+
+    def test_closed_shared_connection_refuses_to_reopen(self):
+        opened = []
+
+        def opener():
+            opened.append(MagicMock())
+            return opened[-1]
+
+        shared = nc._artifact_download.SharedConnection(opener)
+        _connection, generation = shared.current()
+        shared.close()
+        with pytest.raises(nc._artifact_download.SessionClosed):
+            shared.current()
+        with pytest.raises(nc._artifact_download.SessionClosed):
+            shared.reopen(generation)
+        assert len(opened) == 1
+        assert nc._artifact_download.classify_artifact_error(
+            nc._artifact_download.SessionClosed("closed")
+        ) is None
+
     @pytest.mark.parametrize("value", [0, -5, True, "600"])
     def test_stale_after_must_be_positive(self, tmp_path, monkeypatch, value):
         c, _connection, _paths, _calls = self._stale_setup(monkeypatch, count=1)

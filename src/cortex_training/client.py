@@ -3329,6 +3329,7 @@ class CortexTrainingClient:
         chunk_pattern: re.Pattern[str],
         *,
         report_merges: bool = True,
+        cancel: threading.Event | None = None,
     ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
         """Return each sub-job's chunk paths in time order, plus listing warnings.
 
@@ -3351,6 +3352,7 @@ class CortexTrainingClient:
                         connection, run_uri, run_name, artifact_root
                     )
                 ),
+                cancel,
             )
             prefix = artifact_root + "/"
             for relative_path in paths:
@@ -3442,8 +3444,12 @@ class CortexTrainingClient:
         chunks_by_sub_job: Mapping[str, list[str]],
         wanted: set[str] | None,
         stale_after_seconds: float | None,
+        cancel: threading.Event | None = None,
     ) -> dict[str, list[str]]:
         """Warn when a running job's uploads look stalled; never raises.
+
+        ``cancel`` is set when the download returns; after that the check
+        stops, makes no further calls, and logs nothing.
 
         Two signs: the newest chunk's name time is older than
         ``stale_after_seconds``, or (for metrics) a sub-job has saved stdout but
@@ -3517,6 +3523,7 @@ class CortexTrainingClient:
                     "stdout",
                     _STDOUT_CHUNK_RE,
                     report_merges=False,
+                    cancel=cancel,
                 )
             except Exception:
                 logger.debug("stdout listing for upload warnings failed", exc_info=True)
@@ -3535,6 +3542,8 @@ class CortexTrainingClient:
                     "still running, although its stdout output has been; metric "
                     "uploads may be stalled. Contact support if this persists."
                 ]
+        if cancel is not None and cancel.is_set():
+            return {}
         for messages in warnings.values():
             for message in messages:
                 logger.warning(message)
@@ -3595,6 +3604,7 @@ class CortexTrainingClient:
             self._open_experiment_artifact_connection, transfer_timeout_seconds
         )
         root = Path(output_dir).expanduser()
+        stall_cancel = threading.Event()
         try:
             chunks_by_sub_job, warnings_by_sub_job = self._list_gzip_chunks(
                 shared, run_uri, run_name, job_id, artifact_name, chunk_pattern
@@ -3616,6 +3626,7 @@ class CortexTrainingClient:
                         dict(chunks_by_sub_job),
                         wanted,
                         stale_after_seconds,
+                        stall_cancel,
                     ),
                     name="cortex-training-stall-check",
                 )
@@ -3687,6 +3698,8 @@ class CortexTrainingClient:
             )
             return sorted(results, key=lambda result: result["sub_job_id"])
         finally:
+            # Stop a stall check that is still running before its session goes.
+            stall_cancel.set()
             shared.close()
 
     @_track_operation("download_stdout_logs")
