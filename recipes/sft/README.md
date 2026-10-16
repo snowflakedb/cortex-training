@@ -149,6 +149,22 @@ The target list above is for dense Qwen models. For
 The shipped Qwen3.6 configs use sequence parallel size 8 and logical batch 1
 to run at the model's 262K context limit.
 
+The `prime_rl` entries in the template above are deprecated but keep working.
+On server versions that support `model_options`, with `EP_SIZE` > 1, the same
+settings can be written inside `training_config` in place of the `prime_rl`
+block, as the entry below; see
+[the REST API reference](../../docs/reference/rest-api.md#model_options). The
+shipped Qwen3.6 SFT configs still use the block, which older servers need.
+
+```json
+"model_options": {"lm_head": {"token_chunk_size": 8192, "cross_entropy": false}}
+```
+
+On server versions that support `model_options`, dense Qwen3.5-family models
+(for example `Qwen/Qwen3.8-27B`) run with `numerics.fp32_parity` on by default,
+which raises GPU memory. To turn it off, add
+`"model_options": {"numerics": {"fp32_parity": false}}` to `training_config`.
+
 For dense long-context profiles, set an integer
 `fused_lm_head_token_chunk_size` in `training_config`. The server then computes
 per-token log probabilities in chunks without materializing the full

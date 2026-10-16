@@ -187,9 +187,15 @@ same settings can be written inside `training_config`, in place of the
 "model_options": {"lm_head": {"token_chunk_size": 8192, "cross_entropy": false}}
 ```
 
-The Qwen3.6-35B-A3B RL recipe configs, `examples/api/training.json`,
+The Qwen3.6-35B-A3B RL and SFT recipe configs, `examples/api/training.json`,
 `examples/api/rl.json` and the `rl` and `standard-context` model-catalog
 profiles still use the `prime_rl` block, which older servers need.
+
+On server versions that support `model_options`, dense Qwen3.5-family models
+(for example `Qwen/Qwen3.8-27B`) run with `numerics.fp32_parity` on by default,
+which raises GPU memory. To turn it off, add
+`"model_options": {"numerics": {"fp32_parity": false}}` to `training_config`;
+see [the REST API reference](../../docs/reference/rest-api.md#model_options).
 
 The target list above is for dense Qwen models. For
 `Qwen/Qwen3.6-35B-A3B`, use the shipped LoRA config with

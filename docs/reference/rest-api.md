@@ -1622,6 +1622,10 @@ long-context/memory knobs:
 - `sp_size`: Ulysses sequence-parallel degree, sharding each sample's sequence
   across `sp_size` ranks. `1` (default) disables it; the server requires
   `world_size % sp_size == 0`.
+- `mb_spec`: `{"max_tokens_per_mb": N}`, the most real tokens whose rows are
+  packed into one model call (default `10240`). It counts whole rows before
+  sequence parallelism splits them, and a row longer than N runs in a call of
+  its own.
 - `cuda_allocator_conf`: per-job `PYTORCH_CUDA_ALLOC_CONF` string applied before
   PyTorch is imported, e.g. `"expandable_segments:True"` (or `"backend:native"`
   to disable). Omitted uses the server default.
@@ -1708,7 +1712,8 @@ in `extra_training` (and, for a sampling sub-job, in `extra_sampling`, see
 map, writes each option onto the existing field or fields listed in the last
 column below, and, when the sub-job starts, checks the keys against what the
 model implementation supports. Apart from the `seq_len` default described
-[below](#prime_rl-block-deprecated), this does not change a sub-job that does
+[below](#prime_rl-block-deprecated) and the `numerics.fp32_parity` default
+(on; see the notes on single keys), this does not change a sub-job that does
 not send `model_options`.
 
 The client does not validate `model_options`, on the typed path or on the raw
@@ -1769,8 +1774,8 @@ values work, the Value column says so: an even count, or the names that work.
 | `attention.backend` | trainer | non-empty string (see below) | `attn_implementation` |
 | `attention.sparse_mla` | trainer | not available for any model in the catalog that supports training | `prime_rl.sparse_mla_backend` |
 | `compile.fullgraph` | trainer | `true` or `false` | `compile.fullgraph` |
-| `numerics.fp32_parity` | trainer | `true` or `false` | `prime_rl.fp32_parity` when `ep_size` > 1; with `ep_size` 1 or omitted the dense model reads the key directly |
-| `numerics.fp32_residual` | trainer | `true` or `false` (experimental) | no field: the dense model reads the key directly; needs `numerics.fp32_parity` on |
+| `numerics.fp32_parity` | trainer | `true` or `false` (default `true`) | `prime_rl.fp32_parity` when `ep_size` > 1; the top-level field `fp32_parity` otherwise |
+| `numerics.fp32_residual` | trainer | `true` or `false` (experimental, default `false`) | the top-level field `fp32_residual`; rejected when `numerics.fp32_parity` is `false` |
 | `numerics.optimization_dtype` | trainer | `bfloat16` or `float32` | `prime_rl.optimization_dtype` when `ep_size` > 1; nothing otherwise |
 
 An omitted `ep_size` counts as 1 throughout this section. Which keys fail when
@@ -1818,30 +1823,41 @@ Notes on single keys:
   `lm_head.cross_entropy` set to `true` or `liger` together with an integer
   block `prime_rl.fused_lm_head_token_chunk_size`. `lm_head.fp32` combines
   with fused cross-entropy `true`, `false` or `liger`.
-- `numerics.fp32_parity` applies to Qwen3.5-MoE models with `ep_size` > 1
-  and to dense Qwen3.5-family models (for example Qwen3.8-27B) with `ep_size`
-  1 or omitted. With `true` (the default) the residual adds, partial rotary
-  embedding and GatedDeltaNet beta gate are evaluated in fp32, as vLLM does;
-  with `false` they are evaluated in the input dtype. Other models accept the
-  key and are not changed by it, except that with sequence parallelism the
-  GatedDeltaNet beta gate of any model follows it. Because the default is
-  `true`, a dense Qwen3.5-family job uses the fp32 path even when it sends no
-  `model_options`, and it has to send `false` to keep the earlier numerics and
-  memory. Under full activation checkpointing each layer boundary then holds
-  the residual as a second tensor, so GPU memory rises: for Qwen3.8-27B with
-  `sp_size` 4 and 131072 tokens per model call, peak memory was about 92 GiB
-  per GPU without it and 104 GiB with it. Memory follows the tokens each GPU
-  holds in a call, which is the call's tokens divided by `sp_size`.
-  `mb_spec.max_tokens_per_mb` limits how many rows share a call, but a row
-  longer than it runs in a call of its own, so for such rows only a larger
-  `sp_size` lowers the memory.
+- `numerics.fp32_parity` is on by default (`true`), so a job that sends no
+  `model_options` runs it. It applies to Qwen3.5-MoE models with `ep_size` > 1
+  and to dense Qwen3.5-family models (Hugging Face `model_type` `qwen3_5` or
+  `qwen3_5_text`, for example Qwen3.8-27B) with `ep_size` 1 or omitted. With
+  `true` the residual adds, partial rotary embedding and GatedDeltaNet beta
+  gate are evaluated in fp32, as vLLM does. With `false` they are evaluated in
+  the input dtype; with `sp_size` above 1 that is not the numerics from before
+  the option existed, because sequence parallelism always evaluated the beta
+  gate in fp32. Other dense models accept the key and are not changed by it,
+  except that with sequence parallelism the GatedDeltaNet beta gate of any
+  model follows it. With `ep_size` > 1 a model that is not Qwen3.5-MoE
+  rejects the key when the sub-job starts. To turn the path off, send
+  `"model_options": {"numerics": {"fp32_parity": false}}`.
+- Memory of `numerics.fp32_parity`: with `activation_checkpointing` on, every
+  decoder layer after the first holds its residual at the layer boundary as a
+  second tensor, so GPU memory rises. For Qwen3.8-27B with `sp_size` 4 and
+  131072 tokens per model call, peak allocated memory was about 92 GiB per GPU
+  without it and 104 GiB with it, on GPUs with 139.8 GiB; the device uses
+  several GiB more than the allocator reports. Memory follows the tokens each
+  GPU holds in a call, which is the call's tokens divided by `sp_size`.
+  `mb_spec.max_tokens_per_mb` (default `10240`, see the `extra_training` knobs
+  above) limits how many rows share a call, but a row longer than it runs in a
+  call of its own, so for such rows only a larger `sp_size` lowers the memory.
+  With `liger` on, only the first layer's input norm still runs Liger's
+  RMSNorm kernel while this option is on.
 - `numerics.fp32_residual` (experimental, default `false`) also keeps the
   residual stream in fp32 between decoder layers, instead of rounding it to
   the dtype of each layer's output. It applies only to dense Qwen3.5-family
-  models with `ep_size` 1 or omitted, and it requires `numerics.fp32_parity`
-  to be `true`. With `ep_size` > 1 it fails at startup. It needs more memory
-  again (about 122 GiB per GPU in the example above) and made
-  forward/backward about 6% slower in our tests on that model.
+  models with `ep_size` 1 or omitted; other dense models accept the key and
+  are not changed by it, and with `ep_size` > 1 it fails at startup. It is
+  rejected, when the sub-job starts, if `numerics.fp32_parity` is `false`. It
+  needs more memory again (about 122 GiB per GPU allocated in the example
+  above) and, together with `numerics.fp32_parity`, made forward/backward
+  about 6% slower in our tests on that model, measured against a run on a
+  different service image, so treat the figure as approximate.
 - `numerics.optimization_dtype` is the dtype the trainer keeps and optimizes
   the weights in. Qwen3.5-MoE models with `ep_size` > 1 support it, with
   default `bfloat16`, and with `ep_size` > 1 the sub-job's `dtype` is not
@@ -1924,7 +1940,7 @@ key, and a few that the server sets, ignores or rejects.
 | `fused_cross_entropy` | `lm_head.cross_entropy` with `ep_size` > 1; no key with `ep_size` 1 or omitted (see below) |
 | `fused_lm_head_token_chunk_size` | an integer: `lm_head.token_chunk_size`; `"disabled"`: omit the key; `"auto"` has no key |
 | `fp32_lm_head` | `lm_head.fp32` |
-| `fp32_parity` | new with `model_options`; no earlier block spelling |
+| `fp32_parity` | `numerics.fp32_parity` with `ep_size` > 1, on servers that support `model_options`, which are the only ones that read this entry; with `ep_size` 1 or omitted the entry has no effect, while the key does |
 | `sparse_mla_backend` | `attention.sparse_mla`, which no model in the catalog that supports training takes |
 | `attn` | `attention.backend` |
 | `optimization_dtype` | `numerics.optimization_dtype` with `ep_size` > 1; with `ep_size` 1 or omitted the entry is ignored |
@@ -1939,12 +1955,14 @@ forward/backward requests whose loss needs per-token log-probabilities, and
 with `"liger"` or `"huggingface"` it has no effect.
 
 With `ep_size` 1 or omitted, the block entries `fp32_lm_head`,
-`fused_lm_head_token_chunk_size` and `ac_config` have no effect, while their
-keys (`lm_head.fp32`, `lm_head.token_chunk_size`, `checkpointing.freq`,
-`checkpointing.offload`) take effect, so do not translate such an entry
-mechanically: for example, a block `fused_lm_head_token_chunk_size` of 4096
-does nothing on such a job, while `lm_head.token_chunk_size` of 4096 turns the
-chunked LM head on.
+`fused_lm_head_token_chunk_size`, `ac_config` and `fp32_parity` have no effect,
+while their keys (`lm_head.fp32`, `lm_head.token_chunk_size`,
+`checkpointing.freq`, `checkpointing.offload`, `numerics.fp32_parity`) take
+effect, so do not translate such an entry mechanically: for example, a block
+`fused_lm_head_token_chunk_size` of 4096 does nothing on such a job, while
+`lm_head.token_chunk_size` of 4096 turns the chunked LM head on, and a block
+`fp32_parity` of `false` does nothing, while `numerics.fp32_parity` set to
+`false` turns the fp32 path off.
 
 **`seq_len`.** On server versions with this behavior, with `ep_size` > 1 the
 server sets the sequence length the model is built for from the sub-job's
@@ -1959,8 +1977,10 @@ key table names (and `vllm_config.fp32_lm_head` for sampling). With
 `prime_rl.seq_len` equal to `max_seq_len`; with `ep_size` 1 or omitted, it
 sends the top-level field where the Sets column names one, except
 `fused_cross_entropy`, which stays in the block. `numerics.fp32_parity` and
-`numerics.fp32_residual` have no earlier spelling: do not send
-`prime_rl.fp32_parity` to a server without `model_options` support.
+`numerics.fp32_residual` have no earlier spelling, and the top-level fields
+named for them in the Sets column do not exist on such a server, which ignores
+them: do not send `prime_rl.fp32_parity` to a server without `model_options`
+support.
 
 ### 8.3 `InferenceConfig`
 
