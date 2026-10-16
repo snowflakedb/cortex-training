@@ -2310,7 +2310,12 @@ warning such as "newest saved stdout output for SUB_JOB_ID is from
 2026-01-01 12:00:00 UTC (14 min ago) while the job is still running; uploads
 may be stalled. Contact support if this persists." `None` disables the check.
 
-The method stays silent unless `progress` is passed. `progress` receives, for
+Progress is reported only through `progress` and `on_chunk`; retries, skipped
+chunks, and stalled-upload notices are logged as warnings on the
+`cortex_training` logger (and listed in the result's `warnings`). The stall
+check reads the job status in the background while chunks are fetched, so it
+does not lengthen the download; a status lookup still pending after the chunks
+are written is given up to 10 seconds. `progress` receives, for
 each sub-job, a status line such as `stdout: [######--------------] 1/3
 SUB_JOB_ID` before anything in the output directory changes, an updated line
 after each appended chunk (counting only the chunks this call adds), and then

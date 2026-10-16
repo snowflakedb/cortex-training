@@ -7185,6 +7185,71 @@ class TestChunkedArtifactDownload:
         with pytest.raises(ValueError, match="transfer_timeout_seconds"):
             c.download_stdout_logs("job-1", tmp_path, transfer_timeout_seconds=value)
 
+    def test_resume_with_nothing_new_leaves_a_read_only_file_alone(self, tmp_path, monkeypatch):
+        if os.geteuid() == 0:
+            pytest.skip("root ignores the read-only destination")
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=3)
+        c.download_stdout_logs("job-1", tmp_path)
+        destination = tmp_path / self.SUB / "stdout.log"
+        destination.chmod(0o444)
+        gets_before = len(self._gets(connection))
+        calls, counts = [], []
+        try:
+            result = c.download_stdout_logs(
+                "job-1",
+                tmp_path,
+                resume=True,
+                progress=calls.append,
+                on_chunk=lambda *args: counts.append(args),
+            )
+        finally:
+            destination.chmod(0o644)
+        assert len(self._gets(connection)) == gets_before
+        assert destination.read_bytes() == self._expected(self.SUB, range(3))
+        assert result[0]["chunk_count"] == 3
+        assert result[0]["last_artifact_uri"] == self.RUN_URI + paths[self.SUB][-1]
+        assert calls == [f"stdout: no new chunks for {self.SUB}\n"]
+        assert counts == [(self.SUB, 3, 3, destination.stat().st_size)]
+
+    @pytest.mark.parametrize("value", ["job-1:training:0", b"job-1:training:0"])
+    def test_sub_job_ids_rejects_a_bare_string(self, tmp_path, monkeypatch, value):
+        c, connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=1)
+        with pytest.raises(TypeError, match="not a single string"):
+            c.download_stdout_logs("job-1", tmp_path, sub_job_ids=value)
+        assert connection.commands == []
+
+    def test_stall_check_runs_while_chunks_are_fetched(self, tmp_path, monkeypatch):
+        c, connection, paths, _calls = self._stale_setup(monkeypatch, count=3)
+        fetching = threading.Event()
+        threads = []
+        real_lookup = c._job_for_upload_warnings
+
+        def lookup(job_id):
+            threads.append(threading.current_thread().name)
+            # Only returns quickly if the GETs run at the same time.
+            assert fetching.wait(5)
+            return real_lookup(job_id)
+
+        monkeypatch.setattr(c, "_job_for_upload_warnings", lookup)
+        connection.on_get = lambda _source: fetching.set()
+        result = c.download_stdout_logs("job-1", tmp_path)
+        assert threads == ["cortex-training-stall-check"]
+        assert "11 min ago" in result[0]["warnings"][0]
+
+    def test_slow_stall_check_does_not_hold_the_download(self, tmp_path, monkeypatch):
+        c, _connection, _paths, _calls = self._stale_setup(monkeypatch, count=2)
+        monkeypatch.setattr(c, "_STALL_CHECK_WAIT_SECONDS", 0.2)
+        release = threading.Event()
+        monkeypatch.setattr(c, "_job_for_upload_warnings", lambda _job: release.wait(10))
+        started = time.monotonic()
+        try:
+            result = c.download_stdout_logs("job-1", tmp_path)
+        finally:
+            release.set()
+        assert time.monotonic() - started < 3
+        assert "warnings" not in result[0]
+        assert result[0]["chunk_count"] == 2
+
     @pytest.mark.parametrize("value", [0, -5, True, "600"])
     def test_stale_after_must_be_positive(self, tmp_path, monkeypatch, value):
         c, _connection, _paths, _calls = self._stale_setup(monkeypatch, count=1)

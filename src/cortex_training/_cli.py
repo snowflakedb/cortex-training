@@ -1420,17 +1420,17 @@ class _WarningLines(logging.Handler):
 
 @contextlib.contextmanager
 def _library_warnings_to(writer: _ArtifactProgressWriter) -> Iterator[None]:
-    """Show the client's warnings (retries, skipped chunks) as ``warning:`` lines."""
+    """Show the client's warnings (retries, skipped chunks) as ``warning:`` lines.
+
+    Records still propagate, so a caller's own logging handlers see them too.
+    """
     library = logging.getLogger("cortex_training")
     handler = _WarningLines(writer)
-    propagate = library.propagate
     library.addHandler(handler)
-    library.propagate = False
     try:
         yield
     finally:
         library.removeHandler(handler)
-        library.propagate = propagate
 
 
 def _cmd_download_log(

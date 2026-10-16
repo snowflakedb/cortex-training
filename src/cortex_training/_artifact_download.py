@@ -502,7 +502,7 @@ class ChunkWriter:
         self._last_checkpoint = clock()
         data_path.parent.mkdir(parents=True, exist_ok=True)
         # Owner-only, like the temp files earlier versions renamed into place.
-        fd = os.open(data_path, os.O_RDWR | os.O_CREAT, 0o600)
+        fd = os.open(data_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
         self._output = os.fdopen(fd, "r+b")
         try:
             self._output.seek(committed)
@@ -587,6 +587,29 @@ class GzipPlan:
     @property
     def new_paths(self) -> list[str]:
         return self.chunk_paths[len(self.known) :]
+
+
+class Background:
+    """Run ``operation`` on a daemon thread; :meth:`result` waits a bounded time."""
+
+    def __init__(self, operation: Callable[[], _T], *, name: str):
+        self._outcome: list[Any] = []
+        self._done = threading.Event()
+
+        def run() -> None:
+            try:
+                self._outcome.append(operation())
+            except Exception:
+                logger.debug("%s failed", name, exc_info=True)
+            finally:
+                self._done.set()
+
+        threading.Thread(target=run, name=name, daemon=True).start()
+
+    def result(self, timeout: float, default: _T) -> _T:
+        if self._done.wait(timeout) and self._outcome:
+            return self._outcome[0]
+        return default
 
 
 class Spool:

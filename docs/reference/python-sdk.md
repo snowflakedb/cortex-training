@@ -260,8 +260,9 @@ reconstructs persisted console chunks as
 as `<output_dir>/<sub_job_id>/gpu.jsonl`. Chunks are fetched `max_workers` at a
 time (default 16) on one Snowflake session and written in order. `resume=True`
 appends chunks that are not already recorded in the manifest beside that file
-and continues an interrupted download. The methods stay silent unless
-`progress` is passed. `progress` receives status updates without a trailing
+and continues an interrupted download. Progress is reported only through
+`progress` and `on_chunk`; retries, skipped chunks, and stalled-upload notices
+are logged as warnings on the `cortex_training` logger. `progress` receives status updates without a trailing
 newline, then `"\n"` when that sub-job finishes or fails; a status that needs no
 updating arrives as one message ending in a newline.
 `on_chunk(sub_job_id, done, total, bytes)` reports counts instead, with

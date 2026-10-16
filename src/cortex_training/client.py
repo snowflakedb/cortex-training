@@ -2868,6 +2868,9 @@ class CortexTrainingClient:
     # A running job whose newest chunk is older than this gets a warning that
     # uploads may be stalled.
     _DOWNLOAD_STALE_AFTER_SECONDS = 600.0
+    # The stall check runs alongside the download; once the chunks are written
+    # the download waits at most this long for it, then returns without it.
+    _STALL_CHECK_WAIT_SECONDS = 10.0
     # A single LIST or GET attempt that runs longer than this is abandoned and
     # retried. A chunk GET normally takes well under a second.
     _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS = 300.0
@@ -3091,6 +3094,16 @@ class CortexTrainingClient:
             finally:
                 shutil.rmtree(downloaded.parent, ignore_errors=True)
 
+    @staticmethod
+    def _already_committed(plan: _artifact_download.GzipPlan) -> bool:
+        """True when a completed file already holds exactly the planned chunks."""
+        if plan.new_paths or plan.promote:
+            return False
+        try:
+            return plan.destination.stat().st_size == plan.committed
+        except OSError:
+            return False
+
     def _promote_partial(self, plan: _artifact_download.GzipPlan) -> None:
         """Replace the destination with a completed partial file."""
         manifest = self._resume_manifest_path(plan.destination)
@@ -3202,6 +3215,22 @@ class CortexTrainingClient:
                         # Reported before anything in the output directory changes.
                         report(0)
                         self._prepare_gzip_plan(plan, temporary_prefix)
+                        if self._already_committed(plan):
+                            # Nothing to write: leave the file alone (it may be
+                            # read-only) and report it as it is.
+                            saved_progress = True
+                            if on_chunk is not None:
+                                on_chunk(plan.sub_job_id, total, total, plan.committed)
+                            results.append(
+                                self._artifact_result(
+                                    plan.destination,
+                                    run_uri,
+                                    plan.known,
+                                    skipped=plan.skipped,
+                                    warnings=warnings,
+                                )
+                            )
+                            continue
                         writer = _artifact_download.ChunkWriter(
                             plan.data_path,
                             plan.manifest_path,
@@ -3544,6 +3573,8 @@ class CortexTrainingClient:
             max_workers = self._DOWNLOAD_DEFAULT_WORKERS
         if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
             raise ValueError("max_workers must be a positive integer")
+        if isinstance(sub_job_ids, (str, bytes)):
+            raise TypeError("sub_job_ids must be an iterable of sub-job ids, not a single string")
         wanted = None if sub_job_ids is None else set(sub_job_ids)
         if wanted is not None and not wanted:
             raise ValueError("sub_job_ids must name at least one sub-job")
@@ -3568,23 +3599,36 @@ class CortexTrainingClient:
             chunks_by_sub_job, warnings_by_sub_job = self._list_gzip_chunks(
                 shared, run_uri, run_name, job_id, artifact_name, chunk_pattern
             )
-            stale = self._stale_upload_warnings(
-                shared,
-                run_uri,
-                run_name,
-                job_id,
-                artifact_name,
-                chunk_pattern,
-                chunks_by_sub_job,
-                wanted,
-                stale_after_seconds,
-            )
-            for sub_job_id, messages in stale.items():
-                warnings_by_sub_job.setdefault(sub_job_id, []).extend(messages)
-            # Sub-jobs with a warning but no chunks yet still get a result entry.
-            unsaved = sorted(set(stale) - set(chunks_by_sub_job))
-            if wanted is not None:
-                missing = sorted(wanted - set(chunks_by_sub_job) - set(unsaved))
+            # The stall check reads the job status (one REST call, plus a
+            # stdout listing for metrics); it runs while chunks are fetched so
+            # it adds no time to the download.
+            stall_check = None
+            if stale_after_seconds is not None:
+                stall_check = _artifact_download.Background(
+                    functools.partial(
+                        self._stale_upload_warnings,
+                        shared,
+                        run_uri,
+                        run_name,
+                        job_id,
+                        artifact_name,
+                        chunk_pattern,
+                        dict(chunks_by_sub_job),
+                        wanted,
+                        stale_after_seconds,
+                    ),
+                    name="cortex-training-stall-check",
+                )
+
+            def stale_warnings() -> dict[str, list[str]]:
+                if stall_check is None:
+                    return {}
+                return stall_check.result(self._STALL_CHECK_WAIT_SECONDS, {})
+
+            if wanted is not None and wanted - set(chunks_by_sub_job):
+                # A named sub-job without chunks is fine only if it has a warning.
+                unsaved = set(stale_warnings()) - set(chunks_by_sub_job)
+                missing = sorted(wanted - set(chunks_by_sub_job) - unsaved)
                 if missing:
                     available = sorted(chunks_by_sub_job)
                     raise NoChunksError(
@@ -3620,6 +3664,15 @@ class CortexTrainingClient:
                     strict=strict,
                     warnings_by_sub_job=warnings_by_sub_job,
                 )
+            stale = stale_warnings()
+            for result in results:
+                messages = stale.get(result["sub_job_id"])
+                if messages:
+                    result["warnings"] = [*result.get("warnings", []), *messages]
+            for sub_job_id, messages in stale.items():
+                warnings_by_sub_job.setdefault(sub_job_id, []).extend(messages)
+            # Sub-jobs with a warning but no chunks yet still get a result entry.
+            unsaved = sorted(set(stale) - set(chunks_by_sub_job))
             results.extend(
                 {
                     "sub_job_id": sub_job_id,

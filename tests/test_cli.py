@@ -2417,8 +2417,34 @@ def test_download_strict_and_library_warnings_reach_stderr(tmp_path, command):
     assert client.download_options["strict"] is True
     assert stderr.getvalue().count("warning: skipped chunk snow://x: damaged") == 1
     assert "warning" not in stdout.getvalue()
-    assert logging.getLogger("cortex_training").propagate is True
     assert logging.getLogger("cortex_training").handlers == []
+
+
+def test_download_warnings_still_reach_the_callers_log_handlers(tmp_path):
+    client = FakeClient()
+    client.download_warning = "skipped chunk snow://x: damaged"
+    seen = []
+
+    class Collect(logging.Handler):
+        def emit(self, record):
+            seen.append(record.getMessage())
+
+    root = logging.getLogger()
+    collect = Collect(logging.WARNING)
+    root.addHandler(collect)
+    stderr = io.StringIO()
+    try:
+        rc = cli.main(
+            _base_args() + ["download-metrics", "job-1", "--output-dir", str(tmp_path)],
+            client_factory=lambda _: client,
+            stdout=io.StringIO(),
+            stderr=stderr,
+        )
+    finally:
+        root.removeHandler(collect)
+    assert rc == 0
+    assert seen == ["skipped chunk snow://x: damaged"]
+    assert stderr.getvalue().count("warning: skipped chunk snow://x: damaged") == 1
 
 
 @pytest.mark.parametrize(("value", "expected"), [("0", None), ("2.5", 150.0), ("30", 1800.0)])
