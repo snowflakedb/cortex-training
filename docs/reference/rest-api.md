@@ -1696,10 +1696,12 @@ only by the client. In the `prime_rl` block the server also reads
 off. With `ep_size` > 1 the model reads the fp32 head and the chunk size
 only from the `prime_rl` block entries, which `lm_head.fp32` and
 `lm_head.token_chunk_size` also write; a top-level `fp32_lm_head` alone has no
-effect there. A top-level `fused_lm_head_token_chunk_size` alone does not
-install the chunked head in the model, but the server still switches the job
-to chunked log-probability handling, so do not send it alone: use
-`lm_head.token_chunk_size` with `lm_head.cross_entropy` set to `false`.
+effect there. With `ep_size` > 1 a top-level `fused_lm_head_token_chunk_size`
+alone does not install the chunked head in the model, but the server still
+switches the job to chunked log-probability handling, so do not send it alone
+there: use `lm_head.token_chunk_size` with `lm_head.cross_entropy` set to
+`false`. With `ep_size` 1 or omitted the top-level field installs the chunked
+head by itself.
 
 #### `model_options`
 
@@ -1762,7 +1764,7 @@ values work, the Value column says so: an even count, or the names that work.
 |---|---|---|---|
 | `checkpointing.mode` | trainer | non-empty string (`full`, `selective`) | `ac_config.mode` |
 | `checkpointing.freq` | trainer | positive integer | `ac_config.freq` and `activation_checkpointing` |
-| `checkpointing.targets` | trainer | list of strings (target names the model's layers support, such as `norm`) | `ac_config.targets` |
+| `checkpointing.targets` | trainer | list of strings (target names the model's layers support, such as `norm`) | `ac_config.targets`; used only with `checkpointing.mode` `selective` |
 | `checkpointing.offload` | trainer | `true` or `false` | `ac_config.offload_config.enabled`; `false` sets nothing when no `ac_config` block results (see below) |
 | `tiled_mlp.token_chunk_size` | trainer | positive integer | `tiled_mlp_token_chunk_size` |
 | `lm_head.fp32` | both | `true` or `false` | `fp32_lm_head`; also `prime_rl.fp32_lm_head` when `ep_size` > 1 |
@@ -1825,7 +1827,10 @@ Notes on single keys:
   `liger` there, and the server rejects the pair. It also rejects
   `lm_head.cross_entropy` set to `true` or `liger` together with an integer
   block `prime_rl.fused_lm_head_token_chunk_size`. `lm_head.fp32` combines
-  with fused cross-entropy `true`, `false` or `liger`.
+  with fused cross-entropy `true`, `false` or `liger`. The chunked head
+  returns per-token log-probabilities instead of logits, so a plain SFT job
+  with fractional token weights (a `loss_mask` with values other than 0 and 1)
+  cannot use it: leave the chunk size unset there.
 - On server versions that have it, `numerics.fp32_parity` is on by default
   (`true`), so a job that sends no `model_options` runs it. It applies to
   Qwen3.5-MoE models with `ep_size` > 1 and to dense Qwen3.5-family models
@@ -1838,19 +1843,26 @@ Notes on single keys:
   model follows it (so with the default it is evaluated in fp32 there too).
   With `ep_size` > 1 a model that is not Qwen3.5-MoE rejects the key when the
   sub-job starts. To turn the path off, send
-  `"model_options": {"numerics": {"fp32_parity": false}}`.
-- Memory of `numerics.fp32_parity`: with `activation_checkpointing` on, every
-  decoder layer after the first holds its residual at the layer boundary as a
-  second tensor, so GPU memory rises. For Qwen3.8-27B with `sp_size` 4 and
-  `mb_spec.max_tokens_per_mb` 131072 (calls of about 120000 tokens), peak
-  allocated memory was about 92 GiB per GPU without it and 104 GiB with it, on
-  GPUs with 139.8 GiB; the device uses several GiB more than the allocator
-  reports. With a budget of 262144 (calls of about 240000 tokens, 60000 per
-  GPU) it ran out of memory. Memory follows the tokens each GPU holds in a
-  call, which is the call's tokens divided by `sp_size`.
+  `"model_options": {"numerics": {"fp32_parity": false}}`. A server version
+  that has the option but not `model_options` support ignores that map: a
+  dense job cannot turn the path off there, and an `ep_size` > 1 job sends
+  `prime_rl.fp32_parity: false`.
+- Memory of `numerics.fp32_parity`: with activation checkpointing on
+  (`activation_checkpointing` with `ep_size` 1 or omitted, an `ac_config`
+  block with `ep_size` > 1), every decoder layer after the first holds its
+  residual at the layer boundary as a second tensor, so GPU memory rises. For
+  Qwen3.8-27B with `sp_size` 4 and `mb_spec.max_tokens_per_mb` 131072 (calls of
+  about 120000 tokens), peak allocated memory was about 92 GiB per GPU without
+  it and 104 GiB with it, on GPUs with 139.8 GiB. The device uses more than the
+  allocator reports (12 to 15 GiB more for one 262144-token row at `sp_size`
+  8), so leave headroom. With a budget of 262144 (calls of about 240000
+  tokens, 60000 per GPU) the job with the option ran out of memory; the same
+  job without it was not measured. Memory follows the tokens each GPU holds in
+  a call, which is the call's tokens divided by `sp_size`.
   `mb_spec.max_tokens_per_mb` (default `10240`, see the `extra_training` knobs
   above) limits how many rows share a call, but a row longer than it runs in a
-  call of its own, so for such rows only a larger `sp_size` lowers the memory.
+  call of its own, so for such rows lowering the budget does not help: a
+  larger `sp_size`, or turning the option off, lowers the memory.
   On a dense Qwen3.5-family model with `liger` on, only the first layer's
   input norm still runs Liger's RMSNorm kernel while this option is on.
 - `numerics.fp32_residual` (experimental, default `false`) also keeps the
@@ -1861,8 +1873,8 @@ Notes on single keys:
   rejected, when the sub-job starts, if `numerics.fp32_parity` is `false`. It
   needs more memory again (about 122 GiB per GPU allocated in the example
   above) and, together with `numerics.fp32_parity`, made forward/backward
-  about 6% slower in our tests on that model, measured against a run on a
-  different service image, so treat the figure as approximate.
+  about 6% slower in our tests on that model, measured against a run on an
+  earlier server build, so treat the figure as approximate.
 - The Sets column names top-level fields for `numerics.fp32_parity` (with
   `ep_size` 1 or omitted) and `numerics.fp32_residual`. They carry the key to
   the dense model: send the key, not the field. A field sent without its key
@@ -1874,9 +1886,10 @@ Notes on single keys:
   startup.
 - `attn_impl` (as in the shipped examples), `attn_implementation` (default
   `flash_attention_3`) and `prime_rl.attn`: all that are sent together with
-  `attention.backend` must agree. `prime_rl.attn`, when sent, must equal
-  `attn_implementation` (default `flash_attention_3`), or the job fails when it
-  starts.
+  `attention.backend` must agree. `attn_impl`, when sent, takes precedence over
+  `attn_implementation`, and `prime_rl.attn`, when sent, must equal that
+  resolved value (`attn_implementation` defaults to `flash_attention_3`), or
+  the job fails when it starts.
 - Qwen3.5-MoE models with `ep_size` > 1 take `sdpa` (and `eager`, which they
   run as `sdpa`), `flash_attention_3` and `flash_attention_4` as the attention
   backend.
@@ -1916,9 +1929,10 @@ sampler's.
   object, such as `prime_rl` set to a number together with a `moe.*` key;
 - the chunked LM head combinations described in the notes above.
 
-The client does not catch these inputs. The create call is typically accepted;
-the job later ends `failed` ([section 3.2](#32-job-states)), and the server's
-message may not be returned to you.
+The client does not catch these inputs. A rejected input may be refused when
+you create the job, or the job may be accepted and later end `failed`
+([section 3.2](#32-job-states)); the server's message may not be returned to
+you.
 
 **Checks when the sub-job starts.** When a training sub-job starts, it checks
 each key in `model_options` against what the model implementation supports,
@@ -1939,7 +1953,8 @@ working: the server still accepts the block and reads it as before, apart from
 the `seq_len` default described below and the `numerics.fp32_parity` default
 (see the notes on single keys), which applies whether or not a job sends the
 block. The table gives the entries that have a
-key, and a few that the server sets, ignores or rejects.
+key, and a few that the server sets, ignores or rejects. An entry that it does
+not list, such as `trust_remote_code`, has no key and stays in the block.
 
 | Block entry | Replacement |
 |---|---|
@@ -1949,7 +1964,7 @@ key, and a few that the server sets, ignores or rejects.
 | `deepep_token_chunk_size` | `moe.comm_token_chunk` |
 | `moe_use_grouped_mm` | `moe.grouped_mm` |
 | `fused_cross_entropy` | `lm_head.cross_entropy` with `ep_size` > 1; no key with `ep_size` 1 or omitted (see below) |
-| `fused_lm_head_token_chunk_size` | an integer: `lm_head.token_chunk_size`; `"disabled"`: omit the key; `"auto"` has no key |
+| `fused_lm_head_token_chunk_size` | an integer: `lm_head.token_chunk_size`; `"disabled"` or `"auto"` mean no chunked head: omit the key |
 | `fp32_lm_head` | `lm_head.fp32` |
 | `fp32_parity` | `numerics.fp32_parity` with `ep_size` > 1. Only Qwen3.5-MoE models on server versions that have the option read this entry; an older server, or another model, fails an `ep_size` > 1 job that carries it when the sub-job starts. With `ep_size` 1 or omitted the entry has no effect, while the key does |
 | `sparse_mla_backend` | `attention.sparse_mla`, which no model in the catalog that supports training takes |
@@ -1987,12 +2002,14 @@ key table names (and `vllm_config.fp32_lm_head` for sampling). With
 `ep_size` > 1 those include the `prime_rl` block entries, sent as before, and
 `prime_rl.seq_len` equal to `max_seq_len`; with `ep_size` 1 or omitted, it
 sends the top-level field where the Sets column names one, except
-`fused_cross_entropy`, which stays in the block. `numerics.fp32_parity` and
-`numerics.fp32_residual` have no earlier spelling, and the top-level fields
-named for them in the Sets column do not exist on such a server, which ignores
-them: do not send `prime_rl.fp32_parity` to a server version that does not
-have the option, or for a model other than Qwen3.5-MoE: either fails an
-`ep_size` > 1 job that carries it when the sub-job starts.
+`fused_cross_entropy`, which stays in the block. `numerics.fp32_residual` has
+no earlier spelling. `numerics.fp32_parity` has one only with `ep_size` > 1,
+the block entry `prime_rl.fp32_parity`; a dense job has none, and the
+top-level fields named for the two keys in the Sets column do not exist on
+such a server, which ignores them. Send
+`prime_rl.fp32_parity` only to a server version that has the option and for a
+Qwen3.5-MoE model: any other server or model fails an `ep_size` > 1 job that
+carries it when the sub-job starts.
 
 ### 8.3 `InferenceConfig`
 
@@ -2071,11 +2088,11 @@ sampler:
 
 Every other key in the section 8.2 table runs only in the trainer and is
 rejected, as are the keys under "Not accepted" in
-[section 8.2](#model_options). The create call is typically accepted; the job
-later ends `failed` ([section 3.2](#32-job-states)), and the server's message
-may not be returned to you. Nothing is copied from the training sub-job, so a
-job that wants the fp32 head on both sides sets `lm_head.fp32` in both
-sub-jobs:
+[section 8.2](#model_options). A rejected input may be refused when you create
+the job, or the job may be accepted and later end `failed` ([section
+3.2](#32-job-states)); the server's message may not be returned to you. Nothing
+is copied from the training sub-job, so a job that wants the fp32 head on both
+sides sets `lm_head.fp32` in both sub-jobs:
 
 ```python
 sampling = SubJobConfig.sampling_job(

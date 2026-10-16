@@ -169,7 +169,8 @@ memory was not measured for rows near `max_seq_len`. If a job runs out of
 memory, raise `sp_size` or turn the option off by adding
 `"numerics": {"fp32_parity": false}` to the `model_options` entry of
 `training_config`, inside the same object if the config already has one (two
-`model_options` keys in one JSON object keep only the last); see
+`model_options` keys in one JSON object keep only the last). A server that
+has the option but not `model_options` support ignores that entry; see
 [the REST API reference](../../docs/reference/rest-api.md#model_options).
 
 For dense long-context profiles, set an integer
