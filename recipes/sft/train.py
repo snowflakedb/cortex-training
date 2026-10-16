@@ -19,6 +19,7 @@ from recipes.utils import forward_backward_step
 from recipes.utils import load_job_body
 from recipes.utils import log_saved_checkpoints
 from recipes.utils import make_client
+from recipes.utils import name_job
 from recipes.utils import running_job
 from recipes.utils import save_recipe_checkpoints
 
@@ -42,6 +43,7 @@ class Config(Protocol):
     enable_thinking: bool
     renderer_name: str | None
     job_config: str
+    name: str | None
 
 
 class Task(Protocol):
@@ -67,6 +69,14 @@ def job_body(config: Config) -> dict:
     return body
 
 
+def named_job_body(config: Config, task: Task) -> dict:
+    """The job body with the job's name: ``name=``, else ``<task>-sft · MODEL``.
+
+    For the conversational task that is ``conversational-sft · Qwen3-8B``.
+    """
+    return name_job(job_body(config), f"{task.name}-sft", getattr(config, "name", None))
+
+
 def causal_cross_entropy_processing() -> dict[str, Any]:
     return {
         "loss_fn": "causal_cross_entropy",
@@ -80,7 +90,7 @@ def train(config: Config, task: Task) -> dict[str, Any]:
         os.environ[DEBUG_OPTIONS_ENV] = "1"
         logger.info("Using debug image_tag=%s", config.debug_image_tag)
 
-    body = job_body(config)
+    body = named_job_body(config, task)
     training_sub = next(
         (
             sub

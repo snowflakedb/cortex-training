@@ -41,6 +41,8 @@ class Config:
     job_config: str = "configs/qwen3_8b_full.json"
     debug_image_tag: str | None = None
     keep_job: bool = True
+    # The job's name (its comment). Default: inference-serve · MODEL; name="" sends none.
+    name: str | None = None
 
     source_job_id: str | None = None
     # Required with source_job_id. Use the cp_* id.
@@ -58,6 +60,8 @@ def main(config: Config):
         source_job_id=config.source_job_id,
         checkpoint_id=config.checkpoint_id,
         debug_image_tag=config.debug_image_tag,
+        recipe="inference-serve",
+        name=config.name,
     )
     if config.job_id is not None:
         logger.info("Attaching to inference endpoint %s", config.job_id)

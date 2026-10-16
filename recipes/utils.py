@@ -118,6 +118,47 @@ def load_job_body(
     return deepcopy(parsed)
 
 
+def default_job_name(recipe: str, body: Mapping[str, Any]) -> str:
+    """The name a recipe gives the job it creates: ``RECIPE · MODEL``.
+
+    ``MODEL`` is the short model name (``Qwen3-8B`` for ``Qwen/Qwen3-8B``),
+    followed by ``LoRA`` when a sub-job carries a ``peft_config``. Example:
+    ``math-grpo · Qwen3-8B LoRA``.
+    """
+    subs = [sub for sub in body.get("sub_job_configs") or () if isinstance(sub, Mapping)]
+    models = dict.fromkeys(str(sub["model_name"]).rsplit("/", 1)[-1] for sub in subs if sub.get("model_name"))
+    lora = any(
+        isinstance(config.get("peft_config"), Mapping)
+        for sub in subs
+        for config in (sub.get("training_config"), sub.get("inference_config"))
+        if isinstance(config, Mapping)
+    )
+    model = ", ".join(models)
+    if lora:
+        model = f"{model} LoRA".strip()
+    return f"{recipe} · {model}" if model else recipe
+
+
+def name_job(body: Mapping[str, Any], recipe: str, name: str | None = None) -> dict[str, Any]:
+    """Return a copy of a create-job body with its ``comment``, the job's name, set.
+
+    ``name`` is a recipe's ``name=`` setting and wins; ``name=""`` creates the
+    job without a name. Without it, a ``comment`` already in the job config
+    JSON is kept, and otherwise the job gets :func:`default_job_name`. The
+    client checks the result: over 1,024 bytes of UTF-8 is rejected before
+    sending, and a model deployment is sent without a comment.
+    """
+    named = dict(body)
+    if name is not None:
+        if name.strip():
+            named["comment"] = name
+        else:
+            named.pop("comment", None)
+    elif not str(named.get("comment") or "").strip():
+        named["comment"] = default_job_name(recipe, named)
+    return named
+
+
 def lora_peft_config(rank: int) -> dict[str, Any] | None:
     if rank <= 0:
         return None

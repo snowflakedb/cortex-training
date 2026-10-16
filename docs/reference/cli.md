@@ -95,6 +95,7 @@ cortex-training submit examples/api/training.json
 cortex-training submit examples/api/sampling.json
 cortex-training submit job.json --dry-run     # Validate without submitting
 cortex-training submit job.json --wait        # Wait until running, not finished
+cortex-training submit job.json --comment "qwen3-8b lora sweep #3"  # Name the job
 cortex-training submit - < job.json           # Read JSON from stdin
 ```
 
@@ -178,7 +179,7 @@ cortex-training fwd-bwd --help
 - [Forward-backward and optimizer steps](#run-a-forward-backward-smoke-test)
 - [Load checkpoints](#load-a-checkpoint-into-a-running-job) and [initialize sampling](#start-sampling-from-a-training-checkpoint)
 - [Generate](#run-a-generate-smoke-test) and [sync weights](#sync-training-weights)
-- [Download logs](#download-execution-logs), [stdout](#download-persisted-stdout), and [metrics](#download-gpu-metrics)
+- [Download logs](#download-execution-logs), [stdout](#download-persisted-stdout), [metrics](#download-gpu-metrics), and [roles and access](#roles-and-access)
 - [Job TUI](#job-tui), [JSON output and help](#json-output-and-help), and [troubleshooting](#troubleshooting)
 
 `cortex-training` submits and manages Cortex Training jobs through the Cortex
@@ -301,21 +302,77 @@ cortex-training wait JOB_ID
 
 | Flag | Takes | Notes |
 |---|---|---|
-| `--all` | nothing | lists jobs across every schema in the account that you can see, not just the configured one |
-| `--status` | comma list of `pending`, `placing`, `initializing`, `running`, `failed`, `cancelled`, `terminated`, `active`, `done` | `active` is `pending` through `running`; `done` is `cancelled`, `terminated`, and the `done` that older jobs show; `pending` does not include `placing`. Matched against a row's status in any form the server sends, including `JOB_STATE_RUNNING` and aliases such as `canceled`, `completed`, `succeeded`, `error`, `queued`, `creating` |
-| `--user` | user name | SQL name rules: unquoted means its uppercase form, `"quoted"` means exactly that name |
+| `--all` | nothing | lists jobs across every schema in the account that you can see, not just the configured one; see below for when it works |
+| `--status` | comma list of `pending`, `placing`, `initializing`, `running`, `failed`, `cancelled`, `terminated`, `active`, `terminal`, `done` | `active` is `pending` through `running`; `terminal` is `cancelled`, `terminated`, and `failed`; `done` is `cancelled` and `terminated`, plus, without `--all`, the `done` that older jobs show; `pending` does not include `placing`. Without `--all`, matched against a row's status in any form the server sends, including `JOB_STATE_RUNNING` and aliases such as `canceled`, `completed`, `succeeded`, `error`, `queued`, `creating` |
+| `--user` | user name | SQL name rules: unquoted means its uppercase form, `"quoted"` means exactly that name. Without `--all`, an unknown user lists no jobs; with `--all`, a name that matches no active user in the account is an error |
 | `--since` | `YYYY-MM-DD` | a UTC day; keeps jobs created on or after it |
 | `--until` | `YYYY-MM-DD` | a UTC day; keeps jobs created on or before it, so `--since D --until D` means "on day D" |
 | `--limit` | number | prints at most this many of the newest matching jobs by `created_at`; a job listed without one counts as oldest |
 
+`list` prints jobs oldest first by `created_at`, so the newest job that matches
+is printed last, at the bottom of the terminal:
+`cortex-training list --status terminal | jq '.jobs[-1]'` is the most recently
+created job that has ended. A job listed without a `created_at` counts as the
+oldest and is printed first. `--limit N` prints the last N jobs of that order.
+
 Without `--all`, the CLI fetches the configured schema's jobs and applies the
 filters itself, leaving out a job with no `created_at` when `--since` or
 `--until` is set. With `--all`, the server applies them across the account
-([REST API reference section 5.3](rest-api.md#across-the-account---get-apiv2endpoint));
-where account-level listing is not enabled for the account, the command fails
-with `account-level job listing is not enabled for this account`. A bad
-`--status`, `--since`, `--until`, or `--limit`, or an empty `--user`, exits
-with status 2 before connecting.
+([REST API reference section 5.3](rest-api.md#across-the-account---get-apiv2cortex-training)).
+The server no longer takes `done`, so the CLI sends `cancelled,terminated` for
+it, and the `done` of older jobs matches no `--status` there. Either way, a
+job whose status can't be read (`UNKNOWN`) matches no `--status` word.
+
+`list --all` works once the service has account-level listing and Snowflake
+has enabled it for the account. Until then it exits with status 1 and says why:
+
+```text
+error: account-level job listing is not available on this service yet: GET /api/v2/cortex-training answered 404 with no error body, so the route is not deployed
+error: account-level job listing is not enabled for this account (HTTP 404); Snowflake enables it per account
+```
+
+A 404 with some other body, such as a proxy's page, says `answered 404
+without the service's not-enabled error; the route may not be deployed yet, or
+a proxy in front of the service answered` instead. Without `--all`, `list`
+still lists the configured schema in these cases.
+
+The service can stop accepting a page token partway through a long listing,
+for example after it rotated the key that seals its tokens. `list --all` then
+starts over from the first page once by itself; if the token is refused again,
+it exits with status 1 and says so (`could not open page_token ... a second
+time`). Run the command again.
+
+Where Cortex Training or its REST API is off for the account, which stops every
+Cortex Training command, or where something refuses the request, `list --all`
+exits with one of these:
+
+```text
+error: account-level job listing was refused (HTTP 403): <the service's reason>
+error: account-level job listing was refused (HTTP 403) with no error message: a network policy or a proxy may have blocked the request, or Cortex Training is not enabled for this account or its trial has ended
+error: account-level job listing is unavailable: the Cortex Training REST API is turned off for this account (HTTP 405)
+```
+
+The service's reason for a 403 is that Cortex Training is not enabled for the
+account, that its trial has ended, or, with `--status`, that the service was
+refused a status lookup. Each message starts with
+`[snowflake request id: ...]` when the service sent one, and the service's
+error body, if any, follows on a `response body:` line.
+
+With `--status`, the service fails a page only after waiting up to 300 seconds
+on a status lookup that is failing, so `list --all --status ...` retries a
+failing page twice instead of ten times. It can still take about 15 minutes to
+fail; press Ctrl-C to stop it sooner.
+
+With `--all`, a `--user` that matches no active user in the account, because
+the name is mistyped, in the wrong case, or the user was dropped, fails too:
+
+```text
+error: [snowflake request id: ...] --user jdoe: no active user in this account has that name (HTTP 400: submitted_by user not found or not authorized); an unquoted name means JDOE, so quote a lowercase or mixed-case name to match it exactly: --user '"jdoe"'
+response body: {"message": "submitted_by user not found or not authorized", ...}
+```
+
+A bad `--status`, `--since`, `--until`, or `--limit`, or an empty `--user`,
+exits with status 2 before connecting.
 
 `get` fetches current job details; `checkpoints` lists saved checkpoints.
 `wait` waits for the job to reach **running**, not for training to finish.
@@ -424,6 +481,7 @@ Submit it:
 cortex-training submit job.json
 cortex-training submit job.json --wait
 cortex-training submit job.json --dry-run
+cortex-training submit job.json --comment "qwen3-8b lora sweep #3"
 ```
 
 Without `--wait`, submission returns without waiting for the job to run.
@@ -433,6 +491,16 @@ checks as a live submit — so the printed body already shows any `peft_config`
 in its canonical form. A `log_probability` or `log_prob` sub-job is rejected
 before send, including on `--dry-run`, with
 `log_probability sub-jobs are not currently supported`.
+
+`--comment TEXT` names the job. It sets the body's `comment`, replacing one the
+JSON already has. A blank comment (empty, or only whitespace), from TEXT or
+from the JSON, names nothing and is not sent, so `--comment ''` removes the
+JSON's. The text is stored with the job and returned by `get` and `list`. It holds at most 1,024 bytes
+of UTF-8 and can't be changed after the job is created. A longer comment, or
+TEXT holding bytes that aren't UTF-8, fails before anything is sent, including
+on `--dry-run`. A model deployment is submitted without the comment, with a
+warning on stderr, because the server rejects one there;
+[REST API section 5.1](rest-api.md#comment) says which requests count as one.
 
 The repo includes a Prime-RL/Qwen3.6 training example:
 
@@ -703,6 +771,35 @@ warning that no GPU metrics were saved for it (for example, because the job ran
 on an image from before GPU metrics were uploaded). Two downloads of the same directory at once are unsupported; a TUI
 download of the same directory is refused as for stdout.
 
+### Roles And Access
+
+`checkpoints` is a REST call: a role with only
+`MONITOR` on the account can list a job's checkpoints. The
+checkpoint files are stored on the job's Experiment too, but the service reads
+them there for you. Saved logs and GPU metrics are read with SQL on the job's
+Experiment instead (`download-log`, `download-metrics`), so they need
+privileges on that Experiment, and a `MONITOR`-only role can't read them.
+
+When the service can't resolve the job's Experiment for your role, it answers
+500, in one of two wordings. The experiment-run lookup that `download-log` and
+`download-metrics` start with, before any SQL runs, says `Linked experiment is
+not found for job JOB_ID`: the role can't see the Experiment, or it no longer
+exists. `checkpoints` says `Linked experiment is not
+found or not authorized for the training job`. The client retries neither, so
+the command fails at once and adds `hint: this role can't read the job's
+Experiment ...` (with `or it no longer exists` for the first wording). Ask for
+access to the Experiment, or use the role that created the job.
+
+A role the service lets through that has no privileges on the Experiment, such
+as a `MONITOR`-only one, gets Snowflake's refusal of the SQL instead:
+`Experiment '...' does not exist or not authorized`, or `Insufficient
+privileges to operate on experiment '...'`. `download-log` and
+`download-metrics` print Snowflake's message after `error:`, with its
+`snowflake query id:` when it has one and without a traceback, add
+`hint: this role has no privileges on the job's Experiment ...`, and exit with
+status 1; `checkpoints` still works. See
+[REST API reference section 2.5](rest-api.md#25-roles-and-access).
+
 ### Job TUI
 
 `cortex-training tui` is a read-only terminal dashboard for job logs and GPU
@@ -827,6 +924,13 @@ cortex-training --compact list
 cortex-training get JOB_ID | jq '.sub_jobs'
 ```
 
+Text is printed as UTF-8, so a comment or name in any script reads as written.
+Control and invisible formatting characters (such as ESC, a bidi override, or
+a zero-width space) stay `\u` escapes, so printing a job can't change your
+terminal. When stdout's encoding isn't UTF-8 (a Windows pipe, or
+`PYTHONIOENCODING=ascii`), every non-ASCII character is printed as an escape
+instead. Either way, `jq` and other JSON parsers read the same values.
+
 Use `cortex-training --help` to list commands and global flags, or
 `cortex-training COMMAND --help` for command-specific arguments. Job-scoped
 data-plane help includes the required global option:
@@ -895,3 +999,7 @@ full local/mock URL such as `http://localhost:8084` for `base_url`.
 
 For server errors, the CLI prints any Snowflake request id and response body
 returned by the service. Include those details when debugging a `500`.
+Everything the CLI writes to stderr, error bodies and warnings included,
+shows control and invisible formatting characters as escapes such as `\x1b`,
+so an answer can't move your terminal's cursor, retitle its window, or write
+its clipboard.

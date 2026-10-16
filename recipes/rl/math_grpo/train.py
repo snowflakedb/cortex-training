@@ -49,6 +49,8 @@ class Config:
     sf_tracking: bool = False
 
     job_config: str = "configs/qwen3_8b_lora.json"
+    # The job's name (its comment). Default: math-grpo · MODEL; name="" sends none.
+    name: str | None = None
 
 
 def main(config: Config) -> None:

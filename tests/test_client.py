@@ -2396,7 +2396,7 @@ class TestIterJobs:
                 "schema": '"Exp 1"',
                 "status": "running,FAILED",
                 "submitted_by": "jdoe",
-                "created_after": "2026-10-01",
+                "created_after": "2026-10-01T00:00:00Z",
                 "created_before": "2026-10-02T07:30:00Z",
                 "limit": 50,
             },
@@ -2431,16 +2431,16 @@ class TestIterJobs:
     @pytest.mark.parametrize(
         ("value", "wire"),
         [
-            (date(2026, 10, 1), "2026-10-01"),
+            (date(2026, 10, 1), "2026-10-01T00:00:00Z"),
             (
                 datetime(2026, 10, 1, 1, 0, tzinfo=timezone(timedelta(hours=-7))),
                 "2026-10-01T08:00:00Z",
             ),
             (datetime(2026, 10, 1, 8, 0, 0, 250000), "2026-10-01T08:00:00.250000Z"),
-            ("2026-10-01T00:00:00+02:00", "2026-10-01T00:00:00+02:00"),
+            ("2026-10-01T00:00:00+02:00", "2026-09-30T22:00:00Z"),
         ],
     )
-    def test_created_after_is_sent_in_utc_or_as_given(self, value, wire):
+    def test_created_after_is_sent_as_utc_rfc_3339(self, value, wire):
         c = _make_client(get_json={"jobs": []})
 
         list(c.iter_jobs(status="active", created_after=value))
@@ -2565,7 +2565,7 @@ class TestIterJobs:
         assert [call.args[1]["request_count"] for call in calls] == [1, 1]
         assert [call.kwargs["attributes"] for call in calls] == [
             {},
-            {"error.type": "HTTPError", "error.http_status": 404},
+            {"error.type": "AccountJobListUnavailable", "error.http_status": 404},
         ]
         assert "jdoe" not in repr(calls)
 
@@ -8058,19 +8058,24 @@ class TestTailOnEndedJobs:
             c.tail_logs("j1", sub_job_id="j1:training:0")
         assert c._session.post.call_count == 1
 
-    def test_a_starting_job_is_still_retried(self):
+    def test_a_starting_job_fails_at_once_without_a_hint(self):
+        # tail-logs' 404 doesn't clear on a retry; for a job that is still
+        # starting the lookup has nothing to add.
         c = _make_client()
         c.max_retries = 3
         c._session.post.side_effect = [
             _not_found("517604", "session s not found"),
-            _make_response({"entries": [{"_raw": "x"}], "next_cursor": "1", "eof": False}),
+            AssertionError("tail-logs retried a 404"),
         ]
         c._session.get.return_value = self._job("PLACING")
-        assert c.tail_logs("j1", sub_job_id="j1:sampling:0")["entries"] == [{"_raw": "x"}]
-        assert c._session.post.call_count == 2
+        with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+        assert "download-log" not in str(excinfo.value)
+        assert not getattr(excinfo.value, "job_ended", False)
+        assert c._session.post.call_count == 1
         assert c._session.get.call_count == 1
 
-    def test_lookup_failure_keeps_the_old_retry_behavior(self):
+    def test_lookup_failure_leaves_the_error_as_it_is(self):
         c = _make_client()
         c.max_retries = 2
         c._session.post.return_value = _not_found("517604", "session s not found")
@@ -8078,7 +8083,7 @@ class TestTailOnEndedJobs:
         with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
             c.tail_logs("j1", sub_job_id="j1:sampling:0")
         assert "download-log" not in str(excinfo.value)
-        assert c._session.post.call_count == 3
+        assert c._session.post.call_count == 1
 
     def test_the_job_lookup_is_tried_once(self):
         c = _make_client()
@@ -8088,7 +8093,7 @@ class TestTailOnEndedJobs:
         with pytest.raises(nc.requests.exceptions.HTTPError):
             c.tail_logs("j1", sub_job_id="j1:sampling:0")
         assert c._session.get.call_count == 1
-        assert c._session.post.call_count == 3
+        assert c._session.post.call_count == 1
 
 
 class TestStreamStopsWithoutEof:

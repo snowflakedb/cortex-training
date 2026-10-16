@@ -68,7 +68,9 @@ Every runnable recipe should provide:
 - A README with outcome, prerequisites, hardware, commands, expected results,
   CLI knobs, JSON job configs, evaluation, and troubleshooting
 - `recipe.yaml` metadata used by the compatibility catalog
-- A runnable entry point
+- A runnable entry point that names the job it creates: a readable default
+  such as `RECIPE · MODEL`, sent as the job's `comment` and overridable with
+  `name=`
 - `last_validated` in `recipe.yaml`: the date of the last verified run, or `null`
   when the recipe has not been validated since it last changed
 - Tests for local validation logic where practical
