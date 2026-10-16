@@ -523,7 +523,7 @@ def test_moe_rl_enables_router_replay_on_sampling_only():
     ("long_sequence", "expected_context", "expected_sp"),
     [(False, 32768, 1), (True, 262144, 8)],
 )
-def test_qwen36_lora_uses_prime_rl_attention_targets(
+def test_qwen36_lora_uses_arctic_attention_targets(
     profile_key,
     long_sequence,
     expected_context,
@@ -548,7 +548,7 @@ def test_qwen36_lora_uses_prime_rl_attention_targets(
         for sub_job in request["sub_job_configs"]
         if sub_job["job_type"] == "training"
     )
-    assert training["model_provider"] == "prime_rl"
+    assert training["model_provider"] == "arctic"
     assert training.get("sp_size", 1) == expected_sp
     assert {
         tuple(

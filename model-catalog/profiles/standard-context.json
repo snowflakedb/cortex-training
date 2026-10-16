@@ -123,7 +123,7 @@
             "dtype": "bfloat16",
             "seed": 42,
             "extra_training": {
-              "model_provider": "prime_rl",
+              "model_provider": "arctic",
               "attn_implementation": "flash_attention_3",
               "ac_config": {
                 "mode": "full",
@@ -185,7 +185,7 @@
             "dtype": "bfloat16",
             "seed": 42,
             "extra_training": {
-              "model_provider": "prime_rl",
+              "model_provider": "arctic",
               "attn_implementation": "flash_attention_3",
               "attn_impl": "flash_attention_3",
               "ep_size": 4,
@@ -239,7 +239,7 @@
             "dtype": "bfloat16",
             "seed": 42,
             "extra_training": {
-              "model_provider": "prime_rl",
+              "model_provider": "arctic",
               "attn_implementation": "flash_attention_3",
               "ac_config": {
                 "mode": "full",
@@ -344,7 +344,7 @@
             "dtype": "bfloat16",
             "seed": 42,
             "extra_training": {
-              "model_provider": "prime_rl",
+              "model_provider": "arctic",
               "attn_implementation": "flash_attention_3",
               "attn_impl": "flash_attention_3",
               "ep_size": 4,

@@ -26,7 +26,7 @@ The DeepSeek V4 and GLM 5.2 FP8 1M recommendations were validated with
 short prompts.
 
 For `Qwen/Qwen3.6-35B-A3B`, LoRA training and checkpoint save/load require the
-`prime_rl` model provider. Current PrimeRL LoRA support for this MoE model is
+`arctic` model provider. Current Arctic LoRA support for this MoE model is
 limited to `q_proj`, `k_proj`, `v_proj`, and `o_proj`. Routed expert LoRA is not
 yet supported.
 

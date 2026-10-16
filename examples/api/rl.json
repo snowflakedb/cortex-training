@@ -30,7 +30,7 @@
         "mb_spec": {
           "max_tokens_per_mb": 10240
         },
-        "model_provider": "prime_rl",
+        "model_provider": "arctic",
         "n_gpus": 8,
         "nccl_debug": false,
         "optimizer": {

@@ -268,10 +268,10 @@ def _validate_profile_reference(
             if sub_job["builder"] == "training_job"
         )
         training_extra = training_sub_job["args"].get("extra_training") or {}
-        if training_extra.get("model_provider") != "prime_rl":
+        if training_extra.get("model_provider") != "arctic":
             raise CatalogValidationError(
                 f"model {model_id}.{profile_key}{variant}: LoRA save/load requires "
-                "extra_training.model_provider='prime_rl'"
+                "extra_training.model_provider='arctic'"
             )
         for sub_job in profile["subJobs"]:
             args = sub_job["args"]
@@ -279,7 +279,7 @@ def _validate_profile_reference(
             targets = (extra.get("peft_config") or {}).get("target_modules")
             if targets != QWEN36_LORA_TARGET_MODULES:
                 raise CatalogValidationError(
-                    f"model {model_id}.{profile_key}{variant}: PrimeRL LoRA supports only "
+                    f"model {model_id}.{profile_key}{variant}: Arctic LoRA supports only "
                     f"attention target_modules {QWEN36_LORA_TARGET_MODULES}"
                 )
 
@@ -372,7 +372,7 @@ def _validate_profile_reference(
             if (
                 max_context >= LONG_CONTEXT_TRAINING_THRESHOLD
                 and profile_key in {"sftLora", "sftFull"}
-                and extra_training.get("model_provider", "huggingface") != "prime_rl"
+                and extra_training.get("model_provider", "huggingface") != "arctic"
             ):
                 _require_positive_int(
                     extra_training.get("fused_lm_head_token_chunk_size"),

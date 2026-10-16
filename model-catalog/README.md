@@ -25,11 +25,11 @@ standard alternatives use SP1. Adjust batch and distributed settings for the
 workload before submission. Every catalog sub-job must request GPUs in
 multiples of eight.
 
-Qwen3.6-35B-A3B LoRA training uses the `prime_rl` model provider so checkpoints
-can be saved and loaded. PrimeRL currently supports LoRA on the attention
+Qwen3.6-35B-A3B LoRA training uses the `arctic` model provider so checkpoints
+can be saved and loaded. Arctic currently supports LoRA on the attention
 projections (`q_proj`, `k_proj`, `v_proj`, and `o_proj`) for this model. Routed
 expert LoRA is not yet supported, and Hugging Face MLP names such as
-`gate_proj`, `up_proj`, and `down_proj` are no-ops on the PrimeRL model.
+`gate_proj`, `up_proj`, and `down_proj` are no-ops on the Arctic model.
 
 ## Updating the catalog
 
