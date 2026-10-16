@@ -975,11 +975,11 @@ def _validate_create_job_body(body: dict[str, Any]) -> None:
     _validate_raw_sub_job_configs(sub_job_configs)
 
 
-def _print_json(value: Any, stdout: TextIO, *, compact: bool) -> None:
+def _print_json(value: Any, stdout: TextIO, *, compact: bool, sort_keys: bool = True) -> None:
     if compact:
-        json.dump(value, stdout, separators=(",", ":"), sort_keys=True)
+        json.dump(value, stdout, separators=(",", ":"), sort_keys=sort_keys)
     else:
-        json.dump(value, stdout, indent=2, sort_keys=True)
+        json.dump(value, stdout, indent=2, sort_keys=sort_keys)
     stdout.write("\n")
 
 
@@ -1093,8 +1093,18 @@ def _cmd_capacity(args: argparse.Namespace, client, stdout: TextIO) -> int:
         capacity = lookup(args.hardware)
     else:
         capacity = _capacity_by_hardware(lookup)
-    _print_json(capacity, stdout, compact=args.compact)
+    _print_json(_breakdown_last(capacity), stdout, compact=args.compact, sort_keys=False)
     return 0
+
+
+def _breakdown_last(value: Any) -> Any:
+    """``value`` with keys sorted, except that ``breakdown`` follows the totals."""
+    if isinstance(value, dict):
+        keys = sorted(value, key=lambda key: (key == "breakdown", key))
+        return {key: _breakdown_last(value[key]) for key in keys}
+    if isinstance(value, list):
+        return [_breakdown_last(item) for item in value]
+    return value
 
 
 def _json_bool(value: Any, name: str) -> bool:

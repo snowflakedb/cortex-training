@@ -386,13 +386,14 @@ cortex-training capacity --hardware H200 --breakdown submitted-by \
 
 ```json
 {"kind":"USER","submitted_by":"YOUR_USER","is_caller":true,"in_use_gpus":24,"pending_gpus":0,"job_count":2}
-{"kind":"OTHER","submitted_by":null,"is_caller":false,"in_use_gpus":16,"pending_gpus":16,"job_count":3}
+{"kind":"USER","submitted_by":"SOME_USER","is_caller":false,"in_use_gpus":8,"pending_gpus":16,"job_count":2}
+{"kind":"OTHER","submitted_by":null,"is_caller":false,"in_use_gpus":8,"pending_gpus":0,"job_count":1}
 {"kind":"UNATTRIBUTED","submitted_by":null,"is_caller":false,"in_use_gpus":4,"pending_gpus":0,"job_count":1}
 ```
 
 Until the breakdown is enabled for your account, each dimension reports
 `DISABLED`. See [REST API reference section 5.4](rest-api.md#breakdown---breakdown)
-for every field, status and scope.
+for every field and status.
 
 ### Submit A Job
 

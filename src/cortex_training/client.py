@@ -758,7 +758,6 @@ def _hardware_wire(hardware: Hardware | str) -> str:
 # ``get_capacity_breakdown`` dimensions, statuses, and the job types always
 # reported under ``job_type``, in order.
 _CAPACITY_BREAKDOWN_DIMENSIONS = ("job_type", "submitted_by")
-_CAPACITY_BREAKDOWN_STATUSES = ("OK", "DISABLED", "UNSUPPORTED", "UNAVAILABLE")
 _CAPACITY_BREAKDOWN_JOB_TYPES = ("TRAINING", "SAMPLING", "LOG_PROBABILITY")
 
 
@@ -799,8 +798,10 @@ def _capacity_breakdown_dimensions(dimensions: Any) -> tuple[str, ...]:
 def _capacity_breakdown(
     body: Mapping[str, Any], dimensions: tuple[str, ...]
 ) -> dict[str, Any]:
-    """Normalize ``breakdown``: a missing dimension is ``UNSUPPORTED``, an
-    unknown status ``UNAVAILABLE``, and groups are kept only under ``OK``."""
+    """Normalize ``breakdown``, trusting the data over the status label:
+    groups are kept whenever the server sends them, and ``status`` is passed
+    through as sent. Only a missing status is derived: ``OK`` with groups,
+    ``UNAVAILABLE`` without (also for a dimension the server left out)."""
     raw = body.get("breakdown")
     if not isinstance(raw, dict):
         raw = {}
@@ -812,23 +813,17 @@ def _capacity_breakdown(
     for dimension in dict.fromkeys(dimensions):
         section = raw.get(f"by_{dimension}")
         if not isinstance(section, dict):
-            section = {"status": "UNSUPPORTED"}
-        status = section.get("status")
-        if status not in _CAPACITY_BREAKDOWN_STATUSES:
-            status = "UNAVAILABLE"
-        ok = status == "OK"
-        groups = (section.get("groups") or []) if ok else []
-        if dimension == "job_type":
-            breakdown["by_job_type"] = {
-                "status": status,
-                "groups": _capacity_job_type_groups(groups) if ok else [],
-            }
+            section = {}
+        groups = section.get("groups")
+        has_groups = isinstance(groups, list) and bool(groups)
+        status = section.get("status") or ("OK" if has_groups else "UNAVAILABLE")
+        if not has_groups:
+            rendered_groups = []
+        elif dimension == "job_type":
+            rendered_groups = _capacity_job_type_groups(groups)
         else:
-            breakdown["by_submitted_by"] = {
-                "status": status,
-                "scope": section.get("scope"),
-                "groups": [_capacity_submitted_by_group(group) for group in groups],
-            }
+            rendered_groups = [_capacity_submitted_by_group(group) for group in groups]
+        breakdown[f"by_{dimension}"] = {"status": status, "groups": rendered_groups}
     return breakdown
 
 
@@ -2584,8 +2579,8 @@ class CortexTrainingClient:
         ``breakdown`` holds ``job_count``, ``truncated``,
         ``unsupported_dimensions``, and ``by_job_type`` / ``by_submitted_by``
         for the requested dimensions. Each has a ``status`` (``OK``,
-        ``DISABLED``, ``UNSUPPORTED`` or ``UNAVAILABLE``) and ``groups``,
-        which is empty unless ``OK`` and then adds up to ``in_use_gpus`` and
+        ``DISABLED``, ``UNAVAILABLE``, or any newer value the server sends)
+        and ``groups``; under ``OK`` the groups add up to ``in_use_gpus`` and
         ``pending_gpus``. Missing counts are 0; on non-``USER`` groups
         ``submitted_by`` is ``None`` and ``is_caller`` is ``False``.
 

@@ -642,12 +642,13 @@ requested dimension reports `DISABLED`. Example for `?breakdown=job_type,submitt
     },
     "by_submitted_by": {
       "status": "OK",
-      "scope": "SELF",
       "groups": [
         {"kind": "USER", "submitted_by": "YOUR_USER", "is_caller": true,
          "in_use_gpus": 24, "pending_gpus": 0, "job_count": 2},
-        {"kind": "OTHER", "in_use_gpus": 16, "pending_gpus": 16,
-         "job_count": 3},
+        {"kind": "USER", "submitted_by": "SOME_USER", "is_caller": false,
+         "in_use_gpus": 8, "pending_gpus": 16, "job_count": 2},
+        {"kind": "OTHER", "in_use_gpus": 8, "pending_gpus": 0,
+         "job_count": 1},
         {"kind": "UNATTRIBUTED", "in_use_gpus": 4, "pending_gpus": 0,
          "job_count": 1}
       ]
@@ -663,29 +664,30 @@ requested dimension reports `DISABLED`. Example for `?breakdown=job_type,submitt
   one; the rest count as `UNATTRIBUTED`. Present only when a dimension is `OK`.
 - `by_job_type` / `by_submitted_by`: present only when requested.
 
-Each dimension has a `status`, and `groups`, which is empty unless `OK`.
-Every status comes with HTTP `200` and the six totals unchanged:
+Each dimension has a `status` and `groups`. Every status comes with HTTP
+`200` and the six totals unchanged:
 
 | `status` | Meaning |
 |---|---|
 | `OK` | `groups` adds up to `in_use_gpus` and `pending_gpus`. |
-| `DISABLED` | Not enabled for the account. |
-| `UNSUPPORTED` | The service does not support it yet. |
-| `UNAVAILABLE` | Could not be computed for this request. Treat unknown statuses the same way. |
+| `DISABLED` | Not enabled for the account. `groups` is empty. |
+| `UNAVAILABLE` | Cannot be computed for this request, including when the service does not support it yet. `groups` is empty. |
+
+Read the split from `groups`; a newer service may add statuses.
 
 `by_job_type.groups[]`: `TRAINING`, `SAMPLING` and `LOG_PROBABILITY` first,
-then any other type (`UNKNOWN` if the service cannot name it). A job counts
-under each of its sub-jobs' types. `log_probability` sub-jobs and sub-jobs
-that set `multiplex_job_id` add 0 GPUs but count in `sub_job_count`.
+then any other type (`UNSPECIFIED` or `UNKNOWN` when the service cannot name
+it). A job counts under each of its sub-jobs' types. `log_probability`
+sub-jobs and sub-jobs that set `multiplex_job_id` add 0 GPUs but count in
+`sub_job_count`.
 
-`by_submitted_by` carries `scope`, which is set per account: `SELF` names
-only the caller, `VISIBLE` names every submitter of a job the caller can see.
-Each job counts in exactly one group:
+`by_submitted_by` names the submitter of every job the caller can see. Each
+job counts in exactly one group:
 
 | `kind` | Jobs |
 |---|---|
 | `USER` | Submitted by `submitted_by`, and visible to the caller. `is_caller` marks the caller's row. |
-| `OTHER` | Not visible to the caller, plus, with `SELF`, other users' jobs. |
+| `OTHER` | Not visible to the caller. |
 | `UNATTRIBUTED` | No known submitter: none was recorded, the user no longer exists, or the job is past the `truncated` limit. |
 
 `USER` rows come first, most GPUs (`in_use_gpus + pending_gpus`) first and
@@ -694,10 +696,12 @@ then by name, then `OTHER`, then `UNATTRIBUTED`. Find the caller's row by
 or schema names.
 
 `get_capacity_breakdown(hardware=None, *, dimensions=("job_type",
-"submitted_by"))` sends this parameter. It fills missing counts with `0`,
-reports a dimension missing from the response (including from a server
-without this parameter) as `UNSUPPORTED`, and always lists the three known
-job types under `OK`. The CLI exposes it as
+"submitted_by"))` sends this parameter. It keeps `groups` whenever the server
+sends them and passes `status` through as sent. A missing `status` reads as
+`OK` with groups and `UNAVAILABLE` without, and a dimension missing from the
+response (including from a server without this parameter) is `UNAVAILABLE`.
+It fills missing counts with `0` and always lists the three known job types
+when there are groups. The CLI exposes it as
 [`capacity --breakdown`](cli.md#capacity-breakdown).
 
 ### 5.5 Cancel job - `POST /{job_id}:cancel`
