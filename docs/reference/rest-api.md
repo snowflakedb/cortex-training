@@ -1693,10 +1693,13 @@ an enabled or default fused cross-entropy. To pass the client's check, set
 which the client does not check. A top-level `fused_cross_entropy` is read
 only by the client. In the `prime_rl` block the server also reads
 `fused_cross_entropy`: with `ep_size` > 1, `false` there turns the fused head
-off. With `ep_size` > 1 the fp32 head and the chunk size are read only from
-the `prime_rl` block entries, which `lm_head.fp32` and
-`lm_head.token_chunk_size` also write; a top-level `fp32_lm_head` or
-`fused_lm_head_token_chunk_size` alone has no effect there.
+off. With `ep_size` > 1 the model reads the fp32 head and the chunk size
+only from the `prime_rl` block entries, which `lm_head.fp32` and
+`lm_head.token_chunk_size` also write; a top-level `fp32_lm_head` alone has no
+effect there. A top-level `fused_lm_head_token_chunk_size` alone does not
+install the chunked head in the model, but the server still switches the job
+to chunked log-probability handling, so do not send it alone: use
+`lm_head.token_chunk_size` with `lm_head.cross_entropy` set to `false`.
 
 #### `model_options`
 
@@ -1839,15 +1842,17 @@ Notes on single keys:
 - Memory of `numerics.fp32_parity`: with `activation_checkpointing` on, every
   decoder layer after the first holds its residual at the layer boundary as a
   second tensor, so GPU memory rises. For Qwen3.8-27B with `sp_size` 4 and
-  131072 tokens per model call, peak allocated memory was about 92 GiB per GPU
-  without it and 104 GiB with it, on GPUs with 139.8 GiB; the device uses
-  several GiB more than the allocator reports. Memory follows the tokens each
-  GPU holds in a call, which is the call's tokens divided by `sp_size`.
+  `mb_spec.max_tokens_per_mb` 131072 (calls of about 120000 tokens), peak
+  allocated memory was about 92 GiB per GPU without it and 104 GiB with it, on
+  GPUs with 139.8 GiB; the device uses several GiB more than the allocator
+  reports. With a budget of 262144 (calls of about 240000 tokens, 60000 per
+  GPU) it ran out of memory. Memory follows the tokens each GPU holds in a
+  call, which is the call's tokens divided by `sp_size`.
   `mb_spec.max_tokens_per_mb` (default `10240`, see the `extra_training` knobs
   above) limits how many rows share a call, but a row longer than it runs in a
   call of its own, so for such rows only a larger `sp_size` lowers the memory.
-  With `liger` on, only the first layer's input norm still runs Liger's
-  RMSNorm kernel while this option is on.
+  On a dense Qwen3.5-family model with `liger` on, only the first layer's
+  input norm still runs Liger's RMSNorm kernel while this option is on.
 - `numerics.fp32_residual` (experimental, default `false`) also keeps the
   residual stream in fp32 between decoder layers, instead of rounding it to
   the dtype of each layer's output. It applies only to dense Qwen3.5-family
@@ -1946,7 +1951,7 @@ key, and a few that the server sets, ignores or rejects.
 | `fused_cross_entropy` | `lm_head.cross_entropy` with `ep_size` > 1; no key with `ep_size` 1 or omitted (see below) |
 | `fused_lm_head_token_chunk_size` | an integer: `lm_head.token_chunk_size`; `"disabled"`: omit the key; `"auto"` has no key |
 | `fp32_lm_head` | `lm_head.fp32` |
-| `fp32_parity` | `numerics.fp32_parity` with `ep_size` > 1. Only server versions that have the option read this entry; an older server fails an `ep_size` > 1 job that carries it when the sub-job starts. With `ep_size` 1 or omitted the entry has no effect, while the key does |
+| `fp32_parity` | `numerics.fp32_parity` with `ep_size` > 1. Only Qwen3.5-MoE models on server versions that have the option read this entry; an older server, or another model, fails an `ep_size` > 1 job that carries it when the sub-job starts. With `ep_size` 1 or omitted the entry has no effect, while the key does |
 | `sparse_mla_backend` | `attention.sparse_mla`, which no model in the catalog that supports training takes |
 | `attn` | `attention.backend` |
 | `optimization_dtype` | `numerics.optimization_dtype` with `ep_size` > 1; with `ep_size` 1 or omitted the entry is ignored |
@@ -1985,9 +1990,9 @@ sends the top-level field where the Sets column names one, except
 `fused_cross_entropy`, which stays in the block. `numerics.fp32_parity` and
 `numerics.fp32_residual` have no earlier spelling, and the top-level fields
 named for them in the Sets column do not exist on such a server, which ignores
-them: do not send `prime_rl.fp32_parity` to a server version without this
-feature, which fails an `ep_size` > 1 job that carries it when the sub-job
-starts.
+them: do not send `prime_rl.fp32_parity` to a server version that does not
+have the option, or for a model other than Qwen3.5-MoE: either fails an
+`ep_size` > 1 job that carries it when the sub-job starts.
 
 ### 8.3 `InferenceConfig`
 

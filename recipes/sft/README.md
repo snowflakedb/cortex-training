@@ -126,9 +126,10 @@ shipped example or a copy with `job_config=JOB_CONFIG`.
           "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
         },
 
-        // Optional expert parallelism for MoE. With model_provider prime_rl, keep
-        // the prime_rl block: the SFT loss needs per-token log-probabilities, which
-        // the fused cross-entropy does not return.
+        // Optional expert parallelism for MoE. With model_provider prime_rl,
+        // keep fused cross-entropy off (this block, or model_options with
+        // EP_SIZE > 1): the SFT loss needs per-token log-probabilities, which
+        // it does not return.
         "ac_config": {"mode": "full", "freq": 1},
         "prime_rl": {
           "fused_lm_head_token_chunk_size": 8192,
@@ -160,14 +161,15 @@ shipped Qwen3.6 SFT configs still use the block, which older servers need.
 "model_options": {"lm_head": {"token_chunk_size": 8192, "cross_entropy": false}}
 ```
 
-On server versions that support `model_options`, Qwen3.5-family models run
-with `numerics.fp32_parity` on by default: dense models (for example
-`Qwen/Qwen3.8-27B`) and Qwen3.5-MoE models with `EP_SIZE` > 1 (the
-Qwen3.6-35B-A3B configs). It raises GPU memory. To turn it off, add
+On server versions that have `numerics.fp32_parity`, Qwen3.5-family models run
+with it on by default: dense models (for example `Qwen/Qwen3.8-27B`) and
+Qwen3.5-MoE models with `EP_SIZE` > 1 (the Qwen3.6-35B-A3B configs). It raises
+GPU memory. The shipped Qwen3.8-27B configs ran with it on in our tests, but
+memory was not measured for rows near `max_seq_len`. If a job runs out of
+memory, raise `sp_size` or turn the option off by adding
 `"numerics": {"fp32_parity": false}` to the `model_options` entry of
 `training_config`, inside the same object if the config already has one (two
-`model_options` keys in one JSON object keep only the last), or set
-`"fp32_parity": false` in the `prime_rl` block of an `EP_SIZE` > 1 config; see
+`model_options` keys in one JSON object keep only the last); see
 [the REST API reference](../../docs/reference/rest-api.md#model_options).
 
 For dense long-context profiles, set an integer

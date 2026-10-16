@@ -191,14 +191,15 @@ The Qwen3.6-35B-A3B RL and SFT recipe configs, `examples/api/training.json`,
 `examples/api/rl.json` and the `rl` and `standard-context` model-catalog
 profiles still use the `prime_rl` block, which older servers need.
 
-On server versions that support `model_options`, Qwen3.5-family models run
-with `numerics.fp32_parity` on by default: dense models (for example
-`Qwen/Qwen3.8-27B`) and Qwen3.5-MoE models with `EP_SIZE` > 1 (the
-Qwen3.6-35B-A3B configs). It raises GPU memory. To turn it off, add
+On server versions that have `numerics.fp32_parity`, Qwen3.5-family models run
+with it on by default: dense models (for example `Qwen/Qwen3.8-27B`) and
+Qwen3.5-MoE models with `EP_SIZE` > 1 (the Qwen3.6-35B-A3B configs). It raises
+GPU memory. The shipped Qwen3.8-27B configs ran with it on in our tests, but
+memory was not measured for rows near `max_seq_len`. If a job runs out of
+memory, raise `sp_size` or turn the option off by adding
 `"numerics": {"fp32_parity": false}` to the `model_options` entry of
 `training_config`, inside the same object if the config already has one (two
-`model_options` keys in one JSON object keep only the last), or set
-`"fp32_parity": false` in the `prime_rl` block of an `EP_SIZE` > 1 config; see
+`model_options` keys in one JSON object keep only the last); see
 [the REST API reference](../../docs/reference/rest-api.md#model_options).
 
 The target list above is for dense Qwen models. For
