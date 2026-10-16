@@ -208,9 +208,9 @@ Legacy or internal responses can contain `done`, `unknown`, or enum names such
 as `JOB_STATE_RUNNING`. `wait_for_job()` lowercases and removes the
 `JOB_STATE_` prefix internally.
 
-Current client caveat: `wait_for_job()` raises early for `failed`, `done`,
-`cancelled`, and `canceled`, but not `terminated`; a terminated job therefore
-waits until the polling timeout.
+`wait_for_job()` raises as soon as the job reaches `failed`, `cancelled`, or
+`terminated` (also the legacy `done`, `completed`, `succeeded`, and
+`canceled`), instead of polling until its timeout.
 
 ### 3.3 Request states
 

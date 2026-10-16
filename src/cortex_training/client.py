@@ -181,8 +181,12 @@ def _success_telemetry_enabled(operation: str | None = None) -> bool:
 # won't fix itself.
 _TRANSIENT_STATUSES = {429, 500, 502, 503, 504, 404, 409, 307, 308}
 _JOB_NOT_FOUND_CODE = "517601"
-# Job states after which a sub-job's pods, and so its live logs, are gone.
-_ENDED_JOB_STATES = frozenset({"failed", "done", "cancelled", "canceled", "terminated"})
+# Job states after which nothing more runs, and a sub-job's pods (and so its
+# live logs) are gone. The API reports `cancelled`, `terminated` and `failed`;
+# the other spellings are accepted for robustness.
+_ENDED_JOB_STATES = frozenset(
+    {"failed", "cancelled", "canceled", "terminated", "done", "completed", "succeeded"}
+)
 # A job this client created is retried on "not found" for this long, to ride
 # out the service's read-after-create window.
 _RECENTLY_CREATED_SECONDS = 120.0
@@ -2511,7 +2515,7 @@ class CortexTrainingClient:
             status = self._normalize_job_status(job.get("status", ""))
             if status == "running":
                 return job
-            if status in ("failed", "done", "cancelled", "canceled"):
+            if status in _ENDED_JOB_STATES:
                 reason = job.get("reason", "")
                 raise _server_failure(
                     RuntimeError(f"Job {job_id} reached terminal state '{status}': {reason}"),

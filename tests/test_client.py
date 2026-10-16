@@ -8327,3 +8327,26 @@ def test_stall_check_job_lookup_is_tried_once_and_stays_quiet_after_the_download
     assert len(calls) == 1
     assert [r.getMessage() for r in caplog.records if r.created > returned] == []
     assert not any("retrying" in r.getMessage() for r in caplog.records)
+
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["TERMINATED", "JOB_STATE_TERMINATED", "terminated", "CANCELLED", "canceled", "FAILED", "DONE", "succeeded"],
+)
+def test_wait_for_job_stops_at_every_ended_state(monkeypatch, status):
+    c = _make_client(get_json={"status": status, "reason": "r"})
+    monkeypatch.setattr(nc.time, "sleep", lambda *_: (_ for _ in ()).throw(AssertionError("kept polling")))
+    with pytest.raises(RuntimeError, match="reached terminal state"):
+        c.wait_for_job("job-1")
+    assert c._session.get.call_count == 1
+
+
+def test_wait_for_job_keeps_polling_through_starting_states(monkeypatch):
+    monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+    c = _make_client()
+    c._session.get.side_effect = [
+        _make_response({"status": status}) for status in ("PENDING", "PLACING", "INITIALIZING", "RUNNING")
+    ]
+    assert c.wait_for_job("job-1")["status"] == "RUNNING"
+    assert c._session.get.call_count == 4
