@@ -630,6 +630,20 @@ def forward_backward(
     return client.poll_request(job_id, request_id)
 
 
+def forward(
+    client: CortexTrainingClient,
+    job_id: str,
+    kwargs: dict[str, torch.Tensor],
+) -> dict:
+    """No-grad forward pass returning per-token ``logprobs``.
+
+    The server gathers ``logits[i]`` at ``kwargs["labels"][i]`` without shifting,
+    for every model provider, and returns 0 where the label is -100.
+    """
+    request_id = client.forward(job_id, _forward_backward_payload(kwargs))["request_id"]
+    return client.poll_request(job_id, request_id)
+
+
 def optimizer_step(
     client: CortexTrainingClient,
     job_id: str,

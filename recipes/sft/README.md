@@ -9,6 +9,12 @@ weights-only checkpoint. Conversational dataset helpers live in
 `tasks/conversational.py`; the task entrypoint calls the shared SFT engine in
 `train.py`.
 
+The same engine also runs [DARE-Bench agent SFT](dare/README.md). It
+fine-tunes all parameters of Qwen3-8B on DARE-Bench's multi-turn data-science
+agent traces, in which the model calls a `python_executor` tool, and scores
+the result on the benchmark's eval split with a local agent loop. 
+Setup, results, and configuration are in its README.
+
 ## Hardware
 
 Training GPUs are `n_gpus` in the JSON you pass (`NUM_TRAINING_GPUS`). Actual
@@ -225,10 +231,12 @@ a Snowflake experiment; results are viewable in Snowsight under
 [Snowflake ML Experiments docs](https://docs.snowflake.com/en/developer-guide/snowflake-ml/experiments).
 
 Each step logs `train_nll` (the server's `avg_loss`) and `loss_weight_sum`, the
-sum of `loss_mask` over the batch. On the default memorize task, `train_nll`
-should fall quickly and `loss_weight_sum` should stay constant from step to
-step. After save, the recipe prints one generate command. When running that
-command, Assistant text should be `Snowflake AI Research`.
+sum of `loss_mask` over the batch. A task with a held-out set
+(`load_eval_dataset()`, as in [`dare/`](dare/README.md)) also logs `valid_nll` every `eval_every` steps, and after the last step. 
+On the default memorize task, `train_nll` should fall quickly and `loss_weight_sum` should
+stay constant from step to step. After save, the recipe prints one generate
+command. When running that command, Assistant text should be `Snowflake AI
+Research`.
 
 ```bash
 python -m recipes.inference.generate \
