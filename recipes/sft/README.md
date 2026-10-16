@@ -128,8 +128,8 @@ shipped example or a copy with `job_config=JOB_CONFIG`.
 
         // Optional expert parallelism for MoE. With model_provider prime_rl,
         // keep fused cross-entropy off (this block, or model_options with
-        // EP_SIZE > 1): the SFT loss needs per-token log-probabilities, which
-        // it does not return.
+        // EP_SIZE > 1): the chunked LM head set below cannot be combined with
+        // it.
         "ac_config": {"mode": "full", "freq": 1},
         "prime_rl": {
           "fused_lm_head_token_chunk_size": 8192,
@@ -164,9 +164,9 @@ shipped Qwen3.6 SFT configs still use the block, which older servers need.
 On server versions that have `numerics.fp32_parity`, Qwen3.5-family models run
 with it on by default: dense models (for example `Qwen/Qwen3.8-27B`) and
 Qwen3.5-MoE models with `EP_SIZE` > 1 (the Qwen3.6-35B-A3B configs). It raises
-GPU memory. The shipped Qwen3.8-27B configs ran with it on in our tests, but
-memory was not measured for rows near `max_seq_len`. If a job runs out of
-memory, raise `sp_size` or turn the option off by adding
+GPU memory. Memory was not measured for rows near `max_seq_len` with the
+shipped Qwen3.8-27B configs. If a job runs out of memory, raise `sp_size`
+(at most 8 for Qwen3.8-27B) or turn the option off by adding
 `"numerics": {"fp32_parity": false}` to the `model_options` entry of
 `training_config`, inside the same object if the config already has one (two
 `model_options` keys in one JSON object keep only the last). A server that

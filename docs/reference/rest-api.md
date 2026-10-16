@@ -1689,8 +1689,9 @@ accepts `fp32_lm_head=true` with fused cross-entropy `true`, `false` or
 `liger`, as it accepts `lm_head.fp32`, while the client rejects the field with
 an enabled or default fused cross-entropy. To pass the client's check, set
 `fused_cross_entropy` to `false` in the same place (top level or the
-`prime_rl` block) as the chunk size or `fp32_lm_head`, or use `model_options`,
-which the client does not check. A top-level `fused_cross_entropy` is read
+`prime_rl` block) as the chunk size or `fp32_lm_head`, or, on server versions
+that support `model_options`, use it: the client does not check it. A
+top-level `fused_cross_entropy` is read
 only by the client. In the `prime_rl` block the server also reads
 `fused_cross_entropy`: with `ep_size` > 1, `false` there turns the fused head
 off. With `ep_size` > 1 the model reads the fp32 head and the chunk size
@@ -1700,8 +1701,10 @@ effect there. With `ep_size` > 1 a top-level `fused_lm_head_token_chunk_size`
 alone does not install the chunked head in the model, but the server still
 switches the job to chunked log-probability handling, so do not send it alone
 there: use `lm_head.token_chunk_size` with `lm_head.cross_entropy` set to
-`false`. With `ep_size` 1 or omitted the top-level field installs the chunked
-head by itself.
+`false` (on server versions without `model_options`,
+`prime_rl.fused_lm_head_token_chunk_size` with `prime_rl.fused_cross_entropy`
+set to `false`). With `ep_size` 1 or omitted the top-level field installs the
+chunked head by itself.
 
 #### `model_options`
 
@@ -1780,7 +1783,7 @@ values work, the Value column says so: an even count, or the names that work.
 | `attention.sparse_mla` | trainer | not available for any model in the catalog that supports training | `prime_rl.sparse_mla_backend` |
 | `compile.fullgraph` | trainer | `true` or `false` | `compile.fullgraph` |
 | `numerics.fp32_parity` | trainer | `true` or `false` (default `true`) | `prime_rl.fp32_parity` when `ep_size` > 1; the top-level field `fp32_parity` otherwise |
-| `numerics.fp32_residual` | trainer | `true` or `false` (experimental, default `false`) | the top-level field `fp32_residual`; `true` is rejected when `numerics.fp32_parity` is `false` |
+| `numerics.fp32_residual` | trainer | `true` or `false` (experimental, default `false`) | the top-level field `fp32_residual` |
 | `numerics.optimization_dtype` | trainer | `bfloat16` or `float32` | `prime_rl.optimization_dtype` when `ep_size` > 1; nothing otherwise |
 
 An omitted `ep_size` counts as 1 throughout this section. Which keys fail when
@@ -1794,9 +1797,10 @@ the sub-job starts depends on the model and on `ep_size`:
 - With `ep_size` > 1, on models whose Hugging Face `model_type` is
   `qwen3_5_moe` (or `qwen3_5_moe_text`) (in the
   [model catalog](../../model-catalog/README.md), Qwen3.6-35B-A3B), these fail
-  at startup: `liger` set to `true`, `compile.fullgraph`,
-  `lm_head.vocab_chunk_size`, `attention.sparse_mla` and
-  `numerics.fp32_residual`.
+  at startup: `compile.fullgraph`, `lm_head.vocab_chunk_size`,
+  `attention.sparse_mla` and `numerics.fp32_residual`. `liger` set to `true`
+  never gets that far: it sets `model_provider` to `"liger"`, while `ep_size`
+  above 1 needs `"prime_rl"`, so the job is rejected before the model loads.
 - With `ep_size` > 1 a model that is not a supported MoE model fails.
 
 Other models or `ep_size` combinations may fail the job at startup.
@@ -1827,10 +1831,14 @@ Notes on single keys:
   `liger` there, and the server rejects the pair. It also rejects
   `lm_head.cross_entropy` set to `true` or `liger` together with an integer
   block `prime_rl.fused_lm_head_token_chunk_size`. `lm_head.fp32` combines
-  with fused cross-entropy `true`, `false` or `liger`. The chunked head
-  returns per-token log-probabilities instead of logits, so a plain SFT job
-  with fractional token weights (a `loss_mask` with values other than 0 and 1)
-  cannot use it: leave the chunk size unset there.
+  with fused cross-entropy `true`, `false` or `liger`.
+- Fractional token weights: a plain SFT job whose `loss_mask` has values other
+  than 0 and 1 needs non-fused cross-entropy and, on every route, the chunked
+  LM head off, because the loss then needs the full logits. Leave
+  `lm_head.token_chunk_size` and `fused_lm_head_token_chunk_size` unset (with
+  `ep_size` > 1 also `prime_rl.fused_lm_head_token_chunk_size`), and with
+  `ep_size` > 1 set `lm_head.cross_entropy` to `false`, as fused cross-entropy
+  defaults to `liger` there.
 - On server versions that have it, `numerics.fp32_parity` is on by default
   (`true`), so a job that sends no `model_options` runs it. It applies to
   Qwen3.5-MoE models with `ep_size` > 1 and to dense Qwen3.5-family models
@@ -1847,24 +1855,27 @@ Notes on single keys:
   that has the option but not `model_options` support ignores that map: a
   dense job cannot turn the path off there, and an `ep_size` > 1 job sends
   `prime_rl.fp32_parity: false`.
-- Memory of `numerics.fp32_parity`: with activation checkpointing on
-  (`activation_checkpointing` with `ep_size` 1 or omitted, an `ac_config`
-  block with `ep_size` > 1), every decoder layer after the first holds its
-  residual at the layer boundary as a second tensor, so GPU memory rises. For
+- Memory of `numerics.fp32_parity`: with full activation checkpointing (every
+  layer: `activation_checkpointing` with `ep_size` 1 or omitted, an `ac_config`
+  block of mode `full` and `freq` 1 with `ep_size` > 1), every decoder layer
+  after the first holds its residual at the layer boundary as a second tensor,
+  so GPU memory rises. For
   Qwen3.8-27B with `sp_size` 4 and `mb_spec.max_tokens_per_mb` 131072 (calls of
   about 120000 tokens), peak allocated memory was about 92 GiB per GPU without
   it and 104 GiB with it, on GPUs with 139.8 GiB. The device uses more than the
   allocator reports (12 to 15 GiB more for one 262144-token row at `sp_size`
   8), so leave headroom. With a budget of 262144 (calls of about 240000
   tokens, 60000 per GPU) the job with the option ran out of memory; the same
-  job without it was not measured. Memory follows the tokens each GPU holds in
-  a call, which is the call's tokens divided by `sp_size`.
+  job without it was not measured. Memory follows, approximately, the tokens
+  each GPU holds in a call, which is the call's tokens divided by `sp_size`.
   `mb_spec.max_tokens_per_mb` (default `10240`, see the `extra_training` knobs
   above) limits how many rows share a call, but a row longer than it runs in a
   call of its own, so for such rows lowering the budget does not help: a
-  larger `sp_size`, or turning the option off, lowers the memory.
-  On a dense Qwen3.5-family model with `liger` on, only the first layer's
-  input norm still runs Liger's RMSNorm kernel while this option is on.
+  larger `sp_size` (at most 8 for Qwen3.8), or turning the option off, lowers
+  the memory.
+  On a dense Qwen3.5-family model with `liger` on, of the decoder-layer and
+  final norms only the first layer's input norm still runs Liger's RMSNorm
+  kernel while this option is on.
 - `numerics.fp32_residual` (experimental, default `false`) also keeps the
   residual stream in fp32 between decoder layers, instead of rounding it to
   the dtype of each layer's output. It applies only to dense Qwen3.5-family
@@ -1873,8 +1884,8 @@ Notes on single keys:
   rejected, when the sub-job starts, if `numerics.fp32_parity` is `false`. It
   needs more memory again (about 122 GiB per GPU allocated in the example
   above) and, together with `numerics.fp32_parity`, made forward/backward
-  about 6% slower in our tests on that model, measured against a run on an
-  earlier server build, so treat the figure as approximate.
+  about 6% slower in our tests on that model, measured against a run on a
+  different server build, so treat the figure as approximate.
 - The Sets column names top-level fields for `numerics.fp32_parity` (with
   `ep_size` 1 or omitted) and `numerics.fp32_residual`. They carry the key to
   the dense model: send the key, not the field. A field sent without its key
@@ -1908,6 +1919,8 @@ sent, the first in the order `activation_checkpointing`,
 `gradient_checkpointing` counts. So `gradient_checkpointing=true` with
 `checkpointing.freq=1` is accepted. Different values are rejected.
 `liger=false` together with `model_provider="liger"` is rejected the same way.
+With `ep_size` above 1 the `fp32_parity` field is not compared: the key writes
+`prime_rl.fp32_parity`, and the key is compared with that entry.
 
 **Each sub-job on its own.** The server validates each sub-job's map alone and
 never copies a key from one sub-job to another. A key that runs on both sides,
@@ -1966,7 +1979,7 @@ not list, such as `trust_remote_code`, has no key and stays in the block.
 | `fused_cross_entropy` | `lm_head.cross_entropy` with `ep_size` > 1; no key with `ep_size` 1 or omitted (see below) |
 | `fused_lm_head_token_chunk_size` | an integer: `lm_head.token_chunk_size`; `"disabled"` or `"auto"` mean no chunked head: omit the key |
 | `fp32_lm_head` | `lm_head.fp32` |
-| `fp32_parity` | `numerics.fp32_parity` with `ep_size` > 1. Only Qwen3.5-MoE models on server versions that have the option read this entry; an older server, or another model, fails an `ep_size` > 1 job that carries it when the sub-job starts. With `ep_size` 1 or omitted the entry has no effect, while the key does |
+| `fp32_parity` | `numerics.fp32_parity` with `ep_size` > 1. Only Qwen3.5-MoE models on server versions that have the option read this entry; a server version without the option, or another model, fails an `ep_size` > 1 job that carries it when the sub-job starts. With `ep_size` 1 or omitted the entry has no effect, while the key does |
 | `sparse_mla_backend` | `attention.sparse_mla`, which no model in the catalog that supports training takes |
 | `attn` | `attention.backend` |
 | `optimization_dtype` | `numerics.optimization_dtype` with `ep_size` > 1; with `ep_size` 1 or omitted the entry is ignored |
@@ -1988,7 +2001,10 @@ effect, so do not translate such an entry mechanically: for example, a block
 `fused_lm_head_token_chunk_size` of 4096 does nothing on such a job, while
 `lm_head.token_chunk_size` of 4096 turns the chunked LM head on, and a block
 `fp32_parity` of `false` does nothing, while `numerics.fp32_parity` set to
-`false` turns the fp32 path off.
+`false` turns the fp32 path off. Conversely, the keys for the block entries
+`ep_comm_backend`, `deepep_*`, `moe_use_grouped_mm` and `sparse_mla_backend`,
+and for the `mode` and `targets` parts of `ac_config`, fail a dense job when it
+starts, so do not translate those entries for one.
 
 **`seq_len`.** On server versions with this behavior, with `ep_size` > 1 the
 server sets the sequence length the model is built for from the sub-job's
@@ -2009,7 +2025,10 @@ top-level fields named for the two keys in the Sets column do not exist on
 such a server, which ignores them. Send
 `prime_rl.fp32_parity` only to a server version that has the option and for a
 Qwen3.5-MoE model: any other server or model fails an `ep_size` > 1 job that
-carries it when the sub-job starts.
+carries it when the sub-job starts. A server version that supports
+`model_options` but has fewer options than the table above accepts only the
+keys it knows and rejects the others, such as the `numerics` keys, as unknown
+keys.
 
 ### 8.3 `InferenceConfig`
 
