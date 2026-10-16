@@ -1258,10 +1258,47 @@ def _cmd_weight_sync(args: argparse.Namespace, client, stdout: TextIO) -> int:
     return 0
 
 
-def _cmd_download_log(args: argparse.Namespace, client, stdout: TextIO) -> int:
+def _artifact_progress_writer(stderr: TextIO) -> Callable[[str], None]:
+    """Draw one updating terminal line. A redirected stderr gets the final line."""
+    try:
+        tty = stderr.isatty()
+    except (OSError, ValueError):
+        tty = False
+    latest: str | None = None
+
+    def write(message: str) -> None:
+        nonlocal latest
+        try:
+            if message == "\n":
+                status, latest = latest, None
+                if status is None:
+                    return
+                stderr.write("\n" if tty else status + "\n")
+            elif message.endswith("\n"):
+                stderr.write(message)
+            else:
+                latest = message
+                if not tty:
+                    return
+                stderr.write("\r" + message)
+            stderr.flush()
+        except OSError:
+            return
+
+    return write
+
+
+def _cmd_download_log(
+    args: argparse.Namespace, client, stdout: TextIO, stderr: TextIO
+) -> int:
     out_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.cwd()
     if args.log_type == "stdout":
-        logs = client.download_stdout_logs(args.job_id, out_dir, resume=args.resume)
+        logs = client.download_stdout_logs(
+            args.job_id,
+            out_dir,
+            resume=args.resume,
+            progress=_artifact_progress_writer(stderr),
+        )
         _print_json(
             {"job_id": args.job_id, "logs": logs},
             stdout,
@@ -1288,10 +1325,15 @@ def _cmd_download_log(args: argparse.Namespace, client, stdout: TextIO) -> int:
 
 
 def _cmd_download_metrics(
-    args: argparse.Namespace, client, stdout: TextIO
+    args: argparse.Namespace, client, stdout: TextIO, stderr: TextIO
 ) -> int:
     out_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.cwd()
-    metrics = client.download_metrics(args.job_id, out_dir, resume=args.resume)
+    metrics = client.download_metrics(
+        args.job_id,
+        out_dir,
+        resume=args.resume,
+        progress=_artifact_progress_writer(stderr),
+    )
     _print_json(
         {"job_id": args.job_id, "metrics": metrics},
         stdout,
@@ -1339,6 +1381,7 @@ def _run(
     client_factory: Callable[[argparse.Namespace], Any],
     stdout: TextIO,
     stdin: TextIO,
+    stderr: TextIO,
 ) -> int:
     if args.command == "login":
         return _cmd_login(args, stdout)
@@ -1388,9 +1431,9 @@ def _run(
     if args.command == "weight-sync":
         return _cmd_weight_sync(args, client, stdout)
     if args.command == "download-log":
-        return _cmd_download_log(args, client, stdout)
+        return _cmd_download_log(args, client, stdout, stderr)
     if args.command == "download-metrics":
-        return _cmd_download_metrics(args, client, stdout)
+        return _cmd_download_metrics(args, client, stdout, stderr)
     raise ValueError(f"unknown command: {args.command}")
 
 
@@ -1425,7 +1468,7 @@ def main(
                 return None
 
             client_factory = empty_client_factory
-        return _run(args, client_factory, stdout, stdin)
+        return _run(args, client_factory, stdout, stdin, stderr)
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"error: {_format_error(exc)}", file=stderr)
         return 1

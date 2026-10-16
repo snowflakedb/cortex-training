@@ -52,6 +52,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Mapping
@@ -97,6 +98,8 @@ _GPU_METRICS_CHUNK_RE = re.compile(
     r"^gpu\.(?P<timestamp>\d{8}-\d{6})\.(?P<suffix>[^./\\]+)\.gz$"
 )
 _STREAM_COPY_BUFFER_BYTES = 1024 * 1024
+_ARTIFACT_GET_WORKERS = 8
+_ARTIFACT_GET_MIN_CHUNKS = 128
 
 # Env var that unlocks create-job debug options. These are an internal-only
 # capability and are deliberately not documented for external use: the client
@@ -2913,6 +2916,132 @@ class CortexTrainingClient:
         finally:
             downloaded.unlink(missing_ok=True)
 
+    @staticmethod
+    def _artifact_progress_status(
+        artifact_name: str, done: int, total: int, sub_job_id: str
+    ) -> str:
+        width = 20
+        filled = (width * done) // total
+        bar = "#" * filled + "-" * (width - filled)
+        return f"{artifact_name}: [{bar}] {done}/{total} {sub_job_id}"
+
+    @staticmethod
+    def _report_artifact_progress(progress: Callable[[str], None] | None, message: str) -> None:
+        if progress is not None:
+            progress(message)
+
+    @contextlib.contextmanager
+    def _artifact_progress_line(
+        self, progress: Callable[[str], None] | None
+    ) -> Iterator[None]:
+        """Close the status line with ``"\\n"`` whether the body succeeds or fails.
+
+        On failure the download error wins over any error from the newline.
+        """
+        try:
+            yield
+        except BaseException:
+            try:
+                self._report_artifact_progress(progress, "\n")
+            except BaseException:
+                pass
+            raise
+        self._report_artifact_progress(progress, "\n")
+
+    def _write_ordered_gzip_chunks(
+        self,
+        connection: Any,
+        run_uri: str,
+        artifact_temp: Path,
+        paths: list[str],
+        output,
+        on_chunk: Callable[[int], None] | None = None,
+    ) -> None:
+        """GET sessions are not shared across workers; bytes append in path order."""
+        if len(paths) < _ARTIFACT_GET_MIN_CHUNKS:
+            for index, relative_path in enumerate(paths, start=1):
+                self._download_gzip_member(
+                    connection,
+                    run_uri,
+                    relative_path,
+                    artifact_temp,
+                    output,
+                )
+                if on_chunk is not None:
+                    on_chunk(index)
+            return
+        pool = [connection]
+        try:
+            limit = min(_ARTIFACT_GET_WORKERS, len(paths))
+            warned = False
+            while len(pool) < limit:
+                try:
+                    extra = self._open_experiment_artifact_connection()
+                except Exception:
+                    if not warned:
+                        logger.warning(
+                            "could not open an extra session for artifact download; "
+                            "continuing with %d",
+                            len(pool),
+                        )
+                        warned = True
+                    break
+                if any(extra is existing for existing in pool):
+                    break
+                pool.append(extra)
+            self._write_gzip_chunk_batches(
+                pool, run_uri, artifact_temp, paths, output, on_chunk
+            )
+        finally:
+            for extra in pool[1:]:
+                try:
+                    extra.close()
+                except Exception:
+                    logger.warning("failed to close an extra artifact-download session")
+
+    def _write_gzip_chunk_batches(
+        self,
+        pool: list[Any],
+        run_uri: str,
+        artifact_temp: Path,
+        paths: list[str],
+        output,
+        on_chunk: Callable[[int], None] | None,
+    ) -> None:
+        batch_size = len(pool)
+        for start in range(0, len(paths), batch_size):
+            batch = paths[start : start + batch_size]
+            chunk_dirs = []
+            for offset, _relative_path in enumerate(batch):
+                chunk_dir = artifact_temp / f"chunk-{start + offset}"
+                chunk_dir.mkdir()
+                chunk_dirs.append(chunk_dir)
+            try:
+                with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                    futures = [
+                        executor.submit(
+                            self._download_experiment_artifact,
+                            pool[index],
+                            run_uri,
+                            relative_path,
+                            chunk_dir,
+                        )
+                        for index, (relative_path, chunk_dir) in enumerate(
+                            zip(batch, chunk_dirs)
+                        )
+                    ]
+                    for offset, (future, chunk_dir) in enumerate(
+                        zip(futures, chunk_dirs), start=1
+                    ):
+                        downloaded = future.result()
+                        self._copy_gzip_member(downloaded, output)
+                        shutil.rmtree(chunk_dir, ignore_errors=True)
+                        if on_chunk is not None:
+                            on_chunk(start + offset)
+            finally:
+                for chunk_dir in chunk_dirs:
+                    shutil.rmtree(chunk_dir, ignore_errors=True)
+
     def _rebuild_gzip_file(
         self,
         connection: Any,
@@ -2922,42 +3051,60 @@ class CortexTrainingClient:
         chunk_paths: list[str],
         *,
         temporary_prefix: str,
+        artifact_name: str,
+        progress: Callable[[str], None] | None,
     ) -> dict[str, Any]:
         """Write every chunk to a temp file, then replace the destination.
 
         The manifest is removed only after the temp file is fsynced, so a failed
         chunk download leaves the previous manifest and destination in place.
         """
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        output = tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=str(destination.parent),
-            prefix=temporary_prefix,
-            suffix=".tmp",
-            delete=False,
-        )
-        temporary = Path(output.name)
-        try:
-            for relative_path in chunk_paths:
-                self._download_gzip_member(
+        sub_job_id = destination.parent.name
+        chunk_count = len(chunk_paths)
+
+        def report_chunk(index: int) -> None:
+            self._report_artifact_progress(
+                progress,
+                self._artifact_progress_status(
+                    artifact_name, index, chunk_count, sub_job_id
+                ),
+            )
+
+        with self._artifact_progress_line(progress):
+            self._report_artifact_progress(
+                progress,
+                self._artifact_progress_status(artifact_name, 0, chunk_count, sub_job_id),
+            )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            output = tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=str(destination.parent),
+                prefix=temporary_prefix,
+                suffix=".tmp",
+                delete=False,
+            )
+            temporary = Path(output.name)
+            try:
+                self._write_ordered_gzip_chunks(
                     connection,
                     run_uri,
-                    relative_path,
                     artifact_temp,
+                    chunk_paths,
                     output,
+                    report_chunk,
                 )
-            output.flush()
-            os.fsync(output.fileno())
-            output.close()
-            self._resume_manifest_path(destination).unlink(missing_ok=True)
-            os.replace(temporary, destination)
-            nbytes = destination.stat().st_size
-            self._write_resume_manifest(destination, chunk_paths, nbytes)
-        except BaseException:
-            if not output.closed:
+                output.flush()
+                os.fsync(output.fileno())
                 output.close()
-            temporary.unlink(missing_ok=True)
-            raise
+                self._resume_manifest_path(destination).unlink(missing_ok=True)
+                os.replace(temporary, destination)
+                nbytes = destination.stat().st_size
+                self._write_resume_manifest(destination, chunk_paths, nbytes)
+            except BaseException:
+                if not output.closed:
+                    output.close()
+                temporary.unlink(missing_ok=True)
+                raise
         return self._artifact_result(destination, run_uri, chunk_paths)
 
     def _append_gzip_chunks(
@@ -2971,8 +3118,11 @@ class CortexTrainingClient:
         committed: int,
         *,
         temporary_prefix: str,
+        artifact_name: str,
+        progress: Callable[[str], None] | None,
     ) -> dict[str, Any]:
         """Append chunk paths that sort after ``known``, or rebuild."""
+        sub_job_id = destination.parent.name
         if known != chunk_paths[: len(known)]:
             return self._rebuild_gzip_file(
                 connection,
@@ -2981,6 +3131,8 @@ class CortexTrainingClient:
                 destination,
                 chunk_paths,
                 temporary_prefix=temporary_prefix,
+                artifact_name=artifact_name,
+                progress=progress,
             )
         new_paths = chunk_paths[len(known) :]
         try:
@@ -2995,36 +3147,58 @@ class CortexTrainingClient:
                 destination,
                 chunk_paths,
                 temporary_prefix=temporary_prefix,
+                artifact_name=artifact_name,
+                progress=progress,
             )
         if not new_paths:
+            self._report_artifact_progress(
+                progress,
+                f"{artifact_name}: no new chunks for {sub_job_id}\n",
+            )
             if size > committed:
                 with destination.open("r+b") as output:
                     output.truncate(committed)
                     output.flush()
                     os.fsync(output.fileno())
             return self._artifact_result(destination, run_uri, known)
-        with destination.open("r+b") as output:
-            output.seek(committed)
-            output.truncate(committed)
-            try:
-                for relative_path in new_paths:
-                    self._download_gzip_member(
+        names = list(known) + new_paths
+
+        def report_chunk(index: int) -> None:
+            self._report_artifact_progress(
+                progress,
+                self._artifact_progress_status(
+                    artifact_name, index, len(new_paths), sub_job_id
+                ),
+            )
+
+        with self._artifact_progress_line(progress):
+            self._report_artifact_progress(
+                progress,
+                self._artifact_progress_status(
+                    artifact_name, 0, len(new_paths), sub_job_id
+                ),
+            )
+            with destination.open("r+b") as output:
+                output.seek(committed)
+                output.truncate(committed)
+                try:
+                    self._write_ordered_gzip_chunks(
                         connection,
                         run_uri,
-                        relative_path,
                         artifact_temp,
+                        new_paths,
                         output,
+                        report_chunk,
                     )
-                output.flush()
-                os.fsync(output.fileno())
-                end = output.tell()
-            except BaseException:
-                output.truncate(committed)
-                output.flush()
-                os.fsync(output.fileno())
-                raise
-        names = list(known) + new_paths
-        self._write_resume_manifest(destination, names, end)
+                    output.flush()
+                    os.fsync(output.fileno())
+                    end = output.tell()
+                except BaseException:
+                    output.truncate(committed)
+                    output.flush()
+                    os.fsync(output.fileno())
+                    raise
+            self._write_resume_manifest(destination, names, end)
         return self._artifact_result(destination, run_uri, names)
 
     def _download_gzip_artifacts(
@@ -3037,6 +3211,7 @@ class CortexTrainingClient:
         destination_name: str,
         temporary_prefix: str,
         resume: bool = False,
+        progress: Callable[[str], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Reconstruct staged gzip chunks into one file per sub-job.
 
@@ -3083,6 +3258,12 @@ class CortexTrainingClient:
                         )
                     chunks["paths"].append(relative_path)
 
+            if not chunks_by_sub_job:
+                self._report_artifact_progress(
+                    progress, f"{artifact_name}: found 0 chunks\n"
+                )
+                return []
+
             results: list[dict[str, Any]] = []
             with tempfile.TemporaryDirectory(
                 prefix=f"cortex-training-{artifact_name}-artifacts-"
@@ -3101,6 +3282,8 @@ class CortexTrainingClient:
                                 destination,
                                 chunk_paths,
                                 temporary_prefix=temporary_prefix,
+                                artifact_name=artifact_name,
+                                progress=progress,
                             )
                         )
                         continue
@@ -3115,6 +3298,8 @@ class CortexTrainingClient:
                             known,
                             committed,
                             temporary_prefix=temporary_prefix,
+                            artifact_name=artifact_name,
+                            progress=progress,
                         )
                     )
             return results
@@ -3127,11 +3312,17 @@ class CortexTrainingClient:
         output_dir: str | os.PathLike[str],
         *,
         resume: bool = False,
+        progress: Callable[[str], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Reconstruct sealed console artifacts into one file per sub-job.
 
         ``resume=True`` appends chunks that are not already recorded beside the
         file. Two downloads of the same output directory at once are unsupported.
+        ``progress`` receives status updates without a trailing newline, then
+        ``"\\n"`` when that sub-job finishes or fails. A status that needs no
+        updating (nothing new, no chunks) arrives as one message ending in a
+        newline. An error raised by ``progress`` stops the download. The return
+        value is unchanged.
         """
         return self._download_gzip_artifacts(
             job_id,
@@ -3141,6 +3332,7 @@ class CortexTrainingClient:
             destination_name="stdout.log",
             temporary_prefix=".stdout-",
             resume=resume,
+            progress=progress,
         )
 
     def download_metrics(
@@ -3149,11 +3341,17 @@ class CortexTrainingClient:
         output_dir: str | os.PathLike[str],
         *,
         resume: bool = False,
+        progress: Callable[[str], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Reconstruct staged GPU metric chunks into one JSONL file per sub-job.
 
         ``resume=True`` appends chunks that are not already recorded beside the
         file. Two downloads of the same output directory at once are unsupported.
+        ``progress`` receives status updates without a trailing newline, then
+        ``"\\n"`` when that sub-job finishes or fails. A status that needs no
+        updating (nothing new, no chunks) arrives as one message ending in a
+        newline. An error raised by ``progress`` stops the download. The return
+        value is unchanged.
         """
         return self._download_gzip_artifacts(
             job_id,
@@ -3163,6 +3361,7 @@ class CortexTrainingClient:
             destination_name="gpu.jsonl",
             temporary_prefix=".gpu-metrics-",
             resume=resume,
+            progress=progress,
         )
 
     # ─── Data-plane async operations ─────────────────────────────────────
