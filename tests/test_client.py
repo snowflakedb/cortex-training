@@ -7250,6 +7250,31 @@ class TestChunkedArtifactDownload:
         assert "warnings" not in result[0]
         assert result[0]["chunk_count"] == 2
 
+    def test_interrupt_while_waiting_on_stall_check_keeps_saved_progress(
+        self, tmp_path, monkeypatch
+    ):
+        c, _connection, _paths, _calls = self._stale_setup(monkeypatch, count=2)
+        release = threading.Event()
+        monkeypatch.setattr(c, "_job_for_upload_warnings", lambda _job: release.wait(10))
+        destination = tmp_path / self.SUB / "stdout.log"
+        committed = []
+
+        def interrupted_wait(_self, _timeout, _default):
+            # Ctrl-C lands while the stall check is still running, after the
+            # files were written.
+            committed.append(destination.read_bytes())
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(nc._artifact_download.Background, "result", interrupted_wait)
+        try:
+            with pytest.raises(KeyboardInterrupt) as excinfo:
+                c.download_stdout_logs("job-1", tmp_path)
+        finally:
+            release.set()
+        assert excinfo.value.download_progress_saved is True
+        assert committed == [self._expected(self.SUB, range(2))]
+        assert destination.read_bytes() == self._expected(self.SUB, range(2))
+
     @pytest.mark.parametrize("download_fails", [True, False])
     def test_late_stall_check_never_reopens_the_session(
         self, tmp_path, monkeypatch, caplog, download_fails

@@ -3675,7 +3675,15 @@ class CortexTrainingClient:
                     strict=strict,
                     warnings_by_sub_job=warnings_by_sub_job,
                 )
-            stale = stale_warnings()
+            try:
+                stale = stale_warnings()
+            except BaseException as exc:
+                # Every file is committed by now, so an interrupt while waiting
+                # on the stall check still leaves output to resume from.
+                if results:
+                    with contextlib.suppress(Exception):
+                        exc.download_progress_saved = True  # type: ignore[attr-defined]
+                raise
             for result in results:
                 messages = stale.get(result["sub_job_id"])
                 if messages:
