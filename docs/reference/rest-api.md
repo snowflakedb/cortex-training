@@ -1739,7 +1739,7 @@ group of keys, such as `checkpointing` or `lm_head`, cannot be set to `true`,
 `false` or any other value as a whole; set one of its keys instead. An absent
 key leaves the existing field at its value or default.
 
-**Keys.** A training sub-job accepts these 19 keys. The Runs in column says
+**Keys.** A training sub-job accepts these 20 keys. The Runs in column says
 where a key applies: `trainer` keys are accepted only in a training sub-job, and
 `both` keys in either sub-job. The server checks the type of each value, and
 for `numerics.optimization_dtype` the allowed set; for every other key the
@@ -1765,7 +1765,8 @@ values work, the Value column says so: an even count, or the names that work.
 | `attention.backend` | trainer | non-empty string (see below) | `attn_implementation` |
 | `attention.sparse_mla` | trainer | not available for any model in the catalog that supports training | `prime_rl.sparse_mla_backend` |
 | `compile.fullgraph` | trainer | `true` or `false` | `compile.fullgraph` |
-| `numerics.fp32_parity` | trainer | `true` or `false` | `prime_rl.fp32_parity` when `ep_size` > 1; nothing otherwise |
+| `numerics.fp32_parity` | trainer | `true` or `false` | `prime_rl.fp32_parity` when `ep_size` > 1; with `ep_size` 1 or omitted the dense model reads the key directly |
+| `numerics.fp32_residual` | trainer | `true` or `false` (experimental) | no field: the dense model reads the key directly; needs `numerics.fp32_parity` on |
 | `numerics.optimization_dtype` | trainer | `bfloat16` or `float32` | `prime_rl.optimization_dtype` when `ep_size` > 1; nothing otherwise |
 
 An omitted `ep_size` counts as 1 throughout this section. Which keys fail when
@@ -1774,13 +1775,14 @@ the sub-job starts depends on the model and on `ep_size`:
 - With `ep_size` 1 or omitted these keys fail at startup:
   `checkpointing.mode`, `checkpointing.targets`, `lm_head.cross_entropy`,
   `moe.grouped_mm`, `moe.comm_backend`, `moe.comm_sms`,
-  `moe.comm_token_chunk`, `attention.sparse_mla`, `numerics.fp32_parity` and
+  `moe.comm_token_chunk`, `attention.sparse_mla` and
   `numerics.optimization_dtype`.
 - With `ep_size` > 1, on models whose Hugging Face `model_type` is
   `qwen3_5_moe` (or `qwen3_5_moe_text`) (in the
   [model catalog](../../model-catalog/README.md), Qwen3.6-35B-A3B), these fail
   at startup: `liger` set to `true`, `compile.fullgraph`,
-  `lm_head.vocab_chunk_size` and `attention.sparse_mla`.
+  `lm_head.vocab_chunk_size`, `attention.sparse_mla` and
+  `numerics.fp32_residual`.
 - With `ep_size` > 1 a model that is not a supported MoE model fails.
 
 Other models or `ep_size` combinations may fail the job at startup.
@@ -1812,10 +1814,30 @@ Notes on single keys:
   `lm_head.cross_entropy` set to `true` or `liger` together with an integer
   block `prime_rl.fused_lm_head_token_chunk_size`. `lm_head.fp32` combines
   with fused cross-entropy `true`, `false` or `liger`.
-- `numerics.fp32_parity` applies to Qwen3.5-MoE models with `ep_size` > 1:
-  with `true` (the default) the residual adds, partial rotary embedding and
-  GatedDeltaNet beta gate are evaluated in fp32, as vLLM does; with `false`
-  they are evaluated in the input dtype.
+- `numerics.fp32_parity` applies to Qwen3.5-MoE models with `ep_size` > 1
+  and to dense Qwen3.5-family models (for example Qwen3.8-27B) with `ep_size`
+  1 or omitted. With `true` (the default) the residual adds, partial rotary
+  embedding and GatedDeltaNet beta gate are evaluated in fp32, as vLLM does;
+  with `false` they are evaluated in the input dtype. Other models accept the
+  key and are not changed by it, except that with sequence parallelism the
+  GatedDeltaNet beta gate of any model follows it. Because the default is
+  `true`, a dense Qwen3.5-family job uses the fp32 path even when it sends no
+  `model_options`, and it has to send `false` to keep the earlier numerics and
+  memory. Under full activation checkpointing each layer boundary then holds
+  the residual as a second tensor, so GPU memory rises: for Qwen3.8-27B with
+  `sp_size` 4 and 131072 tokens per model call, peak memory was about 92 GiB
+  per GPU without it and 104 GiB with it. Memory follows the tokens each GPU
+  holds in a call, which is the call's tokens divided by `sp_size`.
+  `mb_spec.max_tokens_per_mb` limits how many rows share a call, but a row
+  longer than it runs in a call of its own, so for such rows only a larger
+  `sp_size` lowers the memory.
+- `numerics.fp32_residual` (experimental, default `false`) also keeps the
+  residual stream in fp32 between decoder layers, instead of rounding it to
+  the dtype of each layer's output. It applies only to dense Qwen3.5-family
+  models with `ep_size` 1 or omitted, and it requires `numerics.fp32_parity`
+  to be `true`. With `ep_size` > 1 it fails at startup. It needs more memory
+  again (about 122 GiB per GPU in the example above) and made
+  forward/backward about 6% slower in our tests on that model.
 - `numerics.optimization_dtype` is the dtype the trainer keeps and optimizes
   the weights in. Qwen3.5-MoE models with `ep_size` > 1 support it, with
   default `bfloat16`, and with `ep_size` > 1 the sub-job's `dtype` is not
@@ -1932,9 +1954,9 @@ key table names (and `vllm_config.fp32_lm_head` for sampling). With
 `ep_size` > 1 those include the `prime_rl` block entries, sent as before, and
 `prime_rl.seq_len` equal to `max_seq_len`; with `ep_size` 1 or omitted, it
 sends the top-level field where the Sets column names one, except
-`fused_cross_entropy`, which stays in the block. `numerics.fp32_parity` has no
-earlier spelling: do not send `prime_rl.fp32_parity` to a server without
-`model_options` support.
+`fused_cross_entropy`, which stays in the block. `numerics.fp32_parity` and
+`numerics.fp32_residual` have no earlier spelling: do not send
+`prime_rl.fp32_parity` to a server without `model_options` support.
 
 ### 8.3 `InferenceConfig`
 
