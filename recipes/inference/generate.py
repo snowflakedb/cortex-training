@@ -72,6 +72,8 @@ class Config:
     job_config: str = "configs/qwen3_8b_full.json"
     debug_image_tag: str | None = None
     keep_job: bool | None = None
+    # The job's name (its comment). Default: inference-generate · MODEL; name="" sends none.
+    name: str | None = None
 
     source_job_id: str | None = None
     # Required with source_job_id. Use the cp_* id.
@@ -101,6 +103,8 @@ def main(config: Config):
         source_job_id=config.source_job_id,
         checkpoint_id=config.checkpoint_id,
         debug_image_tag=config.debug_image_tag,
+        recipe="inference-generate",
+        name=config.name,
     )
     model_name = next(
         (sub.get("model_name") for sub in body.get("sub_job_configs") or () if sub.get("job_type") == "sampling"),

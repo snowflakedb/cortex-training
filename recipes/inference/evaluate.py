@@ -250,6 +250,8 @@ class Config:
     job_config: str = "configs/qwen3_8b_full.json"
     debug_image_tag: str | None = None
     keep_job: bool | None = None
+    # The job's name (its comment). Default: inference-evaluate TASK · MODEL; name="" sends none.
+    name: str | None = None
 
     source_job_id: str | None = None
     # Required with source_job_id. Use the cp_* id.
@@ -287,6 +289,7 @@ def run_evaluation(
     keep_job: bool | None = None,
     prompts_file: str | None = None,
     phrase: str = IDENTITY_PHRASE,
+    name: str | None = None,
 ) -> dict[str, float]:
     if debug_image_tag:
         os.environ[DEBUG_OPTIONS_ENV] = "1"
@@ -297,6 +300,8 @@ def run_evaluation(
         source_job_id=source_job_id,
         checkpoint_id=checkpoint_id,
         debug_image_tag=debug_image_tag,
+        recipe=f"inference-evaluate {task.strip().lower()}",
+        name=name,
     )
     sampling_sub = next(
         (
@@ -379,6 +384,7 @@ def main(config: Config):
         keep_job=config.keep_job,
         prompts_file=config.prompts_file,
         phrase=config.phrase,
+        name=config.name,
     )
 
 

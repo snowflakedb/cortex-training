@@ -23,6 +23,7 @@ from recipes.utils import forward_backward_step
 from recipes.utils import load_job_body
 from recipes.utils import log_saved_checkpoints
 from recipes.utils import make_client
+from recipes.utils import name_job
 from recipes.utils import router_replay_stop_params
 from recipes.utils import running_job
 from recipes.utils import sampling_params_with_sample_ids
@@ -62,6 +63,7 @@ class Config(Protocol):
     eval_max_tokens: int | None
     weight_sync_bucket_size: int | None
     job_config: str
+    name: str | None
 
 
 class Task(Protocol):
@@ -98,6 +100,14 @@ def job_body(config: Config) -> dict:
     return body
 
 
+def named_job_body(config: Config, task: Task) -> dict:
+    """The job body with the job's name: ``name=``, else ``<task>-grpo · MODEL``.
+
+    For the MATH task that is ``math-grpo · Qwen3-8B LoRA``.
+    """
+    return name_job(job_body(config), f"{task.name.lower()}-grpo", getattr(config, "name", None))
+
+
 def processing_block(config: Config, global_batch_size: int) -> dict:
     return {
         "loss_fn": "grpo",
@@ -125,7 +135,7 @@ def train(config: Config, task: Task) -> None:
 
 
 def _train(config: Config, task: Task) -> None:
-    body = job_body(config)
+    body = named_job_body(config, task)
     subs = {sub.get("job_type"): sub for sub in body.get("sub_job_configs") or ()}
     training_sub = subs.get("training") or {}
     sampling_sub = subs.get("sampling") or {}

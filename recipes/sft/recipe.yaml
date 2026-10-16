@@ -21,6 +21,10 @@ datasets:
 precision:
   - bfloat16
 default_training_gpus: 4
+# Each run names the job it creates (the job's comment): RECIPE · MODEL,
+# with LoRA after the model for a LoRA config. name=TEXT on the command
+# line picks another name; name="" creates the job without one.
+default_job_name: "conversational-sft · MODEL"
 provenance:
   project: tinker-cookbook
   recipe: recipes/sl_loop.py

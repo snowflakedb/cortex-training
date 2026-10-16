@@ -67,8 +67,15 @@ python -m recipes.rl.math_grpo.train \
   n_test=N_TEST \
   weight_sync_bucket_size=WEIGHT_SYNC_BUCKET_SIZE_BYTES \
   wandb_project=WANDB_PROJECT \
-  sf_tracking=SF_TRACKING
+  sf_tracking=SF_TRACKING \
+  name=JOB_NAME
 ```
+
+`name` names the job (its `comment`, shown by `cortex-training get`, `list`
+and `tui`; at most 1,024 bytes, and not editable later). The default is the
+recipe and model, for example `math-grpo · Qwen3-8B LoRA`; `name=""` creates
+the job without one, and a `comment` in the job config JSON is used when
+`name=` is not given.
 
 LoRA, GPU counts, sequence length, and MoE live in the job-config JSON. Set
 `wandb_project` to log to Weights & Biases after `uv pip install wandb` and

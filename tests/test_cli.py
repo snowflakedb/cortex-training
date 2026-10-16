@@ -835,10 +835,10 @@ def test_list_limit_drops_undated_jobs_before_newer_dated_ones():
     _, ids = _list_ids(["--limit", "4"], jobs=jobs)
     assert ids == ["before", "midnight", "noon", "next-day"]
 
-    # Undated rows fill what the dated ones leave, newest first, and still
-    # print after them.
+    # Undated rows fill what the dated ones leave, newest first, and print
+    # before them, as the oldest.
     _, ids = _list_ids(["--limit", "5"], jobs=jobs)
-    assert ids == ["before", "midnight", "noon", "next-day", "undated-a"]
+    assert ids == ["undated-a", "before", "midnight", "noon", "next-day"]
 
 
 def test_list_limit_keeps_the_first_undated_jobs_when_none_are_dated():
@@ -901,6 +901,8 @@ def test_list_all_sends_every_filter_to_the_server():
         # The server's bound is exclusive, so --until sends the day after.
         "created_before": date(2026, 10, 3),
         "page_size": 100,
+        # A filtered page can fail only after a long status lookup.
+        "max_retries": 2,
     }
     assert ids == ["a", "b"]
 
@@ -1003,7 +1005,9 @@ def test_list_prints_latest_jobs_last():
     }
 
 
-def test_list_sorts_missing_created_at_after_dated_jobs():
+def test_list_sorts_missing_created_at_first_as_the_oldest():
+    # --limit counts a job without created_at as the oldest, so it prints first
+    # and the newest dated job stays last.
     stdout = io.StringIO()
 
     def make_client(_args):
@@ -1027,9 +1031,9 @@ def test_list_sorts_missing_created_at_after_dated_jobs():
 
     assert rc == 0
     assert [job["job_id"] for job in json.loads(stdout.getvalue())["jobs"]] == [
+        "missing",
         "oldest",
         "latest",
-        "missing",
     ]
 
 

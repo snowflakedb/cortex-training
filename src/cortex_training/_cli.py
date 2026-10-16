@@ -18,11 +18,15 @@
 from __future__ import annotations
 
 import argparse
+import codecs
+import contextlib
 import itertools
 import json
+import logging
 import os
 import re
 import sys
+import unicodedata
 from datetime import date
 from datetime import datetime
 from datetime import timedelta
@@ -30,7 +34,10 @@ from datetime import timezone
 from pathlib import Path
 from typing import Any
 from typing import Callable
+from typing import Iterator
 from typing import TextIO
+
+logger = logging.getLogger(__name__)
 
 _CONFIG_KEYS = {
     "base_url",
@@ -53,8 +60,11 @@ _CONFIG_ALIASES = {
 _LOGIN_STATE_ENV = "CORTEX_TRAINING_LOGIN_FILE"
 
 # The statuses each `list --status` word matches, as on the account-level
-# route: pending excludes placing, done takes the DONE older jobs show, and
-# UNKNOWN rows match nothing.
+# route: pending excludes placing, terminal adds failed to cancelled and
+# terminated, and UNKNOWN rows match nothing. done keeps its older meaning,
+# cancelled and terminated; the account-level route no longer takes the word,
+# so the client sends those two for it there, and only this local filter can
+# also keep the DONE that older jobs show.
 _LIST_STATUS_FILTERS = {
     "pending": {"pending"},
     "placing": {"placing"},
@@ -64,6 +74,7 @@ _LIST_STATUS_FILTERS = {
     "cancelled": {"cancelled"},
     "terminated": {"terminated"},
     "active": {"pending", "placing", "initializing", "running"},
+    "terminal": {"cancelled", "terminated", "failed"},
     "done": {"cancelled", "terminated", "done"},
 }
 
@@ -102,6 +113,43 @@ def _normalize_host(host: str) -> str:
 
 def _has_url_scheme(url: str) -> bool:
     return url.startswith("http://") or url.startswith("https://")
+
+
+# Characters a terminal can act on, or that hide or reorder the text around
+# them: control characters (C0 and C1; ESC starts escape sequences, CR rewrites
+# the line), invisible format characters such as bidi overrides and zero-width
+# marks, line and paragraph separators, and unpaired surrogates, which have no
+# UTF-8 form.
+_UNSAFE_TEXT_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+# Candidates for that check: anything but printable ASCII and the newline.
+_NOT_PLAIN_TEXT_RE = re.compile(r"[^\n\x20-\x7e]")
+
+
+def _is_unsafe_char(char: str) -> bool:
+    return unicodedata.category(char) in _UNSAFE_TEXT_CATEGORIES
+
+
+def _printable(text: str) -> str:
+    """``text`` for a terminal: each unsafe character becomes its escape, such as ``\\x1b``.
+
+    Service answers, file names and error bodies reach stderr through this, so
+    none of them can move the cursor, retitle the window or write the
+    clipboard. Newlines are kept; other text, accented letters included, is
+    unchanged.
+    """
+
+    def escape(match: re.Match) -> str:
+        char = match.group()
+        return ascii(char)[1:-1] if _is_unsafe_char(char) else char
+
+    return _NOT_PLAIN_TEXT_RE.sub(escape, text)
+
+
+class _PrintableFormatter(logging.Formatter):
+    """A log formatter whose lines are safe for a terminal (see :func:`_printable`)."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return _printable(super().format(record))
 
 
 # The service rejects a GPU type the account does not support with this code.
@@ -150,48 +198,25 @@ def _created_epoch(raw: Any) -> float | None:
     return created.timestamp()
 
 
-def _jobs_latest_last(jobs: list[Any]) -> list[Any]:
-    """Render jobs oldest-first so the newest entries land at the terminal."""
-    dated_jobs = [
-        (
-            _created_epoch(job.get("created_at")) if isinstance(job, dict) else None,
-            index,
-            job,
-        )
-        for index, job in enumerate(jobs)
-    ]
-    if any(created is not None for created, _, _ in dated_jobs):
-        return [
-            job
-            for _, _, job in sorted(
-                dated_jobs,
-                key=lambda item: (
-                    item[0] is None,
-                    item[0] if item[0] is not None else float("inf"),
-                    item[1],
-                ),
-            )
-        ]
-    return list(reversed(jobs))
+def _jobs_latest_last(jobs: list[Any], limit: int | None = None) -> list[Any]:
+    """Render jobs oldest-first so the newest entries land at the terminal.
 
-
-def _newest_jobs(jobs: list[Any], limit: int) -> list[Any]:
-    """The ``limit`` newest jobs by ``created_at``, in the order given.
-
-    A missing timestamp ranks oldest, so ``--limit`` drops those rows first;
-    ties break toward the earlier row, the server answering newest first.
+    ``limit`` keeps only that many of the newest by ``created_at``. A job
+    without a readable ``created_at`` counts as oldest: ``limit`` drops it
+    first, and it is printed first. Ties rank in the server's order, the
+    account-level list answering newest first. The jobs are printed in exactly
+    the reverse of that ranking, so ``list --limit N`` prints the last N jobs
+    of ``list``.
     """
-    if limit >= len(jobs):
-        return list(jobs)
-    last = len(jobs) - 1
 
-    def rank(item: tuple[int, Any]) -> tuple[float, int]:
-        index, job = item
+    def age(job: Any) -> float:
         created = _created_epoch(job.get("created_at")) if isinstance(job, dict) else None
-        return (created if created is not None else float("-inf"), last - index)
+        return -created if created is not None else float("inf")
 
-    newest = sorted(enumerate(jobs), key=rank)[-limit:]
-    return [job for _, job in sorted(newest)]
+    newest_first = sorted(jobs, key=age)
+    if limit is not None:
+        newest_first = newest_first[:limit]
+    return newest_first[::-1]
 
 
 def _status_list(raw: str) -> str:
@@ -363,6 +388,16 @@ def build_parser(
     )
     submit.add_argument("--job-id", help="Set or override the top-level job_id.")
     submit.add_argument(
+        "--comment",
+        metavar="TEXT",
+        help=(
+            "Name the job: free text, at most 1,024 bytes of UTF-8, that get, list "
+            "and the TUI show. It can't be changed later. Overrides a comment in the "
+            "JSON; an empty TEXT sends none. A model deployment is sent without it, "
+            "because it rejects one."
+        ),
+    )
+    submit.add_argument(
         "--dry-run",
         action="store_true",
         help="Validate and print the CreateJob body without sending it.",
@@ -382,15 +417,16 @@ def build_parser(
     )
     checkpoints.add_argument("job_id")
 
-    list_jobs = subparsers.add_parser("list", help="List Cortex Training jobs.")
+    list_jobs = subparsers.add_parser("list", help="List Cortex Training jobs, oldest first.")
     list_jobs.add_argument(
         "--status",
         type=_status_list,
         help=(
             "Comma-separated statuses to keep: "
             + ", ".join(_LIST_STATUS_FILTERS)
-            + ". active is pending through running; done is cancelled, terminated, "
-            "and the DONE that older jobs show."
+            + ". active is pending through running; terminal is cancelled, "
+            "terminated, and failed; done is cancelled and terminated, plus, "
+            "without --all, the DONE that older jobs show."
         ),
     )
     list_jobs.add_argument(
@@ -398,11 +434,19 @@ def build_parser(
         action="store_true",
         help=(
             "List jobs across every schema in the account that the current user "
-            "can see, not just the configured one. Fails if account-level listing "
-            "is not enabled for the account."
+            "can see, not just the configured one. Works once the service has "
+            "account-level listing and it is enabled for the account; until "
+            "then it fails and says why. With --status, a failing page is "
+            "retried twice, not ten times."
         ),
     )
-    list_jobs.add_argument("--user", help="Keep jobs submitted by this user.")
+    list_jobs.add_argument(
+        "--user",
+        help=(
+            "Keep jobs submitted by this user. With --all, a name that matches "
+            "no active user in the account is an error."
+        ),
+    )
     list_jobs.add_argument(
         "--since",
         type=_utc_date,
@@ -628,7 +672,7 @@ def build_parser(
     if include_tui:
         subparsers.add_parser(
             "tui",
-            help="Open the read-only Cortex Training logs and resources TUI.",
+            help="Open the read-only Cortex Training job TUI.",
         )
 
     return parser
@@ -900,6 +944,12 @@ def build_client(args: argparse.Namespace, cortex_training_client_cls):
         "poll_interval": args.poll_interval,
         "poll_timeout": args.poll_timeout,
     }
+    # The TUI bounds every read (`cortex-training tui` sets these); the CLI
+    # commands keep the client's defaults.
+    for option in ("max_retries", "request_timeout"):
+        value = getattr(args, option, None)
+        if value is not None:
+            kwargs[option] = value
     if args.base_url:
         return cortex_training_client_cls(base_url=args.base_url, **kwargs)
     if args.use_connection_profile:
@@ -953,7 +1003,9 @@ def _reject_log_probability_sub_job(job_type: Any, *, location: str) -> None:
         raise ValueError(f"{location}: {_UNSUPPORTED_LOG_PROBABILITY_MESSAGE}")
 
 
-def _validate_create_job_body(body: dict[str, Any]) -> None:
+def _validate_create_job_body(body: dict[str, Any]) -> dict[str, Any]:
+    """Check a CreateJob body as a live submit would; return the body to send."""
+    from .client import _body_with_checked_comment
     from .client import _validate_raw_sub_job_configs
 
     sub_job_configs = body.get("sub_job_configs")
@@ -973,14 +1025,58 @@ def _validate_create_job_body(body: dict[str, Any]) -> None:
             if training_sub_jobs > 1:
                 raise ValueError("at most one training sub-job is supported per job")
     _validate_raw_sub_job_configs(sub_job_configs)
+    return _body_with_checked_comment(body)
 
 
 def _print_json(value: Any, stdout: TextIO, *, compact: bool, sort_keys: bool = True) -> None:
-    if compact:
-        json.dump(value, stdout, separators=(",", ":"), sort_keys=sort_keys)
-    else:
-        json.dump(value, stdout, indent=2, sort_keys=sort_keys)
-    stdout.write("\n")
+    """Write ``value`` to ``stdout`` as one JSON document, pretty unless ``compact``,
+    its keys sorted unless ``sort_keys`` is False (the value's own order, as the
+    capacity breakdown's).
+
+    Text is written as UTF-8 when ``stdout`` takes it, so a name in any script
+    reads as written; a character a terminal could act on (see
+    :func:`_printable`) stays a ``\\u`` escape. A stream with another encoding
+    (a Windows pipe, say) gets every non-ASCII character as an escape instead,
+    so its bytes are ASCII and still the UTF-8 JSON that ``jq`` reads. Either
+    way the document decodes to the same value.
+    """
+    layout: dict[str, Any] = {"separators": (",", ":")} if compact else {"indent": 2}
+    utf8 = _takes_utf8(stdout)
+    text = json.dumps(value, sort_keys=sort_keys, ensure_ascii=not utf8, **layout)
+    if utf8:
+        text = _NOT_ASCII_RE.sub(_escape_unsafe_json_char, text)
+    stdout.write(text + "\n")
+
+
+# Everything json.dumps(ensure_ascii=False) can leave unescaped that is worth a look:
+# DEL and every non-ASCII character. Only the unsafe ones among them are escaped.
+_NOT_ASCII_RE = re.compile(r"[^\x00-\x7e]")
+
+
+def _escape_unsafe_json_char(match: re.Match) -> str:
+    """A JSON ``\\u`` escape for an unsafe character, as a surrogate pair above U+FFFF.
+
+    Any other character is returned as it is.
+    """
+    char = match.group()
+    if not _is_unsafe_char(char):
+        return char
+    code = ord(char)
+    if code <= 0xFFFF:
+        return f"\\u{code:04x}"
+    code -= 0x10000
+    return f"\\u{0xD800 + (code >> 10):04x}\\u{0xDC00 + (code & 0x3FF):04x}"
+
+
+def _takes_utf8(stream: TextIO) -> bool:
+    """Whether ``stream`` writes UTF-8, or keeps text as str (``io.StringIO``)."""
+    encoding = getattr(stream, "encoding", None)
+    if not isinstance(encoding, str):
+        return True
+    try:
+        return codecs.lookup(encoding).name == "utf-8"
+    except LookupError:
+        return False
 
 
 def _request_sent_pat(response: Any) -> bool:
@@ -991,27 +1087,52 @@ def _request_sent_pat(response: Any) -> bool:
 
 
 def _format_error(exc: BaseException) -> str:
+    message = str(exc)
+    parts = [message]
+    body = ""
     response = getattr(exc, "response", None)
-    if response is None:
-        return str(exc)
+    if response is not None:
+        request_id = getattr(response, "headers", {}).get("x-snowflake-request-id")
+        if request_id and request_id not in message:
+            parts.append(f"snowflake request id: {request_id}")
 
-    parts = [str(exc)]
-    request_id = getattr(response, "headers", {}).get("x-snowflake-request-id")
-    if request_id and request_id not in parts[0]:
-        parts.append(f"snowflake request id: {request_id}")
+        body = getattr(response, "text", "") or ""
+        body = body.strip() if isinstance(body, str) else ""
+        if body:
+            shown = body if len(body) <= 4000 else body[:4000] + "...<truncated>"
+            parts.append(f"response body: {shown}")
+        if getattr(response, "status_code", None) == 401 and _request_sent_pat(response):
+            from cortex_training.snowflake_auth import credentials_rejected_hint
 
-    body = (getattr(response, "text", "") or "").strip()
-    if body:
-        if len(body) > 4000:
-            body = body[:4000] + "...<truncated>"
-        parts.append(f"response body: {body}")
-    if getattr(response, "status_code", None) == 401 and _request_sent_pat(response):
-        from cortex_training.snowflake_auth import credentials_rejected_hint
-
-        parts.append(
-            credentials_rejected_hint("Snowflake rejected your credentials (HTTP 401).")
-        )
+            parts.append(
+                credentials_rejected_hint("Snowflake rejected your credentials (HTTP 401).")
+            )
+    hint = _experiment_access_hint(f"{message}\n{body}")
+    if hint:
+        parts.append(hint)
     return "\n".join(parts)
+
+
+def _experiment_access_hint(text: str) -> str | None:
+    """The ``hint:`` line when ``text``, an error and its body, says the role can't read the Experiment."""
+    if _EXPERIMENT_ACCESS_DENIED in text:
+        return _EXPERIMENT_ACCESS_HINT
+    if _LINKED_EXPERIMENT_NOT_FOUND in text:
+        return _EXPERIMENT_GONE_HINT
+    if _EXPERIMENT_SQL_DENIED.search(text):
+        return _EXPERIMENT_SQL_HINT
+    return None
+
+
+def _is_connector_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is the Snowflake Connector's own error: refused SQL, or a failed login.
+
+    download-log and download-metrics read the job's Experiment with SQL. The
+    connector is loaded by then, so an error from it means it is in sys.modules.
+    """
+    errors = sys.modules.get("snowflake.connector.errors")
+    error_class = getattr(errors, "Error", None)
+    return isinstance(error_class, type) and isinstance(exc, error_class)
 
 
 def _cmd_submit(
@@ -1021,7 +1142,11 @@ def _cmd_submit(
     stdin: TextIO,
 ) -> int:
     body = _read_json_object(args.json_file, stdin)
-    _validate_create_job_body(body)
+    if args.comment is not None:
+        # --comment replaces the JSON's comment. A blank one is left out on the
+        # way out, so an empty TEXT removes it, as a recipe's name="" does.
+        body = {**body, "comment": args.comment}
+    body = _validate_create_job_body(body)
     if args.job_id is not None:
         body = dict(body)
         body["job_id"] = args.job_id
@@ -1042,29 +1167,91 @@ def _cmd_submit(
 
 def _cmd_list(args: argparse.Namespace, client, stdout: TextIO) -> int:
     if args.all:
-        jobs = list(
-            itertools.islice(
-                client.iter_jobs(
-                    status=args.status,
-                    submitted_by=args.user,
-                    created_after=args.since,
-                    # The server's bound is exclusive; --until names the last day kept.
-                    created_before=(
-                        None if args.until is None else args.until + timedelta(days=1)
+        # Under a status filter the service fails a page only after waiting up
+        # to 300 s on its status lookup, so such a page gets fewer retries.
+        bounds = {} if args.status is None else {"max_retries": _LIST_ALL_STATUS_RETRIES}
+        try:
+            jobs = list(
+                itertools.islice(
+                    client.iter_jobs(
+                        status=args.status,
+                        submitted_by=args.user,
+                        created_after=args.since,
+                        # The server's bound is exclusive; --until names the last day kept.
+                        created_before=(
+                            None if args.until is None else args.until + timedelta(days=1)
+                        ),
+                        # No bigger than what gets printed; the server takes 1 to 1000.
+                        page_size=min(args.limit or 100, 1000),
+                        **bounds,
                     ),
-                    # No bigger than what gets printed; the server takes 1 to 1000.
-                    page_size=min(args.limit or 100, 1000),
-                ),
-                args.limit,
+                    args.limit,
+                )
             )
-        )
+        except Exception as exc:
+            if args.user is not None and _is_unknown_submitter(exc):
+                raise _unknown_submitter_error(args.user, exc) from exc
+            raise
     else:
         keep = _list_filter(args)
         jobs = [job for job in client.list_jobs() if keep(job)]
-    if args.limit is not None:
-        jobs = _newest_jobs(jobs, args.limit)
-    _print_json({"jobs": _jobs_latest_last(jobs)}, stdout, compact=args.compact)
+    _print_json({"jobs": _jobs_latest_last(jobs, args.limit)}, stdout, compact=args.compact)
     return 0
+
+
+# Retries after the first attempt for each `list --all --status` page; other
+# pages keep the client's default.
+_LIST_ALL_STATUS_RETRIES = 2
+
+# The account-level list's 400 for a submitted_by that names no active user in
+# the account. Without --all, the CLI filters the schema's rows itself, so an
+# unknown user just matches no job.
+_UNKNOWN_SUBMITTER_MESSAGE = "submitted_by user not found or not authorized"
+
+
+def _is_unknown_submitter(exc: BaseException) -> bool:
+    response = getattr(exc, "response", None)
+    if response is None or getattr(response, "status_code", None) != 400:
+        return False
+    try:
+        text = response.text
+    except Exception:
+        return False
+    return isinstance(text, str) and _UNKNOWN_SUBMITTER_MESSAGE in text
+
+
+def _unknown_submitter_error(user: str, exc: BaseException) -> Exception:
+    """The service's 400 for ``--user``, saying what to change, with its request id."""
+    import requests
+
+    from .client import _add_snowflake_request_id_to_error
+    from .client import _response_snowflake_request_id
+
+    response = getattr(exc, "response", None)
+    error = requests.exceptions.HTTPError(
+        _unknown_submitter_message(user),
+        response=response,
+        request=getattr(exc, "request", None),
+    )
+    _add_snowflake_request_id_to_error(error, _response_snowflake_request_id(response))
+    return error
+
+
+def _unknown_submitter_message(user: str) -> str:
+    import shlex
+
+    message = (
+        f"--user {user}: no active user in this account has that name "
+        f"(HTTP 400: {_UNKNOWN_SUBMITTER_MESSAGE})"
+    )
+    if not user.startswith('"') and user != user.upper():
+        # SQL identifier rules: unquoted means the uppercase name.
+        quoted = shlex.quote('"' + user.replace('"', '""') + '"')
+        message += (
+            f"; an unquoted name means {user.upper()}, so quote a lowercase or "
+            f"mixed-case name to match it exactly: --user {quoted}"
+        )
+    return message
 
 
 def _cmd_login(args: argparse.Namespace, stdout: TextIO) -> int:
@@ -1352,6 +1539,64 @@ def _cmd_download_metrics(
     return 0
 
 
+# Duplicated from client.py rather than imported, like the log-probability
+# aliases above: formatting an error must not import the client (and torch).
+# The service answers 500 when it can't resolve the job's Experiment for the
+# caller's role. The checkpoint routes word it this way...
+_EXPERIMENT_ACCESS_DENIED = "Linked experiment is not found or not authorized"
+# ... and the experiment-run lookup that saved logs and GPU metrics start with
+# says "Linked experiment is not found for job <job id>", which also covers an
+# Experiment that no longer exists. Both start with this.
+_LINKED_EXPERIMENT_NOT_FOUND = "Linked experiment is not found"
+_EXPERIMENT_ACCESS_HINT = (
+    "hint: this role can't read the job's Experiment, where its saved logs, GPU "
+    "metrics and checkpoints live. Ask for access to the Experiment, or use the "
+    "role that created the job."
+)
+_EXPERIMENT_GONE_HINT = (
+    "hint: this role can't read the job's Experiment, or it no longer exists; the "
+    "job's saved logs, GPU metrics and checkpoints live there. Ask for access to "
+    "the Experiment, or use the role that created the job."
+)
+# Snowflake refusing the SQL LIST or GET that download-log and download-metrics
+# run on the Experiment: the role reaches the service but has no privileges on
+# the Experiment (a MONITOR-only role, say). Only these words: an error about a
+# schema or a warehouse that merely mentions an experiment is not this.
+_EXPERIMENT_SQL_DENIED = re.compile(
+    r"insufficient privileges to operate on experiment\b"
+    r"|\bexperiment(?:\s+run)?\s+(?:'[^']*'|\"[^\"]*\"|[^\s'\"]+)\s+does not exist or not authorized",
+    re.IGNORECASE,
+)
+_EXPERIMENT_SQL_HINT = (
+    "hint: this role has no privileges on the job's Experiment, where its saved logs "
+    "and GPU metrics are read with SQL. Ask for access to the Experiment, or use the "
+    "role that created the job; the checkpoints command doesn't need it."
+)
+
+
+@contextlib.contextmanager
+def _progress_logging(stream: TextIO) -> Iterator[None]:
+    """Show the package's warnings on ``stream`` (stderr) for one command, through the printable pass.
+
+    stdout carries the command's JSON. The handler sits on the package logger,
+    so the client's warnings, which Python would otherwise write to stderr as
+    they are, also go through the printable pass: they can quote the service,
+    a job's reason for example. When logging is already configured, the
+    embedding program's own handlers decide instead.
+    """
+    package = logging.getLogger(__name__.rpartition(".")[0])
+    if logging.getLogger().handlers or logger.handlers or package.handlers:
+        yield
+        return
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(_PrintableFormatter("%(message)s"))
+    package.addHandler(handler)
+    try:
+        yield
+    finally:
+        package.removeHandler(handler)
+
+
 def _is_unsupported_hardware(exc: BaseException) -> bool:
     """Whether a capacity lookup failed only because the account lacks that GPU type."""
     response = getattr(exc, "response", None)
@@ -1478,10 +1723,10 @@ def main(
                 return None
 
             client_factory = empty_client_factory
-        return _run(args, client_factory, stdout, stdin, stderr)
+        with _progress_logging(stderr):
+            return _run(args, client_factory, stdout, stdin, stderr)
     except (OSError, ValueError, RuntimeError) as exc:
-        print(f"error: {_format_error(exc)}", file=stderr)
-        return 1
+        return _report_error(exc, stderr)
     except ModuleNotFoundError as exc:
         missing = exc.name or "a required package"
         print(
@@ -1491,6 +1736,19 @@ def main(
             file=stderr,
         )
         return 1
+    except Exception as exc:
+        # Snowflake refusing the SQL on a job's Experiment, or a failed login:
+        # one error line (and hint), not a traceback.
+        if not _is_connector_error(exc):
+            raise
+        return _report_error(exc, stderr)
+
+
+def _report_error(exc: BaseException, stderr: TextIO) -> int:
+    """Write the ``error:`` line (and any hint) for a failed command; return its exit status."""
+    # The message can quote the service's answer: keep it safe for a terminal.
+    stderr.write(f"error: {_printable(_format_error(exc))}\n")
+    return 1
 
 
 if __name__ == "__main__":

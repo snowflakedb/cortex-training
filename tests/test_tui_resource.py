@@ -7,8 +7,10 @@ from pathlib import Path
 
 import cortex_training.tui.resource as resource_module
 from cortex_training.tui.resource import load_resource_data
-from cortex_training.tui.resource import parse_sample_ts
-from cortex_training.tui.resource import render_chart
+from tests.resource_legacy import gpu_jobs
+from tests.resource_legacy import render_chart
+
+parse_sample_epoch = resource_module._sample_epoch
 
 
 def _row(
@@ -65,22 +67,25 @@ def _write_metrics(
 
 
 def test_parse_rfc3339_nano_on_python_floor():
-    parsed = parse_sample_ts("2026-01-01T00:00:00.123456789Z")
-    assert parsed == datetime(2026, 1, 1, 0, 0, 0, 123456, tzinfo=timezone.utc)
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()
+    parsed = parse_sample_epoch("2026-01-01T00:00:00.123456789Z")
+    assert parsed == base + 0.123456
     for fraction, microsecond in [
         ("1", 100000),
         ("12", 120000),
         ("1234", 123400),
         ("12345", 123450),
     ]:
-        parsed = parse_sample_ts(f"2026-01-01T00:00:00.{fraction}Z")
+        parsed = parse_sample_epoch(f"2026-01-01T00:00:00.{fraction}Z")
         assert parsed is not None
-        assert parsed.microsecond == microsecond
-    assert parse_sample_ts("2026-01-01T00:00:00Z") is not None
-    assert parse_sample_ts("not-a-time") is None
-    assert parse_sample_ts("2026-01-01 00:00:00Z") is None
-    assert parse_sample_ts("0001-01-01T00:00:00+05:00") is None
-    assert parse_sample_ts("9999-12-31T23:59:59-05:00") is None
+        assert round((parsed - base) * 1_000_000) == microsecond
+    assert parse_sample_epoch("2026-01-01T00:00:00Z") == base
+    assert parse_sample_epoch("2026-01-01T01:00:00+01:00") == base
+    assert parse_sample_epoch("not-a-time") is None
+    assert parse_sample_epoch("2026-01-01 00:00:00Z") is None
+    assert parse_sample_epoch("2026-01-01T00:00:00") is None  # no zone
+    assert parse_sample_epoch("0001-01-01T00:00:00+05:00") is None
+    assert parse_sample_epoch("9999-12-31T23:59:59-05:00") is None
 
 
 def test_redacted_v2_fixture_preserves_zero(tmp_path):
@@ -94,9 +99,9 @@ def test_redacted_v2_fixture_preserves_zero(tmp_path):
     )
 
     data = load_resource_data(root)
-    view = data.sub_jobs["JOB_ID:training:0"].views["all"]
+    view = gpu_jobs(data)["JOB_ID:training:0"].views["all"]
     assert view.rows[0].current_util_pct == 0.0
-    assert view.average_util_pct == 0.0
+    assert view.busy.avg == 0.0
     assert data.ignored_rows == 0
 
 
@@ -106,6 +111,7 @@ def test_mixed_system_rows_are_silent_but_bad_gpu_rows_warn(tmp_path):
         "record_version": 3,
         "kind": "system",
         "sample_ts": now.isoformat(),
+        "worker_num": 0,
         "cpu_util_pct": 25,
     }
     unknown = {"record_version": 3, "kind": "future", "sample_ts": now.isoformat()}
@@ -120,7 +126,7 @@ def test_mixed_system_rows_are_silent_but_bad_gpu_rows_warn(tmp_path):
 
     data = load_resource_data(tmp_path)
     assert data.ignored_rows == 3
-    assert data.sub_jobs["job:training:0"].views["all"].rows[0].current_util_pct == 0
+    assert gpu_jobs(data)["job:training:0"].views["all"].rows[0].current_util_pct == 0
 
 
 def test_extreme_timestamp_rows_are_ignored_while_valid_rows_render(tmp_path):
@@ -136,7 +142,7 @@ def test_extreme_timestamp_rows_are_ignored_while_valid_rows_render(tmp_path):
     )
 
     data = load_resource_data(tmp_path)
-    view = data.sub_jobs["job:training:0"].views["all"]
+    view = gpu_jobs(data)["job:training:0"].views["all"]
     assert [row.global_gpu_index for row in view.rows] == [2]
     assert data.ignored_rows == 2
     assert render_chart(view, 30)
@@ -151,11 +157,11 @@ def test_kind_gpu_and_invalid_values_keep_latest_without_weighting(tmp_path):
     later["sample_interval_s"] = -1
     _write_metrics(tmp_path, "job:training:0", [missing_interval, later])
 
-    view = load_resource_data(tmp_path).sub_jobs["job:training:0"].views["all"]
+    view = gpu_jobs(load_resource_data(tmp_path))["job:training:0"].views["all"]
     assert view.rows[0].current_util_pct is None
     assert view.rows[0].fb_used_bytes is None
     assert view.rows[0].window_avg_util_pct is None
-    assert view.average_util_pct is None
+    assert view.busy.avg is None
 
 
 def test_overflowing_number_and_deep_json_are_ignored_without_crashing(tmp_path):
@@ -172,7 +178,7 @@ def test_overflowing_number_and_deep_json_are_ignored_without_crashing(tmp_path)
     )
 
     data = load_resource_data(tmp_path)
-    view = data.sub_jobs["job:training:0"].views["all"]
+    view = gpu_jobs(data)["job:training:0"].views["all"]
     assert view.rows[0].current_util_pct is None
     assert view.rows[0].fb_used_bytes is None
     assert view.rows[1].current_util_pct == 50
@@ -198,7 +204,7 @@ def test_gpu_kind_still_requires_v2_and_matching_sub_job(tmp_path):
     )
 
     data = load_resource_data(tmp_path)
-    assert data.sub_jobs == {}
+    assert gpu_jobs(data) == {}
     assert data.ignored_rows_by_sub_job == {"job:training:0": 2}
 
 
@@ -208,7 +214,7 @@ def test_unsupported_rows_are_tracked_per_sub_job_without_valid_samples(tmp_path
     _write_metrics(tmp_path, "job:sampling:0", [_row(now, 0, 20), "{bad json"])
 
     data = load_resource_data(tmp_path)
-    assert "job:training:0" not in data.sub_jobs
+    assert "job:training:0" not in gpu_jobs(data)
     assert data.ignored_rows_by_sub_job == {
         "job:training:0": 1,
         "job:sampling:0": 1,
@@ -226,8 +232,8 @@ def test_identity_is_global_gpu_within_sub_job(tmp_path):
     _write_metrics(tmp_path, "job:sampling:0", [_row(now, 0, 30, local_gpu=0)])
 
     data = load_resource_data(tmp_path)
-    training = data.sub_jobs["job:training:0"].views["all"]
-    sampling = data.sub_jobs["job:sampling:0"].views["all"]
+    training = gpu_jobs(data)["job:training:0"].views["all"]
+    sampling = gpu_jobs(data)["job:sampling:0"].views["all"]
     assert [row.global_gpu_index for row in training.rows] == [0, 1]
     assert [row.current_util_pct for row in training.rows] == [10, 90]
     assert [row.current_util_pct for row in sampling.rows] == [30]
@@ -238,7 +244,7 @@ def test_regular_five_second_series_is_contiguous_and_includes_latest(tmp_path):
     rows = [_row(start + timedelta(seconds=5 * i), 0, 10) for i in range(61)]
     _write_metrics(tmp_path, "job:training:0", rows)
 
-    view = load_resource_data(tmp_path).sub_jobs["job:training:0"].views["5m"]
+    view = gpu_jobs(load_resource_data(tmp_path))["job:training:0"].views["10m"]
     assert len(view.chart) == 61
     assert all(value == 10 for value in view.chart)
     assert view.end == start + timedelta(minutes=5)
@@ -256,7 +262,7 @@ def test_regular_series_with_scrape_jitter_stays_contiguous(tmp_path):
     ]
     _write_metrics(tmp_path, "job:training:0", rows)
 
-    view = load_resource_data(tmp_path).sub_jobs["job:training:0"].views["5m"]
+    view = gpu_jobs(load_resource_data(tmp_path))["job:training:0"].views["10m"]
     assert len(view.chart) == 61
     assert all(value == 90 for value in view.chart)
 
@@ -275,23 +281,24 @@ def test_ranges_are_per_sub_job_bounded_and_preserve_gaps(tmp_path):
     )
 
     data = load_resource_data(tmp_path)
-    training = data.sub_jobs["job:training:0"].views["all"]
-    sampling = data.sub_jobs["job:sampling:0"].views["5m"]
+    training = gpu_jobs(data)["job:training:0"].views["all"]
+    sampling = gpu_jobs(data)["job:sampling:0"].views["10m"]
     assert len(training.chart) == 240
     assert sampling.start == start
     assert sampling.end == start + timedelta(seconds=10)
     assert sampling.chart == (20, None, 20)
 
 
-def test_summary_equal_weights_gpus_with_unequal_sample_counts(tmp_path):
+def test_summary_weights_gpu_time_for_gpus_with_unequal_sample_counts(tmp_path):
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
     rows = [_row(start + timedelta(seconds=5 * i), 0, 0) for i in range(10)]
     rows.append(_row(start + timedelta(seconds=45), 1, 100))
     _write_metrics(tmp_path, "job:training:0", rows)
 
-    view = load_resource_data(tmp_path).sub_jobs["job:training:0"].views["all"]
-    assert view.average_util_pct == 50
-    assert view.chart[-1] == 50
+    view = gpu_jobs(load_resource_data(tmp_path))["job:training:0"].views["all"]
+    # One sample of GPU 1 against ten of GPU 0: it counts for the time it reported.
+    assert abs(view.busy.avg - 100 / 11) < 1e-9
+    assert view.chart[-1] == 50  # the chart's interval there averages both GPUs
 
 
 def test_sample_interval_weights_each_gpu_average(tmp_path):
@@ -305,48 +312,42 @@ def test_sample_interval_weights_each_gpu_average(tmp_path):
         ],
     )
 
-    view = load_resource_data(tmp_path).sub_jobs["job:training:0"].views["all"]
+    view = gpu_jobs(load_resource_data(tmp_path))["job:training:0"].views["all"]
     assert view.rows[0].window_avg_util_pct == 75
-    assert view.average_util_pct == 75
+    assert view.busy.avg == 75
 
 
-def test_loading_uses_two_file_passes_for_all_ranges(tmp_path, monkeypatch):
+def test_loading_reads_each_row_once_for_all_ranges(tmp_path):
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    _write_metrics(
+    path = _write_metrics(
         tmp_path,
         "job:training:0",
         [_row(start + timedelta(seconds=5 * i), 0, 10) for i in range(10)],
     )
-    original = resource_module._documents
-    calls = 0
-
-    def counted_documents(path, committed):
-        nonlocal calls
-        calls += 1
-        yield from original(path, committed)
-
-    monkeypatch.setattr(resource_module, "_documents", counted_documents)
-    data = load_resource_data(tmp_path)
-    assert set(data.sub_jobs["job:training:0"].views) == {"5m", "15m", "1h", "6h", "all"}
-    assert calls == 2
+    loader = resource_module.ResourceLoader(tmp_path)
+    data = loader.load()
+    assert set(gpu_jobs(data)["job:training:0"].views) == {"10m", "30m", "1h", "6h", "all"}
+    assert loader.documents_read == 10
+    assert loader.bytes_read == path.stat().st_size
 
 
 def test_latest_cells_do_not_backfill_and_window_can_be_empty_for_gpu(tmp_path):
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
     older = _row(start, 0, 30)
     older["fb_used_bytes"] = 123.0
-    latest = _row(start + timedelta(minutes=10), 1, 80)
+    # GPU 1's newest sample is 20 minutes in, so GPU 0 has none in the shortest (10m) window.
+    latest = _row(start + timedelta(minutes=20), 1, 80)
     gpu_zero_latest = _row(start + timedelta(minutes=1), 0, None)
     gpu_zero_latest["fb_used_bytes"] = None
     _write_metrics(tmp_path, "job:training:0", [older, gpu_zero_latest, latest])
 
-    view = load_resource_data(tmp_path).sub_jobs["job:training:0"].views["5m"]
+    view = gpu_jobs(load_resource_data(tmp_path))["job:training:0"].views["10m"]
     row0 = view.rows[0]
     assert row0.current_util_pct is None
     assert row0.window_avg_util_pct is None
     assert row0.fb_used_bytes is None
-    assert view.fb_gpu_count == 1
-    assert view.gpu_count == 2
+    assert [row.global_gpu_index for row in view.rows] == [0, 1]
+    assert view.rows[1].fb_used_bytes is not None
 
 
 def test_manifest_bounds_cache_reads(tmp_path):
@@ -359,14 +360,14 @@ def test_manifest_bounds_cache_reads(tmp_path):
         json.dumps({"version": 1, "names": ["chunk.gz"], "bytes": first_size})
     )
     data = load_resource_data(tmp_path)
-    assert [row.global_gpu_index for row in data.sub_jobs["job:training:0"].views["all"].rows] == [0]
+    assert [row.global_gpu_index for row in gpu_jobs(data)["job:training:0"].views["all"].rows] == [0]
 
     path.with_name(".gpu.jsonl.manifest.json").unlink()
-    assert load_resource_data(tmp_path).sub_jobs == {}
+    assert gpu_jobs(load_resource_data(tmp_path)) == {}
     path.with_name(".gpu.jsonl.manifest.json").write_text(
         json.dumps({"version": 1, "names": ["chunk.gz"], "bytes": path.stat().st_size + 1})
     )
-    assert load_resource_data(tmp_path).sub_jobs == {}
+    assert gpu_jobs(load_resource_data(tmp_path)) == {}
 
 
 def test_unterminated_committed_tail_is_not_warned(tmp_path):
@@ -380,14 +381,14 @@ def test_unterminated_committed_tail_is_not_warned(tmp_path):
     )
     data = load_resource_data(tmp_path)
     assert data.ignored_rows == 0
-    assert "job:training:0" in data.sub_jobs
+    assert "job:training:0" in gpu_jobs(data)
 
 
 def test_chart_uses_fixed_scale_labels_and_fits_narrow_width(tmp_path):
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
     rows = [_row(start + timedelta(seconds=5 * i), 0, 10) for i in range(61)]
     _write_metrics(tmp_path, "job:training:0", rows)
-    view = load_resource_data(tmp_path).sub_jobs["job:training:0"].views["all"]
+    view = gpu_jobs(load_resource_data(tmp_path))["job:training:0"].views["all"]
 
     chart = render_chart(view, 30)
     first, axis, labels = chart.splitlines()

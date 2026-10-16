@@ -36,7 +36,11 @@ python -m recipes.inference.serve \
 ```
 
 The command waits until workers are up, prints `job_id`, and leaves the
-endpoint running. Tear it down with:
+endpoint running. The endpoint job is named `inference-serve · MODEL`
+(`inference-generate · MODEL` and `inference-evaluate TASK · MODEL` for the
+other two recipes). The name is the job's `comment`, shown by
+`cortex-training get`, `list` and `tui`; pass `name="my endpoint"` to choose
+another (at most 1,024 bytes), or `name=""` for none. Tear it down with:
 
 ```bash
 cortex-training cancel JOB_ID

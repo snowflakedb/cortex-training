@@ -49,7 +49,9 @@ constructing the emitter.
 Tracked operations:
 
 - Job lifecycle: `create_job`, `wait_for_job`, `get_job`, `list_jobs`,
-  `iter_jobs` (one event per page), `cancel_job`, `get_capacity`,
+  `iter_jobs` (one event per page; a walk that restarts after an expired page
+  token also records the rejected page, as a failure with `error.type`
+  `InvalidPageToken`), `list_jobs_page`, `cancel_job`, `get_capacity`,
   `get_capacity_breakdown`, `get_experiment_run`
 - Compute: `forward_backward`, `forward`, `generate`, `generate_stream`, `step`
 - Checkpoints and logs: `save`, `load`, `list_checkpoints`,
@@ -60,7 +62,8 @@ Tracked operations:
 
 Each emitted event body contains `success`, `duration_ms`, `request_count`,
 `attempt_count`, and `retry_count`. Failures also include a bounded
-`error_message` with common credential patterns redacted. Queryable attributes
+`error_message` with URL query strings (such as list filters and page tokens)
+and common credential patterns redacted. Queryable attributes
 include available `job_id`, sub-job identifiers, `request_id`,
 `checkpoint_id`, `error.type`, HTTP status, and server error code.
 Two attributes carry Snowflake request IDs:
@@ -96,12 +99,13 @@ operation.
 
 | Method | Returns | Notes |
 |---|---|---|
-| `create_job(sub_jobs, job_id=None, experiment_name=None, hardware=None)` | `job_id` | Validates each `SubJobConfig` client-side first. Only `training` and `sampling` sub-jobs can be submitted: a job takes zero or one `training` sub-job and any number of `sampling` sub-jobs. `hardware` is `H200`, `B200`, or `B300` (the `Hardware` enum or its string); omitted means `H200` |
-| `create_job_from_body(body)` | response dict | For callers that already hold the REST JSON. Enforces the same one-training-sub-job and no-`log_probability` rules before sending |
-| `get_job(job_id)` | job dict | Includes `sub_jobs` with their configs |
+| `create_job(sub_jobs, job_id=None, experiment_name=None, hardware=None, idle_timeout_seconds=None, pending_timeout_seconds=None, comment=None)` | `job_id` | Validates each `SubJobConfig` client-side first. Only `training` and `sampling` sub-jobs can be submitted: a job takes zero or one `training` sub-job and any number of `sampling` sub-jobs. `hardware` is `H200`, `B200`, or `B300` (the `Hardware` enum or its string); omitted means `H200`. `comment` names the job: returned by `get_job` and `list_jobs`, and never editable. It is not sent for a model deployment, which rejects it; for any other job more than 1,024 bytes of UTF-8, or text that isn't valid UTF-8, raises `ValueError` before sending. A blank comment is not sent |
+| `create_job_from_body(body)` | response dict | For callers that already hold the REST JSON. Enforces the same one-training-sub-job, no-`log_probability` and `comment` rules before sending, a blank `comment` included |
+| `get_job(job_id)` | job dict | Includes `sub_jobs` with their configs, `comment`, and `reason` / `reason_details` when the service sends them |
 | `list_jobs(status=None)` | list of jobs | Returns the inner list, not the envelope |
-| `iter_jobs(*, database=None, schema=None, status=None, submitted_by=None, created_after=None, created_before=None, page_size=100)` | iterator of jobs | Jobs across the account that the caller can see, newest first, following page tokens; each also carries `database_name` and `schema_name`. The server applies every filter. Arguments are checked on the call: `page_size` is 1 to 1000, and `schema` needs `database` with it. A 404 means account-level listing is not enabled for the account. See [REST API section 5.3](rest-api.md#across-the-account---get-apiv2endpoint) |
-| `for_job(job)` | `CortexTrainingClient` | Bound to a job from `iter_jobs` for per-job calls. Borrows this client's session, auth, and telemetry, so keep this one open; closing the returned client is a no-op. Never creates the job's database |
+| `list_jobs_page(*, database=None, schema=None, status=None, submitted_by=None, created_after=None, created_before=None, page_size=100, page_token=None, max_retries=None, request_timeout=None)` | `{"jobs": [...], "next_page_token": str \| None}` | One page of the jobs across the account that the caller can see, newest first; each job also carries `database_name` and `schema_name`. Pass `next_page_token` back as `page_token`, with the same filters, for the next page; `None` means no more. A page can be short or empty and still have a token. The server applies every filter; `None` and `""` mean none. `status` is a comma list or a list, with the groups `active` and `terminal` (`cancelled`, `terminated`, `failed`); `done` is sent as `cancelled,terminated`. Creation bounds take a `date`, a `datetime`, or a string, `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM[:SS[.fraction]]` (a space may replace the `T`) with an optional `Z` or `+HH[:MM]` / `-HH[:MM]` offset; naive means UTC, and they are sent as RFC 3339 UTC with `Z`. Arguments are checked on the call: `page_size` is an `int` from 1 to 1000, and `schema` needs `database`. `max_retries` (retries after the first attempt) and `request_timeout` (seconds, or `(connect, read)`) bound this page; omitted, the client's 10 retries and 30 s / 600 s apply. Raises `AccountJobListUnavailable` (`reason`: `not_deployed`, `disabled`, `forbidden`, `rest_disabled`) for 404, 403 and 405 without retrying, and `InvalidPageToken` when the service can no longer open `page_token`; both subclass `requests.HTTPError`. Other failed answers raise `requests.HTTPError`, connection errors and timeouts raise `requests.ConnectionError` or `requests.Timeout` once retries are spent, and bad arguments or a page body that is not a job list raise `ValueError`; catch `requests.RequestException` and `ValueError` for all of them. See [REST API section 5.3](rest-api.md#across-the-account---get-apiv2cortex-training) |
+| `iter_jobs(*, database=None, schema=None, status=None, submitted_by=None, created_after=None, created_before=None, page_size=100, max_retries=None, request_timeout=None)` | iterator of jobs | `list_jobs_page` page after page as you iterate, with the same filters, following page tokens to the end, and raising as it does on the page that fails. Arguments are checked on the call, and the bounds apply to each page. When the service can no longer open a page token, the walk restarts from the first page once, skipping jobs already yielded by `job_id`, so jobs created since the walk began then come after older ones; a second time raises `InvalidPageToken` |
+| `for_job(job)` | `CortexTrainingClient` | Bound to a job from `iter_jobs` or `list_jobs_page` for per-job calls. Borrows this client's session, auth, and telemetry, so keep this one open; closing the returned client is a no-op. Never creates the job's database |
 | `wait_for_job(job_id)` | job dict | Polls until `running`; raises on `failed`/`done`/`cancelled` or timeout. Does not treat `terminated` as terminal |
 | `cancel_job(job_id)` | `None` | Idempotent while cancelling/cancelled |
 | `get_capacity(hardware=None)` | capacity dict | `has_reservation`, `max_total_gpus`, `reserved_gpus`, `in_use_gpus`, `pending_gpus`, `available_gpus`, scoped to `hardware` (omitted means the server default, H200). The CLI `capacity` command queries every type unless `--hardware` is set. `max_total_gpus` is the canonical ceiling (`-1` uncapped); `reserved_gpus` is deprecated |
@@ -244,26 +248,51 @@ with 256 or fewer experts. See
 `request_id`, `list_checkpoints(job_id)`, `export_checkpoint(job_id, checkpoint_id)`,
 `delete_checkpoint(job_id, checkpoint_id)`.
 
+`export_checkpoint` returns `{checkpoint_id, files, expires_at}`; each file has a
+relative `filename`, a presigned `url` that lasts 5 hours, and `size_bytes`.
+Fetch the URLs with a plain HTTP client, without this client's credentials.
+Neither `list_checkpoints` nor `export_checkpoint` creates the configured
+database. See [rest-api.md section 5.8](rest-api.md#58-export-checkpoint).
+
 ## Logs
 
 `tail_logs(job_id, ...)` returns one cursor page;
-`stream_logs(job_id, follow=True, ...)` yields entries and keeps polling.
-`fetch_execution_logs(job_id)` downloads every log file for the job's experiment
-run and returns `{sub_job_id, filename, artifact_uri, content}` dicts.
-`download_stdout_logs(job_id, output_dir, *, resume=False, progress=None)` reconstructs persisted
-console chunks as `<output_dir>/<sub_job_id>/stdout.log`.
-`download_metrics(job_id, output_dir, *, resume=False, progress=None)` reconstructs GPU metric
-chunks as `<output_dir>/<sub_job_id>/gpu.jsonl`. The methods stay silent unless
+`stream_logs(job_id, follow=True, ...)` yields entries and keeps polling. Both
+raise a 404 or 409 at once instead of retrying it: the job isn't running
+(pending placement, or ended) or its session is gone, and `get_job()` says
+which. See [Tail logs](rest-api.md#78-tail-logs) for the cursor and what each
+answer means.
+`fetch_execution_logs(job_id, *, sub_job_id=None, filename=None)` downloads every
+log file for the job's experiment run, or only those of one sub-job or with
+one name, and returns `{sub_job_id, filename, artifact_uri, content}` dicts.
+`download_stdout_logs(job_id, output_dir, *, resume=False, sub_job_ids=None, progress=None,
+chunk_progress=None)` reconstructs persisted console chunks as
+`<output_dir>/<sub_job_id>/stdout.log`.
+`download_metrics(job_id, output_dir, *, resume=False, sub_job_ids=None,
+progress=None, chunk_progress=None, priority=(), newest_first_seconds=None,
+on_commit=None)` reconstructs GPU metric chunks as
+`<output_dir>/<sub_job_id>/gpu.jsonl`. The methods stay silent unless
 `progress` is passed. `progress` receives status updates without a trailing
 newline, then `"\n"` when that sub-job finishes or fails; a status that needs no
 updating arrives as one message ending in a newline. An error raised by
 `progress` stops the download. A large download may open additional Snowflake
 sessions for one sub-job, and each session can prompt for authentication.
-`resume=True` appends chunks
-that are not already recorded in the manifest beside that file. See
+`resume=True` appends chunks that are not already recorded in the manifest
+beside that file. `sub_job_ids` downloads only those sub-jobs, in that order
+(by default every sub-job, sorted by id); a sub-job without chunks is skipped.
+`chunk_progress(sub_job_id, done, total)` is called after each chunk, from the
+calling thread. The TUI uses both to show the console of the sub-job on screen
+first. `download_metrics` also takes `priority`, sub-jobs to download first.
+With `newest_first_seconds`, a sub-job downloaded from the start first commits
+only its chunks from that many seconds before its newest one, then the rest.
+`on_commit(entry)` is called after each commit with that sub-job's result
+entry plus `complete` (False after that first, partial commit). See
 [GPU metrics download](rest-api.md#124-gpu-metrics-download) for the JSONL row
 schema.
-`get_experiment_run(job_id)` resolves the experiment/run names.
+`get_experiment_run(job_id)` resolves the experiment/run names. It raises a 500
+saying `Linked experiment is not found` at once, without retries: the role
+can't resolve the job's Experiment, which the readers above all need. See
+[Experiment run](rest-api.md#56-experiment-run---get-job_idexperiment-run).
 
 ## Building payloads
 

@@ -333,3 +333,29 @@ def test_cached_pages_throttles_active_polling(tmp_path):
     # First two sleeps follow entries pages (active branch) — proves the floor
     # applies when busy, not just when idle.
     assert sleeps[0] == 2.0 and sleeps[1] == 2.0
+
+
+def test_cached_pages_hold_pauses_fetching_then_resumes_from_cursor(tmp_path):
+    c = _cache(tmp_path)
+    c.append_entries("src", [{"msg": "old"}])
+    c.set_cursor("src", "5")
+    held = [True]
+    sleeps = []
+    cursors = []
+
+    def fetch(cursor):
+        cursors.append(cursor)
+        return {"entries": [{"msg": "new"}], "next_cursor": "6"}
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 3:
+            held[0] = False  # the Logs tab is back on screen
+
+    pages = cached_pages(
+        c, "src", fetch, entries_key="entries", follow=True, poll_interval=1.0, sleep=sleep, hold=lambda: held[0]
+    )
+    assert next(pages) == ("cache", [{"msg": "old"}])
+    assert next(pages) == ("live", [{"msg": "new"}])
+    # Nothing was fetched while held; the tail resumed from the saved cursor.
+    assert len(sleeps) == 3 and cursors == ["5"]

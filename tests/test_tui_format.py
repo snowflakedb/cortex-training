@@ -264,3 +264,17 @@ def test_wrap_log_line_splits_embedded_newlines():
 def test_wrap_log_line_empty_is_one_blank_line():
     assert wrap_log_line("", 80) == [""]
     assert wrap_log_line("\n", 80) == ["", ""]  # blank lines preserved
+
+
+def test_level_filter_reads_the_level_inside_raw_service_lines():
+    from cortex_training.tui.format import entry_at_level
+
+    # The service sends live lines as {"_raw": "<RFC3339 ts> <line>"}.
+    json_info = {"_raw": '2026-10-14T10:00:00.123456789Z {"level": "INFO", "msg": "step 3"}'}
+    json_error = {"_raw": '2026-10-14T10:00:00Z {"levelname": "ERROR", "message": "boom"}'}
+    word_warning = {"_raw": "2026-10-14T10:00:00Z (Actor pid=12) WARNING slow step"}
+    unclassified = {"_raw": "Traceback (most recent call last):"}
+    assert not entry_at_level(json_info, "ERROR")
+    assert entry_at_level(json_error, "ERROR")
+    assert entry_at_level(word_warning, "WARNING") and not entry_at_level(word_warning, "ERROR")
+    assert entry_at_level(unclassified, "ERROR")  # never hide what can't be classified

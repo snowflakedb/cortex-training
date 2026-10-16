@@ -2392,7 +2392,7 @@ class TestIterJobs:
                 "schema": '"Exp 1"',
                 "status": "running,FAILED",
                 "submitted_by": "jdoe",
-                "created_after": "2026-10-01",
+                "created_after": "2026-10-01T00:00:00Z",
                 "created_before": "2026-10-02T07:30:00Z",
                 "limit": 50,
             },
@@ -2427,16 +2427,16 @@ class TestIterJobs:
     @pytest.mark.parametrize(
         ("value", "wire"),
         [
-            (date(2026, 10, 1), "2026-10-01"),
+            (date(2026, 10, 1), "2026-10-01T00:00:00Z"),
             (
                 datetime(2026, 10, 1, 1, 0, tzinfo=timezone(timedelta(hours=-7))),
                 "2026-10-01T08:00:00Z",
             ),
             (datetime(2026, 10, 1, 8, 0, 0, 250000), "2026-10-01T08:00:00.250000Z"),
-            ("2026-10-01T00:00:00+02:00", "2026-10-01T00:00:00+02:00"),
+            ("2026-10-01T00:00:00+02:00", "2026-09-30T22:00:00Z"),
         ],
     )
-    def test_created_after_is_sent_in_utc_or_as_given(self, value, wire):
+    def test_created_after_is_sent_as_utc_rfc_3339(self, value, wire):
         c = _make_client(get_json={"jobs": []})
 
         list(c.iter_jobs(status="active", created_after=value))
@@ -2561,7 +2561,7 @@ class TestIterJobs:
         assert [call.args[1]["request_count"] for call in calls] == [1, 1]
         assert [call.kwargs["attributes"] for call in calls] == [
             {},
-            {"error.type": "HTTPError", "error.http_status": 404},
+            {"error.type": "AccountJobListUnavailable", "error.http_status": 404},
         ]
         assert "jdoe" not in repr(calls)
 
