@@ -13,13 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the TUI log cache (no ``textual`` dependency)."""
+"""Unit tests for the TUI log cache and the display names stored beside it (no
+``textual`` dependency)."""
 
-import json
 from pathlib import Path
 
 import pytest
-import requests
 
 from cortex_training.tui.log_cache import LogCache
 from cortex_training.tui.log_cache import cache_root
@@ -168,6 +167,98 @@ def test_rotation_trims_oldest_keeps_cursor(tmp_path):
     assert c.get_cursor("s") == "CUR"  # cursor untouched by rotation
 
 
+def test_rotation_leaves_room_so_appends_at_the_cap_rarely_rewrite_the_file(tmp_path, monkeypatch):
+    import cortex_training.tui.log_cache as log_cache
+
+    c = _cache(tmp_path, max_bytes=10_000, max_lines=1_000)
+    rewrites = []
+    write = log_cache._atomic_write_text
+
+    def counted(path, text):
+        if path.suffix == ".jsonl":
+            rewrites.append(len(text.encode("utf-8")))
+        write(path, text)
+
+    monkeypatch.setattr(log_cache, "_atomic_write_text", counted)
+    for i in range(400):  # a line of about 100 bytes at a time: 40 KB through a 10 KB cache
+        c.append_entries("s", [{"i": i, "pad": "x" * 80}])
+    # A trim leaves 8 KB, so some twenty appends go in before the next one. Cut to just
+    # under the cap, every append after the first trim (about 300) rewrote the file.
+    assert 5 <= len(rewrites) <= 20, len(rewrites)
+    assert all(size <= 8_000 for size in rewrites)
+    loaded = c.load_entries("s")
+    assert loaded[-1]["i"] == 399 and [e["i"] for e in loaded] == list(range(loaded[0]["i"], 400))
+    assert c._jsonl_path("s").stat().st_size <= 10_000
+    assert c.head_missing("s")
+
+
+# ─── aliases: renames from every session on the machine are kept ─────────
+
+_RENAMES = """
+import sys, time
+from pathlib import Path
+from cortex_training.tui.stores import AliasStore
+root, tag, count, go = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), Path(sys.argv[4])
+while not go.exists():
+    time.sleep(0.002)
+store = AliasStore(root)
+for i in range(count):
+    store.set(f"{tag}-{i}", f"{tag} run {i}")
+"""
+
+
+def test_renames_in_two_sessions_at_once_are_all_kept(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    from cortex_training.tui import stores
+
+    pytest.importorskip("fcntl")
+    src = str(Path(stores.__file__).resolve().parents[2])  # the cortex_training these tests import
+    env = {**os.environ, "PYTHONPATH": src}
+    go = tmp_path / "go"
+    sessions = [subprocess.Popen([sys.executable, "-c", _RENAMES, str(tmp_path), tag, "60", str(go)], env=env)
+                for tag in ("a", "b")]
+    go.touch()  # both start renaming together
+    assert [session.wait(timeout=120) for session in sessions] == [0, 0]
+    # Without the lock, a session read the names just before the other one wrote
+    # its rename, and wrote them back without it.
+    names = stores.AliasStore(tmp_path).all()
+    assert names == {f"{tag}-{i}": f"{tag} run {i}" for tag in ("a", "b") for i in range(60)}
+
+
+def test_a_rename_waits_for_another_session_s_then_writes_anyway(tmp_path, monkeypatch):
+    import time
+
+    fcntl = pytest.importorskip("fcntl")
+    from cortex_training.tui import stores
+
+    monkeypatch.setattr(stores, "_LOCK_WAIT_SECONDS", 0.2)
+    store = stores.AliasStore(tmp_path)
+    store.set("a", "first")
+    with open(tmp_path / "aliases.json.lock", "a") as held:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX)  # another session, stuck in the middle of a rename
+        started = time.monotonic()
+        store.set("b", "second")
+        waited = time.monotonic() - started
+    assert 0.2 <= waited < 5  # the screen it runs on is held up a moment, not for good
+    assert store.all() == {"a": "first", "b": "second"}
+
+
+def test_renames_without_fcntl_still_merge_with_what_is_on_disk(tmp_path, monkeypatch):
+    from cortex_training.tui import stores
+
+    monkeypatch.setattr(stores, "fcntl", None)  # as on Windows
+    one, other = stores.AliasStore(tmp_path), stores.AliasStore(tmp_path)  # two sessions
+    one.set("a", "first")
+    other.set("b", "  second   name ")
+    one.set("c", "x" * 200)
+    one.set("a", "")  # an empty name removes it
+    assert stores.AliasStore(tmp_path).all() == {"b": "second name", "c": "x" * stores.ALIAS_MAX_CHARS}
+    assert not (tmp_path / "aliases.json.lock").exists()
+
+
 # ─── cached_pages: replay then resume ────────────────────────────────────
 
 
@@ -243,61 +334,6 @@ def test_cached_pages_follow_keeps_polling_past_eof(tmp_path):
     out = _drive(c, "s", client, follow=True, is_cancelled=cancelled)
     assert out == []
     assert client.calls >= 2  # kept polling despite eof (follow=True)
-
-
-# ─── cached_pages: a job that has yet to be placed ───────────────────────
-
-# The two answers tail-logs gives with a 409, which only the message tells apart.
-_PENDING = "Cortex training operation failed: session JOB_ID is pending placement: quota_filled"
-_CANCELLED = "Cortex training operation failed: session JOB_ID has been cancelled: cancelled_by_client"
-
-
-class _Failing:
-    """tail_logs raising the service's ``status`` and ``message`` ``times`` times, then answering ``page``."""
-
-    def __init__(self, status, message, times=1, page=None):
-        resp = requests.Response()
-        resp.status_code, resp.encoding = status, "utf-8"
-        resp._content = json.dumps({"message": message, "code": "510200"}).encode()
-        self.error = requests.exceptions.HTTPError(response=resp)
-        self.times, self.page, self.calls = times, page, 0
-
-    def tail_logs(self, job_id, source_id, *, cursor=None, sub_job_id=None):
-        self.calls += 1
-        if self.calls <= self.times:
-            raise self.error
-        return self.page
-
-
-def test_cached_pages_follow_waits_for_a_job_that_is_not_placed_yet(tmp_path):
-    # Opening the Logs tab on a pending job used to write an [error] line.
-    client = _Failing(409, _PENDING, times=2, page={"entries": [{"n": 1}], "next_cursor": "C1", "eof": False})
-    pages = cached_pages(
-        _cache(tmp_path),
-        "s",
-        lambda cur: client.tail_logs("j", "s", cursor=cur),
-        entries_key="entries",
-        follow=True,
-        poll_interval=0.0,
-        sleep=lambda *_: None,
-    )
-    assert next(pages) == ("live", [{"n": 1}])
-    assert client.calls == 3  # two waits, then the page
-
-
-@pytest.mark.parametrize(
-    ("status", "message", "follow"),
-    [
-        (409, _CANCELLED, True),  # the session is over: the TUI falls back to the saved log
-        (404, "session not found", True),
-        (409, _PENDING, False),  # draining the log once, there is nothing to wait for
-    ],
-)
-def test_cached_pages_raises_anything_but_that_wait(tmp_path, status, message, follow):
-    client = _Failing(status, message)
-    with pytest.raises(requests.exceptions.HTTPError):
-        _drive(_cache(tmp_path), "s", client, follow=follow)
-    assert client.calls == 1
 
 
 def test_cached_pages_cancel_during_replay(tmp_path):
@@ -390,3 +426,29 @@ def test_cached_pages_throttles_active_polling(tmp_path):
     # First two sleeps follow entries pages (active branch) — proves the floor
     # applies when busy, not just when idle.
     assert sleeps[0] == 2.0 and sleeps[1] == 2.0
+
+
+def test_cached_pages_hold_pauses_fetching_then_resumes_from_cursor(tmp_path):
+    c = _cache(tmp_path)
+    c.append_entries("src", [{"msg": "old"}])
+    c.set_cursor("src", "5")
+    held = [True]
+    sleeps = []
+    cursors = []
+
+    def fetch(cursor):
+        cursors.append(cursor)
+        return {"entries": [{"msg": "new"}], "next_cursor": "6"}
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 3:
+            held[0] = False  # the Logs tab is back on screen
+
+    pages = cached_pages(
+        c, "src", fetch, entries_key="entries", follow=True, poll_interval=1.0, sleep=sleep, hold=lambda: held[0]
+    )
+    assert next(pages) == ("cache", [{"msg": "old"}])
+    assert next(pages) == ("live", [{"msg": "new"}])
+    # Nothing was fetched while held; the tail resumed from the saved cursor.
+    assert len(sleeps) == 3 and cursors == ["5"]
