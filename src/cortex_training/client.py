@@ -3257,12 +3257,13 @@ class CortexTrainingClient:
                         except BaseException:
                             try:
                                 writer.abort()
-                            except Exception:
+                            except Exception as abort_exc:
                                 logger.warning(
-                                    "could not save download progress for %s",
+                                    "could not save download progress for %s: %s",
                                     plan.destination,
-                                    exc_info=True,
+                                    abort_exc,
                                 )
+                                logger.debug("saving download progress failed", exc_info=True)
                             raise
                         if plan.promote:
                             self._promote_partial(plan)

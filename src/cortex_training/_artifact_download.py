@@ -257,8 +257,10 @@ class SharedConnection:
         for connection in [*replaced, current]:
             try:
                 connection.close()
-            except Exception:
-                logger.warning("could not close the artifact download session", exc_info=True)
+            except Exception as exc:
+                # One line for the user; the traceback only at debug level.
+                logger.warning("could not close the artifact download session: %s", exc)
+                logger.debug("artifact download session close failure", exc_info=True)
 
 
 class TransferTimeout(TimeoutError):

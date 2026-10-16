@@ -20,6 +20,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import threading
 import time
 from datetime import date
 from unittest.mock import MagicMock
@@ -2646,6 +2647,63 @@ def test_download_warning_does_not_break_the_progress_line():
     write.warn("warning: GET x failed; retrying")
     write("\n")
     assert plain.getvalue() == "warning: GET x failed; retrying\nmetrics: [#-] 1/2 job\n"
+
+
+class _SlowTty(_TtyStderr):
+    """A terminal whose writes yield between characters, so unserialized writes interleave."""
+
+    def write(self, message):
+        for char in message:
+            super().write(char)
+            time.sleep(0)
+        return len(message)
+
+
+def test_progress_writer_keeps_lines_whole_under_concurrent_warnings():
+    tty = _SlowTty()
+    write = cli._artifact_progress_writer(tty)
+    statuses = [f"metrics: [{'#' * (i % 20):-<20}] {i}/200 job" for i in range(200)]
+    warnings = [f"warning: GET chunk-{t}-{i} failed; retrying" for t in range(4) for i in range(25)]
+
+    def warn_all(thread):
+        for i in range(25):
+            write.warn(f"warning: GET chunk-{thread}-{i} failed; retrying")
+
+    threads = [threading.Thread(target=warn_all, args=(t,)) for t in range(4)]
+    for thread in threads:
+        thread.start()
+    for status in statuses:
+        write(status)
+    for thread in threads:
+        thread.join()
+    write("\n")
+
+    text = tty.getvalue()
+    lines = text.split("\n")
+    assert sorted(line for line in lines if line.startswith("warning:")) == sorted(warnings)
+    for line in lines:
+        if line.startswith("warning:"):
+            continue
+        # Every other line is a run of whole status redraws.
+        for segment in line.split("\r")[1:]:
+            assert segment in statuses, repr(segment)
+    assert text.endswith(statuses[-1] + "\n")
+
+
+def test_session_close_failure_is_one_warning_line(monkeypatch):
+    from cortex_training import _artifact_download
+
+    class Broken:
+        def close(self):
+            raise RuntimeError("close failed")
+
+    stderr = io.StringIO()
+    writer = cli._artifact_progress_writer(stderr)
+    with cli._library_warnings_to(writer):
+        _artifact_download.SharedConnection(Broken).close()
+    assert stderr.getvalue() == (
+        "warning: could not close the artifact download session: close failed\n"
+    )
 
 
 def test_download_metrics_defaults_to_cwd(tmp_path, monkeypatch):

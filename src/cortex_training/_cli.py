@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import sys
+import threading
 from datetime import date
 from datetime import datetime
 from datetime import timedelta
@@ -1341,10 +1342,12 @@ class _ArtifactProgressWriter:
     Messages follow the download ``progress`` contract: a status without a
     newline replaces the current line, ``"\\n"`` ends it, and a message that
     already ends in a newline is printed as is. :meth:`warn` prints a full
-    line without breaking the status line.
+    line without breaking the status line. Warnings come from download worker
+    threads, so each update is written in one call under a lock.
     """
 
     def __init__(self, stderr: TextIO):
+        self._lock = threading.Lock()
         self._stderr = stderr
         try:
             self._tty = stderr.isatty()
@@ -1353,31 +1356,30 @@ class _ArtifactProgressWriter:
         self._latest: str | None = None
 
     def __call__(self, message: str) -> None:
-        try:
+        with self._lock:
             if message == "\n":
                 status, self._latest = self._latest, None
                 if status is None:
                     return
-                self._stderr.write("\n" if self._tty else status + "\n")
+                self._write("\n" if self._tty else status + "\n")
             elif message.endswith("\n"):
-                self._stderr.write(message)
+                self._write(message)
             else:
                 self._latest = message
-                if not self._tty:
-                    return
-                self._stderr.write("\r" + message)
-            self._stderr.flush()
-        except OSError:
-            return
+                if self._tty:
+                    self._write("\r" + message)
 
     def warn(self, line: str) -> None:
+        with self._lock:
+            if self._tty and self._latest is not None:
+                # Move off the status line, then redraw it below the warning.
+                self._write("\n" + line + "\n\r" + self._latest)
+            else:
+                self._write(line + "\n")
+
+    def _write(self, text: str) -> None:
         try:
-            if self._tty and self._latest is not None:
-                # Move off the status line; the next update redraws it.
-                self._stderr.write("\n")
-            self._stderr.write(line + "\n")
-            if self._tty and self._latest is not None:
-                self._stderr.write("\r" + self._latest)
+            self._stderr.write(text)
             self._stderr.flush()
         except OSError:
             return
