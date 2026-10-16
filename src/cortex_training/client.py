@@ -3095,6 +3095,13 @@ class CortexTrainingClient:
                 shutil.rmtree(downloaded.parent, ignore_errors=True)
 
     @staticmethod
+    def _mark_progress_saved(exc: BaseException, saved: bool) -> None:
+        """Record on ``exc`` that output was saved; never clears an earlier True."""
+        if saved:
+            with contextlib.suppress(Exception):
+                exc.download_progress_saved = True  # type: ignore[attr-defined]
+
+    @staticmethod
     def _already_committed(plan: _artifact_download.GzipPlan) -> bool:
         """True when a completed file already holds exactly the planned chunks."""
         if plan.new_paths or plan.promote:
@@ -3174,7 +3181,8 @@ class CortexTrainingClient:
         window = max_workers * self._DOWNLOAD_WINDOW_PER_WORKER
         results: list[dict[str, Any]] = []
         cancel = threading.Event()
-        saved_progress = False
+        # A resumed plan starts from output an earlier download saved.
+        saved_progress = any(plan.known for plan in plans)
         spool_prefix = f"cortex-training-{artifact_name}-artifacts-"
         _artifact_download.Spool.sweep(spool_prefix, self._TEMP_ORPHAN_MIN_AGE_SECONDS)
         with _artifact_download.Spool(spool_prefix) as spool:
@@ -3283,6 +3291,7 @@ class CortexTrainingClient:
                                         plan.sub_job_id, len(writer.names), total, writer.offset
                                     )
                             writer.finish()
+                            saved_progress = True
                         except BaseException:
                             try:
                                 writer.abort()
@@ -3307,6 +3316,9 @@ class CortexTrainingClient:
                             warnings=warnings,
                         )
                     )
+                # Inside the handler, so an interrupt here is still marked saved.
+                pool.shutdown(wait=True)
+                spool.remove_after([])
             except BaseException as exc:
                 # Workers stop at their next attempt or backoff; only a GET
                 # already on the wire runs to completion, and it is not awaited.
@@ -3314,9 +3326,9 @@ class CortexTrainingClient:
                 pool.shutdown(wait=False, cancel_futures=True)
                 spool.remove_after([*([head] if head is not None else []), *pending])
                 with contextlib.suppress(Exception):
-                    exc.download_progress_saved = saved_progress  # type: ignore[attr-defined]
+                    if not getattr(exc, "download_progress_saved", False):
+                        exc.download_progress_saved = saved_progress  # type: ignore[attr-defined]
                 raise
-            pool.shutdown(wait=True)
         return results
 
     def _list_gzip_chunks(
@@ -3605,6 +3617,8 @@ class CortexTrainingClient:
         )
         root = Path(output_dir).expanduser()
         stall_cancel = threading.Event()
+        # True once output is on disk that a resumed download would keep.
+        saved = False
         try:
             chunks_by_sub_job, warnings_by_sub_job = self._list_gzip_chunks(
                 shared, run_uri, run_name, job_id, artifact_name, chunk_pattern
@@ -3675,15 +3689,8 @@ class CortexTrainingClient:
                     strict=strict,
                     warnings_by_sub_job=warnings_by_sub_job,
                 )
-            try:
-                stale = stale_warnings()
-            except BaseException as exc:
-                # Every file is committed by now, so an interrupt while waiting
-                # on the stall check still leaves output to resume from.
-                if results:
-                    with contextlib.suppress(Exception):
-                        exc.download_progress_saved = True  # type: ignore[attr-defined]
-                raise
+                saved = True
+            stale = stale_warnings()
             for result in results:
                 messages = stale.get(result["sub_job_id"])
                 if messages:
@@ -3705,10 +3712,21 @@ class CortexTrainingClient:
                 for sub_job_id in unsaved
             )
             return sorted(results, key=lambda result: result["sub_job_id"])
+        except BaseException as exc:
+            # An interrupt in the stall-check wait comes after every file is
+            # committed; one from the writes carries its own flag.
+            saved = saved or getattr(exc, "download_progress_saved", False)
+            self._mark_progress_saved(exc, saved)
+            raise
         finally:
             # Stop a stall check that is still running before its session goes.
             stall_cancel.set()
-            shared.close()
+            try:
+                shared.close()
+            except BaseException as exc:
+                # Closing the session can block; Ctrl-C there keeps the flag.
+                self._mark_progress_saved(exc, saved)
+                raise
 
     @_track_operation("download_stdout_logs")
     def download_stdout_logs(

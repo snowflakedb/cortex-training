@@ -7275,6 +7275,99 @@ class TestChunkedArtifactDownload:
         assert committed == [self._expected(self.SUB, range(2))]
         assert destination.read_bytes() == self._expected(self.SUB, range(2))
 
+    @pytest.mark.parametrize("interrupt_wait_too", [False, True])
+    def test_interrupt_while_closing_the_session_keeps_saved_progress(
+        self, tmp_path, monkeypatch, interrupt_wait_too
+    ):
+        c, _connection, _paths, _calls = self._stale_setup(monkeypatch, count=2)
+        if interrupt_wait_too:
+            # A second Ctrl-C in the close replaces the first one's exception.
+            def interrupted_wait(_self, _timeout, _default):
+                raise KeyboardInterrupt
+
+            monkeypatch.setattr(nc._artifact_download.Background, "result", interrupted_wait)
+        real_close = nc._artifact_download.SharedConnection.close
+        escaped = []
+
+        def interrupted_close(shared):
+            real_close(shared)
+            escaped.append(KeyboardInterrupt())
+            raise escaped[-1]
+
+        monkeypatch.setattr(nc._artifact_download.SharedConnection, "close", interrupted_close)
+        with pytest.raises(KeyboardInterrupt) as excinfo:
+            c.download_stdout_logs("job-1", tmp_path)
+        assert excinfo.value is escaped[0]
+        assert excinfo.value.download_progress_saved is True
+        destination = tmp_path / self.SUB / "stdout.log"
+        assert destination.read_bytes() == self._expected(self.SUB, range(2))
+
+    def test_interrupt_in_pool_shutdown_after_the_last_commit_keeps_saved_progress(
+        self, tmp_path, monkeypatch
+    ):
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=2)
+        real_shutdown = nc.ThreadPoolExecutor.shutdown
+        spools = []
+
+        def live_spools():
+            return set(Path(tempfile.gettempdir()).glob("*-stdout-artifacts-*"))
+
+        earlier = live_spools()
+
+        def interrupted_shutdown(pool, wait=True, **kwargs):
+            real_shutdown(pool, wait=wait, **kwargs)
+            if wait:
+                spools.extend(live_spools() - earlier)
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr(nc.ThreadPoolExecutor, "shutdown", interrupted_shutdown)
+        with pytest.raises(KeyboardInterrupt) as excinfo:
+            c.download_stdout_logs("job-1", tmp_path)
+        assert excinfo.value.download_progress_saved is True
+        destination = tmp_path / self.SUB / "stdout.log"
+        assert destination.read_bytes() == self._expected(self.SUB, range(2))
+        assert spools and not any(path.exists() for path in spools)
+
+    def test_interrupt_while_closing_after_nothing_was_saved_is_not_marked(
+        self, tmp_path, monkeypatch
+    ):
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=0)
+        real_close = nc._artifact_download.SharedConnection.close
+
+        def interrupted_close(shared):
+            real_close(shared)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(nc._artifact_download.SharedConnection, "close", interrupted_close)
+        with pytest.raises(KeyboardInterrupt) as excinfo:
+            c.download_stdout_logs("job-1", tmp_path)
+        assert not getattr(excinfo.value, "download_progress_saved", False)
+
+    @pytest.mark.parametrize("new_chunk", [False, True])
+    def test_resume_interrupted_before_writing_keeps_saved_progress(
+        self, tmp_path, monkeypatch, new_chunk
+    ):
+        c, connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=3)
+        listing = self.RUN_URI + "_stdout/"
+        rows = connection.list_rows[listing]
+        if new_chunk:
+            # The newest chunk is uploaded after the first download.
+            connection.list_rows[listing] = rows[1:]
+        c.download_stdout_logs("job-1", tmp_path)
+        connection.list_rows[listing] = rows
+        destination = tmp_path / self.SUB / "stdout.log"
+        saved = destination.read_bytes()
+
+        def interrupted_progress(_line):
+            # Ctrl-C at the first status line, before any new chunk is written.
+            raise KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt) as excinfo:
+            c.download_stdout_logs("job-1", tmp_path, resume=True, progress=interrupted_progress)
+        assert excinfo.value.download_progress_saved is True
+        assert destination.read_bytes() == saved
+        assert saved == self._expected(self.SUB, range(2 if new_chunk else 3))
+
     @pytest.mark.parametrize("download_fails", [True, False])
     def test_late_stall_check_never_reopens_the_session(
         self, tmp_path, monkeypatch, caplog, download_fails

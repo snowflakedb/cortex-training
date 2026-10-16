@@ -2353,6 +2353,60 @@ def test_download_interrupt_exits_130_with_accurate_message(tmp_path, command, r
     assert stderr.getvalue() == message
 
 
+@pytest.mark.parametrize("where", ["stall wait", "session close"])
+def test_download_interrupted_after_the_files_are_written_prints_the_resume_hint(
+    tmp_path, monkeypatch, where
+):
+    from cortex_training import _artifact_download
+    from cortex_training import client as client_module
+
+    client = client_module.CortexTrainingClient(
+        base_url="http://test.local", database="DB", schema="SCH"
+    )
+    sub = "job-1:training:0"
+    saved = tmp_path / sub / "metrics.jsonl"
+    release = threading.Event()
+
+    def write_plans(*_args, **_kwargs):
+        saved.parent.mkdir(parents=True)
+        saved.write_text("{}\n")
+        return [{"sub_job_id": sub, "saved_path": str(saved)}]
+
+    def interrupted(*_args):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(client, "_experiment_run_uri", lambda _job: ("snow://run/", "RUN"))
+    monkeypatch.setattr(client, "_open_experiment_artifact_connection", MagicMock)
+    monkeypatch.setattr(
+        client, "_list_gzip_chunks", lambda *_args: ({sub: ["_metrics/c0.gz"]}, {})
+    )
+    # The stall check outlives the wait, as when the job lookup is slow.
+    monkeypatch.setattr(client, "_STALL_CHECK_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(client, "_stale_upload_warnings", lambda *_args: release.wait(10))
+    monkeypatch.setattr(client, "_write_gzip_plans", write_plans)
+    if where == "stall wait":
+        monkeypatch.setattr(_artifact_download.Background, "result", interrupted)
+    else:
+        monkeypatch.setattr(_artifact_download.SharedConnection, "close", interrupted)
+    stderr = io.StringIO()
+    try:
+        rc = cli.main(
+            _base_args() + ["download-metrics", "job-1", "--output-dir", str(tmp_path)],
+            client_factory=lambda _: client,
+            stdout=io.StringIO(),
+            stderr=stderr,
+        )
+    finally:
+        release.set()
+
+    assert rc == 130
+    assert stderr.getvalue() == (
+        "interrupted; downloaded chunks were saved. "
+        "Run the same command with --resume to continue.\n"
+    )
+    assert saved.read_text() == "{}\n"
+
+
 @pytest.mark.parametrize("saved", [True, False])
 def test_download_connector_error_is_short_with_query_id_and_hint(tmp_path, saved):
     errors = pytest.importorskip("snowflake.connector.errors")
