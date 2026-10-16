@@ -37,7 +37,6 @@ use the ``extra`` fields for anything the typed layer does not model yet.
 from __future__ import annotations
 
 import base64
-import codecs
 import contextlib
 import email.utils
 import functools
@@ -997,22 +996,6 @@ def _account_list_error(
     return error
 
 
-def _page_token_rejected_again(exc: InvalidPageToken) -> InvalidPageToken:
-    """``iter_jobs``' error when a token fails again after the walk started over.
-
-    Starting again from the first page, the advice of the first such error,
-    has already been tried.
-    """
-    error = InvalidPageToken(
-        "the service could not open page_token (HTTP 400 Invalid page_token) a second "
-        "time, after the walk had started over from the first page; list the jobs again",
-        response=exc.response,
-        request=exc.request,
-    )
-    _add_snowflake_request_id_to_error(error, _response_snowflake_request_id(exc.response))
-    return error
-
-
 def _optional_filter(value: Any, name: str) -> str | None:
     """A string filter, or None when it is None or empty, as the service reads it."""
     if value is None or value == "":
@@ -1085,38 +1068,6 @@ def _account_page_bounds(
     return max_retries, timeout
 
 
-# A response body at least this large is decoded in pieces; see _json_body. (The
-# growth it avoids began between bodies of 1.0 and 1.4 MB, with a 4-byte character.)
-_PIECEWISE_DECODE_BYTES = 1 << 18
-_DECODE_PIECE_BYTES = 1 << 16
-
-
-def _json_body(resp: requests.Response) -> Any:
-    """``resp.json()``, decoded so that reading a large job list again and again
-    doesn't keep growing the process.
-
-    Decoding a large body that holds non-ASCII text (a ``·`` in a comment, say)
-    in one call makes a string that CPython first sizes for the byte count and
-    then shrinks in place. Some allocators (the macOS one among them) never
-    reuse that memory, so the TUI, which lists the jobs again every minute, grew
-    by the size of the decoded list each time: hundreds of MB within the hour
-    for a few thousand jobs. Decoding in 64 KiB pieces and joining them sizes
-    the string once. A smaller body, and a body that isn't JSON, go through
-    ``resp.json()``, which raises as before.
-    """
-    content = resp.content
-    if not content or len(content) < _PIECEWISE_DECODE_BYTES:
-        return resp.json()
-    try:
-        decoder = codecs.getincrementaldecoder(json.detect_encoding(content))(errors="surrogatepass")
-        pieces = [decoder.decode(content[at:at + _DECODE_PIECE_BYTES])
-                  for at in range(0, len(content), _DECODE_PIECE_BYTES)]
-        pieces.append(decoder.decode(b"", final=True))
-        return json.loads("".join(pieces))
-    except ValueError:  # not text, or not JSON: raise what resp.json() raises
-        return resp.json()
-
-
 def _account_jobs_page(body: Any) -> dict:
     """``{"jobs": [...], "next_page_token": str | None}`` from a page's JSON body."""
     if not isinstance(body, dict):
@@ -1146,11 +1097,39 @@ def _is_account_list_transient(exc: BaseException) -> bool:
 def _is_tail_logs_transient(exc: BaseException) -> bool:
     # tail-logs answers 409 while the job is not running (still pending
     # placement, or ended) and 404 once its session is gone. Neither clears on
-    # a retry; get_job says which it is.
+    # the backoff a retry would spend, so the answer is left to the caller:
+    # _is_session_pending tells a following tail which of the two it is.
     if isinstance(exc, requests.exceptions.HTTPError):
         if exc.response is not None and exc.response.status_code in (404, 409):
             return False
     return _is_transient(exc)
+
+
+# tail-logs' 409 for a job the service has not placed yet. It answers 409 both
+# before placement and once the session is over, and only the message tells them
+# apart ("... is pending placement: quota_filled" against "... has been
+# cancelled: cancelled_by_client").
+_SESSION_PENDING_PLACEMENT = "is pending placement"
+
+
+def _is_session_pending(exc: BaseException) -> bool:
+    """Whether ``exc`` is tail-logs' 409 for a job that has yet to start.
+
+    A following tail waits this one out, there being no log to read yet (see
+    :meth:`CortexTrainingClient.stream_logs`). Every other failure is the
+    caller's, the 409 for a session that is over included: that log is complete,
+    and a caller with a saved copy to fall back on has to see it end.
+    """
+    if not isinstance(exc, requests.exceptions.HTTPError):
+        return False
+    response = exc.response
+    if response is None or getattr(response, "status_code", None) != 409:
+        return False
+    try:
+        text = response.text
+    except Exception:  # noqa: BLE001 - an unreadable body is not the pending answer
+        return False
+    return isinstance(text, str) and _SESSION_PENDING_PLACEMENT in text.lower()
 
 
 # The service answers 500 "Linked experiment is not found for job ..." from the
@@ -1220,72 +1199,6 @@ def _is_log_probability_job_type(job_type: Any) -> bool:
 def _reject_log_probability_sub_job(job_type: Any, *, location: str) -> None:
     if _is_log_probability_job_type(job_type):
         raise ValueError(f"{location}: {_UNSUPPORTED_LOG_PROBABILITY_MESSAGE}")
-
-
-# The create-job ``comment``: free text the service stores with the job and
-# returns unchanged from get and list. It is set at creation only (there is no
-# route to change it) and holds at most this many bytes of UTF-8.
-MAX_COMMENT_BYTES = 1024
-
-
-def _is_model_deployment(sub_job_configs: Any) -> bool:
-    """Whether a create body is a model deployment, the way the server decides:
-    some sub-job's ``inference_config`` sets ``deployment_class``."""
-    if not isinstance(sub_job_configs, list):
-        return False
-    for cfg in sub_job_configs:
-        inference = cfg.get("inference_config") if isinstance(cfg, dict) else None
-        if isinstance(inference, dict) and inference.get("deployment_class") is not None:
-            return True
-    return False
-
-
-def _body_with_checked_comment(body: dict) -> dict:
-    """Return the create body to send, with its ``comment`` checked.
-
-    Every create path sends its body through this: :meth:`create_job`,
-    :meth:`create_job_from_body` and ``cortex-training submit`` (also with
-    ``--dry-run``). A model deployment never carries a comment, because the
-    server rejects one there: it is left out of the returned body, unchecked,
-    with a warning when it had text. A blank comment (empty, or only
-    whitespace) names nothing and is left out as well. For any other job a
-    comment that is not a string, is not valid UTF-8 text, or is longer than
-    :data:`MAX_COMMENT_BYTES` bytes of UTF-8 raises :class:`ValueError` before
-    anything is sent. The caller's dict is never changed.
-    """
-    comment = body.get("comment")
-    if comment is None:
-        return body
-    without_comment = {key: value for key, value in body.items() if key != "comment"}
-    if _is_model_deployment(body.get("sub_job_configs")):
-        if str(comment).strip():
-            logger.warning(
-                "comment not sent: this create request is a model deployment, "
-                "which does not accept one"
-            )
-        return without_comment
-    if not isinstance(comment, str):
-        raise ValueError(f"comment must be a string, got {type(comment).__name__}")
-    if not comment.strip():
-        return without_comment
-    try:
-        size = len(comment.encode("utf-8"))
-    except UnicodeEncodeError as exc:
-        raise ValueError(f"comment must be valid UTF-8 text; {_not_utf8(comment, exc.start)}") from None
-    if size > MAX_COMMENT_BYTES:
-        raise ValueError(
-            f"comment must be at most {MAX_COMMENT_BYTES} bytes of UTF-8, got {size}"
-        )
-    return body
-
-
-def _not_utf8(text: str, index: int) -> str:
-    """Why ``text[index]``, an unpaired surrogate, has no UTF-8 form."""
-    code = ord(text[index])
-    if 0xDC80 <= code <= 0xDCFF:
-        # How Python decodes a byte that isn't UTF-8 in a command-line argument.
-        return f"character {index + 1} stands for the byte 0x{code - 0xDC00:02X}, which is not UTF-8"
-    return f"character {index + 1} is U+{code:04X}, an unpaired surrogate"
 
 
 class Hardware(str, Enum):
@@ -2725,10 +2638,8 @@ class CortexTrainingClient:
         """Send one request with retries.
 
         ``ensure_database=False`` skips creating the configured database on a
-        not-found error, for routes whose path names no database, and for reads
-        that must never create it (a database that doesn't exist can't hold the
-        job they read). A client from :meth:`for_job` never creates one,
-        whatever the caller passes.
+        not-found error, for routes whose path names no database. A client from
+        :meth:`for_job` never creates one, whatever the caller passes.
         """
         auto_create = ensure_database and self._auto_create_database
         fn = getattr(self._session, method.lower())
@@ -2955,7 +2866,6 @@ class CortexTrainingClient:
         hardware: Hardware | str | None = None,
         idle_timeout_seconds: int | None = None,
         pending_timeout_seconds: int | None = None,
-        comment: str | None = None,
     ) -> str:
         """Create a job from a list of sub-jobs and return its server job_id.
 
@@ -2974,12 +2884,6 @@ class CortexTrainingClient:
         job may wait for capacity before failing with ``pending_timeout``: between
         300 and 604,800, with no disable value. Omit either to use the server
         default, currently 30 minutes for idle and 24 hours for pending.
-        ``comment`` names the job: free text stored with it and returned by
-        :meth:`get_job` and :meth:`list_jobs` (the TUI shows its first line as
-        the job's name). It can't be changed after creation. It is never sent
-        for a model deployment, which rejects one; for any other job a comment
-        over 1,024 bytes of UTF-8, or not valid UTF-8 text, raises
-        :class:`ValueError` before sending. A blank comment is not sent.
         """
         if not sub_jobs:
             raise ValueError("create_job requires a non-empty sub_jobs list")
@@ -3019,8 +2923,6 @@ class CortexTrainingClient:
             body["idle_timeout_seconds"] = idle_timeout_seconds
         if pending_timeout_seconds is not None:
             body["pending_timeout_seconds"] = pending_timeout_seconds
-        if comment is not None:
-            body["comment"] = comment  # checked, and left out when blank, on the way out
         return self.create_job_from_body(body)["job_id"]
 
     @_track_operation("create_job")
@@ -3037,10 +2939,7 @@ class CortexTrainingClient:
 
         Every ``peft_config`` present in the body is canonicalized in place and
         an invalid one raises :class:`ValueError` before the request is sent.
-        A ``comment`` is checked as in :meth:`create_job`: a model deployment is
-        sent without it, a blank one is not sent, and for any other job one
-        over 1,024 bytes of UTF-8, or not valid UTF-8 text, raises. The rest of
-        the body, including ``optimizer``, is forwarded as given.
+        The rest of the body, including ``optimizer``, is forwarded as given.
         """
         if not isinstance(body, dict):
             raise ValueError("create_job_from_body requires a JSON object")
@@ -3065,7 +2964,6 @@ class CortexTrainingClient:
                 "create-job debug options are an internal-only capability; set "
                 f"{DEBUG_OPTIONS_ENV}=1 to send a request with a `debug` block"
             )
-        body = _body_with_checked_comment(body)
         resp = self._send("POST", self._prefix, json=body, retry_on=_is_connect_error)
         job = resp.json()
         self._note_created_job(job, body)
@@ -3144,7 +3042,7 @@ class CortexTrainingClient:
             max_retries=max_retries,
             **({} if timeout is None else {"timeout": timeout}),
         )
-        return _json_body(resp).get("jobs", [])
+        return resp.json().get("jobs", [])
 
     def iter_jobs(
         self,
@@ -3322,9 +3220,9 @@ class CortexTrainingClient:
             page_params = params if token is None else {**params, "page_token": token}
             try:
                 page = self._iter_jobs_page(page_params, max_retries, timeout)
-            except InvalidPageToken as exc:
+            except InvalidPageToken:
                 if restarted:
-                    raise _page_token_rejected_again(exc) from exc
+                    raise
                 restarted = True
                 token = None
                 logger.info(
@@ -3388,7 +3286,7 @@ class CortexTrainingClient:
                 raise
             raise error from exc
         with _server_payload():
-            return _account_jobs_page(_json_body(resp))
+            return _account_jobs_page(resp.json())
 
     def for_job(self, job: dict) -> "CortexTrainingClient":
         """Return a client bound to ``job``'s schema, for per-job calls on a
@@ -6150,10 +6048,11 @@ class CortexTrainingClient:
 
         A 409 (the job is pending placement, or no longer running) or a 404
         (its session is gone) is raised at once instead of being retried:
-        neither clears on a retry, and :meth:`get_job` tells them apart. A
-        finished job's pods are gone, so for one the error points to
-        :meth:`download_stdout_logs` for the saved console; it also names a
-        ``sub_job_id`` that is not part of the job. See
+        neither clears on a retry. The 409's message says which it is, and
+        :meth:`get_job` confirms it; :meth:`stream_logs` waits out a job that
+        has yet to be placed. A finished job's pods are gone, so for one the
+        error points to :meth:`download_stdout_logs` for the saved console; it
+        also names a ``sub_job_id`` that is not part of the job. See
         ``docs/reference/rest-api.md`` section 7.8.
         """
         payload: dict = {}
@@ -6195,6 +6094,7 @@ class CortexTrainingClient:
         The job is looked up once per call: if it has ended, its live logs are
         gone; if ``sub_job_id`` is not one of its sub-jobs, it never had any.
         Otherwise (for example, a job still starting) there is nothing to add.
+        The 409 that says the job is pending placement needs no lookup.
         """
         if not isinstance(exc, requests.exceptions.HTTPError):
             return None
@@ -6202,6 +6102,9 @@ class CortexTrainingClient:
         if response is None or response.status_code not in (404, 409, 410):
             return None
         if _response_error_code(response) == _JOB_NOT_FOUND_CODE:
+            return None
+        if _is_session_pending(exc):
+            # The job has yet to start, so it has no log to point at.
             return None
         if "job" not in checked:
             try:
@@ -6244,11 +6147,23 @@ class CortexTrainingClient:
         its entries (under ``entries_key``), advance the cursor, and poll with
         backoff. With ``follow`` False, stop at the first empty page; with
         ``stop_at_eof``, also stop at an empty page that reports ``eof``.
+
+        While ``follow`` and the job has yet to be placed, the poll waits on the
+        same backoff rather than failing (see :func:`_is_session_pending`).
         """
         base_delay = poll_interval or self.poll_interval
         delay = base_delay
         while True:
-            page = fetch(cursor)
+            try:
+                page = fetch(cursor)
+            except requests.exceptions.HTTPError as exc:
+                # Nothing to read until the job is placed; a tail that follows
+                # waits for it, one draining the log once reports the answer.
+                if not (follow and _is_session_pending(exc)):
+                    raise
+                time.sleep(delay)
+                delay = min(delay * self.poll_backoff_multiplier, self.poll_max_interval)
+                continue
             cursor = page.get("next_cursor", cursor)
             entries = page.get(entries_key) or []
             for entry in entries:
@@ -6281,10 +6196,17 @@ class CortexTrainingClient:
         tail. With ``follow=False`` it stops at the first empty page, once it
         has caught up with the log (whether or not the server reports ``eof``).
 
+        Following a job the service has not placed yet is waiting, not an
+        error: there is no log to read, so the poll backs off and tries again
+        until the job starts. With ``follow=False`` that answer raises, the
+        caller having asked to drain the log once.
+
         The stream also ends, without an error, once the log can grow no more:
         at an empty page that reports ``eof``, or when the job ends after the
-        stream has read from it. A job that had already ended before the first
-        read raises, as :meth:`tail_logs` does.
+        stream has read from it. A session that was already over before the
+        first read (the 409 for a cancelled or finished job, or the 404 once it
+        is forgotten) raises, as :meth:`tail_logs` does; the job's saved log
+        outlives its session.
         """
         read_once = False
 
@@ -6382,31 +6304,15 @@ class CortexTrainingClient:
 
     @_track_operation("list_checkpoints")
     def list_checkpoints(self, job_id: str) -> list:
-        """Return the job's checkpoint records (``checkpoint_id``, ``created_at``, ``checkpoint_type``).
-
-        A read never creates the configured database: when it doesn't exist,
-        the job can't be in it, so the service's error is raised as it is.
-        """
-        resp = self._send("GET", f"{self._prefix}/{job_id}/checkpoints", ensure_database=False)
+        resp = self._send("GET", f"{self._prefix}/{job_id}/checkpoints")
         return resp.json().get("checkpoints", [])
 
     @_track_operation("export_checkpoint")
     def export_checkpoint(self, job_id: str, checkpoint_id: str) -> dict:
-        """Return download links for every file of one checkpoint.
-
-        The service answers ``{checkpoint_id, files: [{filename, url,
-        size_bytes}], expires_at}``. Each ``url`` is presigned and lasts 5 hours
-        (until ``expires_at``); fetch it without this client's credentials, and
-        export again for fresh links. ``filename`` is relative and may include a
-        folder. Like :meth:`list_checkpoints`, this
-        never creates the configured database. See
-        ``docs/reference/rest-api.md`` section 5.8.
-        """
         # The REST API uses colon-action syntax: /{jobId}/checkpoints/{cpId}:export
         resp = self._send(
             "POST",
             f"{self._prefix}/{job_id}/checkpoints/{checkpoint_id}:export",
-            ensure_database=False,
         )
         return resp.json()
 

@@ -38,8 +38,6 @@ class Config:
     sf_tracking: bool = False
 
     job_config: str = "configs/qwen3_8b_full.json"
-    # The job's name (its comment). Default: conversational-sft · MODEL; name="" sends none.
-    name: str | None = None
 
 
 def main(config: Config) -> dict[str, Any]:

@@ -124,9 +124,9 @@ operation.
 
 | Method | Returns | Notes |
 |---|---|---|
-| `create_job(sub_jobs, job_id=None, experiment_name=None, hardware=None, idle_timeout_seconds=None, pending_timeout_seconds=None, comment=None)` | `job_id` | Validates each `SubJobConfig` client-side first. Only `training` and `sampling` sub-jobs can be submitted: a job takes zero or one `training` sub-job and any number of `sampling` sub-jobs. `hardware` is `H200`, `B200`, or `B300` (the `Hardware` enum or its string); omitted means `H200`. `comment` names the job: returned by `get_job` and `list_jobs`, and never editable. It is not sent for a model deployment, which rejects it; for any other job more than 1,024 bytes of UTF-8, or text that isn't valid UTF-8, raises `ValueError` before sending. A blank comment is not sent |
-| `create_job_from_body(body)` | response dict | For callers that already hold the REST JSON. Enforces the same one-training-sub-job, no-`log_probability` and `comment` rules before sending, a blank `comment` included |
-| `get_job(job_id)` | job dict | Includes `sub_jobs` with their configs, `comment`, and `reason` / `reason_details` when the service sends them |
+| `create_job(sub_jobs, job_id=None, experiment_name=None, hardware=None, idle_timeout_seconds=None, pending_timeout_seconds=None)` | `job_id` | Validates each `SubJobConfig` client-side first. Only `training` and `sampling` sub-jobs can be submitted: a job takes zero or one `training` sub-job and any number of `sampling` sub-jobs. `hardware` is `H200`, `B200`, or `B300` (the `Hardware` enum or its string); omitted means `H200` |
+| `create_job_from_body(body)` | response dict | For callers that already hold the REST JSON. Enforces the same one-training-sub-job and no-`log_probability` rules before sending |
+| `get_job(job_id)` | job dict | Includes `sub_jobs` with their configs |
 | `list_jobs(status=None, *, max_retries=None, request_timeout=None)` | list of jobs | Returns the inner list, not the envelope. `max_retries` and `request_timeout` bound this one call, as on `list_jobs_page` |
 | `list_jobs_page(*, database=None, schema=None, status=None, submitted_by=None, created_after=None, created_before=None, page_size=100, page_token=None, max_retries=None, request_timeout=None)` | `{"jobs": [...], "next_page_token": str \| None}` | One page of the jobs across the account that the caller can see, newest first; each job also carries `database_name` and `schema_name`. Pass `next_page_token` back as `page_token`, with the same filters, for the next page; `None` means no more. A page can be short or empty and still have a token. The server applies every filter; `None` and `""` mean none. `status` is a comma list or a list, with the groups `active` and `terminal` (`cancelled`, `terminated`, `failed`); `done` is sent as `cancelled,terminated`. Creation bounds take a `date`, a `datetime`, or a string, `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM[:SS[.fraction]]` (a space may replace the `T`) with an optional `Z` or `+HH[:MM]` / `-HH[:MM]` offset; naive means UTC, and they are sent as RFC 3339 UTC with `Z`. Arguments are checked on the call: `page_size` is an `int` from 1 to 1000, and `schema` needs `database`. `max_retries` (retries after the first attempt) and `request_timeout` (seconds, or `(connect, read)`) bound this page; omitted, the client's 10 retries and 30 s / 600 s apply. Raises `AccountJobListUnavailable` (`reason`: `not_deployed`, `disabled`, `forbidden`, `rest_disabled`) for 404, 403 and 405 without retrying, and `InvalidPageToken` when the service can no longer open `page_token`; both subclass `requests.HTTPError`. Other failed answers raise `requests.HTTPError`, connection errors and timeouts raise `requests.ConnectionError` or `requests.Timeout` once retries are spent, and bad arguments or a page body that is not a job list raise `ValueError`; catch `requests.RequestException` and `ValueError` for all of them. See [REST API section 5.3](rest-api.md#across-the-account---get-apiv2cortex-training) |
 | `iter_jobs(*, database=None, schema=None, status=None, submitted_by=None, created_after=None, created_before=None, page_size=100, max_retries=None, request_timeout=None)` | iterator of jobs | `list_jobs_page` page after page as you iterate, with the same filters, following page tokens to the end, and raising as it does on the page that fails. Arguments are checked on the call, and the bounds apply to each page. When the service can no longer open a page token, the walk restarts from the first page once, skipping jobs already yielded by `job_id`, so jobs created since the walk began then come after older ones; a second time raises `InvalidPageToken` |
@@ -273,12 +273,6 @@ with 256 or fewer experts. See
 `request_id`, `list_checkpoints(job_id)`, `export_checkpoint(job_id, checkpoint_id)`,
 `delete_checkpoint(job_id, checkpoint_id)`.
 
-`export_checkpoint` returns `{checkpoint_id, files, expires_at}`; each file has a
-relative `filename`, a presigned `url` that lasts 5 hours, and `size_bytes`.
-Fetch the URLs with a plain HTTP client, without this client's credentials.
-Neither `list_checkpoints` nor `export_checkpoint` creates the configured
-database. See [rest-api.md section 5.8](rest-api.md#58-export-checkpoint).
-
 ## Logs
 
 `tail_logs(job_id, ...)` returns one cursor page of `{"_raw": "<time> <line>"}`
@@ -287,8 +281,13 @@ entries (see [REST API section 7.8](rest-api.md#78-tail-logs));
 with `follow=False` stops at the first empty page. `tail_logs` raises a 404 or
 409 at once instead of retrying it: the job isn't running (pending placement,
 or ended) or its session is gone, and `get_job()` says which. On a job that has
-ended, the error points at `download_stdout_logs`; a `stream_logs` that has
-already read from the job ends there without an error instead. See
+ended, the error points at `download_stdout_logs`. While it follows,
+`stream_logs` waits out the `is pending placement` 409 rather than raising it:
+there is no log to read until the job starts, so it polls again on the same
+backoff. A `stream_logs` that has already read from a job that then ends stops
+there without an error; a session that was over before the first read (the
+other 409s, and the 404 once it is forgotten) raises, the job's saved log
+outliving its session. With `follow=False` every one of them raises. See
 [Tail logs](rest-api.md#78-tail-logs) for the cursor and what each answer
 means.
 `download_execution_logs(job_id, output_dir, *, resume=False,

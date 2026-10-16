@@ -28,7 +28,6 @@ from pathlib import Path
 from typing import Any
 
 from recipes.utils import load_job_body
-from recipes.utils import name_job
 from recipes.utils import source_checkpoint_info
 
 logger = logging.getLogger(__name__)
@@ -44,14 +43,8 @@ def inference_endpoint_body(
     checkpoint_id: str | None = None,
     debug_image_tag: str | None = None,
     search_dirs: Sequence[Path] = CONFIG_SEARCH_DIRS,
-    recipe: str = "inference",
-    name: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, str] | None]:
-    """Return ``(create-job body, source checkpoint info or None)``.
-
-    The body names the job (its ``comment``): ``name`` when given (``""`` for
-    no name), else a comment already in the JSON, else ``RECIPE · MODEL``.
-    """
+    """Return ``(create-job body, source checkpoint info or None)``."""
     body = load_job_body(job_config, search_dirs=search_dirs)
     source = source_checkpoint_info(source_job_id, checkpoint_id)
     if source is not None:
@@ -63,7 +56,7 @@ def inference_endpoint_body(
             sampling_sub["source_checkpoint_info"] = dict(source)
     if debug_image_tag:
         body["debug"] = {"job": {"image_tag": debug_image_tag}}
-    return name_job(body, recipe, name), source
+    return body, source
 
 
 def generate_results(

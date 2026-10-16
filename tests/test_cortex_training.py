@@ -18,6 +18,9 @@
 from __future__ import annotations
 
 import io
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -185,6 +188,17 @@ def test_python_package_exports_canonical_objects():
 
     assert cortex_training.CortexTrainingClient is CortexTrainingClient
     assert cortex_training.wire.WIRE_FORMAT_VERSION == "DSSST1"
+
+
+def test_the_wire_codec_and_torch_load_on_first_use():
+    # Importing the package, its client or the CLI encodes no frame, so it needn't load PyTorch.
+    code = (
+        "import sys, cortex_training, cortex_training._cli, cortex_training.client\n"
+        "assert not {'cortex_training.wire', 'torch'} & set(sys.modules)"
+    )
+    src = Path(__file__).resolve().parents[1] / "src"
+    subprocess.run([sys.executable, "-c", code], check=True, env={**os.environ, "PYTHONPATH": str(src)})
+    assert cortex_training.client.wire is cortex_training.wire  # both names still reach it
 
 
 def test_canonical_environment_and_login_paths(monkeypatch, tmp_path):
