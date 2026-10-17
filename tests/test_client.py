@@ -173,6 +173,21 @@ class TestTrainingConfig:
         with pytest.raises(ValidationError, match="optimizer"):
             TrainingConfig(optimizer={}, max_seq_len=128, train_batch_size=1, n_gpus=2)
 
+    @pytest.mark.parametrize("stage", [3, "3"])
+    def test_validate_rejects_zero_stage_3(self, stage):
+        with pytest.raises(ValidationError, match=r"training\.extra\.ds_config\.zero_optimization\.stage=3 \(ZeRO-3\)"):
+            TrainingConfig(
+                optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+                ds_config={"zero_optimization": {"stage": stage}},
+            )
+
+    @pytest.mark.parametrize("stage", [0, 1, 2])
+    def test_validate_accepts_zero_stages_below_3(self, stage):
+        TrainingConfig(
+            optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+            ds_config={"zero_optimization": {"stage": stage}},
+        )
+
     def test_validate_accepts_nested_primerl_fused_ce_false(self):
         TrainingConfig(
             optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=1, n_gpus=2,
@@ -2010,6 +2025,25 @@ class TestCreateJob:
         with pytest.raises(
             ValueError,
             match=r"sub_job_configs\[0\]\.training_config\.peft_config\.peft_type",
+        ):
+            c.create_job_from_body(body)
+        c._session.post.assert_not_called()
+
+    def test_create_job_from_body_rejects_zero_stage_3_before_post(self):
+        c = _make_client()
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": "training",
+                    "model_name": "gpt2",
+                    "training_config": {"ds_config": {"zero_optimization": {"stage": 3}}},
+                },
+            ],
+        }
+
+        with pytest.raises(
+            ValueError,
+            match=r"sub_job_configs\[0\]\.training_config\.ds_config\.zero_optimization\.stage=3 \(ZeRO-3\)",
         ):
             c.create_job_from_body(body)
         c._session.post.assert_not_called()
