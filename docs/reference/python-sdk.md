@@ -288,8 +288,14 @@ progress=None, on_chunk=None, sub_job_ids=None, strict=False,
 stale_after_seconds=600, transfer_timeout_seconds=300)`
 reconstructs persisted console chunks as
 `<output_dir>/<sub_job_id>/stdout.log`.
-`download_metrics(...)`, with the same options, reconstructs GPU metric chunks
-as `<output_dir>/<sub_job_id>/gpu.jsonl`. Chunks are fetched `max_workers` at a
+`download_metrics(...)`, with the same options, reconstructs runtime-metric
+chunks as `<output_dir>/<sub_job_id>/metrics.jsonl`. `filename` and
+`saved_path` use that name. This is a breaking change from `gpu.jsonl`: an
+existing `gpu.jsonl` is left in place and is not merged into the new file.
+Accepted chunk names are `gpu.YYYYMMDD-HHMMSS.<suffix>.gz` and
+`metrics.YYYYMMDD-HHMMSS.<suffix>.gz`, ordered by timestamp, then `gpu` before
+`metrics`, then suffix. The file is a mixed runtime-metrics stream; unknown
+`kind` values are kept and are opaque to download. Chunks are fetched `max_workers` at a
 time (default 16) on one Snowflake session and written in order. `resume=True`
 appends chunks that are not already recorded in the manifest beside that file
 and continues an interrupted download. Progress is reported only through
@@ -308,7 +314,7 @@ damaged chunk is fetched once more and then skipped and listed in the entry's
 running, a sub-job whose newest chunk is older than `stale_after_seconds` (or,
 for metrics, one with stdout but no metrics) gets a warning that uploads may be
 stalled. See
-[GPU metrics download](rest-api.md#124-gpu-metrics-download) for the JSONL row
+[Runtime metrics download](rest-api.md#124-runtime-metrics-download) for the JSONL row
 schema.
 `get_experiment_run(job_id)` resolves the experiment/run names.
 

@@ -592,14 +592,14 @@ def build_parser(
 
     download_metrics = subparsers.add_parser(
         "download-metrics",
-        help="Download and reconstruct GPU metrics for a Cortex Training job.",
+        help="Download and reconstruct runtime metrics for a Cortex Training job.",
     )
     download_metrics.add_argument("job_id")
     download_metrics.add_argument(
         "--output-dir",
         dest="output_dir",
         help=(
-            "Directory to write <sub_job_id>/gpu.jsonl files. Created if "
+            "Directory to write <sub_job_id>/metrics.jsonl files. Created if "
             "missing. Defaults to the current working directory."
         ),
     )
@@ -1344,7 +1344,7 @@ def _add_chunk_download_arguments(parser: argparse.ArgumentParser, applies_to: s
         help=(
             "Warn when a running job's newest saved chunk is older than this "
             "(default: 10). 0 turns off this and the other job-status notices "
-            f"(a just-ended job, missing GPU metrics).{suffix}"
+            f"(a just-ended job, missing metrics).{suffix}"
         ),
     )
     parser.add_argument(

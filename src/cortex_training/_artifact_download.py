@@ -15,9 +15,9 @@
 
 """Building blocks for downloading staged experiment artifacts.
 
-The client downloads console and GPU metric chunks with one Snowflake ``GET``
+The client downloads console and runtime-metric chunks with one Snowflake ``GET``
 per chunk. Each ``GET`` is mostly round-trip latency, so chunks are fetched on a
-thread pool and appended to the output strictly in sorted name order. This
+thread pool and appended to the output strictly in listed order. This
 module holds the pieces that do not depend on the client itself: retry
 classification and backoff, a reconnectable shared connection, and the
 checkpointing chunk writer that keeps a resume manifest in step with the file.

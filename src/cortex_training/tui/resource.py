@@ -175,6 +175,7 @@ def _parse_gpu_row(doc: object, sub_job_id: str) -> tuple[str, GPUSample | None]
 
 
 def _manifest_bytes(path: Path) -> int | None:
+    """Committed length from the manifest beside the selected data file."""
     manifest = path.with_name("." + path.name + ".manifest.json")
     try:
         doc = json.loads(manifest.read_text(encoding="utf-8"))
@@ -346,17 +347,39 @@ def _build_views(path: Path, committed: int, sub_job_id: str, scan: _Scan) -> di
     }
 
 
+# Newer downloads write metrics.jsonl. A committed gpu.jsonl is the previous
+# cache name and is used only when metrics.jsonl has no valid manifest.
+_METRICS_FILENAMES = ("metrics.jsonl", "gpu.jsonl")
+
+
+def _committed_metrics_files(metrics_root: Path) -> list[tuple[Path, int]]:
+    """One committed metrics file per sub-job, preferring metrics.jsonl.
+
+    The two files are never concatenated or deleted.
+    """
+    try:
+        directories = [
+            path
+            for path in metrics_root.iterdir()
+            if path.is_dir() and not path.name.startswith(".")
+        ]
+    except OSError:
+        return []
+    chosen: list[tuple[Path, int]] = []
+    for directory in sorted(directories, key=lambda path: path.name):
+        for name in _METRICS_FILENAMES:
+            path = directory / name
+            committed = _manifest_bytes(path)
+            if committed is not None:
+                chosen.append((path, committed))
+                break
+    return chosen
+
+
 def load_resource_data(metrics_root: Path) -> ResourceData:
     sub_jobs: dict[str, SubJobResource] = {}
     ignored_by_sub_job: dict[str, int] = {}
-    try:
-        paths = sorted(metrics_root.glob("*/gpu.jsonl"))
-    except OSError:
-        paths = []
-    for path in paths:
-        committed = _manifest_bytes(path)
-        if committed is None:
-            continue
+    for path, committed in _committed_metrics_files(metrics_root):
         sub_job_id = path.parent.name
         try:
             scan, file_ignored = _scan_file(path, sub_job_id, committed)
@@ -382,11 +405,7 @@ def load_resource_data(metrics_root: Path) -> ResourceData:
 
 
 def cached_metric_sources(metrics_root: Path) -> list[str]:
-    try:
-        paths = sorted(metrics_root.glob("*/gpu.jsonl"))
-    except OSError:
-        return []
-    return [path.parent.name for path in paths if _manifest_bytes(path) is not None]
+    return [path.parent.name for path, _committed in _committed_metrics_files(metrics_root)]
 
 
 _BLOCKS = "▁▂▃▄▅▆▇█"

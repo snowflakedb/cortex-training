@@ -2817,15 +2817,25 @@ to those sub-jobs and raises `cortex_training.NoChunksError` (a `ValueError`
 with `sub_job_ids` and `available` attributes) before any `GET` if one has no
 chunks. Two downloads of the same output directory at once are unsupported.
 
-### 12.4 GPU metrics download
+### 12.4 Runtime metrics download
 
 `download_metrics(job_id, output_dir, *, resume=False, max_workers=None,
 progress=None, on_chunk=None, sub_job_ids=None, strict=False,
 stale_after_seconds=600, transfer_timeout_seconds=300)`
-applies the same reconstruction to
-`gpu.YYYYMMDD-HHMMSS.UUID.gz` chunks under `_metrics/{sub_job_id}/` and writes
-`<output_dir>/<sub_job_id>/gpu.jsonl`, including the options, retries, and the
-manifests beside that file. Unless `stale_after_seconds` is `None`, it also reads
+reconstructs runtime-metric chunks under `_metrics/{sub_job_id}/` into
+`<output_dir>/<sub_job_id>/metrics.jsonl`. Accepted names are exactly
+`gpu.YYYYMMDD-HHMMSS.<suffix>.gz` and `metrics.YYYYMMDD-HHMMSS.<suffix>.gz`,
+where `<suffix>` has no `.`, `/`, or `\`. Chunks are ordered by that timestamp,
+then `gpu` before `metrics` when both share a second, then `<suffix>`. The
+options, retries, and the manifest beside `metrics.jsonl` match persisted
+stdout. `filename` and `saved_path` in the JSON result name `metrics.jsonl`.
+That local path is a breaking change from `gpu.jsonl`: a download does not
+read, merge, or delete a `gpu.jsonl` already in the output directory, and it
+does not reuse `.gpu.jsonl.manifest.json`. The first `resume=True` after
+upgrading therefore rebuilds `metrics.jsonl`. Treat a leftover `gpu.jsonl` as
+stale.
+
+Unless `stale_after_seconds` is `None`, it also reads
 the job status. While the job is running it lists `_stdout/` too, and a running
 sub-job that has had stdout chunks for at least two minutes (judged from its
 first stdout chunk and `state_changed_at`) but no metrics chunks is returned
@@ -2834,8 +2844,8 @@ with `chunk_count` 0,
 warning that metric uploads may be stalled. Such a sub-job may be named in `sub_job_ids` without an error.
 
 For a job that has ended, each sub-job with stdout chunks but no metrics
-chunks gets the same kind of entry, with a warning that no GPU metrics were
-saved for it: jobs that ran on images from before GPU metrics were uploaded, or
+chunks gets the same kind of entry, with a warning that no metrics were
+saved for it: jobs that ran on images from before metrics were uploaded, or
 that ended before their first metrics upload, have none. An empty result is
 therefore never silent about a sub-job that has output.
 
@@ -2845,8 +2855,10 @@ metrics download in that window gets a warning per sub-job saying so; download
 again with `resume=True` a minute or two later to pick them up. These job
 lookups are skipped when `stale_after_seconds` is `None`.
 
-The reconstructed file contains the JSONL records emitted by the deployed
-training runtime. Version 2 GPU rows have no `kind` field and include:
+The reconstructed file is one mixed runtime-metrics stream, not a GPU-only
+log. Download copies each JSONL row as stored and does not interpret `kind`.
+Unknown or later `kind` values stay in the file and remain opaque to download.
+Version 2 GPU rows have no `kind` field and include:
 
 | Field | Meaning |
 |---|---|

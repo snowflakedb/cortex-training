@@ -4980,7 +4980,7 @@ class TestExecutionLogDownload:
         ("artifact_name", "chunk_name", "destination_name", "method_name"),
         [
             ("stdout", "console", "stdout.log", "download_stdout_logs"),
-            ("metrics", "gpu", "gpu.jsonl", "download_metrics"),
+            ("metrics", "gpu", "metrics.jsonl", "download_metrics"),
         ],
     )
     def test_download_reconstructs_sorted_chunks_atomically(
@@ -5040,7 +5040,7 @@ class TestExecutionLogDownload:
         ("artifact_name", "chunk_name", "destination_name", "method_name"),
         [
             ("stdout", "console", "stdout.log", "download_stdout_logs"),
-            ("metrics", "gpu", "gpu.jsonl", "download_metrics"),
+            ("metrics", "gpu", "metrics.jsonl", "download_metrics"),
         ],
     )
     def test_download_corruption_preserves_existing_file(
@@ -5122,7 +5122,7 @@ class TestExecutionLogDownload:
 
         result = c.download_metrics("job-1", tmp_path)
 
-        assert (tmp_path / sub_job_id / "gpu.jsonl").read_bytes() == b"1\n2\n3\n4\n"
+        assert (tmp_path / sub_job_id / "metrics.jsonl").read_bytes() == b"1\n2\n3\n4\n"
         assert result[0]["chunk_count"] == 4
         assert result[0]["last_artifact_uri"] == run_uri + f"_metrics/{sub_job_id}/{both}"
         assert "merged in chunk time order" in result[0]["warnings"][0]
@@ -5133,6 +5133,338 @@ class TestExecutionLogDownload:
         again = c.download_metrics("job-1", tmp_path, resume=True)
         assert [cmd for cmd in connection.commands if cmd.startswith("GET ")] == gets
         assert again[0]["chunk_count"] == 4
+
+    def _open_metrics(self, monkeypatch, basenames_and_bodies, *, sub="job-1:training:0"):
+        c = _make_client()
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        paths = [f"_metrics/{sub}/{name}" for name, _body in basenames_and_bodies]
+        connection = self.FakeArtifactConnection(
+            {
+                run_uri + "_metrics/": [(f"/versions/RUN_ABC/{path}",) for path in paths],
+                run_uri + "checkpoints/_metrics/": [],
+            },
+            {
+                run_uri + path: gzip.compress(body)
+                for path, (_name, body) in zip(paths, basenames_and_bodies)
+            },
+        )
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", lambda: connection)
+        return c, connection, run_uri, paths
+
+    def _manifest_names(self, destination):
+        manifest = destination.with_name("." + destination.name + ".manifest.json")
+        return json.loads(manifest.read_text(encoding="utf-8"))["names"]
+
+    @pytest.mark.parametrize(
+        ("basenames_and_bodies", "ordered_bodies"),
+        [
+            (
+                [
+                    ("gpu.20260904-120002.b.gz", b"late\n"),
+                    ("gpu.20260904-120001.a.gz", b"early\n"),
+                ],
+                [b"early\n", b"late\n"],
+            ),
+            (
+                [
+                    ("metrics.20260904-120002.b.gz", b"late\n"),
+                    ("metrics.20260904-120001.a.gz", b"early\n"),
+                ],
+                [b"early\n", b"late\n"],
+            ),
+        ],
+        ids=["old-prefix", "new-prefix"],
+    )
+    def test_download_metrics_accepts_each_strict_prefix(
+        self, tmp_path, monkeypatch, basenames_and_bodies, ordered_bodies
+    ):
+        sub = "job-1:training:0"
+        c, _connection, _run_uri, paths = self._open_metrics(
+            monkeypatch, basenames_and_bodies, sub=sub
+        )
+        result = c.download_metrics("job-1", tmp_path, stale_after_seconds=None)
+        destination = tmp_path / sub / "metrics.jsonl"
+        assert destination.read_bytes() == b"".join(ordered_bodies)
+        assert result[0]["filename"] == "metrics.jsonl"
+        assert result[0]["saved_path"] == str(destination)
+        by_body = {body: f"_metrics/{sub}/{name}" for name, body in basenames_and_bodies}
+        assert self._manifest_names(destination) == [by_body[body] for body in ordered_bodies]
+
+    def test_download_metrics_orders_mixed_prefixes_by_time_then_gpu(
+        self, tmp_path, monkeypatch
+    ):
+        sub = "job-1:training:0"
+        chunks = [
+            ("gpu.20260904-120002.b.gz", b"gpu-late\n"),
+            ("metrics.20260904-120001.a.gz", b"metrics-early\n"),
+            ("gpu.20260904-120001.z.gz", b"gpu-early\n"),
+            ("metrics.20260904-120002.a.gz", b"metrics-late\n"),
+        ]
+        c, _connection, _run_uri, _paths = self._open_metrics(monkeypatch, chunks, sub=sub)
+        c.download_metrics("job-1", tmp_path, stale_after_seconds=None)
+        destination = tmp_path / sub / "metrics.jsonl"
+        assert destination.read_bytes() == b"gpu-early\nmetrics-early\ngpu-late\nmetrics-late\n"
+        assert self._manifest_names(destination) == [
+            f"_metrics/{sub}/gpu.20260904-120001.z.gz",
+            f"_metrics/{sub}/metrics.20260904-120001.a.gz",
+            f"_metrics/{sub}/gpu.20260904-120002.b.gz",
+            f"_metrics/{sub}/metrics.20260904-120002.a.gz",
+        ]
+
+    def test_download_metrics_orders_same_second_gpu_before_metrics_then_suffix(
+        self, tmp_path, monkeypatch
+    ):
+        sub = "job-1:training:0"
+        chunks = [
+            ("metrics.20260904-120001.a.gz", b"new-a\n"),
+            ("gpu.20260904-120001.z.gz", b"old-z\n"),
+            ("metrics.20260904-120001.m.gz", b"new-m\n"),
+            ("gpu.20260904-120001.b.gz", b"old-b\n"),
+        ]
+        c, _connection, _run_uri, _paths = self._open_metrics(monkeypatch, chunks, sub=sub)
+        c.download_metrics("job-1", tmp_path, stale_after_seconds=None)
+        destination = tmp_path / sub / "metrics.jsonl"
+        assert destination.read_bytes() == b"old-b\nold-z\nnew-a\nnew-m\n"
+        assert [PurePosixPath(name).name for name in self._manifest_names(destination)] == [
+            "gpu.20260904-120001.b.gz",
+            "gpu.20260904-120001.z.gz",
+            "metrics.20260904-120001.a.gz",
+            "metrics.20260904-120001.m.gz",
+        ]
+
+    def test_download_metrics_ignores_names_outside_the_strict_pattern(
+        self, tmp_path, monkeypatch
+    ):
+        sub = "job-1:training:0"
+        accepted = [
+            ("gpu.20260904-120001.ok.gz", b"gpu\n"),
+            ("metrics.20260904-120002.ok.gz", b"metrics\n"),
+        ]
+        rejected = [
+            "gpu.jsonl",
+            "metrics.jsonl",
+            "gpu.20260904-120001.gz",
+            "metrics.20260904-120001.foo.bar.gz",
+            "GPU.20260904-120001.a.gz",
+            "metrics.20260904-120001.a.gz.bak",
+            "gpu.20260904-120001..gz",
+            "metrics.20260904120001.a.gz",
+            "notmetrics.20260904-120001.a.gz",
+            "gpu.20260904-120001.a.GZ",
+        ]
+        c = _make_client()
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        good = [f"_metrics/{sub}/{name}" for name, _body in accepted]
+        bad = [f"_metrics/{sub}/{name}" for name in rejected]
+        bad.append(f"_metrics/{sub}/metrics.20260904-120003.a/b.gz")
+        connection = self.FakeArtifactConnection(
+            {
+                run_uri + "_metrics/": [
+                    (f"/versions/RUN_ABC/{path}",) for path in [*bad, *good]
+                ],
+                run_uri + "checkpoints/_metrics/": [],
+            },
+            {run_uri + path: gzip.compress(body) for path, (_name, body) in zip(good, accepted)},
+        )
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", lambda: connection)
+        c.download_metrics("job-1", tmp_path, stale_after_seconds=None)
+        destination = tmp_path / sub / "metrics.jsonl"
+        assert destination.read_bytes() == b"gpu\nmetrics\n"
+        assert self._manifest_names(destination) == good
+        assert CortexTrainingClient._chunk_time(nc._METRICS_CHUNK_RE, good[0]) == (
+            CortexTrainingClient._chunk_time(nc._METRICS_CHUNK_RE, good[1].replace("120002", "120001"))
+        )
+
+    def test_metrics_chunk_time_reads_the_shared_timestamp_group(self):
+        pattern = nc._METRICS_CHUNK_RE
+        stamp = datetime(2026, 9, 4, 12, 0, 1, tzinfo=timezone.utc).timestamp()
+        assert CortexTrainingClient._chunk_time(
+            pattern, "_metrics/sub/gpu.20260904-120001.abc.gz"
+        ) == stamp
+        assert CortexTrainingClient._chunk_time(
+            pattern, "metrics.20260904-120001.xyz.gz"
+        ) == stamp
+        assert pattern.fullmatch("gpu.20260904-120001.gz") is None
+        assert pattern.fullmatch("metrics.20260904-120001.foo.bar.gz") is None
+        assert pattern.fullmatch("metrics.20260904-120003.a\\b.gz") is None
+        assert CortexTrainingClient._chunk_time(pattern, "gpu.not-a-time.a.gz") is None
+
+    def test_download_metrics_resume_appends_a_gpu_prefix_and_rebuilds_an_insert(
+        self, tmp_path, monkeypatch
+    ):
+        sub = "job-1:training:0"
+        gpu_early = ("gpu.20260904-120001.a.gz", b"g1\n")
+        gpu_mid = ("gpu.20260904-120002.a.gz", b"g2\n")
+        metrics_late = ("metrics.20260904-120003.a.gz", b"m3\n")
+        c, connection, run_uri, paths = self._open_metrics(
+            monkeypatch, [gpu_early, gpu_mid], sub=sub
+        )
+        c.download_metrics("job-1", tmp_path, stale_after_seconds=None)
+        destination = tmp_path / sub / "metrics.jsonl"
+        committed = destination.read_bytes()
+        assert committed == b"g1\ng2\n"
+        late_path = f"_metrics/{sub}/{metrics_late[0]}"
+        connection.list_rows[run_uri + "_metrics/"].append((f"/versions/RUN_ABC/{late_path}",))
+        connection.content_by_uri[run_uri + late_path] = gzip.compress(metrics_late[1])
+        gets_before = [cmd for cmd in connection.commands if cmd.startswith("GET ")]
+        calls = []
+        c.download_metrics("job-1", tmp_path, resume=True, stale_after_seconds=None, progress=calls.append)
+        assert destination.read_bytes() == committed + b"m3\n"
+        assert self._manifest_names(destination) == [*paths, late_path]
+        new_gets = [cmd for cmd in connection.commands if cmd.startswith("GET ")]
+        assert len(new_gets) - len(gets_before) == 1
+        assert calls[0] == c._artifact_progress_status("metrics", 0, 1, sub)
+
+        inserted = f"_metrics/{sub}/gpu.20260904-120000.a.gz"
+        connection.list_rows[run_uri + "_metrics/"].append((f"/versions/RUN_ABC/{inserted}",))
+        connection.content_by_uri[run_uri + inserted] = gzip.compress(b"g0\n")
+        calls.clear()
+        c.download_metrics("job-1", tmp_path, resume=True, stale_after_seconds=None, progress=calls.append)
+        assert destination.read_bytes() == b"g0\ng1\ng2\nm3\n"
+        assert calls[0] == c._artifact_progress_status("metrics", 0, 4, sub)
+        assert [PurePosixPath(name).name for name in self._manifest_names(destination)] == [
+            "gpu.20260904-120000.a.gz",
+            "gpu.20260904-120001.a.gz",
+            "gpu.20260904-120002.a.gz",
+            "metrics.20260904-120003.a.gz",
+        ]
+
+    def test_download_metrics_rebuilds_when_listing_rolls_back_to_older_gpu_chunks(
+        self, tmp_path, monkeypatch
+    ):
+        sub = "job-1:training:0"
+        chunks = [
+            ("metrics.20260904-120002.a.gz", b"m2\n"),
+            ("metrics.20260904-120003.a.gz", b"m3\n"),
+        ]
+        c, connection, run_uri, _paths = self._open_metrics(monkeypatch, chunks, sub=sub)
+        c.download_metrics("job-1", tmp_path, stale_after_seconds=None)
+        destination = tmp_path / sub / "metrics.jsonl"
+        assert destination.read_bytes() == b"m2\nm3\n"
+        rolled = f"_metrics/{sub}/gpu.20260904-120001.a.gz"
+        connection.list_rows[run_uri + "_metrics/"] = [(f"/versions/RUN_ABC/{rolled}",)]
+        connection.content_by_uri[run_uri + rolled] = gzip.compress(b"g1\n")
+        calls = []
+        c.download_metrics("job-1", tmp_path, resume=True, stale_after_seconds=None, progress=calls.append)
+        assert destination.read_bytes() == b"g1\n"
+        assert self._manifest_names(destination) == [rolled]
+        assert calls[0] == c._artifact_progress_status("metrics", 0, 1, sub)
+
+    def test_download_metrics_leaves_a_stale_gpu_jsonl_and_does_not_migrate_its_manifest(
+        self, tmp_path, monkeypatch
+    ):
+        sub = "job-1:training:0"
+        chunks = [
+            ("gpu.20260904-120001.a.gz", b"g1\n"),
+            ("gpu.20260904-120002.a.gz", b"g2\n"),
+        ]
+        c, _connection, _run_uri, paths = self._open_metrics(monkeypatch, chunks, sub=sub)
+        directory = tmp_path / sub
+        directory.mkdir()
+        legacy = directory / "gpu.jsonl"
+        legacy.write_bytes(b"legacy-local\n")
+        legacy_manifest = directory / ".gpu.jsonl.manifest.json"
+        legacy_manifest_body = json.dumps(
+            {"version": 1, "names": [paths[0]], "bytes": legacy.stat().st_size}
+        )
+        legacy_manifest.write_text(legacy_manifest_body, encoding="utf-8")
+        legacy_partial = directory / ".gpu.jsonl.partial"
+        legacy_partial.write_bytes(b"partial")
+        orphan = directory / ".gpu-metrics-orphan.tmp"
+        old_manifest_tmp = directory / ".gpu.jsonl.manifest-abc.tmp"
+        orphan.write_bytes(b"x")
+        old_manifest_tmp.write_bytes(b"x")
+        old = time.time() - 2 * c._TEMP_ORPHAN_MIN_AGE_SECONDS
+        os.utime(orphan, (old, old))
+        os.utime(old_manifest_tmp, (old, old))
+
+        c.download_metrics("job-1", tmp_path, resume=True, stale_after_seconds=None)
+
+        destination = directory / "metrics.jsonl"
+        assert destination.read_bytes() == b"g1\ng2\n"
+        assert self._manifest_names(destination) == paths
+        assert legacy.read_bytes() == b"legacy-local\n"
+        assert legacy_manifest.read_text(encoding="utf-8") == legacy_manifest_body
+        assert legacy_partial.read_bytes() == b"partial"
+        assert not orphan.exists()
+        assert old_manifest_tmp.exists()
+        assert destination.with_name(".metrics.jsonl.manifest.json").exists()
+
+    def test_stall_check_uses_metrics_time_order_not_basename_order(
+        self, tmp_path, monkeypatch
+    ):
+        sub = "job-1:training:0"
+        # Lexicographic basename order would treat the older metrics chunk as newest.
+        chunks = [
+            ("metrics.20260904-120000.a.gz", b"old\n"),
+            ("gpu.20260904-121500.a.gz", b"new\n"),
+        ]
+        c, _connection, _run_uri, _paths = self._open_metrics(monkeypatch, chunks, sub=sub)
+        monkeypatch.setattr(
+            c, "_job_for_upload_warnings", lambda job_id: ({"status": "RUNNING"}, None)
+        )
+        c._wall_clock = lambda: datetime(2026, 9, 4, 12, 16, tzinfo=timezone.utc).timestamp()
+        result = c.download_metrics("job-1", tmp_path)
+        assert "warnings" not in result[0]
+        assert (tmp_path / sub / "metrics.jsonl").read_bytes() == b"old\nnew\n"
+
+    def test_stdout_chunk_order_stays_lexical(self, tmp_path, monkeypatch):
+        c = _make_client()
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        sub = "job-1:training:0"
+        hyphen = f"_stdout/{sub}/console.20260904-120001.a-b.gz"
+        plain = f"_stdout/{sub}/console.20260904-120001.a.gz"
+        connection = self.FakeArtifactConnection(
+            {
+                run_uri + "_stdout/": [
+                    (f"/versions/RUN_ABC/{plain}",),
+                    (f"/versions/RUN_ABC/{hyphen}",),
+                ],
+                run_uri + "checkpoints/_stdout/": [],
+            },
+            {
+                run_uri + plain: gzip.compress(b"plain\n"),
+                run_uri + hyphen: gzip.compress(b"hyphen\n"),
+            },
+        )
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", lambda: connection)
+        c.download_stdout_logs("job-1", tmp_path, stale_after_seconds=None)
+        # '-' sorts before '.' in the filename, so the longer suffix comes first.
+        assert (tmp_path / sub / "stdout.log").read_bytes() == b"hyphen\nplain\n"
+
+    def test_metrics_duplicate_across_roots_keeps_the_primary_copy(
+        self, tmp_path, monkeypatch
+    ):
+        c = _make_client()
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        sub = "job-1:training:0"
+        early = f"_metrics/{sub}/gpu.20260904-120001.a.gz"
+        both = "metrics.20260904-120002.both.gz"
+        primary = f"_metrics/{sub}/{both}"
+        checkpoint = f"checkpoints/_metrics/{sub}/{both}"
+        connection = self.FakeArtifactConnection(
+            {
+                run_uri + "_metrics/": [
+                    (f"/versions/RUN_ABC/{early}",),
+                    (f"/versions/RUN_ABC/{primary}",),
+                ],
+                run_uri + "checkpoints/_metrics/": [(f"/versions/RUN_ABC/{checkpoint}",)],
+            },
+            {
+                run_uri + early: gzip.compress(b"early\n"),
+                run_uri + primary: gzip.compress(b"primary\n"),
+                run_uri + checkpoint: gzip.compress(b"checkpoint\n"),
+            },
+        )
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", lambda: connection)
+        result = c.download_metrics("job-1", tmp_path, stale_after_seconds=None)
+        assert (tmp_path / sub / "metrics.jsonl").read_bytes() == b"early\nprimary\n"
+        assert "merged in chunk time order" in result[0]["warnings"][0]
+        assert result[0]["last_artifact_uri"].endswith(primary)
 
     def _gzip_download(self, monkeypatch, tmp_path, artifact_name, listed, bodies):
         c = _make_client()
@@ -5153,7 +5485,7 @@ class TestExecutionLogDownload:
         ("artifact_name", "chunk_name", "destination_name", "method_name"),
         [
             ("stdout", "console", "stdout.log", "download_stdout_logs"),
-            ("metrics", "gpu", "gpu.jsonl", "download_metrics"),
+            ("metrics", "gpu", "metrics.jsonl", "download_metrics"),
         ],
     )
     def test_download_resume_appends_suffix_and_writes_manifest(
@@ -5190,7 +5522,7 @@ class TestExecutionLogDownload:
         ("artifact_name", "chunk_name", "destination_name", "method_name"),
         [
             ("stdout", "console", "stdout.log", "download_stdout_logs"),
-            ("metrics", "gpu", "gpu.jsonl", "download_metrics"),
+            ("metrics", "gpu", "metrics.jsonl", "download_metrics"),
         ],
     )
     def test_download_resume_rebuilds_when_new_name_sorts_earlier(
@@ -5220,7 +5552,7 @@ class TestExecutionLogDownload:
         ("artifact_name", "chunk_name", "destination_name", "method_name"),
         [
             ("stdout", "console", "stdout.log", "download_stdout_logs"),
-            ("metrics", "gpu", "gpu.jsonl", "download_metrics"),
+            ("metrics", "gpu", "metrics.jsonl", "download_metrics"),
         ],
     )
     def test_download_resume_truncates_torn_tail(
@@ -5535,7 +5867,7 @@ class TestExecutionLogDownload:
         ("artifact_name", "chunk_name", "destination_name", "method_name"),
         [
             ("stdout", "console", "stdout.log", "download_stdout_logs"),
-            ("metrics", "gpu", "gpu.jsonl", "download_metrics"),
+            ("metrics", "gpu", "metrics.jsonl", "download_metrics"),
         ],
     )
     def test_download_progress_reports_each_chunk(
@@ -5709,7 +6041,7 @@ class TestExecutionLogDownload:
             {names[0]: b"a\n"},
         )
         c.download_metrics("job-1", tmp_path)
-        destination = tmp_path / sub / "gpu.jsonl"
+        destination = tmp_path / sub / "metrics.jsonl"
         committed = destination.read_bytes()
         connection.list_rows[run_uri + root + "/"] = [
             (f"/versions/RUN_ABC/{path}",) for path in names
@@ -5756,7 +6088,7 @@ class TestExecutionLogDownload:
             c.download_metrics("job-1", fresh, progress=stop_on_second)
         assert calls[-1] == "\n"
         assert not list((fresh / sub).glob(".*.tmp"))
-        assert not (fresh / sub / "gpu.jsonl").exists()
+        assert not (fresh / sub / "metrics.jsonl").exists()
 
     def test_download_progress_setup_failures_close_line(self, tmp_path, monkeypatch):
         root = "_stdout"
@@ -5801,8 +6133,8 @@ class TestExecutionLogDownload:
             monkeypatch, tmp_path, "metrics", [first], {first: b"a\n"}
         )
 
-        destination = tmp_path / sub / "gpu.jsonl"
-        manifest = destination.with_name(".gpu.jsonl.manifest.json")
+        destination = tmp_path / sub / "metrics.jsonl"
+        manifest = destination.with_name(".metrics.jsonl.manifest.json")
         seen = []
 
         def fail_on_newline(message):
@@ -5977,7 +6309,7 @@ class TestExecutionLogDownload:
             {first: b"a\n", second: b"b\n"},
         )
         c.download_metrics("job-1", tmp_path)
-        destination = tmp_path / sub / "gpu.jsonl"
+        destination = tmp_path / sub / "metrics.jsonl"
         destination.write_bytes(b"x")
         calls = []
         c.download_metrics("job-1", tmp_path, resume=True, progress=calls.append)
@@ -6209,7 +6541,7 @@ class TestChunkedArtifactDownload:
 
     @pytest.mark.parametrize(
         ("artifact_name", "method_name", "destination_name"),
-        [("stdout", "download_stdout_logs", "stdout.log"), ("metrics", "download_metrics", "gpu.jsonl")],
+        [("stdout", "download_stdout_logs", "stdout.log"), ("metrics", "download_metrics", "metrics.jsonl")],
     )
     def test_interrupted_first_download_resumes_from_saved_chunks(
         self, artifact_name, method_name, destination_name, tmp_path, monkeypatch
@@ -7019,7 +7351,7 @@ class TestChunkedArtifactDownload:
         c.download_stdout_logs("job-1", tmp_path, stale_after_seconds=None)
         assert status_calls == []
 
-    @pytest.mark.parametrize("artifact_name, label", [("stdout", "stdout output"), ("metrics", "GPU metrics")])
+    @pytest.mark.parametrize("artifact_name, label", [("stdout", "stdout output"), ("metrics", "metrics")])
     def test_a_just_ended_job_warns_that_its_last_chunks_may_still_be_uploading(
         self, tmp_path, monkeypatch, artifact_name, label
     ):
@@ -7052,7 +7384,7 @@ class TestChunkedArtifactDownload:
             monkeypatch, count=3, artifact_name="metrics"
         )
         [warning] = c.download_metrics("job-1", tmp_path)[0]["warnings"]
-        assert warning.startswith(f"newest saved GPU metrics for {self.SUB} is from")
+        assert warning.startswith(f"newest saved metrics for {self.SUB} is from")
         assert "prints nothing" not in warning
 
     def _metrics_missing_setup(self, monkeypatch, status="RUNNING", **kwargs):
@@ -7078,13 +7410,13 @@ class TestChunkedArtifactDownload:
         assert [entry["sub_job_id"] for entry in result] == [stdout_only, self.SUB]
         assert result[0] == {
             "sub_job_id": stdout_only,
-            "filename": "gpu.jsonl",
+            "filename": "metrics.jsonl",
             "saved_path": None,
             "chunk_count": 0,
             "first_artifact_uri": None,
             "last_artifact_uri": None,
             "warnings": [
-                f"no GPU metrics have been saved for {stdout_only} while the job is still "
+                f"no metrics have been saved for {stdout_only} while the job is still "
                 "running, although its stdout output has been; metric uploads may be "
                 "stalled. Contact support if this persists."
             ],
@@ -7104,8 +7436,8 @@ class TestChunkedArtifactDownload:
         assert [entry["sub_job_id"] for entry in result] == [stdout_only, self.SUB]
         assert result[0]["chunk_count"] == 0 and result[0]["saved_path"] is None
         (message,) = result[0]["warnings"]
-        assert message.startswith(f"no GPU metrics were saved for {stdout_only}, although its stdout")
-        assert "images from before GPU metrics were uploaded" in message
+        assert message.startswith(f"no metrics were saved for {stdout_only}, although its stdout")
+        assert "images from before metrics were uploaded" in message
         assert "warnings" not in result[1]
         assert any(cmd == f"LIST '{self.RUN_URI}_stdout/'" for cmd in connection.commands)
         # Naming that sub-job returns the explanation instead of NoChunksError.

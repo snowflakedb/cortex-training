@@ -147,7 +147,7 @@ cortex-training download-metrics JOB_ID --output-dir ./metrics
 ```
 
 See [execution logs](#download-execution-logs),
-[persisted stdout](#download-persisted-stdout), and [GPU metrics](#download-gpu-metrics)
+[persisted stdout](#download-persisted-stdout), and [metrics](#download-metrics)
 for download paths and output fields.
 
 ### [Output And Help](#json-output-and-help)
@@ -178,7 +178,7 @@ cortex-training fwd-bwd --help
 - [Forward-backward and optimizer steps](#run-a-forward-backward-smoke-test)
 - [Load checkpoints](#load-a-checkpoint-into-a-running-job) and [initialize sampling](#start-sampling-from-a-training-checkpoint)
 - [Generate](#run-a-generate-smoke-test) and [sync weights](#sync-training-weights)
-- [Download logs](#download-execution-logs), [stdout](#download-persisted-stdout), and [metrics](#download-gpu-metrics)
+- [Download logs](#download-execution-logs), [stdout](#download-persisted-stdout), and [metrics](#download-metrics)
 - [Job TUI](#job-tui), [JSON output and help](#json-output-and-help), and [troubleshooting](#troubleshooting)
 
 `cortex-training` submits and manages Cortex Training jobs through the Cortex
@@ -680,15 +680,28 @@ directory at once are unsupported. If the TUI is downloading into the same
 directory (its cache, as named in a skipped-chunk warning), the command stops
 with an error instead of writing alongside it.
 
-### Download GPU Metrics
+### Download metrics
 
-Reconstruct each sub-job's GPU metric chunks into
-`<output_dir>/<sub_job_id>/gpu.jsonl`:
+Reconstruct each sub-job's runtime-metric chunks into
+`<output_dir>/<sub_job_id>/metrics.jsonl`:
 
 ```bash
 cortex-training download-metrics JOB_ID --output-dir /path/to/metrics
 cortex-training download-metrics JOB_ID --output-dir /path/to/metrics --resume
 ```
+
+The file is a mixed runtime-metrics stream. GPU rows, host rows, and any later
+row kinds are kept as stored; unknown `kind` values stay opaque. Chunk names
+`gpu.YYYYMMDD-HHMMSS.<suffix>.gz` and `metrics.YYYYMMDD-HHMMSS.<suffix>.gz`
+are both accepted and ordered by timestamp, then `gpu` before `metrics`, then
+suffix.
+
+`filename` and `saved_path` in the JSON result are `metrics.jsonl`. That
+replaces `gpu.jsonl` and is a breaking change for callers that open the old
+path. A `gpu.jsonl` already in the output directory is not merged or deleted;
+after upgrading, treat it as stale and use `metrics.jsonl`. `--resume` uses
+the manifest beside `metrics.jsonl` only, so the first resume after upgrading
+rebuilds that file.
 
 The command prints the saved path, chunk count, and first/last logical artifact
 URIs for each reconstructed file. `--resume`, `--parallel N`, `--sub-job
@@ -696,11 +709,11 @@ SUB_JOB_ID`, `--strict`, `--stale-after-minutes`, `--transfer-timeout`,
 damaged chunks, retries,
 progress on stderr, and Ctrl-C behave as for
 [persisted stdout](#download-persisted-stdout). While the job is running, a
-sub-job that has saved stdout but no GPU metrics is also listed, with
+sub-job that has saved stdout but no metrics is also listed, with
 `chunk_count` 0, `saved_path` `null`, and a warning that metric uploads may be
 stalled. After the job has ended, such a sub-job is listed the same way with a
-warning that no GPU metrics were saved for it (for example, because the job ran
-on an image from before GPU metrics were uploaded). Two downloads of the same directory at once are unsupported; a TUI
+warning that no metrics were saved for it (for example, because the job ran
+on an image from before metrics were uploaded). Two downloads of the same directory at once are unsupported; a TUI
 download of the same directory is refused as for stdout.
 
 ### Job TUI
@@ -764,7 +777,7 @@ line, and on the Resource tab, for the selected sub-job. The TUI always
 resumes, so it keeps a skipped chunk skipped; its warning names the
 `download-log --log-type stdout` or `download-metrics` command, with
 `--sub-job` and `--output-dir` set to the TUI's cache, that retries it. The
-stalled-upload check runs on at most one GPU metrics refresh per job every five
+stalled-upload check runs on at most one metrics refresh per job every five
 minutes (a refresh that fails does not count). For two minutes after a job
 ends, the status line also says its last output may still be uploading; `r`
 fetches what has arrived since. A stream error while the job is still running

@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import cortex_training.tui.resource as resource_module
+from cortex_training.tui.resource import cached_metric_sources
 from cortex_training.tui.resource import load_resource_data
 from cortex_training.tui.resource import parse_sample_ts
 from cortex_training.tui.resource import render_chart
@@ -45,9 +46,10 @@ def _write_metrics(
     *,
     committed: int | None = None,
     manifest: bool = True,
+    filename: str = "gpu.jsonl",
 ) -> Path:
-    path = root / sub_job_id / "gpu.jsonl"
-    path.parent.mkdir(parents=True)
+    path = root / sub_job_id / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
     normalized = []
     for item in rows:
         if isinstance(item, dict):
@@ -57,7 +59,7 @@ def _write_metrics(
     path.write_bytes(payload)
     if manifest:
         size = len(payload) if committed is None else committed
-        path.with_name(".gpu.jsonl.manifest.json").write_text(
+        path.with_name("." + path.name + ".manifest.json").write_text(
             json.dumps({"version": 1, "names": ["chunk.gz"], "bytes": size}) + "\n",
             encoding="utf-8",
         )
@@ -408,3 +410,46 @@ def test_chart_uses_fixed_scale_labels_and_fits_narrow_width(tmp_path):
     assert all(len(line) == 120 for line in wide)
     assert wide[0].index("▁") == wide[2].index(view.start.astimezone().strftime("%H:%M"))
     assert wide[2].endswith(view.end.astimezone().strftime("%H:%M"))
+
+
+def test_committed_metrics_jsonl_is_preferred_and_legacy_file_stays(tmp_path):
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    legacy = _write_metrics(tmp_path, "job:training:0", [_row(now, 0, 90), _row(now, 1, 80)])
+    current = _write_metrics(
+        tmp_path,
+        "job:training:0",
+        [_row(now, 0, 10)],
+        filename="metrics.jsonl",
+    )
+
+    view = load_resource_data(tmp_path).sub_jobs["job:training:0"].views["all"]
+    assert [row.global_gpu_index for row in view.rows] == [0]
+    assert view.rows[0].current_util_pct == 10
+    assert legacy.read_bytes()
+    assert current.read_bytes()
+    assert cached_metric_sources(tmp_path) == ["job:training:0"]
+
+
+def test_uncommitted_metrics_jsonl_falls_back_to_committed_gpu_jsonl(tmp_path):
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    legacy = _write_metrics(tmp_path, "job:training:0", [_row(now, 0, 20)])
+    metrics = tmp_path / "job:training:0" / "metrics.jsonl"
+    metrics.write_text(json.dumps(_row(now, 0, 99)) + "\n", encoding="utf-8")
+
+    view = load_resource_data(tmp_path).sub_jobs["job:training:0"].views["all"]
+    assert view.rows[0].current_util_pct == 20
+    assert metrics.exists()
+    assert legacy.exists()
+    assert cached_metric_sources(tmp_path) == ["job:training:0"]
+
+
+def test_metrics_only_cache_and_uncommitted_legacy_are_distinct_sources(tmp_path):
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    _write_metrics(tmp_path, "job:training:0", [_row(now, 0, 10)], filename="metrics.jsonl")
+    bare = tmp_path / "job:sampling:0" / "gpu.jsonl"
+    bare.parent.mkdir()
+    bare.write_text("{}\n", encoding="utf-8")
+
+    assert load_resource_data(tmp_path).sub_jobs["job:training:0"].views["all"].rows[0].current_util_pct == 10
+    assert "job:sampling:0" not in load_resource_data(tmp_path).sub_jobs
+    assert cached_metric_sources(tmp_path) == ["job:training:0"]

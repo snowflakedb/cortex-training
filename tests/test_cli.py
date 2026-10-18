@@ -330,13 +330,13 @@ class FakeClient:
         if progress is not None:
             progress(f"metrics: [####################] 1/1 {job_id}:training:0")
             progress("\n")
-        path = output_dir / f"{job_id}:training:0" / "gpu.jsonl"
+        path = output_dir / f"{job_id}:training:0" / "metrics.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('{"gpu_utilization":0.5}\n', encoding="utf-8")
         return [
             {
                 "sub_job_id": f"{job_id}:training:0",
-                "filename": "gpu.jsonl",
+                "filename": "metrics.jsonl",
                 "saved_path": str(path),
                 "chunk_count": 1,
                 "first_artifact_uri": "snow://experiment/first.gz",
@@ -2310,7 +2310,7 @@ def test_download_metrics_passes_parallel_and_sub_jobs_and_reports_progress(tmp_
         "transfer_timeout_seconds": 300.0,
     }
     assert stderr.getvalue() == "metrics: [####################] 1/1 job-1:training:0\n"
-    assert json.loads(stdout.getvalue())["metrics"][0]["filename"] == "gpu.jsonl"
+    assert json.loads(stdout.getvalue())["metrics"][0]["filename"] == "metrics.jsonl"
 
 
 def test_download_log_stdout_defaults_leave_parallel_to_client(tmp_path):
@@ -2650,7 +2650,7 @@ def test_download_commands_write_progress_to_stderr(tmp_path):
         stderr=stderr,
     )
     assert rc == 0
-    assert json.loads(stdout.getvalue())["metrics"][0]["filename"] == "gpu.jsonl"
+    assert json.loads(stdout.getvalue())["metrics"][0]["filename"] == "metrics.jsonl"
     assert stderr.getvalue() == "metrics: found 1 chunks for job\n"
 
 
@@ -2875,12 +2875,12 @@ def test_download_metrics_defaults_to_cwd(tmp_path, monkeypatch):
     assert rc == 0
     assert client.metrics_job_id == "job-1"
     assert client.metrics_output_dir == tmp_path
-    assert (tmp_path / "job-1:training:0" / "gpu.jsonl").read_text() == (
+    assert (tmp_path / "job-1:training:0" / "metrics.jsonl").read_text() == (
         '{"gpu_utilization":0.5}\n'
     )
     payload = json.loads(stdout.getvalue())
     assert payload["job_id"] == "job-1"
-    assert payload["metrics"][0]["filename"] == "gpu.jsonl"
+    assert payload["metrics"][0]["filename"] == "metrics.jsonl"
 
 
 def test_http_errors_include_response_details():
@@ -3443,7 +3443,7 @@ def test_chunk_download_takes_a_free_tui_lock_and_creates_none(tmp_path):
 
 _CHUNK_COMMANDS = [
     pytest.param(["download-log", "job-1", "--log-type", "stdout"], "stdout.log", id="download-log"),
-    pytest.param(["download-metrics", "job-1"], "gpu.jsonl", id="download-metrics"),
+    pytest.param(["download-metrics", "job-1"], "metrics.jsonl", id="download-metrics"),
 ]
 
 

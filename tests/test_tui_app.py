@@ -892,6 +892,149 @@ def test_offline_shows_metrics_only_cached_sources(tmp_path, monkeypatch):
     asyncio.run(_run_offline_fallback())
 
 
+def _commit_resource_row(root, sub_job_id, util, filename):
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    path = Path(root) / sub_job_id / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "record_version": 2,
+        "sub_job_id": sub_job_id,
+        "sample_ts": now.isoformat().replace("+00:00", "Z"),
+        "worker_num": 0,
+        "local_gpu_index": 0,
+        "global_gpu_index": 0,
+        "gpu_util_pct": util,
+        "fb_used_bytes": float(1024**3),
+        "fb_free_bytes": float(8 * 1024**3),
+        "sample_interval_s": 5.0,
+    }
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    path.with_name("." + filename + ".manifest.json").write_text(
+        json.dumps({"version": 1, "names": ["chunk.gz"], "bytes": path.stat().st_size}),
+        encoding="utf-8",
+    )
+    return path
+
+
+async def _run_offline_legacy_metrics_source():
+    c = _client()
+    c.get_job.side_effect = RuntimeError("network down")
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: isinstance(app.screen, LogScreen)
+            and list(app.screen._source_by_item.values()) == ["7:training:0"],
+        )
+        assert ok, "committed legacy gpu.jsonl was not the offline source"
+        await _settle(app, pilot)
+
+
+def test_offline_legacy_gpu_jsonl_is_the_source_without_an_uncommitted_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    from cortex_training.tui.log_cache import job_cache_dir
+
+    root = job_cache_dir("7") / "metrics"
+    _commit_resource_row(root, "7:training:0", 40, "gpu.jsonl")
+    bare = root / "7:sampling:0" / "gpu.jsonl"
+    bare.parent.mkdir(parents=True)
+    bare.write_text("{}\n", encoding="utf-8")
+    asyncio.run(_run_offline_legacy_metrics_source())
+
+
+async def _run_legacy_first_paint_then_refresh_failure():
+    c = _client()
+    release = threading.Event()
+
+    def download(*_args, **_kwargs):
+        assert release.wait(5)
+        raise RuntimeError("refresh unavailable")
+
+    c.download_metrics.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(100, 36)) as pilot:
+        ok = await _wait(pilot, app, lambda: app.screen._current_source == "7:training:0")
+        assert ok
+        app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: "cached · refreshing…" in str(app.screen.query_one("#resource-status", Static).render())
+            and "avg 90%" in str(app.screen.query_one("#resource-status", Static).render())
+            and app.screen.query_one("#resource-table", DataTable).row_count == 1,
+        )
+        assert ok, "legacy cache was not painted before the refresh finished"
+        release.set()
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: "cached · refresh failed: RuntimeError: refresh unavailable"
+            in str(app.screen.query_one("#resource-status", Static).render())
+            and app.screen.query_one("#resource-table", DataTable).row_count == 1,
+        )
+        assert ok
+        await _settle(app, pilot)
+
+
+def test_resource_first_paint_and_refresh_failure_keep_legacy_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    from cortex_training.tui.log_cache import job_cache_dir
+
+    root = job_cache_dir("7") / "metrics"
+    legacy = _commit_resource_row(root, "7:training:0", 90, "gpu.jsonl")
+    before = legacy.read_bytes()
+    asyncio.run(_run_legacy_first_paint_then_refresh_failure())
+    assert legacy.read_bytes() == before
+    assert not (legacy.parent / "metrics.jsonl").exists()
+
+
+async def _run_first_paint_prefers_metrics_jsonl():
+    c = _client()
+    release = threading.Event()
+
+    def download(*_args, **_kwargs):
+        assert release.wait(5)
+        return []
+
+    c.download_metrics.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(100, 36)) as pilot:
+        ok = await _wait(pilot, app, lambda: app.screen._current_source == "7:training:0")
+        assert ok
+        app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: "avg 10%" in str(app.screen.query_one("#resource-status", Static).render())
+            and "cached · refreshing…" in str(app.screen.query_one("#resource-status", Static).render()),
+        )
+        assert ok, "first paint did not prefer metrics.jsonl"
+        release.set()
+        ok = await _wait(pilot, app, lambda: not app.screen._resource_loading)
+        assert ok
+        status = str(app.screen.query_one("#resource-status", Static).render())
+        assert "avg 10%" in status
+        assert "avg 90%" not in status
+        await _settle(app, pilot)
+
+
+def test_resource_first_paint_prefers_committed_metrics_jsonl(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    from cortex_training.tui.log_cache import job_cache_dir
+
+    root = job_cache_dir("7") / "metrics"
+    legacy = _commit_resource_row(root, "7:training:0", 90, "gpu.jsonl")
+    current = _commit_resource_row(root, "7:training:0", 10, "metrics.jsonl")
+    legacy_bytes = legacy.read_bytes()
+    current_bytes = current.read_bytes()
+    asyncio.run(_run_first_paint_prefers_metrics_jsonl())
+    assert legacy.read_bytes() == legacy_bytes
+    assert current.read_bytes() == current_bytes
+
+
 async def _run_terminal_cache_only():
     c = _client()
     c.get_job.return_value = {  # terminal -> zone gone; metadata still lists sub-jobs

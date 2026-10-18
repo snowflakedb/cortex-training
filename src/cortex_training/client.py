@@ -101,8 +101,10 @@ logger = logging.getLogger(__name__)
 _STDOUT_CHUNK_RE = re.compile(
     r"^console\.(?P<timestamp>\d{8}-\d{6})\.(?P<suffix>[^./\\]+)\.gz$"
 )
-_GPU_METRICS_CHUNK_RE = re.compile(
-    r"^gpu\.(?P<timestamp>\d{8}-\d{6})\.(?P<suffix>[^./\\]+)\.gz$"
+# Both stems are one runtime-metrics stream. ``timestamp`` stays a named group
+# so chunk ages keep parsing the UTC time in the object name.
+_METRICS_CHUNK_RE = re.compile(
+    r"^(?:gpu|metrics)\.(?P<timestamp>\d{8}-\d{6})\.(?P<suffix>[^./\\]+)\.gz$"
 )
 _STREAM_COPY_BUFFER_BYTES = 1024 * 1024
 
@@ -3739,9 +3741,11 @@ class CortexTrainingClient:
 
         Chunks normally live under ``_<name>/``; a run whose stage is anchored
         under ``checkpoints/`` uses ``checkpoints/_<name>/``. If one sub-job has
-        chunks under both, they are merged by chunk name (which starts with the
-        chunk's time), and a chunk name present in both keeps the
-        ``_<name>/`` copy, so no output is dropped or repeated.
+        chunks under both, they are merged by chunk name, and a chunk name
+        present in both keeps the ``_<name>/`` copy, so no output is dropped or
+        repeated. Metrics basenames are then ordered by timestamp, then ``gpu``
+        before ``metrics``, then suffix. Other artifacts keep lexicographic
+        basename order.
         """
         policy = self._artifact_retry_policy
         artifact_roots = (f"_{artifact_name}", f"checkpoints/_{artifact_name}")
@@ -3784,7 +3788,9 @@ class CortexTrainingClient:
             merged: dict[str, str] = {}
             for artifact_root in reversed(artifact_roots):
                 merged.update(roots.get(artifact_root, {}))
-            chunks[sub_job_id] = [merged[name] for name in sorted(merged)]
+            chunks[sub_job_id] = [
+                merged[name] for name in self._ordered_chunk_basenames(merged, chunk_pattern)
+            ]
             if len(roots) > 1 and report_merges:
                 message = (
                     f"{artifact_name} chunks for {sub_job_id} were saved under both "
@@ -3831,6 +3837,22 @@ class CortexTrainingClient:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.timestamp()
+
+    @staticmethod
+    def _metrics_basename_key(filename: str) -> tuple[str, int, str]:
+        """Order ``gpu.*`` and ``metrics.*`` by time, legacy stem, then suffix."""
+        match = _METRICS_CHUNK_RE.fullmatch(filename)
+        assert match is not None
+        stem_rank = 0 if filename.startswith("gpu.") else 1
+        return (match.group("timestamp"), stem_rank, match.group("suffix"))
+
+    def _ordered_chunk_basenames(
+        self, merged: Mapping[str, str], chunk_pattern: re.Pattern[str]
+    ) -> list[str]:
+        """Sort merged basenames. Metrics use timestamp order; stdout stays lexical."""
+        if chunk_pattern is _METRICS_CHUNK_RE:
+            return sorted(merged, key=self._metrics_basename_key)
+        return sorted(merged)
 
     @staticmethod
     def _chunk_time(chunk_pattern: re.Pattern[str], relative_path: str) -> float | None:
@@ -3930,7 +3952,7 @@ class CortexTrainingClient:
             starts = [t for t in (running_since, started) if t is not None]
             return now - max(starts) if starts else None
 
-        label = "stdout output" if artifact_name == "stdout" else "GPU metrics"
+        label = "stdout output" if artifact_name == "stdout" else "metrics"
         warnings: dict[str, list[str]] = {}
         for sub_job_id, newest in candidates.items():
             age = now - newest
@@ -3971,7 +3993,7 @@ class CortexTrainingClient:
                 if ran is not None and ran < self._MISSING_METRICS_GRACE_SECONDS:
                     continue
                 warnings[sub_job_id] = [
-                    f"no GPU metrics have been saved for {sub_job_id} while the job is "
+                    f"no metrics have been saved for {sub_job_id} while the job is "
                     "still running, although its stdout output has been; metric "
                     "uploads may be stalled. Contact support if this persists."
                 ]
@@ -3994,7 +4016,7 @@ class CortexTrainingClient:
         ended_at = self._parse_api_time(job.get("state_changed_at"))
         if ended_at is None or now - ended_at >= self._RECENTLY_ENDED_SECONDS:
             return {}
-        label = "stdout output" if artifact_name == "stdout" else "GPU metrics"
+        label = "stdout output" if artifact_name == "stdout" else "metrics"
         warnings: dict[str, list[str]] = {}
         for sub_job_id in sorted(chunks_by_sub_job):
             if wanted is not None and sub_job_id not in wanted:
@@ -4030,8 +4052,8 @@ class CortexTrainingClient:
             if sub_job_id in metrics_by_sub_job or (wanted is not None and sub_job_id not in wanted):
                 continue
             message = (
-                f"no GPU metrics were saved for {sub_job_id}, although its stdout output "
-                "was. Jobs that ran on images from before GPU metrics were uploaded, or "
+                f"no metrics were saved for {sub_job_id}, although its stdout output "
+                "was. Jobs that ran on images from before metrics were uploaded, or "
                 "that ended before their first metrics upload, have none."
             )
             logger.warning(message)
@@ -4058,12 +4080,12 @@ class CortexTrainingClient:
     ) -> list[dict[str, Any]]:
         """Reconstruct staged gzip chunks into one file per sub-job.
 
-        Chunks are fetched concurrently and appended in sorted name order. A
+        Chunks are fetched concurrently and appended in listed order. A
         sub-job's destination is replaced only when every chunk is written;
         until then progress is checkpointed to a hidden ``.partial`` file so
         ``resume=True`` can continue an interrupted first download. With
         ``resume=True`` a completed file is extended when its manifest names
-        are a prefix of the sorted chunk list, and rebuilt otherwise. A chunk
+        are a prefix of the ordered chunk list, and rebuilt otherwise. A chunk
         that will not decompress is downloaded once more and then skipped,
         unless ``strict``.
         """
@@ -4318,7 +4340,15 @@ class CortexTrainingClient:
         stale_after_seconds: float | None = _DOWNLOAD_STALE_AFTER_SECONDS,
         transfer_timeout_seconds: float | None = _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS,
     ) -> list[dict[str, Any]]:
-        """Reconstruct staged GPU metric chunks into one JSONL file per sub-job.
+        """Reconstruct staged runtime-metric chunks into one JSONL file per sub-job.
+
+        Accepts ``gpu.<timestamp>.<suffix>.gz`` and
+        ``metrics.<timestamp>.<suffix>.gz``. They are merged by timestamp, then
+        ``gpu`` before ``metrics``, then suffix, and written to
+        ``<output_dir>/<sub_job_id>/metrics.jsonl``. The file is a mixed
+        runtime-metrics stream: rows are copied as stored, and unknown ``kind``
+        values stay opaque. A ``gpu.jsonl`` already in that directory is left
+        as it is.
 
         Accepts the same ``resume``, ``max_workers``, ``progress``, ``on_chunk``,
         ``sub_job_ids``, ``strict``, ``stale_after_seconds``, and
@@ -4332,8 +4362,8 @@ class CortexTrainingClient:
             job_id,
             output_dir,
             artifact_name="metrics",
-            chunk_pattern=_GPU_METRICS_CHUNK_RE,
-            destination_name="gpu.jsonl",
+            chunk_pattern=_METRICS_CHUNK_RE,
+            destination_name="metrics.jsonl",
             temporary_prefix=".gpu-metrics-",
             resume=resume,
             max_workers=max_workers,
