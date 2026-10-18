@@ -200,10 +200,10 @@ def test_moe_sft_recipes_have_runnable_parallelism():
         ),
         "glm53_flash.json": (
             "zai-org/GLM-5.3-Flash",
-            32,
             16,
+            8,
             262144,
-            32,
+            16,
             1,
         ),
         "glm53_flash_bf16.json": (
@@ -241,11 +241,14 @@ def test_moe_sft_recipes_have_runnable_parallelism():
         assert sub_job["model_name"] == model_id
         assert sub_job["dtype"] == "bfloat16"
         assert training["model_provider"] == "prime_rl"
+        if filename == "glm53_flash.json":
+            assert training["prime_rl"] == {"ep_comm_backend": "deepep"}
+        elif filename == "glm53_flash_bf16.json":
+            assert training["prime_rl"] == {"ep_comm_backend": "uccl"}
         if filename in {
             "glm53_flash.json",
             "glm53_flash_bf16.json",
         }:
-            assert training["prime_rl"] == {"ep_comm_backend": "uccl"}
             expected_chunk = 512 if "_bf16" in filename else 1024
             assert training["tiled_mlp_token_chunk_size"] == expected_chunk
             assert training["ds_config"]["bf16"]["bf16_optimizer_states"] is True
@@ -309,12 +312,12 @@ def test_moe_rl_recipes_have_runnable_parallelism():
         ),
         "glm53_flash.json": (
             "zai-org/GLM-5.3-Flash",
-            32,
             16,
+            8,
             8,
             "sparse_mla",
             262144,
-            32,
+            16,
             1,
         ),
         "glm53_flash_bf16.json": (
@@ -363,16 +366,22 @@ def test_moe_rl_recipes_have_runnable_parallelism():
         assert sampling_config["n_gpus"] == sampling_gpus
         expected_tp = 8 if filename.startswith("qwen38_flash_next") else sampling_gpus
         assert sampling_config["vllm_config"]["tensor_parallel_size"] == expected_tp
-        assert sampling_config["vllm_config"]["trust_remote_code"] is True
+        if filename == "glm53_flash.json":
+            assert "trust_remote_code" not in sampling_config["vllm_config"]
+        else:
+            assert sampling_config["vllm_config"]["trust_remote_code"] is True
         assert training["job_type"] == "training"
         assert training["model_name"] == model_id
         assert training["dtype"] == "bfloat16"
         assert training_config["model_provider"] == "prime_rl"
+        if filename == "glm53_flash.json":
+            assert training_config["prime_rl"] == {"ep_comm_backend": "deepep"}
+        elif filename == "glm53_flash_bf16.json":
+            assert training_config["prime_rl"] == {"ep_comm_backend": "uccl"}
         if filename in {
             "glm53_flash.json",
             "glm53_flash_bf16.json",
         }:
-            assert training_config["prime_rl"] == {"ep_comm_backend": "uccl"}
             expected_chunk = 512 if "_bf16" in filename else 1024
             assert training_config["tiled_mlp_token_chunk_size"] == expected_chunk
             assert training_config["ds_config"]["bf16"]["bf16_optimizer_states"] is True
