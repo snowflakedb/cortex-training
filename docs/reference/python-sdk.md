@@ -286,15 +286,19 @@ with `follow=False` stops at the first empty page. On a job that has ended,
 sub_job_ids=None, progress=None, transfer_timeout_seconds=300)` saves every
 execution log file as `<output_dir>/<sub_job_id>/<filename>` (mode `0600`)
 without holding it in memory; with `resume=True` it skips files unchanged since
-the last download. `fetch_execution_logs(job_id)` returns the same files as
-`{sub_job_id, filename, artifact_uri, content}` dicts, in memory. See
+the last download. `fetch_execution_logs(job_id, *, sub_job_id=None,
+filename=None)` returns the same files as
+`{sub_job_id, filename, artifact_uri, content}` dicts, in memory, or only
+those of one sub-job or with one name (the rest are listed but not fetched).
+See
 [REST API section 12.2](rest-api.md#122-full-execution-log-download).
 `download_stdout_logs(job_id, output_dir, *, resume=False, max_workers=None,
 progress=None, on_chunk=None, sub_job_ids=None, strict=False,
 stale_after_seconds=600, transfer_timeout_seconds=300)`
 reconstructs persisted console chunks as
 `<output_dir>/<sub_job_id>/stdout.log`.
-`download_metrics(...)`, with the same options, reconstructs GPU metric chunks
+`download_metrics(...)`, with the same options plus `priority=()` and
+`on_commit=None`, reconstructs GPU metric chunks
 as `<output_dir>/<sub_job_id>/gpu.jsonl`. Chunks are fetched `max_workers` at a
 time (default 16) on one Snowflake session and written in order. `resume=True`
 appends chunks that are not already recorded in the manifest beside that file
@@ -304,9 +308,12 @@ are logged as warnings on the `cortex_training` logger. `progress` receives stat
 newline, then `"\n"` when that sub-job finishes or fails; a status that needs no
 updating arrives as one message ending in a newline.
 `on_chunk(sub_job_id, done, total, bytes)` reports counts instead, with
-`done == total` only after that sub-job's file is committed. Both run on the
-calling thread; an error raised by either stops the download and keeps the
-chunks already written. Raise `cortex_training.DownloadCancelled` to stop
+`done == total` only after that sub-job's file is committed. For metrics,
+`on_commit(entry)` then gets a copy of that sub-job's result entry, so a reader
+can open one file while the others download, and sub-jobs named in `priority`
+are downloaded first, in that order (the returned list stays in id order).
+These callbacks run on the calling thread; an error raised by any of them stops
+the download and keeps the chunks already written. Raise `cortex_training.DownloadCancelled` to stop
 without the call counting as a failure. `sub_job_ids` limits the download; an
 entry with no chunks raises `cortex_training.NoChunksError`, a `ValueError`. A
 damaged chunk is fetched once more and then skipped and listed in the entry's

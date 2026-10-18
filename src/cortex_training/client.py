@@ -3086,7 +3086,13 @@ class CortexTrainingClient:
         return downloaded
 
     @_track_operation("fetch_execution_logs")
-    def fetch_execution_logs(self, job_id: str) -> list[dict[str, str]]:
+    def fetch_execution_logs(
+        self,
+        job_id: str,
+        *,
+        sub_job_id: str | None = None,
+        filename: str | None = None,
+    ) -> list[dict[str, str]]:
         """Download every log file under the job's experiment run stage.
 
         Returns a list of
@@ -3094,6 +3100,10 @@ class CortexTrainingClient:
         entries, one per object found under a ``_logs/<sub_job_id>/`` subtree
         in the run's stage. Filenames such as ``execution.jsonl`` and
         ``server.log`` are both included; bodies are decoded as UTF-8.
+
+        ``sub_job_id`` and ``filename``, when given, download only the files
+        of that sub-job and with that name (for example one sub-job's
+        ``execution.jsonl``); the rest are listed but not fetched.
 
         ``artifact_uri`` is the logical ``snow://`` URI. Files are retrieved
         through Snowflake's supported experiment artifact ``LIST``/``GET``
@@ -3125,16 +3135,18 @@ class CortexTrainingClient:
                         after_logs = relative_path.removeprefix("checkpoints/_logs/")
                     else:
                         continue
-                    sub_job_id, separator, filename = after_logs.partition("/")
+                    file_sub_job, separator, file_name = after_logs.partition("/")
                     if (
                         not separator
-                        or not filename
+                        or not file_name
                         or not (
-                            sub_job_id == job_id
-                            or sub_job_id.startswith(f"{job_id}:")
+                            file_sub_job == job_id
+                            or file_sub_job.startswith(f"{job_id}:")
                         )
-                        or sub_job_id in {".", ".."}
-                        or "\\" in sub_job_id
+                        or file_sub_job in {".", ".."}
+                        or "\\" in file_sub_job
+                        or (sub_job_id is not None and file_sub_job != sub_job_id)
+                        or (filename is not None and file_name != filename)
                     ):
                         continue
                     downloaded = self._download_experiment_artifact(
@@ -3153,8 +3165,8 @@ class CortexTrainingClient:
                         downloaded.unlink(missing_ok=True)
                     results.append(
                         {
-                            "sub_job_id": sub_job_id,
-                            "filename": filename,
+                            "sub_job_id": file_sub_job,
+                            "filename": file_name,
                             "artifact_uri": artifact_uri,
                             "content": content,
                         }
@@ -3692,6 +3704,7 @@ class CortexTrainingClient:
         on_chunk: Callable[[str, int, int, int], None] | None = None,
         strict: bool = False,
         warnings_by_sub_job: Mapping[str, list[str]] | None = None,
+        on_commit: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Fetch every new chunk concurrently and append them in plan order.
 
@@ -3704,7 +3717,8 @@ class CortexTrainingClient:
         ``"\\n"`` once the manifest is written or the sub-job fails; a sub-job
         with nothing new gets one line ending in a newline instead.
         ``on_chunk`` gets ``(sub_job_id, done, total, bytes)`` counts, with
-        ``done == total`` only after the file is committed.
+        ``done == total`` only after the file is committed. ``on_commit`` then
+        gets a copy of that sub-job's result entry.
         """
         work = [path for plan in plans for path in plan.new_paths]
         window = max_workers * self._DOWNLOAD_WINDOW_PER_WORKER
@@ -3770,6 +3784,8 @@ class CortexTrainingClient:
                                     warnings=warnings,
                                 )
                             )
+                            if on_commit is not None:
+                                on_commit(dict(results[-1]))
                             continue
                         writer = _artifact_download.ChunkWriter(
                             plan.data_path,
@@ -3852,6 +3868,8 @@ class CortexTrainingClient:
                             warnings=warnings,
                         )
                     )
+                    if on_commit is not None:
+                        on_commit(dict(results[-1]))
                 # Inside the handler, so an interrupt here is still marked saved.
                 pool.shutdown(wait=True)
                 spool.remove_after([])
@@ -4199,6 +4217,8 @@ class CortexTrainingClient:
         strict: bool = False,
         stale_after_seconds: float | None = _DOWNLOAD_STALE_AFTER_SECONDS,
         transfer_timeout_seconds: float | None = _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS,
+        priority: Iterable[str] = (),
+        on_commit: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Reconstruct staged gzip chunks into one file per sub-job.
 
@@ -4210,6 +4230,10 @@ class CortexTrainingClient:
         are a prefix of the sorted chunk list, and rebuilt otherwise. A chunk
         that will not decompress is downloaded once more and then skipped,
         unless ``strict``.
+
+        Sub-jobs are written in id order, those named in ``priority`` first
+        (in that order); the returned list stays in id order. ``on_commit``
+        gets a copy of each sub-job's result entry once its file is committed.
         """
         if max_workers is None:
             max_workers = self._DOWNLOAD_DEFAULT_WORKERS
@@ -4220,6 +4244,9 @@ class CortexTrainingClient:
         wanted = None if sub_job_ids is None else set(sub_job_ids)
         if wanted is not None and not wanted:
             raise ValueError("sub_job_ids must name at least one sub-job")
+        if isinstance(priority, (str, bytes)):
+            raise TypeError("priority must be an iterable of sub-job ids, not a single string")
+        first = {sub_job_id: rank for rank, sub_job_id in enumerate(dict.fromkeys(priority or ()))}
         if stale_after_seconds is not None and (
             isinstance(stale_after_seconds, bool)
             or not isinstance(stale_after_seconds, (int, float))
@@ -4312,6 +4339,9 @@ class CortexTrainingClient:
                 for sub_job_id in sorted(chunks_by_sub_job)
                 if wanted is None or sub_job_id in wanted
             ]
+            # Those named in priority first, in that order; the sort is stable,
+            # so the rest stay in id order.
+            plans.sort(key=lambda plan: first.get(plan.sub_job_id, len(first)))
             values["sub_job_count"] = len(plans)
             modes = {
                 "append"
@@ -4341,6 +4371,7 @@ class CortexTrainingClient:
                         on_chunk=on_chunk,
                         strict=strict,
                         warnings_by_sub_job=warnings_by_sub_job,
+                        on_commit=on_commit,
                     )
                 finally:
                     values["fetch_ms"] = round((time.monotonic() - started) * 1000, 3)
@@ -4461,13 +4492,20 @@ class CortexTrainingClient:
         strict: bool = False,
         stale_after_seconds: float | None = _DOWNLOAD_STALE_AFTER_SECONDS,
         transfer_timeout_seconds: float | None = _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS,
+        priority: Iterable[str] = (),
+        on_commit: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Reconstruct staged GPU metric chunks into one JSONL file per sub-job.
 
         Accepts the same ``resume``, ``max_workers``, ``progress``, ``on_chunk``,
         ``sub_job_ids``, ``strict``, ``stale_after_seconds``, and
         ``transfer_timeout_seconds`` options as
-        :meth:`download_stdout_logs`. While the job is running, a sub-job with
+        :meth:`download_stdout_logs`. Sub-jobs named in ``priority`` are
+        downloaded first, in that order, then the rest in id order; the
+        returned list is in id order either way. ``on_commit`` is called, on
+        the calling thread, with a copy of each sub-job's result entry once its
+        file is committed; an error it raises stops the download as one from
+        ``on_chunk`` does. While the job is running, a sub-job with
         saved stdout but no metrics gets a result entry with ``chunk_count`` 0,
         ``saved_path`` ``None``, and a warning. Two downloads
         of the same output directory at once are unsupported.
@@ -4487,6 +4525,8 @@ class CortexTrainingClient:
             strict=strict,
             stale_after_seconds=stale_after_seconds,
             transfer_timeout_seconds=transfer_timeout_seconds,
+            priority=priority,
+            on_commit=on_commit,
         )
 
     # ─── Data-plane async operations ─────────────────────────────────────
