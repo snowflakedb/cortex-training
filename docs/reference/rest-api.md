@@ -537,16 +537,32 @@ REST response:
 
 Each job carries the per-schema list's fields plus `database_name` and
 `schema_name`. A page can hold fewer than `limit` jobs, or none, and still carry
-`next_page_token`; keep requesting until it is absent. The token is opaque:
-pass it back unchanged. A job whose live status cannot be read while `status`
-is set is left out, uncounted, so a page's size is not a count of what matched.
+`next_page_token`; keep requesting until it is absent. The token is opaque and
+sealed by the service: pass it back unchanged. A token the service can no
+longer open, for example after it rotated the key that seals tokens, returns
+400 `Invalid page_token`; start again from the first page. A job whose live
+status cannot be read while `status` is set is left out, uncounted, so a page's
+size is not a count of what matched.
+
+| Answer | Meaning |
+|---|---|
+| 403 | Cortex Training is not enabled for the account, or its trial has ended; the per-schema routes answer the same. A 403 without the service's JSON error may come from a network policy or a proxy in front of the service. |
+| 404 with an empty body | The service does not have this route yet. |
+| 404 with JSON `Account-level job listing is not enabled for this account` | The route is there but not enabled for the account. |
+| 405 with an empty body | The Cortex Training REST API is turned off for the account. |
 
 `CortexTrainingClient.iter_jobs(...)` takes the same filters, with `page_size`
 for `limit`, checks its arguments on the call, and yields jobs across pages as
 you iterate. It raises a 404 at once instead of retrying it, and never creates
-the configured database. `for_job(job)` returns a client bound to a listed
-job's `database_name` and `schema_name`; it borrows the parent's session and
-creates no database either.
+the configured database. `CortexTrainingClient.list_jobs_page(...)` reads one
+page instead: it takes the same filters plus `page_token`, and per-call
+`max_retries` and `request_timeout`, and returns
+`{"jobs": [...], "next_page_token": str | None}`. It raises 403, 404 and 405
+at once as `AccountJobListUnavailable`, whose `reason` is `forbidden`,
+`not_deployed`, `disabled` or `rest_disabled` by the table above, and the 400
+`Invalid page_token` as `InvalidPageToken`; both subclass `requests.HTTPError`.
+`for_job(job)` returns a client bound to a listed job's `database_name` and
+`schema_name`; it borrows the parent's session and creates no database either.
 
 ### 5.4 Capacity - `GET /capacity`
 

@@ -52,7 +52,7 @@ constructing the emitter.
 Tracked operations:
 
 - Job lifecycle: `create_job`, `wait_for_job`, `get_job`, `list_jobs`,
-  `iter_jobs` (one event per page), `cancel_job`, `get_capacity`,
+  `iter_jobs` (one event per page), `list_jobs_page`, `cancel_job`, `get_capacity`,
   `get_capacity_breakdown`, `get_experiment_run`
 - Compute: `forward_backward`, `forward`, `generate`, `generate_stream`, `step`
 - Checkpoints and logs: `save`, `load`, `list_checkpoints`,
@@ -126,7 +126,8 @@ operation.
 | `get_job(job_id)` | job dict | Includes `sub_jobs` with their configs |
 | `list_jobs(status=None)` | list of jobs | Returns the inner list, not the envelope |
 | `iter_jobs(*, database=None, schema=None, status=None, submitted_by=None, created_after=None, created_before=None, page_size=100)` | iterator of jobs | Jobs across the account that the caller can see, newest first, following page tokens; each also carries `database_name` and `schema_name`. The server applies every filter. Arguments are checked on the call: `page_size` is 1 to 1000, and `schema` needs `database` with it. A 404 means account-level listing is not enabled for the account. See [REST API section 5.3](rest-api.md#across-the-account---get-apiv2endpoint) |
-| `for_job(job)` | `CortexTrainingClient` | Bound to a job from `iter_jobs` for per-job calls. Borrows this client's session, auth, and telemetry, so keep this one open; closing the returned client is a no-op. Never creates the job's database |
+| `list_jobs_page(*, database=None, schema=None, status=None, submitted_by=None, created_after=None, created_before=None, page_size=100, page_token=None, max_retries=None, request_timeout=None)` | `{"jobs": [...], "next_page_token": str \| None}` | One page of what `iter_jobs` walks, with the same filters read the same way. Pass `next_page_token` back as `page_token`, with the same filters, for the next page; `None` means no more. A page can be short or empty and still have a token. `max_retries` (retries after the first attempt) and `request_timeout` (seconds, or `(connect, read)`) bound this page; omitted, the client's own apply. Raises `AccountJobListUnavailable` (`reason`: `not_deployed`, `disabled`, `forbidden`, `rest_disabled`) for 404, 403 and 405 without retrying, and `InvalidPageToken` for 400 `Invalid page_token` (start again from the first page); both subclass `requests.HTTPError`. Bad arguments, or a page body that is not a job list, raise `ValueError`. See [REST API section 5.3](rest-api.md#across-the-account---get-apiv2endpoint) |
+| `for_job(job)` | `CortexTrainingClient` | Bound to a job from `iter_jobs` or `list_jobs_page` for per-job calls. Borrows this client's session, auth, and telemetry, so keep this one open; closing the returned client is a no-op. Never creates the job's database |
 | `wait_for_job(job_id)` | job dict | Polls until `running`; raises once the job has ended (`failed`, `cancelled`, `terminated`) or on timeout |
 | `cancel_job(job_id)` | `None` | Idempotent while cancelling/cancelled |
 | `get_capacity(hardware=None)` | capacity dict | `has_reservation`, `max_total_gpus`, `reserved_gpus`, `in_use_gpus`, `pending_gpus`, `available_gpus`, scoped to `hardware` (omitted means the server default, H200). The CLI `capacity` command queries every type unless `--hardware` is set. `max_total_gpus` is the canonical ceiling (`-1` uncapped); `reserved_gpus` is deprecated |
@@ -345,7 +346,9 @@ before building the typed object; see
 
 `ChunkGroupError` and its subclasses `ChunkGroupRestartError` and
 `ChunkGroupConflictError` (all subclasses of `requests.exceptions.HTTPError`)
-carry a `.detail` dict for chunk-group failures. Polling raises `RuntimeError`
+carry a `.detail` dict for chunk-group failures. `AccountJobListUnavailable` (with a
+`.reason`) and `InvalidPageToken`, also `HTTPError` subclasses, come from
+`list_jobs_page`. Polling raises `RuntimeError`
 on a failed/cancelled request and `TimeoutError` at the deadline.
 
 ## Details not covered here
