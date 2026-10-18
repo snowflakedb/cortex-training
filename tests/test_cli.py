@@ -3340,6 +3340,21 @@ def test_build_client_uses_named_snowflake_connection(tmp_path, monkeypatch):
     )
 
 
+def test_build_client_forwards_read_bounds_only_when_set(tmp_path, monkeypatch):
+    # `cortex-training tui` sets these on its args; the CLI commands never do,
+    # so they keep the client's defaults (the test above).
+    monkeypatch.setenv(
+        "CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "missing.json")
+    )
+    args = cli.parse_args(["--connection", "training-profile", "list"])
+    args.max_retries, args.request_timeout = 2, (10.0, 45.0)
+    client_cls = MagicMock()
+
+    cli.build_client(args, client_cls)
+    kwargs = client_cls.from_connection_name.call_args.kwargs
+    assert (kwargs["max_retries"], kwargs["request_timeout"]) == (2, (10.0, 45.0))
+
+
 def _http_error(status_code: int, headers: dict[str, str] | None = None):
     import requests
 

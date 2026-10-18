@@ -1869,6 +1869,19 @@ class CortexTrainingClient:
         self._session.mount("https://", adapter)
         self._session.mount("http://", adapter)
 
+    @property
+    def auto_create_database(self) -> bool:
+        """Whether a request answered "database or schema not found" creates them and retries.
+
+        True by default. Set it to False for a client that only reads: the error
+        is then raised as it is. A client from :meth:`for_job` starts with it off.
+        """
+        return self._auto_create_database
+
+    @auto_create_database.setter
+    def auto_create_database(self, value: bool) -> None:
+        self._auto_create_database = bool(value)
+
     @classmethod
     def from_pat(
         cls,

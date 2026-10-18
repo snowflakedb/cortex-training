@@ -37,6 +37,11 @@ Tuning knobs on the constructor: `endpoint`, `poll_interval` (0.5s),
 and read timeout, or a `(connect, read)` pair. `from_connection_name` and
 `from_pat` also accept `telemetry_timeout` (3s) for best-effort client metrics.
 
+By default a request answered "database or schema not found" makes the client
+run `CREATE DATABASE` (and `CREATE SCHEMA`) and retry. Set
+`client.auto_create_database = False` for a client that only reads: the error
+is then raised as it is. A client from `for_job` starts with it off.
+
 ## Client metrics
 
 Snowflake profile and PAT clients automatically emit one best-effort event

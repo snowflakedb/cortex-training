@@ -7943,6 +7943,19 @@ class TestEnsureDatabase:
         # Only one POST for CREATE DATABASE, no schema creation
         assert c._session.post.call_count == 1
 
+    def test_auto_create_database_off_raises_the_not_found_error(self):
+        """A client that only reads creates nothing."""
+        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
+        assert c.auto_create_database is True
+        c.auto_create_database = False
+        c._session = MagicMock()
+        c._session.get.return_value = _make_error_response(
+            {"code": "517602", "message": "Schema MY_DB.SCH is not found or not authorized"}, status_code=400
+        )
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.list_jobs()
+        c._session.post.assert_not_called()
+
 
 # ─── Not-found handling and log-tail stopping ────────────────────────────────
 

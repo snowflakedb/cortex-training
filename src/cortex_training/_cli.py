@@ -909,6 +909,12 @@ def build_client(args: argparse.Namespace, cortex_training_client_cls):
         "poll_interval": args.poll_interval,
         "poll_timeout": args.poll_timeout,
     }
+    # The TUI bounds every read (`cortex-training tui` sets these); the CLI
+    # commands keep the client's defaults.
+    for option in ("max_retries", "request_timeout"):
+        value = getattr(args, option, None)
+        if value is not None:
+            kwargs[option] = value
     if args.base_url:
         return cortex_training_client_cls(base_url=args.base_url, **kwargs)
     if args.use_connection_profile:
