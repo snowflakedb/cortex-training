@@ -200,10 +200,10 @@ def test_moe_sft_recipes_have_runnable_parallelism():
         ),
         "glm53_flash.json": (
             "zai-org/GLM-5.3-Flash",
-            16,
+            8,
             8,
             262144,
-            16,
+            8,
             1,
         ),
         "glm53_flash_bf16.json": (
@@ -242,7 +242,10 @@ def test_moe_sft_recipes_have_runnable_parallelism():
         assert sub_job["dtype"] == "bfloat16"
         assert training["model_provider"] == "prime_rl"
         if filename == "glm53_flash.json":
-            assert training["prime_rl"] == {"ep_comm_backend": "deepep"}
+            assert training["prime_rl"] == {
+                "ep_comm_backend": "deepep",
+                "deepep_token_chunk_size": 8192,
+            }
         elif filename == "glm53_flash_bf16.json":
             assert training["prime_rl"] == {"ep_comm_backend": "uccl"}
         if filename in {
@@ -312,12 +315,12 @@ def test_moe_rl_recipes_have_runnable_parallelism():
         ),
         "glm53_flash.json": (
             "zai-org/GLM-5.3-Flash",
-            16,
+            8,
             8,
             8,
             "sparse_mla",
             262144,
-            16,
+            8,
             1,
         ),
         "glm53_flash_bf16.json": (
@@ -375,7 +378,10 @@ def test_moe_rl_recipes_have_runnable_parallelism():
         assert training["dtype"] == "bfloat16"
         assert training_config["model_provider"] == "prime_rl"
         if filename == "glm53_flash.json":
-            assert training_config["prime_rl"] == {"ep_comm_backend": "deepep"}
+            assert training_config["prime_rl"] == {
+                "ep_comm_backend": "deepep",
+                "deepep_token_chunk_size": 8192,
+            }
         elif filename == "glm53_flash_bf16.json":
             assert training_config["prime_rl"] == {"ep_comm_backend": "uccl"}
         if filename in {

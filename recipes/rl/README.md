@@ -111,8 +111,9 @@ The training block of each renamed RL recipe matches its SFT recipe.
 `qwen38_flash_next.json` keeps the 16-GPU
 sampler at TP8, `weight_format: vllm`, and router replay. Its training mesh
 is 16 GPUs, SP16, EP8, `qsa_flex`, and a 256K context.
-`glm53_flash.json` uses the same 16-GPU, SP16, EP8, DeepEP
-training mesh as the SFT recipe, including the tiled MLP chunk of 1024.
+`glm53_flash.json` uses the same 8-GPU, SP8, EP8, DeepEP
+training mesh as the SFT recipe, including the DeepEP token chunk of 8192
+and the tiled MLP chunk of 1024.
 Its sampler stays at 8 GPUs and TP8 with a 256K context. The completed
 evidence is the training optimizer step; sampling was not probed.
 `glm53_flash_bf16.json` uses a 64-GPU, SP64, EP32, UCCL
