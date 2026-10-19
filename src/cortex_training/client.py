@@ -96,6 +96,7 @@ from cortex_training.optimizer import normalize_optimizer_config
 from cortex_training.peft import normalize_lora_peft_config
 from cortex_training.snowflake_auth import SnowflakeProfileAuth
 from cortex_training.snowflake_auth import SnowflakeTelemetryTokenProvider
+from cortex_training.snowflake_auth import rest_host
 from cortex_training.telemetry import CachedSessionTokenProvider
 from cortex_training.telemetry import OtlpMetricEmitter
 
@@ -1902,7 +1903,7 @@ class CortexTrainingClient:
         on every request. No login round-trip.
         """
         client = cls(
-            base_url=f"https://{host}",
+            base_url=f"https://{rest_host(host)}",
             database=database,
             schema=schema,
             endpoint=endpoint,

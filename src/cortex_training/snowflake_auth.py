@@ -28,6 +28,8 @@ import os
 import threading
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import urlsplit
+from urllib.parse import urlunsplit
 
 
 class SnowflakeProfileError(RuntimeError):
@@ -42,6 +44,24 @@ _NETWORK_POLICY_DOCS_URL = (
     "https://github.com/snowflakedb/cortex-training/blob/main/docs/"
     "getting-started/authentication.md#network-policy-requirement"
 )
+
+
+_SNOWFLAKE_DOMAINS = (".snowflakecomputing.com", ".snowflakecomputing.cn")
+
+
+def rest_host(host: str) -> str:
+    """Return ``host`` with underscores in its account label turned into dashes.
+
+    Snowsight shows an account named ``MY_ACCT`` as ``my_acct.<region>...``,
+    and the Connector signs in with it, but Snowflake's certificates name
+    ``my-acct``, so standard HTTPS clients reject the underscore form. Hosts
+    outside Snowflake's domains are returned unchanged.
+    """
+    name, sep, port = host.partition(":")
+    if not name.lower().endswith(_SNOWFLAKE_DOMAINS):
+        return host
+    label, dot, rest = name.partition(".")
+    return f"{label.replace('_', '-')}{dot}{rest}{sep}{port}"
 
 
 def credentials_rejected_hint(summary: str) -> str:
@@ -148,7 +168,8 @@ class SnowflakeProfileAuth:
             raise SnowflakeProfileError(
                 "Snowflake Connector returned an invalid REST server URL"
             )
-        return server_url
+        parts = urlsplit(server_url)
+        return urlunsplit(parts._replace(netloc=rest_host(parts.netloc)))
 
     def _ensure_process(self) -> None:
         """Do not reuse a Connector session inherited across ``fork()``."""

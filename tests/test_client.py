@@ -805,6 +805,14 @@ class TestClientConstruction:
         assert c._metric_emitter is not None
         assert c._metric_emitter.timeout == 3.0
 
+    def test_from_pat_uses_dashes_in_the_rest_host(self):
+        c = CortexTrainingClient.from_pat(
+            host="org-my_acct.snowflakecomputing.com", pat="p", database="DB", schema="SCH"
+        )
+        assert c.base_url == "https://org-my-acct.snowflakecomputing.com"
+        # The Connector accepts either form, so artifact connections keep the host as given.
+        assert c._artifact_connection_config["host"] == "org-my_acct.snowflakecomputing.com"
+
     def test_from_pat_skips_telemetry_when_disabled(self, monkeypatch):
         monkeypatch.setenv(nc.DISABLE_TELEMETRY_ENV, "1")
         c = CortexTrainingClient.from_pat(

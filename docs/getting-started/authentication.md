@@ -73,9 +73,9 @@ chmod 600 ~/.snowflake/connections.toml
   `MYORG-MYACCOUNT`. You can find this in your Snowsight URL:
   `https://app.snowflake.com/MYORG/MYACCOUNT` → `MYORG-MYACCOUNT`.
 - **host**: `ACCOUNT.snowflakecomputing.com`, e.g.,
-  `myorg-myaccount.snowflakecomputing.com`. Use hyphens, not underscores —
-  some Snowflake admin tools show underscores but the SSL certificate requires
-  hyphens.
+  `myorg-myaccount.snowflakecomputing.com`. Snowsight may show an account name
+  with an underscore (`my_acct.…`); the SSL certificate names the hyphen form,
+  and the client uses it for its own HTTPS calls, so either form works.
 
 #### Setting the default connection
 
@@ -150,7 +150,7 @@ Snowflake-prefixed variants (`SNOWFLAKE_PAT`, `SNOWFLAKE_HOST`,
 
 | Error | Cause | Fix |
 |-------|-------|-----|
-| `SSL certificate verify failed` | Underscores in hostname | Replace underscores with hyphens in `host` |
+| `SSL certificate verify failed` | The `host` is not a `snowflakecomputing.com` address and has an underscore (for example, a custom name such as `ml_team.example.com`), or a company network tool that inspects HTTPS traffic replaces Snowflake's certificate with its own | Use the hyphen form (`ml-team.example.com`), or ask IT for the company certificate file and set `REQUESTS_CA_BUNDLE=/path/to/company-ca.pem` |
 | `no PAT found` | Missing token in config | Add `token` to connections.toml, `pat` to JSON, or set `CORTEX_TRAINING_PAT` |
 | `401 Unauthorized` | PAT expired, invalid, or your user has no network policy | See [Network policy requirement](#network-policy-requirement), or regenerate the PAT |
 | `394400 (08001)` / `Programmatic access token is invalid` | Your user has no network policy, or the PAT is wrong | See [Network policy requirement](#network-policy-requirement) |
