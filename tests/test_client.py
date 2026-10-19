@@ -8144,13 +8144,6 @@ class TestStreamStopsWithoutEof:
         ]
         assert [e["msg"] for e in c.stream_logs("j1", sub_job_id="sj-0", follow=True)] == ["a"]
 
-    def test_entries_with_extra_fields_still_render(self):
-        from cortex_training.tui.format import format_log_entry
-
-        entry = {"_raw": "2026-01-01T00:00:00Z hello", "ts": "2026-01-01T00:00:00Z", "line": "hello"}
-        assert "hello" in format_log_entry(entry)
-
-
 class TestStreamEndsWhenTheJobEnds:
     @pytest.fixture(autouse=True)
     def _no_waits(self, monkeypatch):

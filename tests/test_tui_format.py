@@ -369,3 +369,13 @@ def test_emoji_joiners_and_stacked_marks_are_tamed_by_every_cleaner():
 def test_job_records_are_cleaned_dict_keys_too():
     record = {f"comment{ESC}[7m": [f"name{ESC}]0;x{BEL}", {"model": "z" + MARK * 9}], "n_gpus": 8, "lora": None}
     assert printable_data(record) == {"comment": ["name", {"model": "z" + MARK * 4}], "n_gpus": 8, "lora": None}
+
+
+def test_a_raw_line_keeps_its_runtime_timestamp_and_the_screen_localizes_it():
+    # format_log_entry is what a copy and a save are built from, so a raw line goes in
+    # whole, timestamp included. display_line is what the screen shows, and it turns
+    # that timestamp into local time.
+    entry = {"_raw": "2026-01-01T00:00:00Z hello", "ts": "2026-01-01T00:00:00Z", "line": "hello"}
+    assert format_log_entry(entry) == "2026-01-01T00:00:00Z hello"
+    assert display_line(entry["_raw"]).endswith(" hello")
+    assert "2026-01-01T00:00:00Z" not in display_line(entry["_raw"])

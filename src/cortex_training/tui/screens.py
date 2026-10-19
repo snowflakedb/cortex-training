@@ -35,16 +35,16 @@ from textual.widgets import Header
 from textual.widgets import Static
 
 from cortex_training.tui import views as v
-from cortex_training.tui.app import ENDED_STYLE
-from cortex_training.tui.app import KEYS_BINDING
-from cortex_training.tui.app import FollowsPointer
-from cortex_training.tui.app import LogScreen
-from cortex_training.tui.app import SelectableTable
-from cortex_training.tui.app import after_refresh
-from cortex_training.tui.app import call_on_screen
-from cortex_training.tui.app import close_keys_panel
-from cortex_training.tui.app import hanging
-from cortex_training.tui.app import is_shown
+from cortex_training.tui.widgets import ENDED_STYLE
+from cortex_training.tui.widgets import KEYS_BINDING
+from cortex_training.tui.widgets import FollowsPointer
+from cortex_training.tui.logs import LogScreen
+from cortex_training.tui.widgets import SelectableTable
+from cortex_training.tui.widgets import after_refresh
+from cortex_training.tui.widgets import call_on_screen
+from cortex_training.tui.widgets import close_keys_panel
+from cortex_training.tui.widgets import hanging
+from cortex_training.tui.widgets import is_shown
 
 STATUS_STYLE = {
     "running": "bold green",

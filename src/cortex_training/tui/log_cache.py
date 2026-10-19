@@ -679,6 +679,7 @@ def cached_log_pages(
     is_cancelled: Optional[Callable[[], bool]] = None,
     hold: Optional[Callable[[], bool]] = None,
     can_restart: Optional[Callable[[], bool]] = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> Iterator[Tuple[str, list]]:
     """``cached_pages`` over ``client.tail_logs``, keyed by ``sub_job_id``.
 
@@ -709,4 +710,5 @@ def cached_log_pages(
         restart=restart if can_restart is not None else None,
         can_restart=can_restart,
         tail_window=tail_lines,
+        sleep=sleep,
     )

@@ -45,8 +45,8 @@ from cortex_training import CortexTrainingClient  # noqa: E402
 from cortex_training.client import DownloadCancelled  # noqa: E402
 from cortex_training.tui import __main__ as tui_main  # noqa: E402
 from cortex_training.tui.app import CortexTrainingLogTUI  # noqa: E402
-from cortex_training.tui.app import JobListScreen  # noqa: E402
-from cortex_training.tui.app import LogScreen  # noqa: E402
+from cortex_training.tui.job_list import JobListScreen  # noqa: E402
+from cortex_training.tui.logs import LogScreen  # noqa: E402
 from cortex_training.tui.demo import DemoClient  # noqa: E402
 from cortex_training.tui.format import wrap_log_line  # noqa: E402
 from cortex_training.tui.resource import RANGES  # noqa: E402
@@ -58,7 +58,7 @@ def _isolated_cache(tmp_path, monkeypatch):
     # The saved console and caches live under the per-job cache dir; keep every
     # test (including those that do not set it themselves) out of ~/.cache.
     monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path / "isolated-cache"))
-    import cortex_training.tui.app as app_module
+    import cortex_training.tui.widgets as app_module
 
     # ... and out of ~/.cortex-training-errors.log: a test that reads the log finds it in tmp_path.
     monkeypatch.setattr(app_module, "_ERROR_LOG", str(tmp_path / "errors.log"))
@@ -167,7 +167,7 @@ def test_account_list_keeps_equal_ids_from_two_schemas():
 
 
 def test_location_scopes_cache_identity_and_unknown_not_found_is_historical():
-    from cortex_training.tui.app import _cache_job_id
+    from cortex_training.tui.widgets import _cache_job_id
 
     class Client:
         base_url = "https://ACCOUNT.snowflakecomputing.com"
@@ -360,7 +360,7 @@ async def _run_resource_parser_failure_resets_loading():
 
 def test_resource_parser_failure_does_not_leave_loading_stuck(tmp_path, monkeypatch):
     monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
-    import cortex_training.tui.app as app_module
+    import cortex_training.tui.resource_view as app_module
 
     loader = MagicMock()
     loader.last = None  # nothing read yet
@@ -1082,14 +1082,13 @@ def test_a_search_builds_each_hidden_older_job_s_search_text_once(monkeypatch):
     asyncio.run(run())
 
 
-def test_job_table_fills_the_same_through_datatable_s_own_methods(monkeypatch):
-    # replace_rows sets DataTable's rows directly only on the Textual it was written
-    # and tested against (TEXTUAL_FLOOR); any other release gets clear() and
-    # add_row(), which must leave the very same table.
+def test_job_table_replace_rows_shows_exactly_those_rows():
+    # replace_rows fills the table through DataTable's own clear() and add_row():
+    # the rows, their keys and the cursor must come out as the caller asked.
     from textual.app import App
 
-    from cortex_training.tui.app import _cell
-    from cortex_training.tui.app import _JobTable
+    from cortex_training.tui.widgets import _cell
+    from cortex_training.tui.job_list import _JobTable
 
     class Tables(App):
         CSS = "DataTable { height: 8; }"
@@ -1114,43 +1113,23 @@ def test_job_table_fills_the_same_through_datatable_s_own_methods(monkeypatch):
             for table in (fast, own):
                 table.add_column("Job ID", width=8, key="Job ID")
                 table.add_column("N", width=4, key="N")
-            assert fast._fills_fast() is tui_main.textual_is_floor()
-            monkeypatch.setattr(own, "_fills_fast", lambda: False)
+            # Two tables filled the same way hold the same rows, however often refilled.
             for plan in (rows(30, "a"), rows(5, "b"), [], rows(12, "c")):
                 fast.replace_rows(plan)
                 own.replace_rows(plan)
                 await pilot.pause()
                 assert state(fast) == state(own)
+                assert [row.key.value for row in fast.ordered_rows] == [key for key, _cells in plan]
+                assert fast.row_count == len(plan)
             fast.move_cursor(row=9)
             own.move_cursor(row=9)
             fast.replace_rows(rows(20, "d"))
             own.replace_rows(rows(20, "d"))
             await pilot.pause()
             assert state(fast) == state(own)
-            # Any other Textual: the rows go in through DataTable's own methods.
-            monkeypatch.setattr(tui_main, "textual_is_floor", lambda: False)
-            assert not fast._fills_fast()
+            assert [str(cell) for cell in fast.get_row_at(0)] == ["d 0", "0"]
 
     asyncio.run(run())
-
-
-def test_textual_is_floor_is_that_release_only(monkeypatch):
-    from importlib import metadata
-
-    floor = ".".join(map(str, tui_main.TEXTUAL_FLOOR))
-
-    def missing(name):
-        raise metadata.PackageNotFoundError(name)
-
-    try:
-        with monkeypatch.context() as m:
-            for installed, expected in ((floor, True), (f"{floor}.post1", False), (f"{floor}rc1", False),
-                                        ("8.3.0", False), ("9.0.0", False), (None, False)):
-                m.setattr(metadata, "version", missing if installed is None else lambda name, v=installed: v)
-                tui_main.textual_is_floor.cache_clear()
-                assert tui_main.textual_is_floor() is expected, installed
-    finally:
-        tui_main.textual_is_floor.cache_clear()  # read again from the installed Textual
 
 
 async def _run_logscreen_controls():
@@ -2069,7 +2048,7 @@ async def _run_save_exports_file(tmp_path):
         assert copied == ["file body\nsecond"]
         home = tmp_path / "home"
         home.mkdir()
-        import cortex_training.tui.app as app_module
+        import cortex_training.tui.widgets as app_module
 
         original = app_module.os.path.expanduser
         app_module.os.path.expanduser = lambda path: str(home / os.path.basename(path))
@@ -2214,7 +2193,7 @@ async def _run_failure_then_retry():
 
 
 def test_download_failure_shows_error_and_r_retries(monkeypatch, tmp_path):
-    import cortex_training.tui.app as app_module
+    import cortex_training.tui.widgets as app_module
 
     monkeypatch.setattr(app_module, "_ERROR_LOG", str(tmp_path / "errors.log"))
     asyncio.run(_run_failure_then_retry())
@@ -2299,7 +2278,7 @@ async def _run_progress_status_and_cancel(state):
 
 
 def test_progress_updates_status_and_leaving_cancels_download(monkeypatch, tmp_path):
-    import cortex_training.tui.app as app_module
+    import cortex_training.tui.widgets as app_module
 
     monkeypatch.setattr(app_module, "_ERROR_LOG", str(tmp_path / "errors.log"))
     state = {"started": threading.Event()}
@@ -2394,7 +2373,7 @@ async def _run_reopen_while_download_blocks(state):
 
 
 def test_reopen_does_not_wait_forever_on_a_blocked_download(monkeypatch, tmp_path):
-    import cortex_training.tui.app as app_module
+    import cortex_training.tui.widgets as app_module
 
     monkeypatch.setattr(app_module, "_ERROR_LOG", str(tmp_path / "errors.log"))
     state = {"calls": 0, "started": threading.Event()}
@@ -3241,7 +3220,7 @@ def test_the_poll_interval_is_the_flag_s_alone_and_the_sign_in_names_what_the_co
 
 
 def test_resource_refresh_skips_the_reparse_when_nothing_new_arrived(monkeypatch):
-    import cortex_training.tui.app as tui_app
+    import cortex_training.tui.resource_view as tui_app
 
     loaders = []
     real_loader = tui_app.resource_loader

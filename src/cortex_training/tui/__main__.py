@@ -18,14 +18,11 @@
 from __future__ import annotations
 
 import argparse
-import functools
 import math
 import os
 import re
 from pathlib import Path
 
-# --debug account-list behavior.
-DEBUG_ACCOUNT_LIST_ENV = "CORTEX_TRAINING_TUI_DEBUG_ACCOUNT_LIST"
 _CONNECT_HINT = ("to connect, run 'cortex-training login config.json', set CORTEX_TRAINING_CONFIG, pass "
                  "--config config.json, --connection NAME, --base-url (local/mock), or --host + --pat; "
                  "or try the TUI without a connection: --debug")
@@ -61,17 +58,6 @@ def textual_problem() -> str | None:
         return (f"the TUI needs textual {floor} or later, and {installed} is installed: "
                 f"pip install --upgrade '{_TEXTUAL_REQUIREMENT}'")
     return None
-
-
-@functools.lru_cache(maxsize=None)
-def textual_is_floor() -> bool:
-    """Whether Textual is exactly the release whose table internals we use."""
-    from importlib import metadata
-
-    try:
-        return metadata.version("textual") == ".".join(map(str, TEXTUAL_FLOOR))
-    except metadata.PackageNotFoundError:
-        return False
 
 
 def _escaped(text: str) -> str:
@@ -165,11 +151,7 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
                        f"or pip install --upgrade '{_TEXTUAL_REQUIREMENT}'\n")
 
     if args.debug:
-        try:
-            account_list = _demo_account_list()
-        except ValueError as exc:
-            parser.error(str(exc))
-        return _run_demo(args, CortexTrainingLogTUI, account_list=account_list)
+        return _run_demo(args, CortexTrainingLogTUI)
 
     import cortex_training._cli as cli
 
@@ -255,24 +237,8 @@ def _config_connection(cli, values: dict) -> dict:
     return {"base_url": base_url, "host": cli._normalize_host(host) if host else None}
 
 
-def _demo_account_list() -> str | None:
-    """How the demo's account-wide list answers: None (it lists every location), an unavailable
-    reason, or ``unavailable`` (it fails)."""
-    from cortex_training import AccountJobListUnavailable
-    from cortex_training.tui.demo import UNAVAILABLE
-
-    value = (os.environ.get(DEBUG_ACCOUNT_LIST_ENV) or "").strip().lower()
-    if value in ("", "ok"):
-        return None
-    if value not in (*AccountJobListUnavailable.REASONS, UNAVAILABLE):
-        reasons = ", ".join(sorted((*AccountJobListUnavailable.REASONS, UNAVAILABLE)))
-        raise ValueError(f"{DEBUG_ACCOUNT_LIST_ENV} must be ok or one of {reasons}, got {value!r}")
-    return value
-
-
 def _run_demo(args, app_class, *, account_list: str | None = None) -> int:
-    """Run against :class:`~cortex_training.tui.demo.DemoClient` with throwaway local stores
-    (``account_list``: see :func:`_demo_account_list`)."""
+    """Run against :class:`~cortex_training.tui.demo.DemoClient` with throwaway local stores."""
     import tempfile
 
     from cortex_training.tui.demo import DemoClient

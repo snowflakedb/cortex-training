@@ -25,6 +25,26 @@ from cortex_training.tui.views import printable_data
 # The client methods whose answers are job records.
 _RECORD_READS = frozenset({"get_job", "list_jobs", "list_jobs_page"})
 
+# A job's location, which the account-wide list names. These are SQL identifiers that
+# route the job's calls (JobClients.for_job), not text to draw: made printable, a name
+# holding a control or zero-width character becomes a different identifier and every
+# call for that job answers 404. They are kept as the service stored them, and what
+# draws them makes them printable itself (views.location_label, app._cell).
+_ROUTING_KEYS = ("database_name", "schema_name")
+
+
+def _keep_routing(clean: Any, raw: Any) -> Any:
+    """``clean`` with every record's :data:`_ROUTING_KEYS` taken from ``raw``."""
+    if isinstance(clean, dict) and isinstance(raw, dict):
+        kept = {key: _keep_routing(value, raw.get(key)) for key, value in clean.items()}
+        for key in _ROUTING_KEYS:
+            if isinstance(raw.get(key), str):
+                kept[key] = raw[key]
+        return kept
+    if isinstance(clean, list) and isinstance(raw, list) and len(clean) == len(raw):
+        return [_keep_routing(item, original) for item, original in zip(clean, raw)]
+    return clean
+
 
 class PrintableClient:
     """A transparent client proxy that sanitizes job reads and child clients."""
@@ -61,7 +81,8 @@ def printable_client(client: Any) -> Any:
 def _printable_answer(method):
     @functools.wraps(method)
     def read(*args, **kwargs):
-        return printable_data(method(*args, **kwargs))
+        answer = method(*args, **kwargs)
+        return _keep_routing(printable_data(answer), answer)
 
     return read
 

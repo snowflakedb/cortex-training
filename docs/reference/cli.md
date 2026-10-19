@@ -774,10 +774,7 @@ reporting GPU and node samples (one reports its GPUs only), a placing job
 starts within two minutes, a
 running one is cancelled, a tail gets stuck behind a long line and restarts from
 the end, and others have ended, failed, are `UNKNOWN`, or sit on an Experiment
-this role can't read. Set `CORTEX_TRAINING_TUI_DEBUG_ACCOUNT_LIST` to
-`not_deployed`, `disabled`, `forbidden` or `rest_disabled` to preview `a` where
-the account-level list is unavailable, or to `unavailable` for a list that fails
-(503).
+this role can't read.
 
 #### Job list
 
