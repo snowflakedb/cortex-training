@@ -271,18 +271,36 @@ def train(config: Config, task: Task) -> dict[str, Any]:
             ml_logger.log_metrics(metrics=evaluate(job_id), step=total_steps)
 
         saved = save_recipe_checkpoints(client, job_id)
-        sample_prompt = task.sample_prompt()
-        log_saved_checkpoints(
-            config_path=config.config,
-            job_id=job_id,
-            saved=saved,
-            sampling_command="sample",
-            job_config=Path(config.job_config).name,
-            sample_prompt=sample_prompt,
-            enable_thinking=config.enable_thinking,
-            renderer_name=config.renderer_name,
-            temperature=0 if sample_prompt else None,
-        )
+        eval_command = getattr(task, "eval_command", None)
+        if callable(eval_command):
+            log_saved_checkpoints(
+                config_path=config.config,
+                job_id=job_id,
+                saved=saved,
+            )
+            checkpoint_id = str(saved["weights-only"].get("checkpoint_id") or "").strip()
+            if checkpoint_id:
+                logger.info(
+                    "Evaluate this weights-only checkpoint with:\n  %s",
+                    eval_command(
+                        config_path=config.config,
+                        job_id=job_id,
+                        checkpoint_id=checkpoint_id,
+                    ),
+                )
+        else:
+            sample_prompt = task.sample_prompt()
+            log_saved_checkpoints(
+                config_path=config.config,
+                job_id=job_id,
+                saved=saved,
+                sampling_command="sample",
+                job_config=Path(config.job_config).name,
+                sample_prompt=sample_prompt,
+                enable_thinking=config.enable_thinking,
+                renderer_name=config.renderer_name,
+                temperature=0 if sample_prompt else None,
+            )
 
     ml_logger.close()
     logger.info("Training completed")

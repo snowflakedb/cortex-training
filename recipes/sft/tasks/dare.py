@@ -211,3 +211,20 @@ class DareTask:
 
     def sample_prompt(self) -> str | None:
         return None
+
+    def eval_command(
+        self,
+        *,
+        config_path: str,
+        job_id: str,
+        checkpoint_id: str,
+    ) -> str:
+        return (
+            "python -m recipes.sft.dare.evaluate "
+            f"config={config_path} "
+            "bench_dir=$BENCH_DIR "
+            "sandbox_python=$PWD/dare_sandbox_env/bin/python "
+            f"source_job_id={job_id} "
+            f"checkpoint_id={checkpoint_id} "
+            "log_path=/tmp/dare/sft"
+        )
