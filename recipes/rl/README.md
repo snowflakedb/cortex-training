@@ -106,6 +106,7 @@ Other full-parameter job bodies are:
 - `configs/glm53_flash.json` (FP8 weights)
 - `configs/glm53_flash_bf16.json`
 - `configs/qwen38_flash_next.json`
+- `configs/deepseek_v4_flash.json`
 
 The training block of each renamed RL recipe matches its SFT recipe.
 `qwen38_flash_next.json` uses the same 8-GPU, SP8, EP8, `qsa_flex`
@@ -122,6 +123,12 @@ evidence is the training optimizer step; sampling was not probed.
 training mesh with tiled MLP chunk 512. Its sampler remains 8 GPUs and TP8.
 The BF16 mesh is an unproven capacity estimate based on the FP8 run; that
 checkpoint has not completed its own 256K step.
+`deepseek_v4_flash.json` uses the same 32-GPU, SP32, EP32, eager, UCCL
+training mesh as the SFT recipe, including liger fused cross-entropy, bf16
+master weights and optimizer states, and activation offload left off. Its
+sampler stays at 8 GPUs and TP8, with `weight_format: vllm`, router replay,
+and `reasoning_parser: deepseek_v4`. The completed evidence is the training
+optimizer step; sampling was not probed.
 
 ## Customizability
 

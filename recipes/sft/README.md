@@ -181,6 +181,7 @@ DeepEP at EP8. The BF16 recipe keeps UCCL at EP32.
 - `nemotron35_lightning_30b.json`: Nemotron-3.5-Lightning-30B-A3B-BF16, 8 GPUs, SP8, EP4, 256K. One AdamW step completed on H200, including a packed batch. MTP weights are not trained.
 - `glm53_flash.json`: GLM-5.3-Flash FP8 weights, 8 GPUs, SP8, EP8, 256K, DeepEP, DeepEP token chunk 8192, tiled MLP chunk 1024. One AdamW step completed on H200. Peak device memory was about 109 GiB.
 - `glm53_flash_bf16.json`: GLM-5.3-Flash-BF16, 64 GPUs, SP64, EP32, 256K, UCCL, tiled MLP chunk 512. This is an unproven capacity estimate based on the FP8 run; the BF16 checkpoint has not completed its own 256K step.
+- `deepseek_v4_flash.json`: DeepSeek-V4-Flash-0731, 32 GPUs, SP32, EP32, 256K, eager sparse attention, UCCL, liger fused cross-entropy, bf16 Adam state. Activation offload is off. Two AdamW steps completed on H200. Peak device memory on the second step was about 108 GiB.
 
 ```bash
 python -m recipes.sft.conversational.train \

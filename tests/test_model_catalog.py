@@ -222,6 +222,14 @@ def test_moe_sft_recipes_have_runnable_parallelism():
             8,
             1,
         ),
+        "deepseek_v4_flash.json": (
+            "deepseek-ai/DeepSeek-V4-Flash-0731",
+            32,
+            32,
+            262144,
+            32,
+            1,
+        ),
     }
     config_dir = REPO_ROOT / "recipes/sft/configs"
     for filename, (
@@ -248,6 +256,16 @@ def test_moe_sft_recipes_have_runnable_parallelism():
             }
         elif filename == "glm53_flash_bf16.json":
             assert training["prime_rl"] == {"ep_comm_backend": "uccl"}
+        elif filename == "deepseek_v4_flash.json":
+            assert training["prime_rl"] == {
+                "fused_cross_entropy": "liger",
+                "ep_comm_backend": "uccl",
+            }
+            assert training["attn_implementation"] == "eager"
+            assert training["ac_config"]["offload_config"]["enabled"] is False
+            assert sub_job["weight_format"] == "vllm"
+            assert ds_config["bf16"]["bf16_optimizer_states"] is True
+            assert ds_config["bf16"]["bf16_master_weights_and_grads"] is True
         if filename in {
             "glm53_flash.json",
             "glm53_flash_bf16.json",
@@ -256,7 +274,7 @@ def test_moe_sft_recipes_have_runnable_parallelism():
             assert training["tiled_mlp_token_chunk_size"] == expected_chunk
             assert training["ds_config"]["bf16"]["bf16_optimizer_states"] is True
             assert training["ds_config"]["bf16"]["bf16_master_weights_and_grads"] is True
-        else:
+        elif filename != "deepseek_v4_flash.json":
             assert "prime_rl" not in training
         assert training["max_seq_len"] == seq_len
         assert training["n_gpus"] == n_gpus
@@ -345,6 +363,16 @@ def test_moe_rl_recipes_have_runnable_parallelism():
             8,
             1,
         ),
+        "deepseek_v4_flash.json": (
+            "deepseek-ai/DeepSeek-V4-Flash-0731",
+            32,
+            32,
+            8,
+            "eager",
+            262144,
+            32,
+            1,
+        ),
     }
     config_dir = REPO_ROOT / "recipes/rl/configs"
     sft_dir = REPO_ROOT / "recipes/sft/configs"
@@ -386,6 +414,18 @@ def test_moe_rl_recipes_have_runnable_parallelism():
             }
         elif filename == "glm53_flash_bf16.json":
             assert training_config["prime_rl"] == {"ep_comm_backend": "uccl"}
+        elif filename == "deepseek_v4_flash.json":
+            assert training_config["prime_rl"] == {
+                "fused_cross_entropy": "liger",
+                "ep_comm_backend": "uccl",
+            }
+            assert training_config["ac_config"]["offload_config"]["enabled"] is False
+            assert sampling["weight_format"] == "vllm"
+            assert training["weight_format"] == "vllm"
+            assert sampling_config["vllm_config"]["reasoning_parser"] == "deepseek_v4"
+            assert training_config["router_replay"]["enabled"] is True
+            assert ds_config["bf16"]["bf16_optimizer_states"] is True
+            assert ds_config["bf16"]["bf16_master_weights_and_grads"] is True
         if filename in {
             "glm53_flash.json",
             "glm53_flash_bf16.json",
@@ -393,7 +433,7 @@ def test_moe_rl_recipes_have_runnable_parallelism():
             expected_chunk = 512 if "_bf16" in filename else 1024
             assert training_config["tiled_mlp_token_chunk_size"] == expected_chunk
             assert training_config["ds_config"]["bf16"]["bf16_optimizer_states"] is True
-        else:
+        elif filename != "deepseek_v4_flash.json":
             assert "prime_rl" not in training_config
         assert training_config["attn_implementation"] == attention
         assert training_config["max_seq_len"] == seq_len
