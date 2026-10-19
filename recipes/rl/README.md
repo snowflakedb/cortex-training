@@ -123,9 +123,9 @@ evidence is the training optimizer step; sampling was not probed.
 training mesh with tiled MLP chunk 512. Its sampler remains 8 GPUs and TP8.
 The BF16 mesh is an unproven capacity estimate based on the FP8 run; that
 checkpoint has not completed its own 256K step.
-`deepseek_v4_flash.json` uses the same 32-GPU, SP32, EP32, eager, UCCL
+`deepseek_v4_flash.json` uses the same 16-GPU, SP16, EP16, eager, UCCL
 training mesh as the SFT recipe, including liger fused cross-entropy, bf16
-master weights and optimizer states, and activation offload left off. Its
+master weights and optimizer states, and pageable activation offload. Its
 sampler stays at 8 GPUs and TP8, with `weight_format: vllm`, router replay,
 and `reasoning_parser: deepseek_v4`. The completed evidence is the training
 optimizer step; sampling was not probed.

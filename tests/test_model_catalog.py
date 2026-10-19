@@ -224,10 +224,10 @@ def test_moe_sft_recipes_have_runnable_parallelism():
         ),
         "deepseek_v4_flash.json": (
             "deepseek-ai/DeepSeek-V4-Flash-0731",
-            32,
-            32,
+            16,
+            16,
             262144,
-            32,
+            16,
             1,
         ),
     }
@@ -262,7 +262,10 @@ def test_moe_sft_recipes_have_runnable_parallelism():
                 "ep_comm_backend": "uccl",
             }
             assert training["attn_implementation"] == "eager"
-            assert training["ac_config"]["offload_config"]["enabled"] is False
+            offload = training["ac_config"]["offload_config"]
+            assert offload["enabled"] is True
+            assert offload["use_streams"] is False
+            assert offload["pin_memory_enabled"] is False
             assert sub_job["weight_format"] == "vllm"
             assert ds_config["bf16"]["bf16_optimizer_states"] is True
             assert ds_config["bf16"]["bf16_master_weights_and_grads"] is True
@@ -365,12 +368,12 @@ def test_moe_rl_recipes_have_runnable_parallelism():
         ),
         "deepseek_v4_flash.json": (
             "deepseek-ai/DeepSeek-V4-Flash-0731",
-            32,
-            32,
+            16,
+            16,
             8,
             "eager",
             262144,
-            32,
+            16,
             1,
         ),
     }
@@ -419,7 +422,10 @@ def test_moe_rl_recipes_have_runnable_parallelism():
                 "fused_cross_entropy": "liger",
                 "ep_comm_backend": "uccl",
             }
-            assert training_config["ac_config"]["offload_config"]["enabled"] is False
+            offload = training_config["ac_config"]["offload_config"]
+            assert offload["enabled"] is True
+            assert offload["use_streams"] is False
+            assert offload["pin_memory_enabled"] is False
             assert sampling["weight_format"] == "vllm"
             assert training["weight_format"] == "vllm"
             assert sampling_config["vllm_config"]["reasoning_parser"] == "deepseek_v4"
