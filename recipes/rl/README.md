@@ -108,9 +108,11 @@ Other full-parameter job bodies are:
 - `configs/qwen38_flash_next.json`
 
 The training block of each renamed RL recipe matches its SFT recipe.
-`qwen38_flash_next.json` keeps the 16-GPU
-sampler at TP8, `weight_format: vllm`, and router replay. Its training mesh
-is 16 GPUs, SP16, EP8, `qsa_flex`, and a 256K context.
+`qwen38_flash_next.json` uses the same 8-GPU, SP8, EP8, `qsa_flex`
+training mesh as the SFT recipe, including bf16 master weights and optimizer
+states. Its sampler stays at 8 GPUs and TP8, with `weight_format: vllm` and
+router replay. The completed evidence is the training optimizer step;
+sampling was not probed.
 `glm53_flash.json` uses the same 8-GPU, SP8, EP8, DeepEP
 training mesh as the SFT recipe, including the DeepEP token chunk of 8192
 and the tiled MLP chunk of 1024.

@@ -216,10 +216,10 @@ def test_moe_sft_recipes_have_runnable_parallelism():
         ),
         "qwen38_flash_next.json": (
             "Qwen/Qwen3.8-Flash-Next",
-            16,
+            8,
             8,
             262144,
-            16,
+            8,
             1,
         ),
     }
@@ -268,6 +268,8 @@ def test_moe_sft_recipes_have_runnable_parallelism():
         assert ds_config["gradient_accumulation_steps"] == 1
         if filename.startswith("qwen38_flash_next"):
             assert training["attn_implementation"] == "qsa_flex"
+            assert ds_config["bf16"]["bf16_optimizer_states"] is True
+            assert ds_config["bf16"]["bf16_master_weights_and_grads"] is True
 
 
 def test_moe_rl_recipes_have_runnable_parallelism():
@@ -335,12 +337,12 @@ def test_moe_rl_recipes_have_runnable_parallelism():
         ),
         "qwen38_flash_next.json": (
             "Qwen/Qwen3.8-Flash-Next",
-            16,
             8,
-            16,
+            8,
+            8,
             "qsa_flex",
             262144,
-            16,
+            8,
             1,
         ),
     }
@@ -429,6 +431,8 @@ def test_moe_rl_recipes_have_runnable_parallelism():
             assert training_config["router_replay"]["enabled"] is True
             assert training_config["ac_config"]["mode"] == "full"
             assert training_config["mb_spec"]["max_tokens_per_mb"] == seq_len
+            assert ds_config["bf16"]["bf16_optimizer_states"] is True
+            assert ds_config["bf16"]["bf16_master_weights_and_grads"] is True
 
 
 @pytest.mark.parametrize(

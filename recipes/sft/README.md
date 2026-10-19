@@ -175,7 +175,7 @@ configs are 8 GPUs at TP8 and 256K. The GLM-5.3-Flash FP8 recipe uses
 DeepEP at EP8. The BF16 recipe keeps UCCL at EP32.
 
 - `glm45_air.json`: GLM-4.5-Air, 8 GPUs, SP8, EP4, 128K
-- `qwen38_flash_next.json`: Qwen3.8-Flash-Next, 16 GPUs, SP16, EP8, 256K, `qsa_flex`
+- `qwen38_flash_next.json`: Qwen3.8-Flash-Next, 8 GPUs, SP8, EP8, 256K, `qsa_flex`, bf16 Adam state. One AdamW step completed on H200. Peak device memory was about 115 GiB.
 - `qwen3_30b_a3b.json`: Qwen3-30B-A3B, 4 GPUs, SP1, EP4, 40K (model maximum)
 - `nemotron3_nano_30b.json`: Nemotron-3-Nano-30B-A3B-BF16, 8 GPUs, SP8, EP4, 256K. One AdamW step completed on H200, including a packed batch. Mamba context parallel resets at sequence boundaries.
 - `nemotron35_lightning_30b.json`: Nemotron-3.5-Lightning-30B-A3B-BF16, 8 GPUs, SP8, EP4, 256K. One AdamW step completed on H200, including a packed batch. MTP weights are not trained.
