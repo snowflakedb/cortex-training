@@ -35,10 +35,10 @@ cortex-training tui JOB_ID
 ```
 
 The **Logs** tab tails a running job or loads its saved console after it
-finishes; the saved console is cached locally, so reopening the job only
-fetches what is new. The **Resource** tab plots GPU utilization and lists each GPU. Use
-`1`–`5` for 5 minutes, 15 minutes, 1 hour, 6 hours, or all history; use `r` to
-refresh.
+finishes. The **Resources** tab charts the selected sub-job's GPU use and lists
+each GPU; `w` cycles 10 minutes (the default), 30 minutes, 1 hour, 6 hours, or
+the whole job, and `r` refreshes. Run `cortex-training tui` without a job id
+to browse and search your jobs first. See [Job TUI](../../reference/cli.md#job-tui).
 
 Recipe-level metrics are also written under each recipe's `log_path`.
 

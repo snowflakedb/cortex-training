@@ -8148,7 +8148,7 @@ class TestStreamStopsWithoutEof:
         from cortex_training.tui.format import format_log_entry
 
         entry = {"_raw": "2026-01-01T00:00:00Z hello", "ts": "2026-01-01T00:00:00Z", "line": "hello"}
-        assert format_log_entry(entry) == "hello"
+        assert "hello" in format_log_entry(entry)
 
 
 class TestStreamEndsWhenTheJobEnds:

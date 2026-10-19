@@ -22,10 +22,10 @@ with :class:`cortex_training._download_lock.DownloadLock`.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from cortex_training._artifact_download import read_manifest
 from cortex_training.tui.format import entry_matches
 
 TAIL_MAX_LINES = 20000
@@ -45,21 +45,9 @@ class SavedTail:
 
 
 def committed_size(path: Path, size: int) -> int:
-    """Bytes of ``path`` that a download has committed.
-
-    A download records the committed length in ``.<name>.manifest.json``;
-    anything past it is a torn append the next download truncates. Without a
-    readable manifest the whole file counts.
-    """
-    manifest = path.with_name("." + path.name + ".manifest.json")
-    try:
-        doc = json.loads(manifest.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return size
-    committed = doc.get("bytes") if isinstance(doc, dict) else None
-    if isinstance(committed, bool) or not isinstance(committed, int) or not 0 <= committed <= size:
-        return size
-    return committed
+    """Bytes committed by a valid resume manifest, else the whole file."""
+    manifest = read_manifest(path.with_name("." + path.name + ".manifest.json"))
+    return manifest.nbytes if manifest is not None and manifest.nbytes <= size else size
 
 
 def _decode(raw: bytes, *, cut: bool) -> str:

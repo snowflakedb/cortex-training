@@ -13,23 +13,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the TUI's pure formatting helpers (no ``textual`` needed)."""
+"""Unit tests for the TUI's pure helpers: formatting, sanitizing, wrapping, sorting, search (no ``textual`` needed)."""
+
+import json
 
 import pytest
+from rich.cells import cell_len
 
+from cortex_training.tui.format import cut_cells
+from cortex_training.tui.format import display_line
 from cortex_training.tui.format import entry_at_level
 from cortex_training.tui.format import entry_matches
 from cortex_training.tui.format import format_created_at
-from cortex_training.tui.format import format_event
 from cortex_training.tui.format import format_job_config
-from cortex_training.tui.format import format_job_row
-from cortex_training.tui.format import format_job_summary
 from cortex_training.tui.format import format_log_entry
-from cortex_training.tui.format import job_matches
-from cortex_training.tui.format import job_status_color
-from cortex_training.tui.format import sort_jobs
+from cortex_training.tui.format import one_line
+from cortex_training.tui.format import printable
+from cortex_training.tui.format import safe_text
 from cortex_training.tui.format import source_label
 from cortex_training.tui.format import wrap_log_line
+from cortex_training.tui.views import fit_cells
+from cortex_training.tui.views import job_matches_query
+from cortex_training.tui.views import parse_query
+from cortex_training.tui.views import printable_data
+from cortex_training.tui.views import resolve_query
+from cortex_training.tui.views import sort_job_list
+from cortex_training.tui.views import wrap_cells
 
 
 def test_format_structured_log_entry():
@@ -60,29 +69,6 @@ def test_format_non_dict_entry():
     assert format_log_entry("already a string") == "already a string"
 
 
-def test_format_event_full():
-    out = format_event(
-        {
-            "ts": "2026-06-12T00:01:00Z",
-            "kind": "zone_transition",
-            "zone": "training-1",
-            "from": "creating",
-            "to": "ready",
-            "sub_job_id": "s:training:0",
-            "detail": "zone_manager=zm-1",
-        }
-    )
-    assert "zone_transition" in out
-    assert "zone=training-1" in out
-    assert "creating→ready" in out
-    assert "sub_job=s:training:0" in out
-    assert "zone_manager=zm-1" in out
-
-
-def test_format_event_minimal():
-    assert format_event({"kind": "route_added"}) == "route_added"
-
-
 def test_source_label_names_the_component():
     # Sources are sub-jobs: "<type> #<index>", type from job_type or the id.
     assert source_label({"sub_job_id": "u:training:0", "job_type": "training"}) == "training #0"
@@ -96,40 +82,11 @@ def test_source_label_falls_back_to_server_label_then_id():
     assert source_label({"source_id": "weird"}) == "weird"
 
 
-def test_format_job_row():
-    row = format_job_row(
-        {
-            "job_id": "abc-123",
-            "status": "RUNNING",
-            "created_at": "2026-06-13T18:49:54Z",
-            "sub_jobs": [{"job_type": "training"}, {"job_type": "sampling"}],
-        }
-    )
-    assert "RUNNING" in row and "abc-123" in row and "training" in row and "sampling" in row
-    assert "2026-06-1" in row  # created date shown (tz may shift the day by ±1)
-    assert "│" in row  # column separators present
-    # JOB_STATE_ prefix stripped; type shown; missing created → placeholder column
-    no_ts = format_job_row({"id": "j", "status": "JOB_STATE_FAILED", "job_type": "training"})
-    assert no_ts.startswith("FAILED") and "training" in no_ts and "│" in no_ts and "—" in no_ts
-    assert format_job_row({"job_id": "j"}).startswith("?")  # missing status
-
-
-def test_job_status_color():
-    # Subtle: only live jobs get a hue (green); everything else stays default.
-    assert job_status_color("RUNNING") == "green"
-    assert job_status_color("JOB_STATE_PENDING") == "green"
-    assert job_status_color("FAILED") == ""
-    assert job_status_color("CANCELLED") == ""
-    assert job_status_color("TERMINATED") == ""
-    assert job_status_color(None) == ""
-    assert job_status_color("weird") == ""
-
-
 def test_format_created_at():
     import re
 
     out = format_created_at("2026-06-13T18:49:54Z")
-    assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} \S+", out)  # local YYYY-MM-DD HH:MM TZ
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", out)  # local YYYY-MM-DD HH:MM
     assert format_created_at(None) == ""
     assert format_created_at("") == ""
     assert format_created_at("not-a-date") == ""
@@ -142,9 +99,9 @@ def test_sort_jobs_newest_first():
         {"job_id": "mid", "created_at": "2026-06-11T00:00:00Z"},
         {"job_id": "none"},  # missing created_at -> sorts last
     ]
-    order = [j["job_id"] for j in sort_jobs(jobs)]
+    order = [j["job_id"] for j in sort_job_list(jobs)]
     assert order == ["new", "mid", "old", "none"]
-    assert sort_jobs("not a list") == []
+    assert sort_job_list("not a list") == []
 
 
 def test_sort_jobs_stable_on_equal_timestamps():
@@ -153,35 +110,7 @@ def test_sort_jobs_stable_on_equal_timestamps():
         {"job_id": "second", "created_at": "2026-06-12T00:00:00Z"},
     ]
     # equal created_at keeps original order (stable)
-    assert [j["job_id"] for j in sort_jobs(jobs)] == ["first", "second"]
-
-
-def test_format_job_summary():
-    job = {
-        "status": "RUNNING",
-        "sub_jobs": [
-            {
-                "job_type": "TRAINING",
-                "model_name": "Qwen/Qwen3-0.6B",
-                "training_config": {
-                    "n_gpus": 1.0,
-                    "max_seq_len": 128.0,
-                    "train_batch_size": 1.0,
-                    "optimizer": {"name": "adamw", "lr": 1e-5},
-                },
-            }
-        ],
-    }
-    s = format_job_summary(job)
-    assert s.startswith("RUNNING")
-    assert "training" in s and "Qwen/Qwen3-0.6B" in s
-    assert "gpus=1" in s and "seq=128" in s and "bs=1" in s
-    assert "opt=adamw/lr=1e-05" in s
-    assert "gbs=" not in s and "clip=" not in s  # only what was passed
-    # failure reason is appended
-    failed = {"status": "FAILED", "reason": "oom killed", "sub_jobs": []}
-    assert format_job_summary(failed).endswith("reason: oom killed")
-    assert format_job_summary("not a dict") == ""
+    assert [j["job_id"] for j in sort_job_list(jobs)] == ["first", "second"]
 
 
 def test_format_job_config_is_config_only():
@@ -209,13 +138,54 @@ def test_format_job_config_is_config_only():
     assert format_job_config("not a dict") == ""
 
 
-def test_job_matches():
-    job = {"job_id": "abc-123", "status": "RUNNING", "sub_jobs": [{"job_type": "training", "model_name": "Qwen3"}]}
-    assert job_matches(job, "") is True
-    assert job_matches(job, "abc") and job_matches(job, "run")
-    assert job_matches(job, "qwen") and job_matches(job, "training")
-    assert not job_matches(job, "sampling")
-    assert job_matches("not a dict", "q") is False
+def _job(job_id: str, *, seed: int, lr: float, betas: list) -> dict:
+    return {"job_id": job_id, "status": "RUNNING", "sub_jobs": [{
+        "sub_job_id": f"{job_id}:training:0", "job_type": "training", "seed": seed,
+        "training_config": {"n_gpus": 8, "optimizer": {"name": "adamw", "lr": lr, "betas": betas}},
+    }]}
+
+
+JOBS = [_job("j1", seed=42, lr=5e-5, betas=[0.9, 0.95]), _job("j2", seed=7, lr=3e-4, betas=[0.8])]
+
+
+def _matches(text: str) -> list:
+    query = resolve_query(parse_query(text), JOBS)
+    return [job["job_id"] for job in JOBS if job_matches_query(job, query)]
+
+
+def test_quotes_group_words_and_a_wholly_quoted_token_is_a_word():
+    query = parse_query("owner:\"lora sweep\" model:'qwen3 8b' \"training:0\"")
+    assert query.filters == [("owner", ":", "lora sweep"), ("model", ":", "qwen3 8b")]
+    assert query.terms == ["training:0"] and not query.errors  # quoted: the text, not a filter
+
+
+def test_an_unbalanced_quote_leaves_every_word_as_typed():
+    assert parse_query('lora "sweep 3').terms == ["lora", '"sweep', "3"]
+    assert parse_query("bob's run").terms == ["bob's", "run"]  # an apostrophe opens no quote
+    assert parse_query('owner:"lora sweep').filters == [("owner", ":", '"lora')]
+
+
+def test_a_dotted_key_reads_that_member_in_any_case():
+    query = parse_query("Training_Config.Optimizer.LR<1e-4")
+    assert query.filters == [("training_config.optimizer.lr", "<", "1e-4")] and not query.errors
+    assert _matches("Training_Config.Optimizer.LR<1e-4") == ["j1"]
+    assert _matches("training_config.optimizer.betas=0.95") == ["j1"]  # a list matches on any element
+
+
+def test_an_unknown_key_is_an_error_until_a_loaded_job_has_it():
+    query = parse_query("Seed=42 lora")
+    assert query.errors == ["unknown field 'Seed'"] and query.unknown == [("seed", "=", "42", "Seed")]
+    assert not job_matches_query(JOBS[0], query)  # an unknown key never matches every job
+    resolved = resolve_query(query, JOBS)
+    assert resolved.filters == [("seed", "=", "42")] and resolved.errors == [] and resolved.terms == ["lora"]
+    assert _matches("seed=42") == ["j1"]
+
+
+def test_a_key_no_job_has_stays_an_error_and_names_the_nested_paths_ending_in_it():
+    assert resolve_query(parse_query("betas=0.95"), JOBS).errors == [
+        "unknown field 'betas' (did you mean training_config.optimizer.betas?)"]
+    assert resolve_query(parse_query("nope=1"), JOBS).errors == ["unknown field 'nope'"]
+    assert _matches("betas=0.95") == []
 
 
 def test_entry_matches():
@@ -268,61 +238,42 @@ def test_wrap_log_line_empty_is_one_blank_line():
     assert wrap_log_line("\n", 80) == ["", ""]  # blank lines preserved
 
 
-# ─── Live tail lines: {"_raw": "<runtime time> <line>"} ──────────────────────
+CJK = "模型训练任务已经完成"  # two cells a character
+EMOJI = "\N{GRINNING FACE}" * 5  # two cells each
+MARKED = "e\N{COMBINING ACUTE ACCENT}" * 6  # one cell a pair
 
-from cortex_training.tui.format import entry_time  # noqa: E402
-from cortex_training.tui.format import line_level  # noqa: E402
-from cortex_training.tui.format import split_runtime_time  # noqa: E402
+
+@pytest.mark.parametrize("width", range(1, 10))
+@pytest.mark.parametrize("text", [CJK, EMOJI, f"ab{CJK}cd"])
+def test_rows_hold_what_fits_and_lose_nothing(text, width):
+    rows = wrap_log_line(text, width)
+    assert "".join(rows) == text
+    assert all(cell_len(row) <= max(width, 2) for row in rows)  # in a one-cell pane a wide character still shows
+    assert all(cell_len(row) + 2 > width for row in rows[:-1])  # a row ends early only before a wide character
+
+
+def test_a_wide_character_is_never_split_and_marks_stay_on_theirs():
+    assert wrap_log_line("模型训练任务", 5) == ["模型", "训练", "任务"]
+    assert wrap_log_line(EMOJI, 5) == ["\N{GRINNING FACE}" * 2] * 2 + ["\N{GRINNING FACE}"]
+    assert wrap_log_line(MARKED, 4) == ["e\N{COMBINING ACUTE ACCENT}" * 4, "e\N{COMBINING ACUTE ACCENT}" * 2]
+
+
+def test_breaks_fall_between_words_and_a_wide_prefix_counts_its_cells():
+    assert wrap_log_line("hello 世界 wide 文字", 8) == ["hello", "世界", "wide", "文字"]
+    rows = wrap_log_line("模型训练任务", 12, first="训练 │ ", rest="     │ ")  # both prefixes take 7 cells
+    assert rows == ["训练 │ 模型", "     │ 训练", "     │ 任务"]
+
+
+def test_cutting_to_cells_never_splits_a_wide_character():
+    assert cut_cells("模型训练", 5) == "模型" and cut_cells("模型", 1) == ""
+    assert fit_cells("模型训练", 5) == "模型…" and fit_cells("模型训练", 8) == "模型训练"
+    assert wrap_cells("模型 训练任务", 5) == ["模型", "训练", "任务"]
+
+
+# ─── Live tail lines: {"_raw": "<runtime time> <line>"} ──────────────────────
 
 _JSON_LINE = '{"ts": "2026-01-01T00:00:00.1+00:00", "level": "ERROR", "logger": "x", "msg": "boom"}'
 _VLLM_LINE = "\x1b[36m(InferenceWorker pid=9, ip=10.0.0.1)\x1b[0m (EngineCore pid=7) WARNING 01-01 00:00:00 [a.py:1] slow"
-
-
-@pytest.mark.parametrize(
-    "raw, expected",
-    [
-        ("2026-01-01T00:00:00.329214070Z hello", ("2026-01-01T00:00:00.329214070Z", "hello")),
-        ("2026-01-01T00:00:00Z  indented", ("2026-01-01T00:00:00Z", " indented")),
-        ("2026-01-01T00:00:00+02:00 x", ("2026-01-01T00:00:00+02:00", "x")),
-        ("2026-01-01T00:00:00.1Z ", ("2026-01-01T00:00:00.1Z", "")),
-        ("no time here", (None, "no time here")),
-        ("2026-01-01 00:00:00 not runtime format", (None, "2026-01-01 00:00:00 not runtime format")),
-    ],
-)
-def test_split_runtime_time(raw, expected):
-    assert split_runtime_time(raw) == expected
-
-
-def test_live_raw_line_renders_like_the_saved_console():
-    for line in [_JSON_LINE, _VLLM_LINE, "plain", ""]:
-        entry = {"_raw": f"2026-01-01T00:00:00.123456789Z {line}"}
-        assert format_log_entry(entry) == line
-        assert entry_time(entry) == "2026-01-01T00:00:00.123456789Z"
-    assert format_log_entry({"_raw": "2026-01-01T00:00:00Z cut", "_truncated": True}) == "cut …[truncated]"
-    # A line without a runtime time is shown unchanged.
-    assert format_log_entry({"_raw": "x 2026-01-01T00:00:00Z y"}) == "x 2026-01-01T00:00:00Z y"
-
-
-@pytest.mark.parametrize(
-    "line, level",
-    [
-        (_JSON_LINE, "ERROR"),
-        ('{"levelname": "WARNING", "message": "m"}', "WARNING"),
-        ('{"msg": "no level"}', None),
-        ('{"level": 3, "msg": "game level"}', None),
-        ('{"level": "high", "msg": "priority"}', None),
-        ('{"level": "warning", "msg": "lower-case"}', "WARNING"),
-        ('{"not json', None),
-        (_VLLM_LINE, "WARNING"),
-        ("INFO 01-01 00:00:00 [a.py:1] ok", "INFO"),
-        ("ERROR: something", "ERROR"),
-        ("Information about INFO", None),
-        ("warning lowercase is not a level", None),
-        ("", None),
-    ],
-)
-def test_line_level(line, level):
-    assert line_level(line) == level
 
 
 def test_level_filter_applies_to_live_raw_lines():
@@ -339,64 +290,82 @@ def test_level_filter_applies_to_live_raw_lines():
     assert not entry_at_level({"_raw": stamp + _JSON_LINE, "level": "DEBUG"}, "INFO")
 
 
-def test_filter_matches_the_line_not_the_runtime_time():
-    entry = {"_raw": "2026-01-01T00:00:00Z payload"}
-    assert entry_matches(entry, "payload")
-    assert not entry_matches(entry, "2026-01-01T00")
+# ─── What the TUI draws but didn't write never acts on the terminal ─────────
+
+ESC, BEL, ST = "\x1b", "\x07", "\x1b\\"
+FFFD = "\N{REPLACEMENT CHARACTER}"
+MARK = "\N{COMBINING ACUTE ACCENT}"
+CLEANERS = [printable, safe_text, one_line]
+
+# Each escape sequence goes whole; the text around it stays.
+ESCAPES = [
+    (f"red {ESC}[31mtext{ESC}[0m end", "red text end"),  # CSI: colours
+    (f"{ESC}[2J{ESC}[Hcleared", "cleared"),  # CSI: clear the screen, move the cursor
+    (f"x{ESC}]52;c;ZXZpbA=={BEL}y", "xy"),  # OSC 52 (write the clipboard), ended by BEL
+    (f"{ESC}]0;title{ST}ok", "ok"),  # OSC 0 (retitle the window), ended by ST
+    (f"{ESC}Pq#0;2;0;0;0{ST}done", "done"),  # DCS (sixel graphics)
+    (f"a{ESC}cb", "ab"),  # RIS: reset the terminal
+    (f"a{ESC}(Bb", "ab"),  # a character set designation
+    (f"cut {ESC}[", "cut "),  # cut short at the end
+]
 
 
-def test_format_created_at_names_the_time_zone(monkeypatch):
-    import time as time_module
-
-    monkeypatch.setenv("TZ", "UTC")
-    time_module.tzset()
-    try:
-        assert format_created_at("2026-06-13T18:49:54Z") == "2026-06-13 18:49 UTC"
-    finally:
-        monkeypatch.undo()
-        time_module.tzset()
+@pytest.mark.parametrize("clean", CLEANERS)
+@pytest.mark.parametrize("text, shown", ESCAPES)
+def test_escape_sequences_go_whole(clean, text, shown):
+    assert clean(text) == shown
 
 
-@pytest.mark.parametrize(
-    "nbytes, text",
-    [(None, "—"), (0, "0 B"), (1023, "1023 B"), (1024, "1.0 KiB"), (1153433, "1.1 MiB"),
-     (5 * 1024**3, "5.0 GiB"), (3 * 1024**4, "3.0 TiB")],
-)
-def test_format_size(nbytes, text):
-    from cortex_training.tui.format import format_size
-
-    assert format_size(nbytes) == text
+def test_an_unterminated_osc_ends_with_its_line():
+    text = f"{ESC}]0;title\nnext line"
+    assert printable(text) == safe_text(text) == "\nnext line"
+    assert one_line(text) == " / next line"  # not "": the escape goes before the line breaks do
 
 
-@pytest.mark.parametrize(
-    "seconds, text",
-    [(-3, "0s"), (0, "0s"), (59, "59s"), (60, "1m 0s"), (725, "12m 5s"), (3600, "1h 0m"),
-     (7380, "2h 3m"), (184694, "2d 3h")],
-)
-def test_format_age(seconds, text):
-    from cortex_training.tui.format import format_age
-
-    assert format_age(seconds) == text
+def test_an_esc_that_starts_no_sequence_shows_as_the_replacement_character():
+    assert printable(f"a{ESC}") == f"a{FFFD}"
+    assert printable(f"{ESC}{ESC}[1mz") == f"{FFFD}z"
+    assert printable("\x9b31m") == f"{FFFD}31m"  # an 8-bit CSI: its C1 control is replaced, so nothing acts
 
 
-def test_local_clock_has_a_time_zone(monkeypatch):
-    import time as time_module
-
-    from cortex_training.tui.format import local_clock
-
-    monkeypatch.setenv("TZ", "UTC")
-    time_module.tzset()
-    try:
-        assert local_clock(0) == "00:00:00 UTC"
-    finally:
-        monkeypatch.undo()
-        time_module.tzset()
+@pytest.mark.parametrize("char", ["\x00", BEL, "\x7f", "\x85", "\N{RIGHT-TO-LEFT OVERRIDE}",
+                                  "\N{LEFT-TO-RIGHT ISOLATE}", "\N{ZERO WIDTH SPACE}", "\N{WORD JOINER}",
+                                  "\N{ZERO WIDTH NO-BREAK SPACE}"])
+def test_controls_and_bidi_and_invisible_characters_show_as_the_replacement_character(char):
+    for clean in CLEANERS:
+        assert clean(f"a{char}b") == f"a{FFFD}b"
 
 
-def test_a_level_field_that_is_not_a_logging_level_never_hides_the_line():
-    stamp = "2026-01-01T00:00:00Z "
-    for line in ['{"level": 3, "msg": "m"}', '{"level": "high", "msg": "m"}', '{"level": null, "msg": "m"}']:
-        assert entry_at_level({"_raw": stamp + line}, "ERROR")
-    assert entry_at_level({"level": "high", "msg": "structured"}, "ERROR")
-    assert entry_at_level({"level": 7, "msg": "structured"}, "ERROR")
-    assert not entry_at_level({"level": "info", "msg": "structured"}, "ERROR")
+def test_nothing_a_terminal_acts_on_survives_any_cleaner():
+    text = f"{ESC}[31m{ESC}]52;c;eA=={BEL}{ESC}\x9b{BEL}\r\N{RIGHT-TO-LEFT OVERRIDE}ok\t" * 3
+    for clean in (*CLEANERS, display_line):
+        shown = clean(text)
+        assert not [ch for ch in shown if (ch < " " and ch != "\n") or "\x7f" <= ch <= "\x9f"
+                    or ch == "\N{RIGHT-TO-LEFT OVERRIDE}"], (clean.__name__, shown)
+
+
+def test_a_json_log_record_cannot_smuggle_an_escape():
+    line = json.dumps({"level": "INFO", "msg": f"{ESC}]0;title{BEL}{ESC}[31mred{ESC}[0m"})  # "\u001b" in the JSON
+    assert ESC in json.loads(line)["msg"]
+    assert display_line(line) == "INFO  red"
+
+
+def test_a_log_line_shows_carriage_returns_and_tabs_as_a_terminal_would():
+    assert safe_text("10%\r50%\r100%") == "100%"  # a progress bar: its last state
+    assert printable("10%\r50%") == f"10%{FFFD}50%"  # elsewhere nothing is hidden
+    assert safe_text("a\tbb\tc") == "a   bb  c"  # to the next stop of four cells
+    assert printable("a\tbb\tc") == "a    bb    c"
+
+
+def test_emoji_joiners_and_stacked_marks_are_tamed_by_every_cleaner():
+    coder = "\N{WOMAN}\N{ZERO WIDTH JOINER}\N{PERSONAL COMPUTER}"
+    for clean in CLEANERS:
+        assert clean(coder) == "\N{WOMAN}\N{PERSONAL COMPUTER}"  # the width counted, on every terminal
+        assert clean("z" + MARK * 12) == "z" + MARK * 4
+    ssa = "\N{DEVANAGARI LETTER KA}\N{DEVANAGARI SIGN VIRAMA}\N{ZERO WIDTH JOINER}\N{DEVANAGARI LETTER SSA}"
+    assert printable(ssa) == ssa  # a joiner a script uses stays
+
+
+def test_job_records_are_cleaned_dict_keys_too():
+    record = {f"comment{ESC}[7m": [f"name{ESC}]0;x{BEL}", {"model": "z" + MARK * 9}], "n_gpus": 8, "lora": None}
+    assert printable_data(record) == {"comment": ["name", {"model": "z" + MARK * 4}], "n_gpus": 8, "lora": None}

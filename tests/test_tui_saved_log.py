@@ -148,6 +148,8 @@ def test_reads_only_bytes_the_manifest_committed(tmp_path):
     tail = read_saved_tail(path)
     assert tail.lines == ["one", "two"]
     assert tail.size == 8
+    manifest.write_text(json.dumps({"version": 2, "names": ["a.gz"], "bytes": 8}), encoding="utf-8")
+    assert read_saved_tail(path).lines == ["one", "two", "torn app"]
     manifest.write_text("not json", encoding="utf-8")
     assert read_saved_tail(path).lines == ["one", "two", "torn app"]
     manifest.write_text(json.dumps({"bytes": 999}), encoding="utf-8")
