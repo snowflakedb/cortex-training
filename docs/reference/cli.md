@@ -785,7 +785,10 @@ database and schema the role can see instead, from the account-level list
 ([REST API reference section 5.3](rest-api.md#across-the-account---get-apiv2endpoint));
 the footer then offers `a Current schema`, which goes back. The
 header line starts with when the list was last refreshed (`refreshing…` while
-a refresh reads), then which list is shown:
+a refresh reads), then which list is shown. Until the list `a` asked for
+answers, which can take several seconds for a large account, the header reads
+`loading all schemas…` (or `loading the current schema, DB.SCHEMA…`) and the
+previous list stays on screen:
 
 | Header | The list holds |
 |---|---|
@@ -793,7 +796,7 @@ a refresh reads), then which list is shown:
 | `all schemas` | after `a`: the jobs in every database and schema the role can see, from the account-level list; `all schemas (all in DB.SCHEMA)` when every one of them is in the same location |
 | `newest 2,000 + every active job (more exist)` | the same, cut at the newest 2,000 because more exist, plus the active jobs created before those |
 | `first 20 pages: N jobs + every active job (more may exist)` | the same, cut after 20 pages (see below), plus the active jobs |
-| `Current schema only: DB.SCHEMA (reason)` | the jobs of the configured database and schema, in place of the account-level list where it turned unavailable while shown (see below) |
+| `Current schema only: DB.SCHEMA (reason)` | the jobs of the configured database and schema, in place of the account-level list: `a` found it unavailable, or it turned unavailable while shown (see below) |
 
 After `a`, each refresh reads the account-level list newest first, 500 jobs a
 page. It stops after 2,000 jobs, or after 20 pages, because the service examines
@@ -812,13 +815,16 @@ Search filters the jobs the list holds: when more exist, a search can't reach
 the older ones, and the message for a search without results says so. To
 search all of the configured schema's jobs, press `a` to go back to its list;
 for another schema, start the TUI with that schema's `--database` and
-`--schema`.
+`--schema`. These also go with `--connection`, where they take the place of the
+profile's database and schema:
+`cortex-training tui --connection NAME --database OTHER_DB --schema OTHER_SCHEMA`.
 
 If the account-level list is unavailable, `a` keeps the configured schema and
-explains why: `no account-wide list yet` or `account-wide list not enabled`
-(404), `account-wide list: HTTP 403` for an unexplained 403, or the service's
-403/405 message. Once all schemas are showing, the same fallback reads
-`Current schema only: DB.SCHEMA (reason)`. A 403/405 refusal shared by the
+explains why, in a notice and in the header (`Current schema only: DB.SCHEMA
+(reason)`, until the next `a`): `no account-wide list yet` or `account-wide list
+not enabled` (404), `account-wide list: HTTP 403` for an unexplained 403, or the
+service's 403/405 message. Once all schemas are showing, the same fallback reads
+`Current schema only: DB.SCHEMA (reason)` too. A 403/405 refusal shared by the
 schema route is a failed refresh instead. The TUI retries a fallback every 10
 minutes, or on `r` after one minute; another `a` within that minute reuses the
 last answer.

@@ -276,6 +276,7 @@ class JobListScreen(FollowsPointer, Screen):
     _FIRST_COLUMNS = ("Job ID", "Status", "Type", "Created", "Duration", "Owner")
     _NAME_MIN = 16
     _SEARCH_DEBOUNCE_SECONDS = 0.12
+    _DECLINED_CELLS = 60  # the header's reason a could not show all schemas; the notice has it in full
     _LOCATION_AT = [label for label, _width in _COLUMNS].index("GPUs") + 1
     _LOCATION_WIDTHS = (10, 32)
 
@@ -306,6 +307,9 @@ class JobListScreen(FollowsPointer, Screen):
         self._list_refused = False  # that failure was the account-wide list refusing this caller (403/405)
         self._scope: ListScope | None = None  # what the list on screen covers
         self._asked = self._account_wanted()
+        # Why the last a couldn't show all schemas, for the header until the next a.
+        self._declined: str | None = None
+        self._switching = False  # a was pressed and the list it asked for hasn't answered yet
         self._search_timer = None
         self._layout: _ListLayout | None = None  # the table's columns, once they exist
         self._notice: Content | None = None  # the stale-list notice, before wrapping
@@ -448,6 +452,13 @@ class JobListScreen(FollowsPointer, Screen):
     def _update_subtitle(self) -> None:
         if self.app.screen is not self:
             return  # a late refresh must not retitle the screen on top
+        switching = self._switching_text()
+        if switching:
+            # a was pressed and the other list is still being read: say so first,
+            # rather than the scope of the list it replaces.
+            bits = [switching, f"list from {self._last_refreshed}" if self._last_refreshed else ""]
+            self.app.sub_title = "  ·  ".join(bit for bit in bits if bit)
+            return
         if self._refreshing:
             refresh_status = "refreshing…"
             if self._last_refreshed:
@@ -463,10 +474,20 @@ class JobListScreen(FollowsPointer, Screen):
         bits = [refresh_status, self._scope_text()]
         self.app.sub_title = "  ·  ".join(bit for bit in bits if bit)
 
+    def _switching_text(self) -> str:
+        """While the list ``a`` asked for is read in place of the one on screen: which; else ""."""
+        if not (self._refreshing and self._switching):
+            return ""
+        if self._account_wanted():
+            return "loading all schemas…"
+        return f"loading the current schema, {self._schema_label()}…"
+
     def _scope_text(self) -> str:
         """What the list on screen covers ("all schemas", ...); "" before the first list."""
         if self._scope is None:
             return ""
+        if self._declined and self._scope.kind == SCHEMA:
+            return f"Current schema only: {self._schema_label()} ({self._declined})"
         labels = {views.location_label(job) for job in self._all_jobs}
         only = next(iter(labels)) if len(labels) == 1 else ""
         return scope_text(self._scope, location=self._schema_label(), only=only)
@@ -496,8 +517,13 @@ class JobListScreen(FollowsPointer, Screen):
             return
         self._lister.account_wide = account
         self._asked = account
+        self._declined = None
+        self._switching = True
         self.refresh_bindings()  # the footer's a names the other list now
         self._refresh_jobs(manual=True, quiet=True)
+        # A refresh already in flight reads the list a asked for when it answers;
+        # the header says so now.
+        self._update_subtitle()
 
     def _refresh_tick(self) -> None:
         if self.app.screen is self:
@@ -738,6 +764,7 @@ class JobListScreen(FollowsPointer, Screen):
             # a switched lists while this one was read: read the one asked for now.
             self._refresh_jobs(manual=True, quiet=True)
             return
+        self._switching = False
         if account and self._asked:
             self._asked = False
             if error is not None or listing.scope.kind != ACCOUNT:
@@ -775,6 +802,8 @@ class JobListScreen(FollowsPointer, Screen):
             listing.scope)
         self.notify(f"Can't show all schemas ({why}); the list stays on {self._schema_label()}.",
                     severity="warning", timeout=10, markup=False)
+        # The header keeps saying why, in short, after the notice has gone.
+        self._declined = views.fit_cells(why, self._DECLINED_CELLS) or "all schemas unavailable"
         if error is None:
             return Listing(listing.jobs, ListScope(SCHEMA))
         self._update_subtitle()
