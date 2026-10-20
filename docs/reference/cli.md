@@ -786,9 +786,32 @@ database and schema the role can see instead, from the account-level list
 the footer then offers `a Current schema`, which goes back. The
 header line starts with when the list was last refreshed (`refreshing…` while
 a refresh reads), then which list is shown. Until the list `a` asked for
-answers, which can take several seconds for a large account, the header reads
-`loading all schemas…` (or `loading the current schema, DB.SCHEMA…`) and the
-previous list stays on screen:
+answers, the header reads `loading all schemas…` (or `loading the current
+schema, DB.SCHEMA…`) and the previous list stays on screen. The account-level
+list shows its first page (the newest 500 jobs) as soon as it answers, and adds
+each later page as it comes: the highlighted row stays where it is on screen,
+and folds and a search stay as they are. From its second page on, it also reads
+the active jobs (see below) beside the newest ones, at most two requests at a
+time. Until the last page, the header reads `all schemas · loading older jobs…
+N so far` (`+ every active job` once the active jobs are listed, `(older active
+jobs may be missing)` if reading them failed or stopped short), the counts above
+the list and a search's matches end in `so far`, and the LIVE and HISTORY rows'
+counts in `…`. Once the active jobs are listed, the active statuses' counts drop
+their `so far`; the `unknown` count and the LIVE row keep theirs until the last
+page, as no status filter lists an `unknown` job. If the newest jobs are all in
+while the active jobs are still being read, the header reads `newest 2,000;
+loading older active jobs…`: the history count and the HISTORY row drop their
+marks, and the live counts and the LIVE row keep theirs.
+The list also shows its pages as they come when it first opens on all schemas;
+a refresh of a whole list keeps showing it until the next one is whole.
+`a` while the pages are read stops reading them: the pages read stay, no longer
+marked, under `loading the current schema, DB.SCHEMA… · showing the partial
+all-schemas list` until that list answers. An `a` back to all schemas before
+then waits for the configured schema's list (several seconds for a large one),
+and the pages start again from the first. `r` meanwhile does nothing (and
+nothing is read again after): it says so, `Still loading older jobs (Ns); r
+works once it's done.` (`older active jobs` while the header says so). Once the
+list is whole, the header names it:
 
 | Header | The list holds |
 |---|---|
@@ -805,7 +828,14 @@ have more after it: a refresh never walks the whole history. It asks for no
 status, so jobs whose status the service can't read (`unknown`) are listed too.
 When it stops with jobs left, it also reads the active jobs (`pending`,
 `placing`, `initializing` and `running`) and adds those created before the
-newest ones, so a long-running job stays under live. An `unknown` job older than
+newest ones, so a long-running job stays under live. A refresh of a whole list
+reads them after the newest jobs, only when it stops with jobs left. A list
+showing its pages reads them beside the newest jobs; if the newest turn out
+whole, the active jobs' walk asks for no page after the one in flight (a quick
+walk may have read all of its pages by then, one or two in the usual case) and
+its jobs are dropped. While an earlier load's active jobs' request is still in
+flight (after `a` pressed again), a new load reads them after the newest jobs
+instead. An `unknown` job older than
 the newest 2,000 is not listed, as a status filter leaves those out, and if
 reading the active jobs fails or is cut short too, the header says `older active
 jobs may be missing`. A walk that stops at 20 pages with no job to show says
@@ -831,8 +861,12 @@ last answer.
 
 On refresh failure, the previous list stays under a red error and a
 `refresh failed TIME (list from TIME)` header. A first-load error replaces the
-list; `r` retries. The list pauses under details and refreshes on return when
-its last read is over 60 seconds old.
+list; `r` retries. When a later page of the account-level list fails after the
+first pages showed, those stay, under a red error, with a `load failed TIME ·
+newest N (the rest didn't load; r retries; …)` header; if the list turns
+unavailable there (404), the configured schema's list takes their place, as
+when `a` finds it unavailable. The list pauses under details and refreshes on
+return when its last read is over 60 seconds old.
 
 When the list holds jobs from more than one database and schema, a
 **Location** column after GPUs shows `DB.SCHEMA` (SQL-quoted when needed) and
@@ -875,7 +909,9 @@ job's and as glyph and word where it differs, its model where the job has more
 than one, and its GPUs (left out for a job's only sub-job when the job's row
 gives the same count). `▸`/`▾`, arrows, clicks, and `e` control sub-job rows.
 Every live job starts unfolded, its sub-job rows in view; history jobs start
-folded.
+folded. `e` unfolds every job (or folds every one, once all are unfolded),
+those that later pages of the list being read bring too; the jobs a later
+refresh or `a` adds start as above, and those `e` covered keep its choice.
 
 `ctrl+c` copies text that holds up once pasted. With nothing highlighted, it
 copies every row of the list (scrolled out of view too) in aligned columns,
@@ -934,7 +970,7 @@ operators shows under it only while it has focus.
 | `Home` / `End` | First / last job |
 | `→` / `←` | Unfold the highlighted job's sub-jobs / fold them; on a sub-job row, `←` folds its job and moves to it. The job's row stays where it is on screen, and the list scrolls only as far as an unfolded job's sub-jobs need to show. Where there is nothing to unfold or fold, they scroll the columns sideways |
 | click `▸` / `▾` | Unfold or fold that job, as `→` / `←` do |
-| `e` | Expand or collapse every job's sub-jobs |
+| `e` | Expand or collapse every job's sub-jobs, also those of jobs that later pages of the list being read bring (jobs a later refresh adds start as usual) |
 | `a` | All schemas / current schema: switch to the account-level list of every database and schema the role can see (the footer's `a All schemas`), or back to the configured one (`a Current schema`) |
 | `ctrl+c` | Copy what is highlighted, else every row in the list with a `Whole ID` column (see above for what each cell copies as); in the preview, the highlight, else the whole preview |
 | `r` | Refresh (the list also refreshes every 60 seconds while it is showing); while it shows the configured schema in place of the account-level list (`Current schema only: DB.SCHEMA (reason)`), `r` asks that list again once a minute has passed since the last ask |

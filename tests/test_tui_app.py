@@ -42,8 +42,13 @@ from textual.widgets import TabbedContent  # noqa: E402
 
 from cortex_training import AccountJobListUnavailable  # noqa: E402
 from cortex_training import CortexTrainingClient  # noqa: E402
+from cortex_training import InvalidPageToken  # noqa: E402
 from cortex_training.client import DownloadCancelled  # noqa: E402
 from cortex_training.tui import __main__ as tui_main  # noqa: E402
+from cortex_training.tui.account import ACCOUNT  # noqa: E402
+from cortex_training.tui.account import SCHEMA  # noqa: E402
+from cortex_training.tui.account import JobLister  # noqa: E402
+from cortex_training.tui.account import scope_text  # noqa: E402
 from cortex_training.tui.app import CortexTrainingLogTUI  # noqa: E402
 from cortex_training.tui.job_list import JobListScreen  # noqa: E402
 from cortex_training.tui.logs import LogScreen  # noqa: E402
@@ -4065,6 +4070,649 @@ async def _run_a_says_at_once_that_it_is_loading_all_schemas(in_flight):
 @pytest.mark.parametrize("in_flight", [False, True], ids=["idle", "refresh-in-flight"])
 def test_a_says_at_once_that_it_is_loading_all_schemas(in_flight):
     asyncio.run(_run_a_says_at_once_that_it_is_loading_all_schemas(in_flight))
+
+
+class _PagedDemo(DemoClient):
+    """A demo whose account-wide pages of the newest jobs answer one per ``release()`` while
+    ``gated``, and whose active jobs' walk (read beside them) answers while ``active_gate`` is
+    set. For the newest jobs' walk: ``fail_at`` is the page (1 is the first) that fails,
+    ``unavailable_at`` the one that answers the list is not deployed, ``bad_token_at`` the one
+    whose token the service can't open (once), ``running_at`` / ``unknown_at`` the one whose first
+    job is running / of unknown status. ``schema_fails``: the configured schema's list fails.
+    ``pages`` / ``active_pages`` count the pages each walk asked for."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.gated = False
+        self.fail_at = self.unavailable_at = self.bad_token_at = self.running_at = self.unknown_at = None
+        self.schema_fails = False
+        self.schema_gate = threading.Event()  # the configured schema's list answers while it is set
+        self.schema_gate.set()
+        self.active_gate = threading.Event()
+        self.active_gate.set()
+        self.pages = self.active_pages = 0
+        self._permits = threading.Semaphore(0)
+
+    def release(self, pages: int = 1) -> None:
+        for _ in range(pages):
+            self._permits.release()
+
+    def list_jobs(self, *args, **kwargs):
+        self.schema_gate.wait(10)
+        if self.schema_fails:
+            raise ConnectionError("schema down")
+        return super().list_jobs(*args, **kwargs)
+
+    def list_jobs_page(self, **kwargs):
+        if kwargs.get("status"):  # the active jobs' walk, read beside the newest
+            self.active_pages += 1
+            self.active_gate.wait(10)
+            return super().list_jobs_page(**kwargs)
+        self.pages += 1
+        if self.gated:
+            self._permits.acquire(timeout=10)
+        page = int(kwargs.get("page_token") or 0) // self._ACCOUNT_PAGE_ROWS + 1
+        if not kwargs.get("status"):
+            if page == self.fail_at:
+                raise ConnectionError("connection reset")
+            if page == self.unavailable_at:
+                raise AccountJobListUnavailable("the account-level list is not deployed",
+                                                reason=AccountJobListUnavailable.NOT_DEPLOYED)
+            if page == self.bad_token_at:
+                self.bad_token_at = None
+                raise InvalidPageToken("400 Invalid page_token")
+        answer = super().list_jobs_page(**kwargs)
+        if page == self.running_at and not kwargs.get("status") and answer["jobs"]:
+            answer["jobs"][0]["status"] = "RUNNING"  # an older job still running: it shows under LIVE
+        if page == self.unknown_at and not kwargs.get("status") and answer["jobs"]:
+            answer["jobs"][0]["status"] = "UNKNOWN"  # live, but no status filter lists it
+        return answer
+
+
+def _info_text(screen) -> str:
+    """The line above the list, as text."""
+    info = screen._info
+    return info.plain if not isinstance(info, tuple) else "  ".join(part.plain for part in [*info[0], info[1]])
+
+
+def _all_at_once(client) -> tuple:
+    """The account-wide list's job keys and scope as read all at once (no page shown before the last)."""
+    listing = JobLister(client, account_wide=True).load(datetime.now(timezone.utc))
+    return {views.job_key(job) for job in listing.jobs}, listing.scope
+
+
+async def _run_all_schemas_shows_each_page_as_it_comes(refill):
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 30)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        if refill:
+            screen._PATCH_REMOVALS = -1  # each page fills the table again (as when many rows go)
+        rows = client._ACCOUNT_PAGE_ROWS
+        client.gated = True
+        await pilot.press("a")
+        client.release()
+        # The first page shows before the others answer, saying how far the list is.
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == rows, seconds=10.0), len(screen._all_jobs)
+        await pilot.pause(0.2)
+        assert screen._scope.kind == ACCOUNT and screen._scope.loading and screen._refreshing
+        # The active jobs, read beside the newest (at once, here): the active statuses' counts are whole;
+        # the history, the unknown count and the LIVE row (an unknown job may still come) are not.
+        assert await _pause_until(pilot, lambda: screen._scope.active_read, seconds=10.0)
+        assert app.sub_title == f"all schemas  ·  loading older jobs… {rows} so far + every active job", (
+            app.sub_title)
+        live_part, history_part = _info_text(screen).split("│")
+        assert "running so far" not in live_part and "in history so far" in history_part, _info_text(screen)
+        assert all(row.endswith("…") for row in _group_rows(table).values()), _group_rows(table)
+
+        client.release()
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 2 * rows, seconds=10.0)
+        await pilot.pause(0.2)
+        # The reader's place: a row partway down, the view scrolled, a live job folded, a history one unfolded.
+        live = next(j for j in screen._all_jobs if views.is_live(j) and screen._expandable(j))
+        ended = next(j for j in screen._all_jobs if not views.is_live(j) and views.sub_jobs(j))
+        screen._toggle(screen._job_key(live), False)
+        screen._toggle(screen._job_key(ended), True)
+        await pilot.pause(0.1)
+        table.focus()
+        await pilot.pause(0.1)
+        top = int(table.max_scroll_y)  # scrolled to the end, the cursor near the view's top
+        assert top > 0
+        table.move_cursor(row=top + 3, animate=False, scroll=False)
+        table.scroll_to(y=top, animate=False, immediate=True)
+        await pilot.pause(0.2)
+        assert table.scroll_y == top
+        key = screen._highlighted()[0]
+        line = table.cursor_row - round(table.scroll_y)
+
+        client.release()
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 3 * rows, seconds=10.0)
+        await pilot.pause(0.3)
+        assert screen._highlighted()[0] == key  # the same row is highlighted, on the same line
+        assert table.cursor_row - round(table.scroll_y) == line, (table.cursor_row, table.scroll_y, line)
+        assert not screen._is_expanded(live) and screen._is_expanded(ended)
+
+        # A search while the list loads covers what has loaded, and says it is not all.
+        await pilot.press("slash", *"status:done", "enter")
+        assert await _pause_until(pilot, lambda: " so far for status:done" in _info_text(screen)), _info_text(screen)
+        client.release(10)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        await pilot.pause(0.2)
+        assert screen._filter == "status:done"
+        assert "so far" not in _info_text(screen) and re.search(r"match(es)? for status:done", _info_text(screen))
+        # Whole: what the list read all at once would have shown.
+        keys, scope = _all_at_once(DemoClient())
+        assert {screen._job_key(job) for job in screen._all_jobs} == keys and screen._scope == scope
+        assert app.sub_title.endswith("  ·  " + scope_text(scope, location="")), app.sub_title
+        assert not any(str(table.get_row_at(i)[0]).endswith("…") for i in range(table.row_count))
+        await _settle(app, pilot)
+
+
+@pytest.mark.parametrize("refill", [False, True], ids=["in-place", "refilled"])
+def test_all_schemas_shows_each_page_as_it_comes(refill):
+    asyncio.run(_run_all_schemas_shows_each_page_as_it_comes(refill))
+
+
+async def _run_a_cursor_on_a_group_row_stays_on_it_as_pages_come():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 30)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        client.gated = True
+        await pilot.press("a")
+        client.release()
+        assert await _pause_until(pilot, lambda: screen._scope.loading, seconds=10.0)
+        await pilot.pause(0.2)
+        table.focus()
+        table.move_cursor(row=table.get_row_index("hdr-history"), animate=False)
+        await pilot.pause(0.2)
+        line = table.cursor_row - round(table.scroll_y)
+        for pages in (2, 3):
+            client.release()
+            assert await _pause_until(pilot, lambda: len(screen._all_jobs) == pages * client._ACCOUNT_PAGE_ROWS,
+                                      seconds=10.0)
+            await pilot.pause(0.3)
+            assert screen._highlighted()[0] == "hdr-history", screen._highlighted()
+            assert table.cursor_row - round(table.scroll_y) == line
+        client.release(10)
+        await _settle(app, pilot)
+
+
+async def _run_a_list_the_reader_has_not_moved_stays_at_its_top_as_live_jobs_come():
+    client = _PagedDemo()
+    client.running_at = 3  # an older job still running comes on page 3, above the cursor
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        client.gated = True
+        await pilot.press("a")
+        client.release()
+        assert await _pause_until(pilot, lambda: screen._scope.loading, seconds=10.0)
+        # The list puts the cursor on a history job (as it keeps the one a schema list had).
+        first_ended = next(j for j in views.sort_job_list(screen._all_jobs, "created", True) if not views.is_live(j))
+        screen._render_jobs(keep=screen._job_key(first_ended))
+        await pilot.pause(0.3)
+        key = screen._highlighted()[0]
+        assert table.scroll_y == 0 and screen._job_by_item.get(key) == screen._job_key(first_ended)
+        client.release(2)
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 3 * client._ACCOUNT_PAGE_ROWS,
+                                  seconds=10.0)
+        await pilot.pause(0.3)
+        late = next(job for job in screen._all_jobs if views.is_live(job) and screen._job_key(job) not in {
+            screen._job_key(j) for j in views.sort_job_list(screen._all_jobs, "created", True)[:10]})
+        assert table.get_row_index(screen._row_key(screen._job_key(late))) < table.cursor_row  # it came above
+        assert table.max_scroll_y > 0  # and the list is taller than the view
+        assert table.scroll_y == 0 and screen._highlighted()[0] == key  # LIVE, all of it, still in view
+        client.release(10)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        await pilot.pause(0.3)
+        assert table.scroll_y == 0 and screen._highlighted()[0] == key
+        await _settle(app, pilot)
+
+
+def test_a_list_the_reader_has_not_moved_stays_at_its_top_as_live_jobs_come():
+    asyncio.run(_run_a_list_the_reader_has_not_moved_stays_at_its_top_as_live_jobs_come())
+
+
+async def _run_a_reader_who_moved_keeps_their_line_on_every_page_after(how):
+    client = _PagedDemo()
+    client.running_at = 3  # a running job comes on page 3, above the cursor
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        client.gated = True
+        await pilot.press("a")
+        client.release()
+        assert await _pause_until(pilot, lambda: screen._scope.loading, seconds=10.0)
+        await pilot.pause(0.2)
+        table.focus()
+        table.move_cursor(row=table.get_row_index("hdr-history") + 2, animate=False)  # the reader moves
+        await pilot.pause(0.2)
+        if how == "fold":  # and folds the job there, which draws the list again with the cursor on it
+            screen._toggle(screen._highlighted()[1], True)
+            await pilot.pause(0.2)
+        key, line = screen._highlighted()[0], table.cursor_row - round(table.scroll_y)
+        assert table.scroll_y == 0
+        for pages in (2, 3):  # page 2 draws the list with the cursor on the reader's row; page 3 too
+            client.release()
+            assert await _pause_until(pilot, lambda: len(screen._all_jobs) == pages * client._ACCOUNT_PAGE_ROWS,
+                                      seconds=10.0)
+            await pilot.pause(0.3)
+            assert screen._highlighted()[0] == key
+            assert table.cursor_row - round(table.scroll_y) == line, (pages, table.cursor_row, table.scroll_y, line)
+        client.release(10)
+        await _settle(app, pilot)
+
+
+@pytest.mark.parametrize("how", ["moved", "fold"])
+def test_a_reader_who_moved_keeps_their_line_on_every_page_after(how):
+    asyncio.run(_run_a_reader_who_moved_keeps_their_line_on_every_page_after(how))
+
+
+async def _run_e_unfolds_the_jobs_of_later_pages_too_and_then_folds_them_all():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        client.gated = True
+        await pilot.press("a")
+        client.release()
+        assert await _pause_until(pilot, lambda: screen._scope.loading, seconds=10.0)
+        table.focus()
+        await pilot.press("e")
+
+        def expandable():
+            return [job for job in screen._all_jobs if screen._expandable(job)]
+
+        assert all(screen._is_expanded(job) for job in expandable())
+        client.release()
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 2 * client._ACCOUNT_PAGE_ROWS,
+                                  seconds=10.0)
+        await pilot.pause(0.2)
+        assert any(not views.is_live(job) for job in expandable())  # history jobs that unfold came
+        assert all(screen._is_expanded(job) for job in expandable())  # unfolded, as e asked
+        await pilot.press("e")
+        assert not any(screen._is_expanded(job) for job in expandable())  # every one folds
+        client.release(10)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        assert not any(screen._is_expanded(job) for job in expandable())
+        await _settle(app, pilot)
+
+
+def test_e_unfolds_the_jobs_of_later_pages_too_and_then_folds_them_all():
+    asyncio.run(_run_e_unfolds_the_jobs_of_later_pages_too_and_then_folds_them_all())
+
+
+async def _run_e_holds_for_its_list_and_jobs_a_refresh_adds_start_as_usual(fold):
+    from cortex_training.tui.account import Listing
+    from cortex_training.tui.account import ListScope
+    app = CortexTrainingLogTUI(_PagedDemo(), poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        table.focus()
+        await pilot.press("e")  # every job unfolded
+        if fold:
+            await pilot.press("e")  # then every job folded
+        listed = [job for job in screen._all_jobs if screen._expandable(job)]
+        assert all(screen._is_expanded(job) is not fold for job in listed)
+        live = next(job for job in listed if views.is_live(job))
+        ended = next(job for job in listed if not views.is_live(job))
+        # A refresh lands with a live job and an ended one new since.
+        new_live = {**live, "job_id": "new-live-job", "created_at": live.get("created_at")}
+        new_ended = {**ended, "job_id": "new-ended-job"}
+        refreshed = [*screen._all_jobs, new_live, new_ended]
+        screen._on_jobs(Listing(refreshed, ListScope(SCHEMA)), None, False, screen._load_gen)
+        await pilot.pause(0.2)
+        assert all(screen._is_expanded(job) is not fold for job in listed)  # e's choice holds for them
+        by_id = {views.job_id_of(job): job for job in screen._all_jobs}
+        assert screen._is_expanded(by_id["new-live-job"]) and not screen._is_expanded(by_id["new-ended-job"])
+        assert screen._all_folded is None
+        await _settle(app, pilot)
+
+
+@pytest.mark.parametrize("fold", [False, True], ids=["unfolded", "folded"])
+def test_e_holds_for_its_list_and_jobs_a_refresh_adds_start_as_usual(fold):
+    asyncio.run(_run_e_holds_for_its_list_and_jobs_a_refresh_adds_start_as_usual(fold))
+
+
+async def _run_a_that_stops_the_pages_says_at_once_what_the_list_on_screen_is():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        client.gated = True
+        await pilot.press("a")
+        client.release(2)
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 2 * client._ACCOUNT_PAGE_ROWS,
+                                  seconds=10.0)
+        await pilot.pause(0.2)
+        client.schema_gate.clear()  # the configured schema's list takes its time
+        await pilot.press("a")
+        await pilot.pause(0.2)
+        assert app.sub_title == (f"loading the current schema, {screen._schema_label()}…  ·  "
+                                 "showing the partial all-schemas list"), app.sub_title
+        assert "so far" not in _info_text(screen)
+        assert not any(str(table.get_row_at(i)[0]).endswith("…") for i in range(table.row_count))
+        client.schema_gate.set()
+        assert await _pause_until(pilot, lambda: screen._scope.kind == SCHEMA, seconds=10.0)
+        assert app.sub_title.endswith("Current schema: " + screen._schema_label()), app.sub_title
+        client.release(10)
+        await _settle(app, pilot)
+
+
+def test_a_that_stops_the_pages_says_at_once_what_the_list_on_screen_is():
+    asyncio.run(_run_a_that_stops_the_pages_says_at_once_what_the_list_on_screen_is())
+
+
+def _group_rows(table) -> dict:
+    """The LIVE and HISTORY rows' text, by group."""
+    rows = [str(table.get_row_at(i)[0]) for i in range(table.row_count)]
+    return {row.split()[0]: row for row in rows if row.startswith(("LIVE", "HISTORY"))}
+
+
+async def _run_an_unknown_job_keeps_the_live_count_open_until_the_newest_jobs_are_in():
+    client = _PagedDemo()
+    client.unknown_at = 3  # an unknown job comes on page 3: live, but not among the active jobs
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        rows = client._ACCOUNT_PAGE_ROWS
+        client.gated = True
+        await pilot.press("a")
+        client.release()
+        assert await _pause_until(pilot, lambda: screen._scope.loading and screen._scope.active_read, seconds=10.0)
+        await pilot.pause(0.2)
+
+        def unknown() -> int:  # live ones (one the control plane has no record of has ended)
+            return sum(views.is_unknown(job) and views.is_live(job) for job in screen._all_jobs)
+
+        live_part, _history = _info_text(screen).split("│")
+        # The active statuses are whole; the unknown count (and so LIVE) may still grow.
+        assert "running so far" not in live_part and live_part.count("so far") == 1, live_part
+        assert f"{unknown()} unknown so far" in live_part, live_part
+        assert _group_rows(table)["LIVE"].endswith("…")
+        before = unknown()
+        client.release(2)
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 3 * rows, seconds=10.0)
+        await pilot.pause(0.2)
+        assert unknown() == before + 1  # page 3 brought one, after the active jobs were all listed
+        live_part, _history = _info_text(screen).split("│")
+        assert f"{unknown()} unknown so far" in live_part and live_part.count("so far") == 1
+        assert _group_rows(table)["LIVE"].endswith("…")
+        client.release(10)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        await pilot.pause(0.2)
+        assert "so far" not in _info_text(screen) and "unknown" in _info_text(screen)
+        assert not any(row.endswith("…") for row in _group_rows(table).values())
+        await _settle(app, pilot)
+
+
+def test_an_unknown_job_keeps_the_live_count_open_until_the_newest_jobs_are_in():
+    asyncio.run(_run_an_unknown_job_keeps_the_live_count_open_until_the_newest_jobs_are_in())
+
+
+async def _run_a_slow_active_jobs_walk_after_the_newest_are_in(monkeypatch, then):
+    from cortex_training.tui import account
+    monkeypatch.setattr(account, "ACCOUNT_LIST_MAX_PAGES", 2)  # the newest jobs' walk stops after 2 pages
+    client = _PagedDemo()
+    client.active_gate.clear()  # the active jobs' walk takes its time
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        newest = 2 * client._ACCOUNT_PAGE_ROWS
+        await pilot.press("a")
+        assert await _pause_until(pilot, lambda: screen._scope.loading == "active", seconds=10.0), app.sub_title
+        await pilot.pause(0.2)
+        # The history is whole; only the live jobs may grow, and the header says what is still read.
+        assert app.sub_title == f"all schemas  ·  newest {newest}; loading older active jobs…", app.sub_title
+        live_part, history_part = _info_text(screen).split("│")
+        assert "so far" in live_part and "so far" not in history_part, _info_text(screen)
+        groups = _group_rows(table)
+        assert groups["LIVE"].endswith("…") and not groups["HISTORY"].endswith("…"), groups
+        await pilot.press("r")
+        said = [str(note.message) for note in app._notifications]
+        assert any(m.startswith("Still loading older active jobs (") for m in said), said
+        if then == "wait":
+            client.active_gate.set()
+            assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+            assert app.sub_title.endswith(f"first 2 pages: {newest} jobs + every active job (more may exist)"), (
+                app.sub_title)
+        else:  # a, while the load waits for the active jobs: it stops, and nothing of it comes after
+            await pilot.press("a")
+            assert await _pause_until(pilot, lambda: screen._scope.kind == SCHEMA, seconds=10.0), app.sub_title
+            client.active_gate.set()
+            await pilot.pause(0.5)
+            assert screen._scope.kind == SCHEMA and app.sub_title.endswith("Current schema: " + screen._schema_label())
+            assert client.active_pages == 1  # the walk asked for no page after the one in flight
+        await _settle(app, pilot)
+
+
+@pytest.mark.parametrize("then", ["wait", "a"])
+def test_a_slow_active_jobs_walk_after_the_newest_are_in(monkeypatch, then):
+    asyncio.run(_run_a_slow_active_jobs_walk_after_the_newest_are_in(monkeypatch, then))
+
+
+def test_a_cursor_on_a_group_row_stays_on_it_as_pages_come():
+    asyncio.run(_run_a_cursor_on_a_group_row_stays_on_it_as_pages_come())
+
+
+async def _run_a_fresh_list_of_pages_shows_no_earlier_failure(how):
+    client = _PagedDemo()
+    client.schema_fails = how == "r"
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        if how == "a":  # a refresh of the configured schema's list fails, then a
+            screen, _table = await _demo_list(app, pilot)
+            notice = screen.query_one("#listnotice", Static)
+            client.schema_fails = True
+            screen._refresh_jobs(manual=True)
+            assert await _pause_until(pilot, lambda: notice.display, seconds=10.0)
+            client.gated = True
+            await pilot.press("a")
+        else:  # the first load fails, and r reads all schemas (the list's own, shared lister's)
+            assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen)
+                               and app.screen._list_error, tries=400)
+            screen = app.screen
+            notice = screen.query_one("#listnotice", Static)
+            assert "list_jobs failed" in app.screen.query_one("#listinfo", Static).render().plain
+            screen._lister.account_wide = True
+            client.gated = True
+            await pilot.press("r")
+        client.release()
+        assert await _pause_until(pilot, lambda: screen._scope is not None and screen._scope.loading,
+                                  seconds=10.0), app.sub_title
+        await pilot.pause(0.2)
+        assert not notice.display and screen._list_error is None
+        assert not screen.query_one("#listinfo", Static).has_class("error")
+        assert app.sub_title.startswith("all schemas  ·  loading older jobs…"), app.sub_title
+        client.release(10)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        assert not notice.display and "failed" not in app.sub_title
+        await _settle(app, pilot)
+
+
+@pytest.mark.parametrize("how", ["a", "r"])
+def test_a_fresh_list_of_pages_shows_no_earlier_failure(how):
+    asyncio.run(_run_a_fresh_list_of_pages_shows_no_earlier_failure(how))
+
+
+async def _run_a_failure_of_the_schema_list_after_a_stopped_the_pages_is_the_schema_lists():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, _table = await _demo_list(app, pilot)
+        client.gated = True
+        await pilot.press("a")
+        client.release()
+        assert await _pause_until(pilot, lambda: screen._scope.loading, seconds=10.0)
+        client.schema_fails = True
+        await pilot.press("a")  # back to the configured schema, whose list fails
+        assert await _pause_until(pilot, lambda: not screen._refreshing and screen._list_error, seconds=10.0)
+        await pilot.pause(0.2)
+        assert app.sub_title.startswith("refresh failed "), app.sub_title
+        assert "schema down" in screen._notice.plain and "read before it" not in screen._notice.plain
+        assert screen.check_action("show_list", ("account",)) is True  # the footer offers all schemas
+        client.release(10)
+        await _settle(app, pilot)
+
+
+def test_a_failure_of_the_schema_list_after_a_stopped_the_pages_is_the_schema_lists():
+    asyncio.run(_run_a_failure_of_the_schema_list_after_a_stopped_the_pages_is_the_schema_lists())
+
+
+async def _run_an_account_list_unavailable_after_its_first_pages_says_so():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, _table = await _demo_list(app, pilot)
+        schema_jobs = len(screen._all_jobs)
+        client.unavailable_at = 3
+        await pilot.press("a")
+        assert await _pause_until(pilot, lambda: "Current schema only: " in app.sub_title, seconds=10.0), (
+            app.sub_title)
+        assert "no account-wide list yet" in app.sub_title
+        assert screen._scope.kind == SCHEMA and len(screen._all_jobs) == schema_jobs
+        assert screen.check_action("show_list", ("account",)) is True
+        assert any("Can't show all schemas" in str(n.message) for n in app._notifications)
+        await _settle(app, pilot)
+
+
+def test_an_account_list_unavailable_after_its_first_pages_says_so():
+    asyncio.run(_run_an_account_list_unavailable_after_its_first_pages_says_so())
+
+
+async def _run_pages_read_again_from_the_start_keep_the_list_and_the_cursor():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 30)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        rows = client._ACCOUNT_PAGE_ROWS
+        client.gated, client.bad_token_at = True, 3
+        await pilot.press("a")
+        client.release(2)
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 2 * rows, seconds=10.0)
+        await pilot.pause(0.2)
+        shown = []
+        apply = screen._on_partial
+        screen._on_partial = lambda gen, listing: (shown.append(len(listing.jobs)), apply(gen, listing))
+        table.focus()
+        table.move_cursor(row=table.row_count - 2, animate=False)
+        await pilot.pause(0.2)
+        key, line = screen._highlighted()[0], table.cursor_row - round(table.scroll_y)
+        client.release(4)  # page 3's token fails: pages 1 and 2 again, then page 3
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 3 * rows, seconds=10.0)
+        await pilot.pause(0.3)
+        assert min(shown) == 2 * rows  # the list never went back to its first page
+        assert screen._highlighted()[0] == key and table.cursor_row - round(table.scroll_y) == line
+        client.release(10)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        keys, scope = _all_at_once(DemoClient())
+        assert {screen._job_key(job) for job in screen._all_jobs} == keys and screen._scope == scope
+        await _settle(app, pilot)
+
+
+def test_pages_read_again_from_the_start_keep_the_list_and_the_cursor():
+    asyncio.run(_run_pages_read_again_from_the_start_keep_the_list_and_the_cursor())
+
+
+async def _run_a_or_r_while_all_schemas_loads_supersedes_it_cleanly():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, _table = await _demo_list(app, pilot)
+        schema_jobs = len(screen._all_jobs)
+        client.gated = True
+        await pilot.press("a")
+        client.release()
+        assert await _pause_until(pilot, lambda: screen._scope.kind == ACCOUNT and screen._scope.loading,
+                                  seconds=10.0)
+        await pilot.pause(0.2)
+        asked = client.pages  # the first page, and the second one waiting
+        # r and the timed refresh wait for the load: no second walk starts.
+        await pilot.press("r")
+        screen._refresh_tick()
+        await pilot.pause(0.2)
+        assert client.pages == asked and screen._scope.loading
+        said = [str(note.message) for note in app._notifications]
+        assert any(m.startswith("Still loading older jobs (") and m.endswith("r works once it's done.")
+                   for m in said), said
+        # a goes back to the configured schema at once; the walk stops at its page in flight.
+        await pilot.press("a")
+        assert await _pause_until(pilot, lambda: screen._scope.kind == SCHEMA, seconds=10.0), app.sub_title
+        client.release(10)
+        await pilot.pause(0.5)
+        assert client.pages == asked  # it asked for no page after
+        assert screen._scope.kind == SCHEMA and len(screen._all_jobs) == schema_jobs  # its pages never shown
+        assert app.sub_title.endswith("Current schema: " + screen._schema_label()), app.sub_title
+        # a again: a new walk, whole in the end.
+        client.gated = False
+        await pilot.press("a")
+        assert await _pause_until(pilot, lambda: screen._scope.kind == ACCOUNT and not screen._refreshing,
+                                  seconds=10.0)
+        keys, scope = _all_at_once(DemoClient())
+        assert {screen._job_key(job) for job in screen._all_jobs} == keys and screen._scope == scope
+        await _settle(app, pilot)
+
+
+def test_a_or_r_while_all_schemas_loads_supersedes_it_cleanly():
+    asyncio.run(_run_a_or_r_while_all_schemas_loads_supersedes_it_cleanly())
+
+
+async def _run_a_page_that_fails_keeps_the_pages_read_and_r_reads_them_again():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, _table = await _demo_list(app, pilot)
+        rows = client._ACCOUNT_PAGE_ROWS
+        client.fail_at = 3
+        await pilot.press("a")
+        assert await _pause_until(pilot, lambda: not screen._refreshing and screen._scope.kind == ACCOUNT,
+                                  seconds=10.0), app.sub_title
+        await pilot.pause(0.2)
+        assert len(screen._all_jobs) == 2 * rows  # the two pages read stay
+        assert app.sub_title.startswith("load failed "), app.sub_title
+        # The active jobs, read beside the newest pages, stay listed: none is missing.
+        assert app.sub_title.endswith(f"newest {2 * rows} + every active job (the rest didn't load; r retries)"), (
+            app.sub_title)
+        notice = screen.query_one("#listnotice", Static)
+        assert notice.display and f"showing the {2 * rows} jobs read before it" in screen._notice.plain
+        client.fail_at = None
+        await pilot.press("r")
+        assert await _pause_until(pilot, lambda: not screen._refreshing and screen._list_error is None,
+                                  seconds=10.0), app.sub_title
+        keys, scope = _all_at_once(DemoClient())
+        assert {screen._job_key(job) for job in screen._all_jobs} == keys and screen._scope == scope
+        assert not notice.display
+        await _settle(app, pilot)
+
+
+def test_a_page_that_fails_keeps_the_pages_read_and_r_reads_them_again():
+    asyncio.run(_run_a_page_that_fails_keeps_the_pages_read_and_r_reads_them_again())
+
+
+async def _run_a_refresh_of_the_whole_list_shows_it_until_the_next_is_whole():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, _table = await _demo_list(app, pilot)
+        await pilot.press("a")
+        assert await _pause_until(pilot, lambda: screen._scope.kind == ACCOUNT and not screen._refreshing,
+                                  seconds=10.0)
+        whole = len(screen._all_jobs)
+        client.gated = True
+        screen._refresh_tick()  # the timed refresh
+        client.release(2)
+        await pilot.pause(0.5)
+        assert screen._refreshing and len(screen._all_jobs) == whole and not screen._scope.loading
+        assert "so far" not in app.sub_title
+        client.release(10)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        assert len(screen._all_jobs) == whole and not screen._scope.loading
+        await _settle(app, pilot)
+
+
+def test_a_refresh_of_the_whole_list_shows_it_until_the_next_is_whole():
+    asyncio.run(_run_a_refresh_of_the_whole_list_shows_it_until_the_next_is_whole())
 
 
 async def _run_a_keeps_why_all_schemas_are_unavailable_in_the_header(reason, why):
