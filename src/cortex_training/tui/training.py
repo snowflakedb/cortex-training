@@ -426,7 +426,10 @@ def chart_spans(series: MetricSeries, first_step: int | None, width: int, *, hei
     axis = max(len(label) for label in labels)
     height = max(2, height)
     inner = max(1, width - axis - 2)
-    first = steps[0] if first_step is None else max(first_step, 0)
+    # The window's first step, but never before the series' own first step: a window
+    # reaching back past the job's history would otherwise start the axis at a step
+    # that never ran (step 0, for a job's first steps) and leave its columns blank.
+    first = steps[0] if first_step is None else max(first_step, series.steps[0])
     columns = _columns(steps, values, first, steps[-1], inner)
     # Shifted so the lowest value is the bottom of the chart; it still draws one eighth of a row.
     shifted = [None if value is None else value - low for value in columns]

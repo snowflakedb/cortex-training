@@ -197,6 +197,21 @@ def test_chart_runs_from_the_lowest_value_and_labels_steps():
     assert lines[-1].split() == ["1", "2", "3"]
 
 
+def test_a_window_longer_than_the_history_starts_at_the_first_step():
+    # Three steps under "last 100 steps": the axis is steps 1 to 3, not 0 to 3 with a
+    # blank column for a step that never ran.
+    parsed = _parse([_row(step, sum_loss=value) for step, value in [(1, 9.8), (2, 5.1), (3, 2.0)]])
+    series = parsed.metrics[0]
+    lines = _text(training.chart_spans(series, parsed.first_step(100), 40, height=4))
+    assert lines[-1].split() == ["1", "2", "3"]
+    bars = lines[-3].split("│", 1)[1]
+    assert bars[0] != " "  # step 1 draws from the first column
+    # A window inside the history still starts where the window does, gaps and all.
+    gappy = _parse([_row(step, sum_loss=1.0) for step in (1, 2, 9, 10)])
+    lines = _text(training.chart_spans(gappy.metrics[0], 5, 40, height=4))
+    assert lines[-1].split()[0] == "5"
+
+
 def test_chart_of_a_flat_series_and_of_an_empty_window():
     flat = _parse([_row(step, op="step", last_lr=1e-5) for step in range(1, 5)]).metrics[0]
     lines = _text(training.chart_spans(flat, None, 30, height=4))
