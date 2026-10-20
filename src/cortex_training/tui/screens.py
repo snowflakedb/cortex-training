@@ -34,6 +34,7 @@ from textual.widgets import Footer
 from textual.widgets import Header
 from textual.widgets import Static
 
+from cortex_training.tui import theme
 from cortex_training.tui import views as v
 from cortex_training.tui.widgets import ENDED_STYLE
 from cortex_training.tui.widgets import KEYS_BINDING
@@ -161,7 +162,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
         self._table_shown = None  # what the sub-job table holds, so an unchanged refresh leaves it be
 
     def compose(self) -> ComposeResult:
-        yield Header()
+        yield Header(icon=theme.BRAND_ICON)
         with VerticalScroll(id="summary-body"):
             yield Static("", id="preview")
             yield Static("", id="fetch")  # reading, refreshing, or why the copy shown is older

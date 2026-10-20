@@ -58,6 +58,7 @@ from textual.widgets import TabPane
 from textual.worker import get_current_worker
 from cortex_training.client import DownloadCancelled
 from cortex_training.client import NoChunksError
+from cortex_training.tui import theme
 from cortex_training.tui import format as log_format
 from cortex_training.tui import views
 from cortex_training.tui.format import display_line
@@ -236,7 +237,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         self._no_sources: str | None = None  # why the job has no sources to show (it couldn't be read, say)
 
     def compose(self) -> ComposeResult:
-        yield Header()
+        yield Header(icon=theme.BRAND_ICON)
         yield Static("", id="summary")
         with JobTabs(initial=self._active_tab, id="job-tabs"):
             with TabPane("Logs", id="logs"):

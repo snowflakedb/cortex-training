@@ -52,6 +52,7 @@ from textual.widgets import Input
 from textual.widgets._toast import Toast
 from textual.widgets._toast import ToastRack
 
+from cortex_training.tui import theme
 from cortex_training.tui.account import JobClients
 from cortex_training.tui.job_list import JobListScreen
 from cortex_training.tui.logs import LogScreen
@@ -218,6 +219,10 @@ class CortexTrainingLogTUI(App):
     job_id is supplied."""
 
     CSS = """
+    /* A quiet title bar: the brand mark in the accent, the title over the screen's status. */
+    Header { background: $surface; color: $text-muted; }
+    Header HeaderIcon { color: $accent; }
+    Header HeaderTitle { color: $text; }
     #jobs { height: 1fr; }
     #listinfo { padding: 0 1; height: auto; }
     #nomatch-box { height: 1fr; scrollbar-gutter: stable; }
@@ -260,6 +265,8 @@ class CortexTrainingLogTUI(App):
         """Every job record read through ``client`` and its per-location clients comes back printable
         (:mod:`cortex_training.tui.untrusted`)."""
         super().__init__()
+        self.register_theme(theme.CORTEX_THEME)
+        self.theme = theme.CORTEX_THEME.name
         client = printable_client(client)
         self._client = client
         self._job_id = job_id

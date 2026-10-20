@@ -41,6 +41,7 @@ from textual.widgets import Header
 from textual.widgets import Input
 from textual.widgets import Static
 from textual.worker import get_current_worker
+from cortex_training.tui import theme
 from cortex_training.tui import views
 from cortex_training.tui.account import ACCOUNT
 from cortex_training.tui.logs import LogScreen
@@ -249,7 +250,7 @@ class JobListScreen(FollowsPointer, Screen):
         return views.job_key(job, self._clients.home)
 
     def compose(self) -> ComposeResult:
-        yield Header()
+        yield Header(icon=theme.BRAND_ICON)
         yield Static("", id="listinfo")
         yield Static("", id="listnotice")
         yield _JobTable(id="jobs", cursor_type="row", zebra_stripes=False, fixed_columns=self._FIXED_COLUMNS)
