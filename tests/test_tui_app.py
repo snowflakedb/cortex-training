@@ -4268,6 +4268,41 @@ def test_a_list_the_reader_has_not_moved_stays_at_its_top_as_live_jobs_come():
     asyncio.run(_run_a_list_the_reader_has_not_moved_stays_at_its_top_as_live_jobs_come())
 
 
+async def _run_a_reader_who_moved_keeps_their_line_on_every_page_after(how):
+    client = _PagedDemo()
+    client.running_at = 3  # a running job comes on page 3, above the cursor
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        client.gated = True
+        await pilot.press("a")
+        client.release()
+        assert await _pause_until(pilot, lambda: screen._scope.loading, seconds=10.0)
+        await pilot.pause(0.2)
+        table.focus()
+        table.move_cursor(row=table.get_row_index("hdr-history") + 2, animate=False)  # the reader moves
+        await pilot.pause(0.2)
+        if how == "fold":  # and folds the job there, which draws the list again with the cursor on it
+            screen._toggle(screen._highlighted()[1], True)
+            await pilot.pause(0.2)
+        key, line = screen._highlighted()[0], table.cursor_row - round(table.scroll_y)
+        assert table.scroll_y == 0
+        for pages in (2, 3):  # page 2 draws the list with the cursor on the reader's row; page 3 too
+            client.release()
+            assert await _pause_until(pilot, lambda: len(screen._all_jobs) == pages * client._ACCOUNT_PAGE_ROWS,
+                                      seconds=10.0)
+            await pilot.pause(0.3)
+            assert screen._highlighted()[0] == key
+            assert table.cursor_row - round(table.scroll_y) == line, (pages, table.cursor_row, table.scroll_y, line)
+        client.release(10)
+        await _settle(app, pilot)
+
+
+@pytest.mark.parametrize("how", ["moved", "fold"])
+def test_a_reader_who_moved_keeps_their_line_on_every_page_after(how):
+    asyncio.run(_run_a_reader_who_moved_keeps_their_line_on_every_page_after(how))
+
+
 async def _run_e_unfolds_the_jobs_of_later_pages_too_and_then_folds_them_all():
     client = _PagedDemo()
     app = CortexTrainingLogTUI(client, poll_interval=0.01)

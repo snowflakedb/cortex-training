@@ -366,6 +366,7 @@ class JobListScreen(FollowsPointer, Screen):
         self._keys: dict[tuple, str] = {}  # job key -> its row's table key
         self._shown: tuple | None = None  # what the table holds: (layout, ((row key, cells), ...))
         self._placed_key: str | None = None  # the row the last render put the cursor on
+        self._reader_moved = False  # the reader moved the cursor since the list (or a sort) placed it
 
     def _job_key(self, job: dict) -> tuple:
         return views.job_key(job, self._clients.home)
@@ -867,7 +868,7 @@ class JobListScreen(FollowsPointer, Screen):
         self._rows = {key: rows for key, rows in self._rows.items() if key in self._jobs_by_key}
         self._hay = {key: hay for key, hay in self._hay.items() if key in self._jobs_by_key}
         self._update_subtitle()
-        self._render_jobs(steady=steady)
+        self._render_jobs(steady=steady, fresh=not steady)
 
     def _on_jobs(self, listing, error: JobListError | None, account: bool = False, gen: int | None = None) -> None:
         """A load's answer: ``listing``, or ``error``; ``account``: it read the account-wide list."""
@@ -1246,11 +1247,21 @@ class JobListScreen(FollowsPointer, Screen):
 
     # ─── the table ───────────────────────────────────────────────────────────
 
-    def _render_jobs(self, *, keep: tuple | None = None, top: bool = False, steady: bool = False) -> None:
+    def _render_jobs(self, *, keep: tuple | None = None, top: bool = False, steady: bool = False,
+                     fresh: bool = False) -> None:
         """Draw the list, optionally keeping one job or starting at the top; ``steady``: the
-        list grew (a page more of it), and the highlighted row stays where it is on screen."""
+        list grew (a page more of it), and the highlighted row stays where it is on screen;
+        ``fresh``: a new list, the cursor where the list puts it."""
         table = self.query_one("#jobs", DataTable)
         info_line = self.query_one("#listinfo", Static)
+        if top or fresh:
+            self._reader_moved = False
+        elif table.display and table.row_count:
+            # The cursor off the row the last render put it on: the reader moved it, and the
+            # list keeps their place from now on (a search, a fold or a sort since too).
+            current = self._highlighted()[0]
+            if current is not None and current != self._placed_key:
+                self._reader_moved = True
         keep_sub = None
         keep_header = None
         anchor = None
@@ -1259,10 +1270,10 @@ class JobListScreen(FollowsPointer, Screen):
             key, keep = self._highlighted()
             keep_sub = self._sub_by_item.get(key)  # a sub-job row keeps its own cursor
             if steady and key is not None and table.display and table.row_count:
-                # The list grows. Where the reader has moved (the cursor off the row the list
-                # put it on, or the view scrolled), the highlighted row stays on its line;
-                # where not, the list stays at its top.
-                at_top = round(table.scroll_y) == 0 and key == self._placed_key
+                # The list grows. Where the reader has moved (the cursor, or the view
+                # scrolled), the highlighted row stays on its line; where not, the list
+                # stays at its top.
+                at_top = round(table.scroll_y) == 0 and not self._reader_moved
                 if not at_top:
                     anchor = (key, table.cursor_row - round(table.scroll_y), table.scroll_x)
                 if str(key).startswith("hdr-"):
