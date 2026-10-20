@@ -147,7 +147,7 @@ cortex-training download-metrics JOB_ID --output-dir ./metrics
 ```
 
 See [execution logs](#download-execution-logs),
-[persisted stdout](#download-persisted-stdout), and [GPU metrics](#download-gpu-metrics)
+[persisted stdout](#download-persisted-stdout), and [GPU metrics](#download-metrics)
 for download paths and output fields.
 
 ### [Output And Help](#json-output-and-help)
@@ -178,7 +178,7 @@ cortex-training fwd-bwd --help
 - [Forward-backward and optimizer steps](#run-a-forward-backward-smoke-test)
 - [Load checkpoints](#load-a-checkpoint-into-a-running-job) and [initialize sampling](#start-sampling-from-a-training-checkpoint)
 - [Generate](#run-a-generate-smoke-test) and [sync weights](#sync-training-weights)
-- [Download logs](#download-execution-logs), [stdout](#download-persisted-stdout), and [metrics](#download-gpu-metrics)
+- [Download logs](#download-execution-logs), [stdout](#download-persisted-stdout), and [metrics](#download-metrics)
 - [Job TUI](#job-tui), [JSON output and help](#json-output-and-help), and [troubleshooting](#troubleshooting)
 
 `cortex-training` submits and manages Cortex Training jobs through the Cortex
@@ -678,27 +678,45 @@ completes.
 execution logs, including `download-log` without `--log-type stdout`. Two downloads of the same
 directory at once are unsupported.
 
-### Download GPU Metrics
+### Download Metrics
 
-Reconstruct each sub-job's GPU metric chunks into
-`<output_dir>/<sub_job_id>/gpu.jsonl`:
+Reconstruct each sub-job's metric chunks. GPU and host rows go to
+`<output_dir>/<sub_job_id>/gpu.jsonl`, and a training sub-job's
+[training metrics](rest-api.md#125-training-metrics-download) — the loss,
+gradient norm, learning rate and whatever else its loss function returns — to
+`<output_dir>/<sub_job_id>/training.jsonl`:
 
 ```bash
 cortex-training download-metrics JOB_ID --output-dir /path/to/metrics
 cortex-training download-metrics JOB_ID --output-dir /path/to/metrics --resume
 ```
 
-The command prints the saved path, chunk count, and first/last logical artifact
-URIs for each reconstructed file. `--resume`, `--parallel N`, `--sub-job
-SUB_JOB_ID`, `--strict`, `--stale-after-minutes`, `--transfer-timeout`,
-damaged chunks, retries,
-progress on stderr, and Ctrl-C behave as for
-[persisted stdout](#download-persisted-stdout). While the job is running, a
-sub-job that has saved stdout but no GPU metrics is also listed, with
-`chunk_count` 0, `saved_path` `null`, and a warning that metric uploads may be
-stalled. After the job has ended, such a sub-job is listed the same way with a
-warning that no GPU metrics were saved for it (for example, because the job ran
-on an image from before GPU metrics were uploaded). Two downloads of the same directory at once are unsupported.
+The two are separate streams, fetched one after the other into the same
+directory, each with its own file and resume manifest. The command prints the
+saved path, chunk count, and first/last logical artifact URIs for each
+reconstructed file, under `metrics` for the GPU stream and `training_metrics`
+for the training one:
+
+```json
+{"job_id": "JOB_ID", "metrics": [...], "training_metrics": [...]}
+```
+
+Each stream reports its own progress line on stderr (`metrics: …`,
+`training metrics: …`). `--resume`, `--parallel N`, `--sub-job SUB_JOB_ID`,
+`--strict`, `--stale-after-minutes`, `--transfer-timeout`, damaged chunks,
+retries, and Ctrl-C behave as for
+[persisted stdout](#download-persisted-stdout) and apply to both streams.
+
+While the job is running, a sub-job that has saved stdout but no GPU metrics is
+also listed under `metrics`, with `chunk_count` 0, `saved_path` `null`, and a
+warning that metric uploads may be stalled. After the job has ended, such a
+sub-job is listed the same way with a warning that no GPU metrics were saved
+for it (for example, because the job ran on an image from before GPU metrics
+were uploaded). `training_metrics` carries no such warning: only training
+sub-jobs save training metrics, and only where the deployment saves them (a job
+opts out with `training_config.save_training_metrics` false), so a sub-job
+without them is simply absent. Two downloads of the same directory at once are
+unsupported.
 
 ### Job TUI
 

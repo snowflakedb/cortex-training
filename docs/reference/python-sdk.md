@@ -62,7 +62,8 @@ Tracked operations:
 - Compute: `forward_backward`, `forward`, `generate`, `generate_stream`, `step`
 - Checkpoints and logs: `save`, `load`, `list_checkpoints`,
   `export_checkpoint`, `delete_checkpoint`, `fetch_execution_logs`,
-  `download_execution_logs`, `download_stdout_logs`, `download_metrics`
+  `download_execution_logs`, `download_stdout_logs`, `download_metrics`,
+  `download_training_metrics`
 - Multi-sub-job operations: `weight_sync`, `bootstrap_router_replay`,
   `router_replay_discard`, `reset_prefix_cache`
 - Async requests: `poll_request`, `get_request_status`, `cancel_request`
@@ -81,7 +82,7 @@ Download events add these body fields:
 |---|---|
 | `artifact` | `stdout`, `metrics`, or `execution_logs` |
 | `list_ms` / `fetch_ms` | Time listing the run's artifacts, and fetching and writing them |
-| `sub_job_count` | Sub-jobs written (`download_stdout_logs` / `download_metrics`) |
+| `sub_job_count` | Sub-jobs written (`download_stdout_logs` / `download_metrics` / `download_training_metrics`) |
 | `chunk_count` / `chunks_skipped` | Chunks this call appended or skipped; skipped ones are also counted in `chunk_count` |
 | `bytes_written` | Bytes this call added to the output files |
 | `max_workers` | Concurrent GETs used |
@@ -299,7 +300,12 @@ reconstructs persisted console chunks as
 `<output_dir>/<sub_job_id>/stdout.log`.
 `download_metrics(...)`, with the same options plus `priority=()` and
 `on_commit=None`, reconstructs GPU metric chunks
-as `<output_dir>/<sub_job_id>/gpu.jsonl`. Chunks are fetched `max_workers` at a
+as `<output_dir>/<sub_job_id>/gpu.jsonl`.
+`download_training_metrics(...)` takes the same options and reconstructs a
+training sub-job's training-metric chunks as
+`<output_dir>/<sub_job_id>/training.jsonl`; the two are separate streams that
+can share an output directory (see
+[REST API section 12.5](rest-api.md#125-training-metrics-download)). Chunks are fetched `max_workers` at a
 time (default 16) on one Snowflake session and written in order. `resume=True`
 appends chunks that are not already recorded in the manifest beside that file
 and continues an interrupted download. Progress is reported only through

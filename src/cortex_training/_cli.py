@@ -592,15 +592,16 @@ def build_parser(
 
     download_metrics = subparsers.add_parser(
         "download-metrics",
-        help="Download and reconstruct GPU metrics for a Cortex Training job.",
+        help="Download and reconstruct GPU and training metrics for a Cortex Training job.",
     )
     download_metrics.add_argument("job_id")
     download_metrics.add_argument(
         "--output-dir",
         dest="output_dir",
         help=(
-            "Directory to write <sub_job_id>/gpu.jsonl files. Created if "
-            "missing. Defaults to the current working directory."
+            "Directory to write <sub_job_id>/gpu.jsonl and "
+            "<sub_job_id>/training.jsonl files. Created if missing. Defaults "
+            "to the current working directory."
         ),
     )
     download_metrics.add_argument(
@@ -1526,13 +1527,13 @@ def _cmd_download_metrics(
     out_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.cwd()
     progress = _artifact_progress_writer(stderr)
     with _output_dir_lock(out_dir), _library_warnings_to(progress):
-        metrics = client.download_metrics(
-            args.job_id,
-            out_dir,
-            **_chunk_download_options(args, progress),
-        )
+        options = _chunk_download_options(args, progress)
+        metrics = client.download_metrics(args.job_id, out_dir, **options)
+        # The zone's own training-metric file: its own stream, under the same
+        # stage root, written beside the GPU file (see download_training_metrics).
+        training = client.download_training_metrics(args.job_id, out_dir, **options)
     _print_json(
-        {"job_id": args.job_id, "metrics": metrics},
+        {"job_id": args.job_id, "metrics": metrics, "training_metrics": training},
         stdout,
         compact=args.compact,
     )

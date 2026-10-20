@@ -2899,11 +2899,68 @@ The same file also carries one host row per worker per scrape, with
 | `cpu_count` | Logical CPUs on the host |
 | `mem_used_bytes` / `mem_total_bytes` | Host memory in use and installed |
 
-A row without `kind` is a GPU row; a later GPU row may carry `kind: "gpu"`.
-Consumers should select rows by `kind` and ignore kinds they do not support.
-The TUI's Resource tab uses GPU rows only.
+### 12.5 Training metrics download
 
-### 12.5 Zone scheduling events
+`download_training_metrics(job_id, output_dir, ...)` takes the same options as
+`download_metrics` and reconstructs a training sub-job's **training metrics**:
+what its `/fwd-bwd` and `/step` calls returned, written by the zone to its own
+file and staged beside the GPU chunks as
+`training.YYYYMMDD-HHMMSS.UUID.gz` under `_metrics/{sub_job_id}/`. It writes
+`<output_dir>/<sub_job_id>/training.jsonl`, with its own manifest, so the two
+downloads can share an output directory and neither stream's rows reach the
+other's file. `cortex-training download-metrics` runs both and reports them as
+`metrics` and `training_metrics`.
+
+Only training sub-jobs have these rows, and only where the deployment saves
+them; a job opts out by setting `training_config.save_training_metrics` to
+`false`. So, unlike the GPU stream, a sub-job with saved stdout and no training
+chunks is not warned about.
+
+At each successful `/step` the zone appends one row combining every `/fwd-bwd`
+call of that step and one row for the step itself, with `"kind": "training"`
+and `record_version` `1`:
+
+```json
+{"kind": "training", "record_version": 1, "sub_job_id": "JOB_ID:training:0",
+ "sample_ts": "2026-10-16T18:02:14Z", "seq": 84, "seq_epoch": "...",
+ "op": "fwd_bwd", "step": 7, "request_id": null,
+ "metrics": {"avg_loss": 0.0137, "approx_kl": 0.0021, "entropy": 0.8636, "num_calls": 2.0}}
+{"kind": "training", "record_version": 1, "sub_job_id": "JOB_ID:training:0",
+ "sample_ts": "2026-10-16T18:02:14Z", "seq": 85, "seq_epoch": "...",
+ "op": "step", "step": 7, "request_id": "REQUEST_ID",
+ "metrics": {"grad_norm": 0.873, "last_lr": 1e-05}}
+```
+
+| Field | Meaning |
+|---|---|
+| `kind` | `"training"` |
+| `record_version` | `1` |
+| `sub_job_id`, `sample_ts`, `seq`, `seq_epoch` | As for GPU rows; `sample_ts` is when the step completed |
+| `op` | `"fwd_bwd"` (every `/fwd-bwd` call since the previous step, combined) or `"step"` |
+| `step` | The training step the row belongs to |
+| `request_id` | The `/step` request's id on a `step` row; `null` on a `fwd_bwd` row |
+| `metrics` | Numeric metrics, by name |
+
+A `fwd_bwd` row's `metrics` hold `sum_loss`, the sum of the calls' losses, and
+`num_calls`, the number of calls combined, plus every other numeric metric the
+`/fwd-bwd` responses returned (their totals and counts summed, rates
+recomputed by the loss function) except `rank`. There is deliberately no
+mean: whether a step's loss is the sum or the mean of its calls' losses depends
+on how the loss was scaled, so the row carries both numbers and leaves the
+choice to the reader. A `step` row holds `grad_norm` (omitted when the
+optimizer reported none) and `last_lr`.
+
+A failed step saves no rows, and its `/fwd-bwd` calls count toward no step. The
+metrics a loss function returns vary, so consumers should read whatever names a
+row has.
+
+In the GPU file, a row without `kind` is a GPU row; a later GPU row may carry
+`kind: "gpu"`. Consumers should select rows by `kind` and ignore kinds they do
+not support. The TUI's Resources tab uses GPU and system rows; its Training
+metrics tab reads `training.jsonl` and charts `sum_loss / num_calls` beside
+`sum_loss`.
+
+### 12.6 Zone scheduling events
 
 The client contains `tail_events()` and `stream_events()`, but the server does
 not accept their operation type. See
