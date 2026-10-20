@@ -8,6 +8,7 @@ For reviewing how a screen looks without a terminal or a connection:
     python scripts/tui_screenshot.py list.svg
     python scripts/tui_screenshot.py logs.svg --keys "slash,type:gsm8k,enter,enter,wait:1,l,wait:4"
     python scripts/tui_screenshot.py job.svg --size 120x36 --job-id JOB_ID
+    python scripts/tui_screenshot.py list.svg --connection NAME   # a real account, read-only
 
 ``--keys`` is comma-separated Textual key names, plus ``type:TEXT`` (types each
 character) and ``wait:SECONDS``. ``--png`` also writes a PNG beside the SVG
@@ -27,13 +28,25 @@ import tempfile
 from pathlib import Path
 
 
-async def _shoot(out: Path, size: tuple[int, int], keys: list[str], job_id: str | None) -> None:
+def _real_client(connection: str):
+    """A client for a Snowflake connection profile, resolved as ``cortex-training tui`` does."""
+    import cortex_training._cli as cli
+    from cortex_training.tui.__main__ import _build_arg_parser
+
+    args = cli._resolve_args(_build_arg_parser().parse_args(["--connection", connection]))
+    args = cli._normalize_connection_args(args)
+    return cli.build_client(args, cli._load_cortex_training_client_class())
+
+
+async def _shoot(out: Path, size: tuple[int, int], keys: list[str], job_id: str | None,
+                 connection: str | None) -> None:
     from cortex_training.tui.app import CortexTrainingLogTUI
     from cortex_training.tui.demo import DemoClient
 
-    client = DemoClient()
+    client = _real_client(connection) if connection else DemoClient()
     app = CortexTrainingLogTUI(client, job_id, poll_interval=1.0)
-    app.title = "cortex training (debug)"
+    if not connection:
+        app.title = "cortex training (debug)"
     async with app.run_test(size=size) as pilot:
         await pilot.pause(1.5)
         for key in keys:
@@ -73,6 +86,7 @@ def main(argv=None) -> int:
     p.add_argument("--size", default="150x42", help="COLUMNSxROWS (default 150x42)")
     p.add_argument("--keys", default="", help="comma-separated keys to press first")
     p.add_argument("--job-id", help="open this job's dashboard directly")
+    p.add_argument("--connection", help="use this Snowflake connection profile instead of the synthetic jobs")
     p.add_argument("--png", action="store_true", help="also write a PNG beside the SVG (needs rsvg-convert)")
     args = p.parse_args(argv)
 
@@ -82,7 +96,7 @@ def main(argv=None) -> int:
     columns, rows = (int(n) for n in args.size.lower().split("x"))
     keys = [k for k in args.keys.split(",") if k]
     out = Path(args.output).resolve()
-    asyncio.run(_shoot(out, (columns, rows), keys, args.job_id))
+    asyncio.run(_shoot(out, (columns, rows), keys, args.job_id, args.connection))
     if args.png:
         if shutil.which("rsvg-convert") is None:
             raise SystemExit("--png needs rsvg-convert (brew install librsvg)")
