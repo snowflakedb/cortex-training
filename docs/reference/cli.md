@@ -1131,11 +1131,19 @@ out (the header names it too). Switch tabs with `l` (Logs), `g`
     `.safetensors` weights alone mean `weights-only`) and marks it
     `(from its files)`. The export's links are never shown or kept.
   - The highlighted checkpoint's details sit under the list: every field the
-    service sent, its files, the job and training sub-job that saved it, the
-    job's training configuration as submitted, and commands to download it
-    (Python, with `export_checkpoint`) and use it: serve a `weights-only`
-    checkpoint for sampling, or resume training from a `resumable` one with
-    `load` or `source_checkpoint_info`.
+    service sent, its files, the job and training sub-job that saved it, and
+    the job's training configuration as submitted.
+  - **Download** (or `d`) downloads its files, with fresh export links, to
+    `~/cortex-training-checkpoints/<job8>/<checkpoint_id>/`, showing progress
+    beside the button; pressing it again stops the download, and the next one
+    keeps the files already whole. One download runs at a time.
+  - **New job from it: Training / Sampling / Training + sampling** copies one
+    shell command to the clipboard: `printf '%s' '<CreateJob JSON>' |
+    cortex-training ... submit -`. The body repeats this job's training
+    sub-job, its sampling sub-job (or one GPU of the training model), or both,
+    and its hardware, each with `source_checkpoint_info` naming this
+    checkpoint. Sampling loads only weights, so a `resumable` checkpoint's
+    Sampling buttons are disabled. The details show the copied command.
 
 #### Logs
 
@@ -1291,7 +1299,7 @@ Use the terminal's selection modifier instead when needed (Option in iTerm2,
 Fn in macOS Terminal, or configured Option in VS Code). With the keys panel
 open, a whole-screen copy includes its keys.
 
-Keys in the job details view (`/`, `e`, `n`, `p`, `s`, `[` and `]` work on Logs; `s` and `o` sort on Checkpoints):
+Keys in the job details view (`/`, `e`, `n`, `p`, `s`, `[` and `]` work on Logs; `s`, `o` and `d` on Checkpoints):
 
 | Key | Action |
 |-----|--------|
@@ -1307,6 +1315,7 @@ Keys in the job details view (`/`, `e`, `n`, `p`, `s`, `[` and `]` work on Logs;
 | `p` | Pause / resume auto-scroll. Scrolled up from the end of a live log, or after a jump, `p` goes back to the end and follows again |
 | `s` | Save the current source to `~/cortex-training-<job8>-<source>.log` (Logs); cycle the sort: created, step, type (Checkpoints) |
 | `o` | Reverse the sort (Checkpoints) |
+| `d` | Download the highlighted checkpoint, or stop its download (Checkpoints) |
 | `ctrl+c` | Copy what is highlighted, else everything the tab holds: the log (its newest lines, up to 1 MiB) on Logs; the panel, header, stats and every chart on Resources; the list and the highlighted checkpoint's details on Checkpoints (any tab) |
 | `[` / `]` | Narrow / widen the sources panel |
 | `PgUp` `PgDn` `Home` `End` | Scroll the log, also while the sources panel has the focus (Logs); scroll the stats and charts, also while the panel has the focus (Resources) |

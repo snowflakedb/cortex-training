@@ -18,25 +18,41 @@
 ``CheckpointTab`` is mixed into ``LogScreen`` (tui/logs.py), as ``ResourceTab`` is:
 the tab lists the job's checkpoints (``list_checkpoints``), newest first, and shows
 the highlighted one's details under the list: its fields, the job and training
-sub-job that saved it, the job's training configuration, and the commands that
-download it and use it. Each checkpoint's export is read once, in the background,
-for its files: their sizes, and the step and type they show when the list doesn't
-say (see tui/checkpoints.py). The export's links are never shown or kept.
+sub-job that saved it and the job's training configuration. The buttons between
+the list and the details download it (``d``), or copy the command that starts a
+new training job, sampling job, or both from it. Each checkpoint's export is read
+once, in the background, for its files: their sizes, and the step and type they
+show when the list doesn't say (see tui/checkpoints.py). The export's links are
+never shown or kept; a download asks for fresh ones.
 """
 
 from __future__ import annotations
 import json
 import shlex
+import threading
 import time
+from pathlib import Path
 from datetime import datetime
 from datetime import timezone
 from rich.text import Text
 from textual import work
+from textual.app import ComposeResult
+from textual.containers import Horizontal
+from textual.containers import VerticalScroll
+from textual.widgets import Button
 from textual.widgets import DataTable
 from textual.widgets import Static
 from textual.worker import get_current_worker
 from cortex_training.tui import views
+from cortex_training.tui.checkpoints import BOTH
 from cortex_training.tui.checkpoints import RESUMABLE
+from cortex_training.tui.checkpoints import SAMPLING
+from cortex_training.tui.checkpoints import TRAINING
+from cortex_training.tui.checkpoints import USES
+from cortex_training.tui.checkpoints import DownloadCancelled
+from cortex_training.tui.checkpoints import download_export
+from cortex_training.tui.checkpoints import new_job_body
+from cortex_training.tui.checkpoints import usable_for
 from cortex_training.tui.checkpoints import SORTS
 from cortex_training.tui.checkpoints import WEIGHTS_ONLY
 from cortex_training.tui.checkpoints import Checkpoint
@@ -52,6 +68,7 @@ from cortex_training.tui.checkpoints import sort_checkpoints
 from cortex_training.tui.checkpoints import training_sub_jobs
 from cortex_training.tui.format import local_time
 from cortex_training.tui.format import printable
+from cortex_training.tui.widgets import SelectableTable
 from cortex_training.tui.widgets import log_traceback
 
 
@@ -76,6 +93,29 @@ class CheckpointTab:
         self._ckpt_reading_files: set[str] = set()
         self._ckpt_highlighted: str | None = None  # the id the details are for
         self._ckpt_shown: tuple | None = None  # what the table holds, so an unchanged redraw leaves it be
+        self._ckpt_copied: tuple | None = None  # (checkpoint id, use, command) last copied
+        # The download running or last run: checkpoint id, its folder, and its progress or outcome.
+        self._ckpt_download: dict | None = None
+        self._ckpt_download_stop = threading.Event()
+
+    _USE_HELP = {
+        TRAINING: "copies the command for a new training job that resumes from it",
+        SAMPLING: "copies the command for a new sampling job serving its weights",
+        BOTH: "copies the command for a new job with both, each starting from it",
+    }
+
+    def _compose_checkpoint_tab(self) -> ComposeResult:
+        yield Static("", id="checkpoint-status")
+        yield SelectableTable(id="checkpoint-table", cursor_type="row", zebra_stripes=True)
+        with Horizontal(id="checkpoint-actions"):
+            yield Button("⬇ Download", id="ckpt-download", compact=True, variant="primary")
+            yield Static(" New job from it:", id="ckpt-use-label")
+            yield Button("Training", id=f"ckpt-use-{TRAINING}", compact=True)
+            yield Button("Sampling", id=f"ckpt-use-{SAMPLING}", compact=True)
+            yield Button("Training + sampling", id=f"ckpt-use-{BOTH}", compact=True)
+        yield Static("", id="checkpoint-action-status")
+        with VerticalScroll(id="checkpoint-pane"):
+            yield Static("", id="checkpoint-detail")
 
     def _checkpoints_active(self) -> bool:
         return self._active_tab == "checkpoints"
@@ -170,6 +210,164 @@ class CheckpointTab:
         self._ckpt_highlighted = event.row_key.value
         self._render_checkpoint_detail()
 
+    # ─── actions: download, and a new job from it ────────────────────────
+    def _highlighted_checkpoint(self) -> Checkpoint | None:
+        return next((r for r in self._ckpt_rows if r.checkpoint_id == self._ckpt_highlighted), None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        button = event.button.id or ""
+        if button == "ckpt-download":
+            event.stop()
+            self.action_checkpoint_download()
+        elif button.startswith("ckpt-use-"):
+            event.stop()
+            self._copy_new_job_command(button.removeprefix("ckpt-use-"))
+        else:
+            return
+        # Back to the list, so the arrows keep picking checkpoints.
+        self.set_focus(self.query_one("#checkpoint-table", DataTable))
+
+    def _checkpoint_use_reasons(self, row: Checkpoint, kind: str | None) -> dict:
+        """Use → why the highlighted checkpoint can't start a job for it (None: it can)."""
+        reasons = dict(usable_for(kind))
+        for use in USES:
+            if reasons[use] is None and new_job_body(self._job, str(self._job_id), row.checkpoint_id, use) is None:
+                reasons[use] = "the job's record has no training sub-job configuration to copy"
+        return reasons
+
+    def _copy_new_job_command(self, use: str) -> None:
+        row = self._highlighted_checkpoint()
+        if row is None or use not in USES:
+            return
+        kind = row.with_files(self._files_of(row))[2]
+        why = self._checkpoint_use_reasons(row, kind)[use]
+        if why:
+            self.notify(f"Can't start a {USES[use]} job from it: {why}.", severity="warning", markup=False)
+            return
+        body = new_job_body(self._job, str(self._job_id), row.checkpoint_id, use)
+        # One line to paste into a shell: the CreateJob body, quoted, piped to submit.
+        command = (f"printf '%s' {shlex.quote(json.dumps(body, separators=(',', ':')))} | "
+                   + self._cli("submit -"))
+        self._ckpt_copied = (row.checkpoint_id, use, command)
+        self.app.copy_out(command, f"the command for a new {USES[use]} job from {printable(row.checkpoint_id)}")
+        self._render_checkpoint_detail()
+
+    def _ckpt_download_root(self, checkpoint_id: str) -> Path:
+        return Path.home() / "cortex-training-checkpoints" / str(self._job_id)[:8] / checkpoint_id
+
+    def action_checkpoint_download(self) -> None:
+        if not self._checkpoints_active():
+            return
+        running = self._ckpt_download
+        row = self._highlighted_checkpoint()
+        if running is not None and running.get("running"):
+            if row is not None and running["id"] != row.checkpoint_id:
+                self.notify(f"Already downloading {printable(running['id'])}: one download at a time.",
+                            markup=False)
+                return
+            self._ckpt_download_stop.set()  # the button reads "Stop" while it runs
+            return
+        if row is None:
+            return
+        self._ckpt_download_stop = threading.Event()
+        self._ckpt_download = {"id": row.checkpoint_id, "root": self._ckpt_download_root(row.checkpoint_id),
+                               "running": True, "done": 0, "total": None, "files_done": 0, "files": None}
+        self._render_checkpoint_actions()
+        self._ckpt_download_checkpoint(row.checkpoint_id, self._ckpt_download["root"], self._ckpt_download_stop)
+
+    @work(thread=True, group="checkpoint-download")
+    def _ckpt_download_checkpoint(self, checkpoint_id: str, root: Path, stop: threading.Event) -> None:
+        last = [0.0]
+
+        def progress(done, total, files_done, files) -> None:
+            now = time.monotonic()
+            if now - last[0] >= 0.25 or files_done == files:  # a few repaints a second
+                last[0] = now
+                self._post(self._ckpt_download_progress, checkpoint_id, done, total, files_done, files)
+
+        try:
+            # Fresh links: the ones read for the files' sizes may have expired.
+            export = self._client.export_checkpoint(self._job_id, checkpoint_id)
+            paths = download_export(export, root, on_progress=progress,
+                                    cancelled=lambda: stop.is_set() or not self._screen_open)
+            outcome, error = f"{len(paths)} files", None
+        except DownloadCancelled:
+            outcome, error = None, "stopped"
+        except Exception as exc:  # noqa: BLE001 - said beside the button
+            log_traceback(f"downloading checkpoint {checkpoint_id} of {self._job_id} failed")
+            outcome, error = None, views.describe_error(exc)
+        self._post(self._ckpt_download_finished, checkpoint_id, outcome, error)
+
+    def _ckpt_download_progress(self, checkpoint_id, done, total, files_done, files) -> None:
+        state = self._ckpt_download
+        if not self._screen_open or state is None or state["id"] != checkpoint_id:
+            return
+        state.update(done=done, total=total, files_done=files_done, files=files)
+        self._render_checkpoint_actions()
+
+    def _ckpt_download_finished(self, checkpoint_id, outcome, error) -> None:
+        state = self._ckpt_download
+        if not self._screen_open or state is None or state["id"] != checkpoint_id:
+            return
+        state.update(running=False, outcome=outcome, error=error)
+        self._render_checkpoint_actions()
+
+    def _ckpt_download_text(self, row: Checkpoint | None) -> Text:
+        state = self._ckpt_download
+        if state is None or row is None or state["id"] != row.checkpoint_id:
+            return Text(f" d downloads it to {self._display_path(self._ckpt_download_root(row.checkpoint_id))}"
+                        if row is not None else "", style="dim")
+        where = self._display_path(state["root"])
+        if state["running"]:
+            total = state.get("total")
+            amount = (f"{fmt_bytes(state['done'])} of {fmt_bytes(total)}" if total
+                      else fmt_bytes(state["done"]))
+            files = f" · file {min(state['files_done'] + 1, state['files'])} of {state['files']}" \
+                if state.get("files") else ""
+            percent = f" ({state['done'] * 100 // total}%)" if total else ""
+            return Text(f" downloading {amount}{percent}{files} to {where} · d or the button stops it",
+                        style="yellow")
+        if state.get("error") == "stopped":
+            return Text(f" download stopped · d picks it up again in {where}", style="yellow")
+        if state.get("error"):
+            return Text(f" download failed: {state['error']} · d tries again", style="red")
+        return Text(f" downloaded {state.get('outcome')} ({fmt_bytes(state.get('total'))}) to {where}",
+                    style="green")
+
+    @staticmethod
+    def _display_path(path: Path) -> str:
+        try:
+            return "~/" + str(path.relative_to(Path.home()))
+        except ValueError:
+            return str(path)
+
+    def _render_checkpoint_actions(self) -> None:
+        try:
+            actions = self.query_one("#checkpoint-actions", Horizontal)
+            status = self.query_one("#checkpoint-action-status", Static)
+        except Exception:  # noqa: BLE001 - not mounted yet
+            return
+        row = self._highlighted_checkpoint()
+        actions.display = status.display = row is not None
+        if row is None:
+            return
+        state = self._ckpt_download
+        running_here = state is not None and state.get("running")
+        download = self.query_one("#ckpt-download", Button)
+        download.label = "■ Stop download" if running_here else "⬇ Download"
+        download.variant = "warning" if running_here else "primary"
+        # One download at a time: another checkpoint's button waits for it.
+        download.disabled = bool(running_here and state["id"] != row.checkpoint_id)
+        kind = row.with_files(self._files_of(row))[2]
+        reasons = self._checkpoint_use_reasons(row, kind)
+        for use in USES:
+            button = self.query_one(f"#ckpt-use-{use}", Button)
+            button.disabled = reasons[use] is not None
+            button.tooltip = reasons[use] or self._USE_HELP[use]
+        status.update(self._ckpt_download_text(row) if not (running_here and state["id"] != row.checkpoint_id)
+                      else Text(f" downloading {printable(state['id'])} · its row's button stops it",
+                                style="yellow"))
+
     # ─── drawing ─────────────────────────────────────────────────────────
     def _files_of(self, row: Checkpoint) -> FilesInfo | None:
         info = self._ckpt_files.get(row.checkpoint_id)
@@ -252,7 +450,8 @@ class CheckpointTab:
             detail = self.query_one("#checkpoint-detail", Static)
         except Exception:  # noqa: BLE001 - not mounted yet
             return
-        row = next((r for r in self._ckpt_rows if r.checkpoint_id == self._ckpt_highlighted), None)
+        self._render_checkpoint_actions()
+        row = self._highlighted_checkpoint()
         if row is None:
             empty = self._ckpt_loaded and not self._ckpt_rows and not saves_no_checkpoints(self._job)
             if not empty:
@@ -288,9 +487,6 @@ class CheckpointTab:
         step, step_inferred, kind, kind_inferred = row.with_files(info)
         cid = printable(row.checkpoint_id)
         job_id = printable(self._job_id)
-        # The commands quote the ids as the service sent them: a cleaned-up id would name
-        # another checkpoint. shlex and JSON quoting keep them inert in a terminal.
-        raw_cid, raw_job = row.checkpoint_id, str(self._job_id)
         text = Text()
 
         self._heading(text, "Checkpoint")
@@ -344,39 +540,15 @@ class CheckpointTab:
                                        default=str).splitlines():
                     text.append(f"    {line}\n")
 
-        self._heading(text, "Download")
-        text.append("  Export short-lived links to its files, then download them (Python):\n", style="dim")
-        self._command(text, [
-            "import pathlib, shutil, requests",
-            "# client: a CortexTrainingClient for this account, database and schema",
-            f"links = client.export_checkpoint({json.dumps(raw_job)}, {json.dumps(raw_cid)})",
-            'for f in links["files"]:',
-            f'    path = pathlib.Path({json.dumps(raw_cid)}) / f["filename"]',
-            "    path.parent.mkdir(parents=True, exist_ok=True)",
-            '    with requests.get(f["url"], stream=True) as r, open(path, "wb") as out:',
-            "        r.raise_for_status(); shutil.copyfileobj(r.raw, out)",
-        ])
-        text.append("  List this job's checkpoints from the CLI:\n", style="dim")
-        self._command(text, [self._cli(f"checkpoints {shlex.quote(raw_job)}")])
-
-        self._heading(text, "Use it")
-        source = json.dumps({"source_checkpoint_info": {"checkpoint_id": raw_cid, "source_job_id": raw_job}})
-        if kind != RESUMABLE:
-            text.append("  Serve it for sampling (needs a weights-only checkpoint):\n", style="dim")
-            self._command(text, ["python -m recipes.inference.serve config=CONFIG.json job_config=JOB_CONFIG "
-                                 f"source_job_id={shlex.quote(raw_job)} checkpoint_id={shlex.quote(raw_cid)}"])
-            text.append("  or start a sampling sub-job from it, with this in its config:\n", style="dim")
-            self._command(text, [source])
-        if kind != WEIGHTS_ONLY:
-            text.append("  Resume training from it in a running training job (the location options are this\n"
-                        "  job's: change them when the target job is elsewhere):\n", style="dim")
-            self._command(text, [self._cli(f"--job-id TARGET_JOB_ID load {shlex.quote(raw_cid)} "
-                                           f"--source-job-id {shlex.quote(raw_job)}")])
-            text.append("  or start a training sub-job from it, with this in its config "
-                        "(training_config.load_optimizer_states=false keeps only the weights,\n"
-                        "  as a different GPU count needs):\n", style="dim")
-            self._command(text, [source])
-        if kind == RESUMABLE:
-            text.append("  Sampling needs a weights-only checkpoint: save one with "
-                        "save(checkpoint_type=\"weights-only\").\n", style="dim")
+        self._heading(text, "Start a new job from it")
+        reasons = self._checkpoint_use_reasons(row, kind)
+        for use, label in USES.items():
+            why = reasons[use]
+            text.append(f"  {label:<20}", style="bold" if why is None else "dim")
+            text.append(why or self._USE_HELP[use], style="dim")
+            text.append("\n")
+        copied = self._ckpt_copied
+        if copied is not None and copied[0] == row.checkpoint_id:
+            text.append(f"\n  Copied to the clipboard ({USES[copied[1]]}):\n", style="dim")
+            self._command(text, [copied[2]])
         return text

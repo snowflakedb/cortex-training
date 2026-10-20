@@ -16,12 +16,15 @@
 """The Checkpoints tab: its data helpers and the tab on the job details screen."""
 
 import asyncio
+import json
+import shlex
 from unittest.mock import MagicMock
 
 import pytest
 
 pytest.importorskip("textual")
 
+from textual.widgets import Button  # noqa: E402
 from textual.widgets import DataTable  # noqa: E402
 from textual.widgets import Static  # noqa: E402
 from textual.widgets import TabbedContent  # noqa: E402
@@ -30,7 +33,11 @@ from cortex_training import AccountJobListUnavailable  # noqa: E402
 from cortex_training.tui.app import CortexTrainingLogTUI  # noqa: E402
 from cortex_training.tui.checkpoints import RESUMABLE  # noqa: E402
 from cortex_training.tui.checkpoints import WEIGHTS_ONLY  # noqa: E402
+from cortex_training.tui.checkpoints import DownloadCancelled  # noqa: E402
 from cortex_training.tui.checkpoints import compact_numbers  # noqa: E402
+from cortex_training.tui.checkpoints import download_export  # noqa: E402
+from cortex_training.tui.checkpoints import new_job_body  # noqa: E402
+from cortex_training.tui.checkpoints import usable_for  # noqa: E402
 from cortex_training.tui.checkpoints import files_info  # noqa: E402
 from cortex_training.tui.checkpoints import fmt_bytes  # noqa: E402
 from cortex_training.tui.checkpoints import parse_checkpoints  # noqa: E402
@@ -180,7 +187,7 @@ def _text(screen, selector) -> str:
     return str(screen.query_one(selector, Static).render())
 
 
-async def _run_tab_lists_and_details():
+async def _run_tab_lists_and_details(monkeypatch):
     c = _client()
     app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
     async with app.run_test(size=(140, 50)) as pilot:
@@ -198,13 +205,33 @@ async def _run_tab_lists_and_details():
         # Highlighting a row shows its details, with the type and step its files show.
         detail = _text(screen, "#checkpoint-detail")
         assert "cp_b" in detail and "weights-only" in detail and "(from its files)" in detail
-        assert "recipes.inference.serve" in detail and "export_checkpoint" in detail
         assert "links.example" not in detail  # the export's links are never shown
+        assert "export_checkpoint" not in detail  # a button downloads it, not a script
+        buttons = {use: screen.query_one(f"#ckpt-use-{use}", Button) for use in ("training", "sampling", "both")}
+        assert not any(b.disabled for b in buttons.values())
+        # A use button copies one command that starts a job from the checkpoint.
+        copied = []
+        monkeypatch.setattr(app, "copy_out", lambda text, what: copied.append(text))
+        await pilot.click("#ckpt-use-both")
+        assert await _wait(pilot, lambda: copied)
+        body = _submitted_body(copied[-1])
+        assert [sj["job_type"] for sj in body["sub_job_configs"]] == ["training", "sampling"]
+        assert all(sj["source_checkpoint_info"] == {"checkpoint_id": "cp_b", "source_job_id": "7"}
+                   for sj in body["sub_job_configs"])
+        assert body["sub_job_configs"][0]["training_config"]["n_gpus"] == 1
+        assert "Copied to the clipboard" in _text(screen, "#checkpoint-detail")
         await pilot.press("down")
         assert await _wait(pilot, lambda: screen._ckpt_highlighted == "cp_a")
         detail = _text(screen, "#checkpoint-detail")
-        assert "resumable" in detail and "load cp_a --source-job-id 7" in detail
-        assert "recipes.inference.serve" not in detail  # sampling needs a weights-only checkpoint
+        assert "resumable" in detail and "Copied to the clipboard" not in detail
+        # Sampling loads only weights: a resumable checkpoint starts a training job only.
+        assert await _wait(pilot, lambda: buttons["sampling"].disabled and buttons["both"].disabled)
+        assert not buttons["training"].disabled
+        await pilot.click("#ckpt-use-training")
+        assert await _wait(pilot, lambda: len(copied) == 2)
+        body = _submitted_body(copied[-1])
+        assert [sj["job_type"] for sj in body["sub_job_configs"]] == ["training"]
+        assert body["sub_job_configs"][0]["source_checkpoint_info"]["checkpoint_id"] == "cp_a"
         assert "7:training:0" in detail and '"lr": 0.0001' in detail and '"n_gpus": 1,' in detail
         # s sorts by step (the highlight stays on its checkpoint), o reverses it.
         await pilot.press("s")
@@ -221,8 +248,98 @@ async def _run_tab_lists_and_details():
         await _settle(app, pilot)
 
 
-def test_checkpoints_tab_lists_sorts_and_shows_details():
-    asyncio.run(_run_tab_lists_and_details())
+def test_checkpoints_tab_lists_sorts_and_shows_details(monkeypatch):
+    asyncio.run(_run_tab_lists_and_details(monkeypatch))
+
+
+def _submitted_body(command: str) -> dict:
+    """The CreateJob body a copied ``printf '%s' BODY | cortex-training ... submit -`` sends."""
+    words = shlex.split(command)
+    assert words[:2] == ["printf", "%s"] and words[3] == "|" and words[-2:] == ["submit", "-"]
+    return json.loads(words[2])
+
+
+def test_new_job_body_copies_the_job_s_sub_jobs():
+    job = _client().get_job.return_value
+    job["hardware"] = "H200"
+    body = new_job_body(job, "7", "cp_b", "sampling")
+    assert body["hardware"] == "H200"
+    (sampler,) = body["sub_job_configs"]
+    # The job had a sampling sub-job without a config: one is made for the trainer's model.
+    assert sampler == {"job_type": "sampling", "model_name": "Qwen/Qwen3-0.6B", "inference_config": {"n_gpus": 1},
+                       "source_checkpoint_info": {"checkpoint_id": "cp_b", "source_job_id": "7"}}
+    assert new_job_body({"sub_jobs": [{"job_type": "SAMPLING"}]}, "7", "cp_b", "training") is None
+    assert usable_for(RESUMABLE)["sampling"] and usable_for(None)["sampling"] is None
+
+
+class _Response:
+    def __init__(self, data):
+        self._data = data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def raise_for_status(self):
+        pass
+
+    def iter_content(self, size):
+        for i in range(0, len(self._data), size):
+            yield self._data[i:i + size]
+
+
+def test_download_export_writes_files_and_skips_complete_ones(tmp_path):
+    export = {"files": [{"filename": "global_step8/model.safetensors", "size_bytes": "6", "url": "u1"},
+                        {"filename": "metadata.json", "size_bytes": "2", "url": "u2"}]}
+    data = {"u1": b"abcdef", "u2": b"{}"}
+    gets = []
+
+    def get(url, **kwargs):
+        gets.append(url)
+        return _Response(data[url])
+
+    progress = []
+    paths = download_export(export, tmp_path, get=get, on_progress=lambda *a: progress.append(a), chunk_bytes=4)
+    assert [p.read_bytes() for p in paths] == [b"abcdef", b"{}"]
+    assert progress[-1] == (8, 8, 2, 2) and not list(tmp_path.rglob("*.partial"))
+    download_export(export, tmp_path, get=get)  # both whole already: nothing is fetched
+    assert gets == ["u1", "u2"]
+    with pytest.raises(DownloadCancelled):
+        download_export(export, tmp_path / "again", get=get, cancelled=lambda: True)
+    with pytest.raises(ValueError):
+        download_export({"files": [{"filename": "../x", "url": "u2"}]}, tmp_path, get=get)
+
+
+async def _run_download_button(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    import cortex_training.tui.checkpoint_view as view
+
+    calls = []
+
+    def fake_download(export, root, *, on_progress=None, cancelled=lambda: False):
+        calls.append((export["checkpoint_id"], root))
+        on_progress(10, 10, 1, 1)
+        return [root / "metadata.json"]
+
+    monkeypatch.setattr(view, "download_export", fake_download)
+    app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
+    async with app.run_test(size=(140, 50)) as pilot:
+        assert await _wait(pilot, lambda: isinstance(app.screen, LogScreen) and app.screen._sources_ready)
+        screen = app.screen
+        await pilot.press("c")
+        assert await _wait(pilot, lambda: screen._ckpt_loaded and screen._ckpt_highlighted == "cp_b")
+        await pilot.click("#ckpt-download")
+        ok = await _wait(pilot, lambda: "downloaded 1 files" in _text(screen, "#checkpoint-action-status"))
+        assert ok, (_text(screen, "#checkpoint-action-status"), calls, screen._ckpt_download)
+        assert calls == [("cp_b", tmp_path / "cortex-training-checkpoints" / "7" / "cp_b")]
+        assert "~/cortex-training-checkpoints/7/cp_b" in _text(screen, "#checkpoint-action-status")
+        await _settle(app, pilot)
+
+
+def test_download_button_downloads_the_highlighted_checkpoint(tmp_path, monkeypatch):
+    asyncio.run(_run_download_button(tmp_path, monkeypatch))
 
 
 async def _run_tab_states(client, expect):

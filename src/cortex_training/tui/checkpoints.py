@@ -29,6 +29,8 @@ import re
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import datetime
+from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any
 from typing import Optional
 from cortex_training.tui.format import parse_ts
@@ -256,3 +258,142 @@ def saves_no_checkpoints(job: Any) -> bool:
     none trains, so it has no checkpoints to list."""
     subs = job.get("sub_jobs") if isinstance(job, dict) else None
     return isinstance(subs, list) and bool(subs) and not training_sub_jobs(job)
+
+
+# ─── starting a job from a checkpoint ────────────────────────────────────────
+
+TRAINING = "training"
+SAMPLING = "sampling"
+BOTH = "both"
+USES = {TRAINING: "training", SAMPLING: "sampling", BOTH: "training + sampling"}
+
+# The sub-job fields a CreateJob body takes; a job record's others (ids, status,
+# times) are the service's own.
+_SUB_JOB_WIRE_FIELDS = ("job_type", "model_name", "global_batch_size", "dtype", "seed", "model_post_init",
+                        "training_config", "inference_config")
+
+
+def usable_for(kind: Optional[str]) -> dict:
+    """Use → why ``kind`` can't be used for it (None: it can). Sampling loads only
+    weights, so a resumable checkpoint starts a training sub-job only."""
+    no_sampling = "sampling needs a weights-only checkpoint" if kind == RESUMABLE else None
+    return {TRAINING: None, SAMPLING: no_sampling, BOTH: no_sampling}
+
+
+def _wire_sub_job(sj: dict, kind: str) -> dict:
+    out = {key: sj[key] for key in _SUB_JOB_WIRE_FIELDS if key in sj and sj[key] is not None}
+    out["job_type"] = kind
+    return compact_numbers(out)
+
+
+def _sampling_like(job: Any, trainer: Optional[dict]) -> Optional[dict]:
+    """The job's own sampling sub-job, else one for the trainer's model on one GPU."""
+    subs = job.get("sub_jobs") if isinstance(job, dict) else None
+    for sj in subs if isinstance(subs, list) else []:
+        if isinstance(sj, dict) and str(sj.get("job_type") or "").lower() == SAMPLING \
+                and isinstance(sj.get("inference_config"), dict):
+            return _wire_sub_job(sj, SAMPLING)
+    if trainer is None or not trainer.get("model_name"):
+        return None
+    inference: dict = {"n_gpus": 1}
+    seq = (trainer.get("training_config") or {}).get("max_seq_len")
+    if seq is not None:
+        inference["max_seq_len"] = seq
+    out = {"job_type": SAMPLING, "model_name": trainer["model_name"], "inference_config": inference}
+    if trainer.get("dtype"):
+        out["dtype"] = trainer["dtype"]
+    return compact_numbers(out)
+
+
+def new_job_body(job: Any, job_id: str, checkpoint_id: str, use: str) -> Optional[dict]:
+    """A CreateJob body for a new job that starts from ``checkpoint_id``: the source
+    job's training sub-job, its sampling sub-job, or both, as the job ran them, each
+    with ``source_checkpoint_info``. None when the job's record has no training
+    sub-job to copy."""
+    trainers = training_sub_jobs(job)
+    trainer = next((sj for sj in trainers if isinstance(sj.get("training_config"), dict)), None)
+    source = {"checkpoint_id": checkpoint_id, "source_job_id": job_id}
+    subs = []
+    if use in (TRAINING, BOTH):
+        if trainer is None:
+            return None
+        subs.append({**_wire_sub_job(trainer, TRAINING), "source_checkpoint_info": dict(source)})
+    if use in (SAMPLING, BOTH):
+        sampler = _sampling_like(job, trainer)
+        if sampler is None:
+            return None
+        subs.append({**sampler, "source_checkpoint_info": dict(source)})
+    body: dict = {"sub_job_configs": subs}
+    hardware = job.get("hardware") if isinstance(job, dict) else None
+    if isinstance(hardware, str) and hardware:
+        body["hardware"] = hardware
+    return body
+
+
+# ─── downloading ─────────────────────────────────────────────────────────────
+
+
+class DownloadCancelled(Exception):
+    """The download was stopped before it finished."""
+
+
+def local_path(root: Path, filename: str) -> Optional[Path]:
+    """Where ``filename`` (an export's relative name) goes under ``root``; None for a
+    name that would land outside it."""
+    parts = PurePosixPath(filename).parts
+    if not parts or PurePosixPath(filename).is_absolute() or any(part in ("..", "") for part in parts) \
+            or "\\" in filename:
+        return None
+    return root.joinpath(*parts)
+
+
+def download_export(export: Any, root: Path, *, get=None, on_progress=None, cancelled=lambda: False,
+                    chunk_bytes: int = 1 << 20) -> list:
+    """Download every file of ``export_checkpoint``'s answer under ``root``; return the paths.
+
+    A file already there at its exported size is kept, so a stopped download picks up
+    with the next file. Each file is written beside its final name and renamed into
+    place once whole. ``on_progress(done_bytes, total_bytes, files_done, files)`` is
+    called as bytes arrive; ``cancelled()`` stops it between chunks.
+    """
+    import requests
+
+    get = get or requests.get
+    raw = export.get("files") if isinstance(export, dict) else None
+    entries = [e for e in raw if isinstance(e, dict) and isinstance(e.get("filename"), str)
+               and isinstance(e.get("url"), str)] if isinstance(raw, list) else []
+    plan = []
+    for entry in entries:
+        path = local_path(root, entry["filename"])
+        if path is None:
+            raise ValueError(f"refusing to write {printable(entry['filename'])!r} outside {root}")
+        plan.append((path, entry["url"], _as_int(entry.get("size_bytes"))))
+    total = sum(size or 0 for _path, _url, size in plan)
+    done = 0
+    written = []
+    for index, (path, url, size) in enumerate(plan):
+        if cancelled():
+            raise DownloadCancelled()
+        if size is not None and path.is_file() and path.stat().st_size == size:
+            done += size
+            written.append(path)
+            if on_progress:
+                on_progress(done, total, index + 1, len(plan))
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        partial = path.with_name(path.name + ".partial")
+        with get(url, stream=True, timeout=(10, 60)) as response:
+            response.raise_for_status()
+            with open(partial, "wb") as out:
+                for chunk in response.iter_content(chunk_bytes):
+                    if cancelled():
+                        raise DownloadCancelled()
+                    out.write(chunk)
+                    done += len(chunk)
+                    if on_progress:
+                        on_progress(done, total, index, len(plan))
+        partial.replace(path)
+        written.append(path)
+        if on_progress:
+            on_progress(done, total, index + 1, len(plan))
+    return written

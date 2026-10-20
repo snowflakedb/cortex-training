@@ -263,6 +263,10 @@ class CortexTrainingLogTUI(App):
     #checkpoint-pane { height: 1fr; padding: 0 1; border-top: solid $panel; scrollbar-gutter: stable;
                        scrollbar-size-vertical: 1; }
     #checkpoint-detail { height: auto; }
+    #checkpoint-actions { height: 1; margin: 1 1 0 1; }
+    #checkpoint-actions Button { margin-right: 1; }
+    #ckpt-use-label { width: auto; color: $text-muted; margin: 0 1 0 2; }
+    #checkpoint-action-status { height: auto; margin: 0 1; }
     LogScreen > .screen--selection {
         background: $block-cursor-blurred-background;
         color: $block-cursor-blurred-foreground;

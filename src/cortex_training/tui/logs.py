@@ -118,7 +118,6 @@ from cortex_training.tui.widgets import is_shown
 from cortex_training.tui.widgets import on_stack
 from cortex_training.tui.resource_view import ResourceTab
 from cortex_training.tui.checkpoint_view import CheckpointTab
-from cortex_training.tui.widgets import SelectableTable
 
 
 class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
@@ -158,6 +157,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         # Checkpoints: s and o sort the list (on Logs, s saves the log; see check_action).
         Binding("s", "checkpoint_sort", "Sort"),
         Binding("o", "checkpoint_order", "Order"),
+        Binding("d", "checkpoint_download", "Download"),
     ]
 
     # Auto-fit the source labels until [ or ], while preserving the log's minimum.
@@ -288,10 +288,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
                         yield Static("", id="resource-charts")
                 yield _ColoredLinks("", id="resource-keys")  # the window selector, under the pane
             with TabPane("Checkpoints", id="checkpoints"):
-                yield Static("", id="checkpoint-status")
-                yield SelectableTable(id="checkpoint-table", cursor_type="row", zebra_stripes=True)
-                with VerticalScroll(id="checkpoint-pane"):
-                    yield Static("", id="checkpoint-detail")
+                yield from self._compose_checkpoint_tab()
         yield FittedFooter(id="footer")
 
     def on_mount(self) -> None:
@@ -579,7 +576,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
             return self._resource_active() and len(self._resource_sub_job_ids()) > 1
         if action == "cycle_window":
             return self._resource_active()
-        if action in ("checkpoint_sort", "checkpoint_order"):
+        if action in ("checkpoint_sort", "checkpoint_order", "checkpoint_download"):
             return self._checkpoints_active()
         return True
 
