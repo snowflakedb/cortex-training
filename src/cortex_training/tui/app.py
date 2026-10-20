@@ -241,8 +241,11 @@ class CortexTrainingLogTUI(App):
     #resource-list { width: 16; border-right: solid $panel; scrollbar-size-vertical: 1; }
     #resource-pane { height: 1fr; padding: 0 1; scrollbar-gutter: stable; scrollbar-size-vertical: 1; }
     #resource-status { color: $text-muted; height: auto; dock: top; }
+    #resource-kpis { height: auto; margin-top: 1; text-wrap: nowrap; text-overflow: clip; }
     #resource-stats { height: auto; margin-top: 1; }
+    #resource-stats.-empty { border: round $panel-lighten-2; padding: 1 2; }
     #resource-charts { height: auto; margin-top: 1; text-wrap: nowrap; text-overflow: clip; }
+    #resource-keys { height: 1; padding: 0 1; text-wrap: nowrap; text-overflow: clip; link-style: none; }
     #summary-body { padding: 1 1; scrollbar-gutter: stable; }
     #health { height: auto; margin: 1 0; }
     #subjobs-title { height: auto; margin-top: 1; }

@@ -941,30 +941,61 @@ for the next tab.
   window, sample age and scrape interval while the stats and charts scroll.
   - The focused left panel switches between `GPU Resources` and `System
     Resources`, then `ALL` (the mean) and each GPU or node. `↑`, `↓` or a click
-    selects an entry. Each unit shows its latest utilization; stale units are
-    dimmed, and a view with no rows reads `(none)`. A sub-job with only system
-    rows opens there.
+    selects an entry. Each unit shows its latest utilization after a four-cell
+    meter of it, filled in eighths and coloured by health (as the KPI tiles
+    below); stale units are dimmed, their meters faint, and a view with no rows
+    reads `(none)`. A sub-job with only system rows opens there.
   - The header compares requested and reporting GPUs, or shows reporting nodes,
     CPU count and memory per node. Multiplexed sub-jobs point to the sub-job
     whose GPUs report their shared telemetry. A unit over two minutes or three
     sample intervals behind its view's newest sample is stale. When the newest
     sample itself is over three minutes or six intervals old, the header warns
-    that no new samples are arriving and the windows end at that sample. It
-    also counts malformed or unsupported rows.
+    that no new samples are arriving and the windows end at that sample; a line
+    over the KPI strip says these are the last values received, the tiles go
+    faint and unjudged, and `GPUs reporting` reads `0/8`, an error. It also
+    counts malformed or unsupported rows.
+  - Under the header, a strip of KPI tiles for the GPU or node shown, or the
+    mean: `GPU util` (with the spread across GPUs, `84–95%`), `GPU memory`
+    (`95.9 / 141 GiB` and its %), `power` (and the total, `5.1 kW total`),
+    `temp` (and the hottest GPU) and `GPUs reporting` (`8/8`, against those
+    requested); the System view has `CPU util`, `memory` and `nodes
+    reporting`. Only metrics the rows have get a tile. Each is coloured by
+    health, and for the mean a tile is as healthy as its least healthy GPU or
+    node: GPU util under 50% warns; GPU memory used from 95% warns; GPU
+    temperature from 85 °C warns and from 90 °C is an error; CPU util from 95%
+    warns; node memory used from 90% warns and from 97% is an error; power
+    isn't judged. `GPUs reporting` warns below the GPUs requested and is an
+    error at none. On a narrow pane the details go from the right, then the
+    tiles wrap.
   - Numeric `_pct`, `_bytes`, `_watts` and `_c` fields become `%`, `GiB`, `W`
     and `°C` metrics. GPU and System begin with utilization and derived memory
     used; constant node CPU count and memory total stay in the header. Each
     metric has min, time-weighted average, max and latest stats for the window
-    and whole job, plus a chart (two per row at 90 cells or wider). Percentage
+    and whole job, plus a chart (two per row at 90 cells or wider). The stats
+    are a table: column heads right-aligned over their values, the latest in
+    bold, a rule between the window and the whole job. Each chart is an area
+    chart: the series' edge in the chart's colour over a faint fill of it, the
+    50% gridline running through the fill, and `◂` right of the newest column
+    on the row its value reaches. A bucket without a sample stays blank over a
+    broken baseline (`╌`), so a gap never reads as 0, and the marker is left
+    out when the newest bucket is a gap. Percentage
     axes are 0–100%; other axes use a stable rounded ceiling. `ALL` aggregates
     reporting units by sample interval; one missed node scrape is bridged,
     longer gaps remain gaps. History older than seven hours is folded into
     whole-job bins; `≤` or `≥` marks a late sample that makes the exact extreme
     unknowable.
   - `w` (or the header's window) cycles 10 minutes (the default), 30 minutes,
-    1 hour, 6 hours and the whole job.
+    1 hour, 6 hours and the whole job. The window selector at the bottom of
+    the tab, `window  10m  30m  1h  6h  all`, lights the window shown, and a
+    click on a segment shows that window. At its right end is `↑↓ GPU` (or
+    `↑↓ node`) when the view has more than one; the footer shows the other
+    keys.
   - Telemetry downloads when shown, refreshes every 30 seconds for a running
-    selected sub-job, and refreshes on `r`. Before it runs, the tab waits
+    selected sub-job, and refreshes on `r`. A view with nothing to chart shows
+    a quiet card instead of the stats and charts: a title (`Waiting for the
+    job to start`, `Waiting for the first samples`, `GPU metrics are on
+    another sub-job`, `CPU and memory aren't collected`, `No usable GPU
+    metrics`) over why. Before it runs, the tab waits
     without polling telemetry; a running sub-job without samples says they
     usually arrive after about a minute. A `log_probability` sub-job says it
     has no GPUs. A failed refresh keeps cached data and says
@@ -1109,7 +1140,7 @@ Keys in the job details view (`/`, `p`, `s`, `[` and `]` work on Logs):
 |-----|--------|
 | `l` `g` | Logs / Resources tab, as in the preview, except `l` on Logs (below) |
 | `t` | Next tab |
-| `w` | Cycle the window; so does a click on the window in the header (Resources) |
+| `w` | Cycle the window; so does a click on the window in the header, and a click on a window in the selector at the bottom shows it (Resources) |
 | `Space` | Next sub-job, round to the first after the last, when the job has two or more; the view stays, back to `ALL`. `<` / `>` go back / forward; a click on the sub-job's name in the header goes forward (Resources) |
 | `↑` `↓` | Pick GPU Resources or System Resources, `ALL` or one GPU or node in the panel; the charts follow the highlight (Resources) |
 | `/` | Filter the current source |

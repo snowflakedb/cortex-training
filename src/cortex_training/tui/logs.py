@@ -254,8 +254,10 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
                     yield _ResourceList(id="resource-list")
                     with VerticalScroll(id="resource-pane"):
                         yield _ColoredLinks("Select Resource to load GPU metrics.", id="resource-status")
+                        yield Static("", id="resource-kpis")
                         yield Static("", id="resource-stats")
                         yield Static("", id="resource-charts")
+                yield _ColoredLinks("", id="resource-keys")  # the window selector, under the pane
         yield FittedFooter(id="footer")
 
     def on_mount(self) -> None:
