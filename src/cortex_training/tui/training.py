@@ -3,31 +3,35 @@
 
 """Training metrics for the TUI's Training metrics tab: parsing, stats and charts.
 
-The zone saves the metrics a training sub-job's ``/fwd-bwd`` and ``/step``
-calls return to its own file, staged beside the GPU chunks;
+The zone saves the result of each of a training sub-job's ``/fwd-bwd`` and
+``/step`` calls to its own file, staged beside the GPU chunks;
 ``download_training_metrics`` reconstructs one
 ``<sub_job_id>/training.jsonl`` per sub-job in the TUI cache, next to the
 ``gpu.jsonl`` the Resources tab reads (see :mod:`resource`). A row is
-``"kind": "training"``, one per step for each call type::
+``"kind": "training"``, one per ``/fwd-bwd`` call and one per ``/step``::
 
-    {"kind": "training", "record_version": 1, "sub_job_id": "...:training:0",
-     "sample_ts": "2026-10-16T18:02:14Z", "op": "fwd_bwd", "step": 7,
-     "metrics": {"sum_loss": 0.0274, "num_calls": 2.0, "entropy": 0.8636}}
-    {"kind": "training", "record_version": 1, "sub_job_id": "...:training:0",
-     "sample_ts": "2026-10-16T18:02:14Z", "op": "step", "step": 7,
-     "metrics": {"grad_norm": 0.873, "last_lr": 1e-05}}
+    {"kind": "training", "record_version": 2, "sub_job_id": "...:training:0",
+     "sample_ts": "2026-10-16T18:02:14Z", "op": "fwd_bwd", "step": 3, "call": 1,
+     "metrics": {"avg_loss": 2.042, "rank": 0, "sft_model_calls": 1, "sft_packed_rows": 1}}
+    {"kind": "training", "record_version": 2, "sub_job_id": "...:training:0",
+     "sample_ts": "2026-10-16T18:02:14Z", "op": "step", "step": 3, "call": null,
+     "metrics": {"global_steps": 3, "grad_norm": 84.37, "last_lr": 1e-04,
+                 "update_successful": 1.0, "weight_delta_norm_rank0_sample": 0.145}}
 
-The ``fwd_bwd`` row combines every ``/fwd-bwd`` call of the step: ``sum_loss``
-is the sum of the calls' losses and ``num_calls`` is how many were combined.
-Whether a step's loss is that sum or its mean depends on how the loss was
-scaled, which the row deliberately leaves to the reader, so the tab charts
-both: ``mean_loss`` is derived here as ``sum_loss / num_calls`` (the usual
-reading), with ``sum_loss`` beside it. ``num_calls`` itself is a count, not a
-measurement, so it gets no chart of its own.
+Each row carries the numbers its call's result has, as the client got them, so
+nothing is computed here either. The tab has two views of them:
 
-Every other finite number in ``metrics`` is a metric, charted against the step.
-Two rows of one call type and step (a step run again after a resume) keep the
-later one in the file.
+- **per step**: each ``step`` row's metrics, against the step;
+- **per call**: each ``fwd_bwd`` row's metrics, against the call, in the order
+  the calls ran, each call tagged with the step it counted toward.
+
+A call's ``step`` is null when the zone hadn't yet seen a ``/step`` (a job's
+first calls, or the first after the zone restarted); such a call is taken with
+the ``step`` row that follows it, unless that row can't be read, and then it
+stays unattributed. Two ``step`` rows for one step (a step run again after a
+resume) keep the later one whole; every call is kept, since each one ran. A row
+seen twice (same ``seq_epoch`` and ``seq``) counts once. Rows of an earlier
+record version are counted, not read: they combined a step's calls.
 
 :class:`TrainingLoader` reads only what the download committed since its last
 read. Pure stdlib, NO ``textual`` import, like ``resource.py``.
@@ -54,18 +58,24 @@ from cortex_training.tui.resource import _printable_name
 from cortex_training.tui.resource import _read_manifest
 
 KIND = "training"
-RECORD_VERSION = 1
+# 2: a row per call. Version 1 combined a step's calls into one row; its rows are counted, not read.
+RECORD_VERSION = 2
 # The file ``download_training_metrics`` writes per sub-job.
 FILE_NAME = "training.jsonl"
-# Derived from a fwd_bwd row's ``sum_loss`` and ``num_calls`` (see the module docstring).
-MEAN_LOSS = "mean_loss"
-# Shown first, in this order, when a sub-job has them; the rest follow in the order the file first has them.
-LEADING_METRICS = (MEAN_LOSS, "sum_loss", "grad_norm", "last_lr")
-# Numbers in ``metrics`` that count or label rather than measure, so they get no chart.
-_NOT_METRICS = frozenset({"num_calls", "rank"})
-# A metric name is drawn as it is, so only plain names are read; anything else counts the row as skipped.
+OP_FWD_BWD = "fwd_bwd"
+OP_STEP = "step"
+
+# The two views ``v`` switches between.
+VIEW_STEP = "step"
+VIEW_CALL = "call"
+VIEWS = (VIEW_STEP, VIEW_CALL)
+DEFAULT_VIEW = VIEW_STEP
+VIEW_NAMES = {VIEW_STEP: "per step", VIEW_CALL: "per call"}
+# Shown first in a view, in this order, when its rows have them; the rest follow in the order the
+# file first has them.
+LEADING_METRICS = {VIEW_STEP: ("grad_norm", "last_lr"), VIEW_CALL: ("avg_loss",)}
+# A metric name is drawn as it is, so only plain names are read; anything else is passed over.
 _NAME = re.compile(r"[A-Za-z0-9_.:/-]{1,64}")
-_OP = re.compile(r"[a-z0-9_]{1,32}")
 # The fast filter: a line without this can't be a training row, and isn't parsed.
 _MARK = b'"training"'
 
@@ -83,43 +93,47 @@ def next_window(window: int | None) -> int | None:
     return WINDOWS[(index + 1) % len(WINDOWS)]
 
 
+def next_view(view: str) -> str:
+    index = VIEWS.index(view) if view in VIEWS else 0
+    return VIEWS[(index + 1) % len(VIEWS)]
+
+
 # ─── snapshots ───────────────────────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
 class MetricSeries:
-    """One metric of one sub-job: its values by step, in step order."""
+    """One metric of one sub-job, in x order: by step in the per-step view, by call in the per-call view."""
 
     name: str
-    op: str
-    steps: tuple[int, ...]
+    xs: tuple[int, ...]
     values: tuple[float, ...]
 
-    def window(self, first_step: int | None) -> tuple[tuple[int, ...], tuple[float, ...]]:
-        """The steps and values from ``first_step`` on (every one when None)."""
-        if first_step is None:
-            return self.steps, self.values
-        start = _bisect_left(self.steps, first_step)
-        return self.steps[start:], self.values[start:]
+    def window(self, first_x: int | None) -> tuple[tuple[int, ...], tuple[float, ...]]:
+        """The xs and values from ``first_x`` on (every one when None)."""
+        if first_x is None:
+            return self.xs, self.values
+        start = _bisect_left(self.xs, first_x)
+        return self.xs[start:], self.values[start:]
 
 
 @dataclass(frozen=True)
 class WindowStats:
     count: int
     latest: float
-    latest_step: int
+    latest_x: int
     low: float
-    low_step: int
+    low_x: int
     high: float
-    high_step: int
+    high_x: int
 
 
-def window_stats(steps: tuple[int, ...], values: tuple[float, ...]) -> WindowStats | None:
+def window_stats(xs: tuple[int, ...], values: tuple[float, ...]) -> WindowStats | None:
     if not values:
         return None
     low = min(range(len(values)), key=values.__getitem__)
     high = max(range(len(values)), key=values.__getitem__)
-    return WindowStats(len(values), values[-1], steps[-1], values[low], steps[low], values[high], steps[high])
+    return WindowStats(len(values), values[-1], xs[-1], values[low], xs[low], values[high], xs[high])
 
 
 @dataclass(frozen=True)
@@ -127,16 +141,42 @@ class SubJobTraining:
     """One sub-job's training metrics, as of one read."""
 
     sub_job_id: str
-    metrics: tuple[MetricSeries, ...]
-    last_step: int | None
+    step_metrics: tuple[MetricSeries, ...]
+    call_metrics: tuple[MetricSeries, ...]
+    # The step each call (numbered from 1, in the order the calls ran) counted toward; None for
+    # calls after the newest step row that the zone couldn't yet tag.
+    call_steps: tuple[int | None, ...]
+    last_step: int | None  # the newest step row's step
     newest: datetime | None  # the newest row's ``sample_ts``
     skipped: int  # training rows that couldn't be read
+    old_format: int = 0  # rows of an earlier record version, saved before this format and not read
+    hidden_names: int = 0  # metric names left out because they can't be drawn as they are
+
+    @property
+    def calls(self) -> int:
+        return len(self.call_steps)
+
+    def metrics(self, view: str) -> tuple[MetricSeries, ...]:
+        return self.call_metrics if view == VIEW_CALL else self.step_metrics
 
     def first_step(self, window: int | None) -> int | None:
         """The first step ``window`` shows: the last ``window`` steps up to the newest one."""
         if window is None or self.last_step is None:
             return None
         return self.last_step - window + 1
+
+    def first_x(self, view: str, window: int | None) -> int | None:
+        """Where ``view``'s window starts: a step, or the first call of the window's first step."""
+        first = self.first_step(window)
+        if view != VIEW_CALL or first is None:
+            return first
+        for call, step in enumerate(self.call_steps, start=1):
+            if step is None or step >= first:
+                return call
+        return self.calls + 1  # no call in the window
+
+    def step_of_call(self, call: int) -> int | None:
+        return self.call_steps[call - 1] if 1 <= call <= self.calls else None
 
 
 @dataclass(frozen=True)
@@ -159,71 +199,124 @@ def _finite(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _whole(value: Any, low: int) -> int | None:
+    """``value`` when it is an int of at least ``low`` (not a bool), else None."""
+    return value if not isinstance(value, bool) and isinstance(value, int) and value >= low else None
+
+
+def _numbers(metrics: dict) -> Iterable[tuple[str, float]]:
+    for name, raw in metrics.items():
+        value = _finite(raw)
+        if value is not None and isinstance(name, str) and _NAME.fullmatch(name):
+            yield name, value
+
+
 class _SubJobState:
     """What one file's training rows hold so far."""
 
     def __init__(self, sub_job_id: str) -> None:
         self.sub_job_id = sub_job_id
-        # metric key -> {step: value}; dicts keep the order the file first has each metric.
-        self.values: dict[str, dict[int, float]] = {}
-        self.ops: dict[str, str] = {}  # metric key -> the call type its rows are
+        # metric -> {step: value} and metric -> {call: value}; dicts keep the order the file first
+        # has each metric.
+        self.step_values: dict[str, dict[int, float]] = {}
+        self.call_values: dict[str, dict[int, float]] = {}
+        self.call_steps: list[int | None] = []  # index call - 1
+        self.untagged: list[int] = []  # calls with no step yet, for the next step row
+        self.seen: set[tuple[str, int]] = set()  # (seq_epoch, seq) of rows read, so a re-sent row counts once
         self.newest: datetime | None = None
         self.last_step: int | None = None
         self.skipped = 0
+        self.old_format = 0  # rows of an earlier record version, which this client doesn't read
+        self.hidden_names = 0  # metric names left out because they can't be drawn as they are
+
+    def has_rows(self) -> bool:
+        return bool(self.step_values or self.call_steps or self.last_step is not None or self.skipped
+                    or self.old_format)
+
+    def _skip(self, op: Any) -> None:
+        self.skipped += 1
+        if op == OP_STEP:
+            # The step these calls counted toward was this unreadable row, so the next step row is
+            # not theirs: they stay unattributed rather than land on the wrong step.
+            self.untagged.clear()
 
     def ingest(self, doc: dict) -> None:
-        if doc.get("record_version") != RECORD_VERSION:
-            self.skipped += 1  # a version this client doesn't read
+        version = doc.get("record_version")
+        op = doc.get("op")
+        if version != RECORD_VERSION:
+            if _whole(version, 1) is not None and version < RECORD_VERSION:
+                self.old_format += 1
+            else:
+                self._skip(op)  # a version this client doesn't read yet, or not a version at all
             return
         sub_job = doc.get("sub_job_id")
-        op = doc.get("op")
-        step = doc.get("step")
         metrics = doc.get("metrics")
+        raw_step, raw_call = doc.get("step"), doc.get("call")
+        step, call_tag = _whole(raw_step, 0), _whole(raw_call, 1)
         if (
             (sub_job is not None and sub_job != self.sub_job_id)
-            or not isinstance(op, str) or not _OP.fullmatch(op)
-            or isinstance(step, bool) or not isinstance(step, int) or step < 0
             or not isinstance(metrics, dict)
+            or (raw_step is not None and step is None)
+            or op not in (OP_FWD_BWD, OP_STEP)
+            or (op == OP_STEP and (step is None or raw_call is not None))
+            or (op == OP_FWD_BWD and raw_call is not None and call_tag is None)
         ):
-            self.skipped += 1
+            self._skip(op)
             return
-        for name, raw in metrics.items():
-            value = _finite(raw)
-            if value is None or name in _NOT_METRICS or not isinstance(name, str) or not _NAME.fullmatch(name):
-                continue
-            # The same name from two call types is two metrics: the second is named with its call type.
-            key = name if self.ops.setdefault(name, op) == op else f"{op}/{name}"
-            self.ops.setdefault(key, op)
-            self.values.setdefault(key, {})[step] = value
-        self._derive_mean_loss(op, step, metrics)
-        self.last_step = step if self.last_step is None else max(self.last_step, step)
+        key = (doc.get("seq_epoch"), doc.get("seq"))
+        if isinstance(key[0], str) and _whole(key[1], 0) is not None:
+            if key in self.seen:
+                return  # a chunk delivered twice: the row is already counted
+            self.seen.add(key)
+        values = dict(_numbers(metrics))
+        self.hidden_names += sum(1 for raw in metrics.values() if _finite(raw) is not None) - len(values)
+        if op == OP_FWD_BWD:
+            self.call_steps.append(step)
+            call = len(self.call_steps)
+            if step is None:
+                self.untagged.append(call)
+            for name, value in values.items():
+                self.call_values.setdefault(name, {})[call] = value
+        else:
+            # A step run again (after a resume) replaces its earlier row whole, so the two runs'
+            # metrics never mix in one step.
+            for by_step in self.step_values.values():
+                by_step.pop(step, None)
+            for name, value in values.items():
+                self.step_values.setdefault(name, {})[step] = value
+            # The calls the zone couldn't tag ran before this step, so they counted toward it.
+            for call in self.untagged:
+                self.call_steps[call - 1] = step
+            self.untagged.clear()
+            # The newest step row's step, not the highest: after a resume, the job is back there.
+            self.last_step = step
         moment = parse_ts(doc.get("sample_ts"))
         if moment is not None and (self.newest is None or moment > self.newest):
             self.newest = moment
 
-    def _derive_mean_loss(self, op: str, step: int, metrics: dict) -> None:
-        """A row's mean loss per call, from ``sum_loss`` and ``num_calls`` (see the module docstring).
-
-        Left out when the row has no ``num_calls``, or none above zero: the sum
-        is then the only loss the row supports, and a made-up divisor would
-        chart a number the service never reported.
-        """
-        total = _finite(metrics.get("sum_loss"))
-        calls = _finite(metrics.get("num_calls"))
-        if total is None or calls is None or calls < 1:
-            return
-        self.ops.setdefault(MEAN_LOSS, op)
-        self.values.setdefault(MEAN_LOSS, {})[step] = total / calls
-
     def snapshot(self) -> SubJobTraining:
-        order = [name for name in LEADING_METRICS if name in self.values]
-        order += [name for name in self.values if name not in LEADING_METRICS]
-        metrics = []
-        for name in order:
-            by_step = self.values[name]
-            steps = tuple(sorted(by_step))
-            metrics.append(MetricSeries(name, self.ops[name], steps, tuple(by_step[s] for s in steps)))
-        return SubJobTraining(self.sub_job_id, tuple(metrics), self.last_step, self.newest, self.skipped)
+        return SubJobTraining(
+            self.sub_job_id,
+            _series({name: by_step for name, by_step in self.step_values.items() if by_step},
+                    LEADING_METRICS[VIEW_STEP]),
+            _series(self.call_values, LEADING_METRICS[VIEW_CALL]),
+            tuple(self.call_steps),
+            self.last_step,
+            self.newest,
+            self.skipped,
+            self.old_format,
+            self.hidden_names,
+        )
+
+
+def _series(values: dict[str, dict[int, float]], leading: tuple[str, ...]) -> tuple[MetricSeries, ...]:
+    order = [name for name in leading if name in values] + [name for name in values if name not in leading]
+    out = []
+    for name in order:
+        by_x = values[name]
+        xs = tuple(sorted(by_x))
+        out.append(MetricSeries(name, xs, tuple(by_x[x] for x in xs)))
+    return tuple(out)
 
 
 def parse_lines(sub_job_id: str, lines: Iterable[bytes], state: _SubJobState | None = None) -> _SubJobState:
@@ -282,7 +375,7 @@ class TrainingLoader:
             for path in _training_files(self._root):
                 sub_job_id = path.parent.name
                 state = self._read(sub_job_id, path)
-                if state is not None and (state.values or state.skipped):
+                if state is not None and state.has_rows():
                     found[sub_job_id] = state.snapshot()
             return TrainingData(found)
 
@@ -324,11 +417,11 @@ def load_training_data(metrics_root: Path) -> TrainingData:
     return TrainingLoader(metrics_root).load()
 
 
-def _bisect_left(steps: tuple[int, ...], target: int) -> int:
-    low, high = 0, len(steps)
+def _bisect_left(xs: tuple[int, ...], target: int) -> int:
+    low, high = 0, len(xs)
     while low < high:
         middle = (low + high) // 2
-        if steps[middle] < target:
+        if xs[middle] < target:
             low = middle + 1
         else:
             high = middle
@@ -357,25 +450,25 @@ def format_step(step: int | None) -> str:
     return "—" if step is None else f"{step:,}"
 
 
-def _columns(steps: tuple[int, ...], values: tuple[float, ...], first: int, last: int,
+def _columns(xs: tuple[int, ...], values: tuple[float, ...], first: int, last: int,
              width: int) -> list[float | None]:
-    """The chart's columns from step ``first`` to ``last``: the mean of the steps each covers,
-    None where none has a value. With fewer steps than columns, each step is as many columns wide."""
+    """The chart's columns from x ``first`` to ``last``: the mean of the xs each covers, None
+    where none has a value. With fewer xs than columns, each x is as many columns wide."""
     span = last - first + 1
     count = min(width, span)
-    per_step = max(1, width // span) if span <= width else 1
+    per_x = max(1, width // span) if span <= width else 1
     sums = [0.0] * count
     hits = [0] * count
-    for step, value in zip(steps, values):
-        column = (step - first) * count // span
+    for x, value in zip(xs, values):
+        column = (x - first) * count // span
         if 0 <= column < count:
             sums[column] += value
             hits[column] += 1
     columns = [sums[i] / hits[i] if hits[i] else None for i in range(count)]
-    return [value for value in columns for _ in range(per_step)]
+    return [value for value in columns for _ in range(per_x)]
 
 
-def _step_labels(first: int, last: int, chart_width: int) -> str:
+def _x_labels(first: int, last: int, chart_width: int) -> str:
     left, right = format_step(first), format_step(last)
     if first == last or chart_width < len(left) + len(right) + 1:
         return right.rjust(chart_width) if chart_width >= len(right) else ""
@@ -405,17 +498,17 @@ def _shade(hue: str, share: float) -> str:
     return "#" + "".join(f"{round(int(hue[i:i + 2], 16) * level):02x}" for i in (1, 3, 5))
 
 
-def chart_spans(series: MetricSeries, first_step: int | None, width: int, *, height: int = 6,
+def chart_spans(series: MetricSeries, first_x: int | None, width: int, *, height: int = 6,
                 hue: str | None = None) -> list[list[tuple[str, str]]]:
-    """``series``'s chart from ``first_step`` on, as lines of ``(text, style)`` spans.
+    """``series``'s chart from ``first_x`` on, as lines of ``(text, style)`` spans.
 
     The y axis runs from the window's lowest value to its highest (a loss
     doesn't start at 0, and a policy loss can be negative), labelled at the
-    top, middle and bottom; the x axis is the step, labelled under the bars.
-    With a ``hue``, the bars are in it, lighter toward the top, and the frame
-    is muted; without one, every style is empty.
+    top, middle and bottom; the x axis is the step or the call, labelled under
+    the bars. With a ``hue``, the bars are in it, lighter toward the top, and
+    the frame is muted; without one, every style is empty.
     """
-    steps, values = series.window(first_step)
+    xs, values = series.window(first_x)
     if not values:
         return [[("no samples in this window", CHART_AXIS if hue else "")]]
     low, high = min(values), max(values)
@@ -426,11 +519,11 @@ def chart_spans(series: MetricSeries, first_step: int | None, width: int, *, hei
     axis = max(len(label) for label in labels)
     height = max(2, height)
     inner = max(1, width - axis - 2)
-    # The window's first step, but never before the series' own first step: a window
-    # reaching back past the job's history would otherwise start the axis at a step
-    # that never ran (step 0, for a job's first steps) and leave its columns blank.
-    first = steps[0] if first_step is None else max(first_step, series.steps[0])
-    columns = _columns(steps, values, first, steps[-1], inner)
+    # The window's first x, but never before the series' own first x: a window reaching back
+    # past the job's history would otherwise start the axis at a step that never ran (step 0,
+    # for a job's first steps) and leave its columns blank.
+    first = xs[0] if first_x is None else max(first_x, series.xs[0])
+    columns = _columns(xs, values, first, xs[-1], inner)
     # Shifted so the lowest value is the bottom of the chart; it still draws one eighth of a row.
     shifted = [None if value is None else value - low for value in columns]
     scale = high - low
@@ -451,7 +544,7 @@ def chart_spans(series: MetricSeries, first_step: int | None, width: int, *, hei
             line.append((cells, bar(level)))
         lines.append(line)
     lines.append([(f"{labels[2]:>{axis}} └{'─' * chart_width}", axis_style)])
-    lines.append([(" " * (axis + 2) + _step_labels(first, steps[-1], chart_width), axis_style)])
+    lines.append([(" " * (axis + 2) + _x_labels(first, xs[-1], chart_width), axis_style)])
     return lines
 
 
@@ -467,16 +560,20 @@ def _runs(cells: str) -> list[str]:
     return runs
 
 
-def no_metrics_text(sub_job_label: str, status: str, *, training: bool, downloaded: bool) -> str:
-    """Why the tab has no training metrics for a sub-job."""
+def no_metrics_text(sub_job_label: str, status: str, *, training: bool, downloaded: bool,
+                    view: str = DEFAULT_VIEW, old_format: int = 0) -> str:
+    """Why the tab has nothing to show for a sub-job in ``view``."""
+    if old_format:
+        return (f"{sub_job_label}'s {old_format:,} training rows were saved in an earlier format, which "
+                "combined each step's calls; this version of the tab reads one row per call and step")
     if not training:
         return f"{sub_job_label} is not a training sub-job: only training sub-jobs save training metrics"
     if status in ("pending", "placing", "initializing", "queued"):
-        return f"no training metrics yet: {sub_job_label} is {status.upper()} (the first rows arrive after its first step)"
+        return f"no training metrics yet: {sub_job_label} is {status.upper()} (the first rows arrive after its first call)"
     if not downloaded:
         return "loading training metrics…"
+    what = "calls" if view == VIEW_CALL else "steps"
     if status == "running":
-        return (f"no training metrics yet: {sub_job_label} is RUNNING; a row is saved at each step, "
+        return (f"no {what} saved yet: {sub_job_label} is RUNNING; a row is saved for each call and step, "
                 "and rows reach the stage in batches")
-    return f"{sub_job_label} saved no training metrics"
-
+    return f"{sub_job_label} saved no {what}"

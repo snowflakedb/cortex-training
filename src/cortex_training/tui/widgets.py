@@ -54,6 +54,7 @@ from textual.widgets import ListView
 from textual.widgets import Log
 from textual.widgets import Static
 from textual.widgets import TabbedContent
+from textual.widgets import TabPane
 from textual.widgets.data_table import RowDoesNotExist
 from cortex_training.tui import theme
 from cortex_training.tui import views
@@ -106,10 +107,21 @@ def after_refresh(screen: Screen, fn, *args, **kwargs) -> None:
 
 
 class JobTabs(TabbedContent):
-    """Job tabs that report width changes caused by the keys panel."""
+    """Job tabs that report width changes caused by the keys panel, and that only a tab key
+    or a click on a tab changes."""
 
     def on_resize(self, event: events.Resize) -> None:
         self.screen._tabs_resized()
+
+    def _on_tab_pane_focused(self, event: TabPane.Focused) -> None:
+        """Don't switch to the pane a widget was focused in, as TabbedContent does.
+
+        That message is queued when the focus moves, so it can be handled after a tab key
+        that came later: the screen focuses its Logs panel as it opens, and an `m` or `c`
+        pressed in that moment was switched straight back to Logs. Every focus this screen
+        sets is already in the tab on screen, so following it never changes anything else.
+        """
+        event.stop()
 
 
 def call_on_screen(screen: Screen, fn, *args, **kwargs) -> bool:

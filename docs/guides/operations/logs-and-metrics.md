@@ -45,9 +45,9 @@ cortex-training tui JOB_ID
 The **Logs** tab tails a running job or loads its saved console after it
 finishes. The **Resources** tab charts the selected sub-job's GPU use and lists
 each GPU; `w` cycles 10 minutes (the default), 30 minutes, 1 hour, 6 hours, or
-the whole job, and `r` refreshes. The **Training metrics** tab charts the
-training sub-job's loss and other step metrics against the step, and the **Checkpoints** tab lists
-the job's saved checkpoints and how to use each. Run `cortex-training tui` without a job id
+the whole job, and `r` refreshes. The **Training metrics** tab charts what the
+training sub-job's calls returned, per step (`grad_norm`, `last_lr`, …) or per
+`/fwd-bwd` call (`avg_loss`, …) with `v`. Run `cortex-training tui` without a job id
 to browse and search your jobs first. See [Job TUI](../../reference/cli.md#job-tui).
 
 Recipe-level metrics are also written under each recipe's `log_path`.

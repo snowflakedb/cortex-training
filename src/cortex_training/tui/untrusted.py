@@ -22,8 +22,8 @@ from typing import Any
 
 from cortex_training.tui.views import printable_data
 
-# The client methods whose answers are job (or checkpoint) records.
-_RECORD_READS = frozenset({"get_job", "list_jobs", "list_jobs_page", "list_checkpoints"})
+# The client methods whose answers are job records.
+_RECORD_READS = frozenset({"get_job", "list_jobs", "list_jobs_page"})
 
 # A job's location, which the account-wide list names. These are SQL identifiers that
 # route the job's calls (JobClients.for_job), not text to draw: made printable, a name

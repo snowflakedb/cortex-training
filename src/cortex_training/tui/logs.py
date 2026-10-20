@@ -174,7 +174,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
     _DATA_REFRESH_SECONDS = 30
     _STATUS_REFRESH_SECONDS = 60
     _LOG_ONLY = {"save_log", "cycle_level", "toggle_pause", "shrink_sources", "grow_sources", "filter", "jump"}
-        # The tabs, in the order t cycles them, and their names.
+    # The tabs, in the order t cycles them, and their names.
     _TABS = ("logs", "resource", "training", "checkpoints")
     _TAB_NAMES = {"logs": "Logs", "resource": "Resources", "training": "Training metrics", "checkpoints": "Checkpoints"}
 
@@ -367,7 +367,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
             return None
 
     def _tab_job(self) -> dict:
-        """The job as this screen knows it, with its newest status, for the Training metrics and Checkpoints tabs."""
+        """The job as this screen knows it, with its newest status, for the Training metrics tab."""
         return {**self._job, "status": self._job_status or self._job.get("status")}
 
     def _download_training_metrics(self, *, priority, on_commit, cancelled) -> bool:

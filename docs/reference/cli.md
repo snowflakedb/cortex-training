@@ -1139,27 +1139,33 @@ next tab, round to Logs after the last.
     `cached · refresh failed: …`. Data is kept in the TUI's per-location job
     cache; the selected sub-job and its newest cached samples
     appear first, and later opens download only new chunks.
-- **Training metrics** charts the training sub-job's step metrics, read from
-  its own `training.jsonl`
-  ([Training metrics download](rest-api.md#125-training-metrics-download)):
-  `mean_loss`, `sum_loss`, `grad_norm` and `last_lr` first, then every other
-  metric in the order the rows have them.
-  - A row carries `sum_loss` (the sum of the step's `/fwd-bwd` losses) and
-    `num_calls`, not a mean, since whether a step's loss is the sum or the mean
-    depends on how the loss was scaled. The tab charts both: `mean_loss` is
-    `sum_loss / num_calls`, the usual reading. A row with no usable `num_calls`
-    gets no `mean_loss` rather than a made-up divisor; `num_calls` itself is a
-    count, so it gets no chart.
-  - The header names the sub-job, its newest step, the age of the newest row
-    and the window, and with two or more training sub-jobs its place among
-    them. `Space` shows the next one. Unreadable rows are counted there.
-  - Per metric: latest, min and max over the window, each with the step it came
-    at, then a chart per metric against the step, two per row at 90 cells or
-    wider. The y axis spans the window's own lowest and highest value, since a
-    loss rarely starts at 0 and a policy loss can be negative; with more steps
-    than columns a column is the mean of the steps it covers.
+- **Training metrics** charts what the training sub-job's `/step` and
+  `/fwd-bwd` calls returned, read from its own `training.jsonl`
+  ([Training metrics download](rest-api.md#125-training-metrics-download)),
+  which holds a row per call with that call's numbers as the client got them.
+  Nothing is computed: the tab shows each saved number as it is. `v` switches
+  between two views:
+  - **Per step** (the default): every number in each `/step` result, against
+    the step: `grad_norm` and `last_lr` first, then the rest in the order the
+    rows have them (`global_steps`, `update_successful`, `weight_delta_*`, …).
+  - **Per call**: every number in each `/fwd-bwd` result and its `metrics`,
+    against the call, numbered in the order the calls ran: `avg_loss` first,
+    then the rest (`rank`, `sft_model_calls`, `sft_packed_rows`, or whatever
+    the loss function returns). Each call keeps its own `avg_loss`; a step with
+    two calls shows two points.
+  - The header names the sub-job, its newest step, how many calls were saved,
+    the age of the newest row, the view and the window, and with two or more
+    training sub-jobs its place among them. `Space` shows the next one.
+    Unreadable rows are counted there.
+  - Per metric: latest, min and max over the window, each with where it came
+    from (`0.8 @ 2` per step; `0.8 @ 4 (2)` per call: call 4, of step 2), then
+    a chart per metric, two per row at 90 cells or wider. The y axis spans the
+    window's own lowest and highest value, since a loss rarely starts at 0 and
+    a policy loss can be negative; with more steps or calls than columns, a
+    column is the mean of the ones it covers.
   - `w` cycles all steps (the default), the last 100 and the last 1,000,
-    counted back from the newest step.
+    counted back from the newest step. Per call, the window holds those steps'
+    calls, and the calls of a step still running.
   - It downloads when shown, refreshes on `r`, and re-reads every 30 seconds
     while a live job's tab is showing, reading only the rows added since. The
     file sits in the same per-location cache as the Resources tab's and is
@@ -1358,9 +1364,10 @@ Keys in the job details view (`/`, `e`, `n`, `p`, `s`, `[` and `]` work on Logs;
 
 | Key | Action |
 |-----|--------|
-| `l` `g` `m` `c` | Logs / Resources / Training metrics / Checkpoints tab, as in the preview, except `l` on Logs (below) |
+| `l` `g` `m` | Logs / Resources / Training metrics tab, as in the preview, except `l` on Logs (below) |
 | `t` | Next tab, round to Logs after the last |
 | `w` | Cycle the window; so does a click on the window in the header, and a click on a window in the selector at the bottom shows it (Resources); `w` also cycles all steps, the last 100 and the last 1,000 (Training metrics) |
+| `v` | Per step or per call (Training metrics) |
 | `Space` | Next sub-job, round to the first after the last, when the job has two or more; the view stays, back to `ALL`. `<` / `>` go back / forward; a click on the sub-job's name in the header goes forward (Resources). On Training metrics, the next training sub-job |
 | `↑` `↓` | Pick GPU Resources or System Resources, `ALL` or one GPU or node in the panel; the charts follow the highlight (Resources) |
 | `/` | Filter the current source |

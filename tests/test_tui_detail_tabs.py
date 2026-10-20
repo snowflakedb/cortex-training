@@ -1,11 +1,12 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The job screen's Training metrics and Checkpoints tabs (``tui/detail_tabs.py``), in the app."""
+"""The job screen's Training metrics tab (``tui/detail_tabs.py``), in the app."""
 
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -14,7 +15,6 @@ import pytest
 
 pytest.importorskip("textual")
 
-from textual.widgets import DataTable  # noqa: E402
 from textual.widgets import Static  # noqa: E402
 from textual.widgets import TabbedContent  # noqa: E402
 
@@ -33,9 +33,12 @@ def _isolated_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(widgets_module, "_ERROR_LOG", str(tmp_path / "errors.log"))
 
 
-def _row(step, op="fwd_bwd", **metrics):
-    return {"kind": "training", "record_version": 1, "sub_job_id": TRAINING, "sample_ts": "2026-10-19T10:00:00Z",
-            "seq": step, "seq_epoch": "e", "op": op, "step": step, "metrics": metrics}
+_SEQ = itertools.count(1)  # each row its own seq: rows with the same (seq_epoch, seq) count once
+
+
+def _row(step, op="fwd_bwd", call=None, **metrics):
+    return {"kind": "training", "record_version": 2, "sub_job_id": TRAINING, "sample_ts": "2026-10-19T10:00:00Z",
+            "seq": next(_SEQ), "seq_epoch": "e", "op": op, "step": step, "call": call, "metrics": metrics}
 
 
 def _download(rows):
@@ -68,16 +71,14 @@ def _client(sub_jobs=None, status="RUNNING"):
         ],
     }
     c.tail_logs.return_value = {"entries": [], "next_cursor": "", "eof": True}
+    # Two steps of two calls each, as the zone saves them: a row per call and a row per step.
     c.download_training_metrics.side_effect = _download([
-        _row(1, sum_loss=4.0, num_calls=2.0), _row(1, op="step", grad_norm=0.9, last_lr=1e-5),
-        _row(2, sum_loss=2.0, num_calls=2.0), _row(2, op="step", grad_norm=0.5, last_lr=1e-5),
+        _row(1, call=1, avg_loss=2.1, rank=0), _row(1, call=2, avg_loss=1.9, rank=0),
+        _row(1, op="step", grad_norm=0.9, last_lr=1e-5, global_steps=1.0),
+        _row(2, call=1, avg_loss=1.2, rank=0), _row(2, call=2, avg_loss=0.8, rank=0),
+        _row(2, op="step", grad_norm=0.5, last_lr=1e-5, global_steps=2.0),
+        _row(None, call=1, avg_loss=0.7, rank=0),  # step 3's first call, before the zone saw a /step
     ])
-    c.list_checkpoints.return_value = [
-        {"checkpoint_id": "global_step1", "global_steps": 1, "avg_loss": 2.0, "created_at": "2026-10-19T10:00:00Z",
-         "checkpoint_type": "resumable"},
-        {"checkpoint_id": "global_step2", "global_steps": 2, "avg_loss": 1.0, "created_at": "2026-10-19T10:05:00Z",
-         "checkpoint_type": "weights-only"},
-    ]
     return c
 
 
@@ -117,16 +118,30 @@ def test_training_tab_downloads_and_draws_each_metric():
             assert await _wait(pilot, lambda: screen.query_one("#job-tabs", TabbedContent).active == "training")
             assert c.download_training_metrics.call_args.kwargs["priority"] == [TRAINING]
             status = _text(screen, "#training-status")
-            assert "training #0" in status and "step 2" in status and "all steps (w)" in status
+            assert "training #0" in status and "step 2" in status and "5 calls" in status
+            assert "per step (v)" in status and "all steps (w)" in status
+            # Per step: the step rows' numbers, as saved.
             stats = _text(screen, "#training-stats")
-            assert [line.split()[0] for line in stats.splitlines()[1:]] == \
-                ["mean_loss", "sum_loss", "grad_norm", "last_lr"]
-            assert "1 @ 2" in stats  # the derived mean loss at step 2: 2.0 / 2 calls
+            assert [line.split()[0] for line in stats.splitlines()[1:]] == ["grad_norm", "last_lr", "global_steps"]
+            assert "0.5 @ 2" in stats  # grad_norm's latest, at step 2
             charts = _text(screen, "#training-charts")
-            # num_calls is the mean's divisor, not a chart of its own.
-            assert "mean_loss · all steps" in charts and "num_calls" not in charts
+            assert "grad_norm · per step · all steps" in charts and "avg_loss" not in charts
+
+            # Per call: each call's numbers, as saved, numbered in the order they ran with each one's step.
+            await pilot.press("v")
+            status = _text(screen, "#training-status")
+            assert "per call (v)" in status
+            stats = _text(screen, "#training-stats")
+            assert "latest @ call (step)" in stats
+            assert [line.split()[0] for line in stats.splitlines()[1:]] == ["avg_loss", "rank"]
+            assert "0.7 @ 5 (next)" in stats  # the newest call: its step is the one still running
+            assert "2.1 @ 1 (1)" in stats  # the max: call 1, of step 1
+            assert "avg_loss · per call · all steps" in _text(screen, "#training-charts")
+
             await pilot.press("w")
             assert "last 100 steps (w)" in _text(screen, "#training-status")
+            await pilot.press("v")
+            assert "per step (v)" in _text(screen, "#training-status")
             await _settle(app, pilot)
 
     asyncio.run(run())
@@ -168,12 +183,32 @@ def test_t_cycles_through_every_tab():
         async with app.run_test(size=(120, 40)) as pilot:
             screen = await _open(app, pilot)
             tabs = screen.query_one("#job-tabs", TabbedContent)
-            seen = []
-            for _ in range(4):
+            # Each press is waited for, and the tab it lands on settled, before the next: one pause
+            # can end before a loaded run has handled the key.
+            for expected in ("resource", "training", "checkpoints", "logs"):
                 await pilot.press("t")
-                await pilot.pause()
-                seen.append(tabs.active)
-            assert seen == ["resource", "training", "checkpoints", "logs"]
+                assert await _wait(pilot, lambda: tabs.active == expected and screen._active_tab == expected), \
+                    f"t did not reach {expected} (on {tabs.active})"
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def test_a_tab_key_pressed_as_the_screen_opens_stays_on_its_tab():
+    # The screen focuses its Logs panel as it opens, and the tabs used to follow that focus back to
+    # Logs when the queued focus message was handled after a quicker tab key.
+    async def run():
+        app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("m")  # before the screen has finished opening
+            assert await _wait(pilot, lambda: isinstance(app.screen, LogScreen) and app.screen._sources_ready)
+            screen = app.screen
+            tabs = screen.query_one("#job-tabs", TabbedContent)
+            await pilot.press("m")
+            assert await _wait(pilot, lambda: tabs.active == "training")
+            for _ in range(20):  # and it stays there
+                await pilot.pause(0.01)
+                assert tabs.active == "training"
             await _settle(app, pilot)
 
     asyncio.run(run())
@@ -188,6 +223,25 @@ def test_opens_on_a_new_tab_when_asked():
             app.push_screen(LogScreen(c, "7", initial_tab="training", poll_interval=0.01))
             assert await _wait(pilot, lambda: app.screen.query_one("#training-tab")._downloaded)
             assert app.screen.query_one("#job-tabs", TabbedContent).active == "training"
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def test_a_job_saved_in_the_earlier_format_says_so_instead_of_nothing_saved():
+    async def run():
+        c = _client()
+        old = {"kind": "training", "record_version": 1, "sub_job_id": TRAINING, "op": "fwd_bwd", "step": 1,
+               "metrics": {"sum_loss": 4.0, "num_calls": 2.0}}
+        c.download_training_metrics.side_effect = _download([old, {**old, "op": "step", "metrics": {}}])
+        app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = await _open(app, pilot)
+            await pilot.press("m")
+            pane = screen.query_one("#training-tab")
+            assert await _wait(pilot, lambda: pane._downloaded and not pane._loading)
+            assert "saved in an earlier format" in _text(screen, "#training-stats")
+            assert "2 rows in an earlier format not shown" in _text(screen, "#training-status")
             await _settle(app, pilot)
 
     asyncio.run(run())

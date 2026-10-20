@@ -5,13 +5,13 @@
 
 The tab is one widget that reads and draws its own data, so the job screen
 only places it, tells it when it is shown (:meth:`activate`) and when a live
-job's periodic refresh is due (:meth:`refresh_live`). A tab reads the job as
-the screen knows it through the ``job`` callable it is given, and the Training
-metrics tab fetches its rows through the screen's ``download``, which writes
-into the same cache directory as the Resources tab, under the same lock.
+job's periodic refresh is due (:meth:`refresh_live`). It reads the job as the
+screen knows it through the ``job`` callable it is given, and fetches its rows
+through the screen's ``download``, which writes into the same cache directory
+as the Resources tab, under the same lock.
 
-The panes' keys (``w``, ``Space``, ``r``) are their own bindings, which win over
-the screen's while the focus is inside the pane.
+The pane's keys (``v``, ``w``, ``Space``, ``r``) are its own bindings, which win
+over the screen's while the focus is inside the pane.
 """
 
 from __future__ import annotations
@@ -90,20 +90,12 @@ class _Pane(Vertical):
             node = node.parent
         return False
 
-    def claim_focus(self, *, from_inside: bool = False) -> None:
-        """Put the focus where this tab's keys work.
+    def claim_focus(self) -> None:
+        """Put the focus where this tab's keys work, when this is the tab on screen.
 
-        Only while this is the tab on screen. Called when the tab is shown and when its
-        data arrives, because either can happen first: a read that answers before the
-        activation is processed would otherwise leave the focus in the tab this one
-        replaced, with the arrow keys doing nothing here.
-
-        The focus is left alone once it is inside this pane, where the user may have
-        moved it, except when ``from_inside``: the widget it is on has just been
-        replaced as the place the keys work (a list that was still loading when the tab
-        was shown, and now has rows to arrow through).
+        The focus is left alone once it is inside this pane, where the user may have moved it.
         """
-        if not self.is_active_tab() or (self.holds_focus() and not from_inside):
+        if not self.is_active_tab() or self.holds_focus():
             return
         try:
             self.screen.set_focus(self.focus_target())
@@ -159,9 +151,10 @@ _CHART_HEIGHT = 6
 
 
 class TrainingPane(_Pane):
-    """One sub-job's training metrics: stats over the window, and a chart per metric against the step."""
+    """One sub-job's training metrics, per step or per call: stats over the window, and a chart per metric."""
 
     BINDINGS = [
+        Binding("v", "cycle_view", "Per step/call"),
         Binding("w", "cycle_window", "Window"),
         Binding("space", "next_sub_job", "Sub-job", key_display="space"),
         Binding("r", "refresh", "Refresh"),
@@ -175,6 +168,7 @@ class TrainingPane(_Pane):
         self._data = training.TrainingData()
         self._downloaded = False  # a download finished: a sub-job without rows has none
         self._window = training.DEFAULT_WINDOW
+        self._view = training.DEFAULT_VIEW  # per step, or per /fwd-bwd call
         self._pick: str | None = None  # the sub-job Space last showed
 
     def compose(self) -> ComposeResult:
@@ -202,7 +196,7 @@ class TrainingPane(_Pane):
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         if action == "next_sub_job":
             return len(self._sub_job_ids()) > 1
-        if action == "cycle_window":
+        if action in ("cycle_window", "cycle_view"):
             return self._source() is not None
         return True
 
@@ -216,6 +210,10 @@ class TrainingPane(_Pane):
 
     def action_cycle_window(self) -> None:
         self._window = training.next_window(self._window)
+        self.redraw()
+
+    def action_cycle_view(self) -> None:
+        self._view = training.next_view(self._view)
         self.redraw()
 
     # ── reading ──
@@ -291,11 +289,11 @@ class TrainingPane(_Pane):
         source = self._source()
         sub_job = self._data.get(source)
         status.update(self._status_text(source, sub_job))
-        if sub_job is None or not sub_job.metrics:
+        if sub_job is None or not sub_job.metrics(self._view):
             stats.update(self._empty_text(source))
             charts.update("")
             return
-        first = sub_job.first_step(self._window)
+        first = sub_job.first_x(self._view, self._window)
         width = self._width()
         stats.update(self._stats_text(sub_job, first, width))
         charts.update(self._charts_text(sub_job, first, width))
@@ -309,11 +307,14 @@ class TrainingPane(_Pane):
             text.append(views.sub_job_label(source), style="bold")
             if len(ids) > 1:
                 text.append(f" ({ids.index(source) + 1} of {len(ids)}, space for next)", style=CHART_MUTED)
-        if sub_job is not None and sub_job.last_step is not None:
-            text.append(f"  ·  step {training.format_step(sub_job.last_step)}")
+        if sub_job is not None and (sub_job.last_step is not None or sub_job.calls):
+            if sub_job.last_step is not None:
+                text.append(f"  ·  step {training.format_step(sub_job.last_step)}")
+            text.append(f"  ·  {sub_job.calls:,} call{'s' if sub_job.calls != 1 else ''}")
             if sub_job.newest is not None:
                 text.append(f"  ·  newest row {views.fmt_ago(sub_job.newest, datetime.now(timezone.utc))}")
         if source is not None:
+            text.append(f"  ·  {training.VIEW_NAMES[self._view]} (v)")
             text.append(f"  ·  {training.window_label(self._window)} (w)")
         notes = []
         if self._loading:
@@ -324,6 +325,12 @@ class TrainingPane(_Pane):
         if sub_job is not None and sub_job.skipped:
             notes.append((f"{sub_job.skipped:,} training row{'s' if sub_job.skipped != 1 else ''} skipped "
                           "(malformed or unsupported)", _WARNING))
+        if sub_job is not None and sub_job.old_format:
+            notes.append((f"{sub_job.old_format:,} row{'s' if sub_job.old_format != 1 else ''} in an earlier "
+                          "format not shown", _WARNING))
+        if sub_job is not None and sub_job.hidden_names:
+            notes.append((f"{sub_job.hidden_names:,} value{'s' if sub_job.hidden_names != 1 else ''} with "
+                          "a name that can't be shown as it is", _WARNING))
         text.append("\n")
         for index, (note, style) in enumerate(notes):
             text.append(("  ·  " if index else "") + note, style=style)
@@ -340,21 +347,31 @@ class TrainingPane(_Pane):
         if not views.is_live(job) and status not in ("unknown", "?"):
             status = views.status_word(job.get("status"))
         is_training = not entry or views.sub_job_kind(entry) == "training"
+        sub_job = self._data.get(source)
         return Text(training.no_metrics_text(views.sub_job_label(source), status, training=is_training,
-                                             downloaded=self._downloaded))
+                                             downloaded=self._downloaded, view=self._view,
+                                             old_format=sub_job.old_format if sub_job else 0))
+
+    def _at(self, sub_job: training.SubJobTraining, x: int) -> str:
+        """Where a value is from: its step, or its call and (in parentheses) that call's step."""
+        if self._view != training.VIEW_CALL:
+            return training.format_step(x)
+        step = sub_job.step_of_call(x)
+        return f"{training.format_step(x)} ({training.format_step(step) if step is not None else 'next'})"
 
     def _stats_text(self, sub_job: training.SubJobTraining, first: int | None, width: int) -> Text:
         rows = []
-        for series in sub_job.metrics:
+        for series in sub_job.metrics(self._view):
             found = training.window_stats(*series.window(first))
             if found is None:
                 rows.append((series.name, "—", "—", "—"))
                 continue
             rows.append((series.name,
-                         f"{training.format_metric(found.latest)} @ {training.format_step(found.latest_step)}",
-                         f"{training.format_metric(found.low)} @ {training.format_step(found.low_step)}",
-                         f"{training.format_metric(found.high)} @ {training.format_step(found.high_step)}"))
-        header = ("metric", "latest @ step", "min @ step", "max @ step")
+                         f"{training.format_metric(found.latest)} @ {self._at(sub_job, found.latest_x)}",
+                         f"{training.format_metric(found.low)} @ {self._at(sub_job, found.low_x)}",
+                         f"{training.format_metric(found.high)} @ {self._at(sub_job, found.high_x)}"))
+        where = "call (step)" if self._view == training.VIEW_CALL else "step"
+        header = ("metric", f"latest @ {where}", f"min @ {where}", f"max @ {where}")
         widths = [max(len(row[i]) for row in [header, *rows]) for i in range(4)]
         text = Text()
         text.append("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(header)).rstrip()[:width] + "\n",
@@ -370,7 +387,7 @@ class TrainingPane(_Pane):
         gap = 3
         chart_width = (width - gap * (per_row - 1)) // per_row
         blocks = [self._chart_block(series, first, chart_width, chart_hue(index))
-                  for index, series in enumerate(sub_job.metrics)]
+                  for index, series in enumerate(sub_job.metrics(self._view))]
         text = Text()
         for start in range(0, len(blocks), per_row):
             row = blocks[start:start + per_row]
@@ -389,9 +406,9 @@ class TrainingPane(_Pane):
 
     def _chart_block(self, series: training.MetricSeries, first: int | None, width: int,
                      hue: str) -> list[list[tuple[str, str]]]:
-        steps, values = series.window(first)
+        _xs, values = series.window(first)
         latest = training.format_metric(values[-1]) if values else "—"
-        title = f"{series.name} · {training.window_label(self._window)}"
+        title = f"{series.name} · {training.VIEW_NAMES[self._view]} · {training.window_label(self._window)}"
         room = width - len(latest) - 1
         title = title if len(title) <= room else title[: max(0, room - 1)] + "…"
         head = [(title, hue), (" " * max(1, width - len(title) - len(latest)), ""), (latest, f"bold {hue}")]
