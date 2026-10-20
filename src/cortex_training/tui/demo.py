@@ -202,6 +202,11 @@ UNAVAILABLE = "unavailable"
 _ACTIVE = ("pending", "queued", "placing", "initializing", "creating", "running")
 
 
+def _mean_loss(fwd_bwd: dict) -> float:
+    """A step's loss per call, as the TUI derives it from a row (``sum_loss / num_calls``)."""
+    return fwd_bwd["sum_loss"] / fwd_bwd["num_calls"]
+
+
 def _http_error(status: int, message: str) -> requests.HTTPError:
     """The error the client raises for a service answer of ``status`` with ``message``."""
     response = requests.Response()
@@ -506,6 +511,102 @@ class DemoClient:
             if on_commit is not None:
                 on_commit(dict(written[-1]))
         return written
+
+    def _training_metrics(self, job: dict, sj: dict, k: int) -> tuple[dict, dict]:
+        """Step ``k``'s ``fwd_bwd`` and ``step`` metrics, as the service saves them; the log's step lines agree."""
+        rng = random.Random(f"train{job['job_id']}:{k}")
+        lr = float(sj["training_config"]["optimizer"]["lr"])
+        if self._kinds.get(job["job_id"]) == "rl":
+            calls = 4.0
+            mean = 0.04 * math.exp(-k / 150) + rng.gauss(0, 0.006)
+            fwd_bwd = {
+                "sum_loss": mean * calls,
+                "num_calls": calls,
+                "approx_kl": 0.002 + 0.03 * (1 - math.exp(-k / 300)) + abs(rng.gauss(0, 0.003)),
+                "entropy": 0.95 - 0.35 * (1 - math.exp(-k / 250)) + rng.gauss(0, 0.01),
+                "clip_frac": max(0.0, 0.08 * math.exp(-k / 200) + rng.gauss(0, 0.005)),
+            }
+            return fwd_bwd, {"grad_norm": rng.uniform(0.2, 0.9), "last_lr": lr}
+        calls = 2.0
+        mean = 0.38 + 1.9 * math.exp(-k / 150) + abs(rng.gauss(0, 0.03))
+        fwd_bwd = {"sum_loss": mean * calls, "num_calls": calls}
+        return fwd_bwd, {"grad_norm": rng.uniform(0.3, 1.2), "last_lr": lr * min(1.0, (k + 1) / 50)}
+
+    def download_training_metrics(self, job_id: str, output_dir, *, resume: bool = False, priority=(),
+                                  on_commit=None) -> list:
+        """The client's training-metrics download, generated: one ``training.jsonl`` per training sub-job."""
+        job = self._on_stage(job_id)
+        self._check_experiment(job)
+        if job["status"] in ("PLACING", "PENDING") or job.get("reason") in _NEVER_PLACED:
+            return []
+        end = self._clock() if job["status"] == "RUNNING" else datetime.fromisoformat(
+            job["state_changed_at"].replace("Z", "+00:00"))
+        written = []
+        first = list(priority)
+        ordered = sorted(job["sub_jobs"],
+                         key=lambda sj: first.index(sj["sub_job_id"]) if sj["sub_job_id"] in first else len(first))
+        for sj in ordered:
+            if views.sub_job_kind(sj) != "training":
+                continue  # only a training sub-job has these rows
+            rows = self._training_rows(job, sj, end)
+            if not rows:
+                continue
+            path = Path(output_dir) / sj["sub_job_id"] / "training.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = ("\n".join(rows) + "\n").encode("utf-8")
+            path.write_bytes(data)
+            manifest = path.with_name("." + path.name + ".manifest.json")
+            manifest.write_text(json.dumps({
+                "version": 1,
+                "names": [f"_metrics/{sj['sub_job_id']}/training.demo.jsonl.gz"],
+                "bytes": len(data),
+            }), encoding="utf-8")
+            written.append({"sub_job_id": sj["sub_job_id"], "path": str(path)})
+            if on_commit is not None:
+                on_commit(dict(written[-1]))
+        return written
+
+    def _training_rows(self, job: dict, sj: dict, end: datetime) -> list:
+        """The training sub-job's ``kind: "training"`` rows: a ``fwd_bwd`` and a ``step`` row per step run by ``end``."""
+        rows = []
+        seq = 0
+        for k, at in enumerate(self._step_times(job["job_id"])):
+            if at > end.timestamp():
+                break
+            stamp = datetime.fromtimestamp(at, timezone.utc).isoformat().replace("+00:00", "Z")
+            for op, metrics in zip(("fwd_bwd", "step"), self._training_metrics(job, sj, k)):
+                rows.append(json.dumps({
+                    "kind": "training", "record_version": 1, "sub_job_id": sj["sub_job_id"], "sample_ts": stamp,
+                    "seq": seq, "seq_epoch": "demo", "op": op, "step": k + 1, "request_id": None,
+                    "metrics": {name: round(value, 6) for name, value in metrics.items()},
+                }))
+                seq += 1
+        return rows
+
+    # ── checkpoints: a resumable one every _CHECKPOINT_EVERY steps, and a weights-only one at the end ──
+    _CHECKPOINT_EVERY = 200
+
+    def list_checkpoints(self, job_id: str) -> list:
+        job = self._on_stage(job_id)
+        times = self._step_times(job_id)
+        sj = next((sj for sj in job["sub_jobs"] if views.sub_job_kind(sj) == "training"), None)
+        if not times or sj is None:
+            return []
+        reached = [at for at in times if at <= self._clock().timestamp()]
+        out = []
+        for k, at in enumerate(reached):
+            step = k + 1
+            last = step == len(times) and job["status"] == "SUCCEEDED"
+            if step % self._CHECKPOINT_EVERY and not last:
+                continue
+            out.append({
+                "checkpoint_id": f"global_step{step}",
+                "global_steps": step,
+                "avg_loss": round(_mean_loss(self._training_metrics(job, sj, k)[0]), 4),
+                "created_at": datetime.fromtimestamp(at + 25, timezone.utc).isoformat().replace("+00:00", "Z"),
+                "checkpoint_type": "weights-only" if last else "resumable",
+            })
+        return out
 
     def _system_row(self, rng: random.Random, sid: str, node: int, gpus: int, t: float, phase: float, stamp: str,
                     seq: int, *, sampling: bool, loading: bool) -> dict:

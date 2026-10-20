@@ -232,7 +232,8 @@ class CortexTrainingLogTUI(App):
     #jobs:focus { background-tint: $foreground 0%; }
     #searchhelp { padding: 0 1 0 2; height: auto; background: $panel; }
     #sources { width: 16; border-right: solid $panel; }
-    #job-tabs, #job-tabs ContentSwitcher, #logs, #resource, #checkpoints, #logs-body {
+    #job-tabs, #job-tabs ContentSwitcher, #logs, #resource, #logs-body,
+    #training, #checkpoints, #training-tab {
         height: 1fr;
     }
     #logview { height: 1fr; padding: 0 1; }
@@ -273,6 +274,11 @@ class CortexTrainingLogTUI(App):
                          border-subtitle-align: right; }
     #checkpoint-origin-card { height: auto; margin-top: 1; padding: 0 1; border: round $border;
                               border-title-align: left; }
+    /* The Training metrics tab (detail_tabs.py): a header on top, as on Resources. */
+    #training-status { color: $text-muted; height: auto; padding: 0 1; }
+    #training-pane { height: 1fr; padding: 0 1; scrollbar-gutter: stable; scrollbar-size-vertical: 1; }
+    #training-stats { height: auto; margin-top: 1; text-wrap: nowrap; text-overflow: clip; }
+    #training-charts { height: auto; text-wrap: nowrap; text-overflow: clip; }
     LogScreen > .screen--selection {
         background: $block-cursor-blurred-background;
         color: $block-cursor-blurred-foreground;

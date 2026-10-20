@@ -66,6 +66,8 @@ from cortex_training.tui import views
 from cortex_training.tui.format import compact_stamp
 from cortex_training.tui.format import day_rule
 from cortex_training.tui.format import display_day
+from cortex_training._download_lock import DownloadLock
+from cortex_training.tui.detail_tabs import TrainingPane
 from cortex_training.tui.format import display_line
 from cortex_training.tui.widgets import _TimedTail
 from cortex_training.tui.widgets import _cache_job_id
@@ -153,6 +155,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         Binding("comma", "resource_sub_job(-1)", "Prev sub-job", show=False),
         Binding("full_stop", "resource_sub_job(1)", "Next sub-job", show=False),
         Binding("g", "show_tab('resource')", "Resources", show=False),
+        Binding("m", "show_tab('training')", "Training metrics", show=False),
         Binding("c", "show_tab('checkpoints')", "Checkpoints", show=False),
         # Checkpoints: s and o sort the list (on Logs, s saves the log; see check_action).
         Binding("s", "checkpoint_sort", "Sort"),
@@ -171,7 +174,9 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
     _DATA_REFRESH_SECONDS = 30
     _STATUS_REFRESH_SECONDS = 60
     _LOG_ONLY = {"save_log", "cycle_level", "toggle_pause", "shrink_sources", "grow_sources", "filter", "jump"}
-    _TABS = ("logs", "resource", "checkpoints")
+        # The tabs, in the order t cycles them, and their names.
+    _TABS = ("logs", "resource", "training", "checkpoints")
+    _TAB_NAMES = {"logs": "Logs", "resource": "Resources", "training": "Training metrics", "checkpoints": "Checkpoints"}
 
     class _Note(str):
         """A TUI-authored pane line distinguished by type, not text."""
@@ -287,6 +292,9 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
                         yield Static("", id="resource-stats")
                         yield Static("", id="resource-charts")
                 yield _ColoredLinks("", id="resource-keys")  # the window selector, under the pane
+            with TabPane("Training metrics", id="training"):
+                yield TrainingPane(self._client, self._job_id, self._metrics_root, job=self._tab_job,
+                                   download=self._download_training_metrics, id="training-tab")
             with TabPane("Checkpoints", id="checkpoints"):
                 yield from self._compose_checkpoint_tab()
         yield FittedFooter(id="footer")
@@ -313,6 +321,17 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
 
     def _focus_active_tab(self) -> None:
         try:
+            # Queued at mount (see on_mount). A tab key pressed before it runs has
+            # already switched the tabs, and focusing the tab left behind would put the
+            # focus in a hidden pane, which re-activates that pane and undoes the key
+            # (the alternating activations on_tabbed_content_tab_activated guards
+            # against). That activation focuses its own pane, so there is nothing to do.
+            if (self.query_one("#job-tabs", TabbedContent).active or "logs") != self._active_tab:
+                return
+            pane = self._detail_pane()
+            if pane is not None:
+                pane.activate()  # it claims the focus itself (see detail_tabs.claim_focus)
+                return
             focus = {"resource": "#resource-list", "checkpoints": "#checkpoint-table"}.get(self._active_tab, "#sources")
             self.set_focus(self.query_one(focus))
         except Exception:  # noqa: BLE001 - not mounted yet
@@ -338,6 +357,41 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
     def _resource_active(self) -> bool:
         return self._active_tab == "resource"
 
+    def _detail_pane(self):
+        """The Training metrics tab's pane, when it is shown (see detail_tabs.py)."""
+        if self._active_tab != "training":
+            return None
+        try:
+            return self.query_one(f"#{self._active_tab}-tab")
+        except NoMatches:  # not mounted yet
+            return None
+
+    def _tab_job(self) -> dict:
+        """The job as this screen knows it, with its newest status, for the Training metrics and Checkpoints tabs."""
+        return {**self._job, "status": self._job_status or self._job.get("status")}
+
+    def _download_training_metrics(self, *, priority, on_commit, cancelled) -> bool:
+        """Worker thread. The Training metrics tab's download: the zone's own training rows,
+        into the same cache directory as the Resources tab's GPU file and under the same
+        :class:`DownloadLock`, so the two tabs (and the CLI) don't write that directory at
+        once. The streams are separate, so this fetches its own chunks. False when the
+        screen closed (or ``cancelled()``) before the lock was taken."""
+        lock = DownloadLock(self._metrics_root)
+        if not lock.acquire(lambda: self._screen_open and not cancelled()):
+            return False
+        try:
+            self._client.download_training_metrics(
+                self._job_id,
+                self._metrics_root,
+                resume=True,
+                priority=priority,
+                on_commit=on_commit,
+                **_quiet_download(self._client.download_training_metrics),
+            )
+        finally:
+            lock.release()
+        return True
+
     def action_show_tab(self, tab: str) -> None:
         self.query_one("#job-tabs", TabbedContent).active = tab
 
@@ -354,10 +408,14 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         self.clear_selection()  # what was highlighted is on the tab left behind
         self.refresh_bindings()  # check_action scopes the footer's keys to the tab
         self._update_subtitle()  # the Logs tab's state shows only on Logs
+        focused = self.focused
+        if not self._logs_active() and focused is not None and focused.id in {"sources", "logview", "logfilter"}:
+            self._log_focus_id = focused.id
+        pane = self._detail_pane()
+        if pane is not None:
+            pane.activate()  # it claims the focus itself (see detail_tabs.claim_focus)
+            return
         if self._resource_active():
-            focused = self.focused
-            if focused is not None and focused.id in {"sources", "logview", "logfilter"}:
-                self._log_focus_id = focused.id
             self.set_focus(self.query_one("#resource-list", ListView))  # its arrows pick a view or unit
             self.call_after_refresh(self._render_resource)
             self._start_resource_refresh(force=False)
@@ -440,6 +498,10 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         self._rewrap_timer = self.set_timer(self._REWRAP_SETTLE_SECONDS, partial(after_refresh, self, self._rewrap))
 
     def action_refresh_sources(self) -> None:
+        pane = self._detail_pane()
+        if pane is not None:
+            pane.action_refresh()
+            return
         if self._resource_active():
             self._start_resource_refresh(force=True)
             return
@@ -911,7 +973,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         elif self._checkpoints_active():
             self.app.copy_everything(self, "the Checkpoints tab")
         else:
-            self.app.copy_everything(self, "the Resources tab")
+            self.app.copy_everything(self, f"the {self._TAB_NAMES[self._active_tab]} tab")
 
     def _load_sources(self) -> None:
         """UI thread. Read the job, then show its sub-jobs (see _read_sources)."""
@@ -1711,6 +1773,9 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
             self._start_resource_refresh(force=True)
         elif self._checkpoints_active():
             self._start_checkpoint_refresh(force=True)
+        pane = self._detail_pane()
+        if pane is not None:
+            pane.refresh_live()
 
     def _next_job_read(self) -> int:
         """Any thread. The number of a get_job about to be sent: a read sent later has a larger one."""
