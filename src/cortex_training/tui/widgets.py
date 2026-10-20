@@ -117,11 +117,15 @@ class JobTabs(TabbedContent):
         """Don't switch to the pane a widget was focused in, as TabbedContent does.
 
         That message is queued when the focus moves, so it can be handled after a tab key
-        that came later: the screen focuses its Logs panel as it opens, and an `m` or `c`
-        pressed in that moment was switched straight back to Logs. Every focus this screen
-        sets is already in the tab on screen, so following it never changes anything else.
+        that came later: the screen focuses its Logs panel as it opens, and an `m` pressed in
+        that moment was switched straight back to Logs. Every focus this screen sets is
+        already in the tab on screen, so following it never changes anything else.
+
+        ``prevent_default`` is what stops it: Textual also runs TabbedContent's own handler
+        for this message after this one, and only skips it when the default is prevented.
         """
         event.stop()
+        event.prevent_default()
 
 
 def call_on_screen(screen: Screen, fn, *args, **kwargs) -> bool:

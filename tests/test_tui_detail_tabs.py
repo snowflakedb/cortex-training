@@ -194,21 +194,22 @@ def test_t_cycles_through_every_tab():
     asyncio.run(run())
 
 
-def test_a_tab_key_pressed_as_the_screen_opens_stays_on_its_tab():
-    # The screen focuses its Logs panel as it opens, and the tabs used to follow that focus back to
-    # Logs when the queued focus message was handled after a quicker tab key.
+def test_focusing_a_widget_in_another_tab_does_not_switch_tabs():
+    # TabbedContent switches to whichever pane a widget is focused in, when it handles that message,
+    # which can be after a later tab key: the screen focuses its Logs panel as it opens, and an `m`
+    # pressed in that moment was switched straight back to Logs. Focusing the Logs panel while
+    # Training is shown is that message, arriving late, made deterministic.
     async def run():
         app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.press("m")  # before the screen has finished opening
-            assert await _wait(pilot, lambda: isinstance(app.screen, LogScreen) and app.screen._sources_ready)
-            screen = app.screen
+            screen = await _open(app, pilot)
             tabs = screen.query_one("#job-tabs", TabbedContent)
             await pilot.press("m")
             assert await _wait(pilot, lambda: tabs.active == "training")
-            for _ in range(20):  # and it stays there
+            screen.set_focus(screen.query_one("#sources"))
+            for _ in range(10):
                 await pilot.pause(0.01)
-                assert tabs.active == "training"
+            assert tabs.active == "training"
             await _settle(app, pilot)
 
     asyncio.run(run())
