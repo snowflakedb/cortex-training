@@ -424,7 +424,10 @@ def _is_transient(exc: BaseException) -> bool:
 
 
 def _sqlstate(exc: BaseException) -> str | None:
-    """Return the SQLSTATE of a failed SQL API statement, if the response has one."""
+    """Return the SQLSTATE of a failed statement, from the Connector or the SQL API."""
+    value = getattr(exc, "sqlstate", None)
+    if value:
+        return str(value)
     response = getattr(exc, "response", None)
     try:
         body = response.json() if response is not None else None
@@ -2269,11 +2272,15 @@ class CortexTrainingClient:
         return " ".join(parts)
 
     def _run_statement(self, statement: str) -> list[dict[str, Any]]:
-        """Run one SQL statement through the SQL API and return its rows.
+        """Run one SQL statement and return its rows.
 
-        Each row maps lower-case column names to values. Raises when the
-        statement fails or has not finished.
+        Profile clients use their Connector session, because the SQL API does
+        not accept its session token; PAT clients use the SQL API. Each row maps
+        lower-case column names to values. Raises when the statement fails or
+        has not finished.
         """
+        if self._auth_provider is not None:
+            return self._auth_provider.run_statement(statement)
         resp = self._send(
             "POST",
             f"{self.base_url}/api/v2/statements",

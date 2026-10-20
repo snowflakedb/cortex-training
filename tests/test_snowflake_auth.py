@@ -28,6 +28,27 @@ from cortex_training.snowflake_auth import SnowflakeTelemetryTokenProvider
 from cortex_training.snowflake_auth import rest_host
 
 
+class FakeCursor:
+    def __init__(self, columns=(), rows=(), error: Exception | None = None) -> None:
+        self.description = [(name, None) for name in columns] if columns else None
+        self._rows = list(rows)
+        self._error = error
+        self.executed = []
+        self.closed = False
+
+    def execute(self, statement, **kwargs):
+        self.executed.append((statement, kwargs))
+        if self._error is not None:
+            raise self._error
+        return self
+
+    def fetchall(self):
+        return self._rows
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class FakeConnection:
     def __init__(
         self,
@@ -35,11 +56,16 @@ class FakeConnection:
         server_url: str = "https://account.example:8443",
         database: str | None = "DB",
         schema: str | None = "SCHEMA",
+        cursor: FakeCursor | None = None,
     ) -> None:
         self.rest = SimpleNamespace(token=token, server_url=server_url)
         self.database = database
         self.schema = schema
         self.close_count = 0
+        self._cursor = cursor or FakeCursor()
+
+    def cursor(self) -> FakeCursor:
+        return self._cursor
 
     def close(self) -> None:
         self.close_count += 1
@@ -270,3 +296,27 @@ def test_rejected_pat_error_points_to_network_policy(exc) -> None:
     assert "Snowflake rejected your programmatic access token (PAT)." in message
     assert "Your user has no network policy." in message
     assert "authentication.md#network-policy-requirement" in message
+
+
+def test_run_statement_returns_rows_keyed_by_lower_case_column() -> None:
+    cursor = FakeCursor(columns=["created_on", "NAME"], rows=[("2026-01-01", "MY_DB")])
+    auth = SnowflakeProfileAuth("training-profile", connect_factory=lambda **_: FakeConnection(cursor=cursor))
+
+    assert auth.run_statement("SHOW DATABASES LIKE 'MY_DB'") == [{"created_on": "2026-01-01", "name": "MY_DB"}]
+    assert cursor.executed == [("SHOW DATABASES LIKE 'MY_DB'", {"timeout": 60})]
+    assert cursor.closed
+
+
+def test_run_statement_closes_the_cursor_when_the_statement_fails() -> None:
+    cursor = FakeCursor(error=RuntimeError("denied"))
+    auth = SnowflakeProfileAuth("training-profile", connect_factory=lambda **_: FakeConnection(cursor=cursor))
+
+    with pytest.raises(RuntimeError, match="denied"):
+        auth.run_statement("CREATE DATABASE IF NOT EXISTS MY_DB")
+    assert cursor.closed
+
+
+def test_run_statement_without_a_result_set_returns_no_rows() -> None:
+    auth = SnowflakeProfileAuth("training-profile", connect_factory=lambda **_: FakeConnection(cursor=FakeCursor()))
+
+    assert auth.run_statement("USE ROLE TRAINER") == []

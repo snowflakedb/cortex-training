@@ -9525,3 +9525,96 @@ def test_execution_log_filenames_keep_their_subdirectories(tmp_path, monkeypatch
     # Resume finds the nested file's record.
     again = c.download_execution_logs("job-1", tmp_path, resume=True)
     assert [r["unchanged"] for r in again] == [True, True]
+
+
+class _ConnectorSqlError(Exception):
+    """Stands in for a Connector ``ProgrammingError``, which carries ``sqlstate``."""
+
+    def __init__(self, sqlstate, message):
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
+
+class TestEnsureDatabaseForProfileClients:
+    """Profile clients run the database check on their Connector session, not the SQL API."""
+
+    @staticmethod
+    def _client(statements, schema="PUBLIC"):
+        c = CortexTrainingClient(
+            base_url="https://test.snowflakecomputing.com", database="MY_DB", schema=schema
+        )
+        c._session = MagicMock()
+        c._auth_provider = MagicMock()
+        c._auth_provider.get_token.return_value = "session-token"
+        c._auth_provider.run_statement.side_effect = statements
+        return c
+
+    @staticmethod
+    def _statements(c):
+        return [call.args[0] for call in c._auth_provider.run_statement.call_args_list]
+
+    def test_check_and_create_use_the_session_then_retry(self):
+        ok = _make_response({"jobs": []})
+        c = self._client([[], [{"status": "Database MY_DB successfully created."}]])
+        c._session.get.side_effect = [_make_error_response(_FAILED_REQUEST, 400), ok]
+
+        assert c._send("GET", f"{c.base_url}/test") is ok
+        assert self._statements(c) == [
+            "SHOW DATABASES LIKE 'MY_DB'",
+            "CREATE DATABASE IF NOT EXISTS MY_DB",
+        ]
+        c._session.post.assert_not_called()
+        assert c._session.get.call_count == 2
+
+    def test_listed_database_keeps_the_original_error(self):
+        c = self._client([[{"created_on": "2026-01-01", "name": "MY_DB"}]])
+        c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
+
+        with pytest.raises(nc.requests.exceptions.HTTPError, match="400 Client Error"):
+            c._send("GET", f"{c.base_url}/test")
+        assert self._statements(c) == ["SHOW DATABASES LIKE 'MY_DB'"]
+        c._session.post.assert_not_called()
+
+    def test_hidden_database_uses_the_connector_sqlstate(self):
+        c = self._client([
+            [],
+            _ConnectorSqlError("42710", "Database 'MY_DB' already exists, but current role has no privileges on it."),
+            [{"current_role()": "TRAINER"}],
+        ])
+        c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
+
+        with pytest.raises(nc.DatabaseAccessError) as exc:
+            c._send("GET", f"{c.base_url}/test")
+        assert str(exc.value).startswith("Database MY_DB exists, but role TRAINER can't access it.")
+        assert exc.value.exists is True
+
+    def test_no_create_privilege_uses_the_connector_sqlstate(self):
+        c = self._client([
+            [],
+            _ConnectorSqlError("42501", "Insufficient privileges to operate on account."),
+            [{"current_role()": "TRAINER"}],
+        ])
+        c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
+
+        with pytest.raises(nc.DatabaseAccessError) as exc:
+            c._send("GET", f"{c.base_url}/test")
+        assert str(exc.value).startswith("Role TRAINER can't find database MY_DB and can't create it.")
+
+    def test_failed_check_keeps_the_original_error(self):
+        c = self._client([RuntimeError("session expired")])
+        c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
+
+        with pytest.raises(nc.requests.exceptions.HTTPError, match="400 Client Error"):
+            c._send("GET", f"{c.base_url}/test")
+        assert self._statements(c) == ["SHOW DATABASES LIKE 'MY_DB'"]
+        assert c._db_ensured is True
+
+
+def test_sqlstate_reads_connector_errors_and_sql_api_bodies():
+    assert nc._sqlstate(_ConnectorSqlError("42710", "exists")) == "42710"
+    api_error = nc.requests.exceptions.HTTPError(
+        response=_make_error_response({"code": "003041", "sqlState": "42710", "message": "exists"}, 422)
+    )
+    assert nc._sqlstate(api_error) == "42710"
+    assert nc._sqlstate(RuntimeError("no state")) is None
+
