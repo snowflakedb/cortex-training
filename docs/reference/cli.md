@@ -987,8 +987,8 @@ out (the header names it too). Switch tabs with `l` (Logs) and `g`
   one sub-job at a time, the one selected in the list beside it, so its lines
   carry no sub-job tag; each starts with its time (`HH:MM:SS`), and its
   wrapped rows start under the end of that time. The list marks each sub-job
-  with its status's glyph and colour (`●` running, `◐` initializing, `○`
-  pending, `✕` failed, `✓` ended), with the status under its name; the one the
+  with its status's glyph and colour (`●` running, `◐` initializing, `◔`
+  placing, `○` pending, `✕` failed, `⊘` cancelled, `✓` ended, `?` unknown), with the status under its name; the one the
   pane shows has an accent edge and a bold name. Saved logs (`s`) and copies
   stay as the lines came, uncoloured. In the pane the time is faint, the level
   has its severity's colour (a warning's or an error's message is tinted to
@@ -1111,7 +1111,8 @@ right end are chips for what is found or set, in this order: where the last
 jump landed (`error 2/5` or `no errors` for `e` / `E`, `problem 2/5` or
 `no problems` for `n` / `N`), the level (`≥ WARNING`), and the filter's count
 (`12 matches`, over the whole saved console, or the lines the pane holds for a
-live tail). A re-wrap (a resize) keeps the jump's mark and chip.
+live tail). The jump's count follows the lines as they come and go (`error –/5`
+once the marked line has left the pane); a re-wrap (a resize) keeps its mark and chip.
 
 The line between the pane and that bar is the Logs tab's status line. It appears when the
 job read is slow, when the tail is waiting, paused, or restarted, when the

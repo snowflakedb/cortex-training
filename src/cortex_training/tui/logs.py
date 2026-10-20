@@ -65,7 +65,6 @@ from cortex_training.tui.format import compact_stamp
 from cortex_training.tui.format import day_rule
 from cortex_training.tui.format import display_day
 from cortex_training.tui.format import display_line
-from cortex_training.tui.format import is_day_rule
 from cortex_training.tui.widgets import _TimedTail
 from cortex_training.tui.widgets import _cache_job_id
 from cortex_training.tui.widgets import _quiet_download
@@ -189,6 +188,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         self._cache = LogCache(cache_job_id)
         self._source_by_item: dict[str, str] = {}
         self._source_items: dict[str, tuple[ListItem, Label]] = {}  # each sub-job's row (see _paint_sources)
+        self._source_labels: dict[str, str] = {}  # each sub-job's name in the list, from its record (job_type)
         self._logview: Log | None = None
         self._filter = ""  # grep substring for the log pane
         self._min_level = None  # None | INFO | WARNING | ERROR
@@ -362,7 +362,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         return max(self._SOURCES_MIN, width - self._LOG_MIN_WIDTH) if width else self._SOURCES_AUTO_MAX
 
     def _fitted_sources_width(self) -> int:
-        labels = [views.sub_job_label(sid) for sid in self._source_by_item.values()]
+        labels = [self._source_label(sid) for sid in self._source_by_item.values()]
         longest = max((views.cell_width(label) for label in labels), default=0) + 2  # with the "● " before it
         return min(self._SOURCES_AUTO_MAX, max(self._SOURCES_AUTO_MIN, longest + 4))
 
@@ -675,6 +675,18 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         lv.set_mark((first, end))
         lv.scroll_to(y=max(0, first - lv.scrollable_content_region.height // 3), animate=False)
         self._render_log_bar()
+
+    def _recount_jump(self) -> None:
+        """UI thread. The last jump's place among the lines the pane holds now: which of how many
+        the marked line is, or only how many once that line has left the pane."""
+        noun = self._jump[0]
+        wanted = next(kinds for kinds, name in self._JUMPS.values() if name == noun)
+        lv = self._logview
+        index = self._line_at_row(lv.mark[0]) if isinstance(lv, _LogPane) and lv.mark is not None else None
+        if index is None:
+            self._jump = (noun, 0, sum(kind in wanted for kind in self._shown_kinds))
+        else:
+            self._jump = (noun, *place_of(self._shown_kinds, index, wanted))
 
     def _line_rows(self, index: int) -> tuple[int, int]:
         """The pane rows [start, end) of line ``index`` of _shown_lines: its own, not its day's rule."""
@@ -1008,6 +1020,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         await lv.clear()  # await removal before re-appending src-* ids (see _populate)
         self._source_by_item = {}
         self._source_items = {}
+        self._source_labels = {}
         self._sources_ready = True
         self._sub_job_missing = False
         self._no_sources = why[1] if why is not None else None
@@ -1043,6 +1056,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             sid = s["sub_job_id"]
             item_id = f"src-{i}"
             self._source_by_item[item_id] = sid
+            self._source_labels[sid] = views.sub_job_label(s)  # its type as the preview and Resources name it
             label = Label(self._source_text(sid))
             item = ListItem(label, id=item_id)
             self._source_items[sid] = (item, label)  # (the label, before the item mounts it)
@@ -1060,6 +1074,9 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             self._render_resource()
             self._start_resource_refresh(force=False)
 
+    def _source_label(self, sid: str) -> str:
+        return self._source_labels.get(sid) or views.sub_job_label(sid)
+
     def _source_text(self, sid: str) -> Content:
         """A sub-job's row in the list: its status's glyph and name, and its status under them
         (the name bold for the one the pane shows)."""
@@ -1067,7 +1084,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         look = theme.status_look(word)
         shown = sid == self._current_source
         return Content.assemble((f"{look.glyph} ", look.color),
-                                (views.sub_job_label(sid), f"bold {theme.TEXT}" if shown else ""),
+                                (self._source_label(sid), f"bold {theme.TEXT}" if shown else ""),
                                 ("\n  " + word, theme.TEXT if shown else theme.FAINT))
 
     def _paint_sources(self) -> None:
@@ -2227,7 +2244,8 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         chips: list[tuple[str, str]] = []
         if self._jump is not None:
             noun, n, total = self._jump
-            chips.append(self._chip(f"{noun} {n:,}/{total:,}" if total else f"no {noun}s",
+            place = f"{n:,}" if n else "–"  # (the marked line has left the pane)
+            chips.append(self._chip(f"{noun} {place}/{total:,}" if total else f"no {noun}s",
                                     theme.ERR if noun == "error" else theme.WARN))
         if self._min_level:
             chips.append(self._chip(f"≥ {self._min_level}", theme.ERR if self._min_level == "ERROR" else
@@ -2833,8 +2851,13 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         if context is not None and not fresh:
             # Worked out for an empty pane, which this isn't (its callers clear it first): the
             # rules it put in go, and the kinds are worked out again after the lines on screen.
-            chunks = [(line, pieces[1:], count - 1) if count > 1 and is_day_rule(pieces[0]) else (line, pieces, count)
-                      for line, pieces, count in chunks]
+            rows, at = context[0], 0
+            unruled = []
+            for line, pieces, count in chunks:
+                ruled = count > 1 and at < len(rows) and rows[at] == DAY_KIND
+                unruled.append((line, pieces[1:], count - 1) if ruled else (line, pieces, count))
+                at += count
+            chunks = unruled
             kinds = context = None
         if context is None:
             if kinds is None:
@@ -2881,6 +2904,8 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             lv.refresh()
         if dropped:
             self._rule_the_top(width)
+        if self._jump is not None:
+            self._recount_jump()  # lines came (or went): the chip's count follows them
         if len(self._display_cache) > 4 * self._MAX_LINES:
             self._prune_display_cache()
 
@@ -3060,6 +3085,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             if 0 <= index < len(self._shown_lines) and isinstance(lv, _LogPane):
                 lv.set_mark(self._line_rows(index))
                 self._jump = job.mark[1]
+                self._recount_jump()
         if job.width != self._content_width():
             after_refresh(self, self._rewrap)  # the pane changed width meanwhile
         self._render_log_status()
@@ -3084,8 +3110,10 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             line = lines[index]
             return self._display(line) if isinstance(line, self._Note) else compact_stamp(self._display(line))
 
+        kinds = getattr(lv, "row_kinds", [])
+        rules = {row for row, kind in enumerate(kinds) if kind == DAY_KIND}
         return log_format.copied_text(rows, self._shown_rows, lambda index: lines[index], shown, start, end,
-                                      indent=self._line_prefixes()[1])
+                                      indent=self._line_prefixes()[1], rules=rules)
 
     def _line_at_row(self, row: int) -> int | None:
         """The index in ``_shown_lines`` of the line drawn on pane row ``row``."""

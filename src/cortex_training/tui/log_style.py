@@ -62,6 +62,9 @@ _EXCEPTION = re.compile(r"[A-Za-z_][\w.]*(?:Error|Exception|Exit|Interrupt|Warni
                         r"|[A-Za-z_][\w.]*: .*")
 
 NOTE_KIND = "note"  # a row of one of the TUI's own notes (see LogHighlighter.row_kind)
+# The row's kind isn't known (a plain Log, which doesn't keep them): a row that reads
+# like one of the TUI's notes is drawn as one. The Logs pane always says.
+UNKNOWN_KIND = "unknown"
 DAY_KIND = "day"  # the rule above the first line of a day (see format.day_rule)
 TRACEBACK_KIND = "traceback"  # the first line of a traceback ("Traceback (most recent call last):")
 TRACE_KIND = "traceback-body"  # a traceback's later lines: frames, code, chained causes, its exception
@@ -87,8 +90,9 @@ def _body(text: str) -> str:
 
 # Where a traceback stands after a line (see traceback_kind), as (phase, its lines so
 # far): no traceback, or the line was an error's (a traceback right under it is that
-# error's), or inside one, or just after its exception (another chained to it may follow).
-NO_PHASE, AFTER_ERROR, IN_TRACEBACK, AFTER_EXCEPTION = "", "error", "in", "after"
+# error's), or inside one, or just after its exception (blank lines and a chained
+# exception's sentence may follow), or after that sentence (the chained traceback follows).
+NO_PHASE, AFTER_ERROR, IN_TRACEBACK, AFTER_EXCEPTION, AFTER_CHAIN = "", "error", "in", "after", "chain"
 NO_TRACEBACK = (NO_PHASE, 0)  # the state before any line
 # A block this long has lost its end (a log cut short, or text that only looks like
 # one): the lines after it are drawn as they are.
@@ -103,7 +107,9 @@ def traceback_kind(text: str, kind: str | None, state: tuple = NO_TRACEBACK) -> 
     ``Traceback (most recent call last):`` to the exception line that ends it, with
     the exceptions chained to it ("The above exception was the direct cause …").
     The block is one stop for e: its first line, unless it is chained to the one
-    before or sits right under an error's line, which is then the stop.
+    before or sits right under an error's line, which is then the stop. Only the
+    chained-exception sentence chains the next traceback to the block: another one
+    straight after an exception is a block, and a stop, of its own.
 
     A line with a level of its own (``14:50:39 INFO …``) ends a block, as does its
     _MAX_TRACEBACK_LINES-th line: a traceback cut short, then indented text (a JSON
@@ -113,15 +119,21 @@ def traceback_kind(text: str, kind: str | None, state: tuple = NO_TRACEBACK) -> 
     phase, lines = state
     if kind is None and lines < _MAX_TRACEBACK_LINES:
         body = _body(text)
-        if body.lstrip().startswith(_TRACEBACK):
-            # (Inside one already: a chained one, its exception indented as an execution log's are.)
-            return (TRACEBACK_KIND if phase == NO_PHASE else TRACE_KIND), (IN_TRACEBACK, lines + 1)
-        if phase == IN_TRACEBACK:
-            if not body.strip() or body[0] in " \t" or body.startswith(_CHAIN):
-                return TRACE_KIND, (IN_TRACEBACK, lines + 1)
+        stripped = body.lstrip()
+        if stripped.startswith(_TRACEBACK):
+            # Chained to the block (the sentence said so), or the traceback of the error's line
+            # above; else a block of its own.
+            first = phase not in (AFTER_ERROR, AFTER_CHAIN)
+            return (TRACEBACK_KIND if first else TRACE_KIND), (IN_TRACEBACK, 1 if first else lines + 1)
+        if phase in (IN_TRACEBACK, AFTER_EXCEPTION, AFTER_CHAIN) and stripped.startswith(_CHAIN):
+            # (Indented too, as an execution log's record shows its chain.)
+            return TRACE_KIND, (AFTER_CHAIN, lines + 1)
+        if phase in (IN_TRACEBACK, AFTER_CHAIN):
+            if not body.strip() or body[0] in " \t":
+                return TRACE_KIND, (phase, lines + 1)
             if _EXCEPTION.fullmatch(body):  # its exception: the block ends here, or a chained one follows
                 return TRACE_KIND, (AFTER_EXCEPTION, lines + 1)
-        elif phase == AFTER_EXCEPTION and (not body.strip() or body.startswith(_CHAIN)):
+        elif phase == AFTER_EXCEPTION and not body.strip():
             return TRACE_KIND, (AFTER_EXCEPTION, lines + 1)
     return kind, (AFTER_ERROR, 0) if kind in _ERROR_LEVELS else NO_TRACEBACK
 
@@ -206,12 +218,12 @@ class LogHighlighter(Highlighter):
 
     def __init__(self) -> None:
         self.query = ""
-        self.row_kind: str | None = None
+        self.row_kind: str | None = UNKNOWN_KIND
 
     def highlight(self, text: Text) -> None:
         plain = text.plain
         kind = self.row_kind
-        if kind == NOTE_KIND or (kind is None and _NOTE.fullmatch(plain)):
+        if kind == NOTE_KIND or (kind == UNKNOWN_KIND and _NOTE.fullmatch(plain)):
             text.stylize(NOTE)
             return
         if kind == DAY_KIND:
