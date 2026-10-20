@@ -513,7 +513,10 @@ class CortexTrainingLogTUI(App):
             log_traceback("cache limit failed")
             return
         if removed:
-            self.call_from_thread(self.notify, freed_text(removed, self._CACHE_LIMIT), timeout=8, markup=False)
+            try:
+                self.call_from_thread(self.notify, freed_text(removed, self._CACHE_LIMIT), timeout=8, markup=False)
+            except RuntimeError:
+                pass  # the app stopped while the pass ran
 
     async def on_event(self, event: events.Event) -> None:
         # A key, click, scroll or paste means someone is at the screen (a mouse

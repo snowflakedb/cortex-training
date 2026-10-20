@@ -624,6 +624,8 @@ def cached_pages(
                 counted = None
                 if not partial:
                     partial = True
+                    if cancelled():
+                        return  # persisted nothing: the next open reads this page again
                     try:
                         cache.set_head_missing(source_id)
                     except OSError as exc:
@@ -659,6 +661,8 @@ def cached_pages(
                 return
             yield ("caught-up", [])  # the read after full pages brought nothing: the tail is at the log's end
         if new_cursor != cursor:
+            if cancelled():
+                return  # persisted nothing: the next open reads this page again from the cursor
             _safe_set_cursor(cache, source_id, new_cursor)
             cursor = new_cursor
             still_since, empty_polls, window = clock(), 0, 0

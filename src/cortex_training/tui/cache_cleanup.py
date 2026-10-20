@@ -395,6 +395,8 @@ def _remove_unless_in_use(job_dir: Path, now: float) -> tuple:
     try:
         if fcntl is not None:
             fd = _open_lock(job_dir / _LEASE_LOCK)
+            # Unlike the pass lock, no .lease means no removal: without it exclusively,
+            # removing the job could race a screen opening it.
             if fd is None or _try_exclusive(fd) is False:
                 return "in_use", 0
         for part in ("metrics", "console"):
@@ -425,13 +427,15 @@ def _remove_unless_in_use(job_dir: Path, now: float) -> tuple:
 
 @contextlib.contextmanager
 def _pass_lock(root: Path):
-    """Serialize cleanup passes across TUIs so two processes don't both evict the excess."""
+    """Serialize cleanup passes across TUIs so two processes don't both evict the excess.
+    Yields False only while another TUI's pass holds the lock: when the lock file can't be
+    created (no free inodes, a quota), the pass runs unserialized rather than free nothing."""
     if fcntl is None:
         yield True
         return
     fd = _open_lock(root / _PASS_LOCK)
     try:
-        yield fd is not None and _try_exclusive(fd) is not False
+        yield fd is None or _try_exclusive(fd) is not False
     finally:
         if fd is not None:
             os.close(fd)

@@ -1448,9 +1448,9 @@ Each opened job is cached under `~/.cache/cortex-training/jobs/` (or
 its log tail, finished console, and telemetry. To bound disk usage across long
 or repeated sessions, the cache keeps under 5 GiB. Soon after startup, every 10
 minutes while running, and after keeping a saved console, one TUI at a time
-evicts the least-recently-used jobs (whole jobs at a time) until the cache fits,
-and notifies how much space was freed; a removed job is downloaded again when
-reopened. Only TUI-named real job directories holding TUI files are counted or
+evicts the least-recently-used jobs (whole jobs at a time) until the cache fits
+(open or downloading jobs can keep it over the limit), and notifies how much
+space was freed; a removed job is downloaded again when reopened. Only TUI-named real job directories holding TUI files are counted or
 removed, and symlinks are never followed.
 
 Jobs open in a running TUI or actively downloading (`download-metrics` included)

@@ -180,6 +180,23 @@ def test_two_passes_at_once_remove_the_excess_once(tmp_path, monkeypatch):
     assert _names(first) == ["j0"] and len(cache_cleanup._jobs(tmp_path)) == 3
 
 
+def test_a_pass_runs_without_its_lock_file_but_skips_a_job_without_its_lease(tmp_path, monkeypatch):
+    # No free inodes or a quota: freeing nothing is worse than two TUIs evicting at once. A
+    # job whose .lease can't be created still stays: removing it could race a screen opening it.
+    old = _job(tmp_path, "old", mib=1, age=9000)
+    no_lease = _job(tmp_path, "no-lease", mib=1, age=8000)
+    real_open_lock = cache_cleanup._open_lock
+
+    def open_lock(path):
+        if path.name == cache_cleanup._PASS_LOCK or path.parent == no_lease:
+            return None  # as when the file can't be created
+        return real_open_lock(path)
+
+    monkeypatch.setattr(cache_cleanup, "_open_lock", open_lock)
+    assert _names(cache_cleanup.enforce_cache_limit(tmp_path, limit=1)) == ["old"]
+    assert not old.exists() and no_lease.exists()
+
+
 def test_a_job_open_in_a_running_tui_is_never_removed(tmp_path):
     open_job = _job(tmp_path, "open", mib=3, age=5000)
     _job(tmp_path, "other", mib=3, age=100)
@@ -505,3 +522,28 @@ def test_a_cancelled_tail_persists_nothing(tmp_path):
                               is_cancelled=lambda: bool(cancelled), sleep=lambda _s: None))
     assert pages == []
     assert cache.get_cursor("s") is None and cache.load_entries("s") == []
+
+
+def test_a_cancelled_tail_persists_neither_an_empty_page_nor_a_missing_head(tmp_path):
+    # The screen closed during the read: an empty page's new cursor, and the
+    # "head missing" mark from a cursorless window, must not write the job back.
+    cache = LogCache("late", root=tmp_path)
+    cache.set_cursor("empty", "old")
+    cancelled = []
+
+    def fetch(cursor):
+        cancelled.append(True)
+        if cursor == "old":
+            return {"entries": [], "next_cursor": "new"}
+        return {"entries": [{"n": 1}, {"n": 2}], "next_cursor": "window-end"}
+
+    pages = list(cached_pages(cache, "empty", fetch, entries_key="entries", follow=True, poll_interval=0.01,
+                              is_cancelled=lambda: bool(cancelled), sleep=lambda _s: None))
+    assert pages == [] and cache.get_cursor("empty") == "old"
+
+    cancelled.clear()
+    pages = list(cached_pages(cache, "window", fetch, entries_key="entries", follow=False, poll_interval=0.01,
+                              tail_window=2, is_cancelled=lambda: bool(cancelled), sleep=lambda _s: None))
+    assert pages == []
+    assert cache.get_cursor("window") is None and cache.load_entries("window") == []
+    assert not cache.head_missing("window")
