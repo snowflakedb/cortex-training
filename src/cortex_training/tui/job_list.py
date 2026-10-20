@@ -335,7 +335,7 @@ class JobListScreen(FollowsPointer, Screen):
         self._sort = "created"
         self._descending = True
         self._expanded: set = set()
-        self._collapsed: set = set()  # live jobs the user folded
+        self._collapsed: set = set()  # jobs folded by the reader (or by an e that holds no more)
         self._all_folded: bool | None = None  # e: every job folded (True) or unfolded (False); None before
         self._last_refreshed = None
         self._loaded_at: float | None = None  # monotonic time of the last good load
@@ -602,6 +602,7 @@ class JobListScreen(FollowsPointer, Screen):
         self._lister.account_wide = account
         self._asked = account
         self._declined = None
+        self._settle_folds()  # another list: e's choice was for this one
         self._switching = True
         self.refresh_bindings()  # the footer's a names the other list now
         if self._refreshing and self._progressive:
@@ -809,6 +810,19 @@ class JobListScreen(FollowsPointer, Screen):
         self._collapsed.clear()
         self._render_jobs()
 
+    def _settle_folds(self) -> None:
+        """e's choice holds for the list in front of the reader (and its later pages): once
+        another list comes (a, or a refresh), the jobs it covered keep it, each as its own fold,
+        and jobs new since start as every job does (live unfolded, history folded)."""
+        if self._all_folded is None:
+            return
+        chosen = self._collapsed if self._all_folded else self._expanded
+        for job in self._all_jobs:
+            key = self._job_key(job)
+            if key not in self._expanded and key not in self._collapsed and self._expandable(job):
+                chosen.add(key)
+        self._all_folded = None
+
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id != "jobfilter":
             return
@@ -925,6 +939,8 @@ class JobListScreen(FollowsPointer, Screen):
         self._failed_at = None
         self._pages_failed = False
         self._last_refreshed = time.strftime("%H:%M:%S")
+        if not shown:
+            self._settle_folds()  # a refresh: the jobs new in it start as every job does
         self._show_listing(listing, steady=shown)
         self.app.job_list_drawn(self)
 

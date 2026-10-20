@@ -4343,6 +4343,38 @@ def test_e_unfolds_the_jobs_of_later_pages_too_and_then_folds_them_all():
     asyncio.run(_run_e_unfolds_the_jobs_of_later_pages_too_and_then_folds_them_all())
 
 
+async def _run_e_holds_for_its_list_and_jobs_a_refresh_adds_start_as_usual(fold):
+    from cortex_training.tui.account import Listing
+    from cortex_training.tui.account import ListScope
+    app = CortexTrainingLogTUI(_PagedDemo(), poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        table.focus()
+        await pilot.press("e")  # every job unfolded
+        if fold:
+            await pilot.press("e")  # then every job folded
+        listed = [job for job in screen._all_jobs if screen._expandable(job)]
+        assert all(screen._is_expanded(job) is not fold for job in listed)
+        live = next(job for job in listed if views.is_live(job))
+        ended = next(job for job in listed if not views.is_live(job))
+        # A refresh lands with a live job and an ended one new since.
+        new_live = {**live, "job_id": "new-live-job", "created_at": live.get("created_at")}
+        new_ended = {**ended, "job_id": "new-ended-job"}
+        refreshed = [*screen._all_jobs, new_live, new_ended]
+        screen._on_jobs(Listing(refreshed, ListScope(SCHEMA)), None, False, screen._load_gen)
+        await pilot.pause(0.2)
+        assert all(screen._is_expanded(job) is not fold for job in listed)  # e's choice holds for them
+        by_id = {views.job_id_of(job): job for job in screen._all_jobs}
+        assert screen._is_expanded(by_id["new-live-job"]) and not screen._is_expanded(by_id["new-ended-job"])
+        assert screen._all_folded is None
+        await _settle(app, pilot)
+
+
+@pytest.mark.parametrize("fold", [False, True], ids=["unfolded", "folded"])
+def test_e_holds_for_its_list_and_jobs_a_refresh_adds_start_as_usual(fold):
+    asyncio.run(_run_e_holds_for_its_list_and_jobs_a_refresh_adds_start_as_usual(fold))
+
+
 async def _run_a_that_stops_the_pages_says_at_once_what_the_list_on_screen_is():
     client = _PagedDemo()
     app = CortexTrainingLogTUI(client, poll_interval=0.01)

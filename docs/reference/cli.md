@@ -907,7 +907,9 @@ job's and as glyph and word where it differs, its model where the job has more
 than one, and its GPUs (left out for a job's only sub-job when the job's row
 gives the same count). `▸`/`▾`, arrows, clicks, and `e` control sub-job rows.
 Every live job starts unfolded, its sub-job rows in view; history jobs start
-folded.
+folded. `e` unfolds every job (or folds every one, once all are unfolded),
+those that later pages of the list being read bring too; the jobs a later
+refresh or `a` adds start as above, and those `e` covered keep its choice.
 
 `ctrl+c` copies text that holds up once pasted. With nothing highlighted, it
 copies every row of the list (scrolled out of view too) in aligned columns,
@@ -966,7 +968,7 @@ operators shows under it only while it has focus.
 | `Home` / `End` | First / last job |
 | `→` / `←` | Unfold the highlighted job's sub-jobs / fold them; on a sub-job row, `←` folds its job and moves to it. The job's row stays where it is on screen, and the list scrolls only as far as an unfolded job's sub-jobs need to show. Where there is nothing to unfold or fold, they scroll the columns sideways |
 | click `▸` / `▾` | Unfold or fold that job, as `→` / `←` do |
-| `e` | Expand or collapse every job's sub-jobs |
+| `e` | Expand or collapse every job's sub-jobs, also those of jobs that later pages of the list being read bring (jobs a later refresh adds start as usual) |
 | `a` | All schemas / current schema: switch to the account-level list of every database and schema the role can see (the footer's `a All schemas`), or back to the configured one (`a Current schema`) |
 | `ctrl+c` | Copy what is highlighted, else every row in the list with a `Whole ID` column (see above for what each cell copies as); in the preview, the highlight, else the whole preview |
 | `r` | Refresh (the list also refreshes every 60 seconds while it is showing); while it shows the configured schema in place of the account-level list (`Current schema only: DB.SCHEMA (reason)`), `r` asks that list again once a minute has passed since the last ask |
