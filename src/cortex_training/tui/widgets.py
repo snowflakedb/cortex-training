@@ -191,6 +191,13 @@ class _LogPane(Log):
         self.row_kinds.insert(y, kind)
         if self.mark is not None and self.mark[0] >= y:
             self.mark = (self.mark[0] + 1, self.mark[1] + 1)
+        selection = self.text_selection  # held in rows: it stays on the text it covered
+        if selection is not None:
+            def shift(at):
+                return at if at is None or at.y < y else Offset(at.x, at.y + 1)
+
+            self.screen.selections = {**self.screen.selections,
+                                      self: Selection(shift(selection.start), shift(selection.end))}
         self._width = max(self._width, cell_len(row))
         self.virtual_size = Size(self._width, len(self._lines))
         self._render_line_cache.clear()

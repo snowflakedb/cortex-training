@@ -1520,9 +1520,16 @@ def test_a_log_line_that_reads_like_a_note_is_still_a_log_line():
             assert s._shown_logs == logs + 1
             assert s._logview.lines[-1] == "— live —"  # (no sub-job tag: the pane shows one sub-job)
             assert s._logview.row_kinds[-1] != NOTE_KIND and s._shown_kinds[-1] != NOTE_KIND
+
+            def italic(y):  # the row as the pane draws it: in the notes' italics?
+                strip = s._logview._render_line_strip(y, s._logview.rich_style)
+                return any(segment.style is not None and segment.style.italic for segment in strip)
+
+            assert not italic(len(s._logview.lines) - 1)
             s._write_line("— live —")  # the TUI's own note
             assert s._shown_logs == logs + 1
             assert s._logview.lines[-1] == "— live —" and s._logview.row_kinds[-1] == NOTE_KIND
+            assert italic(len(s._logview.lines) - 1)
             await _settle(app, pilot)
 
     asyncio.run(run())
@@ -1614,6 +1621,24 @@ def test_a_highlight_across_a_day_rule_and_a_wrapped_line_copies_the_lines_as_lo
     asyncio.run(run())
 
 
+def test_the_sub_job_list_names_each_sub_job_by_its_type_as_the_preview_does():
+    c = _client()
+    c.get_job.return_value = {"status": "RUNNING", "sub_jobs": [
+        {"sub_job_id": "7:training:0", "job_type": "training"},
+        {"sub_job_id": "7:log_probability:0", "job_type": "LOG_PROBABILITY"}]}
+
+    async def run():
+        app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+        async with app.run_test() as pilot:
+            assert await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen)
+                               and len(app.screen.query("#sources ListItem")) == 2)
+            labels = [str(item.query_one(Label).render()) for item in app.screen.query("#sources ListItem")]
+            assert "log_prob #0" in labels[1] and "log_probability" not in labels[1]
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
 def test_the_day_rule_comes_back_on_top_as_the_oldest_lines_go(monkeypatch):
     from cortex_training.tui.log_style import DAY_KIND
 
@@ -1662,12 +1687,16 @@ def test_e_jumps_to_the_errors_and_the_bar_says_where_the_reader_is():
             assert await _pause_until(pilot, lambda: s._repaint_job is None and s._wrap_width == width - 20)
             assert s._shown_lines[s._line_at_row(s._logview.mark[0])].endswith("first failure")
             assert s._jump == ("error", 1, 2) and bar(s)[1].strip() == "error 1/2"
+            # An error that comes while paused counts at once.
+            _live_page(s, ["2026-10-18T12:02:00Z ERROR third failure"])
+            await pilot.pause()
+            assert s._jump == ("error", 1, 3) and bar(s)[1].strip() == "error 1/3"
             await pilot.press("N")  # n / N stop at warnings too: problems
             await pilot.pause()
-            assert s._jump == ("problem", 2, 2) and bar(s)[1].strip() == "problem 2/2"
+            assert s._jump == ("problem", 3, 3) and bar(s)[1].strip() == "problem 3/3"
             _live_page(s, ["line new"])
             await pilot.pause()
-            assert bar(s)[0] == "⏸ PAUSED · 1 new line · p resumes"
+            assert bar(s)[0] == "⏸ PAUSED · 2 new lines · p resumes"  # (the third failure, and this)
             await pilot.press("p")
             await pilot.pause()
             assert not s._paused and s._logview.mark is None and s._jump is None

@@ -88,7 +88,8 @@ LINE_ROWS = [2, 2]
 
 
 def _copy(start=None, end=None):
-    return copied_text(ROWS, LINE_ROWS, WHOLE.__getitem__, SHOWN.__getitem__, start, end, indent=" " * 9)
+    return copied_text(ROWS, LINE_ROWS, WHOLE.__getitem__, SHOWN.__getitem__, start, end, indent=" " * 9,
+                       rules={0})
 
 
 def test_a_highlight_over_whole_lines_copies_them_as_logged():
@@ -103,6 +104,13 @@ def test_a_highlight_over_part_of_a_line_copies_that_part_as_its_text_has_it():
     assert _copy((2, 14), (3, 17)) == "step 2 loss=0.5"  # across the wrap: its space back, no indent
     assert _copy((3, 0), (3, 13)) == "loss"  # from the indent
     assert _copy((1, 9), (2, 13)) == WHOLE[0][21:] + "\n" + "05:00:01 INFO"  # a line's end, then the next's start
+
+
+def test_a_log_row_that_reads_like_a_day_rule_is_copied_with_its_line():
+    rule = day_rule("2026-10-17", 24)  # the text of a rule, logged: not one of the pane's rules
+    rows = [rule, "         more"]
+    copied = copied_text(rows, [2], lambda i: rule + "\nmore", lambda i: rule + "\nmore", indent=" " * 9)
+    assert copied == rule + "\nmore"
 
 
 def test_the_rows_a_long_line_leaves_out_come_back_and_its_note_is_copied_as_shown():
@@ -163,6 +171,16 @@ def test_a_chained_traceback_and_one_under_an_error_are_one_stop():
                 "    The above exception was the direct cause of the following exception:",
                 "    Traceback (most recent call last):", "    RuntimeError: failed"]
     assert _kinds(indented) == [TRACEBACK_KIND, *[TRACE_KIND] * 5]  # as an execution log's record shows one
+
+
+def test_two_tracebacks_back_to_back_are_two_stops():
+    lines = ["Traceback (most recent call last):", '  File "a.py", line 1, in f', "ValueError: one",
+             "Traceback (most recent call last):", '  File "b.py", line 2, in g', "KeyError: two"]
+    kinds = _kinds(lines)
+    assert kinds == [TRACEBACK_KIND, TRACE_KIND, TRACE_KIND, TRACEBACK_KIND, TRACE_KIND, TRACE_KIND]
+    assert sum(kind in ERROR_KINDS for kind in kinds) == 2
+    # A blank line between them doesn't chain them either: only the sentence does.
+    assert _kinds([*lines[:3], "", *lines[3:]])[4] == TRACEBACK_KIND
 
 
 def test_a_line_with_a_level_or_a_block_too_long_ends_a_traceback():
@@ -263,6 +281,15 @@ def test_a_traceback_row_marks_its_file_and_its_exception():
     assert ('"train.py"', theme.INFO) in _styles('  File "train.py", line 12, in <module>', TRACE_KIND)
     assert ("ValueError: bad shape", f"bold {theme.ERR}") in _styles("ValueError: bad shape", TRACE_KIND)
     assert TRACEBACK_BACKGROUND.startswith("#")
+
+
+def test_a_log_row_that_reads_like_a_note_is_drawn_as_a_log_row():
+    from cortex_training.tui.log_style import NOTE
+    from cortex_training.tui.log_style import UNKNOWN_KIND
+
+    assert ("— the job ended —", NOTE) not in _styles("— the job ended —", None)  # the pane says: a log line
+    assert ("— the job ended —", NOTE) in _styles("— the job ended —", NOTE_KIND)
+    assert ("— the job ended —", NOTE) in _styles("— the job ended —", UNKNOWN_KIND)  # a plain Log's guess
 
 
 def test_the_day_rule_and_the_filter_s_matches():

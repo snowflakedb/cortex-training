@@ -421,13 +421,15 @@ def is_day_rule(row: str) -> bool:
     return row.startswith("── ") and _DAY_RULE.fullmatch(row) is not None
 
 
-def copied_text(rows: list, line_rows: list, whole, shown, start=None, end=None, *, indent: str = "") -> str:
+def copied_text(rows: list, line_rows: list, whole, shown, start=None, end=None, *, indent: str = "",
+                rules=()) -> str:
     """What a highlight over the Logs pane copies: the lines as they were logged.
 
     ``rows`` are the pane's rows and ``line_rows`` how many of them each line takes, in
     order; ``whole(i)`` is line ``i`` as it came (what ``s`` saves) and ``shown(i)`` the
     text its rows were wrapped from (the time without its date). ``start`` and ``end``
-    are the highlight's ``(row, column)`` ends, None for the pane's first and last.
+    are the highlight's ``(row, column)`` ends, None for the pane's first and last;
+    ``rules`` the rows that are a day's rule (by the pane's row kinds, not their text).
 
     A line highlighted whole, from the start of its first row to the end of its last,
     is copied whole; one highlighted in part (where the highlight begins or ends) gives
@@ -450,7 +452,7 @@ def copied_text(rows: list, line_rows: list, whole, shown, start=None, end=None,
             continue
         if a > last_row:
             break
-        if taken > 1 and is_day_rule(rows[a]):
+        if taken > 1 and a in rules:
             a += 1  # its text starts under its day's rule
         if b < first_row or a > last_row:
             continue  # only the rule is highlighted
