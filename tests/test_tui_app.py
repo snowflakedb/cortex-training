@@ -4084,6 +4084,8 @@ class _PagedDemo(DemoClient):
         self.gated = False
         self.fail_at = self.unavailable_at = self.bad_token_at = self.running_at = None
         self.schema_fails = False
+        self.schema_gate = threading.Event()  # the configured schema's list answers while it is set
+        self.schema_gate.set()
         self.pages = 0
         self._permits = threading.Semaphore(0)
 
@@ -4092,6 +4094,7 @@ class _PagedDemo(DemoClient):
             self._permits.release()
 
     def list_jobs(self, *args, **kwargs):
+        self.schema_gate.wait(10)
         if self.schema_fails:
             raise ConnectionError("schema down")
         return super().list_jobs(*args, **kwargs)
@@ -4289,6 +4292,35 @@ async def _run_e_unfolds_the_jobs_of_later_pages_too_and_then_folds_them_all():
 
 def test_e_unfolds_the_jobs_of_later_pages_too_and_then_folds_them_all():
     asyncio.run(_run_e_unfolds_the_jobs_of_later_pages_too_and_then_folds_them_all())
+
+
+async def _run_a_that_stops_the_pages_says_at_once_what_the_list_on_screen_is():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        client.gated = True
+        await pilot.press("a")
+        client.release(2)
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 2 * client._ACCOUNT_PAGE_ROWS,
+                                  seconds=10.0)
+        await pilot.pause(0.2)
+        client.schema_gate.clear()  # the configured schema's list takes its time
+        await pilot.press("a")
+        await pilot.pause(0.2)
+        assert app.sub_title == (f"loading the current schema, {screen._schema_label()}…  ·  "
+                                 "showing the partial all-schemas list"), app.sub_title
+        assert "so far" not in _info_text(screen)
+        assert not any(str(table.get_row_at(i)[0]).endswith("…") for i in range(table.row_count))
+        client.schema_gate.set()
+        assert await _pause_until(pilot, lambda: screen._scope.kind == SCHEMA, seconds=10.0)
+        assert app.sub_title.endswith("Current schema: " + screen._schema_label()), app.sub_title
+        client.release(10)
+        await _settle(app, pilot)
+
+
+def test_a_that_stops_the_pages_says_at_once_what_the_list_on_screen_is():
+    asyncio.run(_run_a_that_stops_the_pages_says_at_once_what_the_list_on_screen_is())
 
 
 def test_a_cursor_on_a_group_row_stays_on_it_as_pages_come():

@@ -342,6 +342,8 @@ class JobListScreen(FollowsPointer, Screen):
         # The failure that stands is the account-wide list's, after its first pages showed
         # (and the list on screen is those pages), not a later refresh's.
         self._pages_failed = False
+        # a stopped reading the pages on screen, and the list it asked for hasn't answered yet.
+        self._partial_stays = False
         self._list_error: str | None = None  # last failed load, on one line; cleared by a good one
         self._list_refused = False  # that failure was the account-wide list refusing this caller (403/405)
         self._scope: ListScope | None = None  # what the list on screen covers
@@ -496,7 +498,11 @@ class JobListScreen(FollowsPointer, Screen):
         if switching:
             # a was pressed and the other list is still being read: say so first,
             # rather than the scope of the list it replaces.
-            bits = [switching, f"list from {self._last_refreshed}" if self._last_refreshed else ""]
+            if self._partial_stays:
+                shown = "showing the partial all-schemas list"  # the pages a stopped reading
+            else:
+                shown = f"list from {self._last_refreshed}" if self._last_refreshed else ""
+            bits = [switching, shown]
             self.app.sub_title = "  ·  ".join(bit for bit in bits if bit)
             return
         if self._scope is not None and self._scope.loading:
@@ -565,7 +571,10 @@ class JobListScreen(FollowsPointer, Screen):
         self._load_worker = None
         self._refreshing = False
         if self._scope is not None and self._scope.loading:
-            self._scope = stopped_scope(self._scope)  # its first pages stay until the next list answers
+            # Its first pages stay until the next list answers, no longer marked as still loading.
+            self._scope = stopped_scope(self._scope)
+            self._partial_stays = True
+            self._render_jobs(steady=True)
 
     def _account_wanted(self) -> bool:
         """Whether the list to show is the account-wide one (a), not the configured schema's."""
@@ -845,6 +854,7 @@ class JobListScreen(FollowsPointer, Screen):
 
     def _show_listing(self, listing: Listing, *, steady: bool = False) -> None:
         """Show ``listing`` as the list; ``steady``: it grows the list on screen, which stays where it is."""
+        self._partial_stays = False
         self._scope = listing.scope
         self._loaded_at = time.monotonic()
         self._all_jobs = self._merged(listing.jobs)

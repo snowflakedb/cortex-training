@@ -796,7 +796,9 @@ active jobs…` while it reads the active jobs), the counts above the list and a
 search's matches end in `so far`, and the LIVE and HISTORY rows' counts in `…`.
 The list also shows its pages as they come when it first opens on all schemas;
 a refresh of a whole list keeps showing it until the next one is whole.
-`a` while the pages are read stops reading them. `r` meanwhile starts no second
+`a` while the pages are read stops reading them: the pages read stay, no longer
+marked, under `loading the current schema, DB.SCHEMA… · showing the partial
+all-schemas list` until that list answers. `r` meanwhile starts no second
 read: it says the list is still loading (`Still loading older jobs (Ns); r asks
 again once it answers.`). Once the list is whole, the header names it:
 
