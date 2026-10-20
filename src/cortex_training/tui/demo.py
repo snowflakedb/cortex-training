@@ -202,6 +202,16 @@ UNAVAILABLE = "unavailable"
 _ACTIVE = ("pending", "queued", "placing", "initializing", "creating", "running")
 
 
+def _in_location(row: dict, wanted: tuple) -> bool:
+    """Whether an account-list row is in the ``(database, schema)`` asked for; either may be None.
+
+    ``wanted`` holds the names already resolved as SQL resolves them, so they compare equal to the
+    names a row stores.
+    """
+    held = (row.get("database_name"), row.get("schema_name"))
+    return all(name is None or name == held[at] for at, name in enumerate(wanted))
+
+
 def _http_error(status: int, message: str) -> requests.HTTPError:
     """The error the client raises for a service answer of ``status`` with ``message``."""
     response = requests.Response()
@@ -377,19 +387,26 @@ class DemoClient:
                        status: Any = None, submitted_by: Optional[str] = None, created_after: Any = None,
                        created_before: Any = None, page_size: int = 100, page_token: Optional[str] = None,
                        max_retries: Optional[int] = None, request_timeout: Any = None) -> dict:
-        """One page of the account-wide list: every location, newest first, a few rows per page.
+        """One page of the account-wide list, newest first, a few rows per page.
 
-        Only what the job list sends applies: ``created_after``, and ``status`` as the active group (a
-        job whose status can't be read never matches a status filter).
+        Only what the job list sends applies: ``created_after``; ``status`` as the active group (a
+        job whose status can't be read never matches a status filter); and ``database`` with an
+        optional ``schema``, read by SQL identifier rules as the service reads them, so a narrowed
+        list narrows here too. A ``schema`` without a ``database`` is refused, as the real client
+        refuses it.
         """
         if self._account_list == UNAVAILABLE:
             raise _http_error(503, "Control Plane unavailable")
         if self._account_list is not None:
             raise AccountJobListUnavailable(_UNAVAILABLE[self._account_list], reason=self._account_list)
+        if schema is not None and database is None:
+            raise ValueError("list_jobs_page: schema needs database with it")
+        wanted = tuple(None if name is None else views.identifier_name(name) for name in (database, schema))
         newest = sorted(self._jobs, key=lambda j: j["created_at"], reverse=True)
         rows = [row for row in map(self._account_row, newest)
                 if (created_after is None or views.parse_ts(row["created_at"]) >= created_after)
-                and (not status or views.status_word(row.get("status")) in _ACTIVE)]
+                and (not status or views.status_word(row.get("status")) in _ACTIVE)
+                and _in_location(row, wanted)]
         start = int(page_token or 0)
         page = rows[start:start + min(int(page_size), self._ACCOUNT_PAGE_ROWS)]
         end = start + len(page)

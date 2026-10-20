@@ -65,6 +65,15 @@ _FAILURE_LIMIT = 300  # cells of a failure's one-line text
 _ACCOUNT_ROUTE, _SCHEMA_ROUTE = "the account-wide job list", "list_jobs"
 
 
+class _BadNarrowing(Exception):
+    """The service refused the database or schema a narrowed walk asked for (HTTP 400).
+
+    A name this role cannot see is answered 400, which carries no typed reason of its own, so
+    without this it would read as the whole account list failing. :meth:`JobLister.load` reads
+    the account whole instead and lets the search say that nothing matches.
+    """
+
+
 class JobListError(Exception):
     """A one-line list failure; ``refused`` means the schema was not attempted."""
 
@@ -89,6 +98,12 @@ class ListScope:
     # ACCOUNT, OLDER: the active jobs' walk, read beside the newest jobs', is done and its
     # jobs listed (``active_missing``: it failed or stopped early).
     active_read: bool = False
+    # ACCOUNT: the location the walk asked the server for (``TEAM_DB.EXPERIMENTS``, or
+    # ``TEAM_DB`` for a database alone), so the header can say the list is not the whole
+    # account. "" when it read every schema. Set from what the search box pinned with ``=``
+    # (see :func:`cortex_training.tui.views.pushdown_location`); the rows a listing holds were
+    # read under it, so the header must read it from here and never from the live search text.
+    narrowed: str = ""
 
     @property
     def truncated(self) -> bool:
@@ -125,19 +140,29 @@ def _more(scope: ListScope) -> str:
 
 
 def scope_text(scope: ListScope, *, location: str, only: str = "") -> str:
-    """A short header for this scope; ``only`` names its sole location."""
+    """A short header for this scope; ``only`` names its sole location.
+
+    A narrowed listing (:attr:`ListScope.narrowed`) says so in place of ``only``: the rows do
+    share one location, but because the walk asked for it, not because the account holds no other.
+    """
     if scope.kind == ACCOUNT:
+        narrowed = f"narrowed to {scope.narrowed}" if scope.narrowed else ""
         if scope.loading == OLDER:
             active = "" if not scope.active_read else (
                 " (older active jobs may be missing)" if scope.active_missing else " + every active job")
-            return f"loading older jobs… {scope.walked:,} so far{active}"
+            so_far = f"loading older jobs… {scope.walked:,} so far{active}"
+            return f"{narrowed}: {so_far}" if narrowed else so_far
         if scope.loading:
-            return f"newest {scope.walked:,}; loading older active jobs…"
+            newest = f"newest {scope.walked:,}; loading older active jobs…"
+            return f"{narrowed}: {newest}" if narrowed else newest
         if scope.stopped is None:
+            if narrowed:
+                return f"all schemas, {narrowed}"
             return f"all schemas (all in {only})" if only else "all schemas"
         held = f"newest {scope.walked:,}" if scope.stopped in (CAPPED, FAILED) else (
             f"first {scope.pages} pages: {scope.walked:,} job{'' if scope.walked == 1 else 's'}")
-        return held + ("" if scope.active_missing else " + every active job") + f" ({_more(scope)})"
+        whole = held + ("" if scope.active_missing else " + every active job") + f" ({_more(scope)})"
+        return f"{narrowed}: {whole}" if narrowed else whole
     if scope.kind == SCHEMA:
         return f"Current schema: {location}"
     return f"Current schema only: {location} ({unavailable_text(scope)})"
@@ -152,23 +177,25 @@ def loaded_text(scope: Optional[ListScope]) -> str:
     """What a list cut short holds, for a search without results; "" when it holds every job."""
     if scope is None or not scope.truncated:
         return ""
+    where = f" in {scope.narrowed}" if scope.narrowed else ""
     if scope.loading:
         what = "older jobs are" if scope.loading == OLDER else "older active jobs are"
         active = " and every active job" if scope.active_read and not scope.active_missing else ""
-        return f"the newest {scope.walked:,} so far{active}; {what} still loading"
-    held = (f"the newest {scope.walked:,} of the last 6 months" if scope.stopped in (CAPPED, FAILED)
-            else f"what the first {scope.pages} pages held")
+        return f"the newest {scope.walked:,}{where} so far{active}; {what} still loading"
+    held = (f"the newest {scope.walked:,} of the last 6 months{where}" if scope.stopped in (CAPPED, FAILED)
+            else f"what the first {scope.pages} pages held{where}")
     return held + ("" if scope.active_missing else " and every active job") + f"; {_more(scope)}"
 
 
 def empty_text(scope: ListScope) -> str:
     """The list's message when a walk cut short (or still loading) left no job to show."""
+    where = f" in {scope.narrowed}" if scope.narrowed else ""
     if scope.loading:
-        return (f"The account-wide list has no jobs to show among its newest {scope.walked:,} yet; "
+        return (f"The account-wide list has no jobs to show among its newest {scope.walked:,}{where} yet; "
                 f"{'older' if scope.loading == OLDER else 'older active'} jobs are still loading.")
     held = (f"in its first {scope.pages} pages" if scope.stopped == PAGE_LIMIT
             else f"among its newest {scope.walked:,}")
-    return f"The account-wide list returned no jobs to show {held}; more may exist. r reads it again."
+    return f"The account-wide list returned no jobs to show {held}{where}; more may exist. r reads it again."
 
 
 def _one_line(text: str) -> str:
@@ -223,11 +250,18 @@ class JobLister:
 
     def load(self, now: datetime, *, is_cancelled: Callable[[], bool] = lambda: False,
              manual: bool = False, account: Optional[bool] = None, asked: bool = False,
-             on_partial: Optional[Callable[[Listing], None]] = None) -> Optional[Listing]:
+             on_partial: Optional[Callable[[Listing], None]] = None,
+             location: Optional[tuple] = None) -> Optional[Listing]:
         """Load one refresh; flags override scope, reprobe, and fallback behavior.
 
         ``on_partial`` is given the account-level list as it is read (see :meth:`_walk`), except while
         asking again in fallback: the configured schema's list stands until the account-level one is whole.
+
+        ``location`` is a ``(database, schema)`` the account-level walk asks the service for, so the
+        jobs of one schema are read whole rather than filtered out of the newest
+        :data:`ACCOUNT_LIST_CAP` of the account (see
+        :func:`cortex_training.tui.views.pushdown_location`). It does not reach the configured
+        schema's route, whose URL already names one schema and which takes no such filter.
         """
         if not (self.account_wide if account is None else account):
             return self._schema(ListScope(SCHEMA))
@@ -237,8 +271,17 @@ class JobLister:
             self._fallback = None  # asked again for a: the earlier answer no longer counts
         probing = self._fallback is not None
         try:
+            listing = self._walk(now, is_cancelled, None if probing else on_partial, location)
+        except _BadNarrowing as exc:
+            if is_cancelled():
+                return None
+            # The service refused the narrowing itself (a name this role can't see). Read the whole
+            # account instead and let the search say "no jobs match": the fallback state is about the
+            # route, not the filter, so it is deliberately left alone here.
+            logger.info("job list: %s; reading every schema instead", exc)
             listing = self._walk(now, is_cancelled, None if probing else on_partial)
         except AccountJobListUnavailable as exc:
+
             if is_cancelled():
                 return None  # superseded while its page was read: the load in its place decides
             return self._unavailable(exc, probing)
@@ -288,7 +331,9 @@ class JobLister:
         return Listing([job for job in (jobs or []) if isinstance(job, dict)], scope)
 
     def _walk(self, now: datetime, is_cancelled: Callable[[], bool],
-              on_partial: Optional[Callable[[Listing], None]] = None) -> Optional[Listing]:
+              on_partial: Optional[Callable[[Listing], None]] = None,
+              location: Optional[tuple] = None) -> Optional[Listing]:
+
         """The newest jobs of the account-level list, and the active ones when more exist; None when cancelled.
 
         Without ``on_partial`` (a refresh of a list that is whole), the active jobs' walk follows the
@@ -299,18 +344,21 @@ class JobLister:
         slowest), its jobs listed once it is done. The result is the same either way.
         """
         created_after = now - timedelta(days=views.RETENTION_DAYS)
+        # Snapshotted here and passed down, never re-read from the lister: the newest jobs' walk
+        # and the active one must ask for the same scope.
+        narrowed = views.location_filter_text(location)
         if on_partial is not None:
-            return _Beside(self, created_after, is_cancelled, on_partial).walk()
-        newest = _Walk(self._client, created_after, None)
+            return _Beside(self, created_after, is_cancelled, on_partial, location).walk()
+        newest = _Walk(self._client, created_after, None, location)
         while not newest.done:
             if not newest.step(is_cancelled):
                 return None
         if newest.stopped is None:
-            return Listing(newest.jobs, ListScope(ACCOUNT))
-        active = self._active(created_after, is_cancelled)
+            return Listing(newest.jobs, ListScope(ACCOUNT, narrowed=narrowed))
+        active = self._active(created_after, is_cancelled, location)
         if active is None:
             return None
-        return _listing(newest, active)
+        return _listing(newest, active, narrowed)
 
     def _start_reader(self, read: Callable[[], None]) -> Optional[threading.Thread]:
         """A thread reading the active jobs beside the newest (``read``), started; None while the
@@ -322,9 +370,14 @@ class JobLister:
             self._reader.start()
             return self._reader
 
-    def _active(self, created_after: datetime, is_cancelled: Callable[[], bool]) -> Optional[tuple]:
-        """``(jobs, stopped)`` of the active-job walk (stopped "failed" when it failed); None when cancelled."""
-        walk = _Walk(self._client, created_after, ACTIVE)
+    def _active(self, created_after: datetime, is_cancelled: Callable[[], bool],
+                location: Optional[tuple] = None) -> Optional[tuple]:
+        """``(jobs, stopped)`` of the active-job walk (stopped "failed" when it failed); None when cancelled.
+
+        ``location`` is the newest jobs' walk's own, so the two walks cover one scope and
+        :func:`_merge` unions two sets read the same way."""
+        walk = _Walk(self._client, created_after, ACTIVE, location)
+
         try:
             while not walk.done:
                 if not walk.step(is_cancelled):
@@ -335,12 +388,12 @@ class JobLister:
         return walk.jobs, walk.stopped
 
 
-def _listing(newest: "_Walk", active: tuple) -> Listing:
+def _listing(newest: "_Walk", active: tuple, narrowed: str = "") -> Listing:
     """The list of a newest jobs' walk that stopped short, and of the active jobs' walk ``(jobs, stopped)``."""
     rows, active_stopped = active
     scope = ListScope(ACCOUNT, stopped=newest.stopped, walked=len(newest.jobs),
                       pages=ACCOUNT_LIST_MAX_PAGES if newest.stopped == PAGE_LIMIT else 0,
-                      active_missing=active_stopped is not None)
+                      active_missing=active_stopped is not None, narrowed=narrowed)
     return Listing(_merge(newest.jobs, rows), scope)
 
 
@@ -357,12 +410,15 @@ class _Beside:
     _POLL_SECONDS = 0.1  # how soon a walk waiting for the active jobs sees it was cancelled
 
     def __init__(self, lister: "JobLister", created_after: datetime, is_cancelled: Callable[[], bool],
-                 on_partial: Callable[[Listing], None]) -> None:
+                 on_partial: Callable[[Listing], None], location: Optional[tuple] = None) -> None:
         self._lister, self._created_after = lister, created_after
         self._is_cancelled, self._on_partial = is_cancelled, on_partial
+        self._location = location  # both walks ask for this one scope; its text goes on every scope made
+        self._narrowed = views.location_filter_text(location)
         self._lock = threading.Lock()
         self._stop = threading.Event()  # the walk answered: the active jobs' walk asks for no other page
-        self._newest = _Walk(lister._client, created_after, None)
+        self._newest = _Walk(lister._client, created_after, None, location)
+
         self._shown: Optional[list] = None  # the newest jobs last shown (a walk read again shows none fewer)
         self._active: Optional[tuple] = None  # the active jobs' walk, once done
         # The newest jobs' walk as of the last list made: whether it is done, and how it stopped.
@@ -389,9 +445,10 @@ class _Beside:
                         if not (newest.done and self._active is not None):  # else the result comes next
                             self._report()
             if newest.stopped is None:
-                return Listing(newest.jobs, ListScope(ACCOUNT))
+                return Listing(newest.jobs, ListScope(ACCOUNT, narrowed=self._narrowed))
             if reader is None:  # the first page stopped it short, or an earlier walk still reads
-                active = self._lister._active(self._created_after, self._is_cancelled)
+                active = self._lister._active(self._created_after, self._is_cancelled, self._location)
+
             else:
                 while reader.is_alive():
                     reader.join(self._POLL_SECONDS)
@@ -401,14 +458,17 @@ class _Beside:
                 active = self._active if self._active is not None else ([], "failed")
             if active is None or self._is_cancelled():
                 return None
-            return _listing(newest, active)
+            return _listing(newest, active, self._narrowed)
+
         finally:
             with self._lock:
                 self._stop.set()
 
     def _read_active(self) -> None:
         try:
-            active = self._lister._active(self._created_after, lambda: self._is_cancelled() or self._stop.is_set())
+            active = self._lister._active(self._created_after,
+                                          lambda: self._is_cancelled() or self._stop.is_set(), self._location)
+
             with self._lock:
                 if active is None or self._stop.is_set() or self._is_cancelled():
                     return
@@ -429,10 +489,13 @@ class _Beside:
         if self._newest_done:  # stopped short, the active jobs not read yet
             stopped = self._newest_stopped
             scope = ListScope(ACCOUNT, stopped=stopped, walked=len(self._shown), loading=ACTIVE_NEXT,
-                              pages=ACCOUNT_LIST_MAX_PAGES if stopped == PAGE_LIMIT else 0)
+                              pages=ACCOUNT_LIST_MAX_PAGES if stopped == PAGE_LIMIT else 0,
+                              narrowed=self._narrowed)
         else:
             scope = ListScope(ACCOUNT, walked=len(self._shown), loading=OLDER, active_read=active is not None,
-                              active_missing=active is not None and active[1] is not None)
+                              active_missing=active is not None and active[1] is not None,
+                              narrowed=self._narrowed)
+
         jobs = _merge(self._shown, active[0]) if active is not None else list(self._shown)
         try:
             self._on_partial(Listing(jobs, scope))
@@ -450,9 +513,15 @@ class _Walk:
     """One walk of the account-level list, a page at a time: up to the cap or the page limit, newest first.
     It starts again from the first page, once, when the service can't open its token."""
 
-    def __init__(self, client: Any, created_after: datetime, status: Optional[str]) -> None:
+    def __init__(self, client: Any, created_after: datetime, status: Optional[str],
+                 location: Optional[tuple] = None) -> None:
         self._client = client
-        self._filters: dict = {"created_after": created_after, **({"status": status} if status else {})}
+        database, schema = location if location else (None, None)
+        # Fixed for this walk's life, as ``created_after`` is: the service refuses a page token
+        # sent with filters other than the ones the token was made under.
+        self._filters: dict = {"created_after": created_after, **({"status": status} if status else {}),
+                               **({"database": database} if database else {}),
+                               **({"schema": schema} if schema else {})}
         self._restarted = False
         self._start()
 
@@ -469,7 +538,7 @@ class _Walk:
         if is_cancelled():
             return False
         try:
-            page = self._read()
+            page = self._read_page()
         except InvalidPageToken:
             if self._restarted:
                 raise
@@ -478,7 +547,7 @@ class _Walk:
             self._start()
             if is_cancelled():
                 return False
-            page = self._read()
+            page = self._read_page()
         rows, self._token = _page(page)
         self._pages += 1
         for job in rows:
@@ -499,6 +568,18 @@ class _Walk:
 
     def _read(self) -> Any:
         return self._client.list_jobs_page(**self._filters, page_size=ACCOUNT_PAGE_SIZE, page_token=self._token)
+
+    def _read_page(self) -> Any:
+        """One page, with a 400 about a narrowing surfaced as :class:`_BadNarrowing`."""
+        try:
+            return self._read()
+        except InvalidPageToken:
+            raise  # about the token, not the narrowing: :meth:`step` reads again from the first page
+        except Exception as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status == 400 and "database" in self._filters:
+                raise _BadNarrowing(_failure_text(_ACCOUNT_ROUTE, exc)) from exc
+            raise
 
 
 class JobClients:

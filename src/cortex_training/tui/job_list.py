@@ -76,6 +76,12 @@ from cortex_training.tui.widgets import hanging
 from cortex_training.tui.widgets import is_shown
 from cortex_training.tui.widgets import wrapped_parts
 
+# The column naming where a job lives, as ``DATABASE.SCHEMA`` (see
+# :func:`cortex_training.tui.views.location_label`). One name for both the column's label and the
+# key its cell is built under: a row's cells are looked up by label (see :meth:`_job_rows`), so
+# the two drifting apart would quietly draw the column empty rather than fail.
+_SCHEMA_COLUMN = "Schema"
+
 
 class _RuleCell(_FixedCell):
     """A hairline across a column (a LIVE/HISTORY heading's): drawn, but no text, so a
@@ -359,6 +365,11 @@ class JobListScreen(FollowsPointer, Screen):
         # Why the last a couldn't show all schemas, for the header until the next a.
         self._declined: str | None = None
         self._switching = False  # a was pressed and the list it asked for hasn't answered yet
+        # The (database, schema) the account-wide list on screen was read under, the one the load in
+        # flight asked for, and whether that load is a narrowing (so its pages show as they come).
+        self._pushdown: tuple | None = None
+        self._load_location: tuple | None = None
+        self._narrowing = False
         self._search_timer = None
         self._layout: _ListLayout | None = None  # the table's columns, once they exist
         self._notice: Content | None = None  # the stale-list notice, before wrapping
@@ -455,7 +466,7 @@ class JobListScreen(FollowsPointer, Screen):
         room = (self.size.width or self.app.size.width) - table.styles.scrollbar_size_vertical
         columns = list(self._COLUMNS)
         if location_width:
-            columns.insert(self._LOCATION_AT, ("Location", location_width))
+            columns.insert(self._LOCATION_AT, (_SCHEMA_COLUMN, location_width))
         name_base = dict(self._COLUMNS)["Job ID"]
         spare = room - pad - sum(width + pad for label, width in columns if label != "Job ID")
         if spare >= name_base:
@@ -490,7 +501,10 @@ class JobListScreen(FollowsPointer, Screen):
         return [j for j in self._all_jobs if views.within_retention(j, now)]
 
     def _location_column_width(self, jobs: list) -> int:
-        """The Location column's width for ``jobs``; 0 (hidden) when they all share one location."""
+        """The Schema column's width for ``jobs``; 0 (hidden) when they all share one location.
+
+        A narrowed list (see :func:`cortex_training.tui.views.pushdown_location`) therefore hides
+        it, and the header names the location instead (see :func:`_scope_text`)."""
         labels = {views.location_label(job) for job in jobs}
         if len(labels) <= 1:
             return 0
@@ -536,8 +550,14 @@ class JobListScreen(FollowsPointer, Screen):
         self.app.sub_title = "  ·  ".join(bit for bit in bits if bit)
 
     def _switching_text(self) -> str:
-        """While the list ``a`` asked for is read in place of the one on screen: which; else ""."""
-        if not (self._refreshing and self._switching):
+        """While the list ``a``, or the search's own narrowing, asked for is read in place of the
+        one on screen: which; else ""."""
+        if not self._refreshing:
+            return ""
+        if self._narrowing and not self._switching:
+            where = views.location_filter_text(self._load_location)
+            return f"narrowing to {where}…" if where else "reading every schema…"
+        if not self._switching:
             return ""
         if self._account_wanted():
             return "loading all schemas…"
@@ -549,8 +569,13 @@ class JobListScreen(FollowsPointer, Screen):
             return ""
         if self._declined and self._scope.kind == SCHEMA:
             return f"Current schema only: {self._schema_label()} ({self._declined})"
-        labels = {views.location_label(job) for job in self._all_jobs}
-        only = next(iter(labels)) if len(labels) == 1 else ""
+        if self._scope.narrowed:
+            # The rows share one location because the walk asked for it, not because the account
+            # holds no other, so the header must not claim it covered every schema.
+            only = ""
+        else:
+            labels = {views.location_label(job) for job in self._all_jobs}
+            only = next(iter(labels)) if len(labels) == 1 else ""
         return scope_text(self._scope, location=self._schema_label(), only=only)
 
     def _refresh_jobs(self, *, manual: bool = False, quiet: bool = False) -> None:
@@ -568,14 +593,17 @@ class JobListScreen(FollowsPointer, Screen):
             return
         self._refreshing = True
         self._refresh_started = time.monotonic()
-        self._update_subtitle()
         account = self._account_wanted()
+        # Set before the header is drawn: it names the location this load asks for.
+        self._load_location = self._pushdown_for() if account else None
+        self._update_subtitle()
         # Pages show as they come only where no list of this kind shows yet (the first
-        # load, or after a): a refresh keeps the whole list it has until the next is whole.
-        self._progressive = account and (self._loaded_at is None or self._switching)
+        # load, or after a), or where this load narrows to a location the list on screen
+        # wasn't read under: a refresh keeps the whole list it has until the next is whole.
+        self._progressive = account and (self._loaded_at is None or self._switching or self._narrowing)
         self._load_gen += 1
         self._load_worker = self._load_jobs(manual, account, account and self._asked, self._load_gen,
-                                            self._progressive)
+                                            self._progressive, self._load_location)
 
     def _supersede(self) -> None:
         """Drop the load in flight (its pages come no more; what it answers is dropped), so another can start."""
@@ -842,12 +870,45 @@ class JobListScreen(FollowsPointer, Screen):
         if self._search_timer is not None:
             self._search_timer.stop()
             self._search_timer = None
+        self._renarrow()  # the matches of what is loaded show at once; a narrowed list replaces them
         self._render_jobs()
+
+    def _pushdown_for(self) -> tuple | None:
+        """The ``(database, schema)`` the account-wide walk should ask the service for; None for every schema.
+
+        Only the account-wide list narrows: the configured schema's route names one schema in its
+        URL and takes no such filter.
+        """
+        if not self._account_wanted():
+            return None
+        return views.pushdown_location(self._query())
+
+    def _renarrow(self) -> None:
+        """Read the account-wide list again when the search pins a location other than the one the
+        list on screen was read under.
+
+        Without this a ``db=`` / ``schema=`` search only hides rows the walk already read, so a
+        schema whose jobs fall outside the newest :data:`ACCOUNT_LIST_CAP` of the account could not
+        be reached at all. The search's own debounce keeps this off the keystroke path.
+        """
+        if not self._account_wanted() or self._pushdown_for() == self._pushdown:
+            return
+        if self._scope is None or self._scope.kind != ACCOUNT:
+            # The configured schema's list is showing (its own, or in place of an unavailable
+            # account-wide one): its route names one schema and takes no such filter, so a
+            # search must not have it read again on every edit.
+            return
+        self._narrowing = True
+        self._supersede()  # the load in flight read another scope; its pages are not these
+        self._refresh_jobs(manual=True, quiet=True)
 
     @work(thread=True, group="jobs")
     def _load_jobs(self, manual: bool = False, account: bool = False, asked: bool = False, gen: int = 0,
-                   progressive: bool = False) -> None:
-        """Read one schema or account-wide listing off the UI thread (``progressive``: showing its pages)."""
+                   progressive: bool = False, location: tuple | None = None) -> None:
+        """Read one schema or account-wide listing off the UI thread (``progressive``: showing its pages).
+
+        ``location`` narrows the account-wide walk at the service (see
+        :func:`cortex_training.tui.views.pushdown_location`)."""
         worker = get_current_worker()
 
         def on_partial(listing: Listing) -> None:
@@ -856,7 +917,8 @@ class JobListScreen(FollowsPointer, Screen):
 
         try:
             listing = self._lister.load(self._clock(), is_cancelled=lambda: worker.is_cancelled, manual=manual,
-                                        account=account, asked=asked, on_partial=on_partial if progressive else None)
+                                        account=account, asked=asked, on_partial=on_partial if progressive else None,
+                                        location=location)
             error = None
         except JobListError as exc:
             listing, error = None, exc
@@ -873,6 +935,7 @@ class JobListScreen(FollowsPointer, Screen):
         steady = self._partial_gen == gen  # its earlier pages show: the user may be reading them
         self._partial_gen = gen
         self._switching = False  # the list a asked for shows now
+        self._narrowing = False  # so does the narrowing, if this load was one
         self._asked = False  # its last answer is handled as a's, though (see _on_jobs)
         # A fresh list shows: an earlier failure no longer stands over it.
         self._list_error, self._list_refused, self._failed_at = None, False, None
@@ -884,6 +947,9 @@ class JobListScreen(FollowsPointer, Screen):
         """Show ``listing`` as the list; ``steady``: it grows the list on screen, which stays where it is."""
         self._partial_stays = False
         self._scope = listing.scope
+        # What these rows were read under, so the header and the next search compare against the
+        # listing in hand rather than the live search text (the two differ while a load is in flight).
+        self._pushdown = self._load_location if listing.scope.kind == ACCOUNT else None
         self._loaded_at = time.monotonic()
         self._all_jobs = self._merged(listing.jobs)
         self._jobs_by_key = {self._job_key(job): job for job in self._all_jobs}
@@ -914,7 +980,12 @@ class JobListScreen(FollowsPointer, Screen):
             # a switched lists while this one was read: read the one asked for now.
             self._refresh_jobs(manual=True, quiet=True)
             return
+        if account and self._load_location != self._pushdown_for():
+            # The search pinned another location while this one was read: read that one now.
+            self._refresh_jobs(manual=True, quiet=True)
+            return
         self._switching = False
+        self._narrowing = False
         if account and (self._asked or shown):
             # a's answer, also after its first pages showed: an account-wide list
             # unavailable now keeps the configured schema, saying why, as at once.
@@ -1066,7 +1137,7 @@ class JobListScreen(FollowsPointer, Screen):
             # Requested GPUs; "shared" for a job that runs only on another job's GPUs.
             "GPUs": _cell(views.job_gpu_cell(job, str(job.get("hardware") or ""))),
             # Plain text: a quoted name can hold anything, brackets included.
-            "Location": _cell(views.location_label(job) or "—", theme.MUTED),
+            _SCHEMA_COLUMN: _cell(views.location_label(job) or "—", theme.MUTED),
             "Updated": updated,
         }
         return cells, now.timestamp() + min(created_lasts, updated_lasts, span_lasts)
@@ -1352,13 +1423,18 @@ class JobListScreen(FollowsPointer, Screen):
             one = self._scope is not None and self._scope.kind != ACCOUNT
             widen = self._scope is not None and self._scope.kind == SCHEMA
             if self._filter:
+                # The list is cut short and nothing narrowed it: a whole name would read that
+                # database from the service instead of only the jobs loaded here.
+                narrow = (self._scope is not None and self._scope.kind == ACCOUNT
+                          and self._scope.truncated and self._pushdown is None)
                 found = dict(cut=loaded_text(self._scope), older=self._older_matches(query) if hidden else (),
-                             location=self._schema_label() if one else "", widen=widen)
+                             location=self._schema_label() if one else "", widen=widen, narrow=narrow)
                 message = views.no_match_message(self._filter, query, len(recent), **found)
             elif self._scope is not None and self._scope.truncated:
                 message = empty_text(self._scope)
             elif self._scope is not None and self._scope.kind == ACCOUNT:
-                message = "No jobs created in the last 6 months that this role can see, in any database and schema."
+                where = f"in {self._scope.narrowed}" if self._scope.narrowed else "in any database and schema"
+                message = f"No jobs created in the last 6 months that this role can see, {where}."
             else:
                 message = f"No jobs created in the last 6 months in {self._schema_label()} that this role can see."
                 if widen:

@@ -533,7 +533,7 @@ def preview_facts(job: dict, now: datetime) -> list:
         ("Owner", owner(job)),
         ("Created", format_created_at(job.get("created_at")) or "—"),
         ("Last update", f"{updated}  ({ago})" if "—" not in (updated, ago) else updated),
-        *([("Location", location)] if location else []),
+        *([("Schema", location)] if location else []),
     ]
 
 
@@ -742,8 +742,8 @@ SEARCH_FIELDS = {
     "lora_r": "LoRA rank",
     "lora_alpha": "LoRA alpha",
     "dtype": "dtype",
-    "db": "database name (= and != by SQL identifier rules)",
-    "schema": "schema name (= and != by SQL identifier rules)",
+    "db": "database name, or DB.SCHEMA (db=NAME reads that database from the server)",
+    "schema": "schema name, or DB.SCHEMA as the Schema column shows it",
 }
 # Fields that name where a job is. A row without a location (the configured
 # schema's own list) is in the configured database and schema, which the
@@ -1001,12 +1001,48 @@ def search_haystack(job: dict) -> str:
     return fold(" ".join(str(b) for b in bits))
 
 
-def location_words(job: dict) -> list:
-    """A location folded both as displayed and bare."""
-    names = location_names(job)
+def location_words(job: dict, *, home: Optional[tuple] = None) -> list:
+    """A location folded both as displayed and bare.
+
+    A row that names no location (the configured schema's own list) is in ``home``, the same
+    fallback the ``db`` and ``schema`` filters use, so a word matches that schema's own name
+    there too.
+    """
+    names = location_names(job) or home
     if names is None:
         return []
-    return list(dict.fromkeys((fold(location_label(job)), fold(printable(f"{names[0]}.{names[1]}")))))
+    shown = printable(f"{sql_identifier(names[0])}.{sql_identifier(names[1])}")
+    return list(dict.fromkeys((fold(shown), fold(printable(f"{names[0]}.{names[1]}")))))
+
+
+def split_location(value: str) -> Optional[tuple]:
+    """``(database, schema)`` of a whole location as the Schema column shows it
+    (``TEAM_DB.EXPERIMENTS``, ``"ml"."dev"``); None when ``value`` names one part only.
+
+    Only a dot outside quotes divides the two, so a single quoted name holding one
+    (``"my.db"``) stays one name.
+    """
+    text = value.strip()
+    parts, held, quoted, at = [], [], False, 0
+    while at < len(text):
+        char = text[at]
+        if char == '"':
+            if quoted and text[at:at + 2] == '""':  # an escaped quote inside a quoted name
+                held.append('""')
+                at += 2
+                continue
+            quoted = not quoted
+        elif char == "." and not quoted:
+            parts.append("".join(held))
+            held = []
+            at += 1
+            continue
+        held.append(char)
+        at += 1
+    parts.append("".join(held))
+    if quoted or len(parts) != 2 or not all(parts):
+        return None  # unbalanced quotes, one name, or more dots than a location has
+    return parts[0], parts[1]
 
 
 def _starts_a_name(term: str, words: list) -> bool:
@@ -1025,6 +1061,21 @@ def _same_name(stored: str, wanted: str) -> bool:
     return wanted == stored or identifier_name(wanted) == stored
 
 
+def _location_matches(job: dict, side: str, op: str, name: str, home: Optional[tuple]) -> bool:
+    """Whether ``job``'s database (``side`` ``db``) or schema satisfies one side of a location filter.
+
+    ``=`` and ``!=`` read ``name`` by SQL identifier rules (see :func:`_same_name`); every other
+    operator keeps its usual meaning over the name as stored and as SQL quotes it, so ``:``
+    matches part of it.
+    """
+    stored = _location_name(job, side, home)
+    if stored is None:
+        return False
+    if op in ("=", "!="):
+        return _same_name(stored, name)
+    return any(_compare(held, op, name) for held in (stored, sql_identifier(stored)))
+
+
 def job_matches_query(job: dict, query: Query, *, home: Optional[tuple] = None,
                       hay: Optional[str] = None) -> bool:
     """Whether ``job`` matches every term and filter, using ``home`` if unlocated."""
@@ -1034,13 +1085,20 @@ def job_matches_query(job: dict, query: Query, *, home: Optional[tuple] = None,
         return True
     if hay is None:
         hay = search_haystack(job)
-    places = location_words(job)
+    places = location_words(job, home=home)
     if any(t not in hay and not _starts_a_name(t, places) for t in query.terms):
         return False
     for key, op, value in query.filters:
-        if key in _LOCATION_FIELDS and op in ("=", "!="):
-            stored = _location_name(job, key, home)
-            if (stored is not None and _same_name(stored, value)) != (op == "="):
+        if key in _LOCATION_FIELDS and (op in ("=", "!=") or split_location(value)):
+            # A dotted value is a whole location, as the Schema column shows it, so what that
+            # column holds can be searched for exactly as it reads, with any operator:
+            # ``schema=TEAM_DB.EXPERIMENTS`` asks for both names whole and
+            # ``schema:team_db.exper`` for part of each, while ``schema=EXPERIMENTS`` and
+            # ``schema:exper`` go on asking about the schema alone.
+            pair = split_location(value)
+            wanted = (("db", pair[0]), ("schema", pair[1])) if pair else ((key, value),)
+            matched = all(_location_matches(job, side, op, name, home) for side, name in wanted)
+            if matched == (op == "!="):
                 return False
             continue
         values = field_values(job, key, home=home)
@@ -1053,8 +1111,68 @@ def job_matches_query(job: dict, query: Query, *, home: Optional[tuple] = None,
     return True
 
 
+def pushdown_location(query: Query) -> Optional[tuple]:
+    """``(database, schema)`` the account-wide list can ask the server for; None to read it whole.
+
+    Only a whole ``db=NAME``, and with it a whole ``schema=NAME``, narrows at the server: the
+    account-level route takes those two filters and no others, and it refuses a schema without
+    a database. ``schema`` is None when the database alone narrows. A dotted value names a whole
+    location (``schema=TEAM_DB.EXPERIMENTS``, as the Schema column shows it) and pins both.
+
+    Everything else stays here, matched by :func:`job_matches_query` over what the walk read: a
+    partial match (``schema:exp``), a negation (``schema!=X``), an ordering op, a bare word, and
+    a ``schema=`` with no ``db=`` of its own (the configured database is not implied, and
+    assuming it would hide the same schema name in another database).
+
+    A name narrows only in the form the service resolves it to (see :func:`narrowable_name`), so
+    narrowing never drops a row the search would have kept. The client-side filter runs over the
+    answer either way.
+    """
+    if query.errors:
+        return None  # a typo'd field matches nothing; narrowing on it would ask for the wrong rows
+    pinned: dict = {"db": set(), "schema": set()}
+    for key, op, value in query.filters:
+        if key not in _LOCATION_FIELDS or op != "=":
+            continue
+        pair = split_location(value)  # a whole location pins both sides at once
+        if pair:
+            pinned["db"].add(pair[0].strip())
+            pinned["schema"].add(pair[1].strip())
+        else:
+            pinned[key].add(value.strip())
+
+    def whole(side: str) -> Optional[str]:
+        """The one name ``side`` is pinned to by an ``=`` and can be narrowed on; else None."""
+        wanted = pinned[side]
+        if len(wanted) != 1:
+            return None  # nothing to narrow on, or two names at once (which matches nothing)
+        name = next(iter(wanted))
+        return name if name and narrowable_name(name) else None
+
+    database = whole("db")
+    if database is None:
+        return None  # a schema needs its database with it
+    return database, whole("schema")
+
+
+def narrowable_name(name: str) -> bool:
+    """Whether the service, asked for ``name``, returns every row ``name=`` keeps here.
+
+    ``=`` keeps a row whose name is ``name`` as stored *or* the name SQL resolves ``name`` to
+    (see :func:`_same_name`), while a walk narrowed to ``name`` only reads the second. The two
+    agree when ``name`` is already in its resolved form (``TEAM_DB``), and when it is quoted
+    (``"ml"``, which no stored name is spelled as, so only the resolved ``ml`` can match).
+
+    An unquoted ``ml`` or ``team_db`` resolves to ``ML`` / ``TEAM_DB`` but would also match a
+    database stored under that exact lowercase spelling, which a narrowed walk would never read.
+    Such a name is matched here instead, as it was before narrowing existed -- never worse than
+    reading every schema, and the form the Schema column shows is always narrowable.
+    """
+    return name == identifier_name(name) or _QUOTED_IDENTIFIER.fullmatch(name) is not None
+
+
 def no_match_message(text: str, query: Query, searched: int, *, cut: str = "", older: Iterable[str] = (),
-                     location: str = "", widen: bool = False) -> str:
+                     location: str = "", widen: bool = False, narrow: bool = False) -> str:
     """Explain an empty search, including truncated, old, or wider matches."""
     older = list(older)
     if cut:
@@ -1069,6 +1187,11 @@ def no_match_message(text: str, query: Query, searched: int, *, cut: str = "", o
                      f"jobs older than 6 months): cortex-training tui {older[0]} opens {'the newest' if many else 'it'}.")
     if widen:
         lines.append("  a searches every database and schema.")
+    if narrow:
+        # The list is cut short and nothing narrowed it, so the jobs looked for may simply not be
+        # among the ones read. A whole name is asked of the service instead (see pushdown_location).
+        lines.append("  db=NAME, or db=NAME schema=NAME, reads that whole database from the service "
+                     "rather than only the jobs loaded here.")
     if query.errors:
         lines.append("  " + "; ".join(query.errors) + ".")
         lines.append("  Fields: " + ", ".join(SEARCH_FIELDS) + "; any other key reads that member of a job, its "
@@ -1078,7 +1201,8 @@ def no_match_message(text: str, query: Query, searched: int, *, cut: str = "", o
             lines.append("  To search for text with a colon in it, quote it: \"training:0\".")
     if query.terms:
         lines.append("  Words match id, sub-job id, status, owner, GPU type, job type, model, and "
-                     "the start of a location's database or schema name (case-insensitive).")
+                     "the start of a location's database or schema name (case-insensitive): "
+                     "db:TEXT matches anywhere in the name, db=NAME the whole name.")
     if query.filters:
         lines.append("  Filters must all match; try fewer, or ':' for a partial match (model:qwen).")
     lines.append("  Esc clears the search.")
@@ -1128,6 +1252,7 @@ def sort_job_list(jobs: Iterable[dict], key: str = "created", descending: bool =
 
 
 _PLAIN_IDENTIFIER = re.compile(r"[A-Z_][A-Z0-9_$]*")
+_QUOTED_IDENTIFIER = re.compile(r'"(?:[^"]|"")*"')
 
 
 def sql_identifier(name: str) -> str:
@@ -1180,6 +1305,14 @@ def location_label(job: Any) -> str:
     if names is None:
         return ""
     return printable(f"{sql_identifier(names[0])}.{sql_identifier(names[1])}")
+
+
+def location_filter_text(location: Optional[tuple]) -> str:
+    """``DB.SCHEMA`` (or ``DB`` alone) of a narrowing, each name as the server resolves it and
+    SQL quotes it (``db=team_db`` reads ``TEAM_DB``; ``db="ml"`` reads ``"ml"``); "" without one."""
+    if not location:
+        return ""
+    return printable(".".join(sql_identifier(identifier_name(name)) for name in location if name))
 
 
 def cli_options(*, database: Optional[str] = None, schema: Optional[str] = None,

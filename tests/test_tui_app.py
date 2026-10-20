@@ -5058,3 +5058,106 @@ async def _run_a_finished_job_s_console_shows_its_last_lines_while_the_rest_down
 
 def test_a_finished_job_s_console_shows_its_last_lines_while_the_rest_downloads(tmp_path):
     asyncio.run(_run_a_finished_job_s_console_shows_its_last_lines_while_the_rest_downloads(tmp_path))
+
+
+# ─── the Schema column, and narrowing the account-wide list to one schema ─────
+
+
+async def _account_list(app, pilot):
+    """The demo's account-wide job list (``a``), drawn: the screen and its table."""
+    screen, table = await _demo_list(app, pilot)
+    await pilot.press("a")
+    assert await _pause_until(pilot, lambda: screen._scope is not None and screen._scope.kind == ACCOUNT
+                              and not screen._refreshing, seconds=10.0), app.sub_title
+    await pilot.pause(0.1)
+    return screen, table
+
+
+async def _run_the_schema_column_names_each_jobs_database_and_schema():
+    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    async with app.run_test(size=(200, 40)) as pilot:  # wide enough for every column
+        screen, table = await _account_list(app, pilot)
+        labels = [str(column.label) for column in table.columns.values()]
+        assert "Schema" in labels, labels
+        assert "Location" not in labels  # the header this column used to carry
+        at = labels.index("Schema")
+        # The cell is built under the same name the column is added under: were the two to drift,
+        # the row lookup would fall back to a blank cell and quietly empty the column.
+        drawn = {str(table.get_row_at(row)[at]).strip() for row in range(table.row_count)}
+        assert {"CORTEX_TRAINING_DB.PUBLIC", "TEAM_DB.EXPERIMENTS", '"sandbox"."dev"'} <= drawn, sorted(drawn)
+        await _settle(app, pilot)
+
+
+def test_the_schema_column_names_each_jobs_database_and_schema():
+    asyncio.run(_run_the_schema_column_names_each_jobs_database_and_schema())
+
+
+async def _run_a_whole_location_in_the_search_is_read_from_the_service():
+    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    async with app.run_test(size=(200, 40)) as pilot:
+        screen, _table = await _account_list(app, pilot)
+        assert screen._pushdown is None  # every schema, so far
+
+        box = screen.query_one("#jobfilter", Input)
+        box.value = "db=TEAM_DB schema=EXPERIMENTS"
+        await pilot.pause(0.3)  # past the search debounce
+        assert await _pause_until(pilot, lambda: screen._pushdown == ("TEAM_DB", "EXPERIMENTS")
+                                  and not screen._refreshing, seconds=10.0), screen._pushdown
+        assert screen._scope.narrowed == "TEAM_DB.EXPERIMENTS"
+        # The header says the list was narrowed, never that it covered every schema.
+        assert "narrowed to TEAM_DB.EXPERIMENTS" in app.sub_title, app.sub_title
+        assert "all in" not in app.sub_title
+        # Every row left is in that schema, so the column collapses and the header carries it.
+        assert [str(column.label) for column in screen.query_one("#jobs", DataTable).columns.values()
+                ].count("Schema") == 0
+
+        box.value = ""  # cleared: the whole account is read again
+        await pilot.pause(0.3)
+        assert await _pause_until(pilot, lambda: screen._pushdown is None and not screen._refreshing,
+                                  seconds=10.0), screen._pushdown
+        assert screen._scope.narrowed == ""
+        await _settle(app, pilot)
+
+
+def test_a_whole_location_in_the_search_is_read_from_the_service():
+    asyncio.run(_run_a_whole_location_in_the_search_is_read_from_the_service())
+
+
+async def _run_a_search_that_cannot_narrow_reads_every_schema(text):
+    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    async with app.run_test(size=(200, 40)) as pilot:
+        screen, _table = await _account_list(app, pilot)
+        screen.query_one("#jobfilter", Input).value = text
+        await pilot.pause(0.3)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        # A partial match, a negation, or a schema with no database of its own: matched here, so
+        # the walk still reads every schema and the header still says so.
+        assert screen._pushdown is None, text
+        assert screen._scope.narrowed == ""
+        assert "narrowed to" not in app.sub_title, app.sub_title
+        await _settle(app, pilot)
+
+
+@pytest.mark.parametrize("text", ["schema:exper", "db!=TEAM_DB", "schema=EXPERIMENTS", "db:team"])
+def test_a_search_that_cannot_narrow_reads_every_schema(text):
+    asyncio.run(_run_a_search_that_cannot_narrow_reads_every_schema(text))
+
+
+async def _run_a_narrowing_with_no_jobs_says_so_rather_than_failing():
+    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    async with app.run_test(size=(200, 40)) as pilot:
+        screen, _table = await _account_list(app, pilot)
+        screen.query_one("#jobfilter", Input).value = "db=NOPE schema=NOPE"
+        await pilot.pause(0.3)
+        assert await _pause_until(pilot, lambda: not screen._refreshing and screen._pushdown is not None,
+                                  seconds=10.0)
+        # No such database here, so the narrowed walk answers an empty page: the search says
+        # nothing matched rather than the list reading as a failure. (A service that refuses the
+        # name outright with a 400 is covered in tests/test_tui_account.py.)
+        assert screen._list_error is None, screen._list_error
+        assert not screen.query_one("#jobs", DataTable).display
+        await _settle(app, pilot)
+
+
+def test_a_narrowing_with_no_jobs_says_so_rather_than_failing():
+    asyncio.run(_run_a_narrowing_with_no_jobs_says_so_rather_than_failing())

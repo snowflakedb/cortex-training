@@ -41,6 +41,7 @@ from cortex_training.tui.account import FAILED
 from cortex_training.tui.account import FALLBACK
 from cortex_training.tui.account import OLDER
 from cortex_training.tui.account import PAGE_LIMIT
+from cortex_training.tui.account import SCHEMA
 from cortex_training.tui.account import JobLister
 from cortex_training.tui.account import JobListError
 from cortex_training.tui.account import Listing
@@ -196,13 +197,26 @@ class _Paged:
         self.active_fail = active_fail
         self.unavailable = None
         self.calls = []
+        # The (database, schema) of each page asked for, kept apart from ``calls`` so the
+        # walk-and-token assertions that compare ``calls`` for equality stay as they were.
+        self.filters = []
+        self.bad_location = None  # raised instead of a page when a narrowing is asked for
 
-    def list_jobs_page(self, *, created_after, page_size, page_token=None, status=None):
+    def list_jobs_page(self, *, created_after, page_size, page_token=None, status=None,
+                       database=None, schema=None):
         if self.unavailable is not None:
             raise self.unavailable
+        if schema is not None and database is None:
+            raise ValueError("list_jobs_page: schema needs database with it")
         walk = "active" if status else "newest"
         self.calls.append((walk, page_token))
+        self.filters.append((walk, database, schema))
+        if self.bad_location is not None and database is not None:
+            raise self.bad_location
         rows = [job for job in self.jobs if not status or job["status"] == "RUNNING"]
+        if database is not None:
+            rows = [job for job in rows if job.get("database_name") == database
+                    and (schema is None or job.get("schema_name") == schema)]
         start, page = map(int, (page_token or "0:0").split(":"))
         page += 1
         if page == self.bad[walk]:
@@ -597,3 +611,137 @@ def test_a_loading_list_says_how_far_it_is():
         "newest 2,000 (more exist; older active jobs may be missing)")
     assert stopped_scope(ListScope(ACCOUNT)) == ListScope(ACCOUNT)
 
+
+
+# ─── narrowing the walk to one database and schema ───────────────────────────
+
+
+def test_a_narrowed_walk_asks_the_service_for_that_location_on_every_page():
+    client = _Paged(total=1_200)
+    listing = JobLister(client, account_wide=True).load(NOW, location=("DB", "S1"))
+    assert {(job["database_name"], job["schema_name"]) for job in listing.jobs} == {("DB", "S1")}
+    # Every page of the walk carries the pair: the service refuses a token sent with other filters.
+    assert {(db, sch) for _walk, db, sch in client.filters} == {("DB", "S1")}
+    assert listing.scope.narrowed == "DB.S1"
+
+
+def test_a_narrowed_walk_reads_its_active_jobs_in_the_same_location():
+    # Large enough that one of the three schemas is itself past the cap, so the walk stops short
+    # and reads the active jobs beside the newest: both walks must cover one scope, or _merge
+    # would union two differently-scoped sets.
+    client = _Paged(total=ACCOUNT_LIST_CAP * 3 + 300, active_every=2)
+    JobLister(client, account_wide=True).load(NOW, location=("DB", "S2"))
+    assert _walk_calls(client.filters, "active"), "the active jobs were not read"
+    assert {(db, sch) for _walk, db, sch in client.filters} == {("DB", "S2")}
+
+
+def test_a_database_alone_narrows_and_sends_no_schema():
+    client = _Paged(total=1_200)
+    listing = JobLister(client, account_wide=True).load(NOW, location=("DB", None))
+    assert {(db, sch) for _walk, db, sch in client.filters} == {("DB", None)}
+    assert listing.scope.narrowed == "DB"
+    assert len({job["schema_name"] for job in listing.jobs}) == 3  # every schema of that database
+
+
+def test_an_unnarrowed_walk_sends_neither_name():
+    client = _Paged(total=1_200)
+    listing = JobLister(client, account_wide=True).load(NOW)
+    assert {(db, sch) for _walk, db, sch in client.filters} == {(None, None)}
+    assert listing.scope.narrowed == ""
+
+
+def test_a_narrowed_list_says_what_it_was_narrowed_to():
+    whole = ListScope(ACCOUNT, narrowed="TEAM_DB.EXPERIMENTS")
+    assert scope_text(whole, location="") == "all schemas, narrowed to TEAM_DB.EXPERIMENTS"
+    # A sole location the walk asked for must not read as "all in …", which claims it read every schema.
+    assert scope_text(whole, location="", only="TEAM_DB.EXPERIMENTS") == (
+        "all schemas, narrowed to TEAM_DB.EXPERIMENTS")
+    capped = ListScope(ACCOUNT, stopped=CAPPED, walked=2_000, narrowed="TEAM_DB.EXPERIMENTS")
+    assert scope_text(capped, location="") == (
+        "narrowed to TEAM_DB.EXPERIMENTS: newest 2,000 + every active job (more exist)")
+    assert loaded_text(capped) == (
+        "the newest 2,000 of the last 6 months in TEAM_DB.EXPERIMENTS and every active job; more exist")
+    assert "in TEAM_DB.EXPERIMENTS" in empty_text(capped)
+    loading = ListScope(ACCOUNT, walked=500, loading=OLDER, narrowed="TEAM_DB")
+    assert scope_text(loading, location="") == "narrowed to TEAM_DB: loading older jobs… 500 so far"
+    assert "in TEAM_DB" in empty_text(loading)
+    # The narrowing survives a walk cut short by a load that superseded it.
+    assert stopped_scope(loading).narrowed == "TEAM_DB"
+
+
+def test_an_unnarrowed_list_reads_exactly_as_it_did_before():
+    # The new field defaults to "", so every scope the walk made before says what it said before.
+    assert scope_text(ListScope(ACCOUNT), location="") == "all schemas"
+    assert scope_text(ListScope(ACCOUNT), location="", only="DB.S1") == "all schemas (all in DB.S1)"
+    capped = ListScope(ACCOUNT, stopped=CAPPED, walked=2_000)
+    assert scope_text(capped, location="") == "newest 2,000 + every active job (more exist)"
+    assert loaded_text(capped) == "the newest 2,000 of the last 6 months and every active job; more exist"
+
+
+def test_a_narrowing_the_service_refuses_reads_every_schema_instead():
+    # A database or schema this role can't see is answered 400, which names no typed reason, so
+    # without the retry the whole list would fail rather than the search saying nothing matches.
+    client = _Paged(total=1_200)
+    client.bad_location = requests.exceptions.HTTPError("400 Client Error", response=_response(400))
+    lister = JobLister(client, account_wide=True)
+    listing = lister.load(NOW, location=("NOPE", "NOPE"))
+    assert listing.scope.kind == ACCOUNT and listing.scope.narrowed == ""
+    assert len(listing.jobs) == 1_200  # every schema, for the search to filter
+    assert lister._fallback is None  # the refusal is about the filter, not the route
+
+
+def test_a_refused_narrowing_leaves_a_fallback_found_earlier_alone():
+    # The fallback describes the route; a filter the service refuses must not re-probe it.
+    client = _Client(account_error=_unavailable(NOT_DEPLOYED))
+    lister = JobLister(client, account_wide=True)
+    assert lister.load(NOW).scope == ListScope(FALLBACK, reason=NOT_DEPLOYED)
+    asked_at = lister._asked_at
+    assert lister.load(NOW, location=("DB", "S1")).scope == ListScope(FALLBACK, reason=NOT_DEPLOYED)
+    assert lister._fallback == NOT_DEPLOYED and lister._asked_at == asked_at
+
+
+def test_the_configured_schemas_route_is_never_narrowed():
+    # Its URL already names one schema, and list_jobs takes no such filter.
+    client = _Paged(total=400)
+    listing = JobLister(client, account_wide=False).load(NOW, location=("DB", "S1"))
+    assert listing.scope == ListScope(SCHEMA) and listing.scope.narrowed == ""
+    assert client.filters == []  # the account route was not asked at all
+
+
+class _Clustered:
+    """The account-level list where one schema's jobs are all older than the account's newest
+    :data:`ACCOUNT_LIST_CAP`: the shape no client-side filter can reach."""
+
+    def __init__(self):
+        start = datetime(2026, 9, 30, tzinfo=timezone.utc)
+        self.jobs = [{"job_id": f"new-{i:05d}", "database_name": "DB", "schema_name": "BUSY",
+                      "status": "DONE", "created_at": (start - timedelta(minutes=i)).isoformat()}
+                     for i in range(ACCOUNT_LIST_CAP + 500)]
+        self.jobs += [{"job_id": f"old-{i:05d}", "database_name": "DB", "schema_name": "QUIET",
+                       "status": "DONE",
+                       "created_at": (start - timedelta(days=30, minutes=i)).isoformat()} for i in range(5)]
+
+    def list_jobs_page(self, *, created_after, page_size, page_token=None, status=None,
+                       database=None, schema=None):
+        rows = [job for job in self.jobs if not status or job["status"] == "RUNNING"]
+        if database is not None:
+            rows = [job for job in rows if job["database_name"] == database
+                    and (schema is None or job["schema_name"] == schema)]
+        start = int(page_token or 0)
+        page = rows[start:start + page_size]
+        end = start + len(page)
+        return {"jobs": [dict(job) for job in page], "next_page_token": str(end) if end < len(rows) else None}
+
+    def list_jobs(self, status=None) -> list:
+        return []
+
+
+def test_a_schema_whose_jobs_fall_past_the_cap_is_reachable_only_by_narrowing():
+    lister = JobLister(_Clustered(), account_wide=True)
+    whole = lister.load(NOW)
+    assert whole.scope.stopped == CAPPED  # the walk stopped at the cap, and more exist
+    # Unnarrowed, the older schema is not in the list at all, so no search over it could find a job.
+    assert [job for job in whole.jobs if job["schema_name"] == "QUIET"] == []
+    narrowed = lister.load(NOW, location=("DB", "QUIET"))
+    assert [job["job_id"] for job in narrowed.jobs] == [f"old-{i:05d}" for i in range(5)]
+    assert narrowed.scope.stopped is None and narrowed.scope.narrowed == "DB.QUIET"

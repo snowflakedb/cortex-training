@@ -553,8 +553,9 @@ size is not a count of what matched.
 
 `CortexTrainingClient.iter_jobs(...)` takes the same filters, with `page_size`
 for `limit`, checks its arguments on the call, and yields jobs across pages as
-you iterate. It raises a 404 at once instead of retrying it, and never creates
-the configured database. `CortexTrainingClient.list_jobs_page(...)` reads one
+you iterate. A `schema` without a `database` is refused before any request, as a
+`ValueError`, rather than reaching the service's 400. It raises a 404 at once
+instead of retrying it, and never creates the configured database. `CortexTrainingClient.list_jobs_page(...)` reads one
 page instead: it takes the same filters plus `page_token`, and per-call
 `max_retries` and `request_timeout`, and returns
 `{"jobs": [...], "next_page_token": str | None}`. It raises 403, 404 and 405
@@ -563,6 +564,11 @@ at once as `AccountJobListUnavailable`, whose `reason` is `forbidden`,
 `Invalid page_token` as `InvalidPageToken`; both subclass `requests.HTTPError`.
 `for_job(job)` returns a client bound to a listed job's `database_name` and
 `schema_name`; it borrows the parent's session and creates no database either.
+
+The TUI's job list sends `database` (and `schema` with it) when a search names a
+whole one, so that location's jobs are read whole rather than filtered out of
+the newest jobs the walk reads; see the job list in `docs/reference/cli.md`. A
+page token is only sent back with the filters it was made under, as above.
 
 ### 5.4 Capacity - `GET /capacity`
 

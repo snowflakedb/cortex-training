@@ -34,9 +34,16 @@ from cortex_training.tui.format import source_label
 from cortex_training.tui.format import wrap_log_line
 from cortex_training.tui.views import fit_cells
 from cortex_training.tui.views import job_matches_query
+from cortex_training.tui.views import location_filter_text
+from cortex_training.tui.views import narrowable_name
+from cortex_training.tui.views import no_match_message
 from cortex_training.tui.views import parse_query
 from cortex_training.tui.views import printable_data
+from cortex_training.tui.views import pushdown_location
+from cortex_training.tui.views import Query
 from cortex_training.tui.views import resolve_query
+from cortex_training.tui.views import split_location
+from cortex_training.tui.views import sql_identifier
 from cortex_training.tui.views import sort_job_list
 from cortex_training.tui.views import wrap_cells
 
@@ -186,6 +193,177 @@ def test_a_key_no_job_has_stays_an_error_and_names_the_nested_paths_ending_in_it
         "unknown field 'betas' (did you mean training_config.optimizer.betas?)"]
     assert resolve_query(parse_query("nope=1"), JOBS).errors == ["unknown field 'nope'"]
     assert _matches("betas=0.95") == []
+
+
+def _located(job_id: str, database: str, schema: str) -> dict:
+    return {**_job(job_id, seed=1, lr=1e-4, betas=[0.9]),
+            "database_name": database, "schema_name": schema}
+
+
+# As the account-wide list carries them: the names exactly as stored, unquoted.
+LOCATED = [_located("in-team", "TEAM_DB", "EXPERIMENTS"), _located("in-ml", "ml", "dev")]
+
+
+def _located_matches(text: str) -> list:
+    query = resolve_query(parse_query(text), LOCATED)
+    return [job["job_id"] for job in LOCATED if job_matches_query(job, query)]
+
+
+def test_a_whole_database_and_schema_are_read_from_the_server():
+    assert pushdown_location(parse_query("db=TEAM_DB schema=EXPERIMENTS")) == ("TEAM_DB", "EXPERIMENTS")
+    assert pushdown_location(parse_query("db=TEAM_DB")) == ("TEAM_DB", None)  # the database alone narrows
+    # The aliases name the same two fields, so they narrow the same way.
+    assert pushdown_location(parse_query("database=TEAM_DB schema_name=EXPERIMENTS")) == ("TEAM_DB", "EXPERIMENTS")
+    # Other filters and words beside them are matched here and don't stop the narrowing.
+    assert pushdown_location(parse_query("db=TEAM_DB status:running qwen")) == ("TEAM_DB", None)
+
+
+def test_a_schema_without_a_database_is_not_read_from_the_server():
+    # The account route refuses a schema without a database, and the configured database is not
+    # implied by what was typed: assuming it would hide the same schema name in another database.
+    assert pushdown_location(parse_query("schema=EXPERIMENTS")) is None
+    assert pushdown_location(parse_query("schema_name=PUBLIC owner=me")) is None
+
+
+def test_a_partial_or_negated_location_is_not_read_from_the_server():
+    for text in ("db:team", "db!=TEAM_DB", "db>TEAM_DB", "db>=TEAM_DB", "teamdb", "schema:exp"):
+        assert pushdown_location(parse_query(text)) is None, text
+
+
+def test_two_names_for_one_side_are_not_read_from_the_server():
+    assert pushdown_location(parse_query("db=A db=B")) is None  # a contradiction; it matches nothing here
+    # The database still narrows while the contradictory schema is left to match nothing here.
+    assert pushdown_location(parse_query("db=TEAM_DB schema=A schema=B")) == ("TEAM_DB", None)
+
+
+def test_a_database_is_read_from_the_server_while_a_partial_schema_is_matched_here():
+    assert pushdown_location(parse_query("db=TEAM_DB schema:exp")) == ("TEAM_DB", None)
+    assert _located_matches("db=TEAM_DB schema:exp") == ["in-team"]
+
+
+def test_a_typod_field_is_not_read_from_the_server():
+    query = parse_query("db=TEAM_DB nope=1")
+    assert query.errors and pushdown_location(query) is None
+    # Still an error once resolved against jobs that don't carry it, so still no narrowing.
+    assert pushdown_location(resolve_query(query, LOCATED)) is None
+
+
+def test_a_blank_name_is_not_read_from_the_server():
+    # A blank would go on the wire as a filter and defeat the schema-needs-a-database rule.
+    assert pushdown_location(Query(filters=[("db", "=", "   ")])) is None
+    assert pushdown_location(Query(filters=[("db", "=", "TEAM_DB"), ("schema", "=", " ")])) == ("TEAM_DB", None)
+
+
+def test_a_location_filter_follows_sql_identifier_rules():
+    assert _located_matches("db=team_db") == ["in-team"]  # unquoted: the name it resolves to
+    assert _located_matches("db=TEAM_DB") == ["in-team"]
+    assert _located_matches('db="ml"') == ["in-ml"]  # quoted: exactly what is between the quotes
+    assert _located_matches("db=ml") == ["in-ml"]  # also matches the name as stored
+    assert _located_matches("db!=TEAM_DB") == ["in-ml"]
+    assert _located_matches("schema=EXPERIMENTS") == ["in-team"]
+    assert _located_matches("schema:exp") == ["in-team"]  # a partial match, which never narrows at the server
+
+
+def test_only_a_name_the_service_resolves_the_same_way_is_read_from_it():
+    # `=` keeps a row whose name is the one typed as stored, or the one SQL resolves it to; a
+    # narrowed walk reads only the second. Narrowing on a name where those differ would hide a
+    # database stored under that exact lowercase spelling, so it is matched here instead.
+    assert pushdown_location(parse_query("db=TEAM_DB")) == ("TEAM_DB", None)  # already resolved
+    assert pushdown_location(parse_query('db=\'"ml"\'')) == ('"ml"', None)  # quoted: only `ml` can match
+    assert pushdown_location(parse_query("db=team_db")) is None  # would also match a stored `team_db`
+    assert pushdown_location(parse_query("db=ml")) is None  # would also match a stored `ml`
+    # The database narrows while a schema whose spelling is ambiguous is matched here.
+    assert pushdown_location(parse_query("db=TEAM_DB schema=experiments")) == ("TEAM_DB", None)
+    assert pushdown_location(parse_query("db=TEAM_DB schema=EXPERIMENTS")) == ("TEAM_DB", "EXPERIMENTS")
+
+
+def test_every_name_the_schema_column_shows_is_read_from_the_service():
+    # Whatever the Schema column shows can be copied into the search and still narrow: it shows
+    # each name as SQL quotes it, which is always either already resolved or already quoted.
+    for stored in ("TEAM_DB", "EXPERIMENTS", "ml", "dev", "Mixed_Case", "has space"):
+        assert narrowable_name(sql_identifier(stored)), stored
+    # The column shows a lowercase location as "ml"."dev"; typed back, both names narrow.
+    assert pushdown_location(parse_query('db=\'"ml"\' schema=\'"dev"\'')) == ('"ml"', '"dev"')
+
+
+def test_a_whole_location_can_be_searched_for_as_the_schema_column_shows_it():
+    # The column is headed Schema and shows DB.SCHEMA, so what it holds must be searchable as it
+    # reads; `schema=` taking only the second half matched nothing, with no error to say why.
+    assert _located_matches("schema=TEAM_DB.EXPERIMENTS") == ["in-team"]
+    assert _located_matches("db=TEAM_DB.EXPERIMENTS") == ["in-team"]  # either side takes it
+    assert _located_matches('schema=\'"ml"."dev"\'') == ["in-ml"]  # as the column quotes it
+    assert _located_matches("schema=TEAM_DB.NOPE") == []  # both halves must match
+    assert _located_matches("schema!=TEAM_DB.EXPERIMENTS") == ["in-ml"]
+    # A whole location narrows at the server as the two filters do.
+    assert pushdown_location(parse_query("schema=TEAM_DB.EXPERIMENTS")) == ("TEAM_DB", "EXPERIMENTS")
+    # The plain forms keep their meaning.
+    assert _located_matches("schema=EXPERIMENTS") == ["in-team"]
+    assert _located_matches("db=TEAM_DB") == ["in-team"]
+
+
+def test_a_whole_location_works_with_a_partial_match_too():
+    # `:` is the operator reached for first, and the Schema column's own text is what gets pasted
+    # after it, so a dotted value must work there and not only with `=`.
+    assert _located_matches("schema:TEAM_DB.EXPERIMENTS") == ["in-team"]
+    assert _located_matches("schema:team_db.experiments") == ["in-team"]  # case-insensitive
+    assert _located_matches("schema:team_db.exper") == ["in-team"]  # part of each name
+    assert _located_matches("db:TEAM_DB.EXPERIMENTS") == ["in-team"]  # either field takes it
+    assert _located_matches("schema:ml.dev") == ["in-ml"]  # the quotes the column shows are optional here
+    assert _located_matches("schema:team_db.nope") == []  # both halves must match
+    assert _located_matches("schema:nope.experiments") == []
+    # The single-name forms are untouched.
+    assert _located_matches("schema:exper") == ["in-team"]
+    assert _located_matches("db:team") == ["in-team"]
+    # A partial match is not expressible as a server filter, so it never narrows.
+    assert pushdown_location(parse_query("schema:TEAM_DB.EXPERIMENTS")) is None
+
+
+def test_only_a_dot_outside_quotes_divides_a_location():
+    assert split_location("TEAM_DB.EXPERIMENTS") == ("TEAM_DB", "EXPERIMENTS")
+    assert split_location('"ml"."dev"') == ('"ml"', '"dev"')
+    assert split_location('TEAM_DB."dev"') == ("TEAM_DB", '"dev"')
+    assert split_location('"my.db"') is None  # one quoted name that holds a dot
+    assert split_location("PUBLIC") is None  # one name
+    assert split_location("a.b.c") is None  # a location has two parts, not three
+    assert split_location(".x") is None and split_location("x.") is None
+    assert split_location('"unbalanced.x') is None
+    # A name holding a dot is still matched whole, not split.
+    assert _located_matches('db=\'"my.db"\'') == []
+
+
+def test_a_word_matches_the_configured_locations_own_name():
+    # A row of the configured schema's own list names no location; it is in `home`, the same
+    # fallback the db and schema filters use, so a word must reach it there too.
+    unlocated = [_job("here", seed=1, lr=1e-4, betas=[0.9])]
+    home = ("TEAM_DB", "EXPERIMENTS")
+
+    def matches(text: str) -> list:
+        query = resolve_query(parse_query(text), unlocated)
+        return [job["job_id"] for job in unlocated if job_matches_query(job, query, home=home)]
+
+    assert matches("TEAM_DB.EXPERIMENTS") == ["here"]
+    assert matches("team_db") == ["here"]
+    assert matches("db=TEAM_DB") == ["here"]  # as the filters already did
+    assert matches("schema=TEAM_DB.EXPERIMENTS") == ["here"]
+    assert matches("OTHER_DB") == []
+
+
+def test_a_no_match_message_says_a_whole_name_is_read_from_the_server():
+    query = parse_query("qwen")
+    cut = "the newest 2,000 of the last 6 months and every active job; more exist"
+    narrowed = no_match_message("qwen", query, 2_000, cut=cut, narrow=True)
+    assert "reads that whole database from the service" in narrowed
+    # Not offered where it would not help: the list already holds every job.
+    assert "from the service" not in no_match_message("qwen", query, 12)
+    # The word rules name all three ways a location can be matched.
+    assert "db:TEXT matches anywhere in the name, db=NAME the whole name" in narrowed
+
+
+def test_a_narrowing_reads_as_the_server_resolves_it():
+    assert location_filter_text(("team_db", "experiments")) == "TEAM_DB.EXPERIMENTS"
+    assert location_filter_text(('"ml"', '"dev"')) == '"ml"."dev"'
+    assert location_filter_text(("TEAM_DB", None)) == "TEAM_DB"
+    assert location_filter_text(None) == ""
 
 
 def test_entry_matches():

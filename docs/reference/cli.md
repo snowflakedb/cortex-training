@@ -838,6 +838,7 @@ list is whole, the header names it:
 |---|---|
 | `Current schema: DB.SCHEMA` | the jobs of the configured database and schema (`list_jobs`), as the list opens |
 | `all schemas` | after `a`: the jobs in every database and schema the role can see, from the account-level list; `all schemas (all in DB.SCHEMA)` when every one of them is in the same location |
+| `all schemas, narrowed to DB.SCHEMA` | after a whole `db=` search (see below): the jobs of that one location, asked of the service rather than filtered out of the newest 2,000. A narrowed list cut short reads `narrowed to DB.SCHEMA: newest 2,000 + every active job (more exist)`, and `narrowing to DB.SCHEMA…` while it is read |
 | `newest 2,000 + every active job (more exist)` | the same, cut at the newest 2,000 because more exist, plus the active jobs created before those |
 | `first 20 pages: N jobs + every active job (more may exist)` | the same, cut after 20 pages (see below), plus the active jobs |
 | `Current schema only: DB.SCHEMA (reason)` | the jobs of the configured database and schema, in place of the account-level list: `a` found it unavailable, or it turned unavailable while shown (see below) |
@@ -863,11 +864,27 @@ jobs may be missing`. A walk that stops at 20 pages with no job to show says
 that more may exist and how to list one schema, rather than that there are none.
 
 Search filters the jobs the list holds: when more exist, a search can't reach
-the older ones, and the message for a search without results says so. To
-search all of the configured schema's jobs, press `a` to go back to its list;
-for another schema, start the TUI with that schema's `--database` and
-`--schema`. These also go with `--connection`, where they take the place of the
-profile's database and schema:
+the older ones, and the message for a search without results says so. A search
+naming a whole database is the exception: `db=TEAM_DB`, on its own or together
+with a whole `schema=EXPERIMENTS`, has the account-level list read again asking
+the service for that location, so its jobs come whole instead of being filtered
+out of the newest 2,000. The header reads `narrowing to DB.SCHEMA…` while that
+is read and `narrowed to DB.SCHEMA` after; clearing the search reads every
+schema again. The Schema column is hidden on a narrowed list, as every job it
+holds is then in one location.
+
+Only that form narrows at the service, which takes a database with an optional
+schema and no other location filter. A partial match (`db:team`), a negation
+(`db!=TEAM_DB`), a `schema=` with no `db=` of its own, and a name the service
+would resolve to a different one (`db=team_db`, `db=ml`) all filter the jobs the
+list holds, as before. A name narrows when it is already the name the service
+resolves it to (`db=TEAM_DB`) or is quoted (`db='"ml"'`) — which is how the
+Schema column shows every location, so a location copied from it always narrows.
+
+To search all of the configured schema's jobs, press `a` to go back to its list.
+`--database` and `--schema` choose the configured one at startup. These also go
+with `--connection`, where they take the place of the profile's database and
+schema:
 `cortex-training tui --connection NAME --database OTHER_DB --schema OTHER_SCHEMA`.
 
 If the account-level list is unavailable, `a` keeps the configured schema and
@@ -890,8 +907,9 @@ when `a` finds it unavailable. The list pauses under details and refreshes on
 return when its last read is over 60 seconds old.
 
 When the list holds jobs from more than one database and schema, a
-**Location** column after GPUs shows `DB.SCHEMA` (SQL-quoted when needed) and
-is hidden when every job shares one. Previews, detail reads, logs, metrics and
+**Schema** column after GPUs shows `DB.SCHEMA` (SQL-quoted when needed) and
+is hidden when every job shares one, including on a list narrowed to one
+location, whose header names it instead. The job preview names it too. Previews, detail reads, logs, metrics and
 generated commands use the selected job's location. Commands also retain the
 connection method and a non-default `--endpoint`; a direct `tui JOB_ID` still
 uses the configured schema and suggests location flags after a 404.
@@ -951,9 +969,12 @@ An `unknown` row retains known creation time and derives missing sub-job ids as
 `--sub-job-id` is still attempted when live state cannot be listed.
 
 Search with `/`. Case- and Unicode-normalized words all must match an id,
-status, owner, GPU, type, model, or the start of a location component. Quote
-text containing `:` (for example `"training:0"`). `field<op>value` filters
-narrow further:
+status, owner, GPU, type, model, or the start of a location component — a word
+matches the *start* of a database or schema name, so `db:TEXT` is the way to
+match anywhere in one and `db=NAME` the way to match it whole. A word also
+matches the configured location's own name on its list, where rows name no
+location of their own. Quote text containing `:` (for example `"training:0"`).
+`field<op>value` filters narrow further:
 
 | Field | Meaning |
 |-------|---------|
@@ -962,7 +983,7 @@ narrow further:
 | `gpu`, `gpus` | GPU type (`H200`, `B200`, `B300`), requested GPU count |
 | `optimizer`, `lr`, `batch`, `seq` | optimizer name, learning rate, train batch size, max sequence length |
 | `lora_r`, `lora_alpha` | LoRA rank and alpha |
-| `db`, `schema` | database and schema name; a job of the configured schema's own list is in the configured ones. `:` matches part of the name in any case (`db:team`). `=` and `!=` take the name as stored or as SQL resolves it, a bare name being its uppercase form: `db=team_db` and `db=TEAM_DB` match `TEAM_DB`, `db=ml` and `db='"ml"'` match a lowercase `"ml"`, and `db=ML` doesn't |
+| `db`, `schema` | database and schema name; a job of the configured schema's own list is in the configured ones. Either field also takes a whole `DB.SCHEMA` exactly as the Schema column shows it, with any operator: `schema=TEAM_DB.EXPERIMENTS` asks for both names whole, `schema:team_db.exper` for part of each, and `schema!=TEAM_DB.EXPERIMENTS` for jobs elsewhere. Only a dot outside quotes divides the two, so a quoted name holding one (`db='"my.db"'`) stays one name. `:` matches part of the name in any case (`db:team`). `=` and `!=` take the name as stored or as SQL resolves it, a bare name being its uppercase form: `db=team_db` and `db=TEAM_DB` match `TEAM_DB`, `db=ml` and `db='"ml"'` match a lowercase `"ml"`, and `db=ML` doesn't. A whole `db=` (with an optional whole `schema=`) is also asked of the service rather than filtered here, so it reaches jobs past the newest 2,000 — see the account-level list above |
 
 Operators are `:` (contains, or numeric equality), `=`, `!=`, `>`, `>=`, `<`,
 and `<=`. Unknown keys read job, sub-job, or config members; dotted keys read
@@ -975,10 +996,15 @@ gpu:b200 gpus>=8 lora_r=32
 training_config.optimizer.name=adamw status:cancelled
 training_config.peft_config.target_modules:q_proj seed=42
 db:team_db status:running
+db=TEAM_DB schema=EXPERIMENTS
+schema=TEAM_DB.EXPERIMENTS
+schema:team_db.exper
 ```
 
 No-result messages name the searched scope, truncated or older matching jobs,
-unknown fields (with dotted suggestions), and `a` when a wider search may help.
+unknown fields (with dotted suggestions), `a` when a wider search may help, and,
+on a list cut short that nothing narrowed, that `db=NAME` reads that whole
+database from the service rather than only the jobs loaded.
 Long messages scroll. The header gives the match count and query. The search
 box is one row at the bottom of the screen; the help for its fields and
 operators shows under it only while it has focus.
