@@ -1023,7 +1023,7 @@ Live previews refresh every 60 seconds, on return from details, or on `r`; a
 dim line at the end of the job card reports reads, slow reads and refresh
 errors while keeping the last copy. `Enter` or a click opens the highlighted
 entire-job or sub-job scope on Logs (`⏎ opens its Logs` on the card's border).
-`l` and `g` open Logs and Resources directly.
+`l`, `g` and `c` open Logs, Resources and Checkpoints directly.
 
 #### Job details
 
@@ -1033,8 +1033,8 @@ for its type, models, scope (`all sub-jobs`, or `sub-job training:0`) and
 location when it is not the configured one, then the service's `reason` and
 `reason_details` (or the `unknown` sentence) while it sends them. When the
 line does not fit on one row, the models are cut with `…`, then the id is left
-out (the header names it too). Switch tabs with `l` (Logs) and `g`
-(Resources), or `t` for the next tab.
+out (the header names it too). Switch tabs with `l` (Logs), `g`
+(Resources) and `c` (Checkpoints), or `t` for the next tab.
 
 - **Logs** is the live and historical log view described below. The pane shows
   one sub-job at a time, the one selected in the list beside it, so its lines
@@ -1116,6 +1116,26 @@ out (the header names it too). Switch tabs with `l` (Logs) and `g`
     `cached · refresh failed: …`. Data is kept in the TUI's per-location job
     cache; the selected sub-job and its newest cached samples
     appear first, and later opens download only new chunks.
+- **Checkpoints** lists the job's checkpoints (`list_checkpoints`, the same
+  list as `cortex-training checkpoints JOB_ID`): id, creation time, global
+  step, type (`resumable` or `weights-only`), loss and size. A job whose
+  sub-jobs don't train says it saves none.
+  - The list is read when the tab opens, every 30 seconds while the job is
+    live, and on `r`. `s` sorts by created time (newest first), global step
+    or type; `o` reverses the order. Checkpoints missing the sorted value come
+    last.
+  - Each checkpoint's export (`export_checkpoint`) is read once, in the
+    background, for its file names and sizes. When the list doesn't give a
+    checkpoint's step or type, the tab takes it from those files (a
+    `global_step<N>/` folder; optimizer-state files mean `resumable`,
+    `.safetensors` weights alone mean `weights-only`) and marks it
+    `(from its files)`. The export's links are never shown or kept.
+  - The highlighted checkpoint's details sit under the list: every field the
+    service sent, its files, the job and training sub-job that saved it, the
+    job's training configuration as submitted, and commands to download it
+    (Python, with `export_checkpoint`) and use it: serve a `weights-only`
+    checkpoint for sampling, or resume training from a `resumable` one with
+    `load` or `source_checkpoint_info`.
 
 #### Logs
 
@@ -1271,11 +1291,11 @@ Use the terminal's selection modifier instead when needed (Option in iTerm2,
 Fn in macOS Terminal, or configured Option in VS Code). With the keys panel
 open, a whole-screen copy includes its keys.
 
-Keys in the job details view (`/`, `e`, `n`, `p`, `s`, `[` and `]` work on Logs):
+Keys in the job details view (`/`, `e`, `n`, `p`, `s`, `[` and `]` work on Logs; `s` and `o` sort on Checkpoints):
 
 | Key | Action |
 |-----|--------|
-| `l` `g` | Logs / Resources tab, as in the preview, except `l` on Logs (below) |
+| `l` `g` `c` | Logs / Resources / Checkpoints tab, as in the preview, except `l` on Logs (below) |
 | `t` | Next tab |
 | `w` | Cycle the window; so does a click on the window in the header, and a click on a window in the selector at the bottom shows it (Resources) |
 | `Space` | Next sub-job, round to the first after the last, when the job has two or more; the view stays, back to `ALL`. `<` / `>` go back / forward; a click on the sub-job's name in the header goes forward (Resources) |
@@ -1285,8 +1305,9 @@ Keys in the job details view (`/`, `e`, `n`, `p`, `s`, `[` and `]` work on Logs)
 | `e` / `E` | Next / previous error in the pane (an `ERROR`, `CRITICAL` or `FATAL` line, or a traceback: one stop with the exceptions chained to it, at the error line right above it when there is one), marked and a third of the way down the view, with its place among them on the bar (`error 2/5`). From the end of a followed log, `e` goes to the newest; both go round past either end. A jump pauses following, as `p` does |
 | `n` / `N` | Next / previous warning or error, as `e` / `E`; the bar counts them as problems (`problem 2/5`, or `no problems`) |
 | `p` | Pause / resume auto-scroll. Scrolled up from the end of a live log, or after a jump, `p` goes back to the end and follows again |
-| `s` | Save the current source to `~/cortex-training-<job8>-<source>.log` |
-| `ctrl+c` | Copy what is highlighted, else everything the tab holds: the log (its newest lines, up to 1 MiB) on Logs; the panel, header, stats and every chart on Resources (any tab) |
+| `s` | Save the current source to `~/cortex-training-<job8>-<source>.log` (Logs); cycle the sort: created, step, type (Checkpoints) |
+| `o` | Reverse the sort (Checkpoints) |
+| `ctrl+c` | Copy what is highlighted, else everything the tab holds: the log (its newest lines, up to 1 MiB) on Logs; the panel, header, stats and every chart on Resources; the list and the highlighted checkpoint's details on Checkpoints (any tab) |
 | `[` / `]` | Narrow / widen the sources panel |
 | `PgUp` `PgDn` `Home` `End` | Scroll the log, also while the sources panel has the focus (Logs); scroll the stats and charts, also while the panel has the focus (Resources) |
 | `r` | Refresh the visible tab (on Logs, the sub-job list and its tail) |

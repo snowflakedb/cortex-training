@@ -234,7 +234,7 @@ async def _run_resource_tab(tmp_path):
         assert ok
         tabs = app.screen.query_one("#job-tabs", TabbedContent)
         assert tabs.active == "logs"
-        assert {pane.id for pane in app.screen.query("TabPane")} == {"logs", "resource"}
+        assert {pane.id for pane in app.screen.query("TabPane")} == {"logs", "resource", "checkpoints"}
         c.download_metrics.assert_not_called()
 
         tabs.active = "resource"
@@ -320,6 +320,9 @@ async def _run_resource_tab(tmp_path):
         assert app.screen._resource_range == previous_range
         await pilot.press("t")
         ok = await _wait(pilot, app, lambda: tabs.active == "resource")
+        assert ok
+        await pilot.press("t")
+        ok = await _wait(pilot, app, lambda: tabs.active == "checkpoints")
         assert ok
         await pilot.press("t")
         ok = await _wait(pilot, app, lambda: tabs.active == "logs")

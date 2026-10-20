@@ -694,6 +694,54 @@ class DemoClient:
     _ENDED = {"failed": "has failed", "cancelled": "has been cancelled", "terminated": "has been terminated",
               "succeeded": "has completed", "done": "has completed"}
 
+    # A training run saves a checkpoint every this many steps, weights-only every third
+    # time and resumable otherwise. Every other one is listed without its type, as the
+    # service lists some, so the tab reads the type from its files.
+    _CHECKPOINT_EVERY = 100
+
+    def _checkpoints(self, job_id: str) -> list:
+        """(step, epoch, type, listed with its type?) of each checkpoint the job has saved so far."""
+        now = self._clock().timestamp()
+        saved = []
+        for index, at in enumerate(self._step_times(job_id)[self._CHECKPOINT_EVERY - 1::self._CHECKPOINT_EVERY]):
+            if at > now:
+                break
+            kind = "weights-only" if index % 3 == 2 else "resumable"
+            saved.append(((index + 1) * self._CHECKPOINT_EVERY, at, kind, index % 2 == 0))
+        return saved
+
+    def _checkpoint_id(self, job_id: str, step: int) -> str:
+        return f"cp_{uuid.uuid5(uuid.NAMESPACE_URL, f'{job_id}/{step}')}"
+
+    def list_checkpoints(self, job_id: str) -> list:
+        self._record(job_id)
+        out = []
+        for step, at, kind, typed in self._checkpoints(job_id):
+            entry = {"checkpoint_id": self._checkpoint_id(job_id, step),
+                     "created_at": _iso(datetime.fromtimestamp(at, timezone.utc))}
+            if typed:
+                entry["checkpoint_type"] = kind
+            out.append(entry)
+        return out
+
+    def export_checkpoint(self, job_id: str, checkpoint_id: str) -> dict:
+        self._record(job_id)
+        for step, _at, kind, _typed in self._checkpoints(job_id):
+            if self._checkpoint_id(job_id, step) != checkpoint_id:
+                continue
+            folder = f"global_step{step}"
+            if kind == "weights-only":
+                names = [("config.json", 1418), ("model.safetensors", 1192135096), ("tokenizer.json", 11422654)]
+            else:
+                names = [("bf16_zero_pp_rank_0_mp_rank_00_optim_states.pt", 5161740657),
+                         ("mp_rank_00_model_states.pt", 3441239525)]
+            files = [{"filename": f"{folder}/{name}", "size_bytes": str(size), "url": "https://demo.invalid/"}
+                     for name, size in names]
+            files.append({"filename": "metadata.json", "size_bytes": "296", "url": "https://demo.invalid/"})
+            return {"checkpoint_id": checkpoint_id, "files": files,
+                    "expires_at": _iso(self._clock() + timedelta(hours=1))}
+        raise _http_error(404, f"checkpoint {checkpoint_id} not found")
+
     def tail_logs(self, job_id: str, *, cursor: Optional[str] = None, max_lines: Optional[int] = None,
                   sub_job_id: Optional[str] = None) -> dict:
         if self._extra[job_id].get("not_found"):

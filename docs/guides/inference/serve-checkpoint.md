@@ -7,6 +7,7 @@ weights-only checkpoint produced by a training run:
 ```bash
 python -m recipes.inference.serve \
   config=/path/to/config.json \
+  job_config=JOB_CONFIG \
   source_job_id=TRAINING_JOB_ID \
   checkpoint_id=CHECKPOINT_ID
 ```

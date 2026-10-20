@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Read-only job preview between the list and Logs/Resources details."""
+"""Read-only job preview between the list and the Logs/Resources/Checkpoints details."""
 
 from __future__ import annotations
 
@@ -111,6 +111,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
         KEYS_BINDING,
         ("l", "open('logs')", "Logs"),
         ("g", "open('resource')", "Resources"),
+        ("c", "open('checkpoints')", "Checkpoints"),
         ("r", "refresh", "Refresh"),
         # check_action exposes the applicable expansion binding.
         Binding("e", "expand_values", "Full text"),

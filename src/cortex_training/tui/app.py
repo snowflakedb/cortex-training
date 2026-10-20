@@ -16,7 +16,7 @@
 """Read-only Textual TUI for Cortex Training job logs and GPU resources.
 
 Flow: open → a list of jobs with their status (via the SDK's list_jobs) →
-pick one → its preview, then its Logs and Resources dashboard. Pass a job_id on the command line
+pick one → its preview, then its Logs, Resources and Checkpoints tabs. Pass a job_id on the command line
 to jump straight to that dashboard and skip the picker.
 
 Imports ``textual`` at module load. The interface is strictly read-only and
@@ -232,7 +232,7 @@ class CortexTrainingLogTUI(App):
     #jobs:focus { background-tint: $foreground 0%; }
     #searchhelp { padding: 0 1 0 2; height: auto; background: $panel; }
     #sources { width: 16; border-right: solid $panel; }
-    #job-tabs, #job-tabs ContentSwitcher, #logs, #resource, #logs-body {
+    #job-tabs, #job-tabs ContentSwitcher, #logs, #resource, #checkpoints, #logs-body {
         height: 1fr;
     }
     #logview { height: 1fr; padding: 0 1; }
@@ -258,6 +258,11 @@ class CortexTrainingLogTUI(App):
     #resource-charts { height: auto; margin-top: 1; text-wrap: nowrap; text-overflow: clip; }
     #resource-keys { height: 1; padding: 0 1; text-wrap: nowrap; text-overflow: clip; link-style: none; }
     /* The job preview's layout is JobSummaryScreen.DEFAULT_CSS (screens.py). */
+    #checkpoint-status { height: auto; padding: 0 1; }
+    #checkpoint-table { height: auto; max-height: 40%; margin: 0 1; }
+    #checkpoint-pane { height: 1fr; padding: 0 1; border-top: solid $panel; scrollbar-gutter: stable;
+                       scrollbar-size-vertical: 1; }
+    #checkpoint-detail { height: auto; }
     LogScreen > .screen--selection {
         background: $block-cursor-blurred-background;
         color: $block-cursor-blurred-foreground;

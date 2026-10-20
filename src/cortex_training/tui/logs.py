@@ -13,11 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The job details screen: its Logs tab, and the screen the Resources tab lives on.
+"""The job details screen: its Logs tab, and the screen the Resources and Checkpoints tabs live on.
 
-One screen holds both tabs, so the job's status, its sub-jobs and its downloads are
+One screen holds every tab, so the job's status, its sub-jobs and its downloads are
 read once. The Resources tab's own methods are ``ResourceTab``
-(tui/resource_view.py); everything here is the log tail, the filter, the saved
+(tui/resource_view.py), the Checkpoints tab's ``CheckpointTab``
+(tui/checkpoint_view.py); everything here is the log tail, the filter, the saved
 console and what the screen shares.
 """
 
@@ -45,6 +46,7 @@ from textual.containers import VerticalScroll
 from textual.content import Content
 from textual.css.query import NoMatches
 from textual.screen import Screen
+from textual.widgets import DataTable
 from textual.widgets import Header
 from textual.widgets import HelpPanel
 from textual.widgets import Input
@@ -115,10 +117,12 @@ from cortex_training.tui.widgets import fit_line
 from cortex_training.tui.widgets import is_shown
 from cortex_training.tui.widgets import on_stack
 from cortex_training.tui.resource_view import ResourceTab
+from cortex_training.tui.checkpoint_view import CheckpointTab
+from cortex_training.tui.widgets import SelectableTable
 
 
-class LogScreen(ResourceTab, FollowsPointer, Screen):
-    """Read-only Logs and Resource dashboard for one job."""
+class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
+    """Read-only Logs, Resource dashboard and Checkpoints for one job."""
 
     BINDINGS = [
         ("b", "back", "Back"),
@@ -150,6 +154,10 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         Binding("comma", "resource_sub_job(-1)", "Prev sub-job", show=False),
         Binding("full_stop", "resource_sub_job(1)", "Next sub-job", show=False),
         Binding("g", "show_tab('resource')", "Resources", show=False),
+        Binding("c", "show_tab('checkpoints')", "Checkpoints", show=False),
+        # Checkpoints: s and o sort the list (on Logs, s saves the log; see check_action).
+        Binding("s", "checkpoint_sort", "Sort"),
+        Binding("o", "checkpoint_order", "Order"),
     ]
 
     # Auto-fit the source labels until [ or ], while preserving the log's minimum.
@@ -163,6 +171,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
     _DATA_REFRESH_SECONDS = 30
     _STATUS_REFRESH_SECONDS = 60
     _LOG_ONLY = {"save_log", "cycle_level", "toggle_pause", "shrink_sources", "grow_sources", "filter", "jump"}
+    _TABS = ("logs", "resource", "checkpoints")
 
     class _Note(str):
         """A TUI-authored pane line distinguished by type, not text."""
@@ -215,7 +224,8 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         self._stdout_failed = False
         self._held: tuple[list[str], bool] | None = None
         self._init_log_state()
-        self._active_tab = initial_tab if initial_tab in ("logs", "resource") else "logs"
+        self._active_tab = initial_tab if initial_tab in self._TABS else "logs"
+        self._init_checkpoint_state()
         self._log_focus_id = "sources"
         self._metrics_root = job_cache_dir(cache_job_id) / "metrics"
         # Per sub-job, what a download warned about (chunks it gave up on). The Logs
@@ -277,6 +287,11 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
                         yield Static("", id="resource-stats")
                         yield Static("", id="resource-charts")
                 yield _ColoredLinks("", id="resource-keys")  # the window selector, under the pane
+            with TabPane("Checkpoints", id="checkpoints"):
+                yield Static("", id="checkpoint-status")
+                yield SelectableTable(id="checkpoint-table", cursor_type="row", zebra_stripes=True)
+                with VerticalScroll(id="checkpoint-pane"):
+                    yield Static("", id="checkpoint-detail")
         yield FittedFooter(id="footer")
 
     def on_mount(self) -> None:
@@ -301,7 +316,8 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
 
     def _focus_active_tab(self) -> None:
         try:
-            self.set_focus(self.query_one("#resource-list" if self._resource_active() else "#sources"))
+            focus = {"resource": "#resource-list", "checkpoints": "#checkpoint-table"}.get(self._active_tab, "#sources")
+            self.set_focus(self.query_one(focus))
         except Exception:  # noqa: BLE001 - not mounted yet
             pass
 
@@ -330,7 +346,8 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
 
     def action_cycle_tab(self) -> None:
         tabs = self.query_one("#job-tabs", TabbedContent)
-        tabs.active = "resource" if self._active_tab == "logs" else "logs"
+        index = self._TABS.index(self._active_tab) if self._active_tab in self._TABS else -1
+        tabs.active = self._TABS[(index + 1) % len(self._TABS)]
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         # Ignore queued stale activations, which would re-activate each other.
@@ -347,6 +364,14 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             self.set_focus(self.query_one("#resource-list", ListView))  # its arrows pick a view or unit
             self.call_after_refresh(self._render_resource)
             self._start_resource_refresh(force=False)
+            return
+        if self._checkpoints_active():
+            focused = self.focused
+            if focused is not None and focused.id in {"sources", "logview", "logfilter"}:
+                self._log_focus_id = focused.id
+            self.set_focus(self.query_one("#checkpoint-table", DataTable))
+            self._render_checkpoints()
+            self._start_checkpoint_refresh(force=False)
             return
         try:
             target = self.query_one(f"#{self._log_focus_id}")
@@ -420,6 +445,9 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
     def action_refresh_sources(self) -> None:
         if self._resource_active():
             self._start_resource_refresh(force=True)
+            return
+        if self._checkpoints_active():
+            self._start_checkpoint_refresh(force=True)
             return
         if self._job_read_started is not None:
             # The job is still being read (a thread can't be cancelled): a second read
@@ -551,6 +579,8 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             return self._resource_active() and len(self._resource_sub_job_ids()) > 1
         if action == "cycle_window":
             return self._resource_active()
+        if action in ("checkpoint_sort", "checkpoint_order"):
+            return self._checkpoints_active()
         return True
 
     def action_filter(self) -> None:
@@ -873,13 +903,16 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
     def action_copy_text(self) -> None:
         """ctrl+c, on every tab: what the mouse highlighted, else
         everything the tab holds: the log (its newest lines, up to the cap) on Logs; on
-        Resources the panel, the header, every stats row and every chart."""
+        Resources the panel, the header, every stats row and every chart; on Checkpoints the
+        list and the highlighted checkpoint's details."""
         if self.app.copy_highlight(self):
             return
         if self.query(HelpPanel):
             self.app.copy_everything(self)  # the key list, with the tab beside it
         elif self._logs_active():
             self._copy_log()
+        elif self._checkpoints_active():
+            self.app.copy_everything(self, "the Checkpoints tab")
         else:
             self.app.copy_everything(self, "the Resources tab")
 
@@ -1679,6 +1712,8 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             return
         if self._resource_active() and self._resource_waiting() is None:
             self._start_resource_refresh(force=True)
+        elif self._checkpoints_active():
+            self._start_checkpoint_refresh(force=True)
 
     def _next_job_read(self) -> int:
         """Any thread. The number of a get_job about to be sent: a read sent later has a larger one."""
