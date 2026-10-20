@@ -48,6 +48,7 @@ from cortex_training.tui.app import CortexTrainingLogTUI  # noqa: E402
 from cortex_training.tui.job_list import JobListScreen  # noqa: E402
 from cortex_training.tui.logs import LogScreen  # noqa: E402
 from cortex_training.tui.demo import DemoClient  # noqa: E402
+from cortex_training.tui.theme import ACCENT  # noqa: E402
 from cortex_training.tui import views  # noqa: E402
 from cortex_training.tui.untrusted import printable_client  # noqa: E402
 from cortex_training.tui.format import wrap_log_line  # noqa: E402
@@ -263,6 +264,17 @@ async def _run_resource_tab(tmp_path):
         ok = await _wait(pilot, app, lambda: app.screen._resource_range == "10m")
         assert ok
         assert c.download_metrics.call_count == calls
+        # The bottom row is the window selector, the window shown lit, then only the keys the
+        # footer doesn't show; a click on a segment picks its window.
+        keys = app.screen._resource_keys()
+        lit = [keys.plain[span.start:span.end] for span in keys.spans if f"on {ACCENT}" in str(span.style)]
+        assert lit == [" 10m "]
+        assert keys.plain.startswith("window ") and "↑↓ GPU" in keys.plain
+        assert "refresh" not in keys.plain and "sub-job" not in keys.plain
+        assert all(app.screen._resource_keys(width).cell_length <= width for width in (60, 40, 25, 12))
+        assert "@click=screen.resource_range('30m')" in str(keys.spans[2].style)
+        kpis = str(app.screen.query_one("#resource-kpis", Static).render())
+        assert "GPU util" in kpis and "GPUs reporting" in kpis
         app.screen._content_width = lambda: 10
         app.screen._write_line("x" * 20)
         assert len(app.screen._logview._lines) > len(app.screen._shown_lines)
@@ -515,7 +527,12 @@ async def _run_resource_unsupported_warning():
         assert ok
         status = str(app.screen.query_one("#resource-status", Static).render())
         assert "training #0" in status  # named by type and index
-        assert "no usable GPU metrics" in status
+        # Why the view is empty is the card in the pane; the skipped rows stay on the header.
+        card = app.screen.query_one("#resource-stats", Static)
+        assert card.has_class("-empty")
+        assert "No usable GPU metrics" in str(card.render())
+        assert "no usable GPU metrics for this sub-job" in str(card.render())
+        assert "no usable GPU metrics" not in status
         assert "1 row skipped (malformed or unsupported)" in status
         await _settle(app, pilot)
 
@@ -583,21 +600,26 @@ async def _run_resource_chart_fits_content_width():
         ok = await _wait(pilot, app, lambda: app.screen._current_source is not None)
         assert ok
         app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        chart = app.screen.query_one("#resource-charts", Static)
+
+        def drawn_to_width() -> bool:
+            # The charts are redrawn once the layout settles (the panel beside them is sized
+            # to its labels): wait for a drawing at the final width, not one from before it.
+            lines = str(chart.render()).splitlines()
+            return bool(lines) and all(len(line) <= chart.content_size.width for line in lines)
+
         ok = await _wait(
             pilot,
             app,
             lambda: not app.screen._resource_loading
-            and _listed_units(app.screen) == 1,
+            and _listed_units(app.screen) == 1
+            and drawn_to_width(),
         )
         assert ok
-        chart = app.screen.query_one("#resource-charts", Static)
-        lines = str(chart.render()).splitlines()
-        assert lines
         # The pane's padding is outside the charts: they are drawn to the width they have.
         pane = app.screen.query_one("#resource-pane")
         assert pane.region.width - chart.content_region.width == 3  # its padding and the scrollbar's gutter
         assert chart.content_size.width == chart.content_region.width
-        assert all(len(line) <= chart.content_size.width for line in lines)
         await _settle(app, pilot)
 
 

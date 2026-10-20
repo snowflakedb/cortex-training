@@ -38,6 +38,14 @@ from typing import Mapping
 
 from cortex_training._artifact_download import read_manifest
 from cortex_training.tui import views
+from cortex_training.tui.theme import BACKGROUND
+from cortex_training.tui.theme import ERR
+from cortex_training.tui.theme import FAINT
+from cortex_training.tui.theme import MUTED
+from cortex_training.tui.theme import OK
+from cortex_training.tui.theme import SURFACE
+from cortex_training.tui.theme import TEXT
+from cortex_training.tui.theme import WARN
 
 RANGES: dict[str, timedelta | None] = {
     "10m": timedelta(minutes=10),
@@ -2104,17 +2112,243 @@ def level_glyph(value: float | None, scale: float = 100.0) -> str:
     return _BLOCKS[min(len(_BLOCKS) - 1, max(0, math.ceil(value / scale * len(_BLOCKS)) - 1))]
 
 
-def _bar_row(values: list[float | None], height: int, level: int, scale: float = 100.0) -> str:
-    """Row ``level`` (0 at the bottom) of a ``height``-row bar chart, drawn in eighths of a row."""
-    cells = []
-    for value in values:
-        if value is None:
-            cells.append(" ")
-            continue
-        eighths = min(height * 8, max(1, math.ceil(value / scale * height * 8)))
-        fill = eighths - 8 * level
-        cells.append("█" if fill >= 8 else " " if fill <= 0 else _BLOCKS[fill - 1])
-    return "".join(cells)
+# ─── health ──────────────────────────────────────────────────────────────────
+# How a value of a known metric reads at a glance: "ok", "warn" or "err", by the first
+# bound it reaches, (bound, health) in order; a metric that isn't listed is not judged
+# (power has no bound without the GPU's power limit, which the rows don't carry). Low
+# GPU util is a warning, not an error: a job between steps or waiting on its sampler is
+# briefly idle. GPU memory near full is a warning only: vLLM reserves most of it on
+# purpose. A node short of memory is the one an OOM kill ends.
+_HEALTH_BOUNDS: dict[tuple[str, str], tuple[tuple[Callable[[float], bool], str], ...]] = {
+    (GPU, "gpu_util_pct"): ((lambda v: v < 50, "warn"),),
+    (GPU, "fb_used_pct"): ((lambda v: v >= 95, "warn"),),
+    (GPU, "gpu_temp_c"): ((lambda v: v >= 90, "err"), (lambda v: v >= 85, "warn")),
+    (SYSTEM, "cpu_util_pct"): ((lambda v: v >= 95, "warn"),),
+    (SYSTEM, "mem_used_pct"): ((lambda v: v >= 97, "err"), (lambda v: v >= 90, "warn")),
+}
+_SEVERITY = {None: 0, "ok": 1, "warn": 2, "err": 3}
+HEALTH_COLORS = {"ok": OK, "warn": WARN, "err": ERR, None: TEXT}
+
+
+def metric_health(kind: str, key: str, value: float | None) -> str | None:
+    """``"ok"``, ``"warn"`` or ``"err"`` for ``value`` of metric ``key`` (see :data:`_HEALTH_BOUNDS`).
+
+    None when unmeasured, or for a metric this view doesn't judge.
+    """
+    bounds = _HEALTH_BOUNDS.get((kind, key))
+    if bounds is None or value is None or value != value:
+        return None
+    return next((health for reached, health in bounds if reached(value)), "ok")
+
+
+def worst_health(healths) -> str | None:
+    """The most severe of ``healths`` (``err`` over ``warn`` over ``ok``); None for none of them."""
+    return max(healths, key=_SEVERITY.__getitem__, default=None)
+
+
+_EIGHTHS_WIDE = "▏▎▍▌▋▊▉█"
+METER_TRACK = "#30363d"  # the theme's border: seen under a list's highlight, never read as a value
+
+
+def meter_spans(value: float | None, scale: float, cells: int, color: str | None = None,
+                track: str = METER_TRACK) -> list[tuple[str, str]]:
+    """A horizontal meter ``cells`` wide, filled to ``value`` of ``scale`` in eighths of a cell.
+
+    With a ``color``, the fill is in it over a ``track`` background that runs the
+    meter's whole width (so the empty part shows, under a list's highlight too);
+    without one, the empty part is ``·``. A measured value above 0 fills at least an
+    eighth. Unmeasured, the meter is all track.
+    """
+    if cells <= 0:
+        return []
+    filled = 0
+    if value is not None and value == value and scale > 0:
+        filled = min(cells * 8, max(1 if value > 0 else 0, round(value / scale * cells * 8)))
+    full, part = divmod(filled, 8)
+    bar = "█" * full + (_EIGHTHS_WIDE[part - 1] if part else "")
+    rest = cells - full - (1 if part else 0)
+    if color is None:
+        return [(bar + "·" * rest, "")]
+    spans = [(bar, f"{color} on {track}")] if bar else []
+    if rest:
+        spans.append((" " * rest, f"on {track}"))
+    return spans
+
+
+# ─── the KPI strip ───────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class Kpi:
+    """One tile of the strip over the stats: a label, a value, a detail and how healthy it reads."""
+
+    label: str
+    value: str
+    detail: str = ""
+    health: str | None = None
+
+
+def _kw(watts: float) -> str:
+    return f"{watts / 1000:.1f} kW" if watts >= 1000 else format_value(watts, "W")
+
+
+def kpi_tiles(resource: KindResource, view: KindView, *, unit: int | None = None, requested: int | None = None,
+              reporting: int | None = None, stale: bool = False) -> list[Kpi]:
+    """The strip's tiles for ``view``: utilization, memory, power, temperature and reporting units.
+
+    ``view`` is ``unit``'s (None: the mean across the units). Only the metrics the
+    rows have get a tile; a value is the view's latest (the
+    mean across the units in the newest capture, or the unit's own), as the chart
+    titles show it. For the mean, a tile is as healthy as its least healthy unit
+    (one hot GPU is enough to warn), and its detail says how the units spread
+    (``84–95%``, ``max 69 °C``, ``5.1 kW total``). The last tile counts the units
+    reporting against ``requested`` (None: unknown); ``stale`` (a running sub-job
+    that stopped sending samples) leaves the values unjudged and the count an error.
+    """
+    spec = _KIND_SPECS[resource.kind]
+    word = spec.unit_word
+    mean = unit is None
+    units = [one for one in resource.units if one.reporting] or list(resource.units)
+    if not mean:
+        units = [one for one in resource.units if one.id == unit]
+
+    def latest(key: str) -> float | None:
+        stats = view.stats.get(key)
+        return stats.latest if stats is not None else None
+
+    def each(key: str) -> list[float]:
+        return [value for value in (one.latest.get(key) for one in units) if value is not None]
+
+    def health(key: str, value: float | None) -> str | None:
+        if stale:
+            return None
+        found = [value, *(each(key) if mean else ())]
+        return worst_health([metric_health(resource.kind, key, one) for one in found])
+
+    tiles = []
+    util = resource.metric(spec.headline)
+    if util is not None:
+        value = latest(util.key)
+        found = each(util.key) if mean else []
+        detail = ""
+        if len(found) > 1 and format_value(min(found), util.unit) != format_value(max(found), util.unit):
+            low = format_value(min(found), util.unit).removesuffix(util.unit).rstrip()
+            detail = f"{low}–{format_value(max(found), util.unit)}"
+        tiles.append(Kpi(f"{word} util" if resource.kind == GPU else "CPU util", format_value(value, util.unit),
+                         detail, health(util.key, value)))
+    used, share = resource.metric(spec.used), resource.metric(spec.memory)
+    if used is not None or share is not None:
+        percent = latest(share.key) if share is not None else None
+        value = format_value(percent, "%")
+        if used is not None and latest(used.key) is not None:
+            amount = latest(used.key)
+            if spec.other_is_free:
+                other = latest(spec.other)
+                total = None if other is None else amount + other
+            else:  # a node's total stays the same, so only the header and the units' newest rows have it
+                source = resource.latest if mean else (units[0].latest if units else {})
+                total = source.get(spec.other)
+            value = format_value(amount, "GiB")
+            if total:
+                value = f"{value.removesuffix(' GiB')} / {format_value(total, 'GiB')}"
+        tiles.append(Kpi("GPU memory" if resource.kind == GPU else "memory", value,
+                         format_value(percent, "%") if used is not None and percent is not None else "",
+                         health(share.key, percent) if share is not None else None))
+    power = resource.metric("power_watts")
+    if power is not None:
+        found = each(power.key) if mean else []
+        tiles.append(Kpi("power", format_value(latest(power.key), power.unit),
+                         f"{_kw(sum(found))} total" if len(found) > 1 else "", health(power.key, latest(power.key))))
+    temp = resource.metric("gpu_temp_c")
+    if temp is not None:
+        found = each(temp.key) if mean else []
+        tiles.append(Kpi("temp", format_value(latest(temp.key), temp.unit),
+                         f"max {format_value(max(found), temp.unit)}" if len(found) > 1 else "",
+                         health(temp.key, latest(temp.key))))
+    shown = len(resource.reporting_unit_ids) if reporting is None else reporting
+    if stale or shown == 0:
+        count = "err"
+    elif requested and shown < requested:
+        count = "warn"
+    else:
+        count = "ok"
+    tiles.append(Kpi(f"{word}s reporting", f"{shown}/{requested}" if requested else str(shown),
+                     "samples stopped" if stale else "", count))
+    return tiles
+
+
+_TILE_GAP = 1  # cells between two tiles
+_TILE_EDGE = "▎"
+
+
+def _tile_width(tile: Kpi, detail: bool) -> int:
+    second = views.cell_width(tile.value) + (2 + views.cell_width(tile.detail) if detail and tile.detail else 0)
+    return 2 + max(views.cell_width(tile.label), second) + 1
+
+
+def kpi_strip_spans(tiles: list[Kpi], width: int, *, styled: bool = True,
+                    dim: bool = False) -> list[list[tuple[str, str]]]:
+    """The tiles as lines of ``(text, style)`` spans: two lines a row of tiles, as wide as ``width``.
+
+    Each tile is a card: an edge in its health's colour, its label above, its value
+    (bold, in that colour) and its detail beside it. The tiles share one row,
+    stretched to fill it; where they don't fit, the details go from the right, then the tiles flow
+    onto more rows. ``dim`` (the values are old): every value not judged is faint.
+    ``styled=False``: plain text.
+    """
+    if not tiles or width <= 0:
+        return []
+    # The details go one at a time from the right until the tiles fit one row.
+    keep = [bool(tile.detail) for tile in tiles]
+    for index in reversed(range(len(tiles))):
+        if sum(_tile_width(tile, kept) for tile, kept in zip(tiles, keep)) + _TILE_GAP * (len(tiles) - 1) <= width:
+            break
+        keep[index] = False
+    sizes = [_tile_width(tile, kept) for tile, kept in zip(tiles, keep)]
+    rows: list[list[int]] = [[]]
+    used = 0
+    for index, size in enumerate(sizes):
+        if rows[-1] and used + _TILE_GAP + size > width:
+            rows.append([])
+            used = 0
+        used += size + (_TILE_GAP if rows[-1] else 0)
+        rows[-1].append(index)
+    card = f"on {SURFACE}" if styled else ""
+    lines = []
+    for row in rows:
+        spare = max(0, width - sum(sizes[index] for index in row) - _TILE_GAP * (len(row) - 1))
+        top: list[tuple[str, str]] = []
+        bottom: list[tuple[str, str]] = []
+        for place, index in enumerate(row):
+            tile = tiles[index]
+            # The room the row has left, shared out: the strip spans the pane.
+            inner = max(1, min(width, sizes[index] + spare // len(row) + (1 if place < spare % len(row) else 0)) - 3)
+            color = FAINT if dim and tile.health is None else HEALTH_COLORS.get(tile.health, TEXT)
+            if place:
+                top.append((" " * _TILE_GAP, ""))
+                bottom.append((" " * _TILE_GAP, ""))
+            edge = (f"{_TILE_EDGE} ", f"{color} {card}".strip() if styled else "")
+            label = views.fit_cells(tile.label, inner)
+            top += [edge, (f"{label:<{inner}} ", f"{MUTED} {card}" if styled else "")]
+            value = views.fit_cells(tile.value, inner)
+            rest = inner - views.cell_width(value)
+            note = views.fit_cells(tile.detail, rest - 2) if keep[index] and rest > 3 else ""
+            bottom += [edge, (value, f"bold {color} {card}" if styled else "")]
+            tail = (f"  {note}" if note else "").ljust(rest) + " "
+            bottom.append((tail, f"{FAINT if dim else MUTED} {card}" if styled else ""))
+        lines += [top, bottom]
+    return lines
+
+
+def _eighths(value: float | None, height: int, scale: float) -> int | None:
+    """How high ``value`` of ``scale`` reaches in a ``height``-row chart, in eighths of a row.
+
+    At least one eighth for a measured value (a 0 still shows, unlike a gap), at most
+    the chart's top; None for a column without a sample.
+    """
+    if value is None:
+        return None
+    return min(height * 8, max(1, math.ceil(value / scale * height * 8)))
 
 
 def _time_labels(start: datetime, end: datetime, chart_width: int, inner: int) -> str:
@@ -2145,15 +2379,24 @@ def _time_labels(start: datetime, end: datetime, chart_width: int, inner: int) -
 
 
 # Each chart's colour, by its place in the metrics' order: GPU util % (or CPU util %)
-# green, memory used % cyan, then on round the palette. Hues that read on a dark
-# background; the same chart keeps its colour across windows, units and refreshes.
+# green, memory used % cyan, then on round the palette. Hues that read on the theme's
+# background, a step lighter than its status colours, so a chart's line never reads as
+# a status; the same chart keeps its colour across windows, units and refreshes.
 CHART_HUES = ("#4ade80", "#22d3ee", "#60a5fa", "#a78bfa", "#fbbf24", "#fb7185", "#2dd4bf", "#f472b6", "#a3e635",
               "#fb923c")
-# The frame, labels and the 50% gridline, quieter than the bars.
-CHART_AXIS = "#6b7280"
-CHART_GRID = "#3f4654"
-CHART_MUTED = "#9ca3af"
+# The frame, labels and the 50% gridline, quieter than the series: the theme's own tones.
+CHART_AXIS = FAINT
+CHART_GRID = "#30363d"  # the theme's border: seen, never read as data
+CHART_MUTED = MUTED
 _GRID = "┈"
+# The baseline under a column without a sample: a gap reads as missing data, never as a 0.
+_GAP_AXIS = "╌"
+# Right of the newest column, on the row its value reaches: where the series is now.
+_NOW = "◂"
+# The fill under a series' edge, as a share of its hue over the background: faint at the
+# baseline and a little stronger toward the top, so a steady 90% reads as a lit edge
+# over a shadow rather than as a solid block of colour.
+_FILL_SHARE = (0.14, 0.32)
 
 
 def chart_hue(index: int) -> str:
@@ -2161,31 +2404,43 @@ def chart_hue(index: int) -> str:
     return CHART_HUES[index % len(CHART_HUES)]
 
 
-def _shade(hue: str, share: float) -> str:
-    """``hue`` darkened toward black: ``share`` 1 is the hue itself, 0 is 45% of it."""
-    level = 0.45 + 0.55 * max(0.0, min(1.0, share))
-    return "#" + "".join(f"{round(int(hue[i:i + 2], 16) * level):02x}" for i in (1, 3, 5))
+def mix(hue: str, share: float, base: str = BACKGROUND) -> str:
+    """``hue`` blended over ``base`` (both ``#rrggbb``): ``share`` 1 is the hue itself, 0 is ``base``."""
+    share = max(0.0, min(1.0, share))
+    return "#" + "".join(
+        f"{round(int(hue[i:i + 2], 16) * share + int(base[i:i + 2], 16) * (1 - share)):02x}" for i in (1, 3, 5)
+    )
 
 
 def _chart_spans(values, start: datetime, end: datetime, width: int, height: int, labels: tuple[str, str, str],
                  scale: float, hue: str | None) -> list[list[tuple[str, str]]]:
-    """The lines of a bar chart of ``values`` from 0 to ``scale``, ``height`` rows tall,
-    its axis labelled ``labels``: each line a list of ``(text, style)`` spans. With a
-    ``hue``, the bars are in it, lighter toward the top, and the frame is muted;
-    without one, every style is empty. The middle label's row has a dotted gridline
-    where the bars stay under it."""
+    """The lines of an area chart of ``values`` from 0 to ``scale``, ``height`` rows tall,
+    its axis labelled ``labels``: each line a list of ``(text, style)`` spans.
+
+    Each column rises to its value in eighths of a row. With a ``hue``, the cell where a
+    column ends (its top edge) is in the hue and the cells under it in a faint fill of it
+    (see :data:`_FILL_SHARE`), so the eye follows the series' line; the frame is muted.
+    Without one, every style is empty and the glyphs are the same. A column without a
+    sample stays blank down to the baseline, which is broken under it (:data:`_GAP_AXIS`).
+    The middle label's row has a dotted gridline where the series stays under it. In
+    the column right of the chart, :data:`_NOW` marks the row the newest column reaches;
+    there is none when the newest column is a gap (nothing is known about now).
+    """
     if width <= 0:
         return [[("", "")]]
-    bar = (lambda row: _shade(hue, (row + 1) / height)) if hue else (lambda row: "")
     axis_style, grid_style = (CHART_AXIS, CHART_GRID) if hue else ("", "")
     axis = max(len(label) for label in labels)
-    if width < axis + 3:
+    if width < axis + 4:
         return [[("".join(level_glyph(value, scale) for value in _collapse(values, width)), hue or "")]]
     height = max(1, height)
-    inner = max(1, width - axis - 2)
+    inner = max(1, width - axis - 3)  # the marker's column follows the chart's
     columns = _collapse(values, inner)
     chart_width = len(columns)
     padding = " " * (inner - chart_width)
+    reach = [_eighths(value, height, scale) for value in columns]
+    newest = reach[-1] if reach else None
+    now_level = None if newest is None else (newest - 1) // 8
+    low, high = _FILL_SHARE
     top, middle, bottom = labels
     middle_row = height // 2
     lines = []
@@ -2197,15 +2452,31 @@ def _chart_spans(values, start: datetime, end: datetime, width: int, height: int
         else:
             mark = " " * axis + " │"
         level = height - 1 - index
-        cells = _bar_row(columns, height, level, scale)
-        if index == middle_row and height > 2:
-            cells = cells.replace(" ", _GRID)
-        # Runs of bar and of gridline, each in its own style.
-        styles = {_GRID: grid_style, " ": "", "█": bar(level)}
-        runs = groupby(cells, lambda cell: cell if cell in (_GRID, " ") else "█")
-        lines.append([(mark, axis_style), (padding, ""), *(("".join(run), styles[kind]) for kind, run in runs)])
-    lines.append([(f"{bottom:>{axis}} └{padding}{'─' * chart_width}", axis_style)])
-    lines.append([((" " * (axis + 2) + _time_labels(start, end, chart_width, inner)).rstrip(), axis_style)])
+        grid = index == middle_row and height > 2
+        # The fill is in its colour on its colour: a terminal that leaves a gap between
+        # rows of █ shows no stripes.
+        shade = mix(hue, low + (high - low) * (level + 1) / height) if hue else ""
+        styles = {"edge": hue or "", "fill": f"{shade} on {shade}" if hue else "", "grid": grid_style, "gap": "",
+                  # The gridline goes on through the fill, a shade lighter than it.
+                  "under": f"{mix(hue, 0.5)} on {shade}" if hue else ""}
+        cells = []
+        for eighths in reach:
+            fill = -1 if eighths is None else eighths - 8 * level
+            if fill > 8:
+                cells.append((_GRID, "under") if grid and hue else ("█", "fill"))
+            elif fill > 0:
+                cells.append((_BLOCKS[fill - 1], "edge"))
+            else:
+                cells.append((_GRID, "grid") if grid else (" ", "gap"))
+        # Runs of edge, fill and gridline, each in its own style.
+        runs = groupby(cells, itemgetter(1))
+        lines.append([(mark, axis_style), (padding, ""),
+                      *(("".join(cell for cell, _kind in run), styles[kind]) for kind, run in runs),
+                      (_NOW, hue or "") if level == now_level else (" ", "")])
+    baseline = "".join("─" if eighths is not None else _GAP_AXIS for eighths in reach)
+    lines.append([(f"{bottom:>{axis}} └{padding}{baseline}─", axis_style)])
+    # The times span the marker's column too: the newest one ends under "now".
+    lines.append([((" " * (axis + 2) + _time_labels(start, end, chart_width + 1, inner + 1)).rstrip(), axis_style)])
     return lines
 
 
@@ -2313,7 +2584,8 @@ def window_complete(sub_job: KindResource, view: KindView) -> bool:
 def metric_stats_spans(view: KindView, whole: KindView | None, metrics, *, width: int, partial: bool = False,
                        window_partial: bool = False, missing: str = LOADING_OLDER) -> list[list[tuple[str, str]]]:
     """The stats block as lines of ``(text, style)`` spans: each metric's name in its
-    chart's colour (:func:`chart_hue`), the latest values bold, the column heads muted."""
+    chart's colour (:func:`chart_hue`), the latest values bold, the column heads muted
+    and right-aligned over their values, and a rule between the window and the whole job."""
     metrics = list(metrics)
     window_partial = window_partial or (partial and view.name == "all")
     scopes = [(window_label(view.name), None if window_partial else view)]
@@ -2342,28 +2614,41 @@ def metric_stats_spans(view: KindView, whole: KindView | None, metrics, *, width
     def scope_cells(found: list[str] | None) -> list[tuple[str, str]]:
         if found is None:
             return [(f"{missing_cell:>{block}}", f"italic {CHART_MUTED}")]
-        # The latest value stands out: it is what the panel and the chart titles show.
-        return [(f"{text:>{cell}}", "bold" if index == 3 else "") for index, text in enumerate(found)]
+        # The latest value stands out: it is what the panel and the chart titles show. Each
+        # cell's padding is a span of its own, so its digits start where the column says.
+        spans = []
+        for index, text in enumerate(found):
+            spans += [(" " * (cell - len(text)), ""), (text, f"bold {TEXT}" if index == 3 else "")]
+        return spans
 
     label = view.label
     # Each scope says what its own values are: a GPU that stopped reporting is in the whole
     # job's mean, not the window's.
     labels = [label, *((whole.label,) if len(scopes) > 1 else ())]
-    titles = [f"{name} · {own}" if own else name for (name, _scope), own in zip(scopes, labels)]
-    if any(len(title) > block for title in titles):  # both carry it, or neither
-        titles = [name for name, _scope in scopes]
+    titles = [(name, f" · {own}" if own else "") for (name, _scope), own in zip(scopes, labels)]
+    if any(len(name + own) > block for name, own in titles):  # both carry it, or neither
+        titles = [(name, "") for name, _scope in scopes]
     header = "".join(f"{name:>{cell}}" for name in _STAT_NAMES)
     for names in ([metric.name for metric in metrics], [metric.short for metric in metrics]):
         name_width = max([len(name) for name in names] + [0]) + 2
         if width >= name_width + (block + 2) * len(scopes):
-            lines = [
-                [((" " * name_width + "".join(f"  {title:^{block}}" for title in titles)).rstrip(), "bold")],
-                [(" " * name_width + "".join("  " + header for _ in scopes), CHART_AXIS)],
-            ]
+            # A table: the metric's name, then each scope's four columns, its title over
+            # them and its column heads right-aligned over its values; a rule parts the scopes.
+            title_line: list[tuple[str, str]] = [(" " * name_width, "")]
+            head_line: list[tuple[str, str]] = [(f"{'metric':<{name_width}}", CHART_AXIS)]
+            for position, (name, own) in enumerate(titles):
+                lead = (" │", CHART_GRID) if position else ("  ", "")
+                gap = block - len(name) - len(own)
+                title_line += [lead, (" " * (gap // 2), ""), (name, "bold"), (own, CHART_MUTED),
+                               (" " * (gap - gap // 2), "")]
+                head_line.append(lead)
+                for head in _STAT_NAMES:
+                    head_line += [(" " * (cell - len(head)), ""), (head, CHART_AXIS)]
+            lines = [title_line, head_line]
             for index, (name, row) in enumerate(zip(names, table)):
                 line = [(f"{name:<{name_width}}", chart_hue(index))]
-                for found in row:
-                    line += [("  ", ""), *scope_cells(found)]
+                for position, found in enumerate(row):
+                    line += [(" │", CHART_GRID) if position else ("  ", ""), *scope_cells(found)]
                 lines.append(line)
             return lines
     # Narrow: a row per metric and scope; the first line says what the values are. The

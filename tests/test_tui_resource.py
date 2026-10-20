@@ -422,7 +422,9 @@ def test_chart_uses_fixed_scale_labels_and_fits_narrow_width(tmp_path):
 
     chart = render_chart(view, 30)
     first, axis, labels = chart.splitlines()
-    assert set(first.removeprefix("100% ┤")) == {"▁"}
+    # A column per bucket, then the marker of the newest value's row.
+    assert first.endswith("◂")
+    assert set(first.removeprefix("100% ┤").removesuffix("◂")) == {"▁"}
     assert len(first) <= 30
     assert len(axis) <= 30
     assert "100%" in first and "0%" in axis
@@ -530,3 +532,156 @@ def test_history_past_seven_hours_is_binned_and_keeps_its_span(tmp_path):
     # The last ten minutes are still read from the samples themselves, unbinned.
     recent = resource.view("10m")
     assert recent.stats[BUSY].latest == stats.latest
+
+
+# ─── rendering ───────────────────────────────────────────────────────────────
+
+_LABELS = ("100%", "50%", "0%")
+_T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def _chart(values, *, width=20, height=4, hue="#4ade80"):
+    return resource_module._chart_spans(values, _T0, _T0 + timedelta(minutes=10), width, height, _LABELS, 100.0, hue)
+
+
+def _text(line) -> str:
+    return "".join(text for text, _style in line)
+
+
+def test_chart_draws_a_lit_edge_over_a_faint_fill():
+    lines = _chart([90.0] * 13)  # width 20 = 4 label cells, " ┤", 13 columns and the marker
+    rows = [_text(line) for line in lines[:4]]
+    # 90% of four rows is 29 of 32 eighths: three full rows, then 5/8 of the top row.
+    assert rows[0] == "100% ┤" + "▅" * 13 + "◂"
+    assert rows[1].endswith("█" * 13 + " ") and rows[3].endswith("█" * 13 + " ")
+    styles = {style for line in lines[:4] for text, style in line if "█" in text}
+    # The fill is the hue faded over the background (in its own colour on its own colour).
+    assert styles and all(style.split(" on ")[0] == style.split(" on ")[1] for style in styles)
+    assert all(style.split(" on ")[0] != "#4ade80" for style in styles)
+    assert ("▅" * 13, "#4ade80") in lines[0]
+    # The gridline at 50% runs on through the fill, a shade lighter than it.
+    assert "┈" * 13 in rows[2]
+
+
+def test_chart_leaves_a_gap_blank_and_breaks_its_baseline():
+    values = [50.0, None, None, 50.0, 0.0]
+    lines = _chart(values, width=12, height=2, hue=None)
+    *rows, axis, _times = (_text(line) for line in lines)
+    columns = [row[6:11] for row in rows]
+    # A missing bucket is blank to the baseline, unlike a measured 0, which shows an eighth.
+    assert [column[1:3] for column in columns] == ["  ", "  "]
+    assert columns[-1][4] == "▁"
+    assert axis.endswith("─╌╌──" + "─")
+    # The newest column has a value: the marker is on its row.
+    assert rows[-1].endswith("◂")
+
+
+def test_chart_has_no_now_marker_when_the_newest_bucket_is_a_gap():
+    lines = _chart([40.0, 40.0, None], width=12, height=2, hue=None)
+    assert not any("◂" in _text(line) for line in lines)
+
+
+def test_mix_blends_a_hue_over_the_background():
+    assert resource_module.mix("#ffffff", 1.0, "#000000") == "#ffffff"
+    assert resource_module.mix("#ffffff", 0.0, "#000000") == "#000000"
+    assert resource_module.mix("#ff0000", 0.5, "#000000") == "#800000"
+    assert resource_module.mix("#ff0000", 2.0, "#000000") == "#ff0000"  # clamped
+
+
+def test_meter_fills_in_eighths_of_a_cell_on_a_track():
+    meter = resource_module.meter_spans
+    assert meter(50.0, 100.0, 4) == [("██··", "")]
+    assert meter(90.0, 100.0, 4) == [("███▋", "")]  # 28.8 of 32 eighths
+    assert meter(0.5, 100.0, 4) == [("▏···", "")]  # above 0 shows
+    assert meter(0.0, 100.0, 4) == [("····", "")]
+    assert meter(None, 100.0, 4) == [("····", "")]
+    assert meter(250.0, 100.0, 4) == [("████", "")]
+    styled = meter(50.0, 100.0, 4, "#3fb950", track="#30363d")
+    assert styled == [("██", "#3fb950 on #30363d"), ("  ", "on #30363d")]
+    assert meter(50.0, 100.0, 0) == []
+
+
+def test_health_bounds_judge_only_the_metrics_they_know():
+    health = resource_module.metric_health
+    gpu, system = resource_module.GPU, resource_module.SYSTEM
+    assert health(gpu, "gpu_util_pct", 90.0) == "ok"
+    assert health(gpu, "gpu_util_pct", 20.0) == "warn"
+    assert health(gpu, "gpu_temp_c", 70.0) == "ok"
+    assert health(gpu, "gpu_temp_c", 86.0) == "warn"
+    assert health(gpu, "gpu_temp_c", 91.0) == "err"
+    assert health(gpu, "fb_used_pct", 96.0) == "warn"
+    assert health(system, "mem_used_pct", 98.0) == "err"
+    assert health(system, "cpu_util_pct", 20.0) == "ok"
+    assert health(gpu, "power_watts", 700.0) is None
+    assert health(gpu, "gpu_util_pct", None) is None
+    assert resource_module.worst_health(["ok", None, "err", "warn"]) == "err"
+    assert resource_module.worst_health([]) is None
+
+
+def _gpu_resource(tmp_path, utils, temps):
+    rows = []
+    for i in range(3):
+        at = _T0 + timedelta(seconds=5 * i)
+        for gpu, (util, temp) in enumerate(zip(utils, temps)):
+            row = _row(at, gpu, util)
+            row.update(power_watts=500.0 + 10 * gpu, gpu_temp_c=temp)
+            rows.append(row)
+    _write_metrics(tmp_path, "job:training:0", rows)
+    return resource_module.ResourceLoader(tmp_path).load().kind("job:training:0", resource_module.GPU)
+
+
+def test_kpi_tiles_show_what_the_rows_have_and_the_least_healthy_unit(tmp_path):
+    resource = _gpu_resource(tmp_path, [90.0, 30.0], [60.0, 88.0])
+    view = resource.view("10m")
+    tiles = {tile.label: tile for tile in resource_module.kpi_tiles(resource, view, requested=4)}
+    assert list(tiles) == ["GPU util", "GPU memory", "power", "temp", "GPUs reporting"]
+    assert tiles["GPU util"].value == "60%" and tiles["GPU util"].detail == "30–90%"
+    assert tiles["GPU util"].health == "warn"  # one GPU at 30%
+    # GPU 0 uses 1 GiB and GPU 1 2 GiB, each with 8 GiB free: a mean of 1.5 of 9.5 GiB.
+    assert tiles["GPU memory"].value == "1.50 / 9.50 GiB" and tiles["GPU memory"].detail == "16%"
+    assert tiles["power"].value == "505 W" and tiles["power"].detail == "1.0 kW total"
+    assert tiles["power"].health is None
+    assert tiles["temp"].detail == "max 88 °C" and tiles["temp"].health == "warn"
+    assert (tiles["GPUs reporting"].value, tiles["GPUs reporting"].health) == ("2/4", "warn")
+
+    one = {tile.label: tile for tile in resource_module.kpi_tiles(resource, resource.view("10m", 0), unit=0,
+                                                                  requested=2)}
+    assert (one["GPU util"].value, one["GPU util"].detail, one["GPU util"].health) == ("90%", "", "ok")
+    assert one["GPUs reporting"].health == "ok"
+
+    stale = {tile.label: tile for tile in resource_module.kpi_tiles(resource, view, requested=2, reporting=0,
+                                                                    stale=True)}
+    assert stale["GPU util"].health is None and stale["temp"].health is None
+    assert (stale["GPUs reporting"].value, stale["GPUs reporting"].health) == ("0/2", "err")
+
+
+def test_kpi_strip_fills_its_width_and_drops_details_before_wrapping():
+    tiles = [resource_module.Kpi("GPU util", "90%", "84–95%", "ok"), resource_module.Kpi("power", "632 W", "5.1 kW")]
+    for width in (40, 80):
+        lines = resource_module.kpi_strip_spans(tiles, width)
+        assert len(lines) == 2
+        assert all(sum(len(text) for text, _style in line) == width for line in lines)
+    wide = [_text(line) for line in resource_module.kpi_strip_spans(tiles, 80, styled=False)]
+    assert "GPU util" in wide[0] and "84–95%" in wide[1] and "5.1 kW" in wide[1]
+    # Too narrow for both details: the right one goes first.
+    snug = [_text(line) for line in resource_module.kpi_strip_spans(tiles, 30, styled=False)]
+    assert "84–95%" in snug[1] and "5.1 kW" not in snug[1]
+    # Too narrow for the tiles side by side: a row each.
+    assert len(resource_module.kpi_strip_spans(tiles, 12)) == 4
+    edge = resource_module.kpi_strip_spans(tiles, 80)[1][0]
+    assert edge == ("▎ ", f"{resource_module.HEALTH_COLORS['ok']} on {resource_module.SURFACE}")
+
+
+def test_stats_table_heads_line_up_with_their_columns(tmp_path):
+    resource = _gpu_resource(tmp_path, [90.0, 30.0], [60.0, 88.0])
+    view, whole = resource.view("10m"), resource.view("all")
+    lines = [_text(line) for line in resource_module.metric_stats_spans(view, whole, resource.metrics, width=160)]
+    title, head, *rows = lines
+    assert head.startswith("metric")
+    assert "last 10m" in title and "whole job" in title
+    # Each head ends in the column where its values end.
+    for name in ("min", "avg", "max", "latest"):
+        end = head.index(name) + len(name)
+        assert all(row[end - 1] != " " for row in rows), name
+    assert head.count("│") == 1 and all(row.count("│") == 1 for row in rows)
+    assert len({len(line) for line in lines}) == 1

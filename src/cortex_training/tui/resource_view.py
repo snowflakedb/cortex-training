@@ -17,7 +17,8 @@
 
 ``ResourceTab`` is mixed into ``LogScreen`` (tui/logs.py): the tab's own state lives
 on that screen, and these are the methods that download the telemetry, pick the
-sub-job and the view, and draw the header, the stats and the charts.
+sub-job and the view, and draw the header, the KPI strip, the stats, the charts
+and the window selector.
 """
 
 from __future__ import annotations
@@ -40,7 +41,9 @@ from cortex_training.tui.widgets import _result_warnings
 from cortex_training.tui.widgets import _same_telemetry
 from cortex_training.tui.widgets import _warning_text
 from cortex_training.tui.log_style import sub_job_color
+from cortex_training.tui.resource import CHART_GRID
 from cortex_training.tui.resource import CHART_MUTED
+from cortex_training.tui.resource import HEALTH_COLORS
 from cortex_training.tui.resource import GPU
 from cortex_training.tui.resource import LOADING_OLDER
 from cortex_training.tui.resource import OLDER_NOT_LOADED
@@ -57,8 +60,11 @@ from cortex_training.tui.resource import freshness_text
 from cortex_training.tui.resource import gpu_allocation
 from cortex_training.tui.resource import has_metric_samples
 from cortex_training.tui.resource import headline_metric
-from cortex_training.tui.resource import level_glyph
+from cortex_training.tui.resource import kpi_strip_spans
+from cortex_training.tui.resource import kpi_tiles
+from cortex_training.tui.resource import meter_spans
 from cortex_training.tui.resource import metric_chart_spans
+from cortex_training.tui.resource import metric_health
 from cortex_training.tui.resource import metric_stats_spans
 from cortex_training.tui.resource import no_metrics_text
 from cortex_training.tui.resource import node_allocation_text
@@ -67,6 +73,13 @@ from cortex_training.tui.resource import scrape_text
 from cortex_training.tui.resource import skipped_rows_text
 from cortex_training.tui.resource import window_complete
 from cortex_training.tui.resource import window_label
+from cortex_training.tui.theme import ACCENT
+from cortex_training.tui.theme import BACKGROUND
+from cortex_training.tui.theme import FAINT
+from cortex_training.tui.theme import MUTED
+from cortex_training.tui.theme import PANEL
+from cortex_training.tui.theme import WARN
+from cortex_training.tui.theme import status_look
 from cortex_training.tui.widgets import log_traceback
 from cortex_training.tui.widgets import _SEPARATOR
 from cortex_training.tui.widgets import _fit_line
@@ -94,6 +107,8 @@ class ResourceTab:
     _RESOURCE_VIEWS = {GPU: "GPU Resources", SYSTEM: "System Resources"}
     _RESOURCE_WHAT = {GPU: "GPU metrics", SYSTEM: "system metrics"}
     _RESOURCE_SAMPLES = {GPU: "GPU samples", SYSTEM: "system samples"}
+    # The panel's meter beside each unit's value: 4 cells, 32 steps.
+    _RESOURCE_METER_CELLS = 4
 
     def action_resource_range(self, name: str) -> None:
         if not self._resource_active() or name not in RANGES:
@@ -323,7 +338,11 @@ class ResourceTab:
         return entries.index(view) if view in entries else None
 
     def _resource_list_rows(self, source: str | None, now: datetime) -> list[tuple[tuple, Content, bool]]:
-        """Resource panel rows as ``(entry, label, disabled)``."""
+        """Resource panel rows as ``(entry, label, disabled)``.
+
+        Each unit's newest headline value follows a meter of it
+        (:data:`_RESOURCE_METER_CELLS` cells, see :func:`meter_spans`).
+        """
         kinds = self._resource_data.kinds.get(source or "", {})
         # A kind missing now has no rows: once the sub-job has some, or once a download
         # found none for a sub-job that isn't still to send its first samples.
@@ -336,40 +355,45 @@ class ResourceTab:
             text = f"{'●' if shown else '○'} {name}{' (none)' if none else ''}"
             heads.append((("view", kind), text, "dim" if none else "bold" if shown else ""))
         resource = kinds.get(self._resource_kind)
-        units: list[tuple[tuple, str, str, str]] = []
-        hue = ""
+        # (entry, name, the value's number, its level for the meter, dimmed)
+        units: list[tuple[tuple, str, str, float | None, bool]] = []
+        metric = None
         if resource is not None:
             metric = headline_metric(resource)
             stale = self._resource_stale(resource, now)
-            metrics = list(resource.metrics)
-            hue = chart_hue(metrics.index(metric)) if metric in metrics else ""
 
-            def value(latest) -> str:
-                if metric is None:
-                    return ""
-                found = latest.get(metric.key)
-                return f"{level_glyph(found, metric.scale)} {format_value(found, metric.unit)}"
+            def value(latest) -> tuple[str, float | None]:
+                found = latest.get(metric.key) if metric is not None else None
+                return (format_value(found, metric.unit) if metric is not None else ""), found
 
-            units.append((("unit", None), "ALL", value(resource.latest), "dim" if stale else ""))
+            units.append((("unit", None), "ALL", *value(resource.latest), stale))
             for unit in resource.units:
                 dim = stale or not unit.reporting
-                units.append((("unit", unit.id), unit.name + (" (stale)" if dim else ""), value(unit.latest),
-                              "dim" if dim else ""))
-        value_width = max((views.cell_width(value) for *_head, value, _style in units), default=0)
+                units.append((("unit", unit.id), unit.name + (" (stale)" if dim else ""), *value(unit.latest), dim))
+        meter = self._RESOURCE_METER_CELLS if metric is not None else 0
+        number_width = max((views.cell_width(number) for _entry, _name, number, _level, _dim in units), default=0)
+        value_width = meter + 1 + number_width if metric is not None else 0
         inner = max([views.cell_width(text) for _entry, text, _style in heads]
-                    + [views.cell_width(name) + 2 + value_width for _entry, name, _value, _style in units])
+                    + [views.cell_width(name) + 2 + value_width for _entry, name, *_rest in units])
         rows = [(entry, Content.styled(text, style) if style else Content(text), False)
                 for entry, text, style in heads]
         if units:
-            rows.append((("rule",), Content("─" * inner), True))
-        for entry, name, value, style in units:
-            gap = " " * (inner - views.cell_width(name) - views.cell_width(value))
-            if style:  # dimmed: a unit that stopped reporting
-                rows.append((entry, Content.styled(name + gap + value, style), False))
-            else:
-                # The bar in the chart's colour; the value plain, readable under the highlight too.
-                bar, _space, number = value.partition(" ")
-                rows.append((entry, Content.assemble(name, gap, (bar, hue) if hue else bar, _space + number), False))
+            rows.append((("rule",), Content.styled("─" * inner, CHART_GRID), True))
+        for entry, name, number, level, dim in units:
+            gap = " " * (inner - views.cell_width(name) - value_width)
+            if metric is None:
+                rows.append((entry, Content.styled(name, "dim") if dim else Content(name), False))
+                continue
+            # A few cells of meter, coloured by how healthy the value reads (the chart's colour
+            # for a metric that isn't judged), on a track that shows under the highlight too;
+            # the number plain, readable under the highlight. A unit that stopped reporting is
+            # dimmed, its meter all faint: its value is old.
+            health = metric_health(resource.kind, metric.key, level)
+            color = FAINT if dim else HEALTH_COLORS[health] if health else chart_hue(0)
+            shown = f" {number:>{number_width}}"
+            rows.append((entry, Content.assemble((name, "dim") if dim else name, gap,
+                                                 *meter_spans(level, metric.scale, meter, color),
+                                                 (shown, "dim") if dim else shown), False))
         return rows
 
     def _sync_resource_list(self, source: str | None, now: datetime) -> None:
@@ -488,6 +512,96 @@ class ResourceTab:
         who = "the job" if job_waiting else views.sub_job_label(source) if source else "it"
         return no_metrics_text(allocation, waiting=waiting, who=who, kind=kind)
 
+    def _resource_shows_empty(self) -> bool:
+        """Whether the view shown, without telemetry, says why (its telemetry has loaded, or has none to load)."""
+        source = self._resource_source() or ""
+        cached = bool(self._resource_data.kinds.get(source))
+        return self._resource_loaded and (self._resource_downloaded or cached or not self._resource_state(None))
+
+    def _resource_empty_card(self) -> Content | None:
+        """The pane's card while the view shown has nothing to chart: what that means, then why.
+
+        A title says the case in a few words, with a glyph in a calm colour (a job
+        still waiting has its status's), and :meth:`_resource_empty_text` says why
+        under it. None while the telemetry is still loading (the header says so).
+        """
+        if not self._resource_shows_empty():
+            return None
+        source = self._resource_source() or ""
+        allocation = gpu_allocation(self._job, source)
+        ignored = self._resource_data.ignored_rows_by_sub_job.get(source, 0)
+        why = self._resource_empty_text(allocation, ignored)
+        kind = self._resource_kind
+        waiting = self._resource_waiting()
+        glyph, color = "○", MUTED
+        if kind == GPU and ignored:
+            title, glyph, color = "No usable GPU metrics", "◌", WARN
+        elif allocation.shared_with:
+            title, glyph = "GPU metrics are on another sub-job", "⇢"
+        elif waiting is not None:
+            look = status_look(waiting)
+            job_waiting = views.status_word(self._job_status) in self._PRE_PLACEMENT | self._STARTING
+            who = "the job" if job_waiting else views.sub_job_label(source) if source else "the sub-job"
+            title, glyph, color = f"Waiting for {who} to start", look.glyph, look.color
+        elif self._resource_first_samples_due(allocation):
+            title, glyph, color = "Waiting for the first samples", "◔", status_look("running").color
+        elif kind == SYSTEM:
+            title = "CPU and memory aren't collected"
+        else:
+            title = f"No {self._RESOURCE_WHAT[kind]}"
+        return Content.assemble((f"{glyph}  ", color), (title, "bold"), "\n\n", (why, MUTED))
+
+    def _resource_kpis(self, resource: KindResource, view: KindView, width: int, stale: bool) -> Content:
+        """The KPI strip over the stats (see :func:`kpi_tiles`); a running sub-job whose
+        samples stopped gets a line over it that says so, and its tiles are faint."""
+        allocation = gpu_allocation(self._job, self._resource_source())
+        requested = allocation.requested if resource.kind == GPU else None
+        reporting = 0 if stale else len(resource.reporting_unit_ids)
+        tiles = kpi_tiles(resource, view, unit=self._resource_unit, requested=requested, reporting=reporting,
+                          stale=stale)
+        lines = [spans_content(line) for line in kpi_strip_spans(tiles, width, dim=stale)]
+        if stale:
+            # The header says for how long, in the warning colour; this says what that means.
+            note = "showing the last values received; the tiles and charts move on once new samples arrive"
+            lines[:0] = [Content.assemble(("◌  ", WARN), (views.fit_cells(note, max(1, width - 3)), MUTED)),
+                         Content("")]
+        return Content("\n").join(lines)
+
+    def _resource_keys(self, width: int = 0) -> Content:
+        """The tab's bottom row, fitted to ``width`` (any length when 0): the window selector, then key help.
+
+        The selector is a segmented control, a segment per window and the one shown
+        lit (``window  10m  30m  1h  6h  all``); a click on a segment shows its window.
+        The help at the right end has only what the footer doesn't show: ``↑↓ GPU``
+        (or ``node``) with more than one in the view. Too wide, the help goes, then the
+        selector's label; then the row is cut.
+        """
+        extra = ""
+        resource = self._resource_kind_data()
+        if resource is not None and len(resource.units) > 1:
+            extra = "↑↓ GPU" if self._resource_kind == GPU else "↑↓ node"
+
+        def selector(label: bool) -> list[tuple[str, str]]:
+            spans = [("window ", MUTED)] if label else []
+            for name in RANGES:
+                look = f"bold {BACKGROUND} on {ACCENT}" if name == self._resource_range else f"{MUTED} on {PANEL}"
+                spans.append((f" {name} ", f"{look} @click=screen.resource_range('{name}')"))
+            return spans
+
+        gap = "   "
+        for label, help_text in ((True, extra), (True, ""), (False, "")):
+            spans = selector(label)
+            used = sum(views.cell_width(text) for text, _style in spans)
+            if width > 0 and used > width:
+                continue
+            if help_text:
+                room = width - used if width > 0 else len(gap) + views.cell_width(help_text)
+                if views.cell_width(help_text) + len(gap) > room:
+                    continue
+                spans.append((help_text.rjust(room), FAINT))
+            return Content.assemble(*spans)
+        return Content.assemble(*selector(False)).truncate(width, ellipsis=True)
+
     def _resource_status(self, resource: KindResource | None, width: int = 0) -> Content:
         """Two fitted header lines for scope, sampling, freshness, and refresh state."""
         kind = self._resource_kind
@@ -522,16 +636,15 @@ class ResourceTab:
                                   values)
             else:
                 first = _fit_line([source_forms], [0, 0], width, values)
-            cached = bool(self._resource_data.kinds.get(source))
             # A download that gave up on chunks is why there may be nothing here: say so.
             warned = self._source_warnings()
             if warned:
                 values["warning"] = _warning_text(warned)
             alert = [("$warning", 0)] if warned else [("", 0)]
-            if self._resource_loaded and (self._resource_downloaded or cached or not states):
-                # A message, not the charts: it may wrap. A refresh's state follows it.
-                values["empty"] = self._resource_empty_text(allocation, ignored)
-                second = _fit_line([[("$empty", 0)], state or [("", 0)], note, alert], [], 0, values)
+            if self._resource_shows_empty():
+                # Why there is nothing to chart is the card in the pane (see _resource_empty_card);
+                # the line keeps a refresh's state, the skipped rows and the warning.
+                second = _fit_line([state or [("", 0)], note, alert], [], 0, values)
             elif states or warned:
                 # Nothing to chart yet: the state (an error, say) is the message, whole; it may wrap.
                 second = _fit_line([state, note, alert], [], 0, values)
@@ -667,8 +780,10 @@ class ResourceTab:
             return
         try:
             status = self.query_one("#resource-status", Static)
+            kpis = self.query_one("#resource-kpis", Static)
             stats = self.query_one("#resource-stats", Static)
             charts = self.query_one("#resource-charts", Static)
+            keys = self.query_one("#resource-keys", Static)
         except NoMatches:
             return
         source = self._resource_source()
@@ -692,9 +807,14 @@ class ResourceTab:
             if retry_layout:
                 self.call_after_refresh(self._render_resource, retry_layout=False)
             return
+        keys.update(self._resource_keys(keys.content_size.width or pane_width))
         if resource is None:
             status.update(self._resource_status(None, pane_width) if source else self._resource_no_source_text())
-            stats.update("")
+            kpis.update("")
+            kpis.display = False
+            card = self._resource_empty_card() if source else None
+            stats.set_class(card is not None, "-empty")
+            stats.update(card or "")
             charts.update("")
             self._resource_stale_shown = False
             return
@@ -709,6 +829,9 @@ class ResourceTab:
         missing = self._resource_missing(resource)  # the older samples: loading, or not loaded
         self._resource_stale_shown = self._resource_stale(resource, now)
         status.update(self._resource_status(resource, pane_width))
+        kpis.update(self._resource_kpis(resource, view, pane_width, self._resource_stale_shown))
+        kpis.display = True
+        stats.set_class(False, "-empty")
         stats.update(Content("\n").join(spans_content(line) for line in metric_stats_spans(
             view, whole, resource.metrics, width=pane_width, partial=resource.partial, window_partial=not complete,
             missing=missing or LOADING_OLDER)))
