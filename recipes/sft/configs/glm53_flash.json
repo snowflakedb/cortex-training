@@ -37,11 +37,12 @@
         "step_peak_memory_log": true,
         "prime_rl": {
           "ep_comm_backend": "deepep",
-          "deepep_token_chunk_size": 8192
+          "deepep_token_chunk_size": 8192,
+          "fused_cross_entropy": false
         },
         "optimizer": {
           "name": "AdamW",
-          "lr": 2e-05,
+          "lr": 1e-04,
           "weight_decay": 0.0,
           "betas": [
             0.9,
@@ -65,6 +66,20 @@
             "bf16_master_weights_and_grads": true,
             "bf16_optimizer_states": true
           }
+        },
+        "peft_config": {
+          "peft_type": "Lora",
+          "r": 32,
+          "lora_alpha": 32,
+          "lora_dropout": 0.0,
+          "bias": "none",
+          "target_modules": [
+            "q_a_proj",
+            "q_b_proj",
+            "kv_a_proj_with_mqa",
+            "kv_b_proj",
+            "o_proj"
+          ]
         }
       }
     }

@@ -253,7 +253,17 @@ def test_moe_sft_recipes_have_runnable_parallelism():
             assert training["prime_rl"] == {
                 "ep_comm_backend": "deepep",
                 "deepep_token_chunk_size": 8192,
+                "fused_cross_entropy": False,
             }
+            assert training["optimizer"]["lr"] == 1e-4
+            assert training["peft_config"]["r"] == 32
+            assert training["peft_config"]["target_modules"] == [
+                "q_a_proj",
+                "q_b_proj",
+                "kv_a_proj_with_mqa",
+                "kv_b_proj",
+                "o_proj",
+            ]
         elif filename == "glm53_flash_bf16.json":
             assert training["prime_rl"] == {"ep_comm_backend": "uccl"}
         elif filename == "deepseek_v4_flash.json":
@@ -402,10 +412,7 @@ def test_moe_rl_recipes_have_runnable_parallelism():
         assert sampling_config["n_gpus"] == sampling_gpus
         expected_tp = 8 if filename.startswith("qwen38_flash_next") else sampling_gpus
         assert sampling_config["vllm_config"]["tensor_parallel_size"] == expected_tp
-        if filename == "glm53_flash.json":
-            assert "trust_remote_code" not in sampling_config["vllm_config"]
-        else:
-            assert sampling_config["vllm_config"]["trust_remote_code"] is True
+        assert sampling_config["vllm_config"]["trust_remote_code"] is True
         assert training["job_type"] == "training"
         assert training["model_name"] == model_id
         assert training["dtype"] == "bfloat16"
@@ -414,7 +421,19 @@ def test_moe_rl_recipes_have_runnable_parallelism():
             assert training_config["prime_rl"] == {
                 "ep_comm_backend": "deepep",
                 "deepep_token_chunk_size": 8192,
+                "fused_cross_entropy": False,
             }
+            assert training_config["optimizer"]["lr"] == 1e-4
+            assert training_config["peft_config"]["target_modules"] == [
+                "q_a_proj",
+                "q_b_proj",
+                "kv_a_proj_with_mqa",
+                "kv_b_proj",
+                "o_proj",
+            ]
+            assert sampling_config["peft_config"]["target_modules"] == training_config[
+                "peft_config"
+            ]["target_modules"]
         elif filename == "glm53_flash_bf16.json":
             assert training_config["prime_rl"] == {"ep_comm_backend": "uccl"}
         elif filename == "deepseek_v4_flash.json":
