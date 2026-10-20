@@ -1115,12 +1115,12 @@ def build_client(args: argparse.Namespace, cortex_training_client_cls):
     if args.base_url:
         return cortex_training_client_cls(base_url=args.base_url, **kwargs)
     if args.use_connection_profile:
-        return cortex_training_client_cls.from_connection_name(
+        return cortex_training_client_cls._from_profile(
             connection_name=args.connection,
             verify_ssl=not args.no_verify_ssl,
             **kwargs,
         )
-    return cortex_training_client_cls.from_pat(
+    return cortex_training_client_cls._from_pat(
         host=_normalize_host(args.host),
         pat=args.pat,
         verify_ssl=not args.no_verify_ssl,

@@ -3457,10 +3457,10 @@ def test_build_client_uses_named_snowflake_connection(tmp_path, monkeypatch):
     args = cli.parse_args(["--connection", "training-profile", "list"])
     client_cls = MagicMock()
     connected = object()
-    client_cls.from_connection_name.return_value = connected
+    client_cls._from_profile.return_value = connected
 
     assert cli.build_client(args, client_cls) is connected
-    client_cls.from_connection_name.assert_called_once_with(
+    client_cls._from_profile.assert_called_once_with(
         connection_name="training-profile",
         database=None,
         schema=None,
@@ -3482,7 +3482,7 @@ def test_build_client_forwards_read_bounds_only_when_set(tmp_path, monkeypatch):
     client_cls = MagicMock()
 
     cli.build_client(args, client_cls)
-    kwargs = client_cls.from_connection_name.call_args.kwargs
+    kwargs = client_cls._from_profile.call_args.kwargs
     assert (kwargs["max_retries"], kwargs["request_timeout"]) == (2, (10.0, 45.0))
 
 

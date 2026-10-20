@@ -33,7 +33,7 @@ from pathlib import Path
 
 from cortex_training import CortexTrainingClient
 
-client = CortexTrainingClient.from_connection_name("training")
+client = CortexTrainingClient.from_configs(connection="training")
 body = json.loads(Path("examples/api/rl.json").read_text())  # training + sampling
 job_id = client.create_job_from_body(body)["job_id"]
 client.wait_for_job(job_id)

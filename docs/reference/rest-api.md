@@ -108,7 +108,7 @@ as given.
 `CortexTrainingClient` defaults `endpoint` to `cortex-training`.
 
 ```python
-client = CortexTrainingClient.from_connection_name("training")
+client = CortexTrainingClient.from_configs(connection="training")
 ```
 
 The SQL statements API used by execution-log download is outside this prefix:
@@ -129,8 +129,9 @@ different name, pass it explicitly: `endpoint="my-endpoint-name"`.
 
 ### 2.2 Authentication
 
-`CortexTrainingClient.from_connection_name(...)` uses the Snowflake
-Connector's resolved REST origin and live session token:
+A client built from a Snowflake connection profile
+(`CortexTrainingClient.from_configs(...)`) uses the Snowflake Connector's
+resolved REST origin and live session token:
 
 ```http
 Authorization: Snowflake Token="<session-token>"
@@ -140,8 +141,8 @@ The client reconnects once and replays the request when Snowflake explicitly
 reports that the session token expired. Named profiles and the configured
 default profile are supported.
 
-Direct PAT compatibility is available through
-`CortexTrainingClient.from_pat(...)`, which sends:
+When no profile exists, `from_configs()` uses `CORTEX_TRAINING_HOST` and
+`CORTEX_TRAINING_PAT` (for CI), and sends:
 
 ```http
 Authorization: Bearer <PAT>
@@ -3086,12 +3087,7 @@ most a second.
 ```python
 from cortex_training.client import CortexTrainingClient, SubJobConfig
 
-client = CortexTrainingClient.from_pat(
-    host=HOST,
-    pat=PAT,
-    database=DATABASE,
-    schema=SCHEMA,
-)
+client = CortexTrainingClient.from_configs(database=DATABASE, schema=SCHEMA)
 
 training = SubJobConfig.training_job(
     model_name="Qwen/Qwen3-1.7B",
@@ -3189,12 +3185,7 @@ in vLLM before the first adapter sync.
 ```python
 from cortex_training.client import CortexTrainingClient, SubJobConfig
 
-client = CortexTrainingClient.from_pat(
-    host=HOST,
-    pat=PAT,
-    database=DATABASE,
-    schema=SCHEMA,
-)
+client = CortexTrainingClient.from_configs(database=DATABASE, schema=SCHEMA)
 
 lora_config = {
     "peft_type": "Lora",
