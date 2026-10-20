@@ -790,10 +790,14 @@ answers, the header reads `loading all schemas…` (or `loading the current
 schema, DB.SCHEMA…`) and the previous list stays on screen. The account-level
 list shows its first page (the newest 500 jobs) as soon as it answers, and adds
 each later page as it comes: the highlighted row stays where it is on screen,
-and folds and a search stay as they are. Until the last page, the header reads
-`all schemas · loading older jobs… N so far` (then `newest 2,000; loading older
-active jobs…` while it reads the active jobs), the counts above the list and a
-search's matches end in `so far`, and the LIVE and HISTORY rows' counts in `…`.
+and folds and a search stay as they are. From its second page on, it also reads
+the active jobs (see below) beside the newest ones, at most two requests at a
+time. Until the last page, the header reads `all schemas · loading older jobs…
+N so far` (`+ every active job` once the active jobs are listed; then `newest
+2,000; loading older active jobs…` if they are still being read), the counts
+above the list and a search's matches end in `so far`, and the LIVE and HISTORY
+rows' counts in `…`; the live counts and the LIVE row drop theirs once the
+active jobs are listed.
 The list also shows its pages as they come when it first opens on all schemas;
 a refresh of a whole list keeps showing it until the next one is whole.
 `a` while the pages are read stops reading them: the pages read stay, no longer
@@ -817,7 +821,10 @@ have more after it: a refresh never walks the whole history. It asks for no
 status, so jobs whose status the service can't read (`unknown`) are listed too.
 When it stops with jobs left, it also reads the active jobs (`pending`,
 `placing`, `initializing` and `running`) and adds those created before the
-newest ones, so a long-running job stays under live. An `unknown` job older than
+newest ones, so a long-running job stays under live. (A refresh of a whole list
+reads them after the newest jobs, only when it stops with jobs left; a list
+showing its pages reads them beside the newest jobs, and drops them if the
+newest turn out whole.) An `unknown` job older than
 the newest 2,000 is not listed, as a status filter leaves those out, and if
 reading the active jobs fails or is cut short too, the header says `older active
 jobs may be missing`. A walk that stops at 20 pages with no job to show says

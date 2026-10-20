@@ -86,11 +86,19 @@ class ListScope:
     # ACCOUNT, shown while it is read: OLDER, or ACTIVE_NEXT (the newest jobs' walk
     # stopped as ``stopped`` says). "" once the list is whole.
     loading: str = ""
+    # ACCOUNT, OLDER: the active jobs' walk, read beside the newest jobs', is done and its
+    # jobs listed (``active_missing``: it failed or stopped early).
+    active_read: bool = False
 
     @property
     def truncated(self) -> bool:
         """The list holds only the newest jobs: more exist, may exist, or are still loading."""
         return self.stopped is not None or bool(self.loading)
+
+    @property
+    def live_whole(self) -> bool:
+        """Every active job is listed: the list is whole, or its active jobs' walk is read in full."""
+        return not self.loading or (self.active_read and not self.active_missing)
 
 
 def stopped_scope(scope: ListScope) -> ListScope:
@@ -98,7 +106,7 @@ def stopped_scope(scope: ListScope) -> ListScope:
     if not scope.loading:
         return scope
     return replace(scope, loading="", stopped=scope.stopped if scope.loading == ACTIVE_NEXT else FAILED,
-                   active_missing=True)
+                   active_read=False, active_missing=not scope.live_whole)
 
 
 @dataclass
@@ -118,7 +126,9 @@ def scope_text(scope: ListScope, *, location: str, only: str = "") -> str:
     """A short header for this scope; ``only`` names its sole location."""
     if scope.kind == ACCOUNT:
         if scope.loading == OLDER:
-            return f"loading older jobs… {scope.walked:,} so far"
+            active = "" if not scope.active_read else (
+                " (older active jobs may be missing)" if scope.active_missing else " + every active job")
+            return f"loading older jobs… {scope.walked:,} so far{active}"
         if scope.loading:
             return f"newest {scope.walked:,}; loading older active jobs…"
         if scope.stopped is None:
@@ -142,7 +152,8 @@ def loaded_text(scope: Optional[ListScope]) -> str:
         return ""
     if scope.loading:
         what = "older jobs are" if scope.loading == OLDER else "older active jobs are"
-        return f"the newest {scope.walked:,} so far; {what} still loading"
+        active = " and every active job" if scope.active_read and not scope.active_missing else ""
+        return f"the newest {scope.walked:,} so far{active}; {what} still loading"
     held = (f"the newest {scope.walked:,} of the last 6 months" if scope.stopped in (CAPPED, FAILED)
             else f"what the first {scope.pages} pages held")
     return held + ("" if scope.active_missing else " and every active job") + f"; {_more(scope)}"
@@ -276,36 +287,26 @@ class JobLister:
               on_partial: Optional[Callable[[Listing], None]] = None) -> Optional[Listing]:
         """The newest jobs of the account-level list, and the active ones when more exist; None when cancelled.
 
-        ``on_partial`` is given what is read so far (a :class:`Listing` whose scope is ``loading``) after
-        each page of the newest jobs that isn't the last one read; the requests, and the result, are the
-        same as without it. (The active jobs come last: on a busy account their walk is pages long too,
-        and its first page the slowest.)
+        Without ``on_partial`` (a refresh of a list that is whole), the active jobs' walk follows the
+        newest jobs', as only a walk that stopped short needs it. With it, ``on_partial`` is given what
+        is read so far (a :class:`Listing` whose scope is ``loading``) after each page of the newest
+        jobs that isn't the last one read, and the active jobs' walk is read beside the newest jobs'
+        from their second page on (on a busy account it is pages long too, and its first page the
+        slowest), its jobs listed once it is done. The result is the same either way.
         """
         created_after = now - timedelta(days=views.RETENTION_DAYS)
+        if on_partial is not None:
+            return _Beside(self, created_after, is_cancelled, on_partial).walk()
         newest = _Walk(self._client, created_after, None)
-        reported = 0  # the most jobs a partial has held: a walk read again from its start shows none fewer
         while not newest.done:
             if not newest.step(is_cancelled):
                 return None
-            if on_partial is None or (newest.done and newest.stopped is None) or len(newest.jobs) < reported:
-                continue  # whole (the result comes next), or read again from its start
-            reported = len(newest.jobs)
-            if newest.done:  # stopped short: the active jobs come next
-                scope = ListScope(ACCOUNT, stopped=newest.stopped, walked=len(newest.jobs), loading=ACTIVE_NEXT,
-                                  pages=ACCOUNT_LIST_MAX_PAGES if newest.stopped == PAGE_LIMIT else 0)
-            else:
-                scope = ListScope(ACCOUNT, walked=len(newest.jobs), loading=OLDER)
-            on_partial(Listing(list(newest.jobs), scope))
         if newest.stopped is None:
             return Listing(newest.jobs, ListScope(ACCOUNT))
         active = self._active(created_after, is_cancelled)
         if active is None:
             return None
-        rows, active_stopped = active
-        scope = ListScope(ACCOUNT, stopped=newest.stopped, walked=len(newest.jobs),
-                          pages=ACCOUNT_LIST_MAX_PAGES if newest.stopped == PAGE_LIMIT else 0,
-                          active_missing=active_stopped is not None)
-        return Listing(_merge(newest.jobs, rows), scope)
+        return _listing(newest, active)
 
     def _active(self, created_after: datetime, is_cancelled: Callable[[], bool]) -> Optional[tuple]:
         """``(jobs, stopped)`` of the active-job walk (stopped "failed" when it failed); None when cancelled."""
@@ -318,6 +319,96 @@ class JobLister:
             logger.info("job list: reading the active jobs failed; older active jobs may be missing", exc_info=True)
             return [], "failed"
         return walk.jobs, walk.stopped
+
+
+def _listing(newest: "_Walk", active: tuple) -> Listing:
+    """The list of a newest jobs' walk that stopped short, and of the active jobs' walk ``(jobs, stopped)``."""
+    rows, active_stopped = active
+    scope = ListScope(ACCOUNT, stopped=newest.stopped, walked=len(newest.jobs),
+                      pages=ACCOUNT_LIST_MAX_PAGES if newest.stopped == PAGE_LIMIT else 0,
+                      active_missing=active_stopped is not None)
+    return Listing(_merge(newest.jobs, rows), scope)
+
+
+class _Beside:
+    """One walk of the account-level list that shows its pages: the newest jobs' walk on the
+    caller's thread and, from its second page on, the active jobs' walk on another (at most two
+    requests in flight), each list shown made under one lock, so they reach ``on_partial`` in
+    the order they were made, and none once the walk has answered."""
+
+    _POLL_SECONDS = 0.1  # how soon a walk waiting for the active jobs sees it was cancelled
+
+    def __init__(self, lister: "JobLister", created_after: datetime, is_cancelled: Callable[[], bool],
+                 on_partial: Callable[[Listing], None]) -> None:
+        self._lister, self._created_after = lister, created_after
+        self._is_cancelled, self._on_partial = is_cancelled, on_partial
+        self._lock = threading.Lock()
+        self._stop = threading.Event()  # the walk answered: the active jobs' walk stops at its next page
+        self._newest = _Walk(lister._client, created_after, None)
+        self._shown: Optional[list] = None  # the newest jobs last shown (a walk read again shows none fewer)
+        self._active: Optional[tuple] = None  # the active jobs' walk, once done
+        self._newest_done = False
+
+    def walk(self) -> Optional[Listing]:
+        newest = self._newest
+        reader = None
+        try:
+            while not newest.done:
+                if not newest.step(self._is_cancelled):
+                    return None
+                if reader is None and not newest.done:
+                    reader = threading.Thread(target=self._read_active, name="active-jobs-walk", daemon=True)
+                    reader.start()
+                with self._lock:
+                    self._newest_done = newest.done
+                    if newest.done and newest.stopped is None:
+                        break  # whole: the result comes next
+                    if self._shown is None or len(newest.jobs) >= len(self._shown):
+                        self._shown = list(newest.jobs)
+                        if not (newest.done and self._active is not None):  # else the result comes next
+                            self._report()
+            if newest.stopped is None:
+                return Listing(newest.jobs, ListScope(ACCOUNT))
+            if reader is None:  # the first page stopped it short
+                active = self._lister._active(self._created_after, self._is_cancelled)
+            else:
+                while reader.is_alive():
+                    reader.join(self._POLL_SECONDS)
+                    if self._is_cancelled():
+                        return None
+                active = self._active
+            if active is None or self._is_cancelled():
+                return None
+            return _listing(newest, active)
+        finally:
+            with self._lock:
+                self._stop.set()
+
+    def _read_active(self) -> None:
+        active = self._lister._active(self._created_after, lambda: self._is_cancelled() or self._stop.is_set())
+        with self._lock:
+            if active is None or self._stop.is_set():
+                return
+            self._active = active
+            # Shown with the newest jobs: now, or with their next list if none is made yet; once
+            # the newest jobs' walk is done, the walk answers with them.
+            if not self._newest_done and self._shown is not None:
+                self._report()
+
+    def _report(self) -> None:
+        """Show what is read so far (called under the lock)."""
+        newest, active = self._newest, self._active
+        if newest.done:  # stopped short, the active jobs not read yet
+            scope = ListScope(ACCOUNT, stopped=newest.stopped, walked=len(self._shown), loading=ACTIVE_NEXT,
+                              pages=ACCOUNT_LIST_MAX_PAGES if newest.stopped == PAGE_LIMIT else 0)
+        else:
+            scope = ListScope(ACCOUNT, walked=len(self._shown), loading=OLDER, active_read=active is not None,
+                              active_missing=active is not None and active[1] is not None)
+        jobs = _merge(self._shown, active[0]) if active is not None else list(self._shown)
+        try:
+            self._on_partial(Listing(jobs, scope))
+        except Exception:  # noqa: BLE001 - showing it failed; the walk goes on
+            logger.warning("job list: showing the jobs read so far failed", exc_info=True)
 
 
 def _merge(jobs: list, active: list) -> list:

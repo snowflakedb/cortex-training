@@ -4073,7 +4073,8 @@ def test_a_says_at_once_that_it_is_loading_all_schemas(in_flight):
 
 
 class _PagedDemo(DemoClient):
-    """A demo whose account-wide pages answer one per ``release()`` while ``gated``. For the
+    """A demo whose account-wide pages of the newest jobs answer one per ``release()`` while
+    ``gated`` (the active jobs' walk answers at once, and ``pages`` doesn't count it). For the
     newest jobs' walk: ``fail_at`` is the page (1 is the first) that fails, ``unavailable_at``
     the one that answers the list is not deployed, ``bad_token_at`` the one whose token the
     service can't open (once), ``running_at`` the one whose first job is running. ``schema_fails``:
@@ -4100,6 +4101,8 @@ class _PagedDemo(DemoClient):
         return super().list_jobs(*args, **kwargs)
 
     def list_jobs_page(self, **kwargs):
+        if kwargs.get("status"):  # the active jobs' walk, read beside: ungated, uncounted
+            return super().list_jobs_page(**kwargs)
         self.pages += 1
         if self.gated:
             self._permits.acquire(timeout=10)
@@ -4146,10 +4149,15 @@ async def _run_all_schemas_shows_each_page_as_it_comes(refill):
         assert await _pause_until(pilot, lambda: len(screen._all_jobs) == rows, seconds=10.0), len(screen._all_jobs)
         await pilot.pause(0.2)
         assert screen._scope.kind == ACCOUNT and screen._scope.loading and screen._refreshing
-        assert app.sub_title == f"all schemas  ·  loading older jobs… {rows} so far", app.sub_title
-        assert "so far" in _info_text(screen)
-        assert any(str(table.get_row_at(i)[0]).startswith("HISTORY") and str(table.get_row_at(i)[0]).endswith("…")
-                   for i in range(table.row_count))
+        # The active jobs, read beside the newest (at once, here): the live counts are whole, the history not.
+        assert await _pause_until(pilot, lambda: screen._scope.active_read, seconds=10.0)
+        assert app.sub_title == f"all schemas  ·  loading older jobs… {rows} so far + every active job", (
+            app.sub_title)
+        live_part, history_part = _info_text(screen).split("│")
+        assert "so far" not in live_part and "in history so far" in history_part, _info_text(screen)
+        group_rows = [str(table.get_row_at(i)[0]) for i in range(table.row_count)
+                      if str(table.get_row_at(i)[0]).startswith(("LIVE", "HISTORY"))]
+        assert [row.endswith("…") for row in group_rows] == [False, True], group_rows
 
         client.release()
         assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 2 * rows, seconds=10.0)
@@ -4502,8 +4510,9 @@ async def _run_a_page_that_fails_keeps_the_pages_read_and_r_reads_them_again():
         await pilot.pause(0.2)
         assert len(screen._all_jobs) == 2 * rows  # the two pages read stay
         assert app.sub_title.startswith("load failed "), app.sub_title
-        assert app.sub_title.endswith(f"newest {2 * rows} (the rest didn't load; r retries; "
-                                      "older active jobs may be missing)"), app.sub_title
+        # The active jobs, read beside the newest pages, stay listed: none is missing.
+        assert app.sub_title.endswith(f"newest {2 * rows} + every active job (the rest didn't load; r retries)"), (
+            app.sub_title)
         notice = screen.query_one("#listnotice", Static)
         assert notice.display and f"showing the {2 * rows} jobs read before it" in screen._notice.plain
         client.fail_at = None

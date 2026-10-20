@@ -16,6 +16,8 @@
 """The job list's account-wide list: its fallback to the configured schema, and when it is asked again."""
 
 import json
+import threading
+import time
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
@@ -278,29 +280,51 @@ _SHAPES = {
 }
 
 
+def _walk_calls(calls: list, walk: str) -> list:
+    return [call for call in calls if call[0] == walk]
+
+
 @pytest.mark.parametrize("shape", list(_SHAPES))
-def test_the_walk_shows_each_page_and_ends_with_the_list_it_read_all_at_once(shape):
+def test_a_refresh_reads_the_list_as_it_did_all_at_once(shape):
+    old_client, client = _Paged(**_SHAPES[shape]), _Paged(**_SHAPES[shape])
+    assert JobLister(client, account_wide=True).load(NOW) == _old_walk(old_client)
+    assert client.calls == old_client.calls  # the same requests, in the same order
+
+
+@pytest.mark.parametrize("shape", list(_SHAPES))
+@pytest.mark.parametrize("run", range(3))  # the two walks interleave as their threads go
+def test_the_walk_shows_each_page_and_ends_with_the_list_it_read_all_at_once(shape, run):
     old_client = _Paged(**_SHAPES[shape])
     old = _old_walk(old_client)
     client, partials = _Paged(**_SHAPES[shape]), []
     listing = JobLister(client, account_wide=True).load(NOW, on_partial=partials.append)
-    assert listing == old and client.calls == old_client.calls  # the same list, from the same requests
-    assert not listing.scope.loading
+    assert listing == old and not listing.scope.loading
+    # The same requests of each walk; the active jobs' one, read beside, maybe begun where the old one wasn't.
+    assert _walk_calls(client.calls, "newest") == _walk_calls(old_client.calls, "newest")
+    active, old_active = _walk_calls(client.calls, "active"), _walk_calls(old_client.calls, "active")
+    assert active == old_active if old_active else active == _walk_calls(_active_calls(shape), "active")[:len(active)]
 
-    sizes = [len(p.jobs) for p in partials]
+    sizes = [p.scope.walked for p in partials]
     assert sizes == sorted(sizes)
-    if listing.scope.stopped is None:
-        assert all(size < len(listing.jobs) for size in sizes)  # the page that made it whole is the result
-    else:
-        assert sizes[-1] == listing.scope.walked
+    final = {views.job_key(job) for job in listing.jobs}
     for partial in partials:
-        assert partial.jobs == listing.jobs[:len(partial.jobs)]  # each the start of the list, newest first
-        assert partial.scope.walked == len(partial.jobs) and partial.scope.truncated
+        assert partial.jobs[:partial.scope.walked] == listing.jobs[:partial.scope.walked]  # the newest, in order
+        assert {views.job_key(job) for job in partial.jobs} <= final and partial.scope.truncated
     assert all(p.scope.loading == OLDER for p in partials[:-1])
-    if listing.scope.stopped is not None:  # the newest jobs' walk stopped short: the active jobs come next
+    if partials and partials[-1].scope.loading == ACTIVE_NEXT:  # the newest jobs' walk stopped short first
         assert partials[-1].scope == ListScope(ACCOUNT, stopped=listing.scope.stopped, walked=listing.scope.walked,
                                                pages=listing.scope.pages, loading=ACTIVE_NEXT)
+    # Once the active jobs are read, every list after holds them.
+    read = [p.scope.active_read for p in partials if p.scope.loading == OLDER]
+    assert read == sorted(read)
     assert len({id(p.jobs) for p in partials}) == len(partials)  # each its own list
+
+
+def _active_calls(shape: str) -> list:
+    """The requests a whole active jobs' walk of ``shape`` makes."""
+    client = _Paged(**_SHAPES[shape])
+    JobLister(client)._active(NOW - timedelta(days=views.RETENTION_DAYS), lambda: False)
+    return client.calls
 
 
 @pytest.mark.parametrize("total", [ACCOUNT_LIST_CAP + 300, 1_200, 400])
@@ -309,10 +333,112 @@ def test_the_walk_shows_one_list_after_each_page_but_the_last(total):
     JobLister(_Paged(total), account_wide=True).load(NOW, on_partial=partials.append)
     capped = total > ACCOUNT_LIST_CAP
     pages = -(-min(total, ACCOUNT_LIST_CAP) // ACCOUNT_PAGE_SIZE)
-    # A page that makes the list whole is the result; the newest 2,000 of more come before the active jobs.
-    assert [len(p.jobs) for p in partials] == [ACCOUNT_PAGE_SIZE * n for n in range(1, pages + capped)]
-    if capped:
-        assert partials[-1].scope == ListScope(ACCOUNT, stopped=CAPPED, walked=ACCOUNT_LIST_CAP, loading=ACTIVE_NEXT)
+    # A page that makes the list whole is the result; the active jobs, once read, may come between pages,
+    # and the newest 2,000 of more show while the active jobs are still being read, if they are.
+    walked = {p.scope.walked for p in partials}
+    assert sorted(walked - {ACCOUNT_LIST_CAP} if capped else walked) == [ACCOUNT_PAGE_SIZE * n for n in range(1, pages)]
+
+
+class _Held(_Paged):
+    """A ``_Paged`` whose walks each answer only while their event (``hold["newest"]``,
+    ``hold["active"]``) is set; ``entered`` counts the pages each walk asked for."""
+
+    def __init__(self, total, **kwargs):
+        super().__init__(total, **kwargs)
+        self.hold = {"newest": threading.Event(), "active": threading.Event()}
+        self.entered = {"newest": 0, "active": 0}
+
+    def list_jobs_page(self, *, status=None, **kwargs):
+        walk = "active" if status else "newest"
+        self.entered[walk] += 1
+        assert self.hold[walk].wait(10)
+        return super().list_jobs_page(status=status, **kwargs)
+
+
+def _until(predicate, seconds=5.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def _load_in_thread(lister, **kwargs) -> tuple:
+    """Run ``lister.load`` on a thread: (the thread, the dict its answer lands in under "listing" or "error")."""
+    answer = {}
+
+    def run():
+        try:
+            answer["listing"] = lister.load(NOW, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            answer["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, answer
+
+
+@pytest.mark.parametrize("fails", [False, True], ids=["read", "failed"])
+def test_the_active_jobs_read_beside_the_newest_show_before_the_newest_are_read(fails):
+    client, partials = _Held(ACCOUNT_LIST_CAP + 300, active_every=2, active_fail=fails), []
+    client.hold["newest"].set()
+    client.rows = None
+    held_page = threading.Event()
+    real = client.list_jobs_page
+
+    def newest_waits_at_page_3(**kwargs):  # the newest jobs' walk waits at its third page
+        if not kwargs.get("status") and (kwargs.get("page_token") or "").endswith(":2"):
+            held_page.wait(10)
+        return real(**kwargs)
+
+    client.list_jobs_page = newest_waits_at_page_3
+    thread, answer = _load_in_thread(JobLister(client, account_wide=True), on_partial=partials.append)
+    assert _until(lambda: len(partials) == 2)  # pages 1 and 2
+    client.hold["active"].set()  # the active jobs' walk, all of it
+    assert _until(lambda: len(partials) == 3), [p.scope for p in partials]
+    shown = partials[-1]
+    assert shown.scope == ListScope(ACCOUNT, walked=1_000, loading=OLDER, active_read=True, active_missing=fails)
+    assert shown.scope.live_whole is not fails
+    if fails:
+        assert len(shown.jobs) == 1_000
+        assert scope_text(shown.scope, location="") == "loading older jobs… 1,000 so far (older active jobs may be missing)"
+    else:  # the active jobs older than the first two pages are listed now, with them
+        assert len(shown.jobs) > 1_000
+        assert scope_text(shown.scope, location="") == "loading older jobs… 1,000 so far + every active job"
+    held_page.set()
+    thread.join(10)
+    assert answer["listing"] == _old_walk(_Paged(ACCOUNT_LIST_CAP + 300, active_every=2, active_fail=fails))
+    assert answer["listing"].scope.active_missing is fails
+    assert [p.scope.walked for p in partials[3:]] == [1_500]  # one more page, and then the result
+
+
+def test_a_walk_cancelled_while_it_waits_for_the_active_jobs_answers_at_once():
+    client, partials, cancelled = _Held(ACCOUNT_LIST_CAP + 300), [], threading.Event()
+    client.hold["newest"].set()  # the active jobs' first page takes its time
+    thread, answer = _load_in_thread(JobLister(client, account_wide=True), on_partial=partials.append,
+                                     is_cancelled=cancelled.is_set)
+    assert _until(lambda: partials and partials[-1].scope.loading == ACTIVE_NEXT)
+    cancelled.set()
+    thread.join(1.0)
+    assert not thread.is_alive() and answer == {"listing": None}
+    shown = len(partials)
+    client.hold["active"].set()  # its page answers: the walk asks for no other, and shows nothing more
+    time.sleep(0.2)
+    assert client.entered["active"] == 1 and len(partials) == shown
+
+
+def test_a_list_whole_before_the_active_jobs_are_read_answers_without_them():
+    client, partials = _Held(1_200), []
+    client.hold["newest"].set()
+    thread, answer = _load_in_thread(JobLister(client, account_wide=True), on_partial=partials.append)
+    thread.join(2.0)
+    assert not thread.is_alive() and answer["listing"] == _old_walk(_Paged(1_200))  # no wait for the active jobs
+    shown = len(partials)
+    client.hold["active"].set()
+    time.sleep(0.2)
+    assert len(partials) == shown  # nothing after the result
+    assert all(not p.scope.active_read for p in partials)
 
 
 def test_a_cancelled_load_whose_page_was_refused_leaves_the_fallback_to_the_load_after_it():
@@ -331,9 +457,11 @@ def test_a_cancelled_load_whose_page_was_refused_leaves_the_fallback_to_the_load
 
 
 def test_a_page_that_fails_after_the_first_raises_after_showing_the_pages_before_it():
-    client, partials = _Paged(ACCOUNT_LIST_CAP, fail_at=3), []
+    client, partials = _Held(ACCOUNT_LIST_CAP, fail_at=3), []
+    client.hold["newest"].set()  # the active jobs' walk is still being read when page 3 fails
     with pytest.raises(JobListError) as failed:
         JobLister(client, account_wide=True).load(NOW, on_partial=partials.append)
+    client.hold["active"].set()
     assert str(failed.value).startswith("the account-wide job list failed:")
     assert [len(p.jobs) for p in partials] == [500, 1_000]
     stopped = stopped_scope(partials[-1].scope)
@@ -347,14 +475,15 @@ def test_a_walk_read_again_from_its_start_shows_no_fewer_jobs_than_before():
     listing = JobLister(client, account_wide=True).load(NOW, on_partial=partials.append)
     assert listing == _old_walk(_Paged(1_700))
     # Pages 1 and 2, then from the first page again: 500 is not shown again, 1,000 is.
-    assert [len(p.jobs) for p in partials] == [500, 1_000, 1_000, 1_500]
+    sizes = [p.scope.walked for p in partials]
+    assert sizes == sorted(sizes) and sorted(set(sizes)) == [500, 1_000, 1_500]
 
 
 def test_a_cancelled_walk_stops_before_its_next_page():
     client, partials = _Paged(ACCOUNT_LIST_CAP), []
     listing = JobLister(client, account_wide=True).load(NOW, on_partial=partials.append,
-                                                        is_cancelled=lambda: len(partials) == 2)
-    assert listing is None and len(client.calls) == 2
+                                                        is_cancelled=lambda: len(partials) >= 2)
+    assert listing is None and len(_walk_calls(client.calls, "newest")) <= 3
 
 
 def test_asking_again_in_fallback_shows_no_pages():
