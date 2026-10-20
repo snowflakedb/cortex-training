@@ -54,13 +54,6 @@ Local or mock clients constructed with an explicit `base_url` treat
 `emit_metric` as a no-op. Set `CORTEX_TRAINING_DISABLE_TELEMETRY=1` to skip
 constructing the emitter.
 
-When `poll_request` receives a `/fwd-bwd` or `/step` result, the client also
-appends that result's row, in the stage's `training.jsonl` format
-([REST API section 12.5](rest-api.md#125-training-metrics-download)), to a
-local file under the TUI cache, so the Training metrics tab shows the step
-without waiting for the stage. It never changes the result and never fails the
-call. Set `CORTEX_TRAINING_DISABLE_LOCAL_TRAINING_METRICS=1` to turn it off.
-
 Tracked operations:
 
 - Job lifecycle: `create_job`, `wait_for_job`, `get_job`, `list_jobs`,
@@ -129,6 +122,27 @@ prompts, PATs, or stage credentials. Long-lived applications may call
 release telemetry resources. Telemetry authentication, discovery, queue, or
 export failures are ignored, so metrics never change the outcome of a client
 operation.
+
+## Local training metrics
+
+**The client writes files by default.** When `poll_request` receives a
+`/fwd-bwd` or `/step` result, it appends that result's row, in the stage's
+`training.jsonl` format
+([REST API section 12.5](rest-api.md#125-training-metrics-download)), to a
+local file, so the TUI's Training metrics tab shows the step without waiting
+for the stage's batched upload. This happens in every process that uses the
+client, including notebooks, CI and containers that never open the TUI.
+
+- **Where:** `<cache>/local-training/<job_id>/<sub_job_id>/training.jsonl`,
+  where `<cache>` is the TUI cache: `CORTEX_TRAINING_TUI_CACHE_DIR`, else
+  `$XDG_CACHE_HOME/cortex-training`, else `~/.cache/cortex-training`.
+- **How much:** a file stops growing at 64 MiB. The first write of each client
+  prunes the directory: jobs not written to for 30 days, then the least
+  recently written jobs until the rest fit in 1 GiB. The stage keeps every job
+  whole, so a capped or pruned file only loses the head start.
+- **Safety:** writes are best-effort. A read-only or full disk never fails the
+  call, and the result returned is unchanged.
+- **Turning it off:** set `CORTEX_TRAINING_DISABLE_LOCAL_TRAINING_METRICS=1`.
 
 ## Job lifecycle
 

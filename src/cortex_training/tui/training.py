@@ -223,11 +223,25 @@ class _SubJobState:
         self.call_steps: list[int | None] = []  # index call - 1
         self.untagged: list[int] = []  # calls with no step yet, for the next step row
         self.seen: set[tuple[str, int]] = set()  # (seq_epoch, seq) of rows read, so a re-sent row counts once
+        self.keys: set[tuple[str, str]] = set()  # (op, request_id) of every row read, readable or not
         self.newest: datetime | None = None
         self.last_step: int | None = None
         self.skipped = 0
         self.old_format = 0  # rows of an earlier record version, which this client doesn't read
         self.hidden_names = 0  # metric names left out because they can't be drawn as they are
+
+    def copy(self) -> _SubJobState:
+        """An independent copy, to read more rows into without changing this one."""
+        twin = _SubJobState(self.sub_job_id)
+        twin.step_values = {name: dict(by_step) for name, by_step in self.step_values.items()}
+        twin.call_values = {name: dict(by_call) for name, by_call in self.call_values.items()}
+        twin.call_steps = list(self.call_steps)
+        twin.untagged = list(self.untagged)
+        twin.seen = set(self.seen)
+        twin.keys = set(self.keys)
+        twin.newest, twin.last_step = self.newest, self.last_step
+        twin.skipped, twin.old_format, twin.hidden_names = self.skipped, self.old_format, self.hidden_names
+        return twin
 
     def has_rows(self) -> bool:
         return bool(self.step_values or self.call_steps or self.last_step is not None or self.skipped
@@ -243,6 +257,9 @@ class _SubJobState:
     def ingest(self, doc: dict) -> None:
         version = doc.get("record_version")
         op = doc.get("op")
+        key = row_key(doc)
+        if key is not None:
+            self.keys.add(key)
         if version != RECORD_VERSION:
             if _whole(version, 1) is not None and version < RECORD_VERSION:
                 self.old_format += 1
@@ -319,9 +336,16 @@ def _series(values: dict[str, dict[int, float]], leading: tuple[str, ...]) -> tu
     return tuple(out)
 
 
-def parse_lines(sub_job_id: str, lines: Iterable[bytes], state: _SubJobState | None = None) -> _SubJobState:
-    """Read the training rows among ``lines`` (bytes, one JSON row each) into ``state``."""
-    state = state or _SubJobState(sub_job_id)
+def row_key(doc: dict) -> tuple[str, str] | None:
+    """A row's ``(op, request_id)``: the call it came from, which the stage and the local log share."""
+    op, request_id = doc.get("op"), doc.get("request_id")
+    if op in (OP_FWD_BWD, OP_STEP) and isinstance(request_id, str) and request_id:
+        return op, request_id
+    return None
+
+
+def _rows(lines: Iterable[bytes]) -> Iterable[dict]:
+    """The training rows among ``lines`` (bytes, one JSON row each)."""
     for raw in lines:
         if _MARK not in raw:
             continue
@@ -330,7 +354,14 @@ def parse_lines(sub_job_id: str, lines: Iterable[bytes], state: _SubJobState | N
         except (RecursionError, UnicodeDecodeError, ValueError):
             continue  # not a row (the Resources tab counts those)
         if type(doc) is dict and doc.get("kind") == KIND:
-            state.ingest(doc)
+            yield doc
+
+
+def parse_lines(sub_job_id: str, lines: Iterable[bytes], state: _SubJobState | None = None) -> _SubJobState:
+    """Read the training rows among ``lines`` (bytes, one JSON row each) into ``state``."""
+    state = state or _SubJobState(sub_job_id)
+    for doc in _rows(lines):
+        state.ingest(doc)
     return state
 
 
@@ -358,55 +389,70 @@ class _FileState:
     parsed: _SubJobState
 
 
+@dataclass
+class _LocalState:
+    """How far a sub-job's local log has been read, and its rows the stage doesn't have yet."""
+
+    identity: tuple[int, int]  # (st_dev, st_ino)
+    offset: int = 0
+    pending: list[dict] = field(default_factory=list)
+    keys: set[tuple[str, str]] = field(default_factory=set)  # of every local row read, to count one once
+    # The stage copy with ``pending`` read on top, and what it was built from: the stage file's
+    # read position (None without one) and how many of ``pending`` it has.
+    merged: _SubJobState | None = None
+    base: tuple | None = None
+    applied: int = 0
+
+
 class TrainingLoader:
     """Reads a job's training rows, each file from where it left off.
 
-    A sub-job's rows come from the client's local log (``local_root``, written
-    as each result arrives, so it has a step the moment it runs) when there is
-    one, and from the stage's copy (``metrics_root``, which arrives in batches)
-    otherwise: a job opened on another machine has no local log.
+    A sub-job's rows come from two copies: the stage's (``metrics_root``,
+    complete but arriving in batches) and the client's local log
+    (``local_root``, written as each result arrives on this machine, but only
+    for the calls this machine polled, and capped). The stage's always wins;
+    the local log only adds the newest rows the stage hasn't received yet.
+    Both carry each call's ``request_id``, so a local row the stage has (by
+    ``(op, request_id)``) is passed over, and so is every local row before it:
+    the stage has caught up to there. A job opened on another machine has no
+    local log, and one run from several machines has only some of its calls in
+    each local log; either way the stage's rows are shown whole.
 
     A stage file the download rebuilt (another inode, a chunk list that no
     longer extends the one read, or fewer committed bytes) is read again from
-    the start. Thread-safe: one load at a time.
+    the start, and so is a local log that was pruned or replaced. Thread-safe:
+    one load at a time.
     """
 
     def __init__(self, metrics_root: Path, local_root: Path | None = None) -> None:
         self._root = Path(metrics_root)
-        self._local = Path(local_root) if local_root is not None else None
-        self._files: dict[str, _FileState] = {}
+        self._local_root = Path(local_root) if local_root is not None else None
+        self._files: dict[str, _FileState] = {}  # the stage's, by sub-job
+        self._local: dict[str, _LocalState] = {}
         self._guard = threading.Lock()
 
     def load(self) -> TrainingData:
         with self._guard:
-            local = {path.parent.name: path for path in _training_files(self._local)} if self._local else {}
+            local = {path.parent.name: path for path in _training_files(self._local_root)}
             stage = {path.parent.name: path for path in _training_files(self._root)}
             found: dict[str, SubJobTraining] = {}
             for sub_job_id in sorted(set(local) | set(stage)):
-                path = local.get(sub_job_id)
-                state = self._read(sub_job_id, path, local=True) if path else self._read(sub_job_id, stage[sub_job_id])
+                state = self._read(sub_job_id, stage[sub_job_id]) if sub_job_id in stage else None
+                if sub_job_id in local:
+                    state = self._merge(sub_job_id, state, local[sub_job_id])
                 if state is not None and state.has_rows():
                     found[sub_job_id] = state.snapshot()
             return TrainingData(found)
 
     def local_sub_jobs(self) -> set[str]:
-        """The sub-jobs read from the local log rather than the stage."""
-        return {path.parent.name for path in _training_files(self._local)} if self._local else set()
+        """The sub-jobs with a local log on this machine."""
+        return {path.parent.name for path in _training_files(self._local_root)}
 
-    def _read(self, sub_job_id: str, path: Path, *, local: bool = False) -> _SubJobState | None:
-        if local:
-            # Appended a whole row at a time and never rebuilt: everything on disk is committed.
-            try:
-                committed = path.stat().st_size
-            except OSError:
-                return None
-            names = [str(path)]
-            sub_job_id = f"local:{sub_job_id}"  # its own read position, apart from the stage file's
-        else:
-            manifest = _read_manifest(path)
-            if manifest is None:
-                return None  # not committed yet
-            names, committed = manifest
+    def _read(self, sub_job_id: str, path: Path) -> _SubJobState | None:
+        manifest = _read_manifest(path)
+        if manifest is None:
+            return None  # not committed yet
+        names, committed = manifest
         try:
             stat = path.stat()
         except OSError:
@@ -419,7 +465,7 @@ class TrainingLoader:
             or names[: len(known.names)] != known.names
             or committed < known.offset
         ):
-            known = _FileState(identity, list(names), 0, _SubJobState(sub_job_id.removeprefix("local:")))
+            known = _FileState(identity, list(names), 0, _SubJobState(sub_job_id))
             self._files[sub_job_id] = known
         if committed > known.offset:
             try:
@@ -429,10 +475,66 @@ class TrainingLoader:
             except OSError:
                 return known.parsed
             end = chunk.rfind(b"\n") + 1  # a row is read once it is whole
-            parse_lines(sub_job_id.removeprefix("local:"), chunk[:end].splitlines(), known.parsed)
+            parse_lines(sub_job_id, chunk[:end].splitlines(), known.parsed)
             known.offset += end
         known.names = list(names)
         return known.parsed
+
+    def _merge(self, sub_job_id: str, stage: _SubJobState | None, path: Path) -> _SubJobState | None:
+        """``stage`` with the local log's rows it doesn't have yet read on top (``stage`` itself
+        when it has them all)."""
+        local = self._read_local(sub_job_id, path)
+        if local is None:
+            return stage
+        known = self._files.get(sub_job_id)
+        base = (known.identity, known.offset) if stage is not None and known is not None else None
+        if base != local.base or local.applied < len(local.pending):
+            # The stage or the local log gained rows: drop the local ones the stage has, and every
+            # one before them, since the stage has caught up to there.
+            covered = stage.keys if stage is not None else ()
+            last = max((i for i, doc in enumerate(local.pending) if row_key(doc) in covered), default=-1)
+            if last >= 0:
+                del local.pending[: last + 1]
+                local.merged, local.applied = None, 0
+            if base != local.base:
+                local.merged, local.base, local.applied = None, base, 0
+        if not local.pending:
+            return stage
+        if local.merged is None:
+            local.merged = stage.copy() if stage is not None else _SubJobState(sub_job_id)
+        for doc in local.pending[local.applied:]:
+            local.merged.ingest(doc)
+        local.applied = len(local.pending)
+        return local.merged
+
+    def _read_local(self, sub_job_id: str, path: Path) -> _LocalState | None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return self._local.get(sub_job_id)
+        identity = (stat.st_dev, stat.st_ino)
+        local = self._local.get(sub_job_id)
+        if local is None or local.identity != identity or stat.st_size < local.offset:
+            local = _LocalState(identity)  # first read, or the file was pruned and written again
+            self._local[sub_job_id] = local
+        if stat.st_size > local.offset:
+            # Appended a whole row at a time and never rebuilt: everything on disk is committed.
+            try:
+                with open(path, "rb") as handle:
+                    handle.seek(local.offset)
+                    chunk = handle.read(stat.st_size - local.offset)
+            except OSError:
+                return local
+            end = chunk.rfind(b"\n") + 1
+            for doc in _rows(chunk[:end].splitlines()):
+                key = row_key(doc)
+                if key is not None:
+                    if key in local.keys:
+                        continue  # one result written twice: it is one call
+                    local.keys.add(key)
+                local.pending.append(doc)
+            local.offset += end
+        return local
 
 
 def load_training_data(metrics_root: Path) -> TrainingData:

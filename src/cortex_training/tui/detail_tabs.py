@@ -182,7 +182,9 @@ class TrainingPane(_Pane):
         self.set_interval(self._LOCAL_REFRESH_SECONDS, self._refresh_local)
 
     def _refresh_local(self) -> None:
-        if self._shown and self.is_active_tab() and not self._loading:
+        # One stat when this machine has no local log for the job (another machine's job), so the
+        # poll costs nothing there; a log written later, once calls run here, is still picked up.
+        if self._shown and self.is_active_tab() and not self._loading and self._local_root.is_dir():
             self._read_local()
 
     @work(thread=True, exclusive=True, group="training-local")

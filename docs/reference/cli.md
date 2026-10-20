@@ -1166,17 +1166,18 @@ next tab, round to Logs after the last.
   - `w` cycles all steps (the default), the last 100 and the last 1,000,
     counted back from the newest step. Per call, the window holds those steps'
     calls, and the calls of a step still running.
-  - **The client's own copy first.** The client that makes a job's
-    `/fwd-bwd` and `/step` calls appends each result's row to a local file
-    the moment the result arrives, under the TUI cache
+  - **The newest steps from the client's own copy.** The client that makes a
+    job's `/fwd-bwd` and `/step` calls appends each result's row to a local
+    file the moment the result arrives, under the TUI cache
     (`local-training/<job>/<sub_job_id>/training.jsonl`), in the same format
-    as the stage's. The tab reads that file when there is one and re-reads it
-    every 2 seconds while the tab is showing, so on the machine running the
-    job a step appears within seconds, rather than after the stage's batched
-    upload (30–40 seconds). A job opened anywhere else has no local copy, and
-    the tab reads the stage's. `CORTEX_TRAINING_DISABLE_LOCAL_TRAINING_METRICS`
-    set truthy turns the local copy off; a file stops growing at 64 MiB, and
-    the stage keeps the whole job.
+    as the stage's (see [Local training metrics](python-sdk.md#local-training-metrics)).
+    The tab shows the stage's rows and adds the local rows the stage hasn't
+    received yet, matched by each call's `request_id`; once the stage has a
+    row, its copy replaces the local one. It re-reads the local file every 2
+    seconds while the tab is showing, so on the machine running the job a step
+    appears within seconds, rather than after the stage's batched upload
+    (30–40 seconds). A job opened anywhere else, or run partly from another
+    machine, still shows every step the stage has.
   - It downloads when shown, refreshes on `r`, and re-reads every 30 seconds
     while a live job's tab is showing, reading only the rows added since. The
     file sits in the same per-location cache as the Resources tab's and is
@@ -1442,7 +1443,8 @@ CORTEX_TRAINING_ENDPOINT
 
 `CORTEX_TRAINING_DISABLE_LOCAL_TRAINING_METRICS` (truthy) stops the client
 copying each `/fwd-bwd` and `/step` result to the local training-metrics file
-the TUI's Training metrics tab reads first (see [Job TUI](#job-tui)).
+the TUI's Training metrics tab reads the newest steps from (see
+[Local training metrics](python-sdk.md#local-training-metrics)).
 
 `CORTEX_TRAINING_DISABLE_TELEMETRY` (truthy) skips OTLP client metrics on
 Snowflake profile and PAT clients. Failures are emitted by default, and so are

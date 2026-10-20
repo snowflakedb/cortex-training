@@ -1852,8 +1852,10 @@ class CortexTrainingClient:
         # Forward request ids awaiting poll, so a result that is only
         # ``{"job_id", "payload_b64"}`` (no ``wire_format``) can still be decoded.
         self._forward_request_ids: set[str] = set()
-        # Requests whose results are copied to the local training-metrics log (see _training_log).
-        self._training_log_ops: dict[str, tuple[str, str]] = {}
+        # Requests whose results are copied to the local training-metrics log (see _training_log):
+        # request id -> (job id, op, the sub-job a load targets). Shared by threads polling one client.
+        self._training_log_ops: dict[str, tuple[str, str, str | None]] = {}
+        self._training_log_ops_lock = threading.Lock()
         self._training_log = None if _training_log.disabled() else _training_log.TrainingLog()
         # Per-job cache of the sampling sub-job's ``inference_config.max_seq_len``
         # (the value the backend launches vLLM with as ``max_model_len``). Used
@@ -5069,7 +5071,7 @@ class CortexTrainingClient:
         resp = self._send("POST", f"{self._prefix}/{job_id}/load", json=body)
         request_id = resp.json()["request_id"]
         # A load moves the job to another step: the local log learns its step again at the next /step.
-        self._remember_training_log_op(request_id, job_id, _training_log.OP_LOAD)
+        self._remember_training_log_op(request_id, job_id, _training_log.OP_LOAD, target_sub_job_id)
         return request_id
 
     def _operation(
@@ -5395,6 +5397,12 @@ class CortexTrainingClient:
 
     @staticmethod
     def _decode_result_payload(result: dict) -> dict | None:
+        decoded = CortexTrainingClient._decode_result_body(result)
+        return None if decoded is None else CortexTrainingClient._merge_transport_metrics(decoded, result)
+
+    @staticmethod
+    def _decode_result_body(result: dict) -> dict | None:
+        """A DSSST1 envelope's payload, as the sub-job returned it (without the envelope's metrics)."""
         if not isinstance(result, dict):
             return None
         if result.get("wire_format") != wire.WIRE_FORMAT_VERSION:
@@ -5408,7 +5416,7 @@ class CortexTrainingClient:
         decoded = wire.loads(payload)
         if not isinstance(decoded, dict):
             raise RuntimeError("DSSST1 result payload did not decode to a dict")
-        return CortexTrainingClient._merge_transport_metrics(decoded, result)
+        return decoded
 
     @staticmethod
     def _merge_transport_metrics(decoded: dict, envelope: dict) -> dict:
@@ -5461,25 +5469,25 @@ class CortexTrainingClient:
             result["results"] = self._restore_generate_result_lists(result["results"])
         return result
 
-    def _normalize_forward_result_if_needed(self, request_id: str, result: dict) -> dict:
-        """Decode a forward result that is only a base64 DSSST1 blob.
+    def _decode_legacy_forward_result(self, request_id: str, result: dict) -> dict | None:
+        """The payload of a forward result that is only a base64 DSSST1 blob, else None.
 
         A current backend returns a self-describing envelope that
-        :meth:`_decode_result_payload` already handles. An older backend
+        :meth:`_decode_result_body` already handles. An older backend
         returns ``{"job_id", "payload_b64"}`` with no ``wire_format``.
         """
         if request_id not in self._forward_request_ids:
-            return result
+            return None
         self._forward_request_ids.discard(request_id)
         if not isinstance(result, dict) or result.get("wire_format"):
-            return result
+            return None
         raw = result.get("payload_b64")
         if not isinstance(raw, str) or not raw:
-            return result
+            return None
         decoded = wire.loads(base64.b64decode(raw))
         if not isinstance(decoded, dict):
             raise RuntimeError("legacy forward payload_b64 did not decode to a dict")
-        return self._merge_transport_metrics(decoded, result)
+        return decoded
 
     @staticmethod
     def _decode_stream_result_event(event: Any) -> Any:
@@ -5510,21 +5518,42 @@ class CortexTrainingClient:
     # Requests submitted and never polled are dropped past this, oldest first.
     _MAX_TRAINING_LOG_OPS = 4096
 
-    def _remember_training_log_op(self, request_id: str, job_id: str, op: str) -> None:
-        ops = self._training_log_ops
-        ops[request_id] = (job_id, op)
-        while len(ops) > self._MAX_TRAINING_LOG_OPS:
-            ops.pop(next(iter(ops)))
-
-    def _log_training_result(self, request_id: str, result: Any) -> None:
-        """Copy a finished /fwd-bwd's or /step's result to the local training-metrics log. Never raises."""
-        logged = self._training_log_ops.pop(request_id, None)
-        if logged is None or self._training_log is None:
+    def _remember_training_log_op(self, request_id: str, job_id: str, op: str,
+                                  target_sub_job_id: str | None = None) -> None:
+        """Note a submitted request for :meth:`_log_training_result`. Never raises: the request is
+        already accepted, and its caller must get its id back."""
+        if self._training_log is None:
             return
-        if logged[1] == _training_log.OP_LOAD:
-            self._training_log.forget_step(logged[0])
-        else:
-            self._training_log.record(logged[0], logged[1], request_id, result)
+        try:
+            with self._training_log_ops_lock:
+                ops = self._training_log_ops
+                ops[request_id] = (job_id, op, target_sub_job_id)
+                while len(ops) > self._MAX_TRAINING_LOG_OPS:
+                    ops.pop(next(iter(ops)), None)
+        except Exception:  # noqa: BLE001 - best-effort, like the log itself
+            logger.debug("local training metrics bookkeeping failed", exc_info=True)
+
+    def _log_training_result(self, request_id: str, payload: Any, envelope: Any) -> None:
+        """Copy a finished /fwd-bwd's or /step's result to the local training-metrics log. Never raises.
+
+        ``payload`` is the result as the training sub-job returned it, before the envelope's
+        transport ``metrics`` are merged in: the zone saves the former, so the local row matches
+        the stage's. A result that doesn't name its sub-job takes the envelope's.
+        """
+        try:
+            with self._training_log_ops_lock:
+                logged = self._training_log_ops.pop(request_id, None)
+            if logged is None or self._training_log is None:
+                return
+            job_id, op, target = logged
+            if op == _training_log.OP_LOAD:
+                self._training_log.forget_step(job_id, target)
+                return
+            named = envelope.get("job_id") if isinstance(envelope, dict) else None
+            self._training_log.record(job_id, op, request_id, payload,
+                                      sub_job_id=named if isinstance(named, str) else None)
+        except Exception:  # noqa: BLE001 - best-effort: never fail the call this came from
+            logger.debug("local training metrics record failed", exc_info=True)
 
     @_track_operation("poll_request")
     def poll_request(self, job_id: str, request_id: str) -> dict:
@@ -5552,22 +5581,26 @@ class CortexTrainingClient:
                 # Drain available result chunks without backing off.
                 continue
             if state in ("completed", "done", "succeeded"):
+                # ``payload`` is the result as the sub-job returned it, for the local
+                # training-metrics log; ``result`` also has the envelope's transport metrics.
+                envelope = status.get("result") or {}
                 if result_chunks:
                     with _server_payload():
-                        result = wire.decode_result_chunks(result_chunks)
-                    result = self._merge_transport_metrics(
-                        result,
-                        status.get("result") or {},
-                    )
+                        payload = wire.decode_result_chunks(result_chunks)
+                    result = self._merge_transport_metrics(payload, envelope)
                 else:
-                    result = status.get("result") or {}
+                    result = payload = envelope
                     with _server_payload():
-                        decoded = self._decode_result_payload(result)
+                        decoded = self._decode_result_body(result)
                     if decoded is not None:
-                        result = decoded
+                        payload = decoded
+                        result = self._merge_transport_metrics(decoded, envelope)
                 result = self._normalize_generate_result_if_needed(request_id, result)
-                result = self._normalize_forward_result_if_needed(request_id, result)
-                self._log_training_result(request_id, result)
+                legacy = self._decode_legacy_forward_result(request_id, result)
+                if legacy is not None:
+                    payload = legacy
+                    result = self._merge_transport_metrics(legacy, result)
+                self._log_training_result(request_id, payload, envelope)
                 if debug_label is not None:
                     logger.debug(
                         "%s completed state=%s result=%s",
