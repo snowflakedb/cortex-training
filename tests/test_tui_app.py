@@ -22,6 +22,7 @@ import inspect
 import json
 import os
 import re
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -70,6 +71,14 @@ def _isolated_cache(tmp_path, monkeypatch):
 
     # ... and out of ~/.cortex-training-errors.log: a test that reads the log finds it in tmp_path.
     monkeypatch.setattr(app_module, "_ERROR_LOG", str(tmp_path / "errors.log"))
+    # ... and out of the system's temporary directory, where the app's sweep removes the
+    # staging directories it takes for abandoned.
+    (tmp_path / "tmp").mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
+    yield
+    from cortex_training.tui.cache_cleanup import _release_pending
+
+    _release_pending()  # a closed screen's lease, still in its grace, holds a lock file open
 
 
 def _client():
@@ -92,6 +101,15 @@ def _client():
     }
     # Finite results so the tail worker doesn't loop forever.
     c.tail_logs.return_value = {"entries": [], "next_cursor": "", "eof": True}
+    return c
+
+
+def _located_client():
+    # Names its jobs' caches as a real client does (by service, endpoint, database and
+    # schema), so they are the cache's to count and remove: a bare "7" is left alone.
+    c = _client()
+    c.base_url, c.endpoint = "https://ACCOUNT.snowflakecomputing.com", "cortex-training"
+    c.database, c.schema = "CORTEX_TRAINING_DB", "PUBLIC"
     return c
 
 
@@ -5161,3 +5179,158 @@ async def _run_a_narrowing_with_no_jobs_says_so_rather_than_failing():
 
 def test_a_narrowing_with_no_jobs_says_so_rather_than_failing():
     asyncio.run(_run_a_narrowing_with_no_jobs_says_so_rather_than_failing())
+async def _run_the_open_job_survives_the_cache_limit_and_the_rest_goes(tmp_path, monkeypatch):
+    import cortex_training.tui.app as app_module
+    from cortex_training.tui.cache_cleanup import STAGE_PREFIX
+    from cortex_training.tui.cache_cleanup import _HOST
+    from cortex_training.tui.cache_cleanup import _is_job_dir
+    from cortex_training.tui.cache_cleanup import _release_pending
+    from cortex_training.tui.cache_cleanup import job_in_use
+    from cortex_training.tui.log_cache import job_cache_dir
+    from cortex_training.tui.widgets import _cache_job_id
+
+    root = tmp_path / "isolated-cache"
+    client = _located_client()
+    old = job_cache_dir("0123456789abcdef:old-job", root=root)
+    (old / "metrics").mkdir(parents=True)
+    (old / "metrics" / "gpu.jsonl").write_bytes(b"x" * (2 * 1024 * 1024))
+    open_dir = job_cache_dir(_cache_job_id(client, "7"), root=root)
+    (open_dir / "console" / "7:training:0").mkdir(parents=True)
+    (open_dir / "console" / "7:training:0" / "stdout.log").write_bytes(b"x" * 4096)
+    long_ago = time.time() - 86400
+    for path in (old, *old.rglob("*"), open_dir, *open_dir.rglob("*")):
+        os.utime(path, (long_ago, long_ago))
+    stage = Path(tempfile.gettempdir()) / f"{STAGE_PREFIX}{_HOST}+999999+gone"
+    stage.mkdir()
+    Path(f"{stage}.owner").touch()
+    monkeypatch.setattr(app_module.CortexTrainingLogTUI, "_CACHE_CLEANUP_FIRST_SECONDS", 0.2)
+    monkeypatch.setattr(app_module.CortexTrainingLogTUI, "_CACHE_LIMIT", 1024)
+    monkeypatch.setattr("cortex_training.tui.logs.LEASE_HEARTBEAT_SECONDS", 0.2)
+
+    app = CortexTrainingLogTUI(client, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        assert await _pause_until(pilot, lambda: isinstance(app.screen, LogScreen) and app.screen._current_source)
+        screen, lease = app.screen, app.screen._lease
+        assert screen._cache_limit == 1024, "a kept console would hold the cache to another limit than the app's"
+        assert lease._job_dir == open_dir and _is_job_dir(open_dir), "the open job isn't the cache's to remove"
+        assert job_in_use(open_dir), "the open job holds no lease"
+        os.utime(lease._marker, (long_ago, long_ago))
+        assert await _pause_until(pilot, lambda: time.time() - lease._marker.stat().st_mtime < 60), \
+            "the open job's lease is never refreshed: another machine would take the job for closed"
+        assert await _pause_until(pilot, lambda: not old.exists(), seconds=10.0), "the old job was kept"
+        assert open_dir.exists(), "cache cleanup removed the open job"
+        assert job_in_use(open_dir), "the open job lost its lease"
+        assert await _pause_until(pilot, lambda: any(note.startswith("Freed ") for note in _notes(app))), \
+            "removing the old job said nothing"
+        freed = next(note for note in _notes(app) if note.startswith("Freed "))
+        assert freed.startswith("Freed 2.0 MiB of cached data from 1 job ") and "under 1.0 KiB" in freed, freed
+        assert not stage.exists() and not os.path.lexists(f"{stage}.owner"), "the abandoned stage was left"
+        await _settle(app, pilot)
+    assert lease.held and job_in_use(open_dir)
+    _release_pending()
+    assert not lease.held and not job_in_use(open_dir)
+
+
+def test_the_open_job_survives_the_cache_limit_and_the_rest_goes(tmp_path, monkeypatch):
+    asyncio.run(_run_the_open_job_survives_the_cache_limit_and_the_rest_goes(tmp_path, monkeypatch))
+
+
+def test_the_cache_keeps_under_the_5_gib_the_docs_state():
+    from cortex_training.tui.cache_cleanup import DEFAULT_CACHE_LIMIT
+
+    assert CortexTrainingLogTUI._CACHE_LIMIT == DEFAULT_CACHE_LIMIT == 5 * 1024 ** 3
+
+
+def test_a_console_is_kept_only_under_the_job_s_lease_and_the_cache_then_fits_its_limit(tmp_path, monkeypatch):
+    from cortex_training._download_lock import DownloadLock
+    from cortex_training.tui.log_cache import job_cache_dir
+
+    other = job_cache_dir("0123456789abcdef:other", root=tmp_path / "isolated-cache")
+    (other / "metrics").mkdir(parents=True)
+    (other / "metrics" / "gpu.jsonl").write_bytes(b"x" * 600)  # within the limit until the console lands
+    long_ago = time.time() - 86400
+    for path in (other, *other.rglob("*")):
+        os.utime(path, (long_ago, long_ago))
+    downloaded = tmp_path / "downloaded"
+    _write_stdout(downloaded, "7:training:0", "x" * 2000 + "\n")
+    ended = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    plan = LogScreen._Download(first=None, again=False, root=str(downloaded), others=False, seen=None,
+                               ended_at=ended, created_at="created")
+    screen = LogScreen(_located_client(), "7", job={"job_id": "7", "status": "FAILED"})
+    screen._cache_limit = 1024
+    notes = []
+    screen._post = lambda fn, *args, **kwargs: notes.append(args[0]) or True
+    kept = screen._console_dir / ".complete"
+
+    screen._keep_console(plan)  # lease not held
+    assert not kept.exists() and other.exists() and not notes
+
+    real_acquire = DownloadLock.acquire
+
+    def acquire_as_the_lease_goes(self, keep_waiting, **kwargs):
+        taken = real_acquire(self, keep_waiting, **kwargs)
+        screen._lease.release()
+        return taken
+
+    screen._lease.acquire()
+    monkeypatch.setattr(DownloadLock, "acquire", acquire_as_the_lease_goes)
+    screen._keep_console(plan)
+    assert not kept.exists() and other.exists() and not notes
+    monkeypatch.setattr(DownloadLock, "acquire", real_acquire)
+
+    screen._lease.acquire()
+    try:
+        screen._keep_console(plan)
+        assert kept.read_text(encoding="utf-8") == "created"
+        assert not other.exists(), "the kept console left the cache over its limit"
+        assert len(notes) == 1 and notes[0].startswith("Freed 600 B of cached data from 1 job "), notes
+    finally:
+        screen._lease.release()
+
+
+async def _run_a_new_session_resumes_the_tail_where_the_last_one_stopped(tmp_path):
+    c = _client()
+    c.tail_logs.return_value = {"entries": [{"msg": "first session's line"}], "next_cursor": "cursor-1", "eof": True}
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        assert await _pause_until(pilot, lambda: c.tail_logs.call_count > 0 and "first session's line" in
+                                  "\n".join(getattr(app.screen, "_shown_lines", []) or []), seconds=10.0)
+        await _settle(app, pilot)
+
+    second = _client()
+    second.tail_logs.return_value = {"entries": [], "next_cursor": "cursor-1", "eof": True}
+    app = CortexTrainingLogTUI(second, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        assert await _pause_until(pilot, lambda: second.tail_logs.call_count > 0, seconds=10.0)
+        assert "first session's line" in "\n".join(app.screen._shown_lines), "the cached lines didn't survive the quit"
+        cursors = [call.kwargs.get("cursor") for call in second.tail_logs.call_args_list]
+        assert cursors[0] == "cursor-1", f"the tail started over instead of resuming: {cursors[:3]}"
+        await _settle(app, pilot)
+
+
+def test_a_new_session_resumes_the_tail_where_the_last_one_stopped(tmp_path):
+    asyncio.run(_run_a_new_session_resumes_the_tail_where_the_last_one_stopped(tmp_path))
+
+
+async def _run_a_tail_nobody_watches_stops_polling(monkeypatch):
+    monkeypatch.setattr(LogScreen, "_IDLE_PAUSE_SECONDS", 1.0)
+    monkeypatch.setattr(LogScreen, "_IDLE_CHECK_SECONDS", 0.2)
+    c = _client()
+    c.tail_logs.return_value = {"entries": [], "next_cursor": "c1", "eof": False}
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.05)
+    async with app.run_test() as pilot:
+        assert await _pause_until(pilot, lambda: isinstance(app.screen, LogScreen) and c.tail_logs.call_count > 0)
+        screen = app.screen
+        assert await _pause_until(pilot, lambda: screen._idle_paused, seconds=10.0), "the tail never paused"
+        await pilot.pause(0.5)
+        polls = c.tail_logs.call_count
+        await pilot.pause(2.0)
+        assert c.tail_logs.call_count == polls, "the paused tail kept polling"
+        await pilot.press("p")
+        assert await _pause_until(pilot, lambda: c.tail_logs.call_count > polls, seconds=10.0), "p didn't resume it"
+        assert not screen._idle_paused
+        await _settle(app, pilot)
+
+
+def test_a_tail_nobody_watches_stops_polling(monkeypatch):
+    asyncio.run(_run_a_tail_nobody_watches_stops_polling(monkeypatch))

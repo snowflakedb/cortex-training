@@ -1261,7 +1261,8 @@ runs, its status is also re-read every 60 seconds, so the view switches to the
 saved console when the job ends.
 Logs are cached locally so reopening a job replays instantly without
 re-fetching from the server — under `~/.cache/cortex-training/` (or
-`$XDG_CACHE_HOME`), overridable with `CORTEX_TRAINING_TUI_CACHE_DIR`.
+`$XDG_CACHE_HOME`), overridable with `CORTEX_TRAINING_TUI_CACHE_DIR`, within the
+cache's limit (see [Local data](#local-data)).
 
 The pane draws each line as text only: escape sequences in a line (colours,
 cursor moves, clipboard or title writes) are removed and other control
@@ -1352,9 +1353,9 @@ minutes: the sub-job on screen first shows the console's last 30 minutes, under
 `— the saved console's last 30 minutes; the older lines are still downloading —`,
 until its whole console is in. A job that ended more than 10
 minutes earlier keeps that console in its per-location job cache, so
-reopening it is instant. The
-kept consoles of all jobs take at most 1 GiB together: past that, the ones
-opened least recently are removed (and downloaded again if opened). A
+reopening it is instant. Kept consoles count toward the cache's limit (see
+[Local data](#local-data)): past it, the jobs opened least recently are removed
+(and downloaded again if opened). A
 console fetched sooner, for example right after the job ended while the view
 was open, may still lack its last lines, which are often the error: the pane
 says so under it, and `r` downloads the chunks uploaded since. Until then, the
@@ -1389,7 +1390,9 @@ exception chain keeps the record); their header stays.
 The TUI also writes two files into your home directory: saved logs from the `s`
 key (`~/cortex-training-<job8>-<source>.log`, where `<job8>` is the first eight
 characters of the job id) and its own error log
-(`~/.cortex-training-errors.log`).
+(`~/.cortex-training-errors.log`). Past 5 MiB the error log becomes
+`~/.cortex-training-errors.log.1`, replacing an older one, and a new one starts
+(`~/.cortex-training-errors.log.lock` keeps two TUIs from rotating it at once).
 `<source>` is the sub-job's type and index, such as `training-0`. `s` saves the
 sub-job's saved console, else the lines its tail cached, else the execution log
 the pane shows; with nothing to save it says so and writes no file.
@@ -1437,6 +1440,31 @@ The `--poll-interval` flag (default `1.0s`) is the minimum interval between log
 polls per source, biasing toward server reliability over freshness.
 (A tail catching up with full pages polls faster, above.) The config file's
 `poll_interval` is the CLI's result-polling interval and doesn't change it.
+
+#### Local data
+
+Each opened job is cached under `~/.cache/cortex-training/jobs/` (or
+`$XDG_CACHE_HOME/cortex-training/jobs/`, or `$CORTEX_TRAINING_TUI_CACHE_DIR/jobs/`):
+its log tail, finished console, and telemetry. To bound disk usage across long
+or repeated sessions, the cache keeps under 5 GiB. Soon after startup, every 10
+minutes while running, and after keeping a saved console, one TUI at a time
+evicts the least-recently-used jobs (whole jobs at a time) until the cache fits,
+and notifies how much space was freed; a removed job is downloaded again when
+reopened. Only TUI-named real job directories holding TUI files are counted or
+removed, and symlinks are never followed.
+
+Jobs open in a running TUI or actively downloading (`download-metrics` included)
+are never evicted. An open job screen holds a shared lock on `.lease` (kept
+across `Ctrl+Z`, released by the OS on exit) and refreshes a `.leases/` marker
+every 5 minutes (valid for 30 minutes across shared filesystems); closing a
+screen keeps the lease for a 5-minute grace period for in-flight reads, and
+quitting releases it immediately. A TUI from before leases existed holds none,
+so update every TUI sharing a cache. Nothing is wiped on quit. Eviction takes
+the lease and download locks exclusively and renames the job to
+`jobs/.removing-*` before deleting it. The startup and 10-minute passes also
+sweep abandoned console staging directories (via their `.owner` lock, or after a
+week for older TUIs), interrupted `.removing-*` dirs, `.console-*` / `.tmp-*.swp`
+partials older than an hour, and lease markers older than 30 minutes.
 
 ### JSON Output And Help
 

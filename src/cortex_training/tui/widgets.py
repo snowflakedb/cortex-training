@@ -20,6 +20,7 @@ the preview all build their tables, panes, footers and header lines from these.
 """
 
 from __future__ import annotations
+from cortex_training.tui.log_cache import append_error_log
 from cortex_training.tui.resource import ResourceData
 from pathlib import Path
 import time
@@ -861,10 +862,10 @@ _ERROR_LOG = "~/.cortex-training-errors.log"
 
 
 def log_traceback(label: str) -> None:
-    """Worker thread, inside an ``except``: append the traceback to the error log."""
+    """Worker thread, inside an ``except``: append the traceback to the error log (rotated
+    past a few megabytes, see :func:`~cortex_training.tui.log_cache.append_error_log`)."""
     try:
-        with open(os.path.expanduser(_ERROR_LOG), "a", encoding="utf-8") as handle:
-            handle.write(f"{label}:\n{traceback.format_exc()}\n")
+        append_error_log(f"{label}:\n{traceback.format_exc()}\n", path=os.path.expanduser(_ERROR_LOG))
     except Exception:  # noqa: BLE001 - reporting an error must not raise one
         pass
 

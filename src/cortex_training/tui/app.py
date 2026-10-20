@@ -53,7 +53,12 @@ from textual.widgets._toast import Toast
 from textual.widgets._toast import ToastRack
 
 from cortex_training.tui import theme
+from cortex_training.tui.cache_cleanup import DEFAULT_CACHE_LIMIT
+from cortex_training.tui.cache_cleanup import enforce_cache_limit
+from cortex_training.tui.cache_cleanup import freed_text
+from cortex_training.tui.cache_cleanup import sweep_stale
 from cortex_training.tui.account import JobClients
+from cortex_training.tui.widgets import log_traceback
 from cortex_training.tui.job_list import JobListScreen
 from cortex_training.tui.logs import LogScreen
 from cortex_training.tui.account import JobLister
@@ -471,6 +476,11 @@ class CortexTrainingLogTUI(App):
             # frozen before any screen exists, so the collections while the first
             # list is read and drawn don't visit it.
             _freeze_heap()
+        # The local cache: swept soon after start and kept within its limit while the TUI
+        # runs, for a TUI left open for days fills it as surely as one opened on many jobs.
+        # Not at once: a job opened by id takes its lease when its screen mounts, just after.
+        self.set_timer(self._CACHE_CLEANUP_FIRST_SECONDS, self._clean_cache)
+        self.set_interval(self._CACHE_CLEANUP_SECONDS, self._clean_cache)
         if self._job_id:
             # A job opened by id is in the configured database and schema.
             self.push_screen(
@@ -483,6 +493,27 @@ class CortexTrainingLogTUI(App):
             )
         else:
             self.push_screen(self.job_list_screen())
+
+    _CACHE_CLEANUP_FIRST_SECONDS = 5
+    _CACHE_CLEANUP_SECONDS = 10 * 60
+    _CACHE_LIMIT = DEFAULT_CACHE_LIMIT  # also what a job screen holds the cache to after keeping a console
+
+    @work(thread=True, group="cache-cleanup", exclusive=True)
+    def _clean_cache(self) -> None:
+        """Remove what no running TUI owns, then the jobs used least recently while the
+        cache is over its limit; say so when that freed anything. Each runs whatever the
+        other met: a sweep that fails must not keep the cache over its limit."""
+        try:
+            sweep_stale()
+        except Exception:  # noqa: BLE001 - cache cleanup must never stop the TUI
+            log_traceback("cache sweep failed")
+        try:
+            removed = enforce_cache_limit(limit=self._CACHE_LIMIT)
+        except Exception:  # noqa: BLE001
+            log_traceback("cache limit failed")
+            return
+        if removed:
+            self.call_from_thread(self.notify, freed_text(removed, self._CACHE_LIMIT), timeout=8, markup=False)
 
     async def on_event(self, event: events.Event) -> None:
         # A key, click, scroll or paste means someone is at the screen (a mouse

@@ -58,6 +58,7 @@ from textual.widgets import Static
 from textual.widgets import TabbedContent
 from textual.widgets import TabPane
 from textual.worker import get_current_worker
+from cortex_training._download_lock import DownloadLock
 from cortex_training.client import DownloadCancelled
 from cortex_training.client import NoChunksError
 from cortex_training.tui import theme
@@ -82,12 +83,17 @@ from cortex_training.tui.format import format_log_entry
 from cortex_training.tui.format import one_line
 from cortex_training.tui.format import safe_text
 from cortex_training.tui.format import wrap_log_line
+from cortex_training.tui.cache_cleanup import DEFAULT_CACHE_LIMIT
+from cortex_training.tui.cache_cleanup import LEASE_HEARTBEAT_SECONDS
+from cortex_training.tui.cache_cleanup import enforce_cache_limit
+from cortex_training.tui.cache_cleanup import freed_text
+from cortex_training.tui.cache_cleanup import make_stage
+from cortex_training.tui.cache_cleanup import release_stage
+from cortex_training.tui.cache_cleanup import JobLease
 from cortex_training.tui.log_cache import LogCache
 from cortex_training.tui.log_cache import cached_log_pages
 from cortex_training.tui.log_cache import catching_up
 from cortex_training.tui.log_cache import job_cache_dir
-from cortex_training.tui.log_cache import prune_consoles
-from cortex_training.tui.log_cache import touch_console
 from cortex_training.tui.log_style import DAY_KIND
 from cortex_training.tui.log_style import ERROR_KINDS
 from cortex_training.tui.log_style import ISSUE_KINDS
@@ -203,7 +209,10 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         self._sources_width = self._SOURCES_AUTO_MIN
         self._sources_auto = True  # sized to its labels until [ or ]
         cache_job_id = _cache_job_id(client, job_id)
+        job_dir = job_cache_dir(cache_job_id)
         self._cache = LogCache(cache_job_id)
+        self._lease = JobLease(job_dir)
+        self._cache_limit = DEFAULT_CACHE_LIMIT
         self._source_by_item: dict[str, str] = {}
         self._source_items: dict[str, tuple[ListItem, Label]] = {}  # each sub-job's row (see _paint_sources)
         self._source_labels: dict[str, str] = {}  # each sub-job's name in the list, from its record (job_type)
@@ -219,7 +228,8 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         self._last_line_at: str | None = None  # "last line HH:MM:SS": the newest live line's own time
         self._unmounted = False
         self._stage: tempfile.TemporaryDirectory[str] | None = None
-        self._console_dir = job_cache_dir(cache_job_id) / "console"
+        self._stage_owner: int | None = None  # the lock that says this stage is in use (cache cleanup)
+        self._console_dir = job_dir / "console"
         self._state_changed_at = None  # when the job entered its current (terminal) state
         self._job_created_at = None  # ties a kept console to this job, not a reused id
         self._job_reads = 0
@@ -237,7 +247,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         self._active_tab = initial_tab if initial_tab in self._TABS else "logs"
         self._init_checkpoint_state()
         self._log_focus_id = "sources"
-        self._metrics_root = job_cache_dir(cache_job_id) / "metrics"
+        self._metrics_root = job_dir / "metrics"
         # Per sub-job, what a download warned about (chunks it gave up on). The Logs
         # status line and the Resources header show the selected sub-job's.
         self._stdout_warnings: dict = {}
@@ -306,6 +316,11 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         yield FittedFooter(id="footer")
 
     def on_mount(self) -> None:
+        # First: no tail or download may write into the job's cache before it is leased,
+        # or another TUI's cache limit could remove it under them.
+        self._lease.acquire()
+        self.set_interval(LEASE_HEARTBEAT_SECONDS, self._lease.heartbeat)
+        self._cache_limit = getattr(self.app, "_CACHE_LIMIT", DEFAULT_CACHE_LIMIT)
         self._render_summary_line()
         self.set_interval(self._DATA_REFRESH_SECONDS, self._auto_refresh_data)
         self.set_interval(self._STATUS_REFRESH_SECONDS, self._refresh_status)
@@ -351,6 +366,9 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
             self.workers.cancel_node(self._logview)
         if not self._stdout_inflight:
             self._cleanup_stage()
+        # Not at once: this screen's threads can't be stopped mid-request, and a late answer
+        # still writes into the job's cache, which must not be removed under it.
+        self._lease.release_later()
 
     @property
     def _screen_open(self) -> bool:
@@ -1310,6 +1328,22 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
             return
         if self._console_may_be_incomplete(plan.seen, plan.ended_at):
             return  # it may still be missing its last chunks: download it again next time
+        lock = DownloadLock(self._console_dir)
+        # Hold the console lock so a removal cannot move the job aside mid-copy, and skip
+        # keeping it if the screen's lease expired meanwhile.
+        if not lock.acquire(lambda: self._lease.held):
+            return
+        try:
+            if not self._lease.held:
+                return
+            self._copy_console(plan)
+        finally:
+            lock.release()
+        removed = enforce_cache_limit(self._console_dir.parent.parent.parent, limit=self._cache_limit)
+        if removed:
+            self._post(self.notify, freed_text(removed, self._cache_limit), timeout=8, markup=False)
+
+    def _copy_console(self, plan: LogScreen._Download) -> None:
         tmp = None
         try:
             self._console_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -1325,22 +1359,20 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         finally:
             if tmp is not None:
                 shutil.rmtree(tmp, ignore_errors=True)
-        # The kept consoles of every job stay within their bound, least recently used out first.
-        prune_consoles(root=self._console_dir.parent.parent.parent, keep=self._console_dir)
 
     def _cleanup_stage(self) -> None:
-        stage = self._stage
-        self._stage = None
+        stage, owner = self._stage, self._stage_owner
+        self._stage, self._stage_owner = None, None
         self._stdout_preview.clear()  # its files go with the stage
         if stage is not None:
-            stage.cleanup()
+            release_stage(stage, owner)
 
     def _claim_stdout(self) -> bool:
         """UI thread. One whole-job download for this view; a failure retries on the next open."""
         if not self._screen_open or self._stdout_ready or self._stdout_inflight or self._stdout_failed:
             return False
         if self._stage is None:
-            self._stage = tempfile.TemporaryDirectory(prefix="cortex-training-stage-")
+            self._stage, self._stage_owner = make_stage()
         self._stdout_inflight = True
         return True
 
@@ -2001,7 +2033,6 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         self._clear_pane()
         if not self._stdout_ready and self._kept_console():
             self._stdout_ready = True  # finished long ago and downloaded before: replay it
-            touch_console(self._console_dir)  # just used: the last kept console to be removed
         live = self._live()
         if self._stdout_ready or not live:
             self._idle_paused = False  # nothing polls now, so nothing is paused
