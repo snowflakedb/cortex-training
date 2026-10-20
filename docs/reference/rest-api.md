@@ -2963,8 +2963,7 @@ whatever names a row has.
 
 In the GPU file, a row without `kind` is a GPU row; a later GPU row may carry
 `kind: "gpu"`. Consumers should select rows by `kind` and ignore kinds they do
-not support. The TUI's Resources tab uses GPU and system rows; its Training
-metrics tab reads `training.jsonl` and shows it per step and per call.
+not support. The TUI's Resources tab uses GPU and system rows.
 
 ### 12.6 Zone scheduling events
 

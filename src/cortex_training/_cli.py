@@ -1531,7 +1531,15 @@ def _cmd_download_metrics(
         metrics = client.download_metrics(args.job_id, out_dir, **options)
         # The zone's own training-metric file: its own stream, under the same
         # stage root, written beside the GPU file (see download_training_metrics).
-        training = client.download_training_metrics(args.job_id, out_dir, **options)
+        from cortex_training.client import NoChunksError
+
+        try:
+            training = client.download_training_metrics(args.job_id, out_dir, **options)
+        except NoChunksError:
+            # Training metrics are optional: sampling sub-jobs, opted-out jobs and
+            # deployments that don't save them have none. Auth, network,
+            # cancellation and --strict errors still fail the command.
+            training = []
     _print_json(
         {"job_id": args.job_id, "metrics": metrics, "training_metrics": training},
         stdout,

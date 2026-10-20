@@ -2368,6 +2368,53 @@ def test_download_metrics_passes_parallel_and_sub_jobs_and_reports_progress(tmp_
     assert json.loads(stdout.getvalue())["metrics"][0]["filename"] == "gpu.jsonl"
 
 
+def test_download_metrics_of_a_sub_job_without_training_rows_succeeds(tmp_path):
+    """A named sub-job with GPU chunks but no training chunks (a sampling sub-job, an
+    opted-out job, a deployment that doesn't save them) is not a failure: the command
+    keeps its GPU file and reports the training stream as empty."""
+    from cortex_training.client import NoChunksError
+
+    client = FakeClient()
+    client.training_download_interrupt = NoChunksError(
+        "no training metrics chunks for sub-job(s) job-1:sampling:0; "
+        "sub-jobs with training metrics: none",
+        sub_job_ids=["job-1:sampling:0"],
+        available=[],
+    )
+    stdout = io.StringIO()
+
+    rc = cli.main(
+        _base_args()
+        + ["download-metrics", "job-1", "--sub-job", "job-1:sampling:0", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: client,
+        stdout=stdout,
+        stderr=io.StringIO(),
+    )
+
+    assert rc == 0
+    body = json.loads(stdout.getvalue())
+    assert body["training_metrics"] == []
+    assert body["metrics"][0]["filename"] == "gpu.jsonl"
+
+
+def test_download_metrics_still_fails_on_other_training_download_errors(tmp_path):
+    """Only a missing training stream is forgiven: any other error from the training
+    download still fails the command and prints no result."""
+    client = FakeClient()
+    client.training_download_interrupt = ValueError("chunk will not decompress")
+    stdout = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["download-metrics", "job-1", "--strict", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: client,
+        stdout=stdout,
+        stderr=io.StringIO(),
+    )
+
+    assert rc != 0
+    assert stdout.getvalue() == ""
+
+
 def test_download_log_stdout_defaults_leave_parallel_to_client(tmp_path):
     client = FakeClient()
     stderr = io.StringIO()

@@ -5966,6 +5966,29 @@ class TestExecutionLogDownload:
         assert calls == [c._artifact_progress_status("stdout", 0, 1, sub), "\n"]
         assert not list((tmp_path / sub).glob(".*.tmp"))
 
+    def test_an_empty_training_stream_is_named_as_training_metrics(self, tmp_path, monkeypatch):
+        """The training stream shares ``_metrics/`` with the GPU one, so its empty line
+        and a missing sub-job's error must not read as if the GPU download failed."""
+        sub = "job-1:training:0"
+        chunk = f"_metrics/{sub}/training.20260904-120001.a.gz"
+        c, _connection, _run_uri = self._gzip_download(monkeypatch, tmp_path, "metrics", [], {})
+        monkeypatch.setattr(c, "_job_for_upload_warnings", lambda _: ({"status": "SUCCEEDED"}, None))
+        calls = []
+        assert c.download_training_metrics("job-1", tmp_path, progress=calls.append) == []
+        assert calls == ["training metrics: found 0 chunks\n"]
+
+        c, _connection, _run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "metrics", [chunk], {chunk: b'{"kind": "training"}\n'}
+        )
+        monkeypatch.setattr(c, "_job_for_upload_warnings", lambda _: ({"status": "SUCCEEDED"}, None))
+        with pytest.raises(nc.NoChunksError) as excinfo:
+            c.download_training_metrics("job-1", tmp_path / "named", sub_job_ids=["job-1:sampling:0"])
+        assert str(excinfo.value) == (
+            "no training metrics chunks for sub-job(s) job-1:sampling:0; "
+            "sub-jobs with training metrics: job-1:training:0"
+        )
+        assert excinfo.value.sub_job_ids == ["job-1:sampling:0"]
+
     def test_download_progress_empty_and_directory_destination(self, tmp_path, monkeypatch):
         c, _connection, _run_uri = self._gzip_download(monkeypatch, tmp_path, "stdout", [], {})
         calls = []
@@ -6081,10 +6104,10 @@ class TestChunkedArtifactDownload:
     RUN_URI = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
     SUB = "job-1:training:0"
 
-    def _setup(self, monkeypatch, *, subs=None, count=6, artifact_name="stdout"):
+    def _setup(self, monkeypatch, *, subs=None, count=6, artifact_name="stdout", chunk_name=None):
         subs = subs or [self.SUB]
         root = f"_{artifact_name}"
-        chunk_name = "console" if artifact_name == "stdout" else "gpu"
+        chunk_name = chunk_name or ("console" if artifact_name == "stdout" else "gpu")
         paths = {
             sub: [
                 f"{root}/{sub}/{chunk_name}.20260904-"
@@ -7061,6 +7084,29 @@ class TestChunkedArtifactDownload:
         assert warning in caplog.text
         assert status_calls == ["job-1"]
         assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(self.SUB, range(3))
+
+    def test_old_training_metrics_of_a_running_job_are_not_called_stalled(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Training rows are written only on /fwd-bwd and /step, so a running job whose
+        newest training chunk is old is idle, not stalled: no warning, unlike GPU metrics."""
+        c, _connection, _paths, _status_calls = self._stale_setup(
+            monkeypatch, count=3, artifact_name="metrics", chunk_name="training"
+        )
+        with caplog.at_level(logging.WARNING):
+            result = c.download_training_metrics("job-1", tmp_path)
+        assert [entry["sub_job_id"] for entry in result] == [self.SUB]
+        assert not result[0].get("warnings")
+        assert "stalled" not in caplog.text
+        assert (tmp_path / self.SUB / "training.jsonl").read_bytes() == self._expected(self.SUB, range(3))
+
+    def test_old_gpu_metrics_of_a_running_job_are_still_called_stalled(self, tmp_path, monkeypatch):
+        c, _connection, _paths, _status_calls = self._stale_setup(
+            monkeypatch, count=3, artifact_name="metrics"
+        )
+        result = c.download_metrics("job-1", tmp_path)
+        [warning] = result[0]["warnings"]
+        assert "uploads may be stalled" in warning
 
     @pytest.mark.parametrize(
         ("status", "age_minutes", "stale_after"),
