@@ -2575,7 +2575,7 @@ def _highlighted_columns(app, y, table) -> list:
 
 
 def _first_job_line(lines) -> int:
-    return next(y for y, line in enumerate(lines) if line[4:6] in ("▸ ", "▾ "))
+    return next(y for y, line in enumerate(lines) if line[1:3] in ("▸ ", "▾ "))  # after the cell padding
 
 
 async def _copied(app, pilot, copied):
@@ -2740,10 +2740,10 @@ async def _run_job_list_clicks_still_click_with_text_selection():
         await pilot.pause()
         # A click on a job's ▾ folds it.
         rows = table.row_count
-        assert lines[y][4] == "▾"
-        await _click(mouse, 4, y)
+        assert lines[y][1] == "▾"
+        await _click(mouse, 1, y)
         assert await _wait(pilot, app, lambda: table.row_count < rows)
-        assert _screen_lines(app)[y][4] == "▸"
+        assert _screen_lines(app)[y][1] == "▸"
         # A click on the cursor's row opens the job's preview.
         await _click(mouse, 60, y)
         await _click(mouse, 60, y)
@@ -2791,7 +2791,11 @@ async def _run_a_job_list_row_s_text_is_its_cells_as_drawn():
             read = 0
             for row in table.ordered_rows:
                 plain = table._plain_parts(row.key)
-                if plain is not None:
+                if str(row.key.value).startswith("hdr-"):
+                    # A LIVE/HISTORY heading's rule is drawn, but not in a copy of its text.
+                    assert plain is not None and "─" not in "".join(plain)
+                    assert "─" in "".join(table._drawn_parts(row.key, 0))
+                elif plain is not None:
                     read += 1
                     assert plain == table._drawn_parts(row.key, 0)
             assert read and (width < 130 or read > table.row_count // 2)
@@ -3771,27 +3775,144 @@ async def _run_the_group_rows_count_the_jobs_under_them():
     async with app.run_test(size=(140, 44)) as pilot:
         screen, table = await _demo_list(app, pilot)
         await pilot.pause(0.3)
-        labels = [str(column.label).strip() for column in table.ordered_columns]
-        marker, at = labels.index(""), labels.index("Job ID")
-        rows = [(table.get_row_at(i)[marker].plain, table.get_row_at(i)[at].plain)
-                for i in range(table.row_count)]
-        # Each group row says how many jobs follow it. A job's row carries a status dot;
-        # its sub-job rows do not, so they must not be counted.
+        at = [str(column.label).strip() for column in table.ordered_columns].index("Job ID")
+        rows = [(row.key.value, table.get_row_at(i)[at].plain) for i, row in enumerate(table.ordered_rows)]
+        # Each group row says how many jobs follow it; their sub-job rows must not be counted.
         counts, group, seen = {}, None, 0
-        for dot, text in rows:
-            if text.startswith(("LIVE (", "HISTORY (")):
+        for key, text in rows:
+            if text.startswith(("LIVE  ", "HISTORY  ")):
                 if group:
                     counts[group] = seen
                 group, seen = text, 0
-            elif dot.strip():
+            elif key in screen._job_by_item:
                 seen += 1
         counts[group] = seen
         assert len(counts) == 2, counts
         for header, under in counts.items():
-            said = int(header.split("(")[1].rstrip(")"))
+            said = int(header.split()[1].replace(",", ""))
             assert said == under, f"{header} has {under} job rows under it"
         await _settle(app, pilot)
 
 
 def test_the_group_rows_count_the_jobs_under_them():
     asyncio.run(_run_the_group_rows_count_the_jobs_under_them())
+
+
+def test_list_times_read_at_a_glance_and_say_how_long_they_last():
+    assert views.list_age(None)[0] == "—"
+    assert views.list_age(-30) == ("just now", 90)  # clock skew: until a minute after it
+    assert views.list_age(-7300)[0] == "in 2h"
+    assert views.list_age(20) == ("just now", 40)
+    assert views.list_age(125) == ("2m ago", 55)
+    assert views.list_age(3 * 3600 + 10) == ("3h ago", 3590)
+    assert views.list_age(45 * 86400) == ("45d ago", 86400)
+    assert all(len(views.list_age(days * 86400)[0]) <= 8 for days in (0, 9, 99, 183))  # the column is 8 cells
+    assert views.list_span(None)[0] == views.list_span(-1)[0] == "—"
+    assert views.list_span(40.25) == ("40s", 0.75)
+    assert views.list_span(12 * 60 + 5) == ("12m", 55)
+    assert views.list_span(3 * 3600 + 5 * 60) == ("3h 05m", 60)
+    assert views.list_span(2 * 86400 + 4 * 3600 + 30) == ("2d 4h", 3570)
+
+
+def test_job_list_rows_say_what_their_columns_don_t():
+    from cortex_training.tui.job_list import _ListLayout
+    from cortex_training.tui.job_list import _status_chips
+
+    jid = "a" * 36
+    assert str(JobListScreen._name_cell({"job_id": jid})) == jid  # whole: a copy of the list has it so
+    assert str(JobListScreen._name_cell({"job_id": jid}, False)) == f"▸ {jid}"
+    # Drawn (.plain) with the theme's glyph; copied (str) as the word alone.
+    cancelled = JobListScreen._status_cell("JOB_STATE_CANCELLED")
+    running = JobListScreen._status_cell("RUNNING", glyph_only=True)
+    assert (cancelled.plain, str(cancelled)) == ("⊘ CANCELLED", "CANCELLED")
+    assert (running.plain, str(running)) == ("●", "RUNNING")
+
+    job = {"job_id": "j", "status": "RUNNING", "sub_jobs": [
+        {"sub_job_id": "j:training:0", "job_type": "training", "status": "RUNNING", "model_name": "Qwen/Qwen3-8B"},
+        {"sub_job_id": "j:sampling:0", "job_type": "sampling", "status": "PLACING", "model_name": "Qwen/Qwen3-0.6B"}]}
+    same = JobListScreen._sub_cells(job, job["sub_jobs"][0], False)
+    other = JobListScreen._sub_cells(job, job["sub_jobs"][1], True)
+    assert str(same["Job ID"]) == "  ├ training #0" and same["Status"].plain == "●"
+    assert "Type" not in same  # its label has it
+    assert str(other["Job ID"]) == "  └ sampling #0" and other["Status"].plain == "◔ PLACING"
+    # The job's row says "Qwen3-8B +1": each sub-job row says which; of a one-model job, none does.
+    assert str(same["Model"]) == "Qwen3-8B" and str(other["Model"]) == "Qwen3-0.6B"
+    one_model = {**job, "sub_jobs": [{**sj, "model_name": "Qwen/Qwen3-8B"} for sj in job["sub_jobs"]]}
+    assert str(JobListScreen._sub_cells(one_model, one_model["sub_jobs"][1], True)["Model"]) == ""
+    untold = {"sub_job_id": "j:training:1", "job_type": "training"}  # no status of its own
+    assert str(JobListScreen._sub_cells(job, untold, True)["Status"]) == ""
+    assert JobListScreen._sub_cells({**job, "status": "UNKNOWN"}, untold, True)["Status"].plain == "?"
+
+    # A live job starts unfolded only where its sub-job rows say more than its own row.
+    assert JobListScreen._starts_unfolded(job)
+    assert not JobListScreen._starts_unfolded({**job, "sub_jobs": job["sub_jobs"][:1]})
+    assert JobListScreen._starts_unfolded({"job_id": "u", "status": "UNKNOWN"})
+    assert not JobListScreen._starts_unfolded({**job, "status": "FAILED"})
+
+    layout = _ListLayout((("Job ID", 38), ("Status", 14)))
+    name, rule = JobListScreen._header_cells("HISTORY", 1234, layout)
+    assert str(name) == "HISTORY  1,234"
+    assert str(rule) == "" and rule.text().plain == "─" * 14  # drawn, but not in a copy of the list
+
+    live = [{"status": s} for s in ("RUNNING", "queued", "PENDING", "creating", "UNKNOWN", "RUNNING")]
+    assert _status_chips(live, 21).plain == "● 2 running   ◔ 1 placing   ○ 2 pending   ? 1 unknown  │  21 in history"
+    assert _status_chips([], 0).plain == "no live jobs  │  0 in history"
+
+
+def test_job_list_ages_are_rebuilt_only_once_they_read_differently():
+    from cortex_training.tui.job_list import _ListLayout
+
+    now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    ended = {"job_id": "e", "status": "FAILED", "created_at": "2025-12-01T12:00:00Z",
+             "updated_at": "2025-12-01T13:00:00Z"}
+    live = {"job_id": "l", "status": "RUNNING", "created_at": "2026-01-01T11:57:30Z",
+            "updated_at": "2026-01-01T11:59:50Z"}
+    screen = JobListScreen(MagicMock(), now=now)
+    layout = _ListLayout(tuple(JobListScreen._COLUMNS))
+    # What each cell draws (str() is what a copy of the list has).
+    texts = lambda rows: {label: cell.plain for label, cell in zip(layout.labels, rows.row)}  # noqa: E731
+
+    first_ended, first_live = screen._job_rows(ended, layout), screen._job_rows(live, layout)
+    assert texts(first_ended)["Created"] == "31d ago" and texts(first_ended)["Duration"] == "1h 00m"
+    assert texts(first_live)["Created"] == "2m ago" and texts(first_live)["Duration"] == "2m"
+    assert texts(first_live)["Updated"] == "just now"
+    screen._now = now + timedelta(seconds=20)  # neither reads differently yet
+    assert screen._job_rows(ended, layout) is first_ended and screen._job_rows(live, layout) is first_live
+    screen._now = now + timedelta(seconds=40)  # the live job's third minute
+    again = screen._job_rows(live, layout)
+    assert again is not first_live and texts(again)["Created"] == "3m ago" and texts(again)["Duration"] == "3m"
+    assert screen._job_rows(ended, layout) is first_ended  # its duration never changes, its age by the day
+
+
+def test_a_copy_of_the_job_list_has_whole_times_and_status_words():
+    from cortex_training.tui.format import format_created_at
+
+    created = (datetime.now(timezone.utc) - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    updated = (datetime.now(timezone.utc) - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    c = _client()
+    c.list_jobs.return_value = [{"job_id": "7", "status": "RUNNING", "created_at": created, "updated_at": updated,
+                                 "sub_jobs": [{"sub_job_id": "7:training:0", "job_type": "training",
+                                               "status": "RUNNING"},
+                                              {"sub_job_id": "7:sampling:0", "job_type": "sampling",
+                                               "status": "PLACING"}]}]
+
+    async def run():
+        app = CortexTrainingLogTUI(c, poll_interval=0.01)
+        async with app.run_test(size=(160, 40)) as pilot:
+            ok = await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._job_by_item)
+            assert ok
+            table = app.screen.query_one("#jobs", DataTable)
+            drawn = [cell.plain for cell in table.get_row("job-0")]
+            assert "3h ago" in drawn and "2m ago" in drawn  # the screen reads relative times
+            # The header, the LIVE heading, the job, then its two sub-jobs (several: it starts unfolded).
+            _header, heading, job, training, sampling = table.rows_text()
+            assert heading.startswith("LIVE")
+            # A paste stays true: the times themselves, and each status as its word, no glyph.
+            assert format_created_at(created) in job and format_created_at(updated) in job and "ago" not in job
+            copied = "".join((heading, job, training, sampling))
+            assert "RUNNING" in job and "●" not in copied and "◔" not in copied
+            assert "RUNNING" in training and "PLACING" in sampling  # drawn as the glyph alone, and glyph and word
+            assert "─" not in heading  # the LIVE heading's rule is drawn only
+            await _settle(app, pilot)
+
+    asyncio.run(run())

@@ -228,6 +228,9 @@ class CortexTrainingLogTUI(App):
     #nomatch-box { height: 1fr; scrollbar-gutter: stable; }
     #nomatch { padding: 1 2; color: $warning; height: auto; }
     #jobs > .datatable--fixed { background: $surface; }
+    /* The fixed Job ID column matches the row: no focus tint (the cursor's color says it has focus). */
+    #jobs:focus { background-tint: $foreground 0%; }
+    #searchhelp { padding: 0 1 0 2; height: auto; background: $panel; }
     #sources { width: 16; border-right: solid $panel; }
     #job-tabs, #job-tabs ContentSwitcher, #logs, #resource, #logs-body {
         height: 1fr;
@@ -236,7 +239,9 @@ class CortexTrainingLogTUI(App):
     #log-status { height: auto; padding: 0 1; color: $warning; }
     #summary { color: $text-muted; padding: 0 1; }
     #logfilter { border: tall $panel; }
-    #jobfilter { border: tall $panel; }
+    /* One row, a bar at its left that turns the accent while it has focus. */
+    #jobfilter { border: none; border-left: tall $panel; height: 1; padding: 0 1; background: $surface; }
+    #jobfilter:focus { border: none; border-left: tall $accent; background: $panel; }
     #resource-body { height: 1fr; }
     #resource-list { width: 16; border-right: solid $panel; scrollbar-size-vertical: 1; }
     #resource-pane { height: 1fr; padding: 0 1; scrollbar-gutter: stable; scrollbar-size-vertical: 1; }
