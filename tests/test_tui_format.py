@@ -379,3 +379,74 @@ def test_a_raw_line_keeps_its_runtime_timestamp_and_the_screen_localizes_it():
     assert format_log_entry(entry) == "2026-01-01T00:00:00Z hello"
     assert display_line(entry["_raw"]).endswith(" hello")
     assert "2026-01-01T00:00:00Z" not in display_line(entry["_raw"])
+
+
+# ─── copying to this machine's clipboard ──────────────────────────────────────
+
+
+def test_a_remote_session_never_writes_the_wrong_machine_s_clipboard(monkeypatch):
+    # Over SSH the local tools would write the clipboard of the machine the TUI runs on,
+    # not the one the user is looking at. OSC 52 is what reaches theirs.
+    from cortex_training.tui import clipboard
+
+    monkeypatch.delenv("CORTEX_TRAINING_TUI_CLIPBOARD_FILE", raising=False)
+    monkeypatch.setenv("SSH_CONNECTION", "10.0.0.1 1 10.0.0.2 22")
+    assert clipboard._commands() == []
+    monkeypatch.setattr(clipboard.shutil, "which", lambda _name: "/usr/bin/pbcopy")
+    called = []
+    monkeypatch.setattr(clipboard.subprocess, "run", lambda *a, **k: called.append(a))
+    assert clipboard.copy_local("secret") is False
+    assert called == [], "a clipboard tool ran over SSH"
+
+
+def test_the_clipboard_falls_through_the_tools_until_one_works(monkeypatch):
+    from cortex_training.tui import clipboard
+
+    monkeypatch.delenv("CORTEX_TRAINING_TUI_CLIPBOARD_FILE", raising=False)
+    for name in ("SSH_CONNECTION", "SSH_TTY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(clipboard.sys, "platform", "linux")
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setattr(clipboard.shutil, "which", lambda name: f"/usr/bin/{name}")
+    tried = []
+
+    def run(command, **kwargs):
+        tried.append(command[0])
+        if command[0] == "xclip":
+            raise OSError("no display after all")  # the first tool is there but fails
+        assert kwargs["input"] == "text".encode("utf-8")
+        assert kwargs["timeout"] == 3  # a hung tool can't hold the UI
+        assert kwargs["env"]["LC_CTYPE"] == "UTF-8"  # pbcopy would mangle UTF-8 without it
+        return None
+
+    monkeypatch.setattr(clipboard.subprocess, "run", run)
+    assert clipboard.copy_local("text") is True
+    assert tried == ["xclip", "xsel"], tried
+
+
+def test_the_clipboard_says_no_when_every_tool_fails(monkeypatch):
+    from cortex_training.tui import clipboard
+
+    monkeypatch.delenv("CORTEX_TRAINING_TUI_CLIPBOARD_FILE", raising=False)
+    for name in ("SSH_CONNECTION", "SSH_TTY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(clipboard.sys, "platform", "darwin")
+    monkeypatch.setattr(clipboard.shutil, "which", lambda _name: None)  # no tool installed
+    assert clipboard.copy_local("text") is False
+
+
+def test_the_clipboard_file_takes_precedence_so_a_test_never_touches_the_real_one(monkeypatch, tmp_path):
+    from cortex_training.tui import clipboard
+
+    target = tmp_path / "clip.txt"
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CLIPBOARD_FILE", str(target))
+    monkeypatch.setattr(clipboard.shutil, "which", lambda _name: "/usr/bin/pbcopy")
+    ran = []
+    monkeypatch.setattr(clipboard.subprocess, "run", lambda *a, **k: ran.append(a))
+    assert clipboard.copy_local("written here") is True
+    assert target.read_text(encoding="utf-8") == "written here"
+    assert ran == [], "a clipboard tool ran although the file was set"
+    # An unwritable path is a failure, not a crash.
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CLIPBOARD_FILE", str(tmp_path / "no-such-dir" / "clip.txt"))
+    assert clipboard.copy_local("x") is False

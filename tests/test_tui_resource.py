@@ -502,3 +502,31 @@ def test_sub_job_directories_with_unprintable_names_are_passed_over(tmp_path):
     data = resource_module.load_resource_data(tmp_path)
     assert list(data.kinds) == ["job:training:0"]
     assert data.ignored_rows_by_sub_job == {}
+
+
+def test_history_past_seven_hours_is_binned_and_keeps_its_span(tmp_path):
+    # A long job's samples are binned so the whole-job view stays bounded: kept one by
+    # one, twelve hours would be hundreds of thousands of points. The bins must still
+    # cover the job's real span and keep its extremes.
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    minutes, step = 12 * 60, 60.0  # twelve hours at a sample a minute, past the 7-hour mark
+    rows = [_row(start + timedelta(seconds=minute * step), 0,
+                 100.0 if minute == 300 else float(minute % 50), interval=step)
+            for minute in range(minutes)]
+    assert minutes > resource_module._MAX_BINS, "the fixture must exceed the bin cap"
+    _write_metrics(tmp_path, "job:training:0", rows)
+
+    resource = resource_module.ResourceLoader(tmp_path).load().kinds["job:training:0"]["gpu"]
+    whole = resource.view("all")
+    stats = whole.stats[BUSY]
+    # Binned, not dropped: the peak and the floor survive, and the span reaches the end.
+    assert stats.max == 100.0, "binning lost the job's peak"
+    assert stats.min == 0.0
+    span = (whole.end - whole.start).total_seconds()
+    assert span >= (minutes - 2) * step, f"the binned span is short: {span}s"
+    # Bounded: the chart a whole-job view draws comes from at most _MAX_BINS points.
+    points = whole.chart(BUSY)
+    assert 0 < len(points) <= resource_module._MAX_BINS, len(points)
+    # The last ten minutes are still read from the samples themselves, unbinned.
+    recent = resource.view("10m")
+    assert recent.stats[BUSY].latest == stats.latest

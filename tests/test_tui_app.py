@@ -48,6 +48,8 @@ from cortex_training.tui.app import CortexTrainingLogTUI  # noqa: E402
 from cortex_training.tui.job_list import JobListScreen  # noqa: E402
 from cortex_training.tui.logs import LogScreen  # noqa: E402
 from cortex_training.tui.demo import DemoClient  # noqa: E402
+from cortex_training.tui import views  # noqa: E402
+from cortex_training.tui.untrusted import printable_client  # noqa: E402
 from cortex_training.tui.format import wrap_log_line  # noqa: E402
 from cortex_training.tui.resource import RANGES  # noqa: E402
 from cortex_training.tui.screens import JobSummaryScreen  # noqa: E402
@@ -3508,3 +3510,287 @@ def test_the_demo_client_takes_what_the_real_client_takes(name):
     left_out = NOT_IN_DEMO.get(name, set())
     assert left_out <= set(inspect.signature(real).parameters)  # each one left out is still the client's
     assert _parameters(getattr(DemoClient, name)) == _parameters(real, left_out)
+
+
+ESC, BEL = "\x1b", "\x07"
+
+
+# ─── the review fixes ─────────────────────────────────────────────────────────
+
+
+def test_a_cancelled_worker_stops_waiting_out_a_long_poll_interval():
+    # A tail sleeps between polls on its own thread. Cancelling a Textual worker can't
+    # interrupt time.sleep, so without this the thread (and its executor slot) would be
+    # held for the whole interval after the screen closed.
+    from cortex_training.tui.widgets import _sleep_until_cancelled
+
+    class Worker:
+        is_cancelled = False
+
+    worker = Worker()
+    sleep = _sleep_until_cancelled(worker)
+    threading.Timer(0.2, lambda: setattr(worker, "is_cancelled", True)).start()
+    started = time.monotonic()
+    sleep(300.0)
+    assert time.monotonic() - started < 5.0  # not 300
+
+    # A short wait is slept in one go, so the tail's own timing is unchanged.
+    worker.is_cancelled = False
+    started = time.monotonic()
+    sleep(0.05)
+    assert 0.03 <= time.monotonic() - started < 1.0
+
+
+def test_an_older_tail_does_not_clear_the_newer_tail_s_in_flight_marker():
+    # The status line says "no answer yet" while a tail's read is in flight. A cancelled
+    # older tail answering later must not clear the marker the newer read set.
+    from cortex_training.tui.widgets import _TimedTail
+
+    class Screen:
+        _tail_request = None
+
+    screen = Screen()
+    newer = _TimedTail(MagicMock(), screen, 2)
+
+    class Client:
+        def tail_logs(self, *_args, **_kwargs):
+            # While the older read is in flight, a newer tail starts and claims the marker.
+            newer._screen._tail_request = (newer._gen, time.monotonic())
+            return {"entries": [], "next_cursor": "", "eof": True}
+
+    older = _TimedTail(Client(), screen, 1)
+    older.tail_logs("7", sub_job_id="7:training:0")
+    assert screen._tail_request is not None, "the older tail cleared the newer request"
+    assert screen._tail_request[0] == 2
+
+    # Its own marker it does clear.
+    own = _TimedTail(Client(), screen, 2)
+    own.tail_logs("7", sub_job_id="7:training:0")
+    assert screen._tail_request is None
+
+
+def test_one_job_has_one_cache_wherever_it_was_opened_from():
+    # The configured schema's list gives the client its configured identifiers; the
+    # account-wide list's child client holds the names as stored. Both are the same
+    # schema, so the job must not download its logs and telemetry twice.
+    from cortex_training.tui.widgets import _cache_job_id
+
+    class Client:
+        base_url = "https://ACCOUNT.snowflakecomputing.com"
+        endpoint = "cortex-training"
+
+        def __init__(self, database, schema):
+            self.database, self.schema = database, schema
+
+    configured, resolved = Client("team_db", "ml"), Client("TEAM_DB", "ML")
+    assert _cache_job_id(configured, "J") == _cache_job_id(resolved, "J")
+    # A quoted lower-case name is its own identifier, and another schema is another cache.
+    assert _cache_job_id(Client("DB", "ONE"), "J") != _cache_job_id(Client("DB", "TWO"), "J")
+    assert _cache_job_id(Client("ONE", "S"), "J") != _cache_job_id(Client("TWO", "S"), "J")
+    # Nothing to key on (the demo, a test double): the job id stands alone.
+    assert _cache_job_id(object(), "J") == "J"
+
+
+def test_a_location_is_routed_as_stored_and_drawn_made_printable():
+    # printable_data cleans everything a job record carries, but these two names are SQL
+    # identifiers that route the job's calls: cleaned, they name a different schema and
+    # every call for the job answers 404.
+    from cortex_training.tui.untrusted import printable_client
+
+    stored = "ml​x"  # a quoted schema whose name holds a zero-width space
+
+    class Service:
+        database = schema = "X"
+
+        def list_jobs_page(self, *_args, **_kwargs):
+            return {"jobs": [{"job_id": "J", "database_name": "TEAM_DB", "schema_name": stored,
+                              "reason": f"boom{ESC}]52;c;cGF5bG9hZA=={BEL}"}]}
+
+        def for_job(self, row):
+            return row
+
+    row = printable_client(Service()).list_jobs_page()["jobs"][0]
+    assert row["schema_name"] == stored, "the stored identifier was changed"
+    assert row["database_name"] == "TEAM_DB"
+    assert views.job_key(row) == ("TEAM_DB", stored, "J")  # routed on what the service stored
+    assert ESC not in row["reason"] and "cGF5bG9hZA" not in row["reason"]  # other text still cleaned
+    assert "​" not in views.location_label(row)  # what is drawn is printable
+
+
+@pytest.mark.parametrize("kind,command", [("stdout", "cortex-training download-log 7 --log-type stdout"),
+                                          ("metrics", "cortex-training download-metrics 7")])
+def test_skipped_chunk_hint_names_the_cli_command_for_the_tui_cache(kind, command, tmp_path):
+    # The client's own hint says to download again without resume, but the TUI downloads
+    # into its cache, not a directory the user chose: the hint names that directory.
+    import shlex
+
+    from cortex_training.tui.widgets import _result_warnings
+
+    cache = tmp_path / "cache dir" / kind
+    rows = [{"sub_job_id": "7:training:0", "skipped_chunks": ["chunk"],
+             "warnings": ["1 damaged chunk(s) skipped by an earlier download are still missing from the "
+                          "saved file; download again without resume to retry them"]}]
+    (message,) = _result_warnings(rows, kind=kind, job_id="7", output_dir=cache)["7:training:0"]
+    assert "download again without resume" not in message
+    retry = message.split("`")[1]
+    assert retry == f"{command} --sub-job 7:training:0 --output-dir {shlex.quote(str(cache))}"
+    # The quoted path survives a shell round trip, so the retry repairs the cached file.
+    assert shlex.split(retry)[-1] == str(cache)
+
+
+async def _run_stdout_warnings(calls):
+    c = _client()
+    c.get_job.return_value = _terminal_job()
+
+    class _Downloads:
+        def download_stdout_logs(self, job_id, output_dir, *, resume=False, on_chunk=None, sub_job_ids=None,
+                                 stale_after_seconds=600):
+            calls.append(stale_after_seconds)
+            _write_stdout(output_dir, "7:training:0", "saved\n")
+            return [{"sub_job_id": "7:training:0", "warnings": ["1 damaged chunk was skipped"]},
+                    {"sub_job_id": "7:sampling:0", "warnings": ["sampling warning"]}]
+
+    c.download_stdout_logs = _Downloads().download_stdout_logs
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        ok = await _wait(pilot, app, lambda: "warning: 1 damaged chunk was skipped" in (app.sub_title or ""))
+        assert ok, "the download warning for the selected sub-job was not shown"
+        assert "sampling warning" not in (app.sub_title or "")  # another sub-job's stays there
+        app.screen._start_tail("7:sampling:0")
+        ok = await _wait(pilot, app, lambda: "warning: sampling warning" in (app.sub_title or ""))
+        assert ok, "the warnings did not follow the selected sub-job"
+        await _settle(app, pilot)
+
+
+def test_stdout_download_warnings_show_for_the_selected_sub_job():
+    calls = []
+    asyncio.run(_run_stdout_warnings(calls))
+    # The TUI says itself when a job's output stopped, so the client's stall check is skipped.
+    assert calls and all(value is None for value in calls)
+
+
+async def _run_metrics_warning_shows_in_the_resources_header(tmp_path):
+    c = _client()
+
+    def download(job_id, output_dir, **_kwargs):
+        _write_gpu_metrics(output_dir, "7:training:0", gpu_count=1)
+        return [{"sub_job_id": "7:training:0", "warnings": ["2 chunk(s) could not be downloaded"]}]
+
+    c.download_metrics.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(170, 40)) as pilot:
+        ok = await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen) and app.screen._current_source)
+        assert ok
+        app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        ok = await _wait(pilot, app, lambda: app.screen._metrics_warnings, tries=400)
+        assert ok, "the metrics download's warning was not kept"
+        header = str(app.screen.query_one("#resource-status", Static).render())
+        assert "warning: 2 chunk(s) could not be downloaded" in header
+        await _settle(app, pilot)
+
+
+def test_metrics_download_warning_shows_in_the_resources_header(tmp_path):
+    asyncio.run(_run_metrics_warning_shows_in_the_resources_header(tmp_path))
+
+
+async def _run_hostile_service_text_never_reaches_the_terminal():
+    # Everything the service sends is drawn: a job's reason, its model, a location, a log
+    # line. None of it may carry an escape sequence (an OSC 52 would write the clipboard,
+    # a CSI would clear the screen) or be read as markup.
+    hostile = f"{ESC}]52;c;cGF5bG9hZA=={BEL}{ESC}[2Jboom‮[bold]x[/bold]"
+    c = MagicMock()
+    c.list_jobs_page.side_effect = AccountJobListUnavailable("not deployed", reason="not_deployed")
+    c.list_jobs.return_value = [{"job_id": f"7{hostile}", "status": "RUNNING", "reason": hostile,
+                                 "submitted_by": hostile,
+                                 "sub_jobs": [{"job_type": "training", "model_name": hostile}]}]
+    c.get_job.return_value = {"status": "RUNNING", "reason_details": hostile,
+                              "sub_jobs": [{"sub_job_id": "7:training:0", "job_type": "training",
+                                            "model_name": hostile}]}
+    c.tail_logs.return_value = {"entries": [{"_raw": hostile}], "next_cursor": "", "eof": True}
+    app = CortexTrainingLogTUI(printable_client(c), poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._job_by_item)
+        for stage in ("the job list", "a job's details"):
+            if stage == "a job's details":
+                await pilot.press("down")
+                await pilot.press("enter")
+                assert await _wait(pilot, app, lambda: not isinstance(app.screen, JobListScreen))
+                await pilot.pause(0.3)
+            drawn = "\n".join(strip.text for strip in app.screen._compositor.render_strips())
+            drawn += str(app.sub_title or "") + str(app.title or "")
+            assert ESC not in drawn, f"an escape sequence was drawn on {stage}"
+            assert BEL not in drawn and "cGF5bG9hZA" not in drawn, f"an OSC 52 payload reached {stage}"
+            assert "‮" not in drawn, f"a direction override was drawn on {stage}"
+        await _settle(app, pilot)
+
+
+def test_hostile_service_text_never_reaches_the_terminal():
+    asyncio.run(_run_hostile_service_text_never_reaches_the_terminal())
+
+
+async def _run_the_keys_do_what_their_context_means():
+    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, _table = await _demo_list(app, pilot)
+        # a has two bindings on the job list; check_action enables the one for the other list.
+        assert screen.check_action("show_list", ("account",)) is True
+        assert screen.check_action("show_list", ("schema",)) is False
+        before = len(screen._job_by_item)
+        await pilot.press("a")
+        assert await _pause_until(pilot, lambda: screen._lister.account_wide, seconds=10.0), "a did not widen the list"
+        assert screen.check_action("show_list", ("account",)) is False  # now it offers the way back
+        await pilot.press("a")
+        assert await _pause_until(pilot, lambda: not screen._lister.account_wide, seconds=10.0)
+        assert await _pause_until(pilot, lambda: len(screen._job_by_item) == before, seconds=10.0)
+        # l belongs to the details screen: on the list it is not a binding at all.
+        assert screen.check_action("cycle_level", ()) is True  # not one of the list's actions
+        await pilot.press("enter")
+        assert await _pause_until(pilot, lambda: not isinstance(app.screen, JobListScreen), seconds=10.0)
+        details = app.screen
+        if hasattr(details, "query_one"):
+            await pilot.pause(0.3)
+        # On the details screen l cycles the minimum level, but only while Logs is showing.
+        if hasattr(details, "_min_level"):
+            details._active_tab = "resource"
+            assert details.check_action("cycle_level", ()) is False, "l acts on the Resources tab"
+            details._active_tab = "logs"
+            assert details.check_action("cycle_level", ()) is True
+            level = details._min_level
+            await pilot.press("l")
+            assert await _pause_until(pilot, lambda: details._min_level != level, seconds=10.0), "l did not cycle"
+        await _settle(app, pilot)
+
+
+def test_the_keys_do_what_their_context_means():
+    asyncio.run(_run_the_keys_do_what_their_context_means())
+
+
+async def _run_the_group_rows_count_the_jobs_under_them():
+    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    async with app.run_test(size=(140, 44)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        await pilot.pause(0.3)
+        labels = [str(column.label).strip() for column in table.ordered_columns]
+        marker, at = labels.index(""), labels.index("Job ID")
+        rows = [(table.get_row_at(i)[marker].plain, table.get_row_at(i)[at].plain)
+                for i in range(table.row_count)]
+        # Each group row says how many jobs follow it. A job's row carries a status dot;
+        # its sub-job rows do not, so they must not be counted.
+        counts, group, seen = {}, None, 0
+        for dot, text in rows:
+            if text.startswith(("LIVE (", "HISTORY (")):
+                if group:
+                    counts[group] = seen
+                group, seen = text, 0
+            elif dot.strip():
+                seen += 1
+        counts[group] = seen
+        assert len(counts) == 2, counts
+        for header, under in counts.items():
+            said = int(header.split("(")[1].rstrip(")"))
+            assert said == under, f"{header} has {under} job rows under it"
+        await _settle(app, pilot)
+
+
+def test_the_group_rows_count_the_jobs_under_them():
+    asyncio.run(_run_the_group_rows_count_the_jobs_under_them())
