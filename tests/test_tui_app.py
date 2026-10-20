@@ -4017,6 +4017,80 @@ def test_the_keys_do_what_their_context_means():
     asyncio.run(_run_the_keys_do_what_their_context_means())
 
 
+class _GatedDemo(DemoClient):
+    """A demo whose job lists (schema and account-level) answer only once ``gate`` is set."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.gate = threading.Event()
+        self.gate.set()
+
+    def list_jobs(self, *args, **kwargs):
+        self.gate.wait(10)
+        return super().list_jobs(*args, **kwargs)
+
+    def list_jobs_page(self, **kwargs):
+        self.gate.wait(10)
+        return super().list_jobs_page(**kwargs)
+
+
+async def _run_a_says_at_once_that_it_is_loading_all_schemas(in_flight):
+    client = _GatedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, _table = await _demo_list(app, pilot)
+        assert "Current schema: " in app.sub_title
+        client.gate.clear()
+        if in_flight:
+            # A refresh is reading when a comes: a waits for it, and says so meanwhile.
+            screen._refresh_jobs()
+            assert screen._refreshing
+        await pilot.press("a")
+        await pilot.pause(0.1)
+        # The header names the list a asked for at once, not the one it replaces.
+        assert app.sub_title.startswith("loading all schemas…"), app.sub_title
+        assert "Current schema" not in app.sub_title
+        client.gate.set()
+        assert await _pause_until(pilot, lambda: "all schemas" in app.sub_title
+                                  and not app.sub_title.startswith("loading"), seconds=10.0), app.sub_title
+        client.gate.clear()
+        await pilot.press("a")
+        await pilot.pause(0.1)
+        assert app.sub_title.startswith("loading the current schema, "), app.sub_title
+        client.gate.set()
+        assert await _pause_until(pilot, lambda: "Current schema: " in app.sub_title, seconds=10.0), app.sub_title
+        await _settle(app, pilot)
+
+
+@pytest.mark.parametrize("in_flight", [False, True], ids=["idle", "refresh-in-flight"])
+def test_a_says_at_once_that_it_is_loading_all_schemas(in_flight):
+    asyncio.run(_run_a_says_at_once_that_it_is_loading_all_schemas(in_flight))
+
+
+async def _run_a_keeps_why_all_schemas_are_unavailable_in_the_header(reason, why):
+    app = CortexTrainingLogTUI(DemoClient(account_list=reason), poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, _table = await _demo_list(app, pilot)
+        await pilot.press("a")
+        assert await _pause_until(pilot, lambda: "Current schema only: " in app.sub_title, seconds=10.0), (
+            app.sub_title)
+        assert why in app.sub_title
+        assert screen.check_action("show_list", ("account",)) is True  # the footer offers a again
+        # It stays after the notice has gone, through later refreshes, until the next a.
+        screen._refresh_jobs(manual=True)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        assert why in app.sub_title
+        await _settle(app, pilot)
+
+
+@pytest.mark.parametrize("reason, why", [
+    (AccountJobListUnavailable.DISABLED, "account-wide list not enabled"),
+    (AccountJobListUnavailable.NOT_DEPLOYED, "no account-wide list yet"),
+])
+def test_a_keeps_why_all_schemas_are_unavailable_in_the_header(reason, why):
+    asyncio.run(_run_a_keeps_why_all_schemas_are_unavailable_in_the_header(reason, why))
+
+
 async def _run_the_group_rows_count_the_jobs_under_them():
     app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
     async with app.run_test(size=(140, 44)) as pilot:
