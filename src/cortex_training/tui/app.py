@@ -258,15 +258,21 @@ class CortexTrainingLogTUI(App):
     #resource-charts { height: auto; margin-top: 1; text-wrap: nowrap; text-overflow: clip; }
     #resource-keys { height: 1; padding: 0 1; text-wrap: nowrap; text-overflow: clip; link-style: none; }
     /* The job preview's layout is JobSummaryScreen.DEFAULT_CSS (screens.py). */
-    #checkpoint-status { height: auto; padding: 0 1; }
-    #checkpoint-table { height: auto; max-height: 40%; margin: 0 1; }
-    #checkpoint-pane { height: 1fr; padding: 0 1; border-top: solid $panel; scrollbar-gutter: stable;
-                       scrollbar-size-vertical: 1; }
-    #checkpoint-detail { height: auto; }
-    #checkpoint-actions { height: 1; margin: 1 1 0 1; }
-    #checkpoint-actions Button { margin-right: 1; }
-    #ckpt-use-label { width: auto; color: $text-muted; margin: 0 1 0 2; }
-    #checkpoint-action-status { height: auto; margin: 0 1; }
+    /* The Checkpoints tab, in the preview's cards: round borders, titles in the top border, hints in the bottom. */
+    #checkpoint-list-card { height: auto; max-height: 45%; margin: 0 1; padding: 0 1; border: round $border;
+                            border-title-align: left; border-subtitle-align: right; }
+    #checkpoint-status { height: auto; }
+    #checkpoint-table { height: auto; }
+    #checkpoint-table > .datatable--header { background: $surface; color: $text-muted; }
+    #checkpoint-pane { height: 1fr; padding: 0 1; scrollbar-gutter: stable; scrollbar-size-vertical: 1; }
+    #checkpoint-card { height: auto; margin-top: 1; padding: 0 1; border: round $border; }
+    #checkpoint-hero, #checkpoint-detail, #checkpoint-origin, #checkpoint-action-status { height: auto; }
+    #checkpoint-actions { height: 1; margin-top: 1; text-wrap: nowrap; text-overflow: clip; link-style: none; }
+    #checkpoint-action-status { margin-bottom: 1; }
+    #checkpoint-copied { height: auto; margin-top: 1; padding: 0 1; border-title-align: left;
+                         border-subtitle-align: right; }
+    #checkpoint-origin-card { height: auto; margin-top: 1; padding: 0 1; border: round $border;
+                              border-title-align: left; }
     LogScreen > .screen--selection {
         background: $block-cursor-blurred-background;
         color: $block-cursor-blurred-foreground;

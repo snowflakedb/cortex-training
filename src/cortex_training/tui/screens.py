@@ -277,7 +277,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
 
     # The next steps from here, under the title: the footer has them too, but it
     # cuts its end on a narrow screen, and these say what each one opens.
-    _ACTIONS = (("l", "Logs"), ("g", "Resources"))
+    _ACTIONS = (("l", "Logs"), ("g", "Resources"), ("c", "Checkpoints"))
 
     def _hero(self, width: int, now: datetime) -> list:
         """The card's head, as rows: the job id, its status pill and how long it

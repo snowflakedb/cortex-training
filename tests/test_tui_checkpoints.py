@@ -24,7 +24,7 @@ import pytest
 
 pytest.importorskip("textual")
 
-from textual.widgets import Button  # noqa: E402
+from textual.content import Content  # noqa: E402
 from textual.widgets import DataTable  # noqa: E402
 from textual.widgets import Static  # noqa: E402
 from textual.widgets import TabbedContent  # noqa: E402
@@ -37,7 +37,7 @@ from cortex_training.tui.checkpoints import DownloadCancelled  # noqa: E402
 from cortex_training.tui.checkpoints import compact_numbers  # noqa: E402
 from cortex_training.tui.checkpoints import download_export  # noqa: E402
 from cortex_training.tui.checkpoints import new_job_body  # noqa: E402
-from cortex_training.tui.checkpoints import usable_for  # noqa: E402
+from cortex_training.tui.checkpoints import use_plan  # noqa: E402
 from cortex_training.tui.checkpoints import files_info  # noqa: E402
 from cortex_training.tui.checkpoints import fmt_bytes  # noqa: E402
 from cortex_training.tui.checkpoints import parse_checkpoints  # noqa: E402
@@ -187,6 +187,15 @@ def _text(screen, selector) -> str:
     return str(screen.query_one(selector, Static).render())
 
 
+def _detail(screen) -> str:
+    """Everything shown for the highlighted checkpoint: its card, the copied-command box and the job's card."""
+    shown = [_text(screen, f"#checkpoint-{part}") for part in ("hero", "detail", "action-status", "origin")]
+    copied = screen.query_one("#checkpoint-copied", Static)
+    if copied.display and copied.border_title:
+        shown += [Content.from_markup(copied.border_title).plain, _text(screen, "#checkpoint-copied")]
+    return "\n".join(shown)
+
+
 async def _run_tab_lists_and_details(monkeypatch):
     c = _client()
     app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
@@ -201,37 +210,42 @@ async def _run_tab_lists_and_details(monkeypatch):
         table = screen.query_one("#checkpoint-table", DataTable)
         assert table.row_count == 3
         assert [k.value for k in table.rows] == ["cp_b", "cp_a", "global_step12"]
-        assert "3 checkpoints" in _text(screen, "#checkpoint-status")
+        assert "Checkpoints · 3" in Content.from_markup(screen.query_one("#checkpoint-list-card").border_title).plain
         # Highlighting a row shows its details, with the type and step its files show.
-        detail = _text(screen, "#checkpoint-detail")
-        assert "cp_b" in detail and "weights-only" in detail and "(from its files)" in detail
+        detail = _detail(screen)
+        assert "cp_b" in detail and "WEIGHTS-ONLY" in detail and "from its files" in detail
         assert "links.example" not in detail  # the export's links are never shown
         assert "export_checkpoint" not in detail  # a button downloads it, not a script
-        buttons = {use: screen.query_one(f"#ckpt-use-{use}", Button) for use in ("training", "sampling", "both")}
-        assert not any(b.disabled for b in buttons.values())
+
+        def clickable():
+            markup = screen.query_one("#checkpoint-actions", Static).content.markup
+            return [f"screen.checkpoint_use('{use}')" in markup for use in ("training", "sampling", "both")]
+
+        # Weights-only: sampling only (training resumes from a resumable one, and no
+        # resumable checkpoint shares its step for training + sampling).
+        assert clickable() == [False, True, False]
+        assert "Training resumes from a resumable checkpoint" in _text(screen, "#checkpoint-action-status")
         # A use button copies one command that starts a job from the checkpoint.
         copied = []
         monkeypatch.setattr(app, "copy_out", lambda text, what: copied.append(text))
-        await pilot.click("#ckpt-use-both")
+        await app.run_action("screen.checkpoint_use('sampling')")  # what a click on the segment runs
         assert await _wait(pilot, lambda: copied)
         body = _submitted_body(copied[-1])
-        assert [sj["job_type"] for sj in body["sub_job_configs"]] == ["training", "sampling"]
-        assert all(sj["source_checkpoint_info"] == {"checkpoint_id": "cp_b", "source_job_id": "7"}
-                   for sj in body["sub_job_configs"])
-        assert body["sub_job_configs"][0]["training_config"]["n_gpus"] == 1
-        assert "Copied to the clipboard" in _text(screen, "#checkpoint-detail")
+        assert [sj["job_type"] for sj in body["sub_job_configs"]] == ["sampling"]
+        assert body["sub_job_configs"][0]["source_checkpoint_info"] == {"checkpoint_id": "cp_b", "source_job_id": "7"}
+        assert "Copied: a new" in _detail(screen)
         await pilot.press("down")
         assert await _wait(pilot, lambda: screen._ckpt_highlighted == "cp_a")
-        detail = _text(screen, "#checkpoint-detail")
-        assert "resumable" in detail and "Copied to the clipboard" not in detail
+        detail = _detail(screen)
+        assert "RESUMABLE" in detail and "Copied: a new" not in detail
         # Sampling loads only weights: a resumable checkpoint starts a training job only.
-        assert await _wait(pilot, lambda: buttons["sampling"].disabled and buttons["both"].disabled)
-        assert not buttons["training"].disabled
-        await pilot.click("#ckpt-use-training")
+        assert await _wait(pilot, lambda: clickable() == [True, False, False])
+        await app.run_action("screen.checkpoint_use('training')")
         assert await _wait(pilot, lambda: len(copied) == 2)
         body = _submitted_body(copied[-1])
         assert [sj["job_type"] for sj in body["sub_job_configs"]] == ["training"]
         assert body["sub_job_configs"][0]["source_checkpoint_info"]["checkpoint_id"] == "cp_a"
+        assert body["sub_job_configs"][0]["training_config"]["n_gpus"] == 1
         assert "7:training:0" in detail and '"lr": 0.0001' in detail and '"n_gpus": 1,' in detail
         # s sorts by step (the highlight stays on its checkpoint), o reverses it.
         await pilot.press("s")
@@ -262,14 +276,34 @@ def _submitted_body(command: str) -> dict:
 def test_new_job_body_copies_the_job_s_sub_jobs():
     job = _client().get_job.return_value
     job["hardware"] = "H200"
-    body = new_job_body(job, "7", "cp_b", "sampling")
+    body = new_job_body(job, "7", sampling_checkpoint="cp_b")
     assert body["hardware"] == "H200"
     (sampler,) = body["sub_job_configs"]
     # The job had a sampling sub-job without a config: one is made for the trainer's model.
     assert sampler == {"job_type": "sampling", "model_name": "Qwen/Qwen3-0.6B", "inference_config": {"n_gpus": 1},
                        "source_checkpoint_info": {"checkpoint_id": "cp_b", "source_job_id": "7"}}
-    assert new_job_body({"sub_jobs": [{"job_type": "SAMPLING"}]}, "7", "cp_b", "training") is None
-    assert usable_for(RESUMABLE)["sampling"] and usable_for(None)["sampling"] is None
+    assert new_job_body({"sub_jobs": [{"job_type": "SAMPLING"}]}, "7", training_checkpoint="cp_b") is None
+    both = new_job_body(job, "7", "cp_r", "cp_w")["sub_job_configs"]
+    assert [(sj["job_type"], sj["source_checkpoint_info"]["checkpoint_id"]) for sj in both] == [
+        ("training", "cp_r"), ("sampling", "cp_w")]
+
+
+def test_use_plan_pairs_a_resumable_and_a_weights_only_checkpoint_of_one_step():
+    rows = parse_checkpoints([
+        {"checkpoint_id": "r5", "global_steps": 5, "checkpoint_type": "resumable",
+         "created_at": "2026-07-20T10:00:00Z"},
+        {"checkpoint_id": "w5", "global_steps": 5, "checkpoint_type": "weights-only",
+         "created_at": "2026-07-20T10:01:00Z"},
+        {"checkpoint_id": "w9", "global_steps": 9, "checkpoint_type": "weights-only",
+         "created_at": "2026-07-20T11:00:00Z"},
+        {"checkpoint_id": "u", "created_at": "2026-07-20T12:00:00Z"},
+    ])
+    r5, w5, w9, u = rows
+    assert use_plan(r5, rows) == {"training": ("r5", None), "sampling": "sampling needs a weights-only checkpoint",
+                                  "both": ("r5", "w5")}
+    assert use_plan(w5, rows)["both"] == ("r5", "w5") and use_plan(w5, rows)["training"].startswith("training")
+    assert use_plan(w9, rows)["both"] == "training + sampling needs a resumable checkpoint saved at the same step"
+    assert use_plan(u, rows) == {"training": ("u", None), "sampling": (None, "u"), "both": ("u", "u")}
 
 
 class _Response:
@@ -330,7 +364,8 @@ async def _run_download_button(tmp_path, monkeypatch):
         screen = app.screen
         await pilot.press("c")
         assert await _wait(pilot, lambda: screen._ckpt_loaded and screen._ckpt_highlighted == "cp_b")
-        await pilot.click("#ckpt-download")
+        assert "@click=screen.checkpoint_download" in screen.query_one("#checkpoint-actions", Static).content.markup
+        await pilot.press("d")
         ok = await _wait(pilot, lambda: "downloaded 1 files" in _text(screen, "#checkpoint-action-status"))
         assert ok, (_text(screen, "#checkpoint-action-status"), calls, screen._ckpt_download)
         assert calls == [("cp_b", tmp_path / "cortex-training-checkpoints" / "7" / "cp_b")]
@@ -349,7 +384,7 @@ async def _run_tab_states(client, expect):
         screen = app.screen
         screen.query_one("#job-tabs", TabbedContent).active = "checkpoints"
         assert await _wait(pilot, lambda: expect in _text(screen, "#checkpoint-status")
-                           + _text(screen, "#checkpoint-detail"))
+                           + _detail(screen))
         await _settle(app, pilot)
 
 
@@ -382,7 +417,7 @@ async def _run_live_refresh_picks_up_a_new_checkpoint():
         screen = app.screen
         await pilot.press("c")
         assert await _wait(pilot, lambda: screen._ckpt_loaded)
-        assert "No checkpoints yet" in _text(screen, "#checkpoint-detail")
+        assert "No checkpoints yet" in _text(screen, "#checkpoint-status")
         c.list_checkpoints.return_value = _LISTED[:2]
         screen._auto_refresh_data()  # what the 30-second timer calls
         assert await _wait(pilot, lambda: len(screen._ckpt_rows) == 2 and not screen._ckpt_reading_files)

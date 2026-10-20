@@ -1141,9 +1141,13 @@ out (the header names it too). Switch tabs with `l` (Logs), `g`
     shell command to the clipboard: `printf '%s' '<CreateJob JSON>' |
     cortex-training ... submit -`. The body repeats this job's training
     sub-job, its sampling sub-job (or one GPU of the training model), or both,
-    and its hardware, each with `source_checkpoint_info` naming this
-    checkpoint. Sampling loads only weights, so a `resumable` checkpoint's
-    Sampling buttons are disabled. The details show the copied command.
+    and its hardware, each with `source_checkpoint_info`. The service starts a
+    training sub-job only from a `resumable` checkpoint (with the GPU count and
+    parallelism of the job that saved it, which the copy keeps) and a sampling
+    sub-job only from a `weights-only` one. So Training is offered for a
+    resumable checkpoint, Sampling for a weights-only one, and Training +
+    sampling pairs the checkpoint with one of the other type saved at the same
+    step (disabled when there is none). The details show the copied command.
 
 #### Logs
 

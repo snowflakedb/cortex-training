@@ -273,11 +273,39 @@ _SUB_JOB_WIRE_FIELDS = ("job_type", "model_name", "global_batch_size", "dtype", 
                         "training_config", "inference_config")
 
 
-def usable_for(kind: Optional[str]) -> dict:
-    """Use → why ``kind`` can't be used for it (None: it can). Sampling loads only
-    weights, so a resumable checkpoint starts a training sub-job only."""
-    no_sampling = "sampling needs a weights-only checkpoint" if kind == RESUMABLE else None
-    return {TRAINING: None, SAMPLING: no_sampling, BOTH: no_sampling}
+def use_plan(row: Checkpoint, rows: list[Checkpoint], files: Optional[dict] = None) -> dict:
+    """Use → (training checkpoint id, sampling checkpoint id) for a new job from ``row``,
+    or why it can't be used for it (a string).
+
+    The service loads a training sub-job only from a resumable checkpoint and a
+    sampling sub-job only from a weights-only one. So training + sampling pairs
+    ``row`` with a checkpoint of the other type saved at the same step, the newest
+    when there are several. A checkpoint of unknown type is offered for each use.
+    """
+    files = files or {}
+
+    def info(r: Checkpoint) -> tuple[Optional[int], Optional[str]]:
+        step, _, kind, _ = r.with_files(files.get(r.checkpoint_id) if isinstance(
+            files.get(r.checkpoint_id), FilesInfo) else None)
+        return step, kind
+
+    step, kind = info(row)
+    cid = row.checkpoint_id
+    plan: dict = {}
+    plan[TRAINING] = "training resumes from a resumable checkpoint" if kind == WEIGHTS_ONLY else (cid, None)
+    plan[SAMPLING] = "sampling needs a weights-only checkpoint" if kind == RESUMABLE else (None, cid)
+    if kind is None:
+        plan[BOTH] = (cid, cid)
+    else:
+        other = WEIGHTS_ONLY if kind == RESUMABLE else RESUMABLE
+        partners = [r for r in sort_checkpoints(rows, files=files)
+                    if r.checkpoint_id != cid and info(r) == (step, other)] if step is not None else []
+        if not partners:
+            plan[BOTH] = f"training + sampling needs a {other} checkpoint saved at the same step"
+        else:
+            mate = partners[0].checkpoint_id
+            plan[BOTH] = (cid, mate) if kind == RESUMABLE else (mate, cid)
+    return plan
 
 
 def _wire_sub_job(sj: dict, kind: str) -> dict:
@@ -305,24 +333,30 @@ def _sampling_like(job: Any, trainer: Optional[dict]) -> Optional[dict]:
     return compact_numbers(out)
 
 
-def new_job_body(job: Any, job_id: str, checkpoint_id: str, use: str) -> Optional[dict]:
-    """A CreateJob body for a new job that starts from ``checkpoint_id``: the source
-    job's training sub-job, its sampling sub-job, or both, as the job ran them, each
-    with ``source_checkpoint_info``. None when the job's record has no training
-    sub-job to copy."""
+def new_job_body(job: Any, job_id: str, training_checkpoint: Optional[str] = None,
+                 sampling_checkpoint: Optional[str] = None) -> Optional[dict]:
+    """A CreateJob body for a new job that starts from saved checkpoints: the source
+    job's training sub-job from ``training_checkpoint``, its sampling sub-job from
+    ``sampling_checkpoint``, or both, as the job ran them, each with
+    ``source_checkpoint_info``. The training sub-job keeps the source's GPU count and
+    parallelism, which a resume with optimizer state needs. None when the job's record
+    has no training sub-job to copy."""
     trainers = training_sub_jobs(job)
     trainer = next((sj for sj in trainers if isinstance(sj.get("training_config"), dict)), None)
-    source = {"checkpoint_id": checkpoint_id, "source_job_id": job_id}
     subs = []
-    if use in (TRAINING, BOTH):
+    if training_checkpoint is not None:
         if trainer is None:
             return None
-        subs.append({**_wire_sub_job(trainer, TRAINING), "source_checkpoint_info": dict(source)})
-    if use in (SAMPLING, BOTH):
+        subs.append({**_wire_sub_job(trainer, TRAINING),
+                     "source_checkpoint_info": {"checkpoint_id": training_checkpoint, "source_job_id": job_id}})
+    if sampling_checkpoint is not None:
         sampler = _sampling_like(job, trainer)
         if sampler is None:
             return None
-        subs.append({**sampler, "source_checkpoint_info": dict(source)})
+        subs.append({**sampler,
+                     "source_checkpoint_info": {"checkpoint_id": sampling_checkpoint, "source_job_id": job_id}})
+    if not subs:
+        return None
     body: dict = {"sub_job_configs": subs}
     hardware = job.get("hardware") if isinstance(job, dict) else None
     if isinstance(hardware, str) and hardware:

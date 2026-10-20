@@ -35,14 +35,15 @@ from pathlib import Path
 from datetime import datetime
 from datetime import timezone
 from rich.text import Text
+from textual.content import Content
 from textual import work
 from textual.app import ComposeResult
-from textual.containers import Horizontal
+from textual.containers import Vertical
 from textual.containers import VerticalScroll
-from textual.widgets import Button
 from textual.widgets import DataTable
 from textual.widgets import Static
 from textual.worker import get_current_worker
+from cortex_training.tui import theme
 from cortex_training.tui import views
 from cortex_training.tui.checkpoints import BOTH
 from cortex_training.tui.checkpoints import RESUMABLE
@@ -52,7 +53,7 @@ from cortex_training.tui.checkpoints import USES
 from cortex_training.tui.checkpoints import DownloadCancelled
 from cortex_training.tui.checkpoints import download_export
 from cortex_training.tui.checkpoints import new_job_body
-from cortex_training.tui.checkpoints import usable_for
+from cortex_training.tui.checkpoints import use_plan
 from cortex_training.tui.checkpoints import SORTS
 from cortex_training.tui.checkpoints import WEIGHTS_ONLY
 from cortex_training.tui.checkpoints import Checkpoint
@@ -69,7 +70,9 @@ from cortex_training.tui.checkpoints import training_sub_jobs
 from cortex_training.tui.format import local_time
 from cortex_training.tui.format import printable
 from cortex_training.tui.widgets import SelectableTable
+from cortex_training.tui.widgets import _ColoredLinks
 from cortex_training.tui.widgets import log_traceback
+from cortex_training.tui.widgets import spans_content
 
 
 class CheckpointTab:
@@ -78,7 +81,6 @@ class CheckpointTab:
     # The most checkpoints one refresh reads the files of. The rest are read by the
     # next refresh (r, or the 30-second one while the job is live).
     _CHECKPOINT_FILES_PER_REFRESH = 50
-    _CHECKPOINT_LABEL = 14  # the details' label column
 
     def _init_checkpoint_state(self) -> None:
         self._ckpt_rows: list[Checkpoint] = []
@@ -101,21 +103,28 @@ class CheckpointTab:
     _USE_HELP = {
         TRAINING: "copies the command for a new training job that resumes from it",
         SAMPLING: "copies the command for a new sampling job serving its weights",
-        BOTH: "copies the command for a new job with both, each starting from it",
+        BOTH: "copies the command for a new job with both: training resumes from the resumable "
+              "checkpoint, sampling serves the weights-only one of the same step",
     }
 
     def _compose_checkpoint_tab(self) -> ComposeResult:
-        yield Static("", id="checkpoint-status")
-        yield SelectableTable(id="checkpoint-table", cursor_type="row", zebra_stripes=True)
-        with Horizontal(id="checkpoint-actions"):
-            yield Button("⬇ Download", id="ckpt-download", compact=True, variant="primary")
-            yield Static(" New job from it:", id="ckpt-use-label")
-            yield Button("Training", id=f"ckpt-use-{TRAINING}", compact=True)
-            yield Button("Sampling", id=f"ckpt-use-{SAMPLING}", compact=True)
-            yield Button("Training + sampling", id=f"ckpt-use-{BOTH}", compact=True)
-        yield Static("", id="checkpoint-action-status")
+        # The list's card (its border says how it is sorted and the keys), then, under
+        # it, the highlighted checkpoint: its card with the actions, the box saying
+        # what a button copied, and the card of the job that saved it.
+        with Vertical(id="checkpoint-list-card"):
+            yield Static("", id="checkpoint-status")
+            yield SelectableTable(id="checkpoint-table", cursor_type="row")
         with VerticalScroll(id="checkpoint-pane"):
-            yield Static("", id="checkpoint-detail")
+            with Vertical(id="checkpoint-card"):
+                yield Static("", id="checkpoint-hero")
+                # Segments to click, as the Resources tab's window selector: Download, then
+                # what kind of new job to copy the command for.
+                yield _ColoredLinks("", id="checkpoint-actions")
+                yield Static("", id="checkpoint-action-status")
+                yield Static("", id="checkpoint-detail")
+            yield Static("", id="checkpoint-copied")
+            with Vertical(id="checkpoint-origin-card"):
+                yield Static("", id="checkpoint-origin")
 
     def _checkpoints_active(self) -> bool:
         return self._active_tab == "checkpoints"
@@ -214,37 +223,34 @@ class CheckpointTab:
     def _highlighted_checkpoint(self) -> Checkpoint | None:
         return next((r for r in self._ckpt_rows if r.checkpoint_id == self._ckpt_highlighted), None)
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        button = event.button.id or ""
-        if button == "ckpt-download":
-            event.stop()
-            self.action_checkpoint_download()
-        elif button.startswith("ckpt-use-"):
-            event.stop()
-            self._copy_new_job_command(button.removeprefix("ckpt-use-"))
-        else:
-            return
-        # Back to the list, so the arrows keep picking checkpoints.
-        self.set_focus(self.query_one("#checkpoint-table", DataTable))
+    def action_checkpoint_use(self, use: str) -> None:
+        """A click on a new-job segment: copy the command for that kind of job."""
+        if self._checkpoints_active():
+            self._copy_new_job_command(use)
 
-    def _checkpoint_use_reasons(self, row: Checkpoint, kind: str | None) -> dict:
+    def _checkpoint_plans(self, row: Checkpoint) -> dict:
+        """Use → the CreateJob body for a new job from ``row``, or why there is none (a string)."""
+        plans = {}
+        for use, plan in use_plan(row, self._ckpt_rows, self._ckpt_files).items():
+            if isinstance(plan, str):
+                plans[use] = plan
+                continue
+            body = new_job_body(self._job, str(self._job_id), *plan)
+            plans[use] = body if body is not None else "the job's record has no training sub-job configuration to copy"
+        return plans
+
+    def _checkpoint_use_reasons(self, row: Checkpoint, kind: str | None = None) -> dict:
         """Use → why the highlighted checkpoint can't start a job for it (None: it can)."""
-        reasons = dict(usable_for(kind))
-        for use in USES:
-            if reasons[use] is None and new_job_body(self._job, str(self._job_id), row.checkpoint_id, use) is None:
-                reasons[use] = "the job's record has no training sub-job configuration to copy"
-        return reasons
+        return {use: plan if isinstance(plan, str) else None for use, plan in self._checkpoint_plans(row).items()}
 
     def _copy_new_job_command(self, use: str) -> None:
         row = self._highlighted_checkpoint()
         if row is None or use not in USES:
             return
-        kind = row.with_files(self._files_of(row))[2]
-        why = self._checkpoint_use_reasons(row, kind)[use]
-        if why:
-            self.notify(f"Can't start a {USES[use]} job from it: {why}.", severity="warning", markup=False)
+        body = self._checkpoint_plans(row)[use]
+        if isinstance(body, str):
+            self.notify(f"Can't start a {USES[use]} job from it: {body}.", severity="warning", markup=False)
             return
-        body = new_job_body(self._job, str(self._job_id), row.checkpoint_id, use)
         # One line to paste into a shell: the CreateJob body, quoted, piped to submit.
         command = (f"printf '%s' {shlex.quote(json.dumps(body, separators=(',', ':')))} | "
                    + self._cli("submit -"))
@@ -315,8 +321,8 @@ class CheckpointTab:
     def _ckpt_download_text(self, row: Checkpoint | None) -> Text:
         state = self._ckpt_download
         if state is None or row is None or state["id"] != row.checkpoint_id:
-            return Text(f" d downloads it to {self._display_path(self._ckpt_download_root(row.checkpoint_id))}"
-                        if row is not None else "", style="dim")
+            return Text(f"d downloads it to {self._display_path(self._ckpt_download_root(row.checkpoint_id))}"
+                        if row is not None else "", style=theme.MUTED)
         where = self._display_path(state["root"])
         if state["running"]:
             total = state.get("total")
@@ -325,14 +331,14 @@ class CheckpointTab:
             files = f" · file {min(state['files_done'] + 1, state['files'])} of {state['files']}" \
                 if state.get("files") else ""
             percent = f" ({state['done'] * 100 // total}%)" if total else ""
-            return Text(f" downloading {amount}{percent}{files} to {where} · d or the button stops it",
-                        style="yellow")
+            return Text(f"downloading {amount}{percent}{files} to {where} · d or the button stops it",
+                        style=theme.WARN_TEXT)
         if state.get("error") == "stopped":
-            return Text(f" download stopped · d picks it up again in {where}", style="yellow")
+            return Text(f"download stopped · d picks it up again in {where}", style=theme.WARN_TEXT)
         if state.get("error"):
-            return Text(f" download failed: {state['error']} · d tries again", style="red")
-        return Text(f" downloaded {state.get('outcome')} ({fmt_bytes(state.get('total'))}) to {where}",
-                    style="green")
+            return Text(f"download failed: {state['error']} · d tries again", style=theme.ERR_TEXT)
+        return Text(f"downloaded {state.get('outcome')} ({fmt_bytes(state.get('total'))}) to {where}",
+                    style=theme.OK)
 
     @staticmethod
     def _display_path(path: Path) -> str:
@@ -343,30 +349,36 @@ class CheckpointTab:
 
     def _render_checkpoint_actions(self) -> None:
         try:
-            actions = self.query_one("#checkpoint-actions", Horizontal)
+            actions = self.query_one("#checkpoint-actions", Static)
             status = self.query_one("#checkpoint-action-status", Static)
         except Exception:  # noqa: BLE001 - not mounted yet
             return
         row = self._highlighted_checkpoint()
-        actions.display = status.display = row is not None
         if row is None:
             return
         state = self._ckpt_download
-        running_here = state is not None and state.get("running")
-        download = self.query_one("#ckpt-download", Button)
-        download.label = "■ Stop download" if running_here else "⬇ Download"
-        download.variant = "warning" if running_here else "primary"
-        # One download at a time: another checkpoint's button waits for it.
-        download.disabled = bool(running_here and state["id"] != row.checkpoint_id)
-        kind = row.with_files(self._files_of(row))[2]
-        reasons = self._checkpoint_use_reasons(row, kind)
-        for use in USES:
-            button = self.query_one(f"#ckpt-use-{use}", Button)
-            button.disabled = reasons[use] is not None
-            button.tooltip = reasons[use] or self._USE_HELP[use]
-        status.update(self._ckpt_download_text(row) if not (running_here and state["id"] != row.checkpoint_id)
-                      else Text(f" downloading {printable(state['id'])} · its row's button stops it",
-                                style="yellow"))
+        running = state is not None and state.get("running")
+        elsewhere = running and state["id"] != row.checkpoint_id  # one download at a time
+        if running and not elsewhere:
+            download = (" ■ Stop download ",
+                        f"bold {theme.BACKGROUND} on {theme.WARN} @click=screen.checkpoint_download")
+        elif elsewhere:
+            download = (" ⬇ Download ", f"{theme.FAINT} on {theme.SURFACE}")
+        else:
+            download = (" ⬇ Download ", f"bold {theme.BACKGROUND} on {theme.ACCENT} @click=screen.checkpoint_download")
+        spans = [download, ("   new job from it ", theme.MUTED)]
+        reasons = self._checkpoint_use_reasons(row)
+        for use, label in (("training", "Training"), ("sampling", "Sampling"), ("both", "Training + sampling")):
+            look = (f"{theme.TEXT} on {theme.PANEL} @click=screen.checkpoint_use('{use}')" if reasons[use] is None
+                    else f"{theme.FAINT} on {theme.SURFACE}")
+            spans += [(f" {label} ", look), (" ", "")]
+        actions.update(spans_content(spans))
+        said = self._ckpt_download_text(row) if not elsewhere else Text(
+            f"downloading {printable(state['id'])}: its own Stop ends it", style=theme.WARN_TEXT)
+        why = [reason[0].upper() + reason[1:] for reason in dict.fromkeys(r for r in reasons.values() if r)]
+        if why:
+            said.append("\n" + " · ".join(why), style=theme.FAINT)
+        status.update(said)
 
     # ─── drawing ─────────────────────────────────────────────────────────
     def _files_of(self, row: Checkpoint) -> FilesInfo | None:
@@ -377,37 +389,43 @@ class CheckpointTab:
         return sort_checkpoints(self._ckpt_rows, self._ckpt_sort, self._ckpt_descending, self._ckpt_files)
 
     def _checkpoint_status_text(self) -> Text:
+        """What the list card says above its table: only a wait, an error, or why it is empty."""
         if saves_no_checkpoints(self._job):
-            return Text("This job has no training sub-job, so it saves no checkpoints.", style="dim")
+            return Text("This job has no training sub-job, so it saves no checkpoints.", style=theme.MUTED)
         if not self._ckpt_loaded:
             if self._ckpt_error:
-                return Text(f"Checkpoints unavailable: {self._ckpt_error}  (r tries again)", style="red")
-            return Text("listing checkpoints…", style="dim")
-        count = len(self._ckpt_rows)
-        bits = [f"{count} checkpoint{'' if count == 1 else 's'}",
-                f"sort: {SORTS[self._ckpt_sort]} {'↓' if self._ckpt_descending else '↑'} (s · o)"]
-        if self._ckpt_loading:
-            bits.append("refreshing…")
-        elif self._ckpt_read_at:
-            bits.append(f"listed {self._ckpt_read_at}" + (" · every 30 s while live" if self._live() else "")
-                        + " · r refreshes")
-        if self._ckpt_reading_files:
-            bits.append(f"reading files of {len(self._ckpt_reading_files)}…")
-        text = Text("  ·  ".join(bits), style="dim")
+                return Text(f"Checkpoints unavailable: {self._ckpt_error}  (r tries again)", style=theme.ERR_TEXT)
+            return Text("listing checkpoints…", style=theme.MUTED)
         if self._ckpt_error:  # a refresh failed: the list shown is the last one read
-            text.append(f"\nrefresh failed: {self._ckpt_error}", style="red")
-        return text
+            return Text(f"refresh failed: {self._ckpt_error}", style=theme.ERR_TEXT)
+        if not self._ckpt_rows:
+            return Text("No checkpoints yet. A save() shows here once it completes (r refreshes)."
+                        if self._live() else "This job saved no checkpoints.", style=theme.MUTED)
+        return Text("")
+
+    def _title_list_card(self) -> None:
+        card = self.query_one("#checkpoint-list-card", Vertical)
+        count = f" · {len(self._ckpt_rows)}" if self._ckpt_loaded else ""
+        card.border_title = Content.assemble((" Checkpoints", f"bold {theme.TEXT}"), (f"{count} ", theme.MUTED))
+        hints = []
+        if self._ckpt_loading:
+            hints.append("refreshing…")
+        elif self._ckpt_read_at:
+            hints.append(f"listed {self._ckpt_read_at}" + (" · every 30 s" if self._live() else ""))
+        if self._ckpt_reading_files:
+            hints.append(f"reading files of {len(self._ckpt_reading_files)}…")
+        hints += [f"s sort: {SORTS[self._ckpt_sort]} {'↓' if self._ckpt_descending else '↑'}", "o order", "r refresh"]
+        card.border_subtitle = Content.styled(f" {' · '.join(hints)} ", theme.MUTED)
 
     def _checkpoint_cells(self, row: Checkpoint) -> tuple:
         step, step_inferred, kind, kind_inferred = row.with_files(self._files_of(row))
         info = self._files_of(row)
         created = local_time(row.created, "%Y-%m-%d %H:%M:%S") if row.created else printable(row.created_at or "—")
-        kind_style = "green" if kind == WEIGHTS_ONLY else "cyan" if kind == RESUMABLE else "dim"
         return (
             printable(row.checkpoint_id),
             created,
-            Text(f"{step}" if step is not None else "—", justify="right", style="dim" if step_inferred else ""),
-            Text(kind or "—", style=kind_style + (" italic" if kind_inferred else "")),
+            Text(f"{step}" if step is not None else "—", justify="right", style=theme.MUTED if step_inferred else ""),
+            _kind_badge(kind, inferred=kind_inferred),
             Text(fmt_loss(row.loss), justify="right"),
             Text(fmt_bytes(info.total_bytes) if info else "…" if row.checkpoint_id in self._ckpt_reading_files
                  else "—", justify="right"),
@@ -421,7 +439,10 @@ class CheckpointTab:
             table = self.query_one("#checkpoint-table", DataTable)
         except Exception:  # noqa: BLE001 - not mounted yet
             return
-        status.update(self._checkpoint_status_text())
+        said = self._checkpoint_status_text()
+        status.update(said)
+        status.display = bool(said.plain)
+        self._title_list_card()
         rows = self._sorted_checkpoints()
         cells = [(row.checkpoint_id, self._checkpoint_cells(row)) for row in rows]
         shown = tuple((cid, tuple((str(cell), str(getattr(cell, "style", ""))) for cell in row_cells))
@@ -447,108 +468,124 @@ class CheckpointTab:
 
     def _render_checkpoint_detail(self) -> None:
         try:
-            detail = self.query_one("#checkpoint-detail", Static)
+            pane = self.query_one("#checkpoint-pane", VerticalScroll)
         except Exception:  # noqa: BLE001 - not mounted yet
             return
         self._render_checkpoint_actions()
         row = self._highlighted_checkpoint()
+        pane.display = row is not None
         if row is None:
-            empty = self._ckpt_loaded and not self._ckpt_rows and not saves_no_checkpoints(self._job)
-            if not empty:
-                message = ""
-            elif self._live():
-                message = "No checkpoints yet. A save() shows here once it completes (r refreshes)."
-            else:
-                message = "This job saved no checkpoints."
-            detail.update(Text(message, style="dim"))
             return
-        detail.update(self._checkpoint_detail(row))
+        info = self._files_of(row)
+        step, step_inferred, kind, kind_inferred = row.with_files(info)
+        self.query_one("#checkpoint-hero", Static).update(self._checkpoint_hero(row, kind, kind_inferred))
+        self.query_one("#checkpoint-detail", Static).update(
+            self._checkpoint_facts(row, step, step_inferred, kind, kind_inferred))
+        self._render_copied(row)
+        origin_card = self.query_one("#checkpoint-origin-card", Vertical)
+        origin_card.border_title = Content.styled(" Saved by ", f"bold {theme.TEXT}")
+        self.query_one("#checkpoint-origin", Static).update(self._checkpoint_origin())
 
-    def _field(self, text: Text, label: str, value, style: str = "") -> None:
-        text.append(f"  {label:<{self._CHECKPOINT_LABEL - 2}}", style="bold")
+    # Labels and values as the job preview lays them out: a muted label column, then the value.
+    _LABEL = 13
+
+    def _fact(self, text: Text, label: str, value, style: str = theme.TEXT) -> None:
+        if text.plain:
+            text.append("\n")
+        text.append(f"{label:<{self._LABEL - 1}} ", style=theme.MUTED)
         if isinstance(value, Text):
             text.append_text(value)
         else:
             text.append(str(value), style=style)
-        text.append("\n")
 
-    def _heading(self, text: Text, title: str) -> None:
-        if text.plain:
-            text.append("\n")
-        text.append(title + "\n", style="bold underline")
-
-    def _command(self, text: Text, lines: list[str]) -> None:
-        for line in lines:
-            text.append(f"    {line}\n", style="cyan")
-
-    def _checkpoint_detail(self, row: Checkpoint) -> Text:
-        now = datetime.now(timezone.utc)
-        info = self._files_of(row)
-        step, step_inferred, kind, kind_inferred = row.with_files(info)
-        cid = printable(row.checkpoint_id)
-        job_id = printable(self._job_id)
-        text = Text()
-
-        self._heading(text, "Checkpoint")
-        self._field(text, "ID", cid)
-        kind_value = Text(kind or "unknown", style="green" if kind == WEIGHTS_ONLY else "cyan" if kind else "dim")
-        if kind == WEIGHTS_ONLY:
-            kind_value.append(" · model weights only: loadable for sampling", style="dim")
-        elif kind == RESUMABLE:
-            kind_value.append(" · weights and optimizer state: resumes training", style="dim")
-        if kind_inferred:
-            kind_value.append("  (from its files)", style="dim italic")
-        self._field(text, "Type", kind_value)
+    def _checkpoint_hero(self, row: Checkpoint, kind: str | None, inferred: bool) -> Text:
+        """The card's head: the checkpoint id, its type as a pill, and how long ago it was saved."""
+        hero = Text(printable(row.checkpoint_id), style=f"bold {theme.TEXT}")
+        look = _KIND_LOOKS.get(kind, _KIND_LOOKS[None])
+        hero.append("   ")
+        hero.append(f" {look[0]} {(kind or 'type unknown').upper()} ", style=f"bold {theme.BACKGROUND} on {look[1]}")
+        if inferred:
+            hero.append(" from its files", style=f"italic {theme.FAINT}")
         if row.created:
-            created = f"{local_time(row.created, '%Y-%m-%d %H:%M:%S %Z')}  ({views.fmt_ago(row.created, now)})"
+            hero.append(f"   saved {views.fmt_ago(row.created, datetime.now(timezone.utc))}", style=theme.MUTED)
+        return hero
+
+    def _checkpoint_facts(self, row: Checkpoint, step, step_inferred: bool, kind, kind_inferred: bool) -> Text:
+        text = Text()
+        what = {WEIGHTS_ONLY: "model weights only: serves sampling",
+                RESUMABLE: "weights and optimizer state: resumes training"}.get(kind, "not reported")
+        self._fact(text, "Holds", what)
+        if row.created:
+            self._fact(text, "Created", local_time(row.created, "%Y-%m-%d %H:%M:%S %Z"))
         else:
-            created = printable(row.created_at or "—")
-        self._field(text, "Created", created)
-        self._field(text, "Global step", Text(f"{step}" if step is not None else "—").append(
-            "  (from its files)" if step_inferred else "", style="dim italic"))
-        self._field(text, "Loss", fmt_loss(row.loss))
+            self._fact(text, "Created", printable(row.created_at or "—"))
+        step_value = Text("—" if step is None else str(step), style=theme.TEXT)
+        if step_inferred:
+            step_value.append("  from its files", style=f"italic {theme.FAINT}")
+        self._fact(text, "Global step", step_value)
+        self._fact(text, "Loss", fmt_loss(row.loss), theme.TEXT if row.loss is not None else theme.FAINT)
         for key, value in sorted(row.extra.items()):
-            self._field(text, printable(key), extra_text(value))
+            self._fact(text, printable(key), extra_text(value))
         files = self._ckpt_files.get(row.checkpoint_id)
         if isinstance(files, FilesInfo):
-            self._field(text, "Files", f"{len(files.files)} · {fmt_bytes(files.total_bytes)}")
+            self._fact(text, "Files", f"{len(files.files)} · {fmt_bytes(files.total_bytes)}")
+            width = max((len(printable(name)) for name, _ in files.files), default=0)
             for name, size in files.files:
-                text.append(f"{'':<{self._CHECKPOINT_LABEL}}{printable(name)}", style="dim")
-                text.append(f"  {fmt_bytes(size)}\n", style="dim")
+                text.append(f"\n{'':<{self._LABEL}}{printable(name):<{width}}  ", style=theme.FAINT)
+                text.append(f"{fmt_bytes(size):>8}", style=theme.MUTED)
         elif isinstance(files, str):
-            self._field(text, "Files", f"unavailable: {files}", style="red")
+            self._fact(text, "Files", f"unavailable: {files}", theme.ERR_TEXT)
         elif row.checkpoint_id in self._ckpt_reading_files:
-            self._field(text, "Files", "reading…", style="dim")
-
-        self._heading(text, "Saved by")
-        self._field(text, "Job", f"{job_id}  ({views.status_word(self._job.get('status'))})")
-        trainers = training_sub_jobs(self._job)
-        for sj in trainers:
-            model = sj.get("model_name") or ""
-            self._field(text, "Sub-job" if len(trainers) == 1 else "Training sub-job",
-                        "  ".join(printable(part) for part in (sj.get("sub_job_id") or "—", model) if part))
-
-        configs = [sj for sj in trainers if isinstance(sj.get("training_config"), dict)]
-        if configs:
-            self._heading(text, "Training configuration (the job's, as submitted)")
-            for sj in configs:
-                if len(configs) > 1:
-                    text.append(f"  {printable(sj.get('sub_job_id') or '')}\n", style="bold")
-                shown = {key: sj[key] for key in ("model_name", "dtype", "seed") if key in sj}
-                shown.update(sj["training_config"])
-                for line in json.dumps(compact_numbers(views.printable_data(shown)), indent=2, sort_keys=True,
-                                       default=str).splitlines():
-                    text.append(f"    {line}\n")
-
-        self._heading(text, "Start a new job from it")
-        reasons = self._checkpoint_use_reasons(row, kind)
-        for use, label in USES.items():
-            why = reasons[use]
-            text.append(f"  {label:<20}", style="bold" if why is None else "dim")
-            text.append(why or self._USE_HELP[use], style="dim")
-            text.append("\n")
-        copied = self._ckpt_copied
-        if copied is not None and copied[0] == row.checkpoint_id:
-            text.append(f"\n  Copied to the clipboard ({USES[copied[1]]}):\n", style="dim")
-            self._command(text, [copied[2]])
+            self._fact(text, "Files", "reading…", theme.MUTED)
         return text
+
+    def _render_copied(self, row: Checkpoint) -> None:
+        """The box under the card with the command a button copied, in the callout's style."""
+        box = self.query_one("#checkpoint-copied", Static)
+        copied = self._ckpt_copied
+        box.display = copied is not None and copied[0] == row.checkpoint_id
+        if not box.display:
+            return
+        _cid, use, command = copied
+        box.styles.border = ("round", theme.ACCENT)
+        box.border_title = Content.styled(f" ⧉ Copied: a new {USES[use]} job ", f"bold {theme.ACCENT}")
+        box.border_subtitle = Content.styled(" paste it into a shell to submit ", theme.MUTED)
+        body = Text(self._USE_HELP[use].removeprefix("copies the command for ").capitalize() + "\n",
+                    style=theme.MUTED)
+        body.append(command, style=theme.TEXT)
+        box.update(body)
+
+    def _checkpoint_origin(self) -> Text:
+        text = Text()
+        job = self._job
+        status = Text(f"{theme.status_look(job.get('status')).glyph} {views.status_word(job.get('status')).upper()}",
+                      style=theme.status_style(job.get("status")) or theme.MUTED)
+        self._fact(text, "Job", Text(printable(self._job_id), style=theme.TEXT).append("   ").append_text(status))
+        trainers = training_sub_jobs(job)
+        for sj in trainers:
+            self._fact(text, "Sub-job" if len(trainers) == 1 else "Training",
+                       "  ".join(printable(part) for part in (sj.get("sub_job_id") or "—", sj.get("model_name"))
+                                 if part))
+        configs = [sj for sj in trainers if isinstance(sj.get("training_config"), dict)]
+        for sj in configs:
+            shown = {key: sj[key] for key in ("model_name", "dtype", "seed") if key in sj}
+            shown.update(sj["training_config"])
+            lines = json.dumps(compact_numbers(views.printable_data(shown)), indent=2, sort_keys=True,
+                               default=str).splitlines()
+            label = "Config" if len(configs) == 1 else f"Config {printable(sj.get('sub_job_id') or '')}"
+            self._fact(text, label, "the job's, as submitted", theme.FAINT)
+            for line in lines:
+                text.append(f"\n{'':<{self._LABEL}}{line}", style=theme.TEXT)
+        return text
+
+
+# A checkpoint type's glyph and color, as a status's (theme.STATUS_LOOKS).
+_KIND_LOOKS = {WEIGHTS_ONLY: ("●", theme.OK), RESUMABLE: ("◆", theme.INFO), None: ("?", theme.ENDED)}
+
+
+def _kind_badge(kind: str | None, *, inferred: bool = False) -> Text:
+    """``● weights-only``: a checkpoint type in its color; italic when read from its files."""
+    glyph, color = _KIND_LOOKS.get(kind, _KIND_LOOKS[None])
+    if kind is None:
+        return Text("—", style=theme.FAINT)
+    return Text(f"{glyph} {kind}", style=color + (" italic" if inferred else ""))
