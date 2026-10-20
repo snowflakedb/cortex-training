@@ -41,6 +41,7 @@ from cortex_training.tui.format import _num as compact_number
 from cortex_training.tui.format import cut_cells
 from cortex_training.tui.format import _subjob_config as subjob_config
 from cortex_training.tui.format import format_created_at
+from cortex_training.tui.format import local_time
 from cortex_training.tui.format import parse_ts  # noqa: F401 - views.parse_ts for the screens
 from cortex_training.tui.format import printable
 from cortex_training.tui.format import source_label
@@ -470,32 +471,154 @@ def subjob_config_summary(sj: dict) -> str:
     return " · ".join(bits)
 
 
-def summary_fields(job: dict, now: datetime) -> list:
-    """(label, value) rows for the job preview, in display order."""
-    models = job_models(job)
-    elapsed = job_elapsed(job, now)
-    # Elapsed runs from creation, so it includes any time spent queued or placing.
-    if is_unknown(job):
-        note = "includes queue time; status unavailable"
-    elif is_live(job):
-        note = f"includes queue time; {status_word(job.get('status'))}, so far"
-    else:
-        note = "includes queue time"
+def preview_facts(job: dict, now: datetime) -> list:
+    """(label, value) facts for the job preview's grid, in display order.
+
+    The id, status and elapsed time head the preview, and its lifecycle has a
+    row of its own, so they are not here. A time the job record lacks is ``—``,
+    with no "ago" after it.
+    """
     location = location_label(job)
     # The age only beside a time that is shown: a dash has none.
     updated, ago = format_created_at(job.get("updated_at")) or "—", fmt_ago(job.get("updated_at"), now)
     return [
-        ("Job ID", job_id_of(job)),
-        *([("Location", location)] if location else []),
-        ("Status", status_word(job.get("status")).upper()),
-        ("Model", ", ".join(models) or "—"),
+        ("Model", ", ".join(job_models(job)) or "—"),
         ("Type", job_type_label(job)),
-        ("Owner", owner(job)),
         ("GPUs", gpu_request_text(job)),
+        ("Owner", owner(job)),
         ("Created", format_created_at(job.get("created_at")) or "—"),
-        ("Elapsed", fmt_duration(elapsed) + (f"  ({note})" if elapsed is not None else "")),
         ("Last update", f"{updated}  ({ago})" if "—" not in (updated, ago) else updated),
+        *([("Location", location)] if location else []),
     ]
+
+
+def elapsed_text(job: dict, now: datetime) -> str:
+    """The time beside the preview's status: ``12m 04s so far`` while the job is
+    live, ``lasted 1h 20m`` once it ended, ``""`` without a creation time.
+
+    It runs from creation (:func:`job_elapsed`), so it includes any time spent
+    queued or placing: "lasted", not "ran", since a job may never have run.
+    """
+    seconds = job_elapsed(job, now)
+    if seconds is None:
+        return ""
+    return f"{fmt_duration(seconds)} so far" if is_live(job) else f"lasted {fmt_duration(seconds)}"
+
+
+def short_time(raw: Any, now: datetime) -> str:
+    """A local ``YYYY-MM-DD HH:MM``, without the date when it is the same local
+    day as ``now`` (``15:14``, or ``2026-10-12 16:02``); ``—`` without a time."""
+    dt = raw if isinstance(raw, datetime) else parse_ts(raw)
+    text = local_time(dt) if dt else ""
+    if not text:
+        return "—"
+    return text[11:] if text[:10] == local_time(now)[:10] else text
+
+
+@dataclass(frozen=True)
+class LifeStep:
+    """One step of a job's lifecycle on the preview."""
+
+    status: str  # a status word (drawn with its glyph and color), or "created" / "now"
+    label: str
+    at: str = ""  # when the step began, "" when the job record has no time for it
+    then: str = ""  # how long until the next step, "" when the record can't tell
+
+
+def lifecycle(job: dict, now: datetime) -> list:
+    """The :class:`LifeStep` s from the job's creation to its current state, and on
+    to now while it is live.
+
+    The job record has two times: ``created_at`` and ``state_changed_at``, when
+    it entered its current status. So there are no steps for the states between
+    (a running job's time pending and placing is in its first gap), and none for
+    a time the record lacks; an ended job's current state began when it ended.
+    An ``unknown`` job's state has no time: the service could not read it.
+    """
+    created = parse_ts(job.get("created_at"))
+    word = status_word(job.get("status"))
+    changed = parse_ts(job.get("state_changed_at")) if word != "unknown" else None
+    steps = []
+    if created:
+        gap = (changed - created).total_seconds() if changed else None
+        steps.append(LifeStep("created", "Created", short_time(created, now),
+                              fmt_duration(gap) if gap is not None and gap >= 1 else ""))
+    if word == "unknown":
+        return [*steps, LifeStep("unknown", "status unavailable")]
+    name = word.capitalize()
+    if not changed:
+        return [*steps, LifeStep(word, name)]
+    if not is_live(job):
+        return [*steps, LifeStep(word, name, f"{short_time(changed, now)} ({fmt_ago(changed, now)})")]
+    so_far = (now - changed).total_seconds()
+    if created and abs((changed - created).total_seconds()) < 1:
+        # In this state since it was created (a job still pending): one step says both.
+        steps, name = [], f"Created, {word}"
+    return [*steps, LifeStep(word, f"{name} since", short_time(changed, now),
+                             f"{fmt_duration(so_far)} so far" if so_far >= 0 else ""),
+            LifeStep("now", "now")]
+
+
+# What a waiting job is doing, by state, when the service sends no reason_details.
+WAITING_TEXT = {
+    "pending": "waiting to be placed on GPUs",
+    "queued": "waiting to be placed on GPUs",
+    "creating": "waiting to be placed on GPUs",
+    "placing": "waiting for its GPUs to come up",
+    "initializing": "placed on GPUs; loading the model and starting the engines",
+}
+_NO_LOGS = "It never got GPUs, so no sub-job started or wrote logs."
+
+
+@dataclass(frozen=True)
+class Callout:
+    """Why a job is where it is, for the preview's callout box."""
+
+    tone: str  # "failed", "waiting", "starting", "running", "ended" or "unknown": its color
+    status: str  # the status word whose glyph leads the title
+    title: str
+    reason: str = ""  # the service's reason code
+    details: str = ""  # the service's reason_details, or what the state means
+    hint: str = ""  # where to look next
+
+
+def health_callout(job: dict) -> Optional[Callout]:
+    """The preview's callout for ``job``, or ``None`` for a running job the
+    service says nothing more about (its status pill says it all).
+
+    The service's ``reason`` and ``reason_details`` show the same way for every
+    state; a failure always gets a reason (``not reported``).
+    """
+    word = status_word(job.get("status"))
+    reason, details = collapse(job.get("reason") or ""), collapse(job.get("reason_details") or "")
+    no_logs = _NO_LOGS if never_started(job) else ""
+    if word == "failed":
+        if no_logs:
+            return Callout("failed", word, "Failed before it got GPUs", reason or "not reported", details, no_logs)
+        return Callout("failed", word, "Why it failed", reason or "not reported", details,
+                       "l opens Logs: pick the failing sub-job on the left.")
+    if word in ("cancelled", "canceled"):
+        return Callout("ended", word, "Cancelled", reason, details, no_logs)
+    if word == "terminated":
+        return Callout("ended", word, "Terminated by the platform", reason, details, no_logs)
+    if word in ("succeeded", "completed", "done"):
+        return Callout("ended", word, "Completed", reason, details)
+    if word in WAITING_TEXT:
+        # The service says why a job waits (e.g. quota_filled) and, often, how far
+        # off it is; without that, what the state means.
+        title = "Starting up" if word == "initializing" else "Placing on GPUs" if word == "placing" \
+            else "Why it's waiting"
+        return Callout("starting" if word == "initializing" else "waiting", word, title, reason,
+                       details or WAITING_TEXT[word])
+    if word == "unknown":
+        # The service could not read the job's live state: it may still be running,
+        # unless the service says the control plane has no record of the job.
+        hint = "" if job_not_found(job) else "The job may still be running."
+        return Callout("unknown", word, "Status unavailable", details=status_unavailable_text(job), hint=hint)
+    if word == "running":
+        return Callout("running", word, "Running", reason, details) if reason or details else None
+    # A status this client doesn't know: the service's reason, if it sent one.
+    return Callout("unknown", word, word.capitalize(), reason, details) if reason or details else None
 
 
 def reason_text(job: dict) -> str:

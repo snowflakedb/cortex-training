@@ -1296,11 +1296,12 @@ async def _run_last_updated():
         assert app.screen._last_line_at is not None
         assert "read-only" not in app.sub_title  # dropped from the subtitle
         assert "RUNNING" in app.sub_title  # job status now on this line
-        # The summary line is reserved for static config — no status word there.
+        # The summary line under the title is the job's identity: its status as a
+        # badge (glyph and word), beside its type and scope chips.
         from textual.widgets import Static
 
         summary = str(app.screen.query_one("#summary", Static).render())
-        assert "RUNNING" not in summary
+        assert "● RUNNING" in summary and "all sub-jobs" in summary
         await _settle(app, pilot)
 
 

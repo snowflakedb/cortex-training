@@ -27,6 +27,7 @@ from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.content import Content
+from textual.containers import Vertical
 from textual.containers import VerticalScroll
 from textual.screen import Screen
 from textual.widgets import DataTable
@@ -36,7 +37,6 @@ from textual.widgets import Static
 
 from cortex_training.tui import theme
 from cortex_training.tui import views as v
-from cortex_training.tui.widgets import ENDED_STYLE
 from cortex_training.tui.widgets import KEYS_BINDING
 from cortex_training.tui.widgets import FollowsPointer
 from cortex_training.tui.logs import LogScreen
@@ -47,36 +47,12 @@ from cortex_training.tui.widgets import close_keys_panel
 from cortex_training.tui.widgets import hanging
 from cortex_training.tui.widgets import is_shown
 
-STATUS_STYLE = {
-    "running": "bold green",
-    "initializing": "yellow",
-    "placing": "yellow",
-    "pending": "yellow",
-    "queued": "yellow",
-    "creating": "yellow",
-    "failed": "bold red",
-    "error": "bold red",
-    "cancelled": ENDED_STYLE,
-    "canceled": ENDED_STYLE,
-    "terminated": ENDED_STYLE,
-    "done": ENDED_STYLE,
-    "succeeded": ENDED_STYLE,
-    "completed": ENDED_STYLE,
-    "unknown": "yellow",
-}
-# What a waiting job is doing, by state, when the service sends no reason_details.
-_WAITING = {
-    "pending": "waiting to be placed on GPUs",
-    "queued": "waiting to be placed on GPUs",
-    "creating": "waiting to be placed on GPUs",
-    "placing": "waiting for its GPUs to come up",
-    "initializing": "placed on GPUs; loading the model and starting the engines",
-}
-
-
 def status_text(status) -> Text:
+    """A status as the sub-job table shows it, a badge: ``● RUNNING``, in the
+    theme's glyph and color for it (:func:`~cortex_training.tui.theme.status_badge`)."""
     word = v.status_word(status)
-    return Text(word.upper(), style=STATUS_STYLE.get(word, ""))
+    look = theme.status_look(status)
+    return Text.assemble((f"{look.glyph} ", look.color), (word.upper(), look.style)) if word != "?" else Text("?")
 
 
 _SUBJOB_COLUMNS = ("Sub-job", "Type", "Status", "Model", "GPUs", "Config")
@@ -141,6 +117,23 @@ class JobSummaryScreen(FollowsPointer, Screen):
         Binding("e", "collapse_values", "Less text"),
     ]
 
+    # Cards: the job (its head, facts and lifecycle), the callout (its border
+    # colored by _render_health) and the sub-jobs; _inner_width counts the cells
+    # their borders and paddings take. The scrollbar's room is kept while the
+    # preview fits, so its text never changes width (and re-wraps at the edge)
+    # when a refresh makes it scroll.
+    DEFAULT_CSS = """
+    #summary-body { padding: 0 1; scrollbar-gutter: stable; scrollbar-size-vertical: 1; }
+    #job-card { height: auto; border: round $border; padding: 0 1; }
+    #hero { height: auto; margin-bottom: 1; }
+    #preview, #fetch { height: auto; }
+    #health { height: auto; margin-top: 1; padding: 0 1; border-title-align: left; }
+    #subjobs-card { height: auto; margin-top: 1; border: round $border; padding: 0 1;
+                    border-title-align: left; border-subtitle-align: right; }
+    #subjobs { height: auto; max-height: 12; }
+    #subjobs > .datatable--header { background: $surface; color: $text-muted; }
+    """
+
     def __init__(self, client, job_id: str, *, job: dict | None = None,
                  poll_interval: float = 1.0, on_job=None) -> None:
         """``on_job(record)`` is called with the job each time a fresh read of it
@@ -164,11 +157,13 @@ class JobSummaryScreen(FollowsPointer, Screen):
     def compose(self) -> ComposeResult:
         yield Header(icon=theme.BRAND_ICON)
         with VerticalScroll(id="summary-body"):
-            yield Static("", id="preview")
-            yield Static("", id="fetch")  # reading, refreshing, or why the copy shown is older
-            yield Static("", id="health")
-            yield Static("", id="subjobs-title")  # says what a click on a row opens
-            yield SelectableTable(id="subjobs", cursor_type="row", zebra_stripes=True)  # its text highlights to copy
+            with Vertical(id="job-card"):
+                yield Static("", id="hero")  # the job id, status pill, elapsed time and next steps
+                yield Static("", id="preview")  # the facts and the lifecycle
+                yield Static("", id="fetch")  # reading, refreshing, or why the copy shown is older
+            yield Static("", id="health")  # why the job is where it is
+            with Vertical(id="subjobs-card"):  # its border says what Enter on a row opens
+                yield SelectableTable(id="subjobs", cursor_type="row")  # its text highlights to copy
         yield Footer()
 
     _REFRESH_SECONDS = 60
@@ -192,33 +187,36 @@ class JobSummaryScreen(FollowsPointer, Screen):
         if reread and v.is_live(self._job):
             self._start_fetch()
 
-    _LABEL_WIDTH = 15  # "  " + a 12-column label + " "
+    # The grid's label column: a 12-cell label and a space. Its values wrap
+    # under where they start.
+    _LABEL_WIDTH = 13
+    _GUTTER = 4  # between the grid's two columns
+    # Two columns of facts from this many cells inside the card: each value then
+    # has at least 28 cells ("16 × B200 requested", a model name).
+    _TWO_COLUMNS_FROM = 2 * (_LABEL_WIDTH + 28) + _GUTTER
+    _TITLE_LEAST = 12  # the fewest cells the job id is cut to, to keep the status beside it
 
-    def _value_width(self) -> int:
-        """Columns left for a preview value after its label (100 before the first layout)."""
+    def _inner_width(self) -> int:
+        """The cells inside the job card (the preview's width); before the first
+        layout, the screen's less the body's padding and scrollbar gutter and the
+        card's border and padding (this screen's CSS)."""
         try:
             width = self.query_one("#preview", Static).size.width
         except Exception:  # noqa: BLE001 - not mounted yet
             width = 0
-        return max(20, (width or 100) - self._LABEL_WIDTH)
+        return max(30, width or self.app.size.width - 7)
 
-    def _value_lines(self, value: str) -> list:
-        """A printable preview value wrapped to its cell-aware column."""
-        width = self._value_width()
-        return [row for line in v.printable(value).split("\n") for row in v.wrap_cells(line, width)]
+    def _value_lines(self, value: str, width: int) -> list:
+        """A printable preview value wrapped to ``width`` cells, by terminal cells."""
+        return [row for line in v.printable(value).split("\n") for row in v.wrap_cells(line, max(10, width))]
 
-    def _cut_rows(self, rows: list, keep: int) -> list:
+    def _cut_rows(self, rows: list, keep: int, width: int) -> list:
         """The first ``keep`` rows, the last ending in ``…``: the value goes on."""
         kept = rows[:keep]
-        kept[-1] = v.fit_cells(f"{kept[-1].rstrip()} …", self._value_width())
+        kept[-1] = v.fit_cells(f"{kept[-1].rstrip()} …", width)
         return kept
 
-    def _value_block(self, rows: list) -> str:
-        """Rows of a value, the continuation rows under the value column."""
-        return ("\n" + " " * self._LABEL_WIDTH).join(rows)
-
     _VALUE_ROWS = 3
-    _MORE = "\n" + " " * _LABEL_WIDTH + "[dim](+$more rows · e shows the whole {what})[/dim]"
 
     def check_action(self, action: str, parameters) -> bool | None:
         if action == "expand_values":
@@ -242,33 +240,15 @@ class JobSummaryScreen(FollowsPointer, Screen):
         if self.app.screen is self:  # a late load must not retitle the details on top
             self.app.sub_title = f"job preview  ·  {v.job_id_of(job)}"
         now = datetime.now(timezone.utc)
-        rows = []
-        long = False
-        for label, value in v.summary_fields(job, now):
-            more = 0  # rows of the value left out
-            if label == "Status":
-                word = v.status_word(job.get("status"))
-                style = STATUS_STYLE.get(word, "")
-                if v.is_unknown(job):  # no live state: the health line below says why
-                    live = "  [yellow]? status unavailable[/yellow]"
-                else:
-                    live = "  [green]● live[/green]" if v.is_live(job) else "  [dim]historical[/dim]"
-                value_markup = (f"[{style}]$value[/]" if style else "$value") + live
-            else:
-                lines = self._value_lines(value)
-                if len(lines) > self._VALUE_ROWS:
-                    long = True
-                    if not self._expanded:
-                        more = len(lines) - self._VALUE_ROWS
-                        lines = self._cut_rows(lines, self._VALUE_ROWS)
-                value = self._value_block(lines)
-                value_markup = (("[b]$value[/b]" if label == "Job ID" else "$value")
-                                + (self._MORE.format(what="value") if more else ""))
-            rows.append(Content.from_markup(f"  [dim]{label:<12}[/dim] {value_markup}", value=value, more=str(more)))
+        width = self._inner_width()
+        # Every value (ids, the service's text) goes in as a styled run, never as
+        # markup, so it shows literally. Each wrapped row's indent is a run of its
+        # own too, so the text after it starts where the indent ends.
+        self.query_one("#hero", Static).update(Content("\n").join(self._hero(width, now)))
+        grid, long = self._grid(v.preview_facts(job, now), width)
+        self.query_one("#preview", Static).update(Content("\n").join(grid + self._lifecycle_rows(now, width)))
         self._render_fetch()
-        width = self._value_width() + self._LABEL_WIDTH
-        health = hanging(self._health(), width, 4)
-        self.query_one("#health", Static).update(health)
+        self._render_health()
 
         table = self.query_one("#subjobs", DataTable)
         subjob_rows = self._subjob_rows(job)
@@ -279,38 +259,130 @@ class JobSummaryScreen(FollowsPointer, Screen):
             wider = sum(w + 2 * table.cell_padding for w in _column_widths(labels, fitted)) > table_width
         long = long or cut
         self._show_table(table, labels, fitted, wider)
-        hints = ["Click a job to open its telemetry dashboard"]
+        # What Enter (or a click on the highlighted row) opens, then the keys for a
+        # table that is cut to fit, or wider than the screen: on the card's border,
+        # so they take no row of their own.
+        hints = ["⏎ opens its Logs"]
         if cut:
             hints.append("e fit to screen" if self._expanded else "e whole table")
         if wider:
             hints.append("← → scroll")
-        title = self._subjobs_title(hints, width)
-        self.query_one("#subjobs-title", Static).update(title)
-        self.query_one("#preview", Static).update(Content("\n").join(rows))
+        card = self.query_one("#subjobs-card")
+        card.border_title = Content.styled(" Sub-jobs ", f"bold {theme.TEXT}")
+        card.border_subtitle = Content.styled(f" {' · '.join(hints)} ", theme.MUTED)
         if long != self._long:
             self._long = long
             self.refresh_bindings()  # e appears in the footer, or goes
 
-    _TITLE = "Sub-jobs  ("
+    # The next steps from here, under the title: the footer has them too, but it
+    # cuts its end on a narrow screen, and these say what each one opens.
+    _ACTIONS = (("l", "Logs"), ("g", "Resources"))
 
-    def _subjobs_title(self, hints: list, width: int) -> Content:
-        """Fit ``Sub-jobs  (hint · hint)`` with hanging continuation lines."""
-        indent = v.cell_width(self._TITLE)
-        rows = [self._TITLE + hints[0]]
-        for hint in hints[1:]:
-            if v.cell_width(rows[-1]) + v.cell_width(f" · {hint})") <= width:
-                rows[-1] += f" · {hint}"
+    def _hero(self, width: int, now: datetime) -> list:
+        """The card's head, as rows: the job id, its status pill and how long it
+        has been going; then the next steps' keys."""
+        job = self._job
+        pill = theme.status_pill(job.get("status"))
+        elapsed = v.elapsed_text(job, now)
+        tail = Content.assemble("   ", pill, *(("   ", (elapsed, theme.MUTED)) if elapsed else ()))
+        rows = []
+        # The id gives way first, down to a few cells; then the time goes under it.
+        if elapsed and width - tail.cell_length < self._TITLE_LEAST:
+            tail = Content.assemble("   ", pill)
+            rows.append(Content.styled(elapsed, theme.MUTED))
+        title = v.fit_cells(v.job_id_of(job) or self._job_id, max(self._TITLE_LEAST, width - tail.cell_length))
+        rows.insert(0, Content.styled(title, f"bold {theme.TEXT}") + tail)
+        actions = Content("   ").join(
+            Content.assemble((key, f"bold {theme.ACCENT}"), (f" {label}", theme.MUTED)) for key, label in self._ACTIONS)
+        return [*rows, actions]
+
+    def _fact_rows(self, label: str, value: str, width: int) -> tuple:
+        """``(rows, long)``: a fact in ``width`` cells, its label, then its value
+        wrapped under the value column and, without e, cut after a few rows with a
+        note saying so; and whether it is too long to show whole."""
+        value_width = max(10, width - self._LABEL_WIDTH)
+        lines = self._value_lines(value, value_width)
+        long = len(lines) > self._VALUE_ROWS
+        more = 0
+        if long and not self._expanded:
+            more = len(lines) - self._VALUE_ROWS
+            lines = self._cut_rows(lines, self._VALUE_ROWS, value_width)
+        pad = Content(" " * self._LABEL_WIDTH)
+        rows = [Content.assemble((f"{label:<{self._LABEL_WIDTH - 1}} ", theme.MUTED), (lines[0], theme.TEXT))]
+        rows += [pad + Content.styled(line, theme.TEXT) for line in lines[1:]]
+        if more:
+            # A cut value says so under it, with the key that shows the rest (a
+            # narrow footer has no room for that key).
+            note = v.fit_cells(f"(+{more} rows · e shows the whole value)", value_width)
+            rows.append(pad + Content.styled(note, theme.FAINT))
+        return rows, long
+
+    def _grid(self, facts: list, width: int) -> tuple:
+        """``(rows, long)``: the facts in two columns, down the first and then the
+        second, when the card is wide enough, else in one."""
+        two = width >= self._TWO_COLUMNS_FROM
+        column = (width - self._GUTTER) // 2 if two else width
+        cells, long = [], False
+        for label, value in facts:
+            rows, cut = self._fact_rows(label, value, column)
+            cells.append(rows)
+            long = long or cut
+        if not two:
+            return [row for rows in cells for row in rows], long
+        half = (len(cells) + 1) // 2
+        left, right = cells[:half], cells[half:] + [[]]
+        # The second column starts just after the first's widest row, so short
+        # values don't leave a gulf between the two.
+        start = max(row.cell_length for rows in left for row in rows) + self._GUTTER
+        out = []
+        for a, b in zip(left, right):  # a pair of facts side by side, as tall as the taller
+            for i in range(max(len(a), len(b))):
+                row = a[i] if i < len(a) else Content("")
+                if i < len(b):
+                    row = row + Content(" " * (start - row.cell_length)) + b[i]
+                out.append(row)
+        return out, long
+
+    _LIFE_GLYPHS = {"created": ("◇ ", theme.MUTED), "now": ("", theme.ACCENT)}  # "now" has the arrow
+
+    def _lifecycle_rows(self, now: datetime, width: int) -> list:
+        """The job's lifecycle (:func:`~cortex_training.tui.views.lifecycle`) in
+        ``width`` cells: its steps joined by arrows that say how long each took, on
+        as few rows as they fit, each row after the first under the value column."""
+        steps = v.lifecycle(self._job, now)
+        if not steps:
+            return []
+        parts = []
+        for before, step in zip([None, *steps], steps):
+            look = theme.status_look(step.status)
+            glyph, color = self._LIFE_GLYPHS.get(step.status, (f"{look.glyph} ", look.color))
+            current = step.status not in self._LIFE_GLYPHS  # the job's own state, in its color
+            # The arrow from the step before, with how long that step took when the record tells.
+            if before is None:
+                arrow = []
+            elif before.then:
+                arrow = [(" ──", theme.FAINT), (f" {before.then} ", theme.MUTED), ("─▸ ", theme.FAINT)]
             else:
-                rows.append(" " * indent + hint)
-        rows[-1] += ")"
-        text = Content("\n").join(hanging(Content(row), width, indent) for row in rows).plain
-        bold = len("Sub-jobs")
-        return Content.styled(text[:bold], "bold") + Content.styled(text[bold:], "dim")
+                arrow = [(" ──▸ ", theme.FAINT)]
+            parts.append(Content.assemble(*arrow, (glyph, color),
+                                          (step.label, f"bold {color}" if current else theme.TEXT),
+                                          *([(f" {step.at}", theme.MUTED)] if step.at else [])))
+        value_width = max(10, width - self._LABEL_WIDTH)
+        lines = [parts[0]]
+        for part in parts[1:]:
+            if lines[-1].cell_length + part.cell_length <= value_width:
+                lines[-1] += part
+            else:
+                lines.append(part[1:])  # a row starts at the connector's line, not a space
+        pad = Content(" " * self._LABEL_WIDTH)
+        label = Content.styled(f"{'Lifecycle':<{self._LABEL_WIDTH - 1}} ", theme.MUTED)
+        return [label + lines[0], *(pad + line for line in lines[1:])]
 
     def _show_table(self, table: DataTable, labels: list, rows: list, wider: bool) -> None:
         """Update changed table rows while retaining cursor and horizontal scroll."""
         shown = (tuple(labels), wider,
-                 tuple((key, tuple((cell.plain, str(cell.style)) for cell in cells)) for key, cells in rows))
+                 tuple((key, tuple((cell.plain, str(cell.spans), str(cell.style)) for cell in cells))
+                       for key, cells in rows))
         if shown == self._table_shown:
             return
         self._table_shown = shown
@@ -328,12 +400,12 @@ class JobSummaryScreen(FollowsPointer, Screen):
         self._scope_by_row = {"all": None}
         rows = [("all", [Text("▸ entire job", style="bold"), Text(v.job_type_label(job)), status_text(job.get("status")),
                          Text(", ".join(v.job_models(job)) or "—"), Text(v.job_gpu_cell(job, "requested")),
-                         Text("all sub-jobs", style="dim")])]
+                         Text("all sub-jobs", style=theme.MUTED)])]
         subs = v.sub_jobs(job)
         if v.is_unknown(job):
-            rows.append(("note", [Text("  ? status unavailable", style="yellow"), Text(""), Text("UNKNOWN", style="yellow"),
+            rows.append(("note", [Text("  ? status unavailable", style=theme.WARN), Text(""), status_text("unknown"),
                                   Text(""), Text(""), Text("configs at creation" if subs else
-                                                           "the service sent no sub-job configs", style="dim")]))
+                                                           "the service sent no sub-job configs", style=theme.MUTED)]))
         for i, sj in enumerate(subs):
             key = f"sj-{i}"
             self._scope_by_row[key] = sj.get("sub_job_id")
@@ -348,7 +420,9 @@ class JobSummaryScreen(FollowsPointer, Screen):
 
     def _table_width(self, table: DataTable, rows: int) -> int:
         """Available table cells, accounting for a needed vertical scrollbar."""
-        width = table.size.width or max(40, self.app.size.width - 6)
+        # Before the first layout: the card's inside, as the job card's (the same
+        # border and padding).
+        width = table.size.width or self._inner_width()
         limit = table.styles.max_height
         if limit is not None and limit.is_cells and rows + 1 > limit.value:
             width -= table.styles.scrollbar_size_vertical
@@ -370,39 +444,31 @@ class JobSummaryScreen(FollowsPointer, Screen):
         else:
             after_refresh(self, body.scroll_to_widget, table, animate=False)
 
-    def _health(self) -> Content:
-        job = self._job
-        word = v.status_word(job.get("status"))
-        reason, details = v.collapse(job.get("reason") or ""), v.collapse(job.get("reason_details") or "")
-        if word == "failed" and not reason:
-            reason = "not reported"  # a failure always gets its reason line
-        why = ("  reason: [b]$reason[/b]" if reason else "") + ((" — $details" if reason else "  $details")
-                                                                 if details else "")
+    # The callout's color, by its tone: red for a failure, amber while waiting (or
+    # when the state is unavailable), calm once the job ended without failing.
+    _TONES = {"failed": theme.ERR, "waiting": theme.WARN, "unknown": theme.WARN, "starting": theme.INFO,
+              "running": theme.OK, "ended": theme.ENDED}
 
-        def line(lead: str, tail: str = "", **values) -> Content:
-            return Content.from_markup(f"  {lead}{why}{tail}", reason=reason, details=details, **values)
-
-        if word == "failed":
-            hint = ("it never got GPUs, so no sub-job started or wrote logs" if v.never_started(job)
-                    else "check Logs (l) for the failing sub-job")
-            return line("[bold red]✖ Job failed[/]", "  — $hint", hint=hint)
-        if word in ("cancelled", "canceled"):
-            return line(f"[{ENDED_STYLE}]■ Cancelled[/]")
-        if word == "terminated":
-            return line(f"[{ENDED_STYLE}]■ Terminated by the platform[/]")
-        if word in ("succeeded", "completed", "done"):
-            return line(f"[{ENDED_STYLE}]■ Completed[/]")
-        if word in _WAITING:
-            return line(f"[yellow]◔ {word.capitalize()}[/]", "" if details else " — $doing", doing=_WAITING[word])
-        if word == "running":
-            return Content.from_markup(
-                "  [green]● Running[/] — logs stream live; resources refresh automatically")
-        if word == "unknown":
-            text = v.status_unavailable_text(job)
-            hint = "" if "not found" in text.lower() else " — the job may still be running"
-            return Content.from_markup(f"  [yellow]? $text[/]{hint}", text=text)
-        # A status this client doesn't know: the service's reason, if it sent one.
-        return Content.from_markup("  " + why.lstrip(), reason=reason, details=details) if why else Content("")
+    def _render_health(self) -> None:
+        """Draw why the job is where it is (:func:`~cortex_training.tui.views.health_callout`)
+        in its box; no box for a running job the service says nothing more about."""
+        box = self.query_one("#health", Static)
+        callout = v.health_callout(self._job)
+        box.display = callout is not None
+        if callout is None:
+            return
+        color = self._TONES.get(callout.tone, theme.WARN)
+        box.styles.border = ("round", color)
+        box.border_title = Content.styled(f" {theme.status_look(callout.status).glyph} {callout.title} ",
+                                          f"bold {color}")
+        lines = []
+        if callout.reason:
+            lines.append(Content.assemble(("reason  ", theme.MUTED), (callout.reason, f"bold {color}")))
+        if callout.details:
+            lines.append(Content.styled(callout.details, theme.TEXT))
+        if callout.hint:
+            lines.append(Content.styled(callout.hint, theme.MUTED))
+        box.update(Content("\n").join(lines))  # wrapped rows stay in the box, under the line's start
 
     def _start_fetch(self) -> None:
         if not self._loading:
@@ -442,7 +508,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
             self._render_fetch()
 
     def _fetch_line(self) -> Content:
-        """The line under the fields: a read in flight, the last one's failure, or when the copy was read."""
+        """The job card's last line: a read in flight, the last one's failure, or when the copy was read."""
         took = ""
         if self._loading and self._fetch_since is not None:
             seconds = int(monotonic() - self._fetch_since)
@@ -450,20 +516,20 @@ class JobSummaryScreen(FollowsPointer, Screen):
         error, at = self._fetch_error or "", self._fetched_at or ""
         if self._loading:
             if error:
-                return Content.from_markup(f"  [dim]refreshing…{took}[/dim]  [yellow](last try: $error)[/yellow]",
+                return Content.from_markup(f"[{theme.FAINT}]refreshing…{took}[/]  [{theme.WARN}](last try: $error)[/]",
                                            error=error)
             if at:
-                return Content.from_markup(f"  [dim]refreshing…{took}  (last read at $at)[/dim]", at=at)
-            return Content.from_markup(f"  [dim]reading the job from the service…{took}[/dim]")
+                return Content.from_markup(f"[{theme.FAINT}]refreshing…{took}  (last read at $at)[/]", at=at)
+            return Content.from_markup(f"[{theme.FAINT}]reading the job from the service…{took}[/]")
         if error:
             # The fields above are the last good copy: this preview's, or the job list's.
             if at:
-                return Content.from_markup("  [yellow]couldn't refresh: $error; showing the copy read at $at[/yellow]",
+                return Content.from_markup(f"[{theme.WARN}]couldn't refresh: $error; showing the copy read at $at[/]",
                                            error=error, at=at)
-            return Content.from_markup("  [yellow]couldn't read the job: $error; showing the job list's copy[/yellow]",
+            return Content.from_markup(f"[{theme.WARN}]couldn't read the job: $error; showing the job list's copy[/]",
                                        error=error)
         if at:
-            return Content.from_markup("  [dim]read from the service at $at[/dim]", at=at)
+            return Content.from_markup(f"[{theme.FAINT}]read from the service at $at[/]", at=at)
         return Content("")
 
     def _render_fetch(self) -> None:
@@ -474,7 +540,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
         content = self._fetch_line()
         line.display = bool(content.plain)  # no blank row before the first read
         # A long error continues under its text, after the two-cell indent.
-        line.update(hanging(content, self._value_width() + self._LABEL_WIDTH, 4))
+        line.update(hanging(content, self._inner_width(), 2))
 
     def action_refresh(self) -> None:
         if self._loading:

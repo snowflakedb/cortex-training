@@ -899,34 +899,57 @@ for. `esc` closes that panel first, before it clears a search or goes back.
 
 #### Job preview
 
-Opening a job shows its id, status, model, type, owner, requested GPUs,
-creation and update times, elapsed time, health, and sub-jobs. `unknown` reads
-`? status unavailable`. Values stop after three rows; `e` expands every value
-and the complete sub-job table, and toggles them short again.
+Opening a job shows it as cards. The job card is headed by its id, its status
+as a colored pill (`unknown` reads `? UNKNOWN`), and how long it has been
+going (`12m 04s so far`, or `lasted 1h 20m` once it ended), with the keys for
+`l Logs` and `g Resources` under it. Its facts follow: model, type, owner,
+requested GPUs, creation and update times, and the location when it is not the
+configured one, in two columns from about 90 columns wide and in one below.
+Values stop after three rows; `e` expands every value and the complete sub-job
+table, and toggles them short again.
 
 **GPUs** sums each sub-job's `n_gpus`, excluding `log_probability` and
-multiplexed sub-jobs that run on another sub-job's GPUs. **Elapsed** includes
-queue and placement time; an `unknown` job runs to now. Missing times show `—`,
-and a clock up to five minutes ahead reads `just now`.
+multiplexed sub-jobs that run on another sub-job's GPUs. The time beside the
+status includes queue and placement time; an `unknown` job runs to now.
+Missing times show `—`, and a clock up to five minutes ahead reads `just now`.
 
-The health line describes running, waiting, completed, cancelled, terminated,
-failed, or unavailable state, followed by current `reason` and
-`reason_details`. The sub-job table shows type, status, model, GPUs and key
-config; multiplexed rows name the source sub-job. Long cells use `…`, narrow
-screens omit Type, and wider tables scroll with `←` / `→` or `Home` / `End`.
+**Lifecycle** runs from `created_at` to `state_changed_at`, the two times the
+job record has, and on to now while the job is live, with how long each step
+took: `◇ Created 15:14 ── 3m 10s ─▸ ● Running since 15:17 ── 9m 02s so far ─▸
+now`, or `◇ Created 2026-10-12 15:41 ── 2h 00m ─▸ ✕ Failed 2026-10-12 17:41
+(5d 22h ago)`. States in between have no time in the record and get no step;
+a live job still in the state it was created in is one step (`○ Created,
+pending since 15:14`). An `unknown` job's state has no time.
+
+A callout box under the job card says where the job stands, titled and colored
+by state: red for a failure (`Why it failed`, or `Failed before it got GPUs`);
+amber while it waits (`Why it's waiting`, `Placing on GPUs`) or while its
+status is unavailable; blue while `initializing` (`Starting up`); gray once it
+was cancelled, terminated or completed. It shows the service's `reason` and
+`reason_details` (a failure always has a reason, `not reported` when none is
+sent), or what the state means, and where to look next. A running job has no
+box unless the service sends a reason. The Sub-jobs card shows type, status
+(a badge such as `● RUNNING`), model, GPUs and key config; multiplexed rows
+name the source sub-job. Long cells use `…`, narrow screens omit Type, and
+wider tables scroll with `←` / `→` or `Home` / `End`; the card's bottom border
+says so (`e whole table`, `← → scroll`).
 
 Live previews refresh every 60 seconds, on return from details, or on `r`; a
-dim line reports reads, slow reads and refresh errors while keeping the last
-copy. `Enter` or a click opens the highlighted entire-job or sub-job scope on
-Logs. `l` and `g` open Logs and Resources directly.
+dim line at the end of the job card reports reads, slow reads and refresh
+errors while keeping the last copy. `Enter` or a click opens the highlighted
+entire-job or sub-job scope on Logs (`⏎ opens its Logs` on the card's border).
+`l` and `g` open Logs and Resources directly.
 
 #### Job details
 
-The line under the title names the job and its scope, and repeats the
-service's `reason` and `reason_details` (or the `unknown` sentence) while it
-sends them. A sub-job's details name it by its id once (`sub-job
-JOB_ID:training:0`). Switch tabs with `l` (Logs) and `g` (Resources), or `t`
-for the next tab.
+The line under the title is the job's identity: its id in bold, its status as
+a badge such as `● RUNNING` (redrawn when the details see the job end), chips
+for its type, models, scope (`all sub-jobs`, or `sub-job training:0`) and
+location when it is not the configured one, then the service's `reason` and
+`reason_details` (or the `unknown` sentence) while it sends them. When the
+line does not fit on one row, the models are cut with `…`, then the id is left
+out (the header names it too). Switch tabs with `l` (Logs) and `g`
+(Resources), or `t` for the next tab.
 
 - **Logs** is the live and historical log view described below. Each line is
   tagged with the sub-job being tailed, for example `training:0 │ …`, and its

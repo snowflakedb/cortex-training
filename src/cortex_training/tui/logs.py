@@ -90,7 +90,6 @@ from cortex_training.tui.resource import ResourceData
 from cortex_training.tui.resource import cached_metric_sources
 from cortex_training.tui.saved_log import committed_size
 from cortex_training.tui.saved_log import read_saved_tail
-from cortex_training.tui.widgets import ENDED_STYLE
 from cortex_training.tui.widgets import _ERROR_LOG
 from cortex_training.tui.widgets import log_traceback
 from cortex_training.tui.widgets import FittedFooter
@@ -416,8 +415,8 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
 
     def _update_subtitle(self) -> None:
         # Dynamic status line: everything that changes over the session lives
-        # here, leaving the #summary line for static config only. The status
-        # comes first, so a narrow header still shows it.
+        # here, leaving the #summary line for the job's identity (its status badge
+        # aside). The status comes first, so a narrow header still shows it.
         if not self._screen_open or self.app.screen is not self:
             return  # a late tail update must not overwrite another screen's subtitle
         bits = []
@@ -467,30 +466,39 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
     _SUMMARY_LEAST = 12
 
     def _render_summary_line(self) -> None:
-        job = self._job
+        job = self._ended_job()  # the newest status and reason: the tail can see the job end first
         job_id = views.job_id_of(job) or self._job_id
-        # A sub-job's id starts with its job's (JOB_ID:TYPE:INDEX): name it once.
+        # A sub-job's id starts with its job's (JOB_ID:TYPE:INDEX): the chip names
+        # the rest, beside the job's id.
         if not self._sub_job_id:
-            ids = [job_id, "all sub-jobs"]
+            scope = "all sub-jobs"
         elif str(self._sub_job_id).startswith(f"{job_id}:"):
-            ids = [f"sub-job {self._sub_job_id}"]
+            scope = f"sub-job {str(self._sub_job_id)[len(job_id) + 1:]}"
         else:
-            ids = [job_id, f"sub-job {self._sub_job_id}"]
+            scope = f"sub-job {self._sub_job_id}"
         # Why the job is where it is, in the service's words: reason and reason_details,
         # or the sentence it sends when the job's status is unavailable.
         why = views.status_unavailable_text(job) if views.is_unknown(job) else views.reason_text(job)
         word = views.status_word(job.get("status"))
-        style = "red" if word == "failed" else "yellow" if views.is_live(job) else ENDED_STYLE
+        style = theme.ERR if word == "failed" else theme.WARN if views.is_live(job) else theme.ENDED
         # Where the job is (its calls go there), when the account-wide list says it is
         # somewhere other than the configured location.
         location = views.location_label(job) if self.app.job_elsewhere(job) else ""
         least = self._SUMMARY_LEAST
-        # The models are cut to keep the line on one row; the ids,
-        # the location and the reason stay whole.
-        segments = [*((text, "", None) for text in ids),
-                    (views.job_type_label(job), "", None), (", ".join(views.job_models(job)) or "—", "", least),
-                    *([(location, "", None)] if location else []), *([(why, style, None)] if why else [])]
-        self._set_summary(fit_line(segments, self._summary_width()))
+        # The job id in bold, its status badge, then chips for what the job is, and
+        # the reason. The models are cut to keep the line on one row; the rest stays whole.
+        segments = [(job_id, f"bold {theme.TEXT}", None, False), theme.status_badge(job.get("status")),
+                    (views.job_type_label(job), "", None, True),
+                    (", ".join(views.job_models(job)) or "—", "", least, True),
+                    (scope, "", None, True), *([(location, "", None, True)] if location else []),
+                    *([(why, style, None, False)] if why else [])]
+        width = self._summary_width()
+        line = fit_line(segments, width)
+        if "\n" in line.plain:
+            # The header's subtitle names the job too: a narrow line leaves the id
+            # out rather than wrap.
+            line = fit_line(segments[1:], width)
+        self._set_summary(line)
 
     def _summary_width(self) -> int:
         """The cells the summary line has: the screen's, less its padding, before the first layout."""
@@ -1485,6 +1493,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         if reason is not None:
             self._job_reason = reason
         self._update_subtitle()
+        self._render_summary_line()  # the status badge, and the reason beside it
         if self._resource_active():
             self._render_resource()
 

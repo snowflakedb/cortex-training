@@ -243,10 +243,7 @@ class CortexTrainingLogTUI(App):
     #resource-status { color: $text-muted; height: auto; dock: top; }
     #resource-stats { height: auto; margin-top: 1; }
     #resource-charts { height: auto; margin-top: 1; text-wrap: nowrap; text-overflow: clip; }
-    #summary-body { padding: 1 1; scrollbar-gutter: stable; }
-    #health { height: auto; margin: 1 0; }
-    #subjobs-title { height: auto; margin-top: 1; }
-    #subjobs { height: auto; max-height: 12; margin: 0 1; }
+    /* The job preview's layout is JobSummaryScreen.DEFAULT_CSS (screens.py). */
     LogScreen > .screen--selection {
         background: $block-cursor-blurred-background;
         color: $block-cursor-blurred-foreground;

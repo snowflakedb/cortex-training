@@ -244,6 +244,9 @@ class DemoClient:
             created = self.now - age
             ended = created + duration if duration else None
             updated = ended or self.now - timedelta(seconds=self._rng.randint(4, 40))
+            # When the job entered its status: when it ended; a running job a few
+            # minutes after creation (its time pending and placing); else creation.
+            placed = created + min(age / 10, timedelta(minutes=4)) if status == "RUNNING" else created
             counts: dict = {}
             sub_jobs = []
             for sj in subs:
@@ -253,7 +256,7 @@ class DemoClient:
                 sub_jobs.append({"sub_job_id": f"{jid}:{t}:{i}", "status": status, **json.loads(json.dumps(sj))})
             self._jobs.append({
                 "job_id": jid, "status": status, "reason": reason, "created_at": _iso(created),
-                "updated_at": _iso(updated), "state_changed_at": _iso(ended or updated), "sub_jobs": sub_jobs,
+                "updated_at": _iso(updated), "state_changed_at": _iso(ended or placed), "sub_jobs": sub_jobs,
                 "image_tag": "release_demo", "hardware": hw, "owner_role": "ML_RESEARCH",
                 "submitted_by": self._rng.choice(["USER_A", "USER_B", "USER_A", "USER_C"]),
                 "idle_timeout_seconds": 1800, "pending_timeout_seconds": 86400,
