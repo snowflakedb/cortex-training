@@ -360,6 +360,7 @@ class JobListScreen(FollowsPointer, Screen):
         self._headers: dict[str, tuple] = {}  # LIVE/HISTORY -> ((count, so_far, layout), cells)
         self._keys: dict[tuple, str] = {}  # job key -> its row's table key
         self._shown: tuple | None = None  # what the table holds: (layout, ((row key, cells), ...))
+        self._placed_key: str | None = None  # the row the last render put the cursor on
 
     def _job_key(self, job: dict) -> tuple:
         return views.job_key(job, self._clients.home)
@@ -1235,11 +1236,17 @@ class JobListScreen(FollowsPointer, Screen):
         keep_sub = None
         keep_header = None
         anchor = None
+        at_top = False
         if keep is None and not top:
             key, keep = self._highlighted()
             keep_sub = self._sub_by_item.get(key)  # a sub-job row keeps its own cursor
             if steady and key is not None and table.display and table.row_count:
-                anchor = (key, table.cursor_row - round(table.scroll_y), table.scroll_x)
+                # The list grows. Where the reader has moved (the cursor off the row the list
+                # put it on, or the view scrolled), the highlighted row stays on its line;
+                # where not, the list stays at its top.
+                at_top = round(table.scroll_y) == 0 and key == self._placed_key
+                if not at_top:
+                    anchor = (key, table.cursor_row - round(table.scroll_y), table.scroll_x)
                 if str(key).startswith("hdr-"):
                     keep_header = key  # so does a LIVE/HISTORY row, while the list grows
         recent = self._recent()
@@ -1355,7 +1362,13 @@ class JobListScreen(FollowsPointer, Screen):
         if target_row is None:
             target_row = 1  # first job row (row 0 is a group header)
         target_row = min(target_row, table.row_count - 1)
-        if anchor is not None:
+        self._placed_key = plan[target_row][0] if 0 <= target_row < len(plan) else None
+        if at_top:
+            # The reader hasn't moved: the list stays at its top, where new live jobs show.
+            table.move_cursor(row=target_row, animate=False, scroll=False)
+            table.scroll_to(x=table.scroll_x, y=0, animate=False, immediate=True)
+            after_refresh(self, self._keep_top)
+        elif anchor is not None:
             # The highlighted row stays on its line.
             table.move_cursor(row=target_row, animate=False, scroll=False)
             after_refresh(self, self._keep_view, *anchor)
@@ -1365,6 +1378,12 @@ class JobListScreen(FollowsPointer, Screen):
             after_refresh(self, self._place_cursor, target_row)
         elif not same or top or table.cursor_row != target_row:
             self._place_cursor(target_row)
+
+    def _keep_top(self) -> None:
+        """After the list grew, the reader not having moved: its top stays in view (a refill scrolls home)."""
+        table = self.query_one("#jobs", DataTable)
+        if table.scroll_y:
+            table.scroll_to(y=0, animate=False, immediate=True)
 
     def _keep_view(self, key: str, on_screen: int, scroll_x: float, tries: int = 10) -> None:
         """After the list grew: scroll so the row ``key`` is ``on_screen`` rows below the top

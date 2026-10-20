@@ -4076,13 +4076,13 @@ class _PagedDemo(DemoClient):
     """A demo whose account-wide pages answer one per ``release()`` while ``gated``. For the
     newest jobs' walk: ``fail_at`` is the page (1 is the first) that fails, ``unavailable_at``
     the one that answers the list is not deployed, ``bad_token_at`` the one whose token the
-    service can't open (once). ``schema_fails``: the configured schema's list fails. ``pages``
-    counts the pages asked for."""
+    service can't open (once), ``running_at`` the one whose first job is running. ``schema_fails``:
+    the configured schema's list fails. ``pages`` counts the pages asked for."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.gated = False
-        self.fail_at = self.unavailable_at = self.bad_token_at = None
+        self.fail_at = self.unavailable_at = self.bad_token_at = self.running_at = None
         self.schema_fails = False
         self.pages = 0
         self._permits = threading.Semaphore(0)
@@ -4110,7 +4110,10 @@ class _PagedDemo(DemoClient):
             if page == self.bad_token_at:
                 self.bad_token_at = None
                 raise InvalidPageToken("400 Invalid page_token")
-        return super().list_jobs_page(**kwargs)
+        answer = super().list_jobs_page(**kwargs)
+        if page == self.running_at and not kwargs.get("status") and answer["jobs"]:
+            answer["jobs"][0]["status"] = "RUNNING"  # an older job still running: it shows under LIVE
+        return answer
 
 
 def _info_text(screen) -> str:
@@ -4216,6 +4219,42 @@ async def _run_a_cursor_on_a_group_row_stays_on_it_as_pages_come():
             assert table.cursor_row - round(table.scroll_y) == line
         client.release(10)
         await _settle(app, pilot)
+
+
+async def _run_a_list_the_reader_has_not_moved_stays_at_its_top_as_live_jobs_come():
+    client = _PagedDemo()
+    client.running_at = 3  # an older job still running comes on page 3, above the cursor
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        client.gated = True
+        await pilot.press("a")
+        client.release()
+        assert await _pause_until(pilot, lambda: screen._scope.loading, seconds=10.0)
+        # The list puts the cursor on a history job (as it keeps the one a schema list had).
+        first_ended = next(j for j in views.sort_job_list(screen._all_jobs, "created", True) if not views.is_live(j))
+        screen._render_jobs(keep=screen._job_key(first_ended))
+        await pilot.pause(0.3)
+        key = screen._highlighted()[0]
+        assert table.scroll_y == 0 and screen._job_by_item.get(key) == screen._job_key(first_ended)
+        client.release(2)
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 3 * client._ACCOUNT_PAGE_ROWS,
+                                  seconds=10.0)
+        await pilot.pause(0.3)
+        late = next(job for job in screen._all_jobs if views.is_live(job) and screen._job_key(job) not in {
+            screen._job_key(j) for j in views.sort_job_list(screen._all_jobs, "created", True)[:10]})
+        assert table.get_row_index(screen._row_key(screen._job_key(late))) < table.cursor_row  # it came above
+        assert table.max_scroll_y > 0  # and the list is taller than the view
+        assert table.scroll_y == 0 and screen._highlighted()[0] == key  # LIVE, all of it, still in view
+        client.release(10)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        await pilot.pause(0.3)
+        assert table.scroll_y == 0 and screen._highlighted()[0] == key
+        await _settle(app, pilot)
+
+
+def test_a_list_the_reader_has_not_moved_stays_at_its_top_as_live_jobs_come():
+    asyncio.run(_run_a_list_the_reader_has_not_moved_stays_at_its_top_as_live_jobs_come())
 
 
 def test_a_cursor_on_a_group_row_stays_on_it_as_pages_come():
