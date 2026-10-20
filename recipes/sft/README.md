@@ -172,7 +172,7 @@ uses the same mesh. These recipes set `model_provider` to `prime_rl`.
 The Nemotron-3-Nano and Nemotron-3.5-Lightning SFT and RL training
 recipes are 256K on 8 GPUs, SP8, EP4. Their sampling and inference
 configs are 8 GPUs at TP8 and 256K. The GLM-5.3-Flash LoRA recipe is attention-only LoRA on the FP8 checkpoint,
-DeepEP at EP8. The BF16 recipe keeps UCCL at EP32.
+DeepEP at EP8. The BF16 full-parameter recipe uses a 16-GPU mesh with UCCL.
 
 - `glm45_air.json`: GLM-4.5-Air, 8 GPUs, SP8, EP4, 128K
 - `qwen38_flash_next.json`: Qwen3.8-Flash-Next, 8 GPUs, SP8, EP8, 256K, `qsa_flex`, bf16 Adam state. One AdamW step completed on H200. Peak device memory was about 115 GiB.
@@ -180,7 +180,7 @@ DeepEP at EP8. The BF16 recipe keeps UCCL at EP32.
 - `nemotron3_nano_30b.json`: Nemotron-3-Nano-30B-A3B-BF16, 8 GPUs, SP8, EP4, 256K. One AdamW step completed on H200, including a packed batch. Mamba context parallel resets at sequence boundaries.
 - `nemotron35_lightning_30b.json`: Nemotron-3.5-Lightning-30B-A3B-BF16, 8 GPUs, SP8, EP4, 256K. One AdamW step completed on H200, including a packed batch. MTP weights are not trained.
 - `glm53_flash_lora.json`: GLM-5.3-Flash FP8 checkpoint, attention-only LoRA (rank 32 on `q_a_proj`, `q_b_proj`, `kv_a_proj_with_mqa`, `kv_b_proj`, `o_proj`), learning rate 1e-4, fused cross-entropy off. 8 GPUs, SP8, EP8, 256K, DeepEP, DeepEP token chunk 8192, tiled MLP chunk 1024. One AdamW step at 256K completed on H200.
-- `glm53_flash_bf16.json`: GLM-5.3-Flash-BF16, 64 GPUs, SP64, EP32, 256K, UCCL, tiled MLP chunk 512. This is an unproven capacity estimate based on the FP8 run; the BF16 checkpoint has not completed its own 256K step.
+- `glm53_flash_bf16.json`: GLM-5.3-Flash-BF16 full-parameter SFT, 16 GPUs, SP16, EP16, 256K, UCCL, tiled MLP chunk 1024, learning rate 2e-5, fused cross-entropy off. Same training mesh shape as the 8-GPU LoRA recipe, scaled to 2 nodes. DeepEP at EP32 failed NVSHMEM init (`IBGDA` transport, peer GPUs not accessible). One AdamW step at 256K completed on 2 H200 nodes (loss -1.0, entropy 5.39, grad norm 578, 199s, GPU peak 110.3 GiB). All 313.9B parameters were trainable. A 4-node SP32/EP32 step also completed (145s, GPU peak 84.0 GiB).
 - `deepseek_v4_flash.json`: DeepSeek-V4-Flash-0731, 16 GPUs, SP16, EP16, 256K, eager sparse attention, UCCL, liger fused cross-entropy, bf16 Adam state. Activation offload is on, with streams and pinned memory off. Two AdamW steps completed on H200. Peak device memory on the second step was about 127 GiB.
 
 ```bash

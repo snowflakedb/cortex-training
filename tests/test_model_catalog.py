@@ -208,10 +208,10 @@ def test_moe_sft_recipes_have_runnable_parallelism():
         ),
         "glm53_flash_bf16.json": (
             "zai-org/GLM-5.3-Flash-BF16",
-            64,
-            32,
+            16,
+            16,
             262144,
-            64,
+            16,
             1,
         ),
         "qwen38_flash_next.json": (
@@ -265,7 +265,12 @@ def test_moe_sft_recipes_have_runnable_parallelism():
                 "o_proj",
             ]
         elif filename == "glm53_flash_bf16.json":
-            assert training["prime_rl"] == {"ep_comm_backend": "uccl"}
+            assert training["prime_rl"] == {
+                "ep_comm_backend": "uccl",
+                "fused_cross_entropy": False,
+            }
+            assert training["optimizer"]["lr"] == 2e-5
+            assert "peft_config" not in training
         elif filename == "deepseek_v4_flash.json":
             assert training["prime_rl"] == {
                 "fused_cross_entropy": "liger",
@@ -283,8 +288,7 @@ def test_moe_sft_recipes_have_runnable_parallelism():
             "glm53_flash_lora.json",
             "glm53_flash_bf16.json",
         }:
-            expected_chunk = 512 if "_bf16" in filename else 1024
-            assert training["tiled_mlp_token_chunk_size"] == expected_chunk
+            assert training["tiled_mlp_token_chunk_size"] == 1024
             assert training["ds_config"]["bf16"]["bf16_optimizer_states"] is True
             assert training["ds_config"]["bf16"]["bf16_master_weights_and_grads"] is True
         elif filename != "deepseek_v4_flash.json":
