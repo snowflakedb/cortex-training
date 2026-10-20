@@ -22,8 +22,10 @@ and the window selector.
 """
 
 from __future__ import annotations
+import time
 from datetime import datetime
 from datetime import timezone
+from pathlib import Path
 from textual import work
 from textual.content import Content
 from textual.css.query import NoMatches
@@ -35,6 +37,7 @@ from textual.worker import get_current_worker
 from cortex_training._download_lock import DownloadLock
 from cortex_training.tui import views
 from cortex_training.tui.format import safe_text
+from cortex_training.tui.widgets import _download_options
 from cortex_training.tui.widgets import _has_telemetry
 from cortex_training.tui.widgets import _quiet_download
 from cortex_training.tui.widgets import _result_warnings
@@ -76,6 +79,7 @@ from cortex_training.tui.resource import window_label
 from cortex_training.tui.theme import ACCENT
 from cortex_training.tui.theme import BACKGROUND
 from cortex_training.tui.theme import FAINT
+from cortex_training.tui.theme import INFO
 from cortex_training.tui.theme import MUTED
 from cortex_training.tui.theme import PANEL
 from cortex_training.tui.theme import WARN
@@ -107,6 +111,13 @@ class ResourceTab:
     _RESOURCE_VIEWS = {GPU: "GPU Resources", SYSTEM: "System Resources"}
     _RESOURCE_WHAT = {GPU: "GPU metrics", SYSTEM: "system metrics"}
     _RESOURCE_SAMPLES = {GPU: "GPU samples", SYSTEM: "system samples"}
+    # While the screen has nothing of the shown sub-job (a first open, when its whole
+    # history can take minutes to download), its newest half hour, which covers the 10m
+    # and 30m windows, is fetched first and drawn while the rest comes.
+    _RESOURCE_PREVIEW_SECONDS = RANGES["30m"].total_seconds()
+    # The header's bar for a metrics download: its cells, and how often it is redrawn.
+    _RESOURCE_PROGRESS_CELLS = 12
+    _RESOURCE_PROGRESS_SECONDS = 0.25
     # The panel's meter beside each unit's value: 4 cells, 32 steps.
     _RESOURCE_METER_CELLS = 4
 
@@ -191,7 +202,46 @@ class ResourceTab:
                 if _has_telemetry(data) and not _same_telemetry(data, self._resource_data):
                     accept(data)
 
+            def previewed(entry: dict) -> None:
+                # The shown sub-job's newest chunks, before the rest of its history: drawn,
+                # marked partial, while the screen still has nothing of it. Its file, once
+                # committed, replaces them.
+                sub_job_id = entry.get("sub_job_id")
+                if (worker.is_cancelled or not self._screen_open or sub_job_id in shown_here
+                        or sub_job_id in self._resource_data.kinds):
+                    return
+                try:
+                    data = loader.preview(sub_job_id, Path(entry["path"]))
+                except Exception:  # noqa: BLE001 - the download goes on: its file is drawn when it lands
+                    log_traceback(f"GPU metrics preview for {self._job_id} failed")
+                    return
+                if _has_telemetry(data):
+                    base = loader.last or ResourceData({})
+                    accept(ResourceData(kinds={**base.kinds, **data.kinds},
+                                        ignored_rows_by_sub_job={**base.ignored_rows_by_sub_job,
+                                                                 **data.ignored_rows_by_sub_job}))
+
+            drawn_at = [0.0]
+
+            def progress(sub_job_id: str, done: int, total: int, _bytes: int = 0) -> None:
+                # The header's bar: a few times a second, and once a file is committed.
+                now = time.monotonic()
+                if drawn_at[0] < 0 or (done < total and now - drawn_at[0] < self._RESOURCE_PROGRESS_SECONDS):
+                    return
+                drawn_at[0] = now
+                if worker.is_cancelled or not self._screen_open:
+                    return
+                try:
+                    self._post(self._show_resource_progress, sub_job_id, done, total)
+                except self._CallbackError:
+                    # A bug in drawing the bar must not fail the download it reports on.
+                    drawn_at[0] = -1.0  # no more counts
+                    log_traceback("showing a GPU metrics download's progress failed (a bug in the TUI)")
+
             source = self._resource_source()
+            options: dict = {"on_chunk": progress}
+            if source and source not in shown_here and source not in self._resource_data.kinds:
+                options.update(preview_seconds=self._RESOURCE_PREVIEW_SECONDS, on_preview=previewed)
             results = self._client.download_metrics(
                 self._job_id,
                 self._metrics_root,
@@ -199,6 +249,7 @@ class ResourceTab:
                 priority=[source] if source else [],
                 on_commit=committed,
                 **_quiet_download(self._client.download_metrics),
+                **_download_options(self._client.download_metrics, options),
             )
             # Chunks the download gave up on: say so, with the command that retries them.
             self._post(self._accept_download_warnings, "metrics",
@@ -227,6 +278,18 @@ class ResourceTab:
             if acquired:
                 lock.release()
 
+    def _show_resource_progress(self, sub_job_id: str, done: int, total: int) -> None:
+        """UI thread. A metrics download's chunk count: the shown sub-job's is the header's bar (see _resource_state)."""
+        if not self._screen_open:
+            return
+        if done < total:
+            self._resource_progress[sub_job_id] = (done, total)
+        elif self._resource_progress.pop(sub_job_id, None) is None:
+            return
+        if sub_job_id == self._resource_source() and self._resource_active() and self.app.screen is self:
+            status = self.query_one("#resource-status", Static)
+            status.update(self._resource_status(self._resource_kind_data(), status.content_size.width))
+
     def _accept_cached_resource(self, data: ResourceData) -> None:
         if not self._screen_open:
             return
@@ -244,6 +307,7 @@ class ResourceTab:
         if not self._screen_open:
             return
         self._resource_loading = False
+        self._resource_progress.clear()
         self._resource_refresh_succeeded = error is None
         if error is None:
             self._resource_downloaded = True  # every sub-job's rows are in: one without a kind has none
@@ -453,7 +517,7 @@ class ResourceTab:
         cached = bool(self._resource_data.kinds.get(source)) or source in self._resource_data.ignored_rows_by_sub_job
         what = self._RESOURCE_WHAT[self._resource_kind]
         if self._resource_missing(resource) == LOADING_OLDER:
-            return (LOADING_OLDER,)
+            return self._with_progress(source, (LOADING_OLDER,))
         if resource is not None and resource.partial:
             if self._resource_error:
                 return ("[$warning]older samples failed to load: $problem[/]",
@@ -461,13 +525,27 @@ class ResourceTab:
             return (f"[$warning]{OLDER_NOT_LOADED}[/]",)
         if self._resource_loading:
             if cached:
-                return self._RESOURCE_REFRESHING
+                return self._with_progress(source, self._RESOURCE_REFRESHING)
             # A sub-job with nothing of its own after a whole download has none to load.
-            return ("refreshing…",) if self._resource_downloaded else (f"loading {what}…",)
+            return self._with_progress(source, ("refreshing…",) if self._resource_downloaded else (f"loading {what}…",))
         if self._resource_error:
             return (("cached · [$warning]refresh failed: $problem[/]", "[$warning]refresh failed: $problem[/]")
                     if cached else (f"[$warning]{what} unavailable: $problem[/]",))
         return ()
+
+    def _with_progress(self, source: str, forms: tuple[str, ...]) -> tuple[str, ...]:
+        """``forms`` (fullest first) with ``source``'s download bar, while one runs:
+        ``loading GPU metrics ━━━━━━━━━━━━ 340/1,440 chunks``, then shorter, then the forms alone."""
+        progress = self._resource_progress.get(source)
+        if progress is None:
+            return forms
+        done, total = progress
+        cells = self._RESOURCE_PROGRESS_CELLS
+        filled = min(cells, cells * done // total) if total > 0 else 0
+        bar = f"[{INFO}]{'━' * filled}[/][{FAINT}]{'━' * (cells - filled)}[/]"
+        count = f"{done:,}/{total:,}"
+        return (*(f"{form} {bar} {count} chunks" for form in forms), *(f"{form} {bar} {count}" for form in forms),
+                f"{bar} {count}", *forms)
 
     def _resource_missing(self, resource: KindResource | None) -> str | None:
         """What stands in for the stats that need the shown sub-job's older samples; None once they are read."""

@@ -1689,6 +1689,28 @@ class ResourceLoader:
         self.last = data
         return data
 
+    def preview(self, sub_job_id: str, path: Path) -> ResourceData:
+        """One sub-job's telemetry from a file of its newest rows alone (``download_metrics``'
+        preview), marked partial: the rest of its history is still downloading. The loader's
+        own state is untouched, so the sub-job's file is read as ever once it lands."""
+        fresh = _kind_series(sub_job_id)
+        state = _FileState(series=fresh[GPU], system=fresh[SYSTEM])
+        horizon = time.time() + _MAX_AHEAD_S
+        with Path(path).open("rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            spans = self._peek(handle, size, sub_job_id, horizon)
+            for series in state.kinds:
+                series.horizon = horizon
+                series.plan(*spans[series.spec.name])
+            self._read(state, handle, 0, size)
+        found: dict[str, KindResource] = {}
+        for series in state.kinds:
+            series.trim()
+            if series.latest is not None:
+                found[series.spec.name] = _snapshot(series, True)
+        return ResourceData(kinds={sub_job_id: found} if found else {},
+                            ignored_rows_by_sub_job={sub_job_id: state.ignored} if state.ignored else {})
+
     def _data(self, partial: set[str]) -> ResourceData:
         ignored: dict[str, int] = {}
         kinds: dict[str, dict[str, KindResource]] = {}

@@ -3751,9 +3751,10 @@ def test_an_ended_job_without_an_end_time_gets_no_upload_hint():
 TUI_CALLS = ("get_job", "list_jobs", "list_jobs_page", "for_job", "tail_logs", "download_metrics",
              "download_stdout_logs", "fetch_execution_logs")
 # Parameters of the real client the demo leaves out: the TUI never passes them, or
-# checks the client's signature for them first (sub_job_ids, on_chunk, stale_after_seconds).
+# checks the client's signature for them first (sub_job_ids, on_chunk, stale_after_seconds,
+# and a download's preview).
 _ENGINE = {"max_workers", "progress", "on_chunk", "sub_job_ids", "strict", "stale_after_seconds",
-           "transfer_timeout_seconds"}
+           "transfer_timeout_seconds", "preview_seconds", "on_preview"}
 NOT_IN_DEMO = {
     "tail_logs": {"sub_job_type"},
     "download_metrics": _ENGINE,
@@ -4938,3 +4939,122 @@ def test_a_highlight_of_job_list_rows_copies_whole_times_and_status_words():
             await _settle(app, pilot)
 
     asyncio.run(run())
+
+
+def _gpu_rows(sub_job_id, minutes, *, gpus=2):
+    """GPU rows a minute apart, the newest 30 s ago, from ``minutes`` minutes before that."""
+    newest = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=30)
+    rows = [{"record_version": 2, "sub_job_id": sub_job_id, "worker_num": gpu, "local_gpu_index": 0,
+             "global_gpu_index": gpu, "sample_ts": (newest - timedelta(minutes=back)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+             "gpu_util_pct": 50.0, "fb_used_bytes": float(1024**3), "fb_free_bytes": float(8 * 1024**3),
+             "sample_interval_s": 60.0}
+            for back in range(minutes, -1, -1) for gpu in range(gpus)]
+    return "".join(json.dumps(row) + "\n" for row in rows)
+
+
+async def _run_a_first_open_draws_the_newest_half_hour_while_the_rest_downloads(tmp_path):
+    # A long job's first open: its whole history can take minutes, so the client's preview
+    # (the newest half hour) is drawn, marked partial, while the header's bar counts the
+    # chunks; the committed file then replaces it. A refresh with the job on screen asks no preview.
+    sub = "7:training:0"
+    c = _client()
+    calls, previewed, release = [], threading.Event(), threading.Event()
+
+    def download(job_id, output_dir, *, resume=False, priority=(), on_commit=None, on_chunk=None,
+                 preview_seconds=None, on_preview=None, stale_after_seconds=600):
+        calls.append({"priority": list(priority), "preview_seconds": preview_seconds,
+                      "counts": on_chunk is not None})
+        if on_preview is not None:
+            on_chunk(sub, 0, 300, 0)
+            preview = tmp_path / "preview.jsonl"
+            preview.write_text(_gpu_rows(sub, 32), encoding="utf-8")
+            on_preview({"sub_job_id": sub, "path": str(preview), "chunk_count": 33})
+            time.sleep(0.3)  # past the bar's redraw interval
+            on_chunk(sub, 120, 300, 0)
+            previewed.set()
+            release.wait(10)
+        path = Path(output_dir) / sub / "gpu.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_gpu_rows(sub, 300), encoding="utf-8")
+        path.with_name(".gpu.jsonl.manifest.json").write_text(
+            json.dumps({"version": 1, "names": ["chunk.gz"], "bytes": path.stat().st_size}), encoding="utf-8")
+        if on_chunk is not None:
+            on_chunk(sub, 300, 300, 0)
+        if on_commit is not None:
+            on_commit({"sub_job_id": sub, "saved_path": str(path)})
+        return []
+
+    c.download_metrics = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(160, 45)) as pilot:
+        assert await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen) and app.screen._current_source)
+        screen = app.screen
+        header = lambda: str(screen.query_one("#resource-status", Static).render())  # noqa: E731
+        screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        ok = await _pause_until(pilot, lambda: previewed.is_set() and screen._resource_data.kind(sub, "gpu") is not None
+                                and "120/300" in header(), seconds=10.0)
+        assert ok, header()
+        shown = screen._resource_data.kind(sub, "gpu")
+        assert shown.partial  # the newest half hour alone, and marked so
+        assert "loading older samples" in header() and "━" in header() and "120/300 chunks" in header(), header()
+        release.set()
+        assert await _pause_until(pilot, lambda: not screen._resource_loading, seconds=10.0)
+        full = screen._resource_data.kind(sub, "gpu")
+        assert not full.partial and full.first_sample_ts < shown.first_sample_ts  # the whole history
+        assert "chunks" not in header(), header()  # the bar is gone with the download
+        assert calls == [{"priority": [sub], "preview_seconds": 30 * 60, "counts": True}]
+        screen.action_refresh_sources()  # r: the job is on screen now, so only the count
+        assert await _pause_until(pilot, lambda: len(calls) == 2 and not screen._resource_loading, seconds=10.0)
+        assert calls[1] == {"priority": [sub], "preview_seconds": None, "counts": True}
+        await _settle(app, pilot)
+
+
+def test_a_first_open_draws_the_newest_half_hour_while_the_rest_downloads(tmp_path):
+    asyncio.run(_run_a_first_open_draws_the_newest_half_hour_while_the_rest_downloads(tmp_path))
+
+
+async def _run_a_finished_job_s_console_shows_its_last_lines_while_the_rest_downloads(tmp_path):
+    # A long finished job's console takes minutes to download: the sub-job on screen shows
+    # the client's preview (its newest chunks) under a note, until its whole console is in.
+    c = _client()
+    c.get_job.return_value = _old_terminal_job(minutes_ago=30)
+    calls, previewed, release = [], threading.Event(), threading.Event()
+    console = "".join(f"line {i}\n" for i in range(10)) + "".join(f"newest line {i}\n" for i in range(3))
+
+    def download(job_id, output_dir, *, resume=False, sub_job_ids=None, on_chunk=None, preview_seconds=None,
+                 on_preview=None, stale_after_seconds=600):
+        calls.append({"sub_job_ids": sub_job_ids, "preview_seconds": preview_seconds})
+        if sub_job_ids and on_preview is not None:
+            preview = tmp_path / "preview.log"
+            preview.write_text("".join(f"newest line {i}\n" for i in range(3)), encoding="utf-8")
+            on_preview({"sub_job_id": sub_job_ids[0], "path": str(preview), "chunk_count": 3})
+            previewed.set()
+            release.wait(10)
+        for sub in sub_job_ids or ["7:training:0", "7:sampling:0"]:
+            if not (Path(output_dir) / sub / "stdout.log").exists():  # resumed: a console that is in stays as it is
+                _write_stdout(output_dir, sub, console)
+        return []
+
+    c.download_stdout_logs = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        ok = await _wait(pilot, app, lambda: previewed.is_set() and isinstance(app.screen, LogScreen)
+                         and "newest line 2" in app.screen._shown_lines, tries=200)
+        assert ok
+        screen = app.screen
+        assert any("older lines are still downloading" in line for line in screen._shown_lines), screen._shown_lines
+        assert "line 0" not in screen._shown_lines  # the rest isn't in yet
+        release.set()
+        ok = await _wait(pilot, app, lambda: "line 0" in screen._shown_lines and not screen._stdout_inflight, tries=200)
+        assert ok, screen._shown_lines
+        assert not any("still downloading" in line for line in screen._shown_lines)  # the whole console, alone
+        assert calls == [{"sub_job_ids": ["7:training:0"], "preview_seconds": 30 * 60},
+                         {"sub_job_ids": None, "preview_seconds": None}]  # the others', whole
+        # Kept for the next open (the job ended long ago), without the preview.
+        assert (screen._console_dir / "7:training:0" / "stdout.log").exists()
+        assert not (screen._console_dir / ".preview").exists()
+        await _settle(app, pilot)
+
+
+def test_a_finished_job_s_console_shows_its_last_lines_while_the_rest_downloads(tmp_path):
+    asyncio.run(_run_a_finished_job_s_console_shows_its_last_lines_while_the_rest_downloads(tmp_path))

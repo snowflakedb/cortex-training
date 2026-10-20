@@ -2729,13 +2729,19 @@ paths or object-store credentials.
 
 `download_stdout_logs(job_id, output_dir, *, resume=False, max_workers=None,
 progress=None, on_chunk=None, sub_job_ids=None, strict=False,
-stale_after_seconds=600, transfer_timeout_seconds=300)`
+stale_after_seconds=600, transfer_timeout_seconds=300, preview_seconds=None,
+on_preview=None)`
 downloads gzip chunks under
 `_stdout/{sub_job_id}/`, orders them by chunk name (which starts with the
 chunk's UTC time), and streams them into `<output_dir>/<sub_job_id>/stdout.log`.
 If a run has chunks for one sub-job under both `_stdout/` and
 `checkpoints/_stdout/`, the two lists are merged by chunk name and a name found
 in both keeps the `_stdout/` copy; the sub-job's result gets a warning.
+`preview_seconds` and `on_preview` give the first sub-job named in
+`sub_job_ids` its console's newest output first, the same way
+`download_metrics` previews metrics (see
+[section 12.4](#124-gpu-metrics-download)); that sub-job is written first, and
+without `sub_job_ids` there is no preview.
 
 Each chunk is one experiment artifact `GET` into a private temporary directory.
 Up to `max_workers` (default 16) run at once on one Connector session, each on
@@ -2837,7 +2843,8 @@ chunks. Two downloads of the same output directory at once are unsupported.
 
 `download_metrics(job_id, output_dir, *, resume=False, max_workers=None,
 progress=None, on_chunk=None, sub_job_ids=None, strict=False,
-stale_after_seconds=600, transfer_timeout_seconds=300)`
+stale_after_seconds=600, transfer_timeout_seconds=300, priority=(),
+on_commit=None, preview_seconds=None, on_preview=None)`
 applies the same reconstruction to
 `gpu.YYYYMMDD-HHMMSS.UUID.gz` chunks under `_metrics/{sub_job_id}/` and writes
 `<output_dir>/<sub_job_id>/gpu.jsonl`, including the options, retries, and the
@@ -2860,6 +2867,21 @@ While a job is running, and for 120 seconds after it ends (judged from
 metrics download in that window gets a warning per sub-job saying so; download
 again with `resume=True` a minute or two later to pick them up. These job
 lookups are skipped when `stale_after_seconds` is `None`.
+
+Sub-jobs named in `priority` are written first, in that order; `on_commit` gets
+each sub-job's result entry once its file is committed. With `preview_seconds`
+and `on_preview` (given together), the first sub-job in `priority` gets its
+newest samples before the rest of its history: its chunks from
+`preview_seconds` before its newest chunk are fetched first (two minutes more,
+since a chunk's name gives the time it starts), and `on_preview` gets
+`sub_job_id`, `path`, `chunk_count`, `first_artifact_uri` and
+`last_artifact_uri`. The file at `path` holds those chunks' rows in time order
+and is removed once `on_preview` returns. The chunks are not fetched again, so
+the download makes no more requests than without a preview; there is none when
+they are most of what the sub-job has new, or when none of them can be read.
+Metrics chunks are uploaded about once a minute per sub-job, so a cold download
+of a long job is mostly per-chunk round trips: this is how the TUI draws a job's
+newest half hour before the rest of its history arrives.
 
 The reconstructed file contains the JSONL records emitted by the deployed
 training runtime. Version 2 GPU rows have no `kind` field and include:

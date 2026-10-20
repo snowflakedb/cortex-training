@@ -71,6 +71,7 @@ from cortex_training.tui.detail_tabs import TrainingPane
 from cortex_training.tui.format import display_line
 from cortex_training.tui.widgets import _TimedTail
 from cortex_training.tui.widgets import _cache_job_id
+from cortex_training.tui.widgets import _download_options
 from cortex_training.tui.widgets import _quiet_download
 from cortex_training.tui.widgets import _result_warnings
 from cortex_training.tui.widgets import _sleep_until_cancelled
@@ -171,6 +172,9 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
     _LOG_MIN_WIDTH = 40
     _LEVEL_CYCLE = [None, "INFO", "WARNING", "ERROR"]
     _KEEP_CONSOLE_AFTER_SECONDS = 600
+    # A saved console can take minutes for a long job: the sub-job on screen first shows
+    # its last half hour (where a job's end, and its error, are), until the whole is in.
+    _CONSOLE_PREVIEW_SECONDS = 30 * 60
     _DATA_REFRESH_SECONDS = 30
     _STATUS_REFRESH_SECONDS = 60
     _LOG_ONLY = {"save_log", "cycle_level", "toggle_pause", "shrink_sources", "grow_sources", "filter", "jump"}
@@ -224,6 +228,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         self._stdout_inflight = False
         self._stdout_ready = False
         self._stdout_have: set[str] = set()  # sub-jobs whose saved console is in while the rest download
+        self._stdout_preview: dict[str, Path] = {}  # sub-jobs showing their console's newest chunks until it is in
         self._stdout_first: str | None = None  # the sub-job a download fetches before the others
         self._stdout_others = False  # ... and whether the job has others
         self._stdout_failed = False
@@ -244,6 +249,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         self._resource_error: str | None = None
         self._resource_range = DEFAULT_RANGE
         self._resource_downloaded = False
+        self._resource_progress: dict[str, tuple[int, int]] = {}  # per sub-job, a download's (chunks done, of them)
         self._resource_ticker = None
         self._resource_pick: str | None = None
         self._resource_kind = GPU
@@ -801,7 +807,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         self._held = None
         self._paused = False
         self._update_subtitle()
-        if self._saved_shown(self._current_source):
+        if self._console_shown(self._current_source):
             self._paint_saved()
         else:
             # Older lines may have left the buffer before this repaint.
@@ -1265,6 +1271,10 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         or this sub-job's was fetched first while the rest download."""
         return self._stdout_ready or (source is not None and source in self._stdout_have)
 
+    def _console_shown(self, source: str | None) -> bool:
+        """Whether ``source`` shows a saved console: the whole, or its newest chunks while it downloads."""
+        return self._saved_shown(source) or (source is not None and source in self._stdout_preview)
+
     def _kept_console(self) -> bool:
         """A complete saved console from an earlier open of this same (finished) job."""
         if self._live() or not self._job_created_at:
@@ -1304,7 +1314,8 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         try:
             self._console_dir.parent.mkdir(parents=True, exist_ok=True)
             tmp = Path(tempfile.mkdtemp(prefix=".console-", dir=str(self._console_dir.parent)))
-            shutil.copytree(plan.root, tmp, dirs_exist_ok=True)
+            # The preview (see _console_preview) isn't the console's: the whole is beside it.
+            shutil.copytree(plan.root, tmp, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".preview"))
             (tmp / ".complete").write_text(str(plan.created_at), encoding="utf-8")
             shutil.rmtree(self._console_dir, ignore_errors=True)
             os.replace(tmp, self._console_dir)
@@ -1320,6 +1331,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
     def _cleanup_stage(self) -> None:
         stage = self._stage
         self._stage = None
+        self._stdout_preview.clear()  # its files go with the stage
         if stage is not None:
             stage.cleanup()
 
@@ -1525,7 +1537,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
 
     @work(thread=True, exclusive=True, group="paint")
     def _prepare_saved(self, gen: int, source: str, path: Path, query: str, level, width: int,
-                       prefixes: tuple[str, str], recent: bool) -> None:
+                       prefixes: tuple[str, str], recent: bool, *, preview: bool = False) -> None:
         """Worker thread. Read, filter and wrap the saved console for the pane;
         _apply_saved shows it. A long console takes a while, and the UI keeps
         answering keys meanwhile."""
@@ -1568,7 +1580,8 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         if worker.is_cancelled:
             return
         self._post(self._apply_saved, gen, source, console, chunks, displays, cut, width,
-                   matched, total, len(lines), newer, gap, kinds=kinds, context=(row_kinds, day, in_block))
+                   matched, total, len(lines), newer, gap, kinds=kinds, context=(row_kinds, day, in_block),
+                   preview=preview)
 
     def _ended_job(self) -> dict:
         """This view's copy of the job with the newest status and reason (the tail
@@ -1619,16 +1632,20 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         self._cancel_repaint()  # what a repaint on its way would show, this paint replaces
         self._paint_gen += 1
         self._repainting = True
-        self._prepare_saved(self._paint_gen, source, self._stdout_path(source), self._filter, self._min_level,
-                            self._content_width(), self._line_prefixes(), self._stdout_recent)
+        # Until its whole console is in, a sub-job with a preview shows that.
+        preview = not self._saved_shown(source) and source in self._stdout_preview
+        self._prepare_saved(self._paint_gen, source, self._stdout_preview[source] if preview else self._stdout_path(source),
+                            self._filter, self._min_level, self._content_width(), self._line_prefixes(),
+                            self._stdout_recent and not preview, preview=preview)
         self._render_log_status()
 
     def _apply_saved(self, gen: int, source: str, console: bool, chunks: list, displays: dict, cut: bool,
                      width: int, matched: int, total: int, kept: int, newer: list[str], gap: bool = False, *,
-                     kinds: list | None = None, context: tuple | None = None) -> None:
-        """UI thread. Show a saved console _prepare_saved read and wrapped, unless a newer paint superseded it."""
-        if gen != self._paint_gen or source != self._current_source or not self._saved_shown(source) \
-                or not self._screen_open:
+                     kinds: list | None = None, context: tuple | None = None, preview: bool = False) -> None:
+        """UI thread. Show a saved console _prepare_saved read and wrapped, unless a newer paint superseded it.
+        ``preview``: only its newest chunks, while the rest downloads (see _console_preview)."""
+        shown = self._saved_shown(source) or (preview and source in self._stdout_preview)
+        if gen != self._paint_gen or source != self._current_source or not shown or not self._screen_open:
             return
         self._repainting = False
         self._display_cache.update(displays)
@@ -1636,7 +1653,10 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         # The TUI's own lines (shown untagged), after the console's.
         # A job that never got GPUs has no saved logs still to come.
         notes = ([self._Note(self._recent_console_note(console=console, newer=len(newer)))]
-                 if self._stdout_recent and not views.never_started(self._ended_job()) else [])
+                 if self._stdout_recent and not preview and not views.never_started(self._ended_job()) else [])
+        # Above a preview: its first line isn't the console's.
+        head = ([self._Note(f"— the saved console's last {self._CONSOLE_PREVIEW_SECONDS // 60} minutes; "
+                            "the older lines are still downloading —")] if preview else [])
         empty = False
         if console:
             self._saved_dropped = matched - kept
@@ -1657,10 +1677,12 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
             self._saved_matched_none = total > 0 and not chunks
         if self._paused:
             # Shown once the pause ends (p).
-            self._held = ([line for line, _, _ in chunks] + extra + notes, empty)
+            self._held = (head + [line for line, _, _ in chunks] + extra + notes, empty)
         else:
             self._held = None
             self._clear_pane()
+            if head:
+                self._write_lines(head)
             self._write_chunks(chunks, width, cut=cut, kinds=kinds, context=context)
             if extra or notes:
                 self._write_lines(extra + notes)
@@ -1701,6 +1723,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         self._stdout_recent = recent
         self._stdout_again = False
         self._stdout_have.clear()
+        self._stdout_preview.clear()
         if painted:
             self._render_log_status()
         else:
@@ -1982,7 +2005,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         live = self._live()
         if self._stdout_ready or not live:
             self._idle_paused = False  # nothing polls now, so nothing is paused
-        if self._saved_shown(sub_job_id):
+        if self._console_shown(sub_job_id):
             self._paint_saved()
             if not self._stdout_ready and not live and self._claim_stdout():
                 # The other sub-jobs' consoles, again after they failed (r).
@@ -2079,7 +2102,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         """UI thread. One page of the tail started as ``gen`` (or its cache replay)."""
         # Checked here, on the UI thread, so a page of an older tail, or one that
         # was in flight when the saved console replaced the pane, is dropped.
-        if gen != self._tail_gen or self._saved_shown(self._current_source) or not self._screen_open:
+        if gen != self._tail_gen or self._console_shown(self._current_source) or not self._screen_open:
             return
         if kind == "partial":
             # Older lines of this log are neither here nor coming (the tail read only its end).
@@ -2491,7 +2514,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
             return "wait", label
         # The job ended: show its saved console now.
         if not self._claim_stdout():
-            if self._saved_shown(self._current_source):
+            if self._console_shown(self._current_source):
                 self._paint_saved()
             return None
         return "download", self._current_source or ""
@@ -2577,10 +2600,14 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
             self._console_warnings(results, plan.root)
             return True
         # Resumed in this view's own directory: a sub-job fetched already only gets newer chunks.
+        # Its newest chunks come first, shown until its whole console is in.
+        preview = _download_options(self._client.download_stdout_logs, {
+            "preview_seconds": self._CONSOLE_PREVIEW_SECONDS,
+            "on_preview": lambda entry: self._console_preview(entry, plan.root)})
         try:
             results = self._client.download_stdout_logs(
                 self._job_id, plan.root, sub_job_ids=[plan.first], resume=True,
-                on_chunk=self._download_progress(first=True, others=plan.others), **quiet)
+                on_chunk=self._download_progress(first=True, others=plan.others), **quiet, **preview)
             self._console_warnings(results, plan.root)
         except NoChunksError:
             pass  # the sub-job on screen saved no console (yet): the others still come
@@ -2592,6 +2619,33 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
             on_chunk=self._download_progress(first=False, others=plan.others), **quiet)
         self._console_warnings(results, plan.root)
         return True
+
+    def _console_preview(self, entry: dict, root: str) -> None:
+        """Worker thread. The client's preview of the sub-job on screen, its console's newest
+        chunks: kept in this view's directory (the client removes its own copy) and shown
+        until the whole console is in."""
+        source = entry.get("sub_job_id")
+        if not source or not root or not self._screen_open:
+            return
+        target = Path(root) / ".preview" / source / "stdout.log"
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(entry["path"], target)
+        except (OSError, KeyError, TypeError):
+            return  # no preview: the whole console shows once it is in
+        try:
+            self._post(self._show_console_preview, source, target)
+        except self._CallbackError:
+            # A bug in showing it must not fail the download it previews.
+            log_traceback("showing a saved console's newest lines failed (a bug in the TUI)")
+
+    def _show_console_preview(self, source: str, path: Path) -> None:
+        """UI thread. A sub-job's newest saved-console lines, while the rest downloads."""
+        if not self._screen_open or self._saved_shown(source):
+            return
+        self._stdout_preview[source] = path
+        if source == self._current_source:
+            self._paint_saved()
 
     def _console_warnings(self, results, root) -> None:
         """Worker thread. Pass a saved-console download's warnings to the UI thread."""
@@ -2686,6 +2740,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         if not self._screen_open:
             return
         self._stdout_have.add(source)
+        self._stdout_preview.pop(source, None)  # the whole console replaces its newest lines
         self._stdout_recent = recent
         # Until the others' first chunk is counted (their listing can take a while).
         self._download_note = "downloading the other sub-jobs' saved consoles" if self._stdout_others else None

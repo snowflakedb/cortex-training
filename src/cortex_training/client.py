@@ -52,6 +52,7 @@ import shutil
 import tempfile
 import threading
 import time
+import uuid
 from collections import deque
 from collections.abc import Callable
 from collections.abc import Iterable
@@ -3199,6 +3200,9 @@ class CortexTrainingClient:
     # whichever comes first.
     _DOWNLOAD_CHECKPOINT_CHUNKS = 64
     _DOWNLOAD_CHECKPOINT_SECONDS = 5.0
+    # A preview (``download_metrics``' ``preview_seconds``) reaches this much further back
+    # than asked, since a chunk's name gives the time it starts.
+    _PREVIEW_SLACK_SECONDS = 120.0
     # Leftover temp files are removed only once untouched for this long, so a
     # concurrent download of the same directory is not broken.
     _TEMP_ORPHAN_MIN_AGE_SECONDS = 3600.0
@@ -3704,6 +3708,95 @@ class CortexTrainingClient:
             raise
         self._report_artifact_progress(progress, "\n")
 
+    @classmethod
+    def _preview_paths(
+        cls, plan: _artifact_download.GzipPlan, chunk_pattern: re.Pattern[str], seconds: float
+    ) -> list[str]:
+        """``plan``'s new chunks from ``seconds`` before its newest one, or ``[]`` when they
+        are most of what is new: fetching them first would then save no time."""
+        new = plan.new_paths
+        newest = cls._chunk_time(chunk_pattern, new[-1]) if new else None
+        if newest is None:
+            return []
+        start = newest - seconds - cls._PREVIEW_SLACK_SECONDS
+        paths = [
+            path
+            for path in new
+            if (when := cls._chunk_time(chunk_pattern, path)) is not None and when >= start
+        ]
+        return paths if 2 * len(paths) <= len(new) else []
+
+    def _write_preview(
+        self,
+        shared: _artifact_download.SharedConnection,
+        run_uri: str,
+        pool: ThreadPoolExecutor,
+        spool_root: Path,
+        cancel: threading.Event,
+        sub_job_id: str,
+        chunk_paths: list[str],
+        on_preview: Callable[[dict[str, Any]], None],
+        *,
+        futures: list[Future[Path]],
+    ) -> dict[str, Future[Path]]:
+        """Fetch ``chunk_paths`` (a sub-job's newest chunks, in time order) and call
+        ``on_preview`` with their rows as one file; return the fetches to reuse.
+
+        ``on_preview`` gets ``sub_job_id``, ``path``, ``chunk_count``,
+        ``first_artifact_uri`` and ``last_artifact_uri``; the file at ``path`` holds
+        the chunks' rows in time order and is removed once it returns. A chunk that
+        can't be fetched or decompressed is left out, and the download fetches it
+        again in its turn; with none left there is no preview. ``futures`` gets
+        every fetch, so a download that fails can wait for them before cleaning up.
+        """
+        mine = [
+            pool.submit(self._fetch_artifact_chunk, shared, run_uri, path, spool_root, cancel)
+            for path in chunk_paths
+        ]
+        futures.extend(mine)
+        target = spool_root / f"preview-{uuid.uuid4().hex}.jsonl"
+        kept: dict[str, Future[Path]] = {}
+        shown: list[str] = []
+        try:
+            try:
+                with target.open("wb") as output:
+                    for relative_path, future in zip(chunk_paths, mine):
+                        try:
+                            downloaded = future.result()
+                        except Exception:  # noqa: BLE001 - its turn fetches it again, and says why
+                            logger.debug("metrics preview: %s unavailable", relative_path, exc_info=True)
+                            continue
+                        kept[relative_path] = future
+                        start = output.tell()
+                        try:
+                            _artifact_download.copy_gzip_member(
+                                downloaded, output, _STREAM_COPY_BUFFER_BYTES
+                            )
+                        except _artifact_download.CORRUPT_CHUNK_ERRORS:
+                            output.truncate(start)
+                            output.seek(start)
+                            del kept[relative_path]  # damaged in transit, maybe: fetched again
+                            shutil.rmtree(downloaded.parent, ignore_errors=True)
+                            continue
+                        shown.append(relative_path)
+            except OSError:
+                # No room for the preview, say: the download goes on without one.
+                logger.debug("metrics preview for %s not written", sub_job_id, exc_info=True)
+                shown = []
+            if shown:
+                on_preview(
+                    {
+                        "sub_job_id": sub_job_id,
+                        "path": str(target),
+                        "chunk_count": len(shown),
+                        "first_artifact_uri": run_uri + shown[0],
+                        "last_artifact_uri": run_uri + shown[-1],
+                    }
+                )
+        finally:
+            target.unlink(missing_ok=True)
+        return kept
+
     def _write_gzip_plans(
         self,
         shared: _artifact_download.SharedConnection,
@@ -3720,6 +3813,7 @@ class CortexTrainingClient:
         strict: bool = False,
         warnings_by_sub_job: Mapping[str, list[str]] | None = None,
         on_commit: Callable[[dict[str, Any]], None] | None = None,
+        preview: tuple[str, list[str], Callable[[dict[str, Any]], None]] | None = None,
     ) -> list[dict[str, Any]]:
         """Fetch every new chunk concurrently and append them in plan order.
 
@@ -3734,6 +3828,11 @@ class CortexTrainingClient:
         ``on_chunk`` gets ``(sub_job_id, done, total, bytes)`` counts, with
         ``done == total`` only after the file is committed. ``on_commit`` then
         gets a copy of that sub-job's result entry.
+
+        ``preview`` is ``(sub_job_id, chunk paths, callback)``: those chunks are
+        fetched before anything else and handed to the callback as one file
+        (see :meth:`_write_preview`), then written in their turn without being
+        fetched again.
         """
         work = [path for plan in plans for path in plan.new_paths]
         window = max_workers * self._DOWNLOAD_WINDOW_PER_WORKER
@@ -3760,7 +3859,14 @@ class CortexTrainingClient:
             # The fetch the writer is waiting on; it has left ``pending``.
             head: Future[Path] | None = None
             submitted = 0
+            # The preview's fetches, and those of them its chunks' turn reuses.
+            previewed: list[Future[Path]] = []
+            prefetched: dict[str, Future[Path]] = {}
             try:
+                if preview is not None:
+                    prefetched = self._write_preview(
+                        shared, run_uri, pool, spool_root, cancel, *preview, futures=previewed
+                    )
                 for plan in plans:
                     total = len(plan.chunk_paths)
                     new_total = len(plan.new_paths)
@@ -3823,8 +3929,11 @@ class CortexTrainingClient:
                                 on_chunk(plan.sub_job_id, len(writer.names), total, writer.offset)
                             for done, relative_path in enumerate(plan.new_paths, start=1):
                                 while submitted < len(work) and len(pending) < window:
+                                    fetched = prefetched.pop(work[submitted], None)
                                     pending.append(
-                                        pool.submit(
+                                        fetched
+                                        if fetched is not None
+                                        else pool.submit(
                                             self._fetch_artifact_chunk,
                                             shared,
                                             run_uri,
@@ -3898,7 +4007,7 @@ class CortexTrainingClient:
                 # already on the wire runs to completion, and it is not awaited.
                 cancel.set()
                 pool.shutdown(wait=False, cancel_futures=True)
-                spool.remove_after([*([head] if head is not None else []), *pending])
+                spool.remove_after([*([head] if head is not None else []), *pending, *previewed])
                 with contextlib.suppress(Exception):
                     if not getattr(exc, "download_progress_saved", False):
                         exc.download_progress_saved = saved_progress  # type: ignore[attr-defined]
@@ -4249,6 +4358,8 @@ class CortexTrainingClient:
         transfer_timeout_seconds: float | None = _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS,
         priority: Iterable[str] = (),
         on_commit: Callable[[dict[str, Any]], None] | None = None,
+        preview_seconds: float | None = None,
+        on_preview: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Reconstruct staged gzip chunks into one file per sub-job.
 
@@ -4264,6 +4375,8 @@ class CortexTrainingClient:
         Sub-jobs are written in id order, those named in ``priority`` first
         (in that order); the returned list stays in id order. ``on_commit``
         gets a copy of each sub-job's result entry once its file is committed.
+        With ``preview_seconds`` and ``on_preview``, the first of them gets a
+        preview first (see :meth:`download_metrics`).
 
         ``stream`` names the reconstructed file's stream: it keeps one stream's
         temporary spool apart from another's and is recorded with the operation.
@@ -4275,6 +4388,14 @@ class CortexTrainingClient:
         sub-job named in ``sub_job_ids`` that has no chunks instead of raising
         :class:`NoChunksError`, for a stream only some sub-jobs write.
         """
+        if (preview_seconds is None) != (on_preview is None):
+            raise ValueError("preview_seconds and on_preview are given together")
+        if preview_seconds is not None and (
+            isinstance(preview_seconds, bool)
+            or not isinstance(preview_seconds, (int, float))
+            or not preview_seconds > 0
+        ):
+            raise ValueError("preview_seconds must be a positive number or None")
         # What the warnings call this stream, and whether a sub-job with saved stdout
         # but none of these chunks is worth a warning. Only the GPU stream is: every
         # sub-job with GPUs uploads it, while training metrics are written by training
@@ -4393,6 +4514,11 @@ class CortexTrainingClient:
             # Those named in priority first, in that order; the sort is stable,
             # so the rest stay in id order.
             plans.sort(key=lambda plan: first.get(plan.sub_job_id, len(first)))
+            preview = None
+            if on_preview is not None and plans and plans[0].sub_job_id in first:
+                paths = self._preview_paths(plans[0], chunk_pattern, preview_seconds)
+                if paths:
+                    preview = (plans[0].sub_job_id, paths, on_preview)
             values["sub_job_count"] = len(plans)
             modes = {
                 "append"
@@ -4425,6 +4551,7 @@ class CortexTrainingClient:
                         strict=strict,
                         warnings_by_sub_job=warnings_by_sub_job,
                         on_commit=on_commit,
+                        preview=preview,
                     )
                 finally:
                     values["fetch_ms"] = round((time.monotonic() - started) * 1000, 3)
@@ -4485,6 +4612,8 @@ class CortexTrainingClient:
         strict: bool = False,
         stale_after_seconds: float | None = _DOWNLOAD_STALE_AFTER_SECONDS,
         transfer_timeout_seconds: float | None = _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS,
+        preview_seconds: float | None = None,
+        on_preview: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Reconstruct sealed console artifacts into one file per sub-job.
 
@@ -4513,7 +4642,14 @@ class CortexTrainingClient:
         A LIST or GET attempt still running after ``transfer_timeout_seconds``
         (default 300; ``None`` disables) is abandoned and retried. Two
         downloads of the same output directory at once are unsupported.
+
+        ``preview_seconds`` and ``on_preview`` (given together) give the first
+        sub-job named in ``sub_job_ids`` its newest output before the rest, as
+        :meth:`download_metrics` describes for metrics: the console's last
+        ``preview_seconds`` (and a little more) in one file. That sub-job is
+        written first; without ``sub_job_ids`` there is no preview.
         """
+        named = None if sub_job_ids is None or isinstance(sub_job_ids, (str, bytes)) else list(sub_job_ids)
         return self._download_gzip_artifacts(
             job_id,
             output_dir,
@@ -4527,10 +4663,13 @@ class CortexTrainingClient:
             max_workers=max_workers,
             progress=progress,
             on_chunk=on_chunk,
-            sub_job_ids=sub_job_ids,
+            sub_job_ids=sub_job_ids if named is None else named,
             strict=strict,
             stale_after_seconds=stale_after_seconds,
             transfer_timeout_seconds=transfer_timeout_seconds,
+            priority=named[:1] if named and on_preview is not None else (),
+            preview_seconds=preview_seconds,
+            on_preview=on_preview,
         )
 
     @_track_operation("download_metrics")
@@ -4549,6 +4688,8 @@ class CortexTrainingClient:
         transfer_timeout_seconds: float | None = _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS,
         priority: Iterable[str] = (),
         on_commit: Callable[[dict[str, Any]], None] | None = None,
+        preview_seconds: float | None = None,
+        on_preview: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Reconstruct staged GPU metric chunks into one JSONL file per sub-job.
 
@@ -4564,6 +4705,19 @@ class CortexTrainingClient:
         saved stdout but no metrics gets a result entry with ``chunk_count`` 0,
         ``saved_path`` ``None``, and a warning. Two downloads
         of the same output directory at once are unsupported.
+
+        With ``preview_seconds`` and ``on_preview`` (given together), the first
+        sub-job in ``priority`` gets its newest samples before the rest: the
+        chunks from ``preview_seconds`` before its newest one (and a little
+        more, since a chunk's name gives the time it starts) are fetched first,
+        and ``on_preview`` is called, on the calling thread, with
+        ``sub_job_id``, ``path``, ``chunk_count``, ``first_artifact_uri`` and
+        ``last_artifact_uri``. The file at ``path`` holds those chunks' rows in
+        time order and is removed once ``on_preview`` returns; an error it
+        raises stops the download as one from ``on_commit`` does. Those chunks
+        are not fetched again, so the download makes no more requests. There is
+        no preview when they are most of what the sub-job has new (a first
+        download of a short job, or a resume), or when none of them can be read.
         """
         return self._download_gzip_artifacts(
             job_id,
@@ -4584,6 +4738,8 @@ class CortexTrainingClient:
             transfer_timeout_seconds=transfer_timeout_seconds,
             priority=priority,
             on_commit=on_commit,
+            preview_seconds=preview_seconds,
+            on_preview=on_preview,
         )
 
     @_track_operation("download_training_metrics")

@@ -985,6 +985,20 @@ def _quiet_download(method) -> dict:
     return {"stale_after_seconds": None} if "stale_after_seconds" in parameters else {}
 
 
+def _download_options(method, options: dict) -> dict:
+    """The ``options`` a client's download method takes: an older client's, or the
+    demo's, takes fewer. A preview's two options go together or not at all."""
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return {}
+    taken = {name: value for name, value in options.items() if name in parameters}
+    if not {"preview_seconds", "on_preview"} <= set(taken):
+        taken.pop("preview_seconds", None)
+        taken.pop("on_preview", None)
+    return taken
+
+
 
 
 class _TimedTail:

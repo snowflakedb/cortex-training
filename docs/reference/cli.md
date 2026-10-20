@@ -1128,7 +1128,9 @@ next tab, round to Logs after the last.
     `↑↓ node`) when the view has more than one; the footer shows the other
     keys.
   - Telemetry downloads when shown, refreshes every 30 seconds for a running
-    selected sub-job, and refreshes on `r`. A view with nothing to chart shows
+    selected sub-job, and refreshes on `r`. While a download runs, the header
+    counts the selected sub-job's chunks:
+    `loading GPU metrics ━━━━━━━━━━━━ 340/1,440 chunks`. A view with nothing to chart shows
     a quiet card instead of the stats and charts: a title (`Waiting for the
     job to start`, `Waiting for the first samples`, `GPU metrics are on
     another sub-job`, `CPU and memory aren't collected`, `No usable GPU
@@ -1138,7 +1140,11 @@ next tab, round to Logs after the last.
     has no GPUs. A failed refresh keeps cached data and says
     `cached · refresh failed: …`. Data is kept in the TUI's per-location job
     cache; the selected sub-job and its newest cached samples
-    appear first, and later opens download only new chunks.
+    appear first, and later opens download only new chunks. On a first open,
+    with nothing cached for the selected sub-job, its newest half hour (the 10m
+    and 30m windows) downloads before the rest of its history and is drawn at
+    once, marked `loading older samples…` until the rest is in; a job short
+    enough that this saves no time downloads whole.
 - **Training metrics** charts what the training sub-job's `/step` and
   `/fwd-bwd` calls returned, read from its own `training.jsonl`
   ([Training metrics download](rest-api.md#125-training-metrics-download)),
@@ -1315,7 +1321,10 @@ sub-job's first, shown as soon as it is in, then the others' in the
 background, with its progress on the bar under the pane meanwhile (the other
 sub-jobs' chunk count on the status line, once the selected one's is in). The pane says
 which sub-job's console comes first, and, for a sub-job you select before its
-console is in, that it comes with the others'. A job that ended more than 10
+console is in, that it comes with the others'. A long job's console can take
+minutes: the sub-job on screen first shows the console's last 30 minutes, under
+`— the saved console's last 30 minutes; the older lines are still downloading —`,
+until its whole console is in. A job that ended more than 10
 minutes earlier keeps that console in its per-location job cache, so
 reopening it is instant. The
 kept consoles of all jobs take at most 1 GiB together: past that, the ones
