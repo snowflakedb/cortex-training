@@ -866,10 +866,10 @@ requests zero GPUs.
 A sub-job row is fainter than its job's and shows what it doesn't share with
 it: its label (`training #0`), its status as the glyph alone while it is its
 job's and as glyph and word where it differs, its model where the job has more
-than one, and its GPUs. `▸`/`▾`, arrows, clicks, and `e` control sub-job rows.
-A live job starts unfolded where its sub-job rows tell more than its own row:
-it has more than one sub-job, or its status is `unknown`; a live job of one
-sub-job starts folded.
+than one, and its GPUs (left out for a job's only sub-job when the job's row
+gives the same count). `▸`/`▾`, arrows, clicks, and `e` control sub-job rows.
+Every live job starts unfolded, its sub-job rows in view; history jobs start
+folded.
 
 `ctrl+c` copies text that holds up once pasted. With nothing highlighted, it
 copies every row of the list (scrolled out of view too) in aligned columns,

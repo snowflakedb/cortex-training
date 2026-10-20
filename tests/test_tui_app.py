@@ -4059,9 +4059,18 @@ def test_job_list_rows_say_what_their_columns_don_t():
     assert str(JobListScreen._sub_cells(job, untold, True)["Status"]) == ""
     assert JobListScreen._sub_cells({**job, "status": "UNKNOWN"}, untold, True)["Status"].plain == "?"
 
-    # A live job starts unfolded only where its sub-job rows say more than its own row.
+    # Of several sub-jobs each says its GPUs; a job's only sub-job does where the job's row doesn't.
+    assert str(same["GPUs"]) == "—"
+    lone = {"job_id": "o", "status": "RUNNING", "hardware": "H200", "sub_jobs": [
+        {"sub_job_id": "o:training:0", "job_type": "training", "status": "RUNNING",
+         "training_config": {"n_gpus": 8}}]}
+    lone_cells = JobListScreen._sub_cells(lone, lone["sub_jobs"][0], True)
+    assert str(lone_cells["Job ID"]) == "  └ training #0" and lone_cells["Status"].plain == "●"
+    assert views.job_gpu_cell(lone) == "8" and str(lone_cells["GPUs"]) == ""  # the job's row says "8 H200"
+
+    # Every live job starts unfolded, one of a single sub-job too; history starts folded.
     assert JobListScreen._starts_unfolded(job)
-    assert not JobListScreen._starts_unfolded({**job, "sub_jobs": job["sub_jobs"][:1]})
+    assert JobListScreen._starts_unfolded({**job, "sub_jobs": job["sub_jobs"][:1]})
     assert JobListScreen._starts_unfolded({"job_id": "u", "status": "UNKNOWN"})
     assert not JobListScreen._starts_unfolded({**job, "status": "FAILED"})
 
@@ -4120,7 +4129,7 @@ def test_a_copy_of_the_job_list_has_whole_times_and_status_words():
             table = app.screen.query_one("#jobs", DataTable)
             drawn = [cell.plain for cell in table.get_row("job-0")]
             assert "3h ago" in drawn and "2m ago" in drawn  # the screen reads relative times
-            # The header, the LIVE heading, the job, then its two sub-jobs (several: it starts unfolded).
+            # The header, the LIVE heading, the job, then its two sub-jobs (live: it starts unfolded).
             _header, heading, job, training, sampling = table.rows_text()
             assert heading.startswith("LIVE")
             # A paste stays true: the times themselves, and each status as its word, no glyph.
