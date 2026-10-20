@@ -66,11 +66,6 @@ import os
 import traceback
 
 
-# Rich's grey62, by value: Textual's markup and styles (the preview's Content)
-# don't know that name and would draw the default color instead.
-ENDED_STYLE = "#9e9e9e"
-
-
 def on_stack(screen: Screen) -> bool:
     """Whether ``screen`` remains on its app's stack, safe from a worker."""
     try:
@@ -540,8 +535,55 @@ class SelectableTable(DataTable):
             text = "".join(self._line_parts(line))
             span = _selected_span(selection, line, text)
             if span is not None:
-                parts.append(text[span[0]:span[1]])
-        return ("\n".join(parts), "\n") if parts else None
+                parts.append(self._copied_columns(line, text, span))
+        return ("\n".join(_aligned_pieces(parts)), "\n") if parts else None
+
+    def _copied_columns(self, line: int, text: str, span: tuple[int, int]) -> list:
+        """The selected part of one line, column by column, as ``(column, text, whole)``
+        (``whole``: the piece is the column's full width). A cell the span covers whole
+        is its copy text (``str()``): a relative time drawn "3h ago" copies as the time
+        itself, a status as its word, an id cut with "…" whole. A cell it covers only
+        in part is what it draws there."""
+        start, end = span
+        cells = None if self._labelled_row_exists and self.show_row_labels else self._row_cells(line)
+        if cells is None:
+            return [(None, text[start:end], False)]
+        pad = self.cell_padding
+        pieces, at, used = [], 0, 0
+        columns = self.ordered_columns
+        for index, column in enumerate(columns):
+            used += column.get_render_width(self)
+            stop = _chars_within(text, used)
+            high = min(len(text) if index == len(columns) - 1 else stop, end)  # the last runs to the edge
+            low = max(at, start)
+            if low < high:
+                piece = text[low:high]
+                cell = cells[index] if index < len(cells) else None
+                content = text[at + pad:stop - pad].rstrip()
+                after = at + pad + len(content)
+                if isinstance(cell, _FixedCell) and start <= at + pad and end >= after and str(cell) != content:
+                    lead = text[low:at + pad]
+                    copied = views.printable(str(cell)).replace("\n", " ")
+                    # As wide as the column drew it, or wider (with its padding) for a longer copy text.
+                    piece = lead + copied + " " * max(len(piece) - len(lead) - len(copied), pad if high >= stop else 0)
+                pieces.append((index, piece, low == at and high >= stop))
+            at = stop
+        return pieces
+
+    def _row_cells(self, line: int) -> list | None:
+        """The cells of the one-line row that table line ``line`` draws (none for the
+        column names, which are split into columns all the same); None for a taller
+        row or a line past the rows."""
+        try:
+            row_key, line_in_row = self._get_offsets(line)
+            if row_key == self._header_row_key:
+                return [] if self.header_height == 1 else None
+            row = self.rows.get(row_key)
+            if line_in_row or row is None or row.height != 1:
+                return None
+            return self.get_row(row_key)
+        except (LookupError, KeyError, RowDoesNotExist):
+            return None
 
     def drag_region(self, header: bool = False) -> Region:
         """The clipped header or scrolling-row drag region."""
@@ -614,6 +656,23 @@ def _chars_within(text: str, cells: int) -> int:
         if used > cells:
             return index
     return len(text)
+
+
+def _aligned_pieces(lines: list) -> list:
+    """Lines of ``(column, text, whole)`` pieces (see ``SelectableTable._copied_columns``)
+    as text, each whole column as wide as its widest piece: a copy text longer or shorter
+    than what a cell draws keeps the columns after it in line. Lines whose pieces all
+    draw their cells as they are come out as drawn."""
+    widths: dict = {}
+    for pieces in lines:
+        for column, text, whole in pieces:
+            if whole:
+                widths[column] = max(widths.get(column, 0), cell_len(text))
+    out = []
+    for pieces in lines:
+        texts = [text + " " * (widths[column] - cell_len(text)) if whole else text for column, text, whole in pieces]
+        out.append("".join(texts).rstrip())
+    return out
 
 
 def _selected_span(selection: Selection, line: int, text: str) -> tuple[int, int] | None:
