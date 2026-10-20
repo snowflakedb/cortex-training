@@ -19,6 +19,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
+from dataclasses import replace
 from datetime import datetime
 from datetime import timedelta
 from typing import Any
@@ -47,6 +48,10 @@ FALLBACK = "fallback"  # the account-level list was asked for and isn't there: t
 
 CAPPED = "cap"  # a walk read ACCOUNT_LIST_CAP jobs, and more exist
 PAGE_LIMIT = "pages"  # a walk read ACCOUNT_LIST_MAX_PAGES pages, and the last one carried a token
+FAILED = "failed"  # the walk's first pages were shown, and a later one failed (or was never read)
+
+OLDER = "older"  # loading: the newest jobs' walk has more pages to read
+ACTIVE_NEXT = "active"  # loading: that walk is done; the active jobs' walk is read next
 
 # These failures affect only the account route, so schema listing can continue.
 _FALLBACK_REASONS = frozenset({AccountJobListUnavailable.NOT_DEPLOYED, AccountJobListUnavailable.DISABLED})
@@ -78,11 +83,22 @@ class ListScope:
     pages: int = 0  # ACCOUNT, stopped at PAGE_LIMIT: the pages it read
     active_missing: bool = False  # ACCOUNT, stopped: the active-job walk failed or stopped early; some may be missing
     reason: Optional[str] = None  # FALLBACK: why the account-level list is unavailable
+    # ACCOUNT, shown while it is read: OLDER, or ACTIVE_NEXT (the newest jobs' walk
+    # stopped as ``stopped`` says). "" once the list is whole.
+    loading: str = ""
 
     @property
     def truncated(self) -> bool:
-        """The list holds only the newest jobs: more exist, or may exist."""
-        return self.stopped is not None
+        """The list holds only the newest jobs: more exist, may exist, or are still loading."""
+        return self.stopped is not None or bool(self.loading)
+
+
+def stopped_scope(scope: ListScope) -> ListScope:
+    """A loading scope as its list stands once its walk stopped short (a page failed, or the load was superseded)."""
+    if not scope.loading:
+        return scope
+    return replace(scope, loading="", stopped=scope.stopped if scope.loading == ACTIVE_NEXT else FAILED,
+                   active_missing=True)
 
 
 @dataclass
@@ -94,16 +110,20 @@ class Listing:
 
 
 def _more(scope: ListScope) -> str:
-    more = "more exist" if scope.stopped == CAPPED else "more may exist"
+    more = {CAPPED: "more exist", FAILED: "the rest didn't load; r retries"}.get(scope.stopped or "", "more may exist")
     return more + ("; older active jobs may be missing" if scope.active_missing else "")
 
 
 def scope_text(scope: ListScope, *, location: str, only: str = "") -> str:
     """A short header for this scope; ``only`` names its sole location."""
     if scope.kind == ACCOUNT:
+        if scope.loading == OLDER:
+            return f"loading older jobs… {scope.walked:,} so far"
+        if scope.loading:
+            return f"newest {scope.walked:,}; loading older active jobs…"
         if scope.stopped is None:
             return f"all schemas (all in {only})" if only else "all schemas"
-        held = f"newest {scope.walked:,}" if scope.stopped == CAPPED else (
+        held = f"newest {scope.walked:,}" if scope.stopped in (CAPPED, FAILED) else (
             f"first {scope.pages} pages: {scope.walked:,} job{'' if scope.walked == 1 else 's'}")
         return held + ("" if scope.active_missing else " + every active job") + f" ({_more(scope)})"
     if scope.kind == SCHEMA:
@@ -118,15 +138,21 @@ def unavailable_text(scope: ListScope) -> str:
 
 def loaded_text(scope: Optional[ListScope]) -> str:
     """What a list cut short holds, for a search without results; "" when it holds every job."""
-    if scope is None or scope.stopped is None:
+    if scope is None or not scope.truncated:
         return ""
-    held = (f"the newest {scope.walked:,} of the last 6 months" if scope.stopped == CAPPED
+    if scope.loading:
+        what = "older jobs are" if scope.loading == OLDER else "older active jobs are"
+        return f"the newest {scope.walked:,} so far; {what} still loading"
+    held = (f"the newest {scope.walked:,} of the last 6 months" if scope.stopped in (CAPPED, FAILED)
             else f"what the first {scope.pages} pages held")
     return held + ("" if scope.active_missing else " and every active job") + f"; {_more(scope)}"
 
 
 def empty_text(scope: ListScope) -> str:
-    """The list's message when a walk cut short left no job to show."""
+    """The list's message when a walk cut short (or still loading) left no job to show."""
+    if scope.loading:
+        return (f"The account-wide list has no jobs to show among its newest {scope.walked:,} yet; "
+                f"{'older' if scope.loading == OLDER else 'older active'} jobs are still loading.")
     held = (f"in its first {scope.pages} pages" if scope.stopped == PAGE_LIMIT
             else f"among its newest {scope.walked:,}")
     return f"The account-wide list returned no jobs to show {held}; more may exist. r reads it again."
@@ -181,8 +207,13 @@ class JobLister:
         self._asked_at = 0.0  # in fallback: when the account-level list last answered (or failed)
 
     def load(self, now: datetime, *, is_cancelled: Callable[[], bool] = lambda: False,
-             manual: bool = False, account: Optional[bool] = None, asked: bool = False) -> Optional[Listing]:
-        """Load one refresh; flags override scope, reprobe, and fallback behavior."""
+             manual: bool = False, account: Optional[bool] = None, asked: bool = False,
+             on_partial: Optional[Callable[[Listing], None]] = None) -> Optional[Listing]:
+        """Load one refresh; flags override scope, reprobe, and fallback behavior.
+
+        ``on_partial`` is given the account-level list as it is read (see :meth:`_walk`), except while
+        asking again in fallback: the configured schema's list stands until the account-level one is whole.
+        """
         if not (self.account_wide if account is None else account):
             return self._schema(ListScope(SCHEMA))
         if self._fallback is not None and not self._ask_again(manual):
@@ -191,7 +222,7 @@ class JobLister:
             self._fallback = None  # asked again for a: the earlier answer no longer counts
         probing = self._fallback is not None
         try:
-            listing = self._walk(now, is_cancelled)
+            listing = self._walk(now, is_cancelled, None if probing else on_partial)
         except AccountJobListUnavailable as exc:
             return self._unavailable(exc, probing)
         except Exception as exc:
@@ -237,68 +268,113 @@ class JobLister:
             raise JobListError(_failure_text(_SCHEMA_ROUTE, exc)) from exc
         return Listing([job for job in (jobs or []) if isinstance(job, dict)], scope)
 
-    def _walk(self, now: datetime, is_cancelled: Callable[[], bool]) -> Optional[Listing]:
-        """The newest jobs of the account-level list, and the active ones when more exist; None when cancelled."""
+    def _walk(self, now: datetime, is_cancelled: Callable[[], bool],
+              on_partial: Optional[Callable[[Listing], None]] = None) -> Optional[Listing]:
+        """The newest jobs of the account-level list, and the active ones when more exist; None when cancelled.
+
+        ``on_partial`` is given what is read so far (a :class:`Listing` whose scope is ``loading``) after
+        each page of the newest jobs that isn't the last one read; the requests, and the result, are the
+        same as without it. (The active jobs come last: on a busy account their walk is pages long too,
+        and its first page the slowest.)
+        """
         created_after = now - timedelta(days=views.RETENTION_DAYS)
-        walked = self._pages(created_after, None, is_cancelled)
-        if walked is None:
-            return None
-        jobs, stopped = walked
-        if stopped is None:
-            return Listing(jobs, ListScope(ACCOUNT))
-        try:
-            active = self._pages(created_after, ACTIVE, is_cancelled)
-        except Exception:  # noqa: BLE001 - the newest jobs stand; the scope says active ones may be missing
-            logger.info("job list: reading the active jobs failed; older active jobs may be missing", exc_info=True)
-            active = ([], "failed")
+        newest = _Walk(self._client, created_after, None)
+        reported = 0  # the most jobs a partial has held: a walk read again from its start shows none fewer
+        while not newest.done:
+            if not newest.step(is_cancelled):
+                return None
+            if on_partial is None or (newest.done and newest.stopped is None) or len(newest.jobs) < reported:
+                continue  # whole (the result comes next), or read again from its start
+            reported = len(newest.jobs)
+            if newest.done:  # stopped short: the active jobs come next
+                scope = ListScope(ACCOUNT, stopped=newest.stopped, walked=len(newest.jobs), loading=ACTIVE_NEXT,
+                                  pages=ACCOUNT_LIST_MAX_PAGES if newest.stopped == PAGE_LIMIT else 0)
+            else:
+                scope = ListScope(ACCOUNT, walked=len(newest.jobs), loading=OLDER)
+            on_partial(Listing(list(newest.jobs), scope))
+        if newest.stopped is None:
+            return Listing(newest.jobs, ListScope(ACCOUNT))
+        active = self._active(created_after, is_cancelled)
         if active is None:
             return None
         rows, active_stopped = active
-        listed = {views.job_key(job) for job in jobs}
-        added = [job for job in rows if views.job_key(job) not in listed]
-        scope = ListScope(ACCOUNT, stopped=stopped, walked=len(jobs),
-                          pages=ACCOUNT_LIST_MAX_PAGES if stopped == PAGE_LIMIT else 0,
+        scope = ListScope(ACCOUNT, stopped=newest.stopped, walked=len(newest.jobs),
+                          pages=ACCOUNT_LIST_MAX_PAGES if newest.stopped == PAGE_LIMIT else 0,
                           active_missing=active_stopped is not None)
-        return Listing(jobs + added, scope)
+        return Listing(_merge(newest.jobs, rows), scope)
 
-    def _pages(self, created_after: datetime, status: Optional[str],
-               is_cancelled: Callable[[], bool]) -> Optional[tuple]:
-        """One walk; it starts again from the first page, once, when the service can't open its token."""
+    def _active(self, created_after: datetime, is_cancelled: Callable[[], bool]) -> Optional[tuple]:
+        """``(jobs, stopped)`` of the active-job walk (stopped "failed" when it failed); None when cancelled."""
+        walk = _Walk(self._client, created_after, ACTIVE)
         try:
-            return self._read_pages(created_after, status, is_cancelled)
-        except InvalidPageToken:
-            logger.info("job list: the service could not open its page token; reading again from the first page")
-            return self._read_pages(created_after, status, is_cancelled)
+            while not walk.done:
+                if not walk.step(is_cancelled):
+                    return None
+        except Exception:  # noqa: BLE001 - the newest jobs stand; the scope says active ones may be missing
+            logger.info("job list: reading the active jobs failed; older active jobs may be missing", exc_info=True)
+            return [], "failed"
+        return walk.jobs, walk.stopped
 
-    def _read_pages(self, created_after: datetime, status: Optional[str],
-                    is_cancelled: Callable[[], bool]) -> Optional[tuple]:
-        """``(jobs, stopped)``: up to the cap or the page limit, newest first; None when cancelled."""
-        filters: dict = {"created_after": created_after, **({"status": status} if status else {})}
-        jobs: list = []
-        seen: set = set()
-        token = None
-        for _ in range(ACCOUNT_LIST_MAX_PAGES):
+
+def _merge(jobs: list, active: list) -> list:
+    """``jobs``, then the active jobs not among them (a new list)."""
+    listed = {views.job_key(job) for job in jobs}
+    return jobs + [job for job in active if views.job_key(job) not in listed]
+
+
+class _Walk:
+    """One walk of the account-level list, a page at a time: up to the cap or the page limit, newest first.
+    It starts again from the first page, once, when the service can't open its token."""
+
+    def __init__(self, client: Any, created_after: datetime, status: Optional[str]) -> None:
+        self._client = client
+        self._filters: dict = {"created_after": created_after, **({"status": status} if status else {})}
+        self._restarted = False
+        self._start()
+
+    def _start(self) -> None:
+        self.jobs: list = []
+        self.done = False
+        self.stopped: Optional[str] = None
+        self._seen: set = set()
+        self._token: Optional[str] = None
+        self._pages = 0
+
+    def step(self, is_cancelled: Callable[[], bool]) -> bool:
+        """Read the next page; False when cancelled first."""
+        if is_cancelled():
+            return False
+        try:
+            page = self._read()
+        except InvalidPageToken:
+            if self._restarted:
+                raise
+            logger.info("job list: the service could not open its page token; reading again from the first page")
+            self._restarted = True
+            self._start()
             if is_cancelled():
-                return None
-            page = self._client.list_jobs_page(
-                **filters,
-                page_size=ACCOUNT_PAGE_SIZE,
-                page_token=token,
-            )
-            rows, token = _page(page)
-            for job in rows:
-                job_id = views.job_id_of(job)
-                key = views.job_key(job)
-                if job_id and key in seen:
-                    continue
-                seen.add(key)
-                jobs.append(job)
-            if len(jobs) >= ACCOUNT_LIST_CAP:
-                more = token is not None or len(jobs) > ACCOUNT_LIST_CAP
-                return jobs[:ACCOUNT_LIST_CAP], CAPPED if more else None
-            if token is None:
-                return jobs, None
-        return jobs, PAGE_LIMIT  # stopped at the page limit with pages left
+                return False
+            page = self._read()
+        rows, self._token = _page(page)
+        self._pages += 1
+        for job in rows:
+            key = views.job_key(job)
+            if views.job_id_of(job) and key in self._seen:
+                continue
+            self._seen.add(key)
+            self.jobs.append(job)
+        if len(self.jobs) >= ACCOUNT_LIST_CAP:
+            more = self._token is not None or len(self.jobs) > ACCOUNT_LIST_CAP
+            self.jobs = self.jobs[:ACCOUNT_LIST_CAP]
+            self.done, self.stopped = True, CAPPED if more else None
+        elif self._token is None:
+            self.done = True
+        elif self._pages >= ACCOUNT_LIST_MAX_PAGES:
+            self.done, self.stopped = True, PAGE_LIMIT  # stopped at the page limit with pages left
+        return True
+
+    def _read(self) -> Any:
+        return self._client.list_jobs_page(**self._filters, page_size=ACCOUNT_PAGE_SIZE, page_token=self._token)
 
 
 class JobClients:

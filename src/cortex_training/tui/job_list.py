@@ -46,6 +46,7 @@ from textual.worker import get_current_worker
 from cortex_training.tui import theme
 from cortex_training.tui import views
 from cortex_training.tui.account import ACCOUNT
+from cortex_training.tui.account import FAILED
 from cortex_training.tui.logs import LogScreen
 from cortex_training.tui.account import SCHEMA
 from cortex_training.tui.account import JobClients
@@ -56,6 +57,7 @@ from cortex_training.tui.account import ListScope
 from cortex_training.tui.account import empty_text
 from cortex_training.tui.account import loaded_text
 from cortex_training.tui.account import scope_text
+from cortex_training.tui.account import stopped_scope
 from cortex_training.tui.account import unavailable_text
 from cortex_training.tui.format import format_created_at
 from cortex_training.tui.widgets import FollowsPointer
@@ -133,9 +135,11 @@ _CHIP_ORDER = ("running", "initializing", "placing", "pending", "unknown")
 _CHIP_OF = {"creating": "placing", "queued": "pending"}
 
 
-def _status_chips(live: list, history: int) -> Content:
+def _status_chips(live: list, history: int, *, so_far: bool = False) -> Content:
     """The counts on the line above the list, each live status as its glyph, count and
-    word, then the history: ``● 4 running   ◔ 1 placing   ? 1 unknown  │  21 in history``."""
+    word, then the history: ``● 4 running   ◔ 1 placing   ? 1 unknown  │  21 in history``.
+    ``so_far``: the list is still loading, and the live counts and the history end in "so far"."""
+    mark = Content.styled(" so far", theme.FAINT) if so_far else Content("")
     counts = Counter(_CHIP_OF.get(key, key) for key in (theme.status_key(job.get("status")) for job in live))
     chips = []
     for key in [*_CHIP_ORDER, *sorted(set(counts) - set(_CHIP_ORDER))]:
@@ -146,7 +150,7 @@ def _status_chips(live: list, history: int) -> Content:
     chips = chips or [Content.styled("no live jobs", theme.MUTED)]
     ended = Content.assemble("  ", ("│", theme.FAINT), "  ", (f"{history:,} ", f"bold {theme.TEXT}"),
                              ("in history", theme.MUTED))
-    return Content("   ").join(chips) + ended
+    return Content("   ").join(chips) + mark + ended + mark
 
 
 @dataclass(frozen=True)
@@ -240,12 +244,36 @@ class _JobTable(SelectableTable):
         for key, cells in rows:
             self.add_row(*cells, key=key)
 
+    def patch_rows(self, rows: list, shown: tuple) -> None:
+        """Change the table from ``shown`` to ``rows`` (``(key, cells)`` pairs, in order) in place,
+        without clearing it (which scrolls it home): the rows gone are removed, the cells that
+        changed updated, the new rows added, then all put in order. Each removal is linear in the
+        rows, so this suits a list that grows."""
+        old = dict(shown)
+        for key in old.keys() - {key for key, _cells in rows}:
+            self.remove_row(key)
+        columns = [column.key for column in self.ordered_columns]
+        for key, cells in rows:
+            was = old.get(key)
+            if was is None:
+                self.add_row(*cells, key=key)
+            elif was is not cells:
+                for column, before, after in zip(columns, was, cells):
+                    if before is not after:
+                        self.update_cell(key, column, after)
+        if [row.key.value for row in self.ordered_rows] != [key for key, _cells in rows]:
+            # Each row's Job ID cell is its own object: its identity gives the row's place.
+            at = [column.value for column in columns].index("Job ID")
+            position = {id(cells[at]): index for index, (_key, cells) in enumerate(rows)}
+            self.sort("Job ID", key=lambda name: position[id(name)])
+
 
 class JobListScreen(FollowsPointer, Screen):
     """Every job in the retention window: live first, then history, with sub-job rows.
 
     ``a`` switches between the configured schema's jobs and the account-wide list
-    (see :class:`cortex_training.tui.account.JobLister`); search takes ids, locations
+    (see :class:`cortex_training.tui.account.JobLister`), which shows its pages as they
+    come where no list of its own shows yet (:meth:`_on_partial`); search takes ids, locations
     and ``field<op>value`` filters (see :func:`cortex_training.tui.views.parse_query`).
 
     A job with sub-jobs shows ▸ (folded) or ▾ before its id. Every live job
@@ -276,6 +304,9 @@ class JobListScreen(FollowsPointer, Screen):
     _FIRST_COLUMNS = ("Job ID", "Status", "Type", "Created", "Duration", "Owner")
     _NAME_MIN = 16
     _SEARCH_DEBOUNCE_SECONDS = 0.12
+    # A page more of the list changes its rows in place up to this many rows gone (each
+    # removal is linear in the rows); beyond, the table is filled again.
+    _PATCH_REMOVALS = 64
     _DECLINED_CELLS = 60  # the header's reason a could not show all schemas; the notice has it in full
     _LOCATION_AT = [label for label, _width in _COLUMNS].index("GPUs") + 1
     _LOCATION_WIDTHS = (10, 32)
@@ -303,6 +334,11 @@ class JobListScreen(FollowsPointer, Screen):
         self._failed_at: str | None = None  # HH:MM:SS of the last failed load, while it stands
         self._refreshing = False
         self._refresh_started: float | None = None  # monotonic time the refresh in flight began
+        # Each load's number: the answers (and pages) of a load superseded since are dropped.
+        self._load_gen = 0
+        self._load_worker = None  # the load in flight
+        self._progressive = False  # the load in flight shows its pages as they come
+        self._partial_gen: int | None = None  # the load whose first pages the list shows
         self._list_error: str | None = None  # last failed load, on one line; cleared by a good one
         self._list_refused = False  # that failure was the account-wide list refusing this caller (403/405)
         self._scope: ListScope | None = None  # what the list on screen covers
@@ -459,10 +495,16 @@ class JobListScreen(FollowsPointer, Screen):
             bits = [switching, f"list from {self._last_refreshed}" if self._last_refreshed else ""]
             self.app.sub_title = "  ·  ".join(bit for bit in bits if bit)
             return
+        if self._scope is not None and self._scope.loading:
+            # The list's first pages: how far it is, in place of when it was refreshed.
+            self.app.sub_title = "  ·  ".join(("all schemas", self._scope_text()))
+            return
         if self._refreshing:
             refresh_status = "refreshing…"
             if self._last_refreshed:
                 refresh_status += f" (last refreshed {self._last_refreshed})"
+        elif self._scope is not None and self._scope.stopped == FAILED and self._list_error and self._failed_at:
+            refresh_status = f"load failed {self._failed_at}"  # its first pages show; the notice says what failed
         elif self._list_error and self._failed_at and self._loaded_at is None:
             refresh_status = f"load failed {self._failed_at}"  # no list yet: the error is in its place
         elif self._list_error and self._failed_at:
@@ -497,14 +539,29 @@ class JobListScreen(FollowsPointer, Screen):
         if self._refreshing:
             if manual and not quiet:
                 waited = int(time.monotonic() - (self._refresh_started or time.monotonic()))
-                self.notify(f"Still waiting for the last refresh ({waited}s); r asks again once it answers.",
-                            markup=False)
+                what = "loading older jobs" if self._partial_gen == self._load_gen else "waiting for the last refresh"
+                self.notify(f"Still {what} ({waited}s); r asks again once it answers.", markup=False)
             return
         self._refreshing = True
         self._refresh_started = time.monotonic()
         self._update_subtitle()
         account = self._account_wanted()
-        self._load_jobs(manual, account, account and self._asked)
+        # Pages show as they come only where no list of this kind shows yet (the first
+        # load, or after a): a refresh keeps the whole list it has until the next is whole.
+        self._progressive = account and (self._loaded_at is None or self._switching)
+        self._load_gen += 1
+        self._load_worker = self._load_jobs(manual, account, account and self._asked, self._load_gen,
+                                            self._progressive)
+
+    def _supersede(self) -> None:
+        """Drop the load in flight (its pages come no more; what it answers is dropped), so another can start."""
+        self._load_gen += 1
+        if self._load_worker is not None:
+            self._load_worker.cancel()  # it stops before its next page
+        self._load_worker = None
+        self._refreshing = False
+        if self._scope is not None and self._scope.loading:
+            self._scope = stopped_scope(self._scope)  # its first pages stay until the next list answers
 
     def _account_wanted(self) -> bool:
         """Whether the list to show is the account-wide one (a), not the configured schema's."""
@@ -520,6 +577,9 @@ class JobListScreen(FollowsPointer, Screen):
         self._declined = None
         self._switching = True
         self.refresh_bindings()  # the footer's a names the other list now
+        if self._refreshing and self._progressive:
+            # A list still reading its pages: no need to wait for the rest of them.
+            self._supersede()
         self._refresh_jobs(manual=True, quiet=True)
         # A refresh already in flight reads the list a asked for when it answers;
         # the header says so now.
@@ -742,12 +802,18 @@ class JobListScreen(FollowsPointer, Screen):
         self._render_jobs()
 
     @work(thread=True, group="jobs")
-    def _load_jobs(self, manual: bool = False, account: bool = False, asked: bool = False) -> None:
-        """Read one schema or account-wide listing off the UI thread."""
+    def _load_jobs(self, manual: bool = False, account: bool = False, asked: bool = False, gen: int = 0,
+                   progressive: bool = False) -> None:
+        """Read one schema or account-wide listing off the UI thread (``progressive``: showing its pages)."""
         worker = get_current_worker()
+
+        def on_partial(listing: Listing) -> None:
+            if not worker.is_cancelled:
+                call_on_screen(self, self._on_partial, gen, listing)
+
         try:
             listing = self._lister.load(self._clock(), is_cancelled=lambda: worker.is_cancelled, manual=manual,
-                                        account=account, asked=asked)
+                                        account=account, asked=asked, on_partial=on_partial if progressive else None)
             error = None
         except JobListError as exc:
             listing, error = None, exc
@@ -755,11 +821,46 @@ class JobListScreen(FollowsPointer, Screen):
             listing, error = None, JobListError(views.collapse(f"the job list failed: {views.describe_error(exc)}"))
         if worker.is_cancelled or (listing is None and error is None):
             return
-        call_on_screen(self, self._on_jobs, listing, error, account)
+        call_on_screen(self, self._on_jobs, listing, error, account, gen)
 
-    def _on_jobs(self, listing, error: JobListError | None, account: bool = False) -> None:
+    def _on_partial(self, gen: int, listing: Listing) -> None:
+        """The first pages of the account-wide list the load ``gen`` reads, shown while it reads the rest."""
+        if gen != self._load_gen or not self._refreshing or not self._account_wanted():
+            return  # superseded (by a, or a load since): its pages are not the list asked for
+        steady = self._partial_gen == gen  # its earlier pages show: the user may be reading them
+        self._partial_gen = gen
+        self._switching = False  # the list a asked for shows now
+        self._asked = False  # and stays, whatever its later pages answer
+        self._show_listing(listing, steady=steady)
+
+    def _show_listing(self, listing: Listing, *, steady: bool = False) -> None:
+        """Show ``listing`` as the list; ``steady``: it grows the list on screen, which stays where it is."""
+        self._scope = listing.scope
+        self._loaded_at = time.monotonic()
+        self._all_jobs = self._merged(listing.jobs)
+        self._jobs_by_key = {self._job_key(job): job for job in self._all_jobs}
+        self._rows = {key: rows for key, rows in self._rows.items() if key in self._jobs_by_key}
+        self._hay = {key: hay for key, hay in self._hay.items() if key in self._jobs_by_key}
+        self._update_subtitle()
+        self._render_jobs(steady=steady)
+
+    def _on_jobs(self, listing, error: JobListError | None, account: bool = False, gen: int | None = None) -> None:
         """A load's answer: ``listing``, or ``error``; ``account``: it read the account-wide list."""
+        if gen is not None and gen != self._load_gen:
+            return  # superseded: the load that replaced it answers in its place
         self._refreshing = False
+        self._load_worker = None
+        shown = self._partial_gen is not None and self._partial_gen == gen  # its first pages show
+        self._partial_gen = None
+        if shown and error is not None:
+            # A later page failed: the pages read stay, saying so, and r reads them all again.
+            self._scope = stopped_scope(self._scope)
+            self._list_error = str(error) or "the job list failed"
+            self._list_refused = error.refused
+            self._failed_at = time.strftime("%H:%M:%S")
+            self._update_subtitle()
+            self._render_jobs(steady=True)
+            return
         if account != self._account_wanted():
             # a switched lists while this one was read: read the one asked for now.
             self._refresh_jobs(manual=True, quiet=True)
@@ -783,15 +884,8 @@ class JobListScreen(FollowsPointer, Screen):
         self._list_error = None
         self._list_refused = False
         self._failed_at = None
-        self._loaded_at = time.monotonic()
-        self._scope = listing.scope
-        self._all_jobs = self._merged(listing.jobs)
-        self._jobs_by_key = {self._job_key(job): job for job in self._all_jobs}
-        self._rows = {key: rows for key, rows in self._rows.items() if key in self._jobs_by_key}
-        self._hay = {key: hay for key, hay in self._hay.items() if key in self._jobs_by_key}
         self._last_refreshed = time.strftime("%H:%M:%S")
-        self._update_subtitle()
-        self._render_jobs()
+        self._show_listing(listing, steady=shown)
         self.app.job_list_drawn(self)
 
     def _stay_on_schema(self, listing: Listing | None, error: JobListError | None) -> Listing | None:
@@ -972,20 +1066,21 @@ class JobListScreen(FollowsPointer, Screen):
         return tuple(subs), tuple(keys)
 
     @staticmethod
-    def _header_cells(group: str, count: int, layout: _ListLayout) -> tuple:
+    def _header_cells(group: str, count: int, layout: _ListLayout, so_far: bool = False) -> tuple:
         """A LIVE/HISTORY row, drawn as a section heading: its title and count in the
-        Job ID column, and a rule across the columns after (drawn, not copied)."""
+        Job ID column (``so_far``: "…" after it, while more jobs load), and a rule across
+        the columns after (drawn, not copied)."""
         style = f"bold {theme.OK}" if group == "LIVE" else f"bold {theme.MUTED}"
-        name = _cell(f"{group}  {count:,}", style)
+        name = _cell(f"{group}  {count:,}{'…' if so_far else ''}", style)
         return tuple(name if column == "Job ID" else _RuleCell(width, theme.RULE) for column, width in layout.columns)
 
-    def _header(self, group: str, count: int, layout: _ListLayout) -> tuple:
+    def _header(self, group: str, count: int, layout: _ListLayout, so_far: bool = False) -> tuple:
         """A LIVE/HISTORY row, kept while it reads the same."""
         kept = self._headers.get(group)
-        if kept is not None and kept[0] == (count, layout):
+        if kept is not None and kept[0] == (count, so_far, layout):
             return kept[1]
-        cells = self._header_cells(group, count, layout)
-        self._headers[group] = ((count, layout), cells)
+        cells = self._header_cells(group, count, layout, so_far)
+        self._headers[group] = ((count, so_far, layout), cells)
         return cells
 
     def _job_rows(self, job: dict, layout: _ListLayout) -> _JobRows:
@@ -1047,8 +1142,13 @@ class JobListScreen(FollowsPointer, Screen):
         self._notice = None
         if not stale:
             return
-        text = (f"✕ refresh failed {self._failed_at or ''}: {self._list_error or ''}; "
-                f"showing the list from {(self._last_refreshed or '—')[:5]}")
+        if self._scope is not None and self._scope.stopped == FAILED:
+            # The first pages of a list whose later ones failed (or were never read).
+            text = (f"✕ load failed {self._failed_at or ''}: {self._list_error or ''}; "
+                    f"showing the {len(self._all_jobs):,} jobs read before it (r reads them all again)")
+        else:
+            text = (f"✕ refresh failed {self._failed_at or ''}: {self._list_error or ''}; "
+                    f"showing the list from {(self._last_refreshed or '—')[:5]}")
         self._notice = Content.assemble("   ", (text, theme.ERR))
         self._paint_notice()
 
@@ -1115,14 +1215,18 @@ class JobListScreen(FollowsPointer, Screen):
 
     # ─── the table ───────────────────────────────────────────────────────────
 
-    def _render_jobs(self, *, keep: tuple | None = None, top: bool = False) -> None:
-        """Draw the list, optionally keeping one job or starting at the top."""
+    def _render_jobs(self, *, keep: tuple | None = None, top: bool = False, steady: bool = False) -> None:
+        """Draw the list, optionally keeping one job or starting at the top; ``steady``: the
+        list grew (a page more of it), and the highlighted row stays where it is on screen."""
         table = self.query_one("#jobs", DataTable)
         info_line = self.query_one("#listinfo", Static)
         keep_sub = None
+        anchor = None
         if keep is None and not top:
             key, keep = self._highlighted()
             keep_sub = self._sub_by_item.get(key)  # a sub-job row keeps its own cursor
+            if steady and key is not None and table.display and table.row_count:
+                anchor = (key, table.cursor_row - round(table.scroll_y), table.scroll_x)
         recent = self._recent()
         layout = self._layout_for(self._location_column_width(recent))
         self._show_notice()
@@ -1150,11 +1254,13 @@ class JobListScreen(FollowsPointer, Screen):
         live = [j for j in ordered if views.is_live(j)]
         history = [j for j in ordered if not views.is_live(j)]
 
-        left = [_status_chips(live, len(history))]
+        # While the list loads, its counts are of the jobs read so far.
+        loading = self._scope is not None and bool(self._scope.loading)
+        left = [_status_chips(live, len(history), so_far=loading)]
         if self._filter:
             # The count before the query: a long query wraps, the count stays in view.
             # The search text is shown literally (assembled, never parsed as markup).
-            matched = f"match{'' if len(visible) == 1 else 'es'} for "
+            matched = f"match{'' if len(visible) == 1 else 'es'}{' so far' if loading else ''} for "
             left.append(Content.assemble((f"{len(visible):,} ", f"bold {theme.TEXT}"), (matched, theme.MUTED),
                                          (self._filter, f"bold {theme.ACCENT}")))
         self._info = (left, _sort_part(self._sort, self._descending))
@@ -1191,7 +1297,7 @@ class JobListScreen(FollowsPointer, Screen):
         for group, jobs in groups:
             if not jobs:
                 continue
-            plan.append((f"hdr-{group.lower()}", self._header(group, len(jobs), layout)))
+            plan.append((f"hdr-{group.lower()}", self._header(group, len(jobs), layout, loading)))
             for job in jobs:
                 job_key = self._job_key(job)
                 item_id = self._row_key(job_key)
@@ -1222,6 +1328,9 @@ class JobListScreen(FollowsPointer, Screen):
                 at = layout.labels.index("Job ID")
                 position = {id(cells[at]): index for index, (_key, cells) in enumerate(plan)}
                 table.sort("Job ID", key=lambda name: position[id(name)])
+            elif (steady and shown is not None and shown[0] == layout and table.row_count == len(shown[1])
+                  and len({key for key, _cells in shown[1]} - {key for key, _cells in plan}) <= self._PATCH_REMOVALS):
+                table.patch_rows(plan, shown[1])  # a page more: the rows on screen stay
             else:
                 self._set_columns(table, layout)
                 table.replace_rows(plan)
@@ -1229,12 +1338,31 @@ class JobListScreen(FollowsPointer, Screen):
         if target_row is None:
             target_row = 1  # first job row (row 0 is a group header)
         target_row = min(target_row, table.row_count - 1)
-        if was_hidden:
+        if anchor is not None:
+            # The highlighted row stays on its line.
+            table.move_cursor(row=target_row, animate=False, scroll=False)
+            after_refresh(self, self._keep_view, *anchor)
+        elif was_hidden:
             # Place again after layout without initially scrolling off the group header.
             table.move_cursor(row=target_row, animate=False, scroll=False)
             after_refresh(self, self._place_cursor, target_row)
         elif not same or top or table.cursor_row != target_row:
             self._place_cursor(target_row)
+
+    def _keep_view(self, key: str, on_screen: int, scroll_x: float, tries: int = 10) -> None:
+        """After the list grew: scroll so the row ``key`` is ``on_screen`` rows below the top
+        of the view again (rows added above it don't push it down), and sideways as it was."""
+        table = self.query_one("#jobs", DataTable)
+        try:
+            row = table.get_row_index(key)
+        except Exception:  # noqa: BLE001 - gone with the new rows
+            return
+        top = max(0, row - on_screen)
+        if top > table.max_scroll_y and tries:
+            # Not yet as tall as its new rows: once it is.
+            after_refresh(self, self._keep_view, key, on_screen, scroll_x, tries - 1)
+            return
+        table.scroll_to(x=scroll_x, y=top, animate=False, immediate=True)
 
     def _row_key(self, job_key: tuple) -> str:
         """A stable table key for this screen."""

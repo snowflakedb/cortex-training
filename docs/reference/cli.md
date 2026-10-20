@@ -786,9 +786,18 @@ database and schema the role can see instead, from the account-level list
 the footer then offers `a Current schema`, which goes back. The
 header line starts with when the list was last refreshed (`refreshing…` while
 a refresh reads), then which list is shown. Until the list `a` asked for
-answers, which can take several seconds for a large account, the header reads
-`loading all schemas…` (or `loading the current schema, DB.SCHEMA…`) and the
-previous list stays on screen:
+answers, the header reads `loading all schemas…` (or `loading the current
+schema, DB.SCHEMA…`) and the previous list stays on screen. The account-level
+list shows its first page (the newest 500 jobs) as soon as it answers, and adds
+each later page as it comes: the highlighted row stays where it is on screen,
+and folds and a search stay as they are. Until the last page, the header reads
+`all schemas · loading older jobs… N so far` (then `newest 2,000; loading older
+active jobs…` while it reads the active jobs), the counts above the list and a
+search's matches end in `so far`, and the LIVE and HISTORY rows' counts in `…`.
+The list also shows its pages as they come when it first opens on all schemas;
+a refresh of a whole list keeps showing it until the next one is whole.
+`a` while the pages are read stops reading them; `r` waits for the last page.
+Once the list is whole, the header names it:
 
 | Header | The list holds |
 |---|---|
@@ -831,7 +840,9 @@ last answer.
 
 On refresh failure, the previous list stays under a red error and a
 `refresh failed TIME (list from TIME)` header. A first-load error replaces the
-list; `r` retries. The list pauses under details and refreshes on return when
+list; `r` retries. When a later page of the account-level list fails after the
+first pages showed, those stay, under a red error, with a `load failed TIME ·
+newest N (the rest didn't load; r retries; …)` header. The list pauses under details and refreshes on return when
 its last read is over 60 seconds old.
 
 When the list holds jobs from more than one database and schema, a
