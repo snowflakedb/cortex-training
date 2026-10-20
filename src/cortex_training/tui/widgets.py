@@ -517,6 +517,11 @@ class SelectableTable(DataTable):
         extend = " " * max(0, self.size.width - width - self._row_label_column_width)
         return "".join(texts[:self.fixed_columns]), "".join(texts[self.fixed_columns:]) + extend
 
+    def text_select_all(self) -> None:
+        """Nothing: Textual highlights a whole widget on a double-click, which on a table
+        opens the row clicked (a second click on the cursor's row selects it), and the
+        highlight, under the screen opened, painted the whole table on coming back."""
+
     def _selection_style(self) -> Style:
         """Selection background plus an explicitly configured foreground."""
         screen = self.screen

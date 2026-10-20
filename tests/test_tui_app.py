@@ -2831,6 +2831,37 @@ def test_a_drag_in_a_job_list_cell_highlights_and_copies_just_its_text():
     asyncio.run(_run_a_drag_in_a_job_list_cell_highlights_and_copies_just_its_text())
 
 
+async def _run_a_double_click_that_opens_a_job_leaves_the_list_unhighlighted():
+    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    async with app.run_test(size=(150, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        mouse = _pointer(app, pilot)
+        lines = _screen_lines(app)
+        first = _first_job_line(lines)
+        y = _first_job_line([""] * (first + 1) + lines[first + 1:])  # the second job: not under the cursor
+        # A double-click on a job: the first click puts the cursor on it, the second opens it.
+        # Textual highlights a whole widget on a double-click; on the table that would be
+        # every row, under the preview, there on coming back.
+        await _click(mouse, 20, y)
+        assert not isinstance(app.screen, JobSummaryScreen)
+        await _click(mouse, 20, y)
+        assert await _pause_until(pilot, lambda: isinstance(app.screen, JobSummaryScreen))
+        assert app._chained_clicks == 2
+        await pilot.press("b")
+        assert await _pause_until(pilot, lambda: app.screen is screen)
+        await pilot.pause(0.1)
+        assert screen.selections == {}
+        assert table.text_selection is None
+        assert app.focused is table
+        lines = _screen_lines(app)
+        assert not any(_highlighted_columns(app, row, table) for row in range(y, y + 10)), lines[y:y + 10]
+        await _settle(app, pilot)
+
+
+def test_a_double_click_that_opens_a_job_leaves_the_list_unhighlighted():
+    asyncio.run(_run_a_double_click_that_opens_a_job_leaves_the_list_unhighlighted())
+
+
 async def _run_a_click_on_the_sort_s_name_or_arrow_changes_it():
     app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
     async with app.run_test(size=(130, 40)) as pilot:
