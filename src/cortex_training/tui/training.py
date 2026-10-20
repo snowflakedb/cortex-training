@@ -334,13 +334,15 @@ def parse_lines(sub_job_id: str, lines: Iterable[bytes], state: _SubJobState | N
     return state
 
 
-def _training_files(metrics_root: Path) -> list[Path]:
+def _training_files(metrics_root: Path | None) -> list[Path]:
     """Each ``<sub_job_id>/training.jsonl`` under ``metrics_root``, in name order.
 
     The directory's name is the sub-job's id, which the TUI draws, and it comes
     from the stage's listing, so one that isn't printable as it is is passed
     over rather than shown (as :func:`resource._metric_files` does).
     """
+    if metrics_root is None:
+        return []
     try:
         paths = sorted(metrics_root.glob(f"*/{FILE_NAME}"))
     except OSError:
@@ -357,33 +359,54 @@ class _FileState:
 
 
 class TrainingLoader:
-    """Reads a telemetry cache directory's training rows, each file from where it left off.
+    """Reads a job's training rows, each file from where it left off.
 
-    A file the download rebuilt (another inode, a chunk list that no longer
-    extends the one read, or fewer committed bytes) is read again from the
-    start. Thread-safe: one load at a time.
+    A sub-job's rows come from the client's local log (``local_root``, written
+    as each result arrives, so it has a step the moment it runs) when there is
+    one, and from the stage's copy (``metrics_root``, which arrives in batches)
+    otherwise: a job opened on another machine has no local log.
+
+    A stage file the download rebuilt (another inode, a chunk list that no
+    longer extends the one read, or fewer committed bytes) is read again from
+    the start. Thread-safe: one load at a time.
     """
 
-    def __init__(self, metrics_root: Path) -> None:
+    def __init__(self, metrics_root: Path, local_root: Path | None = None) -> None:
         self._root = Path(metrics_root)
+        self._local = Path(local_root) if local_root is not None else None
         self._files: dict[str, _FileState] = {}
         self._guard = threading.Lock()
 
     def load(self) -> TrainingData:
         with self._guard:
+            local = {path.parent.name: path for path in _training_files(self._local)} if self._local else {}
+            stage = {path.parent.name: path for path in _training_files(self._root)}
             found: dict[str, SubJobTraining] = {}
-            for path in _training_files(self._root):
-                sub_job_id = path.parent.name
-                state = self._read(sub_job_id, path)
+            for sub_job_id in sorted(set(local) | set(stage)):
+                path = local.get(sub_job_id)
+                state = self._read(sub_job_id, path, local=True) if path else self._read(sub_job_id, stage[sub_job_id])
                 if state is not None and state.has_rows():
                     found[sub_job_id] = state.snapshot()
             return TrainingData(found)
 
-    def _read(self, sub_job_id: str, path: Path) -> _SubJobState | None:
-        manifest = _read_manifest(path)
-        if manifest is None:
-            return None  # not committed yet
-        names, committed = manifest
+    def local_sub_jobs(self) -> set[str]:
+        """The sub-jobs read from the local log rather than the stage."""
+        return {path.parent.name for path in _training_files(self._local)} if self._local else set()
+
+    def _read(self, sub_job_id: str, path: Path, *, local: bool = False) -> _SubJobState | None:
+        if local:
+            # Appended a whole row at a time and never rebuilt: everything on disk is committed.
+            try:
+                committed = path.stat().st_size
+            except OSError:
+                return None
+            names = [str(path)]
+            sub_job_id = f"local:{sub_job_id}"  # its own read position, apart from the stage file's
+        else:
+            manifest = _read_manifest(path)
+            if manifest is None:
+                return None  # not committed yet
+            names, committed = manifest
         try:
             stat = path.stat()
         except OSError:
@@ -396,7 +419,7 @@ class TrainingLoader:
             or names[: len(known.names)] != known.names
             or committed < known.offset
         ):
-            known = _FileState(identity, list(names), 0, _SubJobState(sub_job_id))
+            known = _FileState(identity, list(names), 0, _SubJobState(sub_job_id.removeprefix("local:")))
             self._files[sub_job_id] = known
         if committed > known.offset:
             try:
@@ -406,7 +429,7 @@ class TrainingLoader:
             except OSError:
                 return known.parsed
             end = chunk.rfind(b"\n") + 1  # a row is read once it is whole
-            parse_lines(sub_job_id, chunk[:end].splitlines(), known.parsed)
+            parse_lines(sub_job_id.removeprefix("local:"), chunk[:end].splitlines(), known.parsed)
             known.offset += end
         known.names = list(names)
         return known.parsed

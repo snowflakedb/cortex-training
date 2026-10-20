@@ -87,6 +87,7 @@ from urllib3.exceptions import NewConnectionError
 
 from cortex_training import _account_jobs
 from cortex_training import _artifact_download
+from cortex_training import _training_log
 from cortex_training._account_jobs import AccountJobListUnavailable  # noqa: F401 - exported
 from cortex_training._account_jobs import InvalidPageToken  # noqa: F401 - exported
 from cortex_training._artifact_download import DownloadCancelled
@@ -1851,6 +1852,9 @@ class CortexTrainingClient:
         # Forward request ids awaiting poll, so a result that is only
         # ``{"job_id", "payload_b64"}`` (no ``wire_format``) can still be decoded.
         self._forward_request_ids: set[str] = set()
+        # Requests whose results are copied to the local training-metrics log (see _training_log).
+        self._training_log_ops: dict[str, tuple[str, str]] = {}
+        self._training_log = None if _training_log.disabled() else _training_log.TrainingLog()
         # Per-job cache of the sampling sub-job's ``inference_config.max_seq_len``
         # (the value the backend launches vLLM with as ``max_model_len``). Used
         # to validate generate prompt lengths client-side. A cached ``None``
@@ -4883,6 +4887,7 @@ class CortexTrainingClient:
             debug_context=debug_context,
         )
         request_id = body["request_id"]
+        self._remember_training_log_op(request_id, job_id, _training_log.OP_FWD_BWD)
         request_debug_context = {
             "phase": "poll",
             "call": call,
@@ -4980,7 +4985,9 @@ class CortexTrainingClient:
         if learning_rate is not None:
             body["learning_rate"] = learning_rate
         resp = self._send("POST", f"{self._prefix}/{job_id}/step", json=body)
-        return resp.json()["request_id"]
+        request_id = resp.json()["request_id"]
+        self._remember_training_log_op(request_id, job_id, _training_log.OP_STEP)
+        return request_id
 
     @_track_operation("save")
     def save(
@@ -5060,7 +5067,10 @@ class CortexTrainingClient:
         if target_sub_job_id is not None:
             body["target_sub_job_id"] = target_sub_job_id
         resp = self._send("POST", f"{self._prefix}/{job_id}/load", json=body)
-        return resp.json()["request_id"]
+        request_id = resp.json()["request_id"]
+        # A load moves the job to another step: the local log learns its step again at the next /step.
+        self._remember_training_log_op(request_id, job_id, _training_log.OP_LOAD)
+        return request_id
 
     def _operation(
         self,
@@ -5497,6 +5507,25 @@ class CortexTrainingClient:
         status["events"] = decoded
         return status
 
+    # Requests submitted and never polled are dropped past this, oldest first.
+    _MAX_TRAINING_LOG_OPS = 4096
+
+    def _remember_training_log_op(self, request_id: str, job_id: str, op: str) -> None:
+        ops = self._training_log_ops
+        ops[request_id] = (job_id, op)
+        while len(ops) > self._MAX_TRAINING_LOG_OPS:
+            ops.pop(next(iter(ops)))
+
+    def _log_training_result(self, request_id: str, result: Any) -> None:
+        """Copy a finished /fwd-bwd's or /step's result to the local training-metrics log. Never raises."""
+        logged = self._training_log_ops.pop(request_id, None)
+        if logged is None or self._training_log is None:
+            return
+        if logged[1] == _training_log.OP_LOAD:
+            self._training_log.forget_step(logged[0])
+        else:
+            self._training_log.record(logged[0], logged[1], request_id, result)
+
     @_track_operation("poll_request")
     def poll_request(self, job_id: str, request_id: str) -> dict:
         """Poll until the async request completes. Returns the result dict."""
@@ -5538,6 +5567,7 @@ class CortexTrainingClient:
                         result = decoded
                 result = self._normalize_generate_result_if_needed(request_id, result)
                 result = self._normalize_forward_result_if_needed(request_id, result)
+                self._log_training_result(request_id, result)
                 if debug_label is not None:
                     logger.debug(
                         "%s completed state=%s result=%s",

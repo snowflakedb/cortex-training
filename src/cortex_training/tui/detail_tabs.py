@@ -33,6 +33,7 @@ from textual.widgets import Static
 from textual.widgets import TabbedContent
 from textual.worker import get_current_worker
 
+from cortex_training import _training_log
 from cortex_training.tui import training
 from cortex_training.tui import views
 from cortex_training.tui.resource import CHART_AXIS
@@ -134,11 +135,11 @@ _LOADERS_GUARD = threading.Lock()
 _MAX_LOADERS = 4
 
 
-def training_loader(metrics_root: Path) -> training.TrainingLoader:
+def training_loader(metrics_root: Path, local_root: Path | None = None) -> training.TrainingLoader:
     """The shared loader for a cache directory, so reopening a job reads only what is new."""
-    key = str(Path(metrics_root).resolve())
+    key = f"{Path(metrics_root).resolve()}\0{local_root}"
     with _LOADERS_GUARD:
-        loader = _LOADERS.pop(key, None) or training.TrainingLoader(Path(metrics_root))
+        loader = _LOADERS.pop(key, None) or training.TrainingLoader(Path(metrics_root), local_root)
         _LOADERS[key] = loader
         while len(_LOADERS) > _MAX_LOADERS:
             _LOADERS.popitem(last=False)
@@ -164,12 +165,35 @@ class TrainingPane(_Pane):
                  download: Callable[..., bool], id: str = "training") -> None:
         super().__init__(client, job_id, job=job, id=id)
         self._metrics_root = Path(metrics_root)
+        # The client's own copy of this job's rows, written as each result arrives (see _training_log).
+        self._local_root = _training_log.local_dir(job_id)
         self._download = download
         self._data = training.TrainingData()
         self._downloaded = False  # a download finished: a sub-job without rows has none
         self._window = training.DEFAULT_WINDOW
         self._view = training.DEFAULT_VIEW  # per step, or per /fwd-bwd call
         self._pick: str | None = None  # the sub-job Space last showed
+
+    # How often the local log is read while the tab is shown: it gains a row the moment a result
+    # arrives, so a step appears within this, not after the stage's batched upload.
+    _LOCAL_REFRESH_SECONDS = 2.0
+
+    def on_mount(self) -> None:
+        self.set_interval(self._LOCAL_REFRESH_SECONDS, self._refresh_local)
+
+    def _refresh_local(self) -> None:
+        if self._shown and self.is_active_tab() and not self._loading:
+            self._read_local()
+
+    @work(thread=True, exclusive=True, group="training-local")
+    def _read_local(self) -> None:
+        worker = get_current_worker()
+        loader = training_loader(self._metrics_root, self._local_root)
+        if not loader.local_sub_jobs():
+            return  # no local log (another machine's job): the stage refresh is all there is
+        data = loader.load()  # only the rows appended since the last read
+        if not worker.is_cancelled:
+            self._post(self._accept, data)
 
     def compose(self) -> ComposeResult:
         yield Static("", id="training-status")
@@ -231,7 +255,7 @@ class TrainingPane(_Pane):
     @work(thread=True, exclusive=True, group="training")
     def _refresh(self) -> None:
         worker = get_current_worker()
-        loader = training_loader(self._metrics_root)
+        loader = training_loader(self._metrics_root, self._local_root)
 
         def show() -> None:
             data = loader.load()

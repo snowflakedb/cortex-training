@@ -54,6 +54,13 @@ Local or mock clients constructed with an explicit `base_url` treat
 `emit_metric` as a no-op. Set `CORTEX_TRAINING_DISABLE_TELEMETRY=1` to skip
 constructing the emitter.
 
+When `poll_request` receives a `/fwd-bwd` or `/step` result, the client also
+appends that result's row, in the stage's `training.jsonl` format
+([REST API section 12.5](rest-api.md#125-training-metrics-download)), to a
+local file under the TUI cache, so the Training metrics tab shows the step
+without waiting for the stage. It never changes the result and never fails the
+call. Set `CORTEX_TRAINING_DISABLE_LOCAL_TRAINING_METRICS=1` to turn it off.
+
 Tracked operations:
 
 - Job lifecycle: `create_job`, `wait_for_job`, `get_job`, `list_jobs`,
