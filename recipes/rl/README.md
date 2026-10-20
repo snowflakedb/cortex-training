@@ -27,7 +27,7 @@ python -m recipes.rl.math_grpo.train \
 # Qwen3-4B-Instruct-2507 full-parameter, 256K context
 python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json \
-  job_config=configs/qwen3_4b_instruct.json
+  job_config=model-catalog/models/qwen3-4b-instruct/long/h200-training-full.json
 
 # Qwen3-8B full-parameter
 python -m recipes.rl.math_grpo.train \
@@ -37,26 +37,26 @@ python -m recipes.rl.math_grpo.train \
 # Qwen3.5-9B full-parameter, 256K context
 python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json \
-  job_config=configs/qwen35_9b_full.json
+  job_config=model-catalog/models/qwen3.5-9b/long/h200-training-full.json
 
 # Gemma 3 4B IT, MedGemma 4B IT, and MedGemma 1.5 4B IT.
 # Full-parameter, 128K context.
 python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json \
-  job_config=configs/gemma3_4b.json
+  job_config=model-catalog/models/gemma-3-4b/long/h200-training-full.json
 
 python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json \
-  job_config=configs/medgemma_4b.json
+  job_config=model-catalog/models/medgemma-4b/long/h200-training-full.json
 
 python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json \
-  job_config=configs/medgemma15_4b.json
+  job_config=model-catalog/models/medgemma-1.5-4b/long/h200-training-full.json
 
 # Gemma 4 31B IT full-parameter, 256K context
 python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json \
-  job_config=configs/gemma4_31b.json
+  job_config=model-catalog/models/gemma-4-31b/long/h200-training-full.json
 
 # Qwen3.6-35B-A3B LoRA
 python -m recipes.rl.math_grpo.train \
@@ -80,12 +80,12 @@ python -m recipes.rl.math_grpo.train \
 # Qwen3-30B-A3B full-parameter
 python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json \
-  job_config=configs/qwen3_30b_a3b.json
+  job_config=model-catalog/models/qwen3-30b-a3b/standard/h200-training-full.json
 
 # Qwen3.8-Flash-Next full-parameter, 256K context
 python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json \
-  job_config=configs/qwen38_flash_next.json
+  job_config=model-catalog/models/qwen3.8-flash-next/long/h200-training-full.json
 ```
 
 `config=` is the Snowflake connection file. Adapt from
@@ -95,40 +95,42 @@ The default job body is `configs/qwen3_8b_lora.json`. The default run will be fi
 
 Other full-parameter job bodies are:
 
-- `configs/qwen3_4b_instruct.json`: Qwen3-4B-Instruct-2507, 8 training GPUs, SP8, 8 sampling GPUs at TP8, 256K. One optimizer step and an 8-token sample completed on H200.
-- `configs/qwen35_9b_full.json`: Qwen3.5-9B, 8 training GPUs, SP8, 8 sampling GPUs at TP8, 256K. One optimizer step and an 8-token sample completed on H200.
-- `configs/gemma3_4b.json`, `configs/medgemma_4b.json`, and `configs/medgemma15_4b.json`: Gemma 3 4B IT, MedGemma 4B IT, and MedGemma 1.5 4B IT. Each is 8 training GPUs, SP8, 8 sampling GPUs at TP8, 128K. The training block matches the SFT recipe. All three are Gemma 3 conditional-generation checkpoints. MedGemma 4B IT and MedGemma 1.5 4B IT each completed one optimizer step, weight sync, and an 8-token post-sync sample on H200. On Transformers 5, vLLM's Gemma 3 mapper has to send `model.vision_tower.` to `vision_tower.vision_model.`. `google/gemma-3-4b-it` uses this same mesh; that checkpoint was not run because its Hugging Face license grant is still pending.
-- `configs/gemma4_31b.json`: Gemma 4 31B IT, 8 training GPUs, SP8, 8 sampling GPUs at TP8, 256K. The training block matches the SFT recipe. One optimizer step and an 8-token sample completed on H200. Sliding layers use head size 256; full-attention layers use head size 512. Long sequences use flex attention, and shorter sequences use math attention.
-- `configs/qwen3_30b_a3b.json`
-- `configs/glm45_air.json`
-- `configs/nemotron3_nano_30b.json`: Nemotron-3-Nano, 8 training GPUs, SP8, EP4, 8 sampling GPUs at TP8, 256K. The training mesh matches the SFT recipe, which completed an AdamW step on H200. Sampling was not probed.
-- `configs/nemotron35_lightning_30b.json`: Nemotron-3.5-Lightning, same 256K mesh as Nano. MTP weights are not trained.
-- `configs/glm53_flash_lora.json` (FP8 checkpoint, attention-only LoRA)
-- `configs/glm53_flash_bf16.json`
-- `configs/qwen38_flash_next.json`
-- `configs/deepseek_v4_flash.json`
+- `model-catalog/models/qwen3-4b-instruct/long/h200-training-full.json`: Qwen3-4B-Instruct-2507, 8 training GPUs, SP8, 8 sampling GPUs at TP8, 256K. One optimizer step and an 8-token sample completed on H200.
+- `model-catalog/models/qwen3.5-9b/long/h200-training-full.json`: Qwen3.5-9B, 8 training GPUs, SP8, 8 sampling GPUs at TP8, 256K. One optimizer step and an 8-token sample completed on H200.
+- `model-catalog/models/gemma-3-4b/long/h200-training-full.json`, `model-catalog/models/medgemma-4b/long/h200-training-full.json`, and `model-catalog/models/medgemma-1.5-4b/long/h200-training-full.json`: Gemma 3 4B IT, MedGemma 4B IT, and MedGemma 1.5 4B IT. Each is 8 training GPUs, SP8, 8 sampling GPUs at TP8, 128K. The training block matches the SFT recipe. All three are Gemma 3 conditional-generation checkpoints. MedGemma 4B IT and MedGemma 1.5 4B IT each completed one optimizer step, weight sync, and an 8-token post-sync sample on H200. On Transformers 5, vLLM's Gemma 3 mapper has to send `model.vision_tower.` to `vision_tower.vision_model.`. `google/gemma-3-4b-it` uses this same mesh; that checkpoint was not run because its Hugging Face license grant is still pending.
+- `model-catalog/models/gemma-4-31b/long/h200-training-full.json`: Gemma 4 31B IT, 8 training GPUs, SP8, 8 sampling GPUs at TP8, 256K. The training block matches the SFT recipe. One optimizer step and an 8-token sample completed on H200. Sliding layers use head size 256; full-attention layers use head size 512. Long sequences use flex attention, and shorter sequences use math attention.
+- `model-catalog/models/qwen3-30b-a3b/standard/h200-training-full.json`
+- `model-catalog/models/glm-4.5-air/long/h200-training-full.json`
+- `model-catalog/models/nemotron-3-nano-30b/long/h200-training-full.json`: Nemotron-3-Nano, 8 training GPUs, SP8, EP4, 8 sampling GPUs at TP8, 256K. The training mesh matches the SFT recipe, which completed an AdamW step on H200. Sampling was not probed.
+- `model-catalog/models/nemotron-3.5-lightning-30b/long/h200-training-full.json`: Nemotron-3.5-Lightning, same 256K mesh as Nano. MTP weights are not trained.
+- `model-catalog/models/glm-5.3-flash/long/h200-training-lora.json` (FP8 checkpoint, attention-only LoRA)
+- `model-catalog/models/glm-5.3-flash-bf16/long/h200-training-full.json`
+- `model-catalog/models/qwen3.8-flash-next/long/h200-training-full.json`
+- `model-catalog/models/deepseek-v4-flash/long/h200-training-full.json`
 
+RL for a model in `model-catalog/models/` is the inference file plus the
+training file in the same directory. Pass either file as `job_config`.
 The training block of each renamed RL recipe matches its SFT recipe.
-`qwen38_flash_next.json` uses the same 8-GPU, SP8, EP8, `qsa_flex`
+`model-catalog/models/qwen3.8-flash-next/long/h200-training-full.json` uses the same 8-GPU, SP8, EP8, `qsa_flex`
 training mesh as the SFT recipe, including bf16 master weights and optimizer
 states. Its sampler stays at 8 GPUs and TP8, with `weight_format: vllm` and
 router replay. The completed evidence is the training optimizer step;
 sampling was not probed.
-`glm53_flash_lora.json` uses the same 8-GPU, SP8, EP8, DeepEP
+`model-catalog/models/glm-5.3-flash/long/h200-training-lora.json` uses the same 8-GPU, SP8, EP8, DeepEP
 training mesh as the SFT recipe, including the DeepEP token chunk of 8192,
 the tiled MLP chunk of 1024, and attention-only LoRA. Fused cross-entropy
 is off so the training step can return per-token log probabilities.
 Its sampler stays at 8 GPUs and TP8 with a 256K context and the same LoRA
 targets. One generate, one AdamW step, an NCCL LoRA weight sync, and a
 post-sync 8-token sample completed on two H200 nodes.
-`glm53_flash_bf16.json` uses the same 16-GPU, SP16, EP16, UCCL
+`model-catalog/models/glm-5.3-flash-bf16/long/h200-training-full.json` uses the same 16-GPU, SP16, EP16, UCCL
 training mesh as the SFT recipe, including the tiled MLP chunk of 1024.
 Fused cross-entropy is off. Its sampler is 16 GPUs at TP16 with a 256K
 context and no LoRA. One 8-token vLLM sample, one short AdamW step
 (loss -1.0, entropy 0.010, grad norm 8.46, 258s, GPU peak 62.9 GiB),
 a full-weight NCCL sync (1440 params, 45s), and a post-sync 8-token
 sample completed on four H200 nodes. All 313.9B parameters were trainable.
-`deepseek_v4_flash.json` uses the same 16-GPU, SP16, EP16, eager, UCCL
+`model-catalog/models/deepseek-v4-flash/long/h200-training-full.json` uses the same 16-GPU, SP16, EP16, eager, UCCL
 training mesh as the SFT recipe, including liger fused cross-entropy, bf16
 master weights and optimizer states, and pageable activation offload. Its
 sampler stays at 8 GPUs and TP8, with `weight_format: vllm`, router replay,

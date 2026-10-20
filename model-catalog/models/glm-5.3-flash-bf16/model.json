@@ -1,0 +1,17 @@
+{
+  "modelId": "zai-org/GLM-5.3-Flash-BF16",
+  "license": {
+    "name": "MIT",
+    "url": "https://huggingface.co/zai-org/GLM-5.3-Flash-BF16/blob/main/LICENSE"
+  },
+  "architecture": "moe",
+  "moe": {
+    "num_moe_layers": 42,
+    "topk": 8,
+    "num_experts": 288
+  },
+  "lastValidated": {
+    "h200-training-full": "2026-10-20",
+    "h200-inference-full": "2026-10-20"
+  }
+}

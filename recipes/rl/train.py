@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import statistics
@@ -21,6 +22,7 @@ from recipes.utils import collate
 from recipes.utils import discard_router_replay
 from recipes.utils import forward_backward_step
 from recipes.utils import load_job_body
+from recipes.utils import resolve_cortex_training_config_path
 from recipes.utils import log_saved_checkpoints
 from recipes.utils import make_client
 from recipes.utils import router_replay_stop_params
@@ -92,8 +94,46 @@ class Task(Protocol):
     ): ...
 
 
+def _with_sibling_sub_job(path: Path, body: dict) -> dict:
+    """Build an RL job from the training and inference files in one directory."""
+    jobs = list(body.get("sub_job_configs") or [])
+    kinds = {job.get("job_type") for job in jobs}
+    if {"training", "sampling"} <= kinds:
+        return body
+    name = path.name
+    if "-training-" in name:
+        other_name = name.replace("-training-", "-inference-", 1)
+        wanted = "sampling"
+    elif "-inference-" in name:
+        other_name = name.replace("-inference-", "-training-", 1)
+        wanted = "training"
+    else:
+        return body
+    other_path = path.parent / other_name
+    if not other_path.is_file():
+        return body
+    other = json.loads(other_path.read_text(encoding="utf-8"))
+    other_jobs = [
+        job
+        for job in other.get("sub_job_configs") or []
+        if job.get("job_type") == wanted
+    ]
+    if not other_jobs:
+        return body
+    order = {"sampling": 0, "training": 1}
+    combined = sorted(jobs + other_jobs, key=lambda job: order.get(job.get("job_type"), 9))
+    merged = {"sub_job_configs": combined}
+    hardware = body.get("hardware") or other.get("hardware")
+    if hardware:
+        merged["hardware"] = hardware
+    return merged
+
+
 def job_body(config: Config) -> dict:
-    body = load_job_body(config.job_config, search_dirs=_CONFIG_SEARCH_DIRS)
+    path = resolve_cortex_training_config_path(
+        config.job_config, search_dirs=_CONFIG_SEARCH_DIRS
+    )
+    body = _with_sibling_sub_job(path, load_job_body(str(path)))
     if config.debug_image_tag:
         body["debug"] = {"job": {"image_tag": config.debug_image_tag}}
     return body

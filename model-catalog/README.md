@@ -5,6 +5,18 @@ model availability, context limits, and recommended starting configurations.
 
 ## Files
 
+- `models/<model>/` is the config tree for models added after the shared
+  profile catalog. `model.json` records the model id, license, architecture
+  (`dense` or `moe`), and last-validated dates. MoE models also record
+  `moe.num_moe_layers`, `moe.topk`, and `moe.num_experts`.
+  `standard/` and `long/` hold the context-length configs. A file named
+  `<hw>-training-lora.json`, `<hw>-training-full.json`,
+  `<hw>-inference-lora.json`, or `<hw>-inference-full.json` means that
+  model supports that configuration on that GPU. The file's `hardware`
+  field matches the filename prefix (`H200` for `h200-*.json`). Nothing
+  else in the tree points at these files. There is no RL file: an RL job
+  is the inference sub-job plus the training sub-job from the same
+  directory and mode.
 - `models.json` declares inference and training support for every model.
   Supported training models provide SFT and RL starting profiles for LoRA and
   full-parameter training.

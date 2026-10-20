@@ -19,10 +19,10 @@ Shipped SFT configs:
 
 | Job config | Model | Method |
 |---|---|---|
-| `configs/qwen3_4b_instruct.json` | `Qwen/Qwen3-4B-Instruct-2507` | full-parameter, 256K, lr 2e-5 |
+| `model-catalog/models/qwen3-4b-instruct/long/h200-training-full.json` | `Qwen/Qwen3-4B-Instruct-2507` | full-parameter, 256K, lr 2e-5 |
 | `configs/qwen3_8b_full.json` | `Qwen/Qwen3-8B` | full-parameter (default) |
 | `configs/qwen3_8b_lora.json` | `Qwen/Qwen3-8B` | LoRA, rank 32 |
-| `configs/qwen35_9b_full.json` | `Qwen/Qwen3.5-9B` | full-parameter, 256K, lr 5e-6 |
+| `model-catalog/models/qwen3.5-9b/long/h200-training-full.json` | `Qwen/Qwen3.5-9B` | full-parameter, 256K, lr 5e-6 |
 | `configs/qwen35_9b_lora.json` | `Qwen/Qwen3.5-9B` | LoRA, rank 32, lr 1e-4 |
 | `configs/qwen38_27b_full.json` | `Qwen/Qwen3.8-27B` | full-parameter, lr 5e-6 |
 | `configs/qwen38_27b_lora.json` | `Qwen/Qwen3.8-27B` | LoRA, rank 32, lr 1e-4 |

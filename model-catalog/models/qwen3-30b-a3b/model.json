@@ -1,0 +1,13 @@
+{
+  "modelId": "Qwen/Qwen3-30B-A3B",
+  "license": {
+    "name": "Apache 2.0",
+    "url": "https://huggingface.co/Qwen/Qwen3-30B-A3B/blob/main/LICENSE"
+  },
+  "architecture": "moe",
+  "moe": {
+    "num_moe_layers": 48,
+    "topk": 8,
+    "num_experts": 128
+  }
+}

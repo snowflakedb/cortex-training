@@ -1,0 +1,13 @@
+{
+  "modelId": "zai-org/GLM-4.5-Air",
+  "license": {
+    "name": "MIT",
+    "url": "https://huggingface.co/zai-org/GLM-4.5-Air/blob/main/LICENSE"
+  },
+  "architecture": "moe",
+  "moe": {
+    "num_moe_layers": 45,
+    "topk": 8,
+    "num_experts": 128
+  }
+}

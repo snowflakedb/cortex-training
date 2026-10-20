@@ -129,6 +129,7 @@ def test_shipped_qwen_recipes_use_model_limits_and_long_context_sp():
         *REPO_ROOT.glob("recipes/inference/configs/qwen*.json"),
         *REPO_ROOT.glob("recipes/rl/configs/qwen*.json"),
         *REPO_ROOT.glob("recipes/sft/configs/qwen*.json"),
+        *REPO_ROOT.glob("model-catalog/models/qwen*/**/*h200-*.json"),
     ]:
         request = json.loads(path.read_text())
         model_ids = {sub_job["model_name"] for sub_job in request["sub_job_configs"]}
@@ -166,7 +167,7 @@ def test_shipped_qwen_recipes_use_model_limits_and_long_context_sp():
 def test_moe_sft_recipes_have_runnable_parallelism():
     # model, n_gpus, ep_size, max_seq_len, sp_size, train_batch_size
     expected = {
-        "qwen3_30b_a3b.json": (
+        "qwen3-30b-a3b/standard/h200-training-full.json": (
             "Qwen/Qwen3-30B-A3B",
             4,
             4,
@@ -174,7 +175,7 @@ def test_moe_sft_recipes_have_runnable_parallelism():
             1,
             4,
         ),
-        "glm45_air.json": (
+        "glm-4.5-air/long/h200-training-full.json": (
             "zai-org/GLM-4.5-Air",
             8,
             4,
@@ -182,7 +183,7 @@ def test_moe_sft_recipes_have_runnable_parallelism():
             8,
             1,
         ),
-        "nemotron3_nano_30b.json": (
+        "nemotron-3-nano-30b/long/h200-training-full.json": (
             "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
             8,
             4,
@@ -190,7 +191,7 @@ def test_moe_sft_recipes_have_runnable_parallelism():
             8,
             1,
         ),
-        "nemotron35_lightning_30b.json": (
+        "nemotron-3.5-lightning-30b/long/h200-training-full.json": (
             "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
             8,
             4,
@@ -198,7 +199,7 @@ def test_moe_sft_recipes_have_runnable_parallelism():
             8,
             1,
         ),
-        "glm53_flash_lora.json": (
+        "glm-5.3-flash/long/h200-training-lora.json": (
             "zai-org/GLM-5.3-Flash",
             8,
             8,
@@ -206,7 +207,7 @@ def test_moe_sft_recipes_have_runnable_parallelism():
             8,
             1,
         ),
-        "glm53_flash_bf16.json": (
+        "glm-5.3-flash-bf16/long/h200-training-full.json": (
             "zai-org/GLM-5.3-Flash-BF16",
             16,
             16,
@@ -214,7 +215,7 @@ def test_moe_sft_recipes_have_runnable_parallelism():
             16,
             1,
         ),
-        "qwen38_flash_next.json": (
+        "qwen3.8-flash-next/long/h200-training-full.json": (
             "Qwen/Qwen3.8-Flash-Next",
             8,
             8,
@@ -222,7 +223,7 @@ def test_moe_sft_recipes_have_runnable_parallelism():
             8,
             1,
         ),
-        "deepseek_v4_flash.json": (
+        "deepseek-v4-flash/long/h200-training-full.json": (
             "deepseek-ai/DeepSeek-V4-Flash-0731",
             16,
             16,
@@ -231,7 +232,7 @@ def test_moe_sft_recipes_have_runnable_parallelism():
             1,
         ),
     }
-    config_dir = REPO_ROOT / "recipes/sft/configs"
+    config_dir = REPO_ROOT / "model-catalog" / "models"
     for filename, (
         model_id,
         n_gpus,
@@ -241,6 +242,7 @@ def test_moe_sft_recipes_have_runnable_parallelism():
         batch_size,
     ) in expected.items():
         body = json.loads((config_dir / filename).read_text())
+        assert body["hardware"] == "H200"
         sub_job = body["sub_job_configs"][0]
         training = sub_job["training_config"]
         ds_config = training["ds_config"]
@@ -249,7 +251,7 @@ def test_moe_sft_recipes_have_runnable_parallelism():
         assert sub_job["model_name"] == model_id
         assert sub_job["dtype"] == "bfloat16"
         assert training["model_provider"] == "prime_rl"
-        if filename == "glm53_flash_lora.json":
+        if filename == "glm-5.3-flash/long/h200-training-lora.json":
             assert training["prime_rl"] == {
                 "ep_comm_backend": "deepep",
                 "deepep_token_chunk_size": 8192,
@@ -264,14 +266,14 @@ def test_moe_sft_recipes_have_runnable_parallelism():
                 "kv_b_proj",
                 "o_proj",
             ]
-        elif filename == "glm53_flash_bf16.json":
+        elif filename == "glm-5.3-flash-bf16/long/h200-training-full.json":
             assert training["prime_rl"] == {
                 "ep_comm_backend": "uccl",
                 "fused_cross_entropy": False,
             }
             assert training["optimizer"]["lr"] == 2e-5
             assert "peft_config" not in training
-        elif filename == "deepseek_v4_flash.json":
+        elif filename == "deepseek-v4-flash/long/h200-training-full.json":
             assert training["prime_rl"] == {
                 "fused_cross_entropy": "liger",
                 "ep_comm_backend": "uccl",
@@ -285,13 +287,13 @@ def test_moe_sft_recipes_have_runnable_parallelism():
             assert ds_config["bf16"]["bf16_optimizer_states"] is True
             assert ds_config["bf16"]["bf16_master_weights_and_grads"] is True
         if filename in {
-            "glm53_flash_lora.json",
-            "glm53_flash_bf16.json",
+            "glm-5.3-flash/long/h200-training-lora.json",
+            "glm-5.3-flash-bf16/long/h200-training-full.json",
         }:
             assert training["tiled_mlp_token_chunk_size"] == 1024
             assert training["ds_config"]["bf16"]["bf16_optimizer_states"] is True
             assert training["ds_config"]["bf16"]["bf16_master_weights_and_grads"] is True
-        elif filename != "deepseek_v4_flash.json":
+        elif filename != "deepseek-v4-flash/long/h200-training-full.json":
             assert "prime_rl" not in training
         assert training["max_seq_len"] == seq_len
         assert training["n_gpus"] == n_gpus
@@ -301,7 +303,7 @@ def test_moe_sft_recipes_have_runnable_parallelism():
         assert ds_config["train_batch_size"] == batch_size
         assert ds_config["train_micro_batch_size_per_gpu"] == 1
         assert ds_config["gradient_accumulation_steps"] == 1
-        if filename.startswith("qwen38_flash_next"):
+        if "qwen3.8-flash-next" in filename:
             assert training["attn_implementation"] == "qsa_flex"
             assert ds_config["bf16"]["bf16_optimizer_states"] is True
             assert ds_config["bf16"]["bf16_master_weights_and_grads"] is True
@@ -310,7 +312,7 @@ def test_moe_sft_recipes_have_runnable_parallelism():
 def test_moe_rl_recipes_have_runnable_parallelism():
     # model, train gpus, ep, sample gpus, attention, seq, sp, batch
     expected = {
-        "qwen3_30b_a3b.json": (
+        "qwen3-30b-a3b/standard/h200-training-full.json": (
             "Qwen/Qwen3-30B-A3B",
             4,
             4,
@@ -320,7 +322,7 @@ def test_moe_rl_recipes_have_runnable_parallelism():
             1,
             4,
         ),
-        "glm45_air.json": (
+        "glm-4.5-air/long/h200-training-full.json": (
             "zai-org/GLM-4.5-Air",
             8,
             4,
@@ -330,7 +332,7 @@ def test_moe_rl_recipes_have_runnable_parallelism():
             8,
             1,
         ),
-        "nemotron3_nano_30b.json": (
+        "nemotron-3-nano-30b/long/h200-training-full.json": (
             "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
             8,
             4,
@@ -340,7 +342,7 @@ def test_moe_rl_recipes_have_runnable_parallelism():
             8,
             1,
         ),
-        "nemotron35_lightning_30b.json": (
+        "nemotron-3.5-lightning-30b/long/h200-training-full.json": (
             "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
             8,
             4,
@@ -350,7 +352,7 @@ def test_moe_rl_recipes_have_runnable_parallelism():
             8,
             1,
         ),
-        "glm53_flash_lora.json": (
+        "glm-5.3-flash/long/h200-training-lora.json": (
             "zai-org/GLM-5.3-Flash",
             8,
             8,
@@ -360,7 +362,7 @@ def test_moe_rl_recipes_have_runnable_parallelism():
             8,
             1,
         ),
-        "glm53_flash_bf16.json": (
+        "glm-5.3-flash-bf16/long/h200-training-full.json": (
             "zai-org/GLM-5.3-Flash-BF16",
             16,
             16,
@@ -370,7 +372,7 @@ def test_moe_rl_recipes_have_runnable_parallelism():
             16,
             1,
         ),
-        "qwen38_flash_next.json": (
+        "qwen3.8-flash-next/long/h200-training-full.json": (
             "Qwen/Qwen3.8-Flash-Next",
             8,
             8,
@@ -380,7 +382,7 @@ def test_moe_rl_recipes_have_runnable_parallelism():
             8,
             1,
         ),
-        "deepseek_v4_flash.json": (
+        "deepseek-v4-flash/long/h200-training-full.json": (
             "deepseek-ai/DeepSeek-V4-Flash-0731",
             16,
             16,
@@ -391,8 +393,8 @@ def test_moe_rl_recipes_have_runnable_parallelism():
             1,
         ),
     }
-    config_dir = REPO_ROOT / "recipes/rl/configs"
-    sft_dir = REPO_ROOT / "recipes/sft/configs"
+    config_dir = REPO_ROOT / "model-catalog" / "models"
+    sft_dir = config_dir
     for filename, (
         model_id,
         training_gpus,
@@ -403,8 +405,14 @@ def test_moe_rl_recipes_have_runnable_parallelism():
         sp_size,
         batch_size,
     ) in expected.items():
-        body = json.loads((config_dir / filename).read_text())
-        sampling, training = body["sub_job_configs"]
+        training_body = json.loads((config_dir / filename).read_text())
+        sampling_body = json.loads(
+            (config_dir / filename.replace("h200-training-", "h200-inference-")).read_text()
+        )
+        assert training_body["hardware"] == "H200"
+        assert sampling_body["hardware"] == "H200"
+        training = training_body["sub_job_configs"][0]
+        sampling = sampling_body["sub_job_configs"][0]
         sampling_config = sampling["inference_config"]
         training_config = training["training_config"]
         ds_config = training_config["ds_config"]
@@ -414,14 +422,14 @@ def test_moe_rl_recipes_have_runnable_parallelism():
         assert sampling["dtype"] == "bfloat16"
         assert sampling_config["max_seq_len"] == seq_len
         assert sampling_config["n_gpus"] == sampling_gpus
-        expected_tp = 8 if filename.startswith("qwen38_flash_next") else sampling_gpus
+        expected_tp = 8 if "qwen3.8-flash-next" in filename else sampling_gpus
         assert sampling_config["vllm_config"]["tensor_parallel_size"] == expected_tp
         assert sampling_config["vllm_config"]["trust_remote_code"] is True
         assert training["job_type"] == "training"
         assert training["model_name"] == model_id
         assert training["dtype"] == "bfloat16"
         assert training_config["model_provider"] == "prime_rl"
-        if filename == "glm53_flash_lora.json":
+        if filename == "glm-5.3-flash/long/h200-training-lora.json":
             assert training_config["prime_rl"] == {
                 "ep_comm_backend": "deepep",
                 "deepep_token_chunk_size": 8192,
@@ -438,14 +446,14 @@ def test_moe_rl_recipes_have_runnable_parallelism():
             assert sampling_config["peft_config"]["target_modules"] == training_config[
                 "peft_config"
             ]["target_modules"]
-        elif filename == "glm53_flash_bf16.json":
+        elif filename == "glm-5.3-flash-bf16/long/h200-training-full.json":
             assert training_config["prime_rl"] == {
                 "ep_comm_backend": "uccl",
                 "fused_cross_entropy": False,
             }
             assert "peft_config" not in training_config
             assert "peft_config" not in sampling_config
-        elif filename == "deepseek_v4_flash.json":
+        elif filename == "deepseek-v4-flash/long/h200-training-full.json":
             assert training_config["prime_rl"] == {
                 "fused_cross_entropy": "liger",
                 "ep_comm_backend": "uccl",
@@ -461,12 +469,12 @@ def test_moe_rl_recipes_have_runnable_parallelism():
             assert ds_config["bf16"]["bf16_optimizer_states"] is True
             assert ds_config["bf16"]["bf16_master_weights_and_grads"] is True
         if filename in {
-            "glm53_flash_lora.json",
-            "glm53_flash_bf16.json",
+            "glm-5.3-flash/long/h200-training-lora.json",
+            "glm-5.3-flash-bf16/long/h200-training-full.json",
         }:
             assert training_config["tiled_mlp_token_chunk_size"] == 1024
             assert training_config["ds_config"]["bf16"]["bf16_optimizer_states"] is True
-        elif filename != "deepseek_v4_flash.json":
+        elif filename != "deepseek-v4-flash/long/h200-training-full.json":
             assert "prime_rl" not in training_config
         assert training_config["attn_implementation"] == attention
         assert training_config["max_seq_len"] == seq_len
@@ -478,9 +486,9 @@ def test_moe_rl_recipes_have_runnable_parallelism():
         assert ds_config["train_micro_batch_size_per_gpu"] == 1
         assert ds_config["gradient_accumulation_steps"] == 1
         if filename in {
-            "qwen3_30b_a3b.json",
-            "nemotron3_nano_30b.json",
-            "nemotron35_lightning_30b.json",
+            "qwen3-30b-a3b/standard/h200-training-full.json",
+            "nemotron-3-nano-30b/long/h200-training-full.json",
+            "nemotron-3.5-lightning-30b/long/h200-training-full.json",
         }:
             assert "offload_optimizer" not in ds_config["zero_optimization"]
         else:
@@ -497,7 +505,7 @@ def test_moe_rl_recipes_have_runnable_parallelism():
                 if key != "router_replay"
             }
 
-        if filename.startswith("qwen38_flash_next"):
+        if "qwen3.8-flash-next" in filename:
             assert sampling["weight_format"] == "vllm"
             assert training["weight_format"] == "vllm"
             assert sampling_config["router_replay"]["enabled"] is True
@@ -687,6 +695,24 @@ def test_glm52_inference_uses_multinode_tp16_with_hopper_mla_cache(model_id):
     assert vllm_config["tensor_parallel_size"] == 16
     assert vllm_config["kv_cache_dtype"] == "fp8_ds_mla"
     assert vllm_config["gpu_memory_utilization"] == 0.9
+
+
+def test_glm53_long_inference_uses_8_h200_gpus():
+    request = json.loads(
+        (
+            REPO_ROOT
+            / "model-catalog/models/glm-5.3/long/h200-inference-full.json"
+        ).read_text()
+    )
+    assert request["hardware"] == "H200"
+    inference = request["sub_job_configs"][0]["inference_config"]
+    vllm_config = inference["vllm_config"]
+
+    assert request["sub_job_configs"][0]["model_name"] == "zai-org/GLM-5.3"
+    assert inference["max_seq_len"] == 720896
+    assert inference["n_gpus"] == 8
+    assert vllm_config["tensor_parallel_size"] == 8
+    assert vllm_config["kv_cache_dtype"] == "fp8_ds_mla"
 
 
 def test_glm52_fp8_api_example_advertises_the_supported_1m_profile():
