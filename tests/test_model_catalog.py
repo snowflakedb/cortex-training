@@ -362,12 +362,12 @@ def test_moe_rl_recipes_have_runnable_parallelism():
         ),
         "glm53_flash_bf16.json": (
             "zai-org/GLM-5.3-Flash-BF16",
-            64,
-            32,
-            8,
+            16,
+            16,
+            16,
             "sparse_mla",
             262144,
-            64,
+            16,
             1,
         ),
         "qwen38_flash_next.json": (
@@ -439,7 +439,12 @@ def test_moe_rl_recipes_have_runnable_parallelism():
                 "peft_config"
             ]["target_modules"]
         elif filename == "glm53_flash_bf16.json":
-            assert training_config["prime_rl"] == {"ep_comm_backend": "uccl"}
+            assert training_config["prime_rl"] == {
+                "ep_comm_backend": "uccl",
+                "fused_cross_entropy": False,
+            }
+            assert "peft_config" not in training_config
+            assert "peft_config" not in sampling_config
         elif filename == "deepseek_v4_flash.json":
             assert training_config["prime_rl"] == {
                 "fused_cross_entropy": "liger",
@@ -459,8 +464,7 @@ def test_moe_rl_recipes_have_runnable_parallelism():
             "glm53_flash_lora.json",
             "glm53_flash_bf16.json",
         }:
-            expected_chunk = 512 if "_bf16" in filename else 1024
-            assert training_config["tiled_mlp_token_chunk_size"] == expected_chunk
+            assert training_config["tiled_mlp_token_chunk_size"] == 1024
             assert training_config["ds_config"]["bf16"]["bf16_optimizer_states"] is True
         elif filename != "deepseek_v4_flash.json":
             assert "prime_rl" not in training_config

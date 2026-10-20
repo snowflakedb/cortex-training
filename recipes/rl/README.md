@@ -121,10 +121,13 @@ is off so the training step can return per-token log probabilities.
 Its sampler stays at 8 GPUs and TP8 with a 256K context and the same LoRA
 targets. One generate, one AdamW step, an NCCL LoRA weight sync, and a
 post-sync 8-token sample completed on two H200 nodes.
-`glm53_flash_bf16.json` uses a 64-GPU, SP64, EP32, UCCL
-training mesh with tiled MLP chunk 512. Its sampler remains 8 GPUs and TP8.
-The BF16 mesh is an unproven capacity estimate based on the FP8 run; that
-checkpoint has not completed its own 256K step.
+`glm53_flash_bf16.json` uses the same 16-GPU, SP16, EP16, UCCL
+training mesh as the SFT recipe, including the tiled MLP chunk of 1024.
+Fused cross-entropy is off. Its sampler is 16 GPUs at TP16 with a 256K
+context and no LoRA. One 8-token vLLM sample, one short AdamW step
+(loss -1.0, entropy 0.010, grad norm 8.46, 258s, GPU peak 62.9 GiB),
+a full-weight NCCL sync (1440 params, 45s), and a post-sync 8-token
+sample completed on four H200 nodes. All 313.9B parameters were trainable.
 `deepseek_v4_flash.json` uses the same 16-GPU, SP16, EP16, eager, UCCL
 training mesh as the SFT recipe, including liger fused cross-entropy, bf16
 master weights and optimizer states, and pageable activation offload. Its

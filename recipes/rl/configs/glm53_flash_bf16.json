@@ -6,10 +6,10 @@
       "dtype": "bfloat16",
       "seed": 42,
       "inference_config": {
-        "n_gpus": 8,
+        "n_gpus": 16,
         "max_seq_len": 262144,
         "vllm_config": {
-          "tensor_parallel_size": 8,
+          "tensor_parallel_size": 16,
           "trust_remote_code": true,
           "gpu_memory_utilization": 0.8
         }
@@ -21,7 +21,7 @@
       "dtype": "bfloat16",
       "seed": 42,
       "training_config": {
-        "n_gpus": 64,
+        "n_gpus": 16,
         "max_seq_len": 262144,
         "train_batch_size": 1,
         "gradient_clipping": 1.0,
@@ -29,8 +29,8 @@
         "attn_implementation": "sparse_mla",
         "cuda_allocator_conf": "expandable_segments:True",
         "activation_checkpointing": true,
-        "sp_size": 64,
-        "ep_size": 32,
+        "sp_size": 16,
+        "ep_size": 16,
         "ep_group_layout": "auto",
         "mb_spec": {
           "max_tokens_per_mb": 262144
@@ -48,10 +48,11 @@
             "pin_memory_bucket_size_mib": 64
           }
         },
-        "tiled_mlp_token_chunk_size": 512,
+        "tiled_mlp_token_chunk_size": 1024,
         "step_peak_memory_log": true,
         "prime_rl": {
-          "ep_comm_backend": "uccl"
+          "ep_comm_backend": "uccl",
+          "fused_cross_entropy": false
         },
         "optimizer": {
           "name": "AdamW",
