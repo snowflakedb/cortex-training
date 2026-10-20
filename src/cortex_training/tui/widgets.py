@@ -54,6 +54,7 @@ from textual.widgets import Log
 from textual.widgets import Static
 from textual.widgets import TabbedContent
 from textual.widgets.data_table import RowDoesNotExist
+from cortex_training.tui import theme
 from cortex_training.tui import views
 from cortex_training.tui.clipboard import aligned
 import os
@@ -570,12 +571,27 @@ def _draw_highlight(strip: Strip, first: int, span: tuple[int, int], style: Styl
 _SEPARATOR = "  ·  "
 
 
-def fit_line(segments: list, width: int) -> Content:
-    """Fit styled segments by cutting those with minimum widths, then wrapping."""
-    texts = [text for text, _style, _least in segments]
-    sep = views.cell_width(_SEPARATOR)
-    over = sum(views.cell_width(text) for text in texts) + sep * (len(texts) - 1) - width
-    spares = [max(0, views.cell_width(text) - least) if least is not None else 0 for text, _style, least in segments]
+_CHIP = f"{theme.TEXT} on {theme.PANEL}"
+
+
+def fit_line(segments: list, width: int, separator: str = "   ") -> Content:
+    """Segments joined by ``separator`` to fit ``width`` cells.
+
+    A segment is a ``Content``, kept whole, or ``(text, style, least, chip)``: a
+    chip is drawn as `` text `` on a panel. When cutting the segments that have
+    a ``least`` (the first ones first, down to that many cells, with ``…``) puts
+    the line on one row, they are cut just enough; the others stay whole.
+    Otherwise nothing is cut and the line wraps between segments. The texts are
+    shown literally, never as markup.
+    """
+    def cells(segment, text) -> int:
+        return text.cell_length if isinstance(segment, Content) else views.cell_width(text) + (2 if segment[3] else 0)
+
+    texts = [segment if isinstance(segment, Content) else segment[0] for segment in segments]
+    sep = views.cell_width(separator)
+    over = sum(cells(s, t) for s, t in zip(segments, texts)) + sep * (len(texts) - 1) - width
+    spares = [max(0, views.cell_width(s[0]) - s[2]) if not isinstance(s, Content) and s[2] is not None else 0
+              for s in segments]
     if 0 < over <= sum(spares):  # cutting gets it onto one row
         for i, spare in enumerate(spares):
             if over <= 0:
@@ -585,10 +601,13 @@ def fit_line(segments: list, width: int) -> Content:
                 texts[i] = views.fit_cells(texts[i], views.cell_width(texts[i]) - cut)
                 over -= cut
     rows: list = []
-    for text, (_text, style, _least) in zip(texts, segments):
-        piece = Content.styled(text, style)
+    for segment, text in zip(segments, texts):
+        if isinstance(segment, Content):
+            piece = segment
+        else:
+            piece = Content.styled(f" {text} ", _CHIP) if segment[3] else Content.styled(text, segment[1])
         if rows and rows[-1].cell_length + sep + piece.cell_length <= width:
-            rows[-1] = rows[-1] + Content(_SEPARATOR) + piece
+            rows[-1] = rows[-1] + Content(separator) + piece
         else:
             rows.append(piece)
     return Content("\n").join(rows)
