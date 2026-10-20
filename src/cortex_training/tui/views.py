@@ -82,6 +82,51 @@ def fmt_ago(raw: Any, now: datetime) -> str:
     return f"{fmt_duration(seconds)} ago"
 
 
+# The job list's times are read at a glance, so they are coarse: one unit, in a
+# column 8 cells wide. Each helper also says how many seconds its text stays
+# the same, so the list rebuilds a row only once its text would change.
+
+
+def list_age(seconds: Optional[float]) -> tuple[str, float]:
+    """How long ago, as the job list's Created and Updated show it (``just now``,
+    ``12m ago``, ``3h ago``, ``45d ago``), and the seconds until that reads
+    differently; ``—`` (never changing) without a time.
+
+    A time slightly ahead of this computer's clock (see :data:`CLOCK_SKEW_SECONDS`)
+    is ``just now``; one further ahead reads ``in 2h``.
+    """
+    if seconds is None:
+        return "—", math.inf
+    if seconds < 0:
+        if -seconds <= CLOCK_SKEW_SECONDS:
+            return "just now", 60 - seconds  # until a minute after it
+        return f"in {list_age(-seconds)[0].removesuffix(' ago')}", 60.0
+    s = int(seconds)
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= size:
+            return f"{s // size}{unit} ago", size - seconds % size
+    return "just now", 60 - seconds
+
+
+def list_span(seconds: Optional[float]) -> tuple[str, float]:
+    """A job's run so far or its whole run, as the job list's Duration shows it
+    (``40s``, ``12m``, ``3h 05m``, ``2d 4h``), and the seconds until a span that
+    goes on growing reads differently; ``—`` without one."""
+    if seconds is None or seconds < 0:
+        return "—", math.inf
+    s = int(seconds)
+    d, rest = divmod(s, 86400)
+    h, rest = divmod(rest, 3600)
+    m, sec = divmod(rest, 60)
+    if d:
+        return f"{d}d {h}h", 3600 - seconds % 3600
+    if h:
+        return f"{h}h {m:02d}m", 60 - seconds % 60
+    if m:
+        return f"{m}m", 60 - seconds % 60
+    return f"{sec}s", 1 - seconds % 1
+
+
 def status_word(status: Any) -> str:
     return (str(status or "").strip() or "?").removeprefix("JOB_STATE_").lower()
 
