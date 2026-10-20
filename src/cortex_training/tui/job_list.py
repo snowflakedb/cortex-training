@@ -248,9 +248,8 @@ class JobListScreen(FollowsPointer, Screen):
     (see :class:`cortex_training.tui.account.JobLister`); search takes ids, locations
     and ``field<op>value`` filters (see :func:`cortex_training.tui.views.parse_query`).
 
-    A job with sub-jobs shows ▸ (folded) or ▾ before its id. A live job starts
-    unfolded where its sub-job rows say something its own row doesn't: it has
-    more than one, or its status is unknown.
+    A job with sub-jobs shows ▸ (folded) or ▾ before its id. Every live job
+    starts unfolded; history starts folded.
     """
 
     BINDINGS = [
@@ -612,10 +611,8 @@ class JobListScreen(FollowsPointer, Screen):
 
     @staticmethod
     def _starts_unfolded(job: dict) -> bool:
-        """A live job whose sub-job rows say what its own row doesn't: which of
-        several sub-jobs is where, or (unknown) that its status is unavailable. A
-        live job of one sub-job starts folded: that row would only repeat its job's."""
-        return views.is_live(job) and (views.is_unknown(job) or len(views.sub_jobs(job)) > 1)
+        """Every live job starts unfolded, its sub-job rows in view; history starts folded."""
+        return views.is_live(job)
 
     @staticmethod
     def _expandable(job: dict) -> bool:
@@ -910,19 +907,23 @@ class JobListScreen(FollowsPointer, Screen):
         """A sub-job's row, under its job's and fainter, with what it doesn't share with
         its job: its status is the glyph alone while it is its job's, and glyph and word
         where it differs (a sampling sub-job still placing beside a running training
-        one); its model shows where it isn't its job's. No type (its label has it). A
-        sub-job that has no status of its own shows none, unless its job's is unknown too."""
+        one); its model shows where it isn't its job's, and its GPUs unless it is the
+        job's only sub-job and the job's row says the same count. No type (its label
+        has it). A sub-job that has no status of its own shows none, unless its job's
+        is unknown too."""
         status = sj.get("status")
         same = theme.status_key(status) == theme.status_key(job.get("status"))
         told = same or str(status or "").strip()
         model = views.short_model(sj.get("model_name"))
         shown = model and model != cls._shown_model(views.job_models(job))
+        gpus = views.sub_job_gpu_text(sj)
+        gpus_told = len(views.sub_jobs(job)) > 1 or gpus != views.job_gpu_cell(job)
         return {
             "Job ID": _FixedCell.assemble(("  ", ""), (f"{'└' if last else '├'} ", theme.FAINT),
                                           (views.sub_job_label(sj), theme.MUTED)),
             "Status": cls._status_cell(status, glyph_only=same) if told else _BLANK,
             "Model": _cell(model, theme.FAINT) if shown else _BLANK,
-            "GPUs": _cell(views.sub_job_gpu_text(sj), theme.FAINT),
+            "GPUs": _cell(gpus, theme.FAINT) if gpus_told else _BLANK,
         }
 
     def _sub_rows(self, job: dict) -> tuple:
