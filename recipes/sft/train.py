@@ -6,15 +6,18 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from pathlib import Path
 from typing import Any
 from typing import Protocol
 
+import torch
 from recipes.logging import setup_logging
 from recipes.utils import build_renderer
 from recipes.utils import collate
+from recipes.utils import forward
 from recipes.utils import forward_backward_step
 from recipes.utils import load_job_body
 from recipes.utils import log_saved_checkpoints
@@ -76,7 +79,58 @@ def causal_cross_entropy_processing() -> dict[str, Any]:
     }
 
 
+def lr_multiplier(step: int, total_steps: int, *, schedule: str = "linear", warmup_ratio: float = 0.0) -> float:
+    if schedule not in ("linear", "cosine", "constant"):
+        raise ValueError(f"lr_schedule must be linear, cosine, or constant, got {schedule!r}")
+    warmup_steps = math.ceil(warmup_ratio * total_steps)
+    if step < warmup_steps:
+        return (step + 1) / warmup_steps
+    if schedule == "constant":
+        return 1.0
+    progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+    if schedule == "cosine":
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    return max(0.0, 1.0 - progress)
+
+
+def next_token_labels(input_ids: torch.Tensor, loss_mask: torch.Tensor) -> torch.Tensor:
+    """``input_ids[i + 1]`` wherever ``loss_mask[i]`` weights a prediction, else -100."""
+    return input_ids.roll(-1, dims=-1).masked_fill(loss_mask <= 0, -100)
+
+
+def heldout_nll(
+    client: Any,
+    job_id: str,
+    sequences: list[Any],
+    *,
+    batch_size: int,
+    pad_token_id: int,
+    max_seq_len: int,
+    pad_to_max_seq_len: bool = False,
+) -> float:
+    """Token-weighted mean NLL over whole batches, from no-grad forward passes."""
+    total_nll = 0.0
+    total_weight = 0.0
+    for start in range(0, len(sequences), batch_size):
+        kwargs, context = collate(
+            sequences[start : start + batch_size],
+            pad_token_id=pad_token_id,
+            max_seq_len=max_seq_len,
+            pad_to_max_seq_len=pad_to_max_seq_len,
+        )
+        loss_mask = context["loss_mask"]
+        # forward reads labels as sent, for every model provider.
+        kwargs["labels"] = next_token_labels(kwargs["input_ids"], loss_mask)
+        logprobs = forward(client, job_id, kwargs)["logprobs"]
+        total_nll -= float((logprobs.float() * loss_mask).sum())
+        total_weight += float(loss_mask.sum())
+    return total_nll / total_weight
+
+
 def train(config: Config, task: Task) -> dict[str, Any]:
+    # setup_logging replaces these handlers once the job runs; until then this
+    # keeps the created job id in the log, so an interrupted start can be cancelled.
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if config.debug_image_tag:
         os.environ[DEBUG_OPTIONS_ENV] = "1"
         logger.info("Using debug image_tag=%s", config.debug_image_tag)
@@ -126,16 +180,54 @@ def train(config: Config, task: Task) -> dict[str, Any]:
         total_steps,
     )
 
+    eval_every = int(getattr(config, "eval_every", 0))
+    load_eval_dataset = getattr(task, "load_eval_dataset", None)
+    eval_dataset = load_eval_dataset() if eval_every > 0 and callable(load_eval_dataset) else None
+    eval_sequences = []
+    if eval_dataset is not None:
+        n_eval = len(eval_dataset) - len(eval_dataset) % batch_size
+        if n_eval == 0:
+            logger.warning(
+                "Held-out set has %d examples, fewer than one batch of %d; skipping valid_nll",
+                len(eval_dataset),
+                batch_size,
+            )
+        eval_sequences = [
+            task.build_sequence(row, renderer, max_seq_len=max_seq_len) for row in eval_dataset.select(range(n_eval))
+        ]
+        if eval_sequences:
+            logger.info("valid_nll on %d held-out examples every %d steps", n_eval, eval_every)
+
     client = make_client(config.config)
+
+    def evaluate(job_id: str) -> dict[str, float]:
+        eval_start = time.time()
+        valid_nll = heldout_nll(
+            client,
+            job_id,
+            eval_sequences,
+            batch_size=batch_size,
+            pad_token_id=pad_token_id,
+            max_seq_len=max_seq_len,
+            pad_to_max_seq_len=config.pad_to_max_length,
+        )
+        logger.info("valid_nll %.4f", valid_nll)
+        return {"valid_nll": valid_nll, "time_valid": time.time() - eval_start}
 
     with running_job(client, body, job_id=config.job_id) as job_id:
         ml_logger = setup_logging(config, client=client, job_id=job_id)
         for step in range(total_steps):
-            start_time = time.time()
             metrics: dict[str, float] = {}
+            if eval_sequences and step % eval_every == 0:
+                metrics.update(evaluate(job_id))
+            start_time = time.time()
 
-            lr_mult = max(0.0, 1.0 - step / max(n_train_batches, 1))
-            current_lr = learning_rate * lr_mult
+            current_lr = learning_rate * lr_multiplier(
+                step,
+                n_train_batches,
+                schedule=getattr(config, "lr_schedule", "linear"),
+                warmup_ratio=getattr(config, "warmup_ratio", 0.0),
+            )
 
             batch_start = step * batch_size
             batch_rows = train_dataset.select(
@@ -176,19 +268,40 @@ def train(config: Config, task: Task) -> dict[str, Any]:
             )
             ml_logger.log_metrics(metrics=metrics, step=step)
 
+        if eval_sequences:
+            ml_logger.log_metrics(metrics=evaluate(job_id), step=total_steps)
+
         saved = save_recipe_checkpoints(client, job_id)
-        sample_prompt = task.sample_prompt()
-        log_saved_checkpoints(
-            config_path=config.config,
-            job_id=job_id,
-            saved=saved,
-            sampling_command="sample",
-            job_config=Path(config.job_config).name,
-            sample_prompt=sample_prompt,
-            enable_thinking=config.enable_thinking,
-            renderer_name=config.renderer_name,
-            temperature=0 if sample_prompt else None,
-        )
+        eval_command = getattr(task, "eval_command", None)
+        if callable(eval_command):
+            log_saved_checkpoints(
+                config_path=config.config,
+                job_id=job_id,
+                saved=saved,
+            )
+            checkpoint_id = str(saved["weights-only"].get("checkpoint_id") or "").strip()
+            if checkpoint_id:
+                logger.info(
+                    "Evaluate this weights-only checkpoint with:\n  %s",
+                    eval_command(
+                        config_path=config.config,
+                        job_id=job_id,
+                        checkpoint_id=checkpoint_id,
+                    ),
+                )
+        else:
+            sample_prompt = task.sample_prompt()
+            log_saved_checkpoints(
+                config_path=config.config,
+                job_id=job_id,
+                saved=saved,
+                sampling_command="sample",
+                job_config=Path(config.job_config).name,
+                sample_prompt=sample_prompt,
+                enable_thinking=config.enable_thinking,
+                renderer_name=config.renderer_name,
+                temperature=0 if sample_prompt else None,
+            )
 
     ml_logger.close()
     logger.info("Training completed")

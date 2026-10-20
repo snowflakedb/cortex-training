@@ -263,6 +263,34 @@ sub-jobs. Pass a shipped example or a copy with `job_config=JOB_CONFIG`.
 }
 ```
 
+The `prime_rl` entries in the config above are deprecated but keep working. On
+server versions that support `model_options`, and with `EP_SIZE` > 1, the
+same settings can be written inside `training_config`, in place of the
+`prime_rl` block, as the entry below; see
+[the REST API reference](../../docs/reference/rest-api.md#model_options).
+
+```json
+"model_options": {"lm_head": {"token_chunk_size": 8192, "cross_entropy": false}}
+```
+
+The Qwen3.6-35B-A3B RL and SFT recipe configs, `examples/api/training.json`,
+`examples/api/rl.json` and the `rl` and `standard-context` model-catalog
+profiles still use the `prime_rl` block, which older servers need.
+
+On server versions that have `numerics.fp32_parity`, Qwen3.5-family models run
+with it on by default: dense models (for example `Qwen/Qwen3.8-27B`) and
+Qwen3.5-MoE models with `EP_SIZE` > 1 (the Qwen3.6-35B-A3B configs). It raises
+GPU memory. Memory was not measured for rows near `max_seq_len` with the
+shipped Qwen3.8-27B configs. If a job runs out of memory, raise `sp_size`
+(at most 8 for Qwen3.8-27B) or turn the option off by adding
+`"numerics": {"fp32_parity": false}` to the `model_options` entry of
+`training_config`, inside the same object if the config already has one (two
+`model_options` keys in one JSON object keep only the last). Turning it off
+can bring back part of the difference between the trainer's and the sampler's
+log-probabilities, which matters for RL. A server that has the option but not
+`model_options` support ignores that entry; see
+[the REST API reference](../../docs/reference/rest-api.md#model_options).
+
 The target list above is for dense Qwen models. For
 `Qwen/Qwen3.6-35B-A3B`, use the shipped LoRA config with
 `model_provider: "prime_rl"` and attention-only targets (`q_proj`, `k_proj`,

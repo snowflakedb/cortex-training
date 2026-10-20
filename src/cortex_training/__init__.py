@@ -19,12 +19,16 @@ __version__ = "0.0.2"
 
 from . import router_replay_planner
 from . import wire
+from .client import AccountJobListUnavailable
 from .client import ChunkGroupConflictError
 from .client import ChunkGroupError
 from .client import ChunkGroupRestartError
 from .client import CortexTrainingClient
+from .client import DownloadCancelled
+from .client import NoChunksError
 from .client import Hardware
 from .client import InferenceConfig
+from .client import InvalidPageToken
 from .client import JobType
 from .client import SubJobConfig
 from .client import TrainingConfig
@@ -33,12 +37,16 @@ from .client import build_forward_backward_payload
 from .client import serialize_forward_backward_args
 
 __all__ = [
+    "AccountJobListUnavailable",
     "CortexTrainingClient",
     "build_forward_backward_kwargs",
     "build_forward_backward_payload",
     "ChunkGroupError",
     "ChunkGroupRestartError",
     "ChunkGroupConflictError",
+    "DownloadCancelled",
+    "NoChunksError",
+    "InvalidPageToken",
     "serialize_forward_backward_args",
     "SubJobConfig",
     "TrainingConfig",

@@ -9,6 +9,12 @@ weights-only checkpoint. Conversational dataset helpers live in
 `tasks/conversational.py`; the task entrypoint calls the shared SFT engine in
 `train.py`.
 
+The same engine also runs [DARE-Bench agent SFT](dare/README.md). It
+fine-tunes all parameters of Qwen3-8B on DARE-Bench's multi-turn data-science
+agent traces, in which the model calls a `python_executor` tool, and scores
+the result on the benchmark's eval split with a local agent loop. 
+Setup, results, and configuration are in its README.
+
 ## Hardware
 
 Training GPUs are `n_gpus` in the JSON you pass (`NUM_TRAINING_GPUS`). Actual
@@ -126,9 +132,10 @@ shipped example or a copy with `job_config=JOB_CONFIG`.
           "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
         },
 
-        // Optional expert parallelism for MoE. With model_provider prime_rl, keep
-        // the prime_rl block: the SFT loss needs per-token log-probabilities, which
-        // the fused cross-entropy does not return.
+        // Optional expert parallelism for MoE. With model_provider prime_rl,
+        // keep fused cross-entropy off (this block, or model_options with
+        // EP_SIZE > 1): the chunked LM head set below cannot be combined with
+        // it.
         "ac_config": {"mode": "full", "freq": 1},
         "prime_rl": {
           "fused_lm_head_token_chunk_size": 8192,
@@ -163,6 +170,29 @@ use head size 512 and 4 KV heads, and sequence parallel replicates those
 4 KV heads across the 8 ranks. FlashAttention stops at head size 256, so
 the full-attention layers run with flex attention.
 
+The `prime_rl` entries in the template above are deprecated but keep working.
+On server versions that support `model_options`, with `EP_SIZE` > 1, the same
+settings can be written inside `training_config` in place of the `prime_rl`
+block, as the entry below; see
+[the REST API reference](../../docs/reference/rest-api.md#model_options). The
+shipped Qwen3.6 SFT configs still use the block, which older servers need.
+
+```json
+"model_options": {"lm_head": {"token_chunk_size": 8192, "cross_entropy": false}}
+```
+
+On server versions that have `numerics.fp32_parity`, Qwen3.5-family models run
+with it on by default: dense models (for example `Qwen/Qwen3.8-27B`) and
+Qwen3.5-MoE models with `EP_SIZE` > 1 (the Qwen3.6-35B-A3B configs). It raises
+GPU memory. Memory was not measured for rows near `max_seq_len` with the
+shipped Qwen3.8-27B configs. If a job runs out of memory, raise `sp_size`
+(at most 8 for Qwen3.8-27B) or turn the option off by adding
+`"numerics": {"fp32_parity": false}` to the `model_options` entry of
+`training_config`, inside the same object if the config already has one (two
+`model_options` keys in one JSON object keep only the last). A server that
+has the option but not `model_options` support ignores that entry; see
+[the REST API reference](../../docs/reference/rest-api.md#model_options).
+
 ### MoE models
 
 Full-parameter recipes. Renamed files use 256K, or the model's position
@@ -189,7 +219,7 @@ python -m recipes.sft.conversational.train \
   job_config=model-catalog/models/qwen3.8-flash-next/long/h200-training-full.json
 ```
 
-For dense long-context profiles, an integer
+For dense long-context profiles, set an integer
 `fused_lm_head_token_chunk_size` in `training_config`. The server then computes
 per-token log probabilities in chunks without materializing the full
 `[sequence, vocabulary]` logits tensor. The setting saves memory and does not
@@ -290,10 +320,12 @@ a Snowflake experiment; results are viewable in Snowsight under
 [Snowflake ML Experiments docs](https://docs.snowflake.com/en/developer-guide/snowflake-ml/experiments).
 
 Each step logs `train_nll` (the server's `avg_loss`) and `loss_weight_sum`, the
-sum of `loss_mask` over the batch. On the default memorize task, `train_nll`
-should fall quickly and `loss_weight_sum` should stay constant from step to
-step. After save, the recipe prints one generate command. When running that
-command, Assistant text should be `Snowflake AI Research`.
+sum of `loss_mask` over the batch. A task with a held-out set
+(`load_eval_dataset()`, as in [`dare/`](dare/README.md)) also logs `valid_nll` every `eval_every` steps, and after the last step. 
+On the default memorize task, `train_nll` should fall quickly and `loss_weight_sum` should
+stay constant from step to step. After save, the recipe prints one generate
+command. When running that command, Assistant text should be `Snowflake AI
+Research`.
 
 ```bash
 python -m recipes.inference.generate \

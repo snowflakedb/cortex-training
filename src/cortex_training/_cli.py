@@ -18,11 +18,14 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import itertools
 import json
+import logging
 import os
 import re
 import sys
+import threading
 from datetime import date
 from datetime import datetime
 from datetime import timedelta
@@ -30,6 +33,7 @@ from datetime import timezone
 from pathlib import Path
 from typing import Any
 from typing import Callable
+from typing import Iterator
 from typing import TextIO
 
 _CONFIG_KEYS = {
@@ -577,11 +581,14 @@ def build_parser(
         "--resume",
         action="store_true",
         help=(
-            "Continue an earlier stdout download in the output directory and "
-            "fetch only output that is not already saved. Two downloads of the "
-            "same directory at once are unsupported."
+            "Continue an earlier download in the output directory and fetch "
+            "only what is not already saved. For stdout that includes output an "
+            "interrupted download already saved; for execution logs, files "
+            "unchanged since the last download are skipped. Two downloads of "
+            "the same directory at once are unsupported."
         ),
     )
+    _add_chunk_download_arguments(download_log, "--log-type stdout")
 
     download_metrics = subparsers.add_parser(
         "download-metrics",
@@ -601,10 +608,12 @@ def build_parser(
         action="store_true",
         help=(
             "Continue an earlier metrics download in the output directory and "
-            "fetch only metrics that are not already saved. Two downloads of "
-            "the same directory at once are unsupported."
+            "fetch only metrics that are not already saved, including metrics "
+            "an interrupted download already saved. Two downloads of the same "
+            "directory at once are unsupported."
         ),
     )
+    _add_chunk_download_arguments(download_metrics, None)
 
     login = subparsers.add_parser(
         "login",
@@ -900,6 +909,12 @@ def build_client(args: argparse.Namespace, cortex_training_client_cls):
         "poll_interval": args.poll_interval,
         "poll_timeout": args.poll_timeout,
     }
+    # The TUI bounds every read (`cortex-training tui` sets these); the CLI
+    # commands keep the client's defaults.
+    for option in ("max_retries", "request_timeout"):
+        value = getattr(args, option, None)
+        if value is not None:
+            kwargs[option] = value
     if args.base_url:
         return cortex_training_client_cls(base_url=args.base_url, **kwargs)
     if args.use_connection_profile:
@@ -975,11 +990,11 @@ def _validate_create_job_body(body: dict[str, Any]) -> None:
     _validate_raw_sub_job_configs(sub_job_configs)
 
 
-def _print_json(value: Any, stdout: TextIO, *, compact: bool) -> None:
+def _print_json(value: Any, stdout: TextIO, *, compact: bool, sort_keys: bool = True) -> None:
     if compact:
-        json.dump(value, stdout, separators=(",", ":"), sort_keys=True)
+        json.dump(value, stdout, separators=(",", ":"), sort_keys=sort_keys)
     else:
-        json.dump(value, stdout, indent=2, sort_keys=True)
+        json.dump(value, stdout, indent=2, sort_keys=sort_keys)
     stdout.write("\n")
 
 
@@ -1093,8 +1108,18 @@ def _cmd_capacity(args: argparse.Namespace, client, stdout: TextIO) -> int:
         capacity = lookup(args.hardware)
     else:
         capacity = _capacity_by_hardware(lookup)
-    _print_json(capacity, stdout, compact=args.compact)
+    _print_json(_breakdown_last(capacity), stdout, compact=args.compact, sort_keys=False)
     return 0
+
+
+def _breakdown_last(value: Any) -> Any:
+    """``value`` with keys sorted, except that ``breakdown`` follows the totals."""
+    if isinstance(value, dict):
+        keys = sorted(value, key=lambda key: (key == "breakdown", key))
+        return {key: _breakdown_last(value[key]) for key in keys}
+    if isinstance(value, list):
+        return [_breakdown_last(item) for item in value]
+    return value
 
 
 def _json_bool(value: Any, name: str) -> bool:
@@ -1258,34 +1283,208 @@ def _cmd_weight_sync(args: argparse.Namespace, client, stdout: TextIO) -> int:
     return 0
 
 
-def _artifact_progress_writer(stderr: TextIO) -> Callable[[str], None]:
-    """Draw one updating terminal line. A redirected stderr gets the final line."""
-    try:
-        tty = stderr.isatty()
-    except (OSError, ValueError):
-        tty = False
-    latest: str | None = None
+_CHUNK_DOWNLOAD_COMMANDS = ("download-log", "download-metrics")
 
-    def write(message: str) -> None:
-        nonlocal latest
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return parsed
+
+
+# More concurrent fetches than this only add load; the default is 16.
+_MAX_PARALLEL = 128
+
+
+def _parallel_count(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > _MAX_PARALLEL:
+        raise argparse.ArgumentTypeError(f"must be at most {_MAX_PARALLEL}, got {parsed}")
+    return parsed
+
+
+def _non_negative_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a non-negative number, got {value!r}")
+    if not parsed >= 0 or parsed == float("inf"):
+        raise argparse.ArgumentTypeError(f"expected a non-negative number, got {value!r}")
+    return parsed
+
+
+def _add_chunk_download_arguments(parser: argparse.ArgumentParser, applies_to: str | None) -> None:
+    suffix = f" Applies to {applies_to}." if applies_to else ""
+    parser.add_argument(
+        "--parallel",
+        type=_parallel_count,
+        default=None,
+        metavar="N",
+        help=f"Number of chunks to fetch at once, 1 to {_MAX_PARALLEL} (default: 16).{suffix}",
+    )
+    parser.add_argument(
+        "--sub-job",
+        dest="sub_job_ids",
+        action="append",
+        default=None,
+        metavar="SUB_JOB_ID",
+        help="Download only this sub-job. Repeat for more than one.",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "Stop on a chunk that cannot be decompressed instead of skipping it "
+            f"and reporting it in skipped_chunks.{suffix}"
+        ),
+    )
+    parser.add_argument(
+        "--stale-after-minutes",
+        type=_non_negative_float,
+        default=10.0,
+        metavar="MINUTES",
+        help=(
+            "Warn when a running job's newest saved chunk is older than this "
+            "(default: 10). 0 turns off this and the other job-status notices "
+            f"(a just-ended job, missing GPU metrics).{suffix}"
+        ),
+    )
+    parser.add_argument(
+        "--transfer-timeout",
+        type=_non_negative_float,
+        default=300.0,
+        metavar="SECONDS",
+        help=(
+            "Give up on and retry a single file or chunk fetch, or listing, that "
+            "takes longer than this (default: 300; 0 means no limit)."
+        ),
+    )
+
+
+class _ArtifactProgressWriter:
+    """Draw one updating terminal line. A redirected stderr gets the final line.
+
+    Messages follow the download ``progress`` contract: a status without a
+    newline replaces the current line, ``"\\n"`` ends it, and a message that
+    already ends in a newline is printed as is. :meth:`warn` prints a full
+    line without breaking the status line. Warnings come from download worker
+    threads, so each update is written in one call under a lock.
+    """
+
+    def __init__(self, stderr: TextIO):
+        self._lock = threading.Lock()
+        self._stderr = stderr
         try:
+            self._tty = stderr.isatty()
+        except (OSError, ValueError):
+            self._tty = False
+        self._latest: str | None = None
+
+    def __call__(self, message: str) -> None:
+        with self._lock:
             if message == "\n":
-                status, latest = latest, None
+                status, self._latest = self._latest, None
                 if status is None:
                     return
-                stderr.write("\n" if tty else status + "\n")
+                self._write("\n" if self._tty else status + "\n")
             elif message.endswith("\n"):
-                stderr.write(message)
+                self._write(message)
             else:
-                latest = message
-                if not tty:
-                    return
-                stderr.write("\r" + message)
-            stderr.flush()
+                self._latest = message
+                if self._tty:
+                    self._write("\r" + message)
+
+    def warn(self, line: str) -> None:
+        with self._lock:
+            if self._tty and self._latest is not None:
+                # Move off the status line, then redraw it below the warning.
+                self._write("\n" + line + "\n\r" + self._latest)
+            else:
+                self._write(line + "\n")
+
+    def _write(self, text: str) -> None:
+        try:
+            self._stderr.write(text)
+            self._stderr.flush()
         except OSError:
             return
 
-    return write
+
+def _artifact_progress_writer(stderr: TextIO) -> _ArtifactProgressWriter:
+    return _ArtifactProgressWriter(stderr)
+
+
+def _chunk_download_options(
+    args: argparse.Namespace, progress: Callable[[str], None]
+) -> dict[str, Any]:
+    return {
+        "resume": args.resume,
+        "max_workers": args.parallel,
+        "progress": progress,
+        "sub_job_ids": args.sub_job_ids,
+        "strict": args.strict,
+        "stale_after_seconds": (
+            args.stale_after_minutes * 60 if args.stale_after_minutes else None
+        ),
+        "transfer_timeout_seconds": args.transfer_timeout or None,
+    }
+
+
+class _WarningLines(logging.Handler):
+    def __init__(self, writer: _ArtifactProgressWriter):
+        super().__init__(logging.WARNING)
+        self._writer = writer
+        self.setFormatter(logging.Formatter("warning: %(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._writer.warn(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+
+@contextlib.contextmanager
+def _library_warnings_to(writer: _ArtifactProgressWriter) -> Iterator[None]:
+    """Show the client's warnings (retries, skipped chunks) as ``warning:`` lines.
+
+    Records still propagate, so a caller's own logging handlers see them too.
+    """
+    library = logging.getLogger("cortex_training")
+    handler = _WarningLines(writer)
+    library.addHandler(handler)
+    try:
+        yield
+    finally:
+        library.removeHandler(handler)
+
+
+@contextlib.contextmanager
+def _output_dir_lock(out_dir: Path) -> Iterator[None]:
+    """Refuse to share a directory with a running TUI download of it.
+
+    The TUI marks each cache directory it downloads into with a sibling lock
+    file. Only an existing lock file is honored, so a plain CLI download never
+    creates files outside its output directory.
+    """
+    from cortex_training._download_lock import DownloadLock
+
+    lock = DownloadLock(out_dir)
+    if lock.lock_path is None or not lock.lock_path.exists():
+        yield
+        return
+    if not lock.try_acquire():
+        raise RuntimeError(
+            f"another download is using {out_dir}; close that job's view in the "
+            "TUI or wait for its download to finish, then retry"
+        )
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def _cmd_download_log(
@@ -1293,12 +1492,13 @@ def _cmd_download_log(
 ) -> int:
     out_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.cwd()
     if args.log_type == "stdout":
-        logs = client.download_stdout_logs(
-            args.job_id,
-            out_dir,
-            resume=args.resume,
-            progress=_artifact_progress_writer(stderr),
-        )
+        progress = _artifact_progress_writer(stderr)
+        with _output_dir_lock(out_dir), _library_warnings_to(progress):
+            logs = client.download_stdout_logs(
+                args.job_id,
+                out_dir,
+                **_chunk_download_options(args, progress),
+            )
         _print_json(
             {"job_id": args.job_id, "logs": logs},
             stdout,
@@ -1306,19 +1506,15 @@ def _cmd_download_log(
         )
         return 0
 
-    logs = client.fetch_execution_logs(args.job_id)
-    saved = []
-    for log in logs:
-        file_path = out_dir / (log["sub_job_id"] or "unknown") / log["filename"]
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(log["content"], encoding="utf-8")
-        saved.append(
-            {
-                "sub_job_id": log["sub_job_id"],
-                "filename": log["filename"],
-                "artifact_uri": log["artifact_uri"],
-                "saved_path": str(file_path),
-            }
+    progress = _artifact_progress_writer(stderr)
+    with _library_warnings_to(progress):
+        saved = client.download_execution_logs(
+            args.job_id,
+            out_dir,
+            resume=args.resume,
+            sub_job_ids=args.sub_job_ids,
+            progress=progress,
+            transfer_timeout_seconds=args.transfer_timeout or None,
         )
     _print_json({"job_id": args.job_id, "logs": saved}, stdout, compact=args.compact)
     return 0
@@ -1328,12 +1524,13 @@ def _cmd_download_metrics(
     args: argparse.Namespace, client, stdout: TextIO, stderr: TextIO
 ) -> int:
     out_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.cwd()
-    metrics = client.download_metrics(
-        args.job_id,
-        out_dir,
-        resume=args.resume,
-        progress=_artifact_progress_writer(stderr),
-    )
+    progress = _artifact_progress_writer(stderr)
+    with _output_dir_lock(out_dir), _library_warnings_to(progress):
+        metrics = client.download_metrics(
+            args.job_id,
+            out_dir,
+            **_chunk_download_options(args, progress),
+        )
     _print_json(
         {"job_id": args.job_id, "metrics": metrics},
         stdout,
@@ -1381,16 +1578,24 @@ def _run(
     client_factory: Callable[[argparse.Namespace], Any],
     stdout: TextIO,
     stdin: TextIO,
-    stderr: TextIO,
+    stderr: TextIO | None = None,
 ) -> int:
+    stderr = stderr or sys.stderr
     if args.command == "login":
         return _cmd_login(args, stdout)
 
     if args.command == "submit" and args.dry_run:
         return _cmd_submit(args, None, stdout, stdin)
 
-    if args.command == "download-log" and args.resume and args.log_type != "stdout":
-        raise ValueError("--resume applies to --log-type stdout, not execution logs")
+    if args.command == "download-log" and args.log_type != "stdout":
+        # Execution logs are whole files, not chunks.
+        for flag, value in (
+            ("--parallel", args.parallel),
+            ("--strict", args.strict),
+            ("--stale-after-minutes", args.stale_after_minutes != 10.0),
+        ):
+            if value:
+                raise ValueError(f"{flag} applies to --log-type stdout, not execution logs")
 
     client = client_factory(args)
     if args.command == "submit":
@@ -1451,6 +1656,7 @@ def main(
     stderr = stderr or sys.stderr
     stdin = stdin or sys.stdin
 
+    args = None
     try:
         args = parse_args(argv, prog=prog, include_tui=include_tui)
         dry_run = args.command == "submit" and args.dry_run
@@ -1469,8 +1675,20 @@ def main(
 
             client_factory = empty_client_factory
         return _run(args, client_factory, stdout, stdin, stderr)
+    except KeyboardInterrupt as exc:
+        command = getattr(args, "command", None)
+        if command not in _CHUNK_DOWNLOAD_COMMANDS:
+            raise
+        if not _resumable_download(args):
+            print("interrupted", file=stderr)
+        elif getattr(exc, "download_progress_saved", False):
+            print(f"interrupted; {_RESUME_HINT}", file=stderr)
+        else:
+            print("interrupted before any output was saved", file=stderr)
+        return 130
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"error: {_format_error(exc)}", file=stderr)
+        _print_resume_hint(args, exc, stderr)
         return 1
     except ModuleNotFoundError as exc:
         missing = exc.name or "a required package"
@@ -1481,6 +1699,48 @@ def main(
             file=stderr,
         )
         return 1
+    except Exception as exc:
+        if not _is_connector_error(exc):
+            raise
+        print(f"error: {_format_connector_error(exc)}", file=stderr)
+        _print_resume_hint(args, exc, stderr)
+        return 1
+
+
+_RESUME_HINT = (
+    "downloaded chunks were saved. Run the same command with --resume to continue."
+)
+_FAILED_RESUME_HINT = (
+    "Downloaded chunks were saved. Run the same command with --resume to continue."
+)
+
+
+def _resumable_download(args: argparse.Namespace | None) -> bool:
+    command = getattr(args, "command", None)
+    if command == "download-metrics":
+        return True
+    return command == "download-log" and getattr(args, "log_type", None) == "stdout"
+
+
+def _print_resume_hint(args: argparse.Namespace | None, exc: BaseException, stderr: TextIO) -> None:
+    if _resumable_download(args) and getattr(exc, "download_progress_saved", False):
+        print(_FAILED_RESUME_HINT, file=stderr)
+
+
+def _is_connector_error(exc: BaseException) -> bool:
+    try:
+        from snowflake.connector import errors as sf
+    except ImportError:  # pragma: no cover - the connector is a dependency
+        return False
+    return isinstance(exc, sf.Error)
+
+
+def _format_connector_error(exc: BaseException) -> str:
+    message = str(exc).strip() or type(exc).__name__
+    query_id = getattr(exc, "sfqid", None)
+    if query_id and str(query_id) not in message:
+        message += f"\nsnowflake query id: {query_id}"
+    return message
 
 
 if __name__ == "__main__":

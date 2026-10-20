@@ -77,9 +77,13 @@ class SessionTokenProvider(Protocol):
 
 def _flush_emitters_at_exit() -> None:
     deadline = time.monotonic() + 1.0
-    for emitter in list(_EMITTERS):
-        remaining = max(deadline - time.monotonic(), 0.0)
-        emitter.close(timeout=remaining)
+    try:
+        for emitter in list(_EMITTERS):
+            remaining = max(deadline - time.monotonic(), 0.0)
+            emitter.close(timeout=remaining)
+    except KeyboardInterrupt:
+        # A second Ctrl-C while exiting gives up on the flush quietly.
+        return
 
 
 atexit.register(_flush_emitters_at_exit)

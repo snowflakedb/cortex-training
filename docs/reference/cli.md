@@ -139,7 +139,7 @@ cortex-training --job JOB_ID load CHECKPOINT_ID --no-poll
 ### [Logs And Metrics](#job-tui)
 
 ```bash
-cortex-training tui                          # Open job picker
+cortex-training tui                          # Open job list (a: all schemas)
 cortex-training tui JOB_ID                   # Open the job dashboard
 cortex-training download-log JOB_ID --output-dir ./logs
 cortex-training download-log JOB_ID --log-type stdout --output-dir ./logs
@@ -386,13 +386,14 @@ cortex-training capacity --hardware H200 --breakdown submitted-by \
 
 ```json
 {"kind":"USER","submitted_by":"YOUR_USER","is_caller":true,"in_use_gpus":24,"pending_gpus":0,"job_count":2}
-{"kind":"OTHER","submitted_by":null,"is_caller":false,"in_use_gpus":16,"pending_gpus":16,"job_count":3}
+{"kind":"USER","submitted_by":"SOME_USER","is_caller":false,"in_use_gpus":8,"pending_gpus":16,"job_count":2}
+{"kind":"OTHER","submitted_by":null,"is_caller":false,"in_use_gpus":8,"pending_gpus":0,"job_count":1}
 {"kind":"UNATTRIBUTED","submitted_by":null,"is_caller":false,"in_use_gpus":4,"pending_gpus":0,"job_count":1}
 ```
 
 Until the breakdown is enabled for your account, each dimension reports
 `DISABLED`. See [REST API reference section 5.4](rest-api.md#breakdown---breakdown)
-for every field, status and scope.
+for every field and status.
 
 ### Submit A Job
 
@@ -600,15 +601,26 @@ Pull every log file the job's experiment run produced. Each sub-job's
 
 ```bash
 cortex-training download-log JOB_ID --output-dir /path/to/dir
+cortex-training download-log JOB_ID --output-dir /path/to/dir --resume
 ```
 
 Files are written as `<output_dir>/<sub_job_id>/<filename>` so siblings
-do not collide. When `--output-dir` is omitted, the current working
-directory is used instead. The CLI also prints a JSON summary listing
-each `saved_path`.
+do not collide, readable only by you. When `--output-dir` is omitted, the
+current working directory is used instead. Each file goes straight to disk, so
+a large log does not need as much memory, and replaces the earlier copy only
+once it is complete. Progress is one line per file on stderr. The CLI also
+prints a JSON summary listing each `saved_path` and its `bytes`.
 
-Programmatic access is `CortexTrainingClient.fetch_execution_logs(job_id)`,
-which returns a list of `{sub_job_id, filename, artifact_uri, content}` dicts.
+A running job rewrites its execution log as a whole, so a file cannot be
+fetched in part. `--resume` skips a file whose size and checksum are unchanged
+since the last download into that directory (`unchanged: true` in the summary)
+and downloads a changed file in full. `--sub-job SUB_JOB_ID` (repeatable)
+limits the download, and `--transfer-timeout SECONDS` bounds each file's
+fetch, raised for a large file to allow 512 KiB/s.
+
+Programmatic access is `CortexTrainingClient.download_execution_logs(job_id,
+output_dir)`. `fetch_execution_logs(job_id)` returns
+`{sub_job_id, filename, artifact_uri, content}` dicts with every body in memory.
 
 ### Download Persisted Stdout
 
@@ -621,13 +633,49 @@ cortex-training download-log JOB_ID --log-type stdout --output-dir /path/to/logs
 ```
 
 The current working directory is used when `--output-dir` is omitted.
-`--resume` continues a stdout download already in that directory. It does not
-apply to execution logs, including `download-log` without `--log-type stdout`.
-On a terminal, progress is one line on stderr that updates in place. A
-redirected stderr gets one final line per sub-job. Progress is not part of
-the JSON on stdout.
-A large download may open additional Snowflake sessions for one sub-job, and
-each session can prompt for authentication. Two downloads of the same
+`--resume` continues a stdout download already in that directory: it appends
+chunks written since the last download, and it continues a download that was
+interrupted or failed part way through. Progress is saved while every download
+runs, with or without `--resume`, so after an interruption rerun the same
+command with `--resume` to fetch only the remaining chunks. A run without
+`--resume` starts over.
+
+Chunks are fetched concurrently; `--parallel N` sets how many at once (1 to
+128, default 16) and output is still written in chunk order. `--sub-job SUB_JOB_ID`
+(repeatable) limits the download to those sub-jobs; naming a sub-job with no
+stdout chunks is an error. Transient connection and service errors are retried
+with backoff, and an expired session is reopened. A single fetch or listing
+that takes longer than `--transfer-timeout SECONDS` (default 300; `0` means no
+limit) is abandoned and retried. Errors a retry cannot fix,
+such as missing privileges, stop the download at once with a short `error:`
+line. On a terminal, progress is one line on stderr that updates in place, and
+`warning:` lines print above it. A redirected stderr gets one final line per
+sub-job. Progress is not part of the JSON on stdout. The download uses one
+Snowflake session for all of its concurrent fetches. Ctrl-C stops the download, keeps the chunks already written, and exits with
+status 130. After an error or Ctrl-C the CLI says whether anything was saved for
+`--resume` to continue from.
+
+A chunk that was removed from the run after it was listed is skipped. A chunk
+that cannot be decompressed is downloaded once more and, if it is still
+damaged, skipped: the rest of the file is written, the chunk is listed in that
+sub-job's `skipped_chunks`, and a `warning:` line goes to stderr. `--resume`
+keeps a skipped chunk skipped; a run without `--resume` tries it again.
+`--strict` stops on the first damaged chunk instead. Any notice about a
+sub-job is also listed in its `warnings` field in the JSON summary.
+
+While the job and that sub-job are running, a sub-job whose newest saved chunk
+is more than `--stale-after-minutes` old (default 10) gets a warning that
+uploads may be stalled. Chunk times come from the chunk names and are UTC, and
+are compared with the service's clock when it reports one. A job that prints
+nothing for a while also produces this warning for stdout. For two minutes
+after a job ends, each sub-job gets a warning that its last chunks may still be
+uploading; run the command again with `--resume` shortly afterwards to pick
+them up. These checks read the job's status once, alongside the download;
+`--stale-after-minutes 0` turns them all off. The download itself still
+completes.
+
+`--parallel`, `--strict`, and `--stale-after-minutes` do not apply to
+execution logs, including `download-log` without `--log-type stdout`. Two downloads of the same
 directory at once are unsupported.
 
 ### Download GPU Metrics
@@ -641,13 +689,16 @@ cortex-training download-metrics JOB_ID --output-dir /path/to/metrics --resume
 ```
 
 The command prints the saved path, chunk count, and first/last logical artifact
-URIs for each reconstructed file. `--resume` continues a metrics download
-already in that directory. On a terminal, progress is one line on stderr
-that updates in place. A redirected stderr gets one final line per sub-job.
-Progress is not part of the JSON on stdout. A large download may open
-additional Snowflake sessions for one sub-job, and each session can prompt
-for authentication. Two downloads of the same directory at once are
-unsupported.
+URIs for each reconstructed file. `--resume`, `--parallel N`, `--sub-job
+SUB_JOB_ID`, `--strict`, `--stale-after-minutes`, `--transfer-timeout`,
+damaged chunks, retries,
+progress on stderr, and Ctrl-C behave as for
+[persisted stdout](#download-persisted-stdout). While the job is running, a
+sub-job that has saved stdout but no GPU metrics is also listed, with
+`chunk_count` 0, `saved_path` `null`, and a warning that metric uploads may be
+stalled. After the job has ended, such a sub-job is listed the same way with a
+warning that no GPU metrics were saved for it (for example, because the job ran
+on an image from before GPU metrics were uploaded). Two downloads of the same directory at once are unsupported.
 
 ### Job TUI
 
@@ -656,8 +707,9 @@ resources. It uses the same connection handling and fallback order as the CLI,
 including named and configured-default Snowflake profiles:
 
 ```bash
-cortex-training tui                 # opens a job picker
+cortex-training tui                 # opens the job list of the configured database and schema
 cortex-training tui JOB_ID          # opens that job's dashboard directly
+cortex-training tui --debug         # synthetic jobs, no connection needed
 ```
 
 Without login state, pass connection details the same way as the CLI:
@@ -671,7 +723,7 @@ cortex-training tui JOB_ID --base-url http://localhost:8084   # local/mock
 ```
 
 Keep the PAT out of your shell history by exporting it instead (omit `JOB_ID`
-to open the job picker):
+to open the job list):
 
 ```bash
 export CORTEX_TRAINING_PAT='YOUR_PROGRAMMATIC_ACCESS_TOKEN'
@@ -680,59 +732,606 @@ cortex-training tui \
   --database CORTEX_TRAINING_DB --schema PUBLIC
 ```
 
-Pass `--sub-job-id JOB_ID:training:0` to scope Logs and Resource to one matching
+Like `checkpoints` and `list --all`, the TUI never creates the configured
+database or schema, which the other commands do when the service answers that
+they are not found: it shows that error instead, as it does when this role
+can't use them. Every request the TUI sends is retried at most twice, with a
+10-second connect and a 45-second read timeout, where the other commands use
+the SDK's defaults (ten retries, 30 and 600 seconds; [REST API reference
+section 3.5](rest-api.md#35-retries)). So a job id that isn't found (404), or
+a service that keeps failing, shows its error within a few seconds rather than
+after about a minute. Pressing `r` while a refresh is still reading says so.
+
+The TUI explains a refused read in one line on the view that needed it, worded
+the same on every view: the Logs tab's saved console and execution log, and the
+Resources tab (`GPU metrics unavailable: ...`). When the service can't resolve
+the job's Experiment for this role (a 500 that says `Linked experiment is not
+found ...`), the line says the role can't read the job's Experiment, and, for
+`Linked experiment is not found for job ...`, that it may no longer exist. When
+Snowflake refuses the SQL on the Experiment, as it does for a `MONITOR`-only
+role, the line says that saved logs and GPU metrics live there and that
+`checkpoints` still works. A refusal about another object (a warehouse, a
+schema) keeps its own text. A 403 whose message names a privilege says the role
+isn't allowed to read that view's data; one with no such message keeps the
+standard error text.
+
+A config the TUI can't use, such as one with a value of the wrong type (a
+quoted number: `"poll_interval": "2"`), JSON that doesn't parse, an unknown
+key, or a path that isn't there, stops it before it starts, with one line on
+stderr (`cortex-training tui: error: config poll_interval must be a number`)
+and exit status 2.
+
+Pass `--sub-job-id JOB_ID:training:0` to scope the job details to one matching
 sub-job. An unmatched id is shown as an error rather than falling back to a
 different sub-job.
+The error lists the job's sub-job ids; without `JOB_ID`, `--sub-job-id` opens
+that sub-job's job. `--debug` runs against generated jobs and telemetry, and
+keeps its caches in a temporary directory, removed when it ends; the title says
+`(debug)`. Its jobs are in three locations (the configured
+`CORTEX_TRAINING_DB.PUBLIC`, `TEAM_DB.EXPERIMENTS`, and a lowercase
+`"sandbox"."dev"`) and run on the wall clock: live jobs keep logging and
+reporting GPU and node samples (one reports its GPUs only), a placing job
+starts within two minutes, a
+running one is cancelled, a tail gets stuck behind a long line and restarts from
+the end, and others have ended, failed, are `UNKNOWN`, or sit on an Experiment
+this role can't read.
+
+#### Job list
+
+The job list shows the jobs created in the last six months (183 days) that the
+current role can see in the configured database and schema (`list_jobs`).
+Press `a`, or click `a All schemas` in the footer, to list the jobs in every
+database and schema the role can see instead, from the account-level list
+([REST API reference section 5.3](rest-api.md#across-the-account---get-apiv2endpoint));
+the footer then offers `a Current schema`, which goes back. The
+header line starts with when the list was last refreshed (`refreshing…` while
+a refresh reads), then which list is shown. Until the list `a` asked for
+answers, the header reads `loading all schemas…` (or `loading the current
+schema, DB.SCHEMA…`) and the previous list stays on screen. The account-level
+list shows its first page (the newest 500 jobs) as soon as it answers, and adds
+each later page as it comes: the highlighted row stays where it is on screen,
+and folds and a search stay as they are. From its second page on, it also reads
+the active jobs (see below) beside the newest ones, at most two requests at a
+time. Until the last page, the header reads `all schemas · loading older jobs…
+N so far` (`+ every active job` once the active jobs are listed, `(older active
+jobs may be missing)` if reading them failed or stopped short), the counts above
+the list and a search's matches end in `so far`, and the LIVE and HISTORY rows'
+counts in `…`. Once the active jobs are listed, the active statuses' counts drop
+their `so far`; the `unknown` count and the LIVE row keep theirs until the last
+page, as no status filter lists an `unknown` job. If the newest jobs are all in
+while the active jobs are still being read, the header reads `newest 2,000;
+loading older active jobs…`: the history count and the HISTORY row drop their
+marks, and the live counts and the LIVE row keep theirs.
+The list also shows its pages as they come when it first opens on all schemas;
+a refresh of a whole list keeps showing it until the next one is whole.
+`a` while the pages are read stops reading them: the pages read stay, no longer
+marked, under `loading the current schema, DB.SCHEMA… · showing the partial
+all-schemas list` until that list answers. An `a` back to all schemas before
+then waits for the configured schema's list (several seconds for a large one),
+and the pages start again from the first. `r` meanwhile does nothing (and
+nothing is read again after): it says so, `Still loading older jobs (Ns); r
+works once it's done.` (`older active jobs` while the header says so). Once the
+list is whole, the header names it:
+
+| Header | The list holds |
+|---|---|
+| `Current schema: DB.SCHEMA` | the jobs of the configured database and schema (`list_jobs`), as the list opens |
+| `all schemas` | after `a`: the jobs in every database and schema the role can see, from the account-level list; `all schemas (all in DB.SCHEMA)` when every one of them is in the same location |
+| `newest 2,000 + every active job (more exist)` | the same, cut at the newest 2,000 because more exist, plus the active jobs created before those |
+| `first 20 pages: N jobs + every active job (more may exist)` | the same, cut after 20 pages (see below), plus the active jobs |
+| `Current schema only: DB.SCHEMA (reason)` | the jobs of the configured database and schema, in place of the account-level list: `a` found it unavailable, or it turned unavailable while shown (see below) |
+
+After `a`, each refresh reads the account-level list newest first, 500 jobs a
+page. It stops after 2,000 jobs, or after 20 pages, because the service examines
+a bounded number of jobs per call, so a page can be short or empty and still
+have more after it: a refresh never walks the whole history. It asks for no
+status, so jobs whose status the service can't read (`unknown`) are listed too.
+When it stops with jobs left, it also reads the active jobs (`pending`,
+`placing`, `initializing` and `running`) and adds those created before the
+newest ones, so a long-running job stays under live. A refresh of a whole list
+reads them after the newest jobs, only when it stops with jobs left. A list
+showing its pages reads them beside the newest jobs; if the newest turn out
+whole, the active jobs' walk asks for no page after the one in flight (a quick
+walk may have read all of its pages by then, one or two in the usual case) and
+its jobs are dropped. While an earlier load's active jobs' request is still in
+flight (after `a` pressed again), a new load reads them after the newest jobs
+instead. An `unknown` job older than
+the newest 2,000 is not listed, as a status filter leaves those out, and if
+reading the active jobs fails or is cut short too, the header says `older active
+jobs may be missing`. A walk that stops at 20 pages with no job to show says
+that more may exist and how to list one schema, rather than that there are none.
+
+Search filters the jobs the list holds: when more exist, a search can't reach
+the older ones, and the message for a search without results says so. To
+search all of the configured schema's jobs, press `a` to go back to its list;
+for another schema, start the TUI with that schema's `--database` and
+`--schema`. These also go with `--connection`, where they take the place of the
+profile's database and schema:
+`cortex-training tui --connection NAME --database OTHER_DB --schema OTHER_SCHEMA`.
+
+If the account-level list is unavailable, `a` keeps the configured schema and
+explains why, in a notice and in the header (`Current schema only: DB.SCHEMA
+(reason)`, until the next `a`): `no account-wide list yet` or `account-wide list
+not enabled` (404), `account-wide list: HTTP 403` for an unexplained 403, or the
+service's 403/405 message. Once all schemas are showing, the same fallback reads
+`Current schema only: DB.SCHEMA (reason)` too. A 403/405 refusal shared by the
+schema route is a failed refresh instead. The TUI retries a fallback every 10
+minutes, or on `r` after one minute; another `a` within that minute reuses the
+last answer.
+
+On refresh failure, the previous list stays under a red error and a
+`refresh failed TIME (list from TIME)` header. A first-load error replaces the
+list; `r` retries. When a later page of the account-level list fails after the
+first pages showed, those stay, under a red error, with a `load failed TIME ·
+newest N (the rest didn't load; r retries; …)` header; if the list turns
+unavailable there (404), the configured schema's list takes their place, as
+when `a` finds it unavailable. The list pauses under details and refreshes on
+return when its last read is over 60 seconds old.
+
+When the list holds jobs from more than one database and schema, a
+**Location** column after GPUs shows `DB.SCHEMA` (SQL-quoted when needed) and
+is hidden when every job shares one. Previews, detail reads, logs, metrics and
+generated commands use the selected job's location. Commands also retain the
+connection method and a non-default `--endpoint`; a direct `tui JOB_ID` still
+uses the configured schema and suggests location flags after a 404.
+
+`LIVE` groups active states and `unknown` (unless its reason says not found);
+`HISTORY` groups the rest. Each group starts with a heading row that gives its
+count, with a rule across the other columns (drawn only: no copy has it).
+
+The line above the list counts the live jobs by status, then the rest, for
+example `● 4 running   ◔ 1 placing   ○ 1 pending   ? 1 unknown  │  21 in
+history` (counting the jobs a search matches, followed by `N matches for
+QUERY`, while there is one), and ends with the sort (`sort: created ↓ newest
+first`). The Status column draws each status as a glyph and the word:
+`● RUNNING`, `◐ INITIALIZING`, `◔ PLACING` (and `creating`), `○ PENDING` (and
+`queued`), `? UNKNOWN`, `✕ FAILED`, `⊘ CANCELLED`, and `✓` for `terminated`,
+`done` and `succeeded`.
+
+Rows show the job id, status, type, created time, duration and owner, then
+model, requested GPUs, optional location, and updated time. Created and Updated
+say how long ago (`just now`, `12m ago`, `3h ago`, `45d ago`); the job preview
+has both times in full, and a copy has them as `YYYY-MM-DD HH:MM` in local
+time (see below). A time up to five minutes ahead of this
+computer's clock reads `just now`; one further ahead reads how far ahead it is
+(`in 2h`), which means this computer's clock and the service's disagree.
+Duration is how long a live job has run so far (since it was created, so it
+counts time spent waiting to be placed; in its status's color), or how long a
+finished one ran until its last state change (`40s`, `12m`, `3h 05m`,
+`2d 4h`). The times are as of the last refresh, which redraws them. On a narrow
+screen the Job ID column narrows (its id ends in `…`) and stays in view while
+the other columns scroll. `shared` marks multiplexed GPU use and `log_prob`
+requests zero GPUs.
+
+A sub-job row is fainter than its job's and shows what it doesn't share with
+it: its label (`training #0`), its status as the glyph alone while it is its
+job's and as glyph and word where it differs, its model where the job has more
+than one, and its GPUs (left out for a job's only sub-job when the job's row
+gives the same count). `▸`/`▾`, arrows, clicks, and `e` control sub-job rows.
+Every live job starts unfolded, its sub-job rows in view; history jobs start
+folded. `e` unfolds every job (or folds every one, once all are unfolded),
+those that later pages of the list being read bring too; the jobs a later
+refresh or `a` adds start as above, and those `e` covered keep its choice.
+
+`ctrl+c` copies text that holds up once pasted. With nothing highlighted, it
+copies every row of the list (scrolled out of view too) in aligned columns,
+each cell as its copy text, with a `Whole ID` column at the end holding each
+row's whole job or sub-job id. A drag highlights characters on screen; `ctrl+c`
+then copies those rows, where each cell the highlight covers whole is its copy
+text, a cell it covers only in part is the characters it draws there, and the
+columns stay in line. A cell's copy text is what it draws, but: Created and
+Updated are the time itself, `YYYY-MM-DD HH:MM` in local time, rather than
+`3h ago`; Status is the word alone (`RUNNING`, also on a sub-job row that draws
+only the glyph), without the glyph; and an id cut with `…` is the whole id. The
+rule of a `LIVE` or `HISTORY` row is never copied.
+
+An `unknown` row retains known creation time and derives missing sub-job ids as
+`JOB_ID:TYPE:INDEX`; incomplete configs read `config #N`. A supplied
+`--sub-job-id` is still attempted when live state cannot be listed.
+
+Search with `/`. Case- and Unicode-normalized words all must match an id,
+status, owner, GPU, type, model, or the start of a location component. Quote
+text containing `:` (for example `"training:0"`). `field<op>value` filters
+narrow further:
+
+| Field | Meaning |
+|-------|---------|
+| `id`, `status`, `owner`, `type` | job id, status, user or role, `training`/`sampling`/`log_prob` |
+| `model`, `method`, `dtype` | model name (`=` takes it whole, `Qwen/Qwen3-8B`, or as the Model column shows it, `Qwen3-8B`), `full` or `lora`, dtype |
+| `gpu`, `gpus` | GPU type (`H200`, `B200`, `B300`), requested GPU count |
+| `optimizer`, `lr`, `batch`, `seq` | optimizer name, learning rate, train batch size, max sequence length |
+| `lora_r`, `lora_alpha` | LoRA rank and alpha |
+| `db`, `schema` | database and schema name; a job of the configured schema's own list is in the configured ones. `:` matches part of the name in any case (`db:team`). `=` and `!=` take the name as stored or as SQL resolves it, a bare name being its uppercase form: `db=team_db` and `db=TEAM_DB` match `TEAM_DB`, `db=ml` and `db='"ml"'` match a lowercase `"ml"`, and `db=ML` doesn't |
+
+Operators are `:` (contains, or numeric equality), `=`, `!=`, `>`, `>=`, `<`,
+and `<=`. Unknown keys read job, sub-job, or config members; dotted keys read
+nested members. Lists match any element (`!=` requires none). Examples:
+
+```text
+h200
+model:qwen3-8b method:lora lr<=1e-4
+gpu:b200 gpus>=8 lora_r=32
+training_config.optimizer.name=adamw status:cancelled
+training_config.peft_config.target_modules:q_proj seed=42
+db:team_db status:running
+```
+
+No-result messages name the searched scope, truncated or older matching jobs,
+unknown fields (with dotted suggestions), and `a` when a wider search may help.
+Long messages scroll. The header gives the match count and query. The search
+box is one row at the bottom of the screen; the help for its fields and
+operators shows under it only while it has focus.
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Open the job preview (or, on a sub-job row, that sub-job's details, on the Logs tab; on a "status unavailable" line, its job's preview); in the search box, show the matches of all that was typed and move to the list, where `Enter` opens the highlighted match |
+| `/` / `esc` | Search / clear the search. Keys are taken in the order typed, also when they come faster than the list redraws: what is typed before `Enter` or `esc` is in the search they apply or clear, and the keys after `/`, `Enter` and `esc` go to the search box or the list |
+| `s` / `o` | Sort by created, updated, or status (`succeeded` and `completed` sort with `done`, `canceled` with `cancelled`) / reverse the order (so do a click on the sort's name and one on its arrow, in the line above the list). That line says which way it runs: `created ↓` for newest first or `↑` for oldest first (the same for updated; jobs without that time, shown as `—`, come last either way), `status ↓` for running first or `↑` for ended first (history first). The cursor goes to the first job |
+| `Home` / `End` | First / last job |
+| `→` / `←` | Unfold the highlighted job's sub-jobs / fold them; on a sub-job row, `←` folds its job and moves to it. The job's row stays where it is on screen, and the list scrolls only as far as an unfolded job's sub-jobs need to show. Where there is nothing to unfold or fold, they scroll the columns sideways |
+| click `▸` / `▾` | Unfold or fold that job, as `→` / `←` do |
+| `e` | Expand or collapse every job's sub-jobs, also those of jobs that later pages of the list being read bring (jobs a later refresh adds start as usual) |
+| `a` | All schemas / current schema: switch to the account-level list of every database and schema the role can see (the footer's `a All schemas`), or back to the configured one (`a Current schema`) |
+| `ctrl+c` | Copy what is highlighted, else every row in the list with a `Whole ID` column (see above for what each cell copies as); in the preview, the highlight, else the whole preview |
+| `r` | Refresh (the list also refreshes every 60 seconds while it is showing); while it shows the configured schema in place of the account-level list (`Current schema only: DB.SCHEMA (reason)`), `r` asks that list again once a minute has passed since the last ask |
+| `?` | Show or close the keys panel |
+| `q` | Quit |
+
+Every footer starts with Back (`b`, except on the job list) and Quit (`q`), then
+`?`: a narrow terminal cuts the footer's end, and `?` opens a panel that lists
+every key that works where you are, including the ones the footer has no room
+for. `esc` closes that panel first, before it clears a search or goes back.
+
+#### Job preview
+
+Opening a job shows it as cards. The job card is headed by its id, its status
+as a colored pill (`unknown` reads `? UNKNOWN`), and how long it has been
+going (`12m 04s so far`, or `lasted 1h 20m` once it ended), with the keys for
+`l Logs` and `g Resources` under it. Its facts follow: model, type, owner,
+requested GPUs, creation and update times, and the location when it is not the
+configured one, in two columns from about 90 columns wide and in one below.
+Values stop after three rows; `e` expands every value and the complete sub-job
+table, and toggles them short again.
+
+**GPUs** sums each sub-job's `n_gpus`, excluding `log_probability` and
+multiplexed sub-jobs that run on another sub-job's GPUs. The time beside the
+status includes queue and placement time; an `unknown` job runs to now.
+Missing times show `—`, and a clock up to five minutes ahead reads `just now`.
+
+**Lifecycle** runs from `created_at` to `state_changed_at`, the two times the
+job record has, and on to now while the job is live, with how long each step
+took: `◇ Created 15:14 ── 3m 10s ─▸ ● Running since 15:17 ── 9m 02s so far ─▸
+now`, or `◇ Created 2026-10-12 15:41 ── 2h 00m ─▸ ✕ Failed 2026-10-12 17:41
+(5d 22h ago)`. States in between have no time in the record and get no step;
+a live job still in the state it was created in is one step (`○ Created,
+pending since 15:14`). An `unknown` job's state has no time.
+
+A callout box under the job card says where the job stands, titled and colored
+by state: red for a failure (`Why it failed`, or `Failed before it got GPUs`);
+amber while it waits (`Why it's waiting`, `Placing on GPUs`) or while its
+status is unavailable; blue while `initializing` (`Starting up`); gray once it
+was cancelled, terminated or completed. It shows the service's `reason` and
+`reason_details` (a failure always has a reason, `not reported` when none is
+sent), or what the state means, and where to look next. A running job has no
+box unless the service sends a reason. The Sub-jobs card shows type, status
+(a badge such as `● RUNNING`), model, GPUs and key config; multiplexed rows
+name the source sub-job. Long cells use `…`, narrow screens omit Type, and
+wider tables scroll with `←` / `→` or `Home` / `End`; the card's bottom border
+says so (`e whole table`, `← → scroll`).
+
+Live previews refresh every 60 seconds, on return from details, or on `r`; a
+dim line at the end of the job card reports reads, slow reads and refresh
+errors while keeping the last copy. `Enter` or a click opens the highlighted
+entire-job or sub-job scope on Logs (`⏎ opens its Logs` on the card's border).
+`l`, `g` and `c` open Logs, Resources and Checkpoints directly.
+
+#### Job details
+
+The line under the title is the job's identity: its id in bold, its status as
+a badge such as `● RUNNING` (redrawn when the details see the job end), chips
+for its type, models, scope (`all sub-jobs`, or `sub-job training:0`) and
+location when it is not the configured one, then the service's `reason` and
+`reason_details` (or the `unknown` sentence) while it sends them. When the
+line does not fit on one row, the models are cut with `…`, then the id is left
+out (the header names it too). Switch tabs with `l` (Logs), `g`
+(Resources) and `c` (Checkpoints), or `t` for the next tab.
+
+- **Logs** is the live and historical log view described below. The pane shows
+  one sub-job at a time, the one selected in the list beside it, so its lines
+  carry no sub-job tag; each starts with its time (`HH:MM:SS`), and its
+  wrapped rows start under the end of that time. The list marks each sub-job
+  with its status's glyph and colour (`●` running, `◐` initializing, `◔`
+  placing, `○` pending, `✕` failed, `⊘` cancelled, `✓` ended, `?` unknown), with the status under its name; the one the
+  pane shows has an accent edge and a bold name. Saved logs (`s`) and copies
+  stay as the lines came, uncoloured. In the pane the time is faint, the level
+  has its severity's colour (a warning's or an error's message is tinted to
+  match), the logger name is muted, a traceback is one block on a dark red
+  background from its `Traceback (most recent call last):` to the exception
+  that ends it (with any chained to it), and what the filter matches is marked
+  in amber.
+- **Resources** shows telemetry (`download_metrics`) for one sub-job at a
+  time. `Space` (or a click on its name) shows the next one; `<` and `>` go
+  back and forth. Its two-line pinned header names the sub-job, position,
+  window, sample age and scrape interval while the stats and charts scroll.
+  - The focused left panel switches between `GPU Resources` and `System
+    Resources`, then `ALL` (the mean) and each GPU or node. `↑`, `↓` or a click
+    selects an entry. Each unit shows its latest utilization after a four-cell
+    meter of it, filled in eighths and coloured by health (as the KPI tiles
+    below); stale units are dimmed, their meters faint, and a view with no rows
+    reads `(none)`. A sub-job with only system rows opens there.
+  - The header compares requested and reporting GPUs, or shows reporting nodes,
+    CPU count and memory per node. Multiplexed sub-jobs point to the sub-job
+    whose GPUs report their shared telemetry. A unit over two minutes or three
+    sample intervals behind its view's newest sample is stale. When the newest
+    sample itself is over three minutes or six intervals old, the header warns
+    that no new samples are arriving and the windows end at that sample; a line
+    over the KPI strip says these are the last values received, the tiles go
+    faint and unjudged, and `GPUs reporting` reads `0/8`, an error. It also
+    counts malformed or unsupported rows.
+  - Under the header, a strip of KPI tiles for the GPU or node shown, or the
+    mean: `GPU util` (with the spread across GPUs, `84–95%`), `GPU memory`
+    (`95.9 / 141 GiB` and its %), `power` (and the total, `5.1 kW total`),
+    `temp` (and the hottest GPU) and `GPUs reporting` (`8/8`, against those
+    requested); the System view has `CPU util`, `memory` and `nodes
+    reporting`. Only metrics the rows have get a tile. Each is coloured by
+    health, and for the mean a tile is as healthy as its least healthy GPU or
+    node: GPU util under 50% warns; GPU memory used from 95% warns; GPU
+    temperature from 85 °C warns and from 90 °C is an error; CPU util from 95%
+    warns; node memory used from 90% warns and from 97% is an error; power
+    isn't judged. `GPUs reporting` warns below the GPUs requested and is an
+    error at none. On a narrow pane the details go from the right, then the
+    tiles wrap.
+  - Numeric `_pct`, `_bytes`, `_watts` and `_c` fields become `%`, `GiB`, `W`
+    and `°C` metrics. GPU and System begin with utilization and derived memory
+    used; constant node CPU count and memory total stay in the header. Each
+    metric has min, time-weighted average, max and latest stats for the window
+    and whole job, plus a chart (two per row at 90 cells or wider). The stats
+    are a table: column heads right-aligned over their values, the latest in
+    bold, a rule between the window and the whole job. Each chart is an area
+    chart: the series' edge in the chart's colour over a faint fill of it, the
+    50% gridline running through the fill, and `◂` right of the newest column
+    on the row its value reaches. A bucket without a sample stays blank over a
+    broken baseline (`╌`), so a gap never reads as 0, and the marker is left
+    out when the newest bucket is a gap. Percentage
+    axes are 0–100%; other axes use a stable rounded ceiling. `ALL` aggregates
+    reporting units by sample interval; one missed node scrape is bridged,
+    longer gaps remain gaps. History older than seven hours is folded into
+    whole-job bins; `≤` or `≥` marks a late sample that makes the exact extreme
+    unknowable.
+  - `w` (or the header's window) cycles 10 minutes (the default), 30 minutes,
+    1 hour, 6 hours and the whole job. The window selector at the bottom of
+    the tab, `window  10m  30m  1h  6h  all`, lights the window shown, and a
+    click on a segment shows that window. At its right end is `↑↓ GPU` (or
+    `↑↓ node`) when the view has more than one; the footer shows the other
+    keys.
+  - Telemetry downloads when shown, refreshes every 30 seconds for a running
+    selected sub-job, and refreshes on `r`. A view with nothing to chart shows
+    a quiet card instead of the stats and charts: a title (`Waiting for the
+    job to start`, `Waiting for the first samples`, `GPU metrics are on
+    another sub-job`, `CPU and memory aren't collected`, `No usable GPU
+    metrics`) over why. Before it runs, the tab waits
+    without polling telemetry; a running sub-job without samples says they
+    usually arrive after about a minute. A `log_probability` sub-job says it
+    has no GPUs. A failed refresh keeps cached data and says
+    `cached · refresh failed: …`. Data is kept in the TUI's per-location job
+    cache; the selected sub-job and its newest cached samples
+    appear first, and later opens download only new chunks.
+- **Checkpoints** lists the job's checkpoints (`list_checkpoints`, the same
+  list as `cortex-training checkpoints JOB_ID`): id, creation time, global
+  step, type (`resumable` or `weights-only`), loss and size. A job whose
+  sub-jobs don't train says it saves none.
+  - The list is read when the tab opens, every 30 seconds while the job is
+    live, and on `r`. `s` sorts by created time (newest first), global step
+    or type; `o` reverses the order. Checkpoints missing the sorted value come
+    last.
+  - Each checkpoint's export (`export_checkpoint`) is read once, in the
+    background, for its file names and sizes. When the list doesn't give a
+    checkpoint's step or type, the tab takes it from those files (a
+    `global_step<N>/` folder; optimizer-state files mean `resumable`,
+    `.safetensors` weights alone mean `weights-only`) and marks it
+    `(from its files)`. The export's links are never shown or kept.
+  - The highlighted checkpoint's details sit under the list: every field the
+    service sent, its files, the job and training sub-job that saved it, and
+    the job's training configuration as submitted.
+  - **Download** (or `d`) downloads its files, with fresh export links, to
+    `~/cortex-training-checkpoints/<job8>/<checkpoint_id>/`, showing progress
+    beside the button; pressing it again stops the download, and the next one
+    keeps the files already whole. One download runs at a time.
+  - **New job from it: Training / Sampling / Training + sampling** copies one
+    shell command to the clipboard: `printf '%s' '<CreateJob JSON>' |
+    cortex-training ... submit -`. The body repeats this job's training
+    sub-job, its sampling sub-job (or one GPU of the training model), or both,
+    and its hardware, each with `source_checkpoint_info`. The service starts a
+    training sub-job only from a `resumable` checkpoint (with the GPU count and
+    parallelism of the job that saved it, which the copy keeps) and a sampling
+    sub-job only from a `weights-only` one. So Training is offered for a
+    resumable checkpoint, Sampling for a weights-only one, and Training +
+    sampling pairs the checkpoint with one of the other type saved at the same
+    step (disabled when there is none). The details show the copied command.
+
+#### Logs
 
 The **Logs** tab's left panel lists the job's sub-jobs; select one to tail its
 logs (the zone-manager pod is the Ray head, so a sub-job's worker output is
 included).
+The tail polls only while the Logs tab is on screen: on another tab it stops
+and later resumes from where it left off, so no lines are lost. While a job
+runs, its status is also re-read every 60 seconds, so the view switches to the
+saved console when the job ends.
 Logs are cached locally so reopening a job replays instantly without
 re-fetching from the server — under `~/.cache/cortex-training/` (or
 `$XDG_CACHE_HOME`), overridable with `CORTEX_TRAINING_TUI_CACHE_DIR`.
 
-A finished job loads its saved console once. A stream error while the job is
-still running stays an error. The level key filters structured live lines and
-does not hide lines from that saved console.
+The pane draws each line as text only: escape sequences in a line (colours,
+cursor moves, clipboard or title writes) are removed and other control
+characters show as `�`, so nothing in a log acts on your terminal; a line that
+rewrites itself with carriage returns (a progress bar) shows its last state.
+A leading timestamp shows in local time, as `HH:MM:SS`; the date is on a faint
+rule above the first line of each day (`── Sun 18 Oct 2026 ─────`), at the top
+of the pane and wherever the day changes (when the pane drops its oldest lines,
+the rule comes back above the first one left). A highlight copies the lines as
+they were logged, as `s` saves them: each line it covers whole with its whole
+timestamp, without the day's rules or the indent of wrapped rows; a line it
+covers only in part gives the highlighted part. A JSON log record, after the timestamp and any Ray
+`(Actor pid=...)` prefix, shows as `time LEVEL logger: message`, with the
+message's line breaks kept and an error or exception chain on the lines under
+it; its other fields (host, ids) are left out. `s` saves the lines as they came.
+
+The header's subtitle starts with the job's status. On the Logs tab it adds
+`last line HH:MM:SS`, the newest live line's own timestamp in local time
+(`last line received` with the time it arrived, for a line without one), and
+any filter, level, or pause.
+
+The bar under the pane says, at its left end, what the pane shows and whether
+it follows the log: `● LIVE · following` while it tails a running sub-job and
+keeps to the newest line; `⏸ PAUSED · 12 new lines · p resumes` once you pause
+(`p`) or jump to an error (`e`), as the subtitle's `PAUSED` says;
+`↑ SCROLLED UP · 12 new lines · p follows` once you scroll up from the end
+(each counts the lines that came since); `✓ SAVED CONSOLE` for a finished
+job's saved console; `↓ DOWNLOADING training #0`, a bar and `8/12 chunks`
+while that console downloads; `○ WAITING` while the job or sub-job waits to
+start (the status line says why); and `✕ STOPPED · r retries` when the tail
+stopped on an error. In the middle is the filter box (`/` focuses it). At its
+right end are chips for what is found or set, in this order: where the last
+jump landed (`error 2/5` or `no errors` for `e` / `E`, `problem 2/5` or
+`no problems` for `n` / `N`), the level (`≥ WARNING`), and the filter's count
+(`12 matches`, over the whole saved console, or the lines the pane holds for a
+live tail). The jump's count follows the lines as they come and go (`error –/5`
+once the marked line has left the pane); a re-wrap (a resize) keeps its mark and chip.
+
+The line between the pane and that bar is the Logs tab's status line. It appears when the
+job read is slow, when the tail is waiting, paused, or restarted, when the
+filter or level hides every line (`no lines match …`), after `s` (for 15
+seconds), or when the pane doesn't hold a sub-job's oldest lines:
+
+- **Reading the job.** The Logs tab reads the job first, for its sub-jobs and
+  status. The pane and status line show the read, elapsed wait, retry bounds,
+  and any failure; `r` retries once the current read finishes.
+- **Waiting to start.** While the job or the selected sub-job is `pending`,
+  `placing`, or `initializing`, the line shows its reasons and the 60-second
+  status check (`r` checks now). Pending work is not tailed; placing or
+  initializing work may produce startup lines. Placement and not-yet-routed
+  service answers wait and retry as status changes.
+- **The job ends.** Once a job stops running, `tail-logs` answers 409, and 404
+  once its session is gone. The TUI confirms the status and switches to the
+  saved console instead of retrying.
+- **The tail stops on an error.** Any other error while the job is live stays
+  in the pane as `tail stopped: …`; `r` and active status checks retry. A
+  request without an answer for 20 seconds is reported.
+- **Status unavailable.** While the job's status is `UNKNOWN` (the service
+  could not read it), the tail is still attempted and the status line warns.
+- **A refused position.** The tail resumes from the position (cursor) it last
+  saved. If the service refuses it with 400, the TUI restarts at the end and
+  marks the possible gap.
+- **A log ahead of the view.** While pages come back full (the log is written
+  faster than a page per poll), reads run every 0.2 seconds until caught up;
+  the line reports lag of at least 5 seconds.
+- **A stuck tail.** On some service versions a log line of 256 KiB or more is
+  never delivered. After 45 seconds without movement, the TUI probes the end,
+  skips lines already shown, and marks any possible gap; `download-log
+  --log-type stdout` retrieves the complete uploaded log.
+- **No input for 15 minutes.** A `tail-logs` call on a running job currently
+  keeps the job active, so the TUI pauses after 15 minutes without a key,
+  click, or scroll. `p`, `r`, or another sub-job resumes it; waiting time
+  before the job runs does not count.
+- **Scrollback.** The pane keeps a sub-job's newest 20,000 lines (fewer when
+  long lines wrap to many rows). A line that would take more than 20 rows
+  shows its beginning and end (`s` saves all of it). First open and cache
+  replay use the newest 2,000 lines. When history is missing, the line gives
+  the retained (or matching) count and a `download-log` command.
+
+A finished job loads its saved console (the whole job's output, which can
+take minutes for a long job) when its Logs tab is first shown: the selected
+sub-job's first, shown as soon as it is in, then the others' in the
+background, with its progress on the bar under the pane meanwhile (the other
+sub-jobs' chunk count on the status line, once the selected one's is in). The pane says
+which sub-job's console comes first, and, for a sub-job you select before its
+console is in, that it comes with the others'. A job that ended more than 10
+minutes earlier keeps that console in its per-location job cache, so
+reopening it is instant. The
+kept consoles of all jobs take at most 1 GiB together: past that, the ones
+opened least recently are removed (and downloaded again if opened). A
+console fetched sooner, for example right after the job ended while the view
+was open, may still lack its last lines, which are often the error: the pane
+says so under it, and `r` downloads the chunks uploaded since. Until then, the
+live tail's lines that came after the console's last one stay on screen after
+it, under `— N newer lines from the live tail, not in the saved console yet —`,
+so the end of the job doesn't take away lines you saw. A sub-job with no
+console yet says instead that its saved logs may not all be uploaded yet; `r`
+checks again for its console and its execution log.
+A job that never got GPUs has no logs at all: one that failed with a
+`placement_*` reason (such as `placement_timeout`), `hardware_unavailable` or
+`pending_timeout`, or one that ended while every sub-job was still waiting to
+be placed. Its pane says so with the reason, for example "No log output: the
+job never got GPUs (reason: placement_timeout), so no sub-job started or wrote
+logs.", and its preview says the same instead of pointing to Logs.
+Jobs that fail while they are created or start up may have no saved console.
+For a failed job's sub-job without one, the pane shows the error records from
+that sub-job's execution log (`_logs/<sub_job_id>/execution.jsonl` on the job's
+Experiment) under a header, each with its error message and exception chain;
+when the log has no error records, its last 20 records.
+
+The filter (`/`) and the level key apply to the lines the view already has:
+changing either repaints the pane and never restarts the tail or sends a
+request. A saved console is searched whole. The level key keeps lines
+at or above the chosen level, judged from a JSON line's `level` field or a
+level word such as `WARNING` in its first 512 characters; lines with no level
+always stay, and a record that carries an error or an exception counts as
+`ERROR` whatever its level says. Both apply to live
+lines, saved consoles, and the execution-log records shown for a failed job
+without a console, the latter a whole record at a time (a match in its
+exception chain keeps the record); their header stays.
 
 The TUI also writes two files into your home directory: saved logs from the `s`
 key (`~/cortex-training-<job8>-<source>.log`, where `<job8>` is the first eight
 characters of the job id) and its own error log
 (`~/.cortex-training-errors.log`).
+`<source>` is the sub-job's type and index, such as `training-0`. `s` saves the
+sub-job's saved console, else the lines its tail cached, else the execution log
+the pane shows; with nothing to save it says so and writes no file.
 
-Use `t` to switch between Logs and Resource. The **Resource** tab plots GPU
-utilization and lists each GPU. Use `1`–`5` for 5 minutes, 15 minutes, 1 hour,
-6 hours, or all history; use `r` to refresh.
+Copying works everywhere: drag to highlight, then press `ctrl+c` (or Cmd-C
+where the terminal passes it through). Drags stay in their log, list, pane, or
+table region and scroll it at an edge; table selection follows characters
+across rows and hidden horizontal columns. Small row movements remain clicks,
+while a drag never activates the row. Changing the shown tab, source, unit,
+window, or rows clears the highlight.
 
-Keys in Logs:
+The TUI owns the mouse selection and copies safe text both locally (`pbcopy`,
+`wl-copy`, `xclip` or `xsel`) and through OSC 52; a note reports the result.
+Use the terminal's selection modifier instead when needed (Option in iTerm2,
+Fn in macOS Terminal, or configured Option in VS Code). With the keys panel
+open, a whole-screen copy includes its keys.
+
+Keys in the job details view (`/`, `e`, `n`, `p`, `s`, `[` and `]` work on Logs; `s`, `o` and `d` on Checkpoints):
 
 | Key | Action |
 |-----|--------|
+| `l` `g` `c` | Logs / Resources / Checkpoints tab, as in the preview, except `l` on Logs (below) |
+| `t` | Next tab |
+| `w` | Cycle the window; so does a click on the window in the header, and a click on a window in the selector at the bottom shows it (Resources) |
+| `Space` | Next sub-job, round to the first after the last, when the job has two or more; the view stays, back to `ALL`. `<` / `>` go back / forward; a click on the sub-job's name in the header goes forward (Resources) |
+| `↑` `↓` | Pick GPU Resources or System Resources, `ALL` or one GPU or node in the panel; the charts follow the highlight (Resources) |
 | `/` | Filter the current source |
-| `L` | Cycle minimum log level (INFO / WARNING / ERROR) |
-| `p` | Pause / resume auto-scroll |
-| `s` | Save the current source to `~/cortex-training-<job8>-<source>.log` |
-| `y` | Copy the whole log to the clipboard |
-| `c` | Copy the current selection |
-| `r` | Refresh the sub-job list |
-| `t` | Switch to Resource |
+| `l` | Cycle minimum log level (INFO / WARNING / ERROR) (Logs; `L` works too); elsewhere the Logs tab |
+| `e` / `E` | Next / previous error in the pane (an `ERROR`, `CRITICAL` or `FATAL` line, or a traceback: one stop with the exceptions chained to it, at the error line right above it when there is one), marked and a third of the way down the view, with its place among them on the bar (`error 2/5`). From the end of a followed log, `e` goes to the newest; both go round past either end. A jump pauses following, as `p` does |
+| `n` / `N` | Next / previous warning or error, as `e` / `E`; the bar counts them as problems (`problem 2/5`, or `no problems`) |
+| `p` | Pause / resume auto-scroll. Scrolled up from the end of a live log, or after a jump, `p` goes back to the end and follows again |
+| `s` | Save the current source to `~/cortex-training-<job8>-<source>.log` (Logs); cycle the sort: created, step, type (Checkpoints) |
+| `o` | Reverse the sort (Checkpoints) |
+| `d` | Download the highlighted checkpoint, or stop its download (Checkpoints) |
+| `ctrl+c` | Copy what is highlighted, else everything the tab holds: the log (its newest lines, up to 1 MiB) on Logs; the panel, header, stats and every chart on Resources; the list and the highlighted checkpoint's details on Checkpoints (any tab) |
 | `[` / `]` | Narrow / widen the sources panel |
-| `b` / `esc` | Back (`esc` clears an active log filter first) |
+| `PgUp` `PgDn` `Home` `End` | Scroll the log, also while the sources panel has the focus (Logs); scroll the stats and charts, also while the panel has the focus (Resources) |
+| `r` | Refresh the visible tab (on Logs, the sub-job list and its tail) |
+| `b` / `esc` | Back, or to the job list for a job opened directly (`esc` closes the keys panel first, and on Logs clears an active filter first) |
+| `?` | Show or close the keys panel |
 | `q` | Quit |
 
-Keys in Resource:
-
-| Key | Action |
-|-----|--------|
-| `1` / `2` / `3` / `4` / `5` | Show 5m / 15m / 1h / 6h / all history |
-| `r` | Refresh |
-| `t` | Return to Logs |
-| `b` / `esc` | Back |
-| `q` | Quit |
-
-In the job picker, `/` filters by id/status/type and `r` refreshes. The
-`--poll-interval` flag (default `1.0s`) is the minimum interval between log
+The `--poll-interval` flag (default `1.0s`) is the minimum interval between log
 polls per source, biasing toward server reliability over freshness.
+(A tail catching up with full pages polls faster, above.) The config file's
+`poll_interval` is the CLI's result-polling interval and doesn't change it.
 
 ### JSON Output And Help
 
@@ -773,9 +1372,10 @@ CORTEX_TRAINING_ENDPOINT
 ```
 
 `CORTEX_TRAINING_DISABLE_TELEMETRY` (truthy) skips OTLP client metrics on
-Snowflake profile and PAT clients. `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY`
-(truthy) also emits successful outcomes for essential operations; failures
-are emitted by default. See the [Python SDK reference](python-sdk.md#client-metrics).
+Snowflake profile and PAT clients. Failures are emitted by default, and so are
+successful downloads (`download-log`, `download-metrics`) with their timings.
+`CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY` set truthy also emits successful
+outcomes for every other essential operation; set falsy, it emits failures only. See the [Python SDK reference](python-sdk.md#client-metrics).
 
 `CORTEX_TRAINING_DISABLE_TENSOR_PROMPTS` (truthy) sends pre-tokenized prompts
 as JSON lists inside the request frame instead of as tensors. The request body

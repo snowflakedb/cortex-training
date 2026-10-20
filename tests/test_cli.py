@@ -19,8 +19,11 @@ from __future__ import annotations
 
 import io
 import json
+import logging
+import threading
 import time
 from datetime import date
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -30,6 +33,9 @@ import cortex_training._cli as cli
 
 class FakeClient:
     def __init__(self):
+        self.download_interrupt = None
+        self.download_warning = None
+        self.download_options = None
         self.submitted_body = None
         self.status_filter = None
         self.cancelled_job_id = None
@@ -212,10 +218,74 @@ class FakeClient:
             },
         ]
 
-    def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None):
+    def download_execution_logs(
+        self,
+        job_id,
+        output_dir,
+        *,
+        resume=False,
+        sub_job_ids=None,
+        progress=None,
+        transfer_timeout_seconds=300.0,
+    ):
+        self.execution_log_options = {
+            "output_dir": output_dir,
+            "resume": resume,
+            "sub_job_ids": sub_job_ids,
+            "transfer_timeout_seconds": transfer_timeout_seconds,
+        }
+        saved = []
+        for log in self.fetch_execution_logs(job_id):
+            if sub_job_ids is not None and log["sub_job_id"] not in sub_job_ids:
+                continue
+            path = output_dir / log["sub_job_id"] / log["filename"]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(log["content"], encoding="utf-8")
+            if progress is not None:
+                progress(f"execution logs: {log['sub_job_id']}/{log['filename']}: saved")
+                progress("\n")
+            saved.append(
+                {
+                    "sub_job_id": log["sub_job_id"],
+                    "filename": log["filename"],
+                    "artifact_uri": log["artifact_uri"],
+                    "saved_path": str(path),
+                    "bytes": path.stat().st_size,
+                    "unchanged": False,
+                }
+            )
+        return saved
+
+    def download_stdout_logs(
+        self,
+        job_id,
+        output_dir,
+        *,
+        resume=False,
+        max_workers=None,
+        progress=None,
+        sub_job_ids=None,
+        strict=False,
+        stale_after_seconds=600.0,
+        transfer_timeout_seconds=300.0,
+    ):
         self.stdout_log_job_id = job_id
         self.stdout_log_output_dir = output_dir
         self.stdout_resume = resume
+        self.download_options = {
+            "max_workers": max_workers,
+            "sub_job_ids": sub_job_ids,
+            "strict": strict,
+            "stale_after_seconds": stale_after_seconds,
+            "transfer_timeout_seconds": transfer_timeout_seconds,
+        }
+        if self.download_warning:
+            logging.getLogger("cortex_training.client").warning(self.download_warning)
+        if self.download_interrupt:
+            raise self.download_interrupt
+        if progress is not None:
+            progress(f"stdout: [####################] 1/1 {job_id}:training:0")
+            progress("\n")
         path = output_dir / f"{job_id}:training:0" / "stdout.log"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("console\n", encoding="utf-8")
@@ -230,10 +300,36 @@ class FakeClient:
             }
         ]
 
-    def download_metrics(self, job_id, output_dir, *, resume=False, progress=None):
+    def download_metrics(
+        self,
+        job_id,
+        output_dir,
+        *,
+        resume=False,
+        max_workers=None,
+        progress=None,
+        sub_job_ids=None,
+        strict=False,
+        stale_after_seconds=600.0,
+        transfer_timeout_seconds=300.0,
+    ):
         self.metrics_job_id = job_id
         self.metrics_output_dir = output_dir
         self.metrics_resume = resume
+        self.download_options = {
+            "max_workers": max_workers,
+            "sub_job_ids": sub_job_ids,
+            "strict": strict,
+            "stale_after_seconds": stale_after_seconds,
+            "transfer_timeout_seconds": transfer_timeout_seconds,
+        }
+        if self.download_warning:
+            logging.getLogger("cortex_training.client").warning(self.download_warning)
+        if self.download_interrupt:
+            raise self.download_interrupt
+        if progress is not None:
+            progress(f"metrics: [####################] 1/1 {job_id}:training:0")
+            progress("\n")
         path = output_dir / f"{job_id}:training:0" / "gpu.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('{"gpu_utilization":0.5}\n', encoding="utf-8")
@@ -267,7 +363,6 @@ def _capacity_with_breakdown(hardware, dimensions):
     breakdown = {"job_count": 1, "truncated": False, "unsupported_dimensions": []}
     if "job_type" in dimensions:
         breakdown["by_job_type"] = {
-            "status": "OK",
             "groups": [
                 {"job_type": "TRAINING", "in_use_gpus": 8, "pending_gpus": 0, "sub_job_count": 1},
                 {"job_type": "SAMPLING", "in_use_gpus": 0, "pending_gpus": 0, "sub_job_count": 0},
@@ -276,8 +371,6 @@ def _capacity_with_breakdown(hardware, dimensions):
         }
     if "submitted_by" in dimensions:
         breakdown["by_submitted_by"] = {
-            "status": "OK",
-            "scope": "SELF",
             "groups": [
                 {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
                  "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
@@ -1355,8 +1448,9 @@ def test_capacity_breakdown_single_hardware_prints_compact_sorted_json():
     assert err == ""
     assert client.capacity_hardware_requests == []
     assert client.capacity_breakdown_requests == [("B300", ("submitted_by",))]
-    expected = _capacity_with_breakdown("B300", ("submitted_by",))
-    assert out == json.dumps(expected, separators=(",", ":"), sort_keys=True) + "\n"
+    expected = cli._breakdown_last(_capacity_with_breakdown("B300", ("submitted_by",)))
+    assert out == json.dumps(expected, separators=(",", ":")) + "\n"
+    assert list(json.loads(out))[-1] == "breakdown"
 
 
 @pytest.mark.parametrize("hardware", _CAPACITY_HARDWARE)
@@ -1400,7 +1494,6 @@ def test_capacity_breakdown_prints_the_real_client_result_with_sorted_keys():
             "by_job_type": {"status": "DISABLED", "groups": []},
             "by_submitted_by": {
                 "status": "OK",
-                "scope": "SELF",
                 "groups": [
                     {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
                      "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
@@ -1445,7 +1538,6 @@ def test_capacity_breakdown_prints_the_real_client_result_with_sorted_keys():
             "by_job_type": {"status": "DISABLED", "groups": []},
             "by_submitted_by": {
                 "status": "OK",
-                "scope": "SELF",
                 "groups": [
                     {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
                      "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
@@ -1457,7 +1549,8 @@ def test_capacity_breakdown_prints_the_real_client_result_with_sorted_keys():
             },
         },
     }
-    assert out == json.dumps(expected, indent=2, sort_keys=True) + "\n"
+    assert out == json.dumps(cli._breakdown_last(expected), indent=2) + "\n"
+    assert list(json.loads(out))[-1] == "breakdown"
 
 
 def test_capacity_breakdown_prints_visible_user_rows_in_server_order():
@@ -1480,7 +1573,6 @@ def test_capacity_breakdown_prints_visible_user_rows_in_server_order():
             "truncated": False,
             "by_submitted_by": {
                 "status": "OK",
-                "scope": "VISIBLE",
                 "groups": [
                     {"kind": "USER", "submitted_by": "CAROL", "is_caller": False,
                      "in_use_gpus": 16, "pending_gpus": 8, "job_count": 2},
@@ -1509,7 +1601,6 @@ def test_capacity_breakdown_prints_visible_user_rows_in_server_order():
     }
     assert json.loads(out)["breakdown"]["by_submitted_by"] == {
         "status": "OK",
-        "scope": "VISIBLE",
         "groups": [
             {"kind": "USER", "submitted_by": "CAROL", "is_caller": False,
              "in_use_gpus": 16, "pending_gpus": 8, "job_count": 2},
@@ -2077,18 +2168,24 @@ def test_download_log_writes_each_log_under_sub_job_dir(tmp_path):
             "filename": "execution.jsonl",
             "artifact_uri": "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_logs/job-1:training:0/execution.jsonl",
             "saved_path": str(training_dir / "execution.jsonl"),
+            "bytes": (training_dir / "execution.jsonl").stat().st_size,
+            "unchanged": False,
         },
         {
             "sub_job_id": "job-1:training:0",
             "filename": "server.log",
             "artifact_uri": "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_logs/job-1:training:0/server.log",
             "saved_path": str(training_dir / "server.log"),
+            "bytes": (training_dir / "server.log").stat().st_size,
+            "unchanged": False,
         },
         {
             "sub_job_id": "job-1:sampling:0",
             "filename": "execution.jsonl",
             "artifact_uri": "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_logs/job-1:sampling:0/execution.jsonl",
             "saved_path": str(sampling_dir / "execution.jsonl"),
+            "bytes": (sampling_dir / "execution.jsonl").stat().st_size,
+            "unchanged": False,
         },
     ]
 
@@ -2133,21 +2230,38 @@ def test_download_log_resume_reaches_stdout_download(tmp_path):
     assert client.stdout_resume is True
 
 
-def test_download_log_resume_rejects_execution_logs(tmp_path):
-    stderr = io.StringIO()
-
-    def client_factory(_args):
-        raise AssertionError("client constructed before the --resume check")
-
+def test_download_log_execution_options_reach_the_streaming_download(tmp_path):
+    client = FakeClient()
     rc = cli.main(
-        _base_args() + ["download-log", "job-1", "--resume", "--output-dir", str(tmp_path)],
-        client_factory=client_factory,
+        _base_args()
+        + [
+            "download-log", "job-1", "--resume", "--sub-job", "job-1:sampling:0",
+            "--transfer-timeout", "60", "--output-dir", str(tmp_path),
+        ],
+        client_factory=lambda _: client,
         stdout=io.StringIO(),
-        stderr=stderr,
+        stderr=io.StringIO(),
     )
+    assert rc == 0
+    assert client.execution_log_options == {
+        "output_dir": tmp_path,
+        "resume": True,
+        "sub_job_ids": ["job-1:sampling:0"],
+        "transfer_timeout_seconds": 60.0,
+    }
+    assert not (tmp_path / "job-1:training:0").exists()
 
-    assert rc == 1
-    assert "--resume applies to --log-type stdout" in stderr.getvalue()
+
+def test_download_log_execution_transfer_timeout_zero_means_no_limit(tmp_path):
+    client = FakeClient()
+    rc = cli.main(
+        _base_args() + ["download-log", "job-1", "--transfer-timeout", "0", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: client,
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+    assert rc == 0
+    assert client.execution_log_options["transfer_timeout_seconds"] is None
 
 
 def test_download_metrics_resume_reaches_client(tmp_path):
@@ -2163,20 +2277,355 @@ def test_download_metrics_resume_reaches_client(tmp_path):
     assert client.metrics_resume is True
 
 
+def test_download_metrics_passes_parallel_and_sub_jobs_and_reports_progress(tmp_path):
+    client = FakeClient()
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args()
+        + [
+            "download-metrics",
+            "job-1",
+            "--parallel",
+            "4",
+            "--sub-job",
+            "job-1:training:0",
+            "--sub-job",
+            "job-1:sampling:0",
+            "--output-dir",
+            str(tmp_path),
+        ],
+        client_factory=lambda _: client,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert rc == 0
+    assert client.download_options == {
+        "max_workers": 4,
+        "sub_job_ids": ["job-1:training:0", "job-1:sampling:0"],
+        "strict": False,
+        "stale_after_seconds": 600.0,
+        "transfer_timeout_seconds": 300.0,
+    }
+    assert stderr.getvalue() == "metrics: [####################] 1/1 job-1:training:0\n"
+    assert json.loads(stdout.getvalue())["metrics"][0]["filename"] == "gpu.jsonl"
+
+
+def test_download_log_stdout_defaults_leave_parallel_to_client(tmp_path):
+    client = FakeClient()
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args()
+        + ["download-log", "job-1", "--log-type", "stdout", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: client,
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert rc == 0
+    assert client.download_options == {
+        "max_workers": None,
+        "sub_job_ids": None,
+        "strict": False,
+        "stale_after_seconds": 600.0,
+        "transfer_timeout_seconds": 300.0,
+    }
+    assert stderr.getvalue() == "stdout: [####################] 1/1 job-1:training:0\n"
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        ["--parallel", "2"],
+        ["--strict"],
+        ["--stale-after-minutes", "5"],
+    ],
+)
+def test_download_log_chunk_flags_reject_execution_logs(tmp_path, flag):
+    stderr = io.StringIO()
+
+    def client_factory(_args):
+        raise AssertionError("client constructed before the flag check")
+
+    rc = cli.main(
+        _base_args() + ["download-log", "job-1", *flag, "--output-dir", str(tmp_path)],
+        client_factory=client_factory,
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert f"{flag[0]} applies to --log-type stdout" in stderr.getvalue()
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "x"])
+def test_download_metrics_rejects_bad_parallel(tmp_path, value, capsys):
+    with pytest.raises(SystemExit):
+        cli.main(
+            _base_args() + ["download-metrics", "job-1", "--parallel", value],
+            client_factory=lambda _: FakeClient(),
+            stdout=io.StringIO(),
+        )
+    assert "positive integer" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", [["download-metrics", "job-1"], ["download-log", "job-1", "--log-type", "stdout"]])
+def test_parallel_is_capped(tmp_path, command, capsys):
+    with pytest.raises(SystemExit):
+        cli.main(_base_args() + command + ["--parallel", "129"], client_factory=lambda _: FakeClient(), stdout=io.StringIO())
+    assert "--parallel: must be at most 128, got 129" in capsys.readouterr().err
+    client = FakeClient()
+    rc = cli.main(
+        _base_args() + command + ["--parallel", "128", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: client,
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+    assert rc == 0
+    assert client.download_options["max_workers"] == 128
+
+
+def _interrupted(saved):
+    exc = KeyboardInterrupt()
+    exc.download_progress_saved = saved
+    return exc
+
+
+@pytest.mark.parametrize(
+    "command",
+    [["download-metrics", "job-1"], ["download-log", "job-1", "--log-type", "stdout"]],
+)
+@pytest.mark.parametrize(
+    ("raised", "message"),
+    [
+        (_interrupted(True), "interrupted; downloaded chunks were saved. Run the same command with --resume to continue.\n"),
+        (_interrupted(False), "interrupted before any output was saved\n"),
+        (KeyboardInterrupt(), "interrupted before any output was saved\n"),
+    ],
+)
+def test_download_interrupt_exits_130_with_accurate_message(tmp_path, command, raised, message):
+    client = FakeClient()
+    client.download_interrupt = raised
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + command + ["--output-dir", str(tmp_path)],
+        client_factory=lambda _: client,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert rc == 130
+    assert stdout.getvalue() == ""
+    assert stderr.getvalue() == message
+
+
+@pytest.mark.parametrize("where", ["stall wait", "session close"])
+def test_download_interrupted_after_the_files_are_written_prints_the_resume_hint(
+    tmp_path, monkeypatch, where
+):
+    from cortex_training import _artifact_download
+    from cortex_training import client as client_module
+
+    client = client_module.CortexTrainingClient(
+        base_url="http://test.local", database="DB", schema="SCH"
+    )
+    sub = "job-1:training:0"
+    saved = tmp_path / sub / "metrics.jsonl"
+    release = threading.Event()
+
+    def write_plans(*_args, **_kwargs):
+        saved.parent.mkdir(parents=True)
+        saved.write_text("{}\n")
+        return [{"sub_job_id": sub, "saved_path": str(saved)}]
+
+    def interrupted(*_args):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(client, "_experiment_run_uri", lambda _job: ("snow://run/", "RUN"))
+    monkeypatch.setattr(client, "_open_experiment_artifact_connection", MagicMock)
+    monkeypatch.setattr(
+        client, "_list_gzip_chunks", lambda *_args: ({sub: ["_metrics/c0.gz"]}, {})
+    )
+    # The stall check outlives the wait, as when the job lookup is slow.
+    monkeypatch.setattr(client, "_STALL_CHECK_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(client, "_stale_upload_warnings", lambda *_args: release.wait(10))
+    monkeypatch.setattr(client, "_write_gzip_plans", write_plans)
+    if where == "stall wait":
+        monkeypatch.setattr(_artifact_download.Background, "result", interrupted)
+    else:
+        monkeypatch.setattr(_artifact_download.SharedConnection, "close", interrupted)
+    stderr = io.StringIO()
+    try:
+        rc = cli.main(
+            _base_args() + ["download-metrics", "job-1", "--output-dir", str(tmp_path)],
+            client_factory=lambda _: client,
+            stdout=io.StringIO(),
+            stderr=stderr,
+        )
+    finally:
+        release.set()
+
+    assert rc == 130
+    assert stderr.getvalue() == (
+        "interrupted; downloaded chunks were saved. "
+        "Run the same command with --resume to continue.\n"
+    )
+    assert saved.read_text() == "{}\n"
+
+
+@pytest.mark.parametrize("saved", [True, False])
+def test_download_connector_error_is_short_with_query_id_and_hint(tmp_path, saved):
+    errors = pytest.importorskip("snowflake.connector.errors")
+    exc = errors.ProgrammingError(msg="Insufficient privileges", errno=3001, sfqid="query-123")
+    exc.download_progress_saved = saved
+    client = FakeClient()
+    client.download_interrupt = exc
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["download-metrics", "job-1", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: client,
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    text = stderr.getvalue()
+    assert text.startswith("error: ") and "Insufficient privileges" in text
+    assert "query-123" in text
+    assert "Traceback" not in text
+    assert ("--resume" in text) is saved
+
+
+def test_download_os_error_gets_resume_hint_when_saved(tmp_path):
+    exc = OSError("disk full")
+    exc.download_progress_saved = True
+    client = FakeClient()
+    client.download_interrupt = exc
+    stderr = io.StringIO()
+    rc = cli.main(
+        _base_args() + ["download-log", "job-1", "--log-type", "stdout", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: client,
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+    assert rc == 1
+    assert stderr.getvalue() == (
+        "error: disk full\n"
+        "Downloaded chunks were saved. Run the same command with --resume to continue.\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [["download-metrics", "job-1"], ["download-log", "job-1", "--log-type", "stdout"]],
+)
+def test_download_strict_and_library_warnings_reach_stderr(tmp_path, command):
+    client = FakeClient()
+    client.download_warning = "skipped chunk snow://x: damaged"
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + command + ["--strict", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: client,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert rc == 0
+    assert client.download_options["strict"] is True
+    assert stderr.getvalue().count("warning: skipped chunk snow://x: damaged") == 1
+    assert "warning" not in stdout.getvalue()
+    assert logging.getLogger("cortex_training").handlers == []
+
+
+def test_download_warnings_still_reach_the_callers_log_handlers(tmp_path):
+    client = FakeClient()
+    client.download_warning = "skipped chunk snow://x: damaged"
+    seen = []
+
+    class Collect(logging.Handler):
+        def emit(self, record):
+            seen.append(record.getMessage())
+
+    root = logging.getLogger()
+    collect = Collect(logging.WARNING)
+    root.addHandler(collect)
+    stderr = io.StringIO()
+    try:
+        rc = cli.main(
+            _base_args() + ["download-metrics", "job-1", "--output-dir", str(tmp_path)],
+            client_factory=lambda _: client,
+            stdout=io.StringIO(),
+            stderr=stderr,
+        )
+    finally:
+        root.removeHandler(collect)
+    assert rc == 0
+    assert seen == ["skipped chunk snow://x: damaged"]
+    assert stderr.getvalue().count("warning: skipped chunk snow://x: damaged") == 1
+
+
+@pytest.mark.parametrize(("value", "expected"), [("0", None), ("2.5", 150.0), ("30", 1800.0)])
+def test_download_metrics_stale_after_minutes(tmp_path, value, expected):
+    client = FakeClient()
+    rc = cli.main(
+        _base_args()
+        + ["download-metrics", "job-1", "--stale-after-minutes", value, "--output-dir", str(tmp_path)],
+        client_factory=lambda _: client,
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+    assert rc == 0
+    assert client.download_options["stale_after_seconds"] == expected
+
+
+@pytest.mark.parametrize(("value", "expected"), [("0", None), ("45", 45.0)])
+def test_download_log_transfer_timeout(tmp_path, value, expected):
+    client = FakeClient()
+    rc = cli.main(
+        _base_args()
+        + ["download-log", "job-1", "--log-type", "stdout", "--transfer-timeout", value]
+        + ["--output-dir", str(tmp_path)],
+        client_factory=lambda _: client,
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+    assert rc == 0
+    assert client.download_options["transfer_timeout_seconds"] == expected
+
+
+@pytest.mark.parametrize("value", ["-1", "x", "nan", "inf"])
+def test_download_metrics_rejects_bad_stale_after(value, capsys):
+    with pytest.raises(SystemExit):
+        cli.main(
+            _base_args() + ["download-metrics", "job-1", "--stale-after-minutes", value],
+            client_factory=lambda _: FakeClient(),
+            stdout=io.StringIO(),
+        )
+    assert "non-negative number" in capsys.readouterr().err
+
+
 def test_download_commands_write_progress_to_stderr(tmp_path):
     class ProgressClient(FakeClient):
-        def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None):
+        def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None, **options):
             if progress is not None:
                 progress("stdout: found 1 chunks for job\n")
             return super().download_stdout_logs(
-                job_id, output_dir, resume=resume, progress=None
+                job_id, output_dir, resume=resume, progress=None, **options
             )
 
-        def download_metrics(self, job_id, output_dir, *, resume=False, progress=None):
+        def download_metrics(self, job_id, output_dir, *, resume=False, progress=None, **options):
             if progress is not None:
                 progress("metrics: found 1 chunks for job\n")
             return super().download_metrics(
-                job_id, output_dir, resume=resume, progress=None
+                job_id, output_dir, resume=resume, progress=None, **options
             )
 
     stdout = io.StringIO()
@@ -2227,10 +2676,10 @@ class _FlushFails(_TtyStderr):
 )
 def test_download_metrics_survives_stderr_oserror(stream_cls, messages, tmp_path):
     class ProgressClient(FakeClient):
-        def download_metrics(self, job_id, output_dir, *, resume=False, progress=None):
+        def download_metrics(self, job_id, output_dir, *, resume=False, progress=None, **options):
             for message in messages:
                 progress(message)
-            return super().download_metrics(job_id, output_dir, resume=resume, progress=None)
+            return super().download_metrics(job_id, output_dir, resume=resume, progress=None, **options)
 
     stdout = io.StringIO()
     rc = cli.main(
@@ -2286,12 +2735,12 @@ def test_artifact_progress_writer_edges():
 
 def test_download_progress_is_one_terminal_line(tmp_path):
     class ProgressClient(FakeClient):
-        def download_metrics(self, job_id, output_dir, *, resume=False, progress=None):
+        def download_metrics(self, job_id, output_dir, *, resume=False, progress=None, **options):
             if progress is not None:
                 progress("metrics: [##------------------] 1/2 job")
                 progress("metrics: [####################] 2/2 job")
                 progress("\n")
-            return super().download_metrics(job_id, output_dir, resume=resume, progress=None)
+            return super().download_metrics(job_id, output_dir, resume=resume, progress=None, **options)
 
     tty = _TtyStderr()
     rc = cli.main(
@@ -2317,7 +2766,7 @@ def test_download_progress_is_one_terminal_line(tmp_path):
     assert plain.getvalue() == "metrics: [####################] 2/2 job\n"
 
 
-def test_execution_log_download_writes_no_progress(tmp_path):
+def test_execution_log_download_reports_each_file(tmp_path):
     stderr = io.StringIO()
     rc = cli.main(
         _base_args() + ["download-log", "job-1", "--output-dir", str(tmp_path)],
@@ -2326,7 +2775,90 @@ def test_execution_log_download_writes_no_progress(tmp_path):
         stderr=stderr,
     )
     assert rc == 0
-    assert stderr.getvalue() == ""
+    assert stderr.getvalue().splitlines() == [
+        "execution logs: job-1:training:0/execution.jsonl: saved",
+        "execution logs: job-1:training:0/server.log: saved",
+        "execution logs: job-1:sampling:0/execution.jsonl: saved",
+    ]
+
+
+def test_download_warning_does_not_break_the_progress_line():
+    tty = _TtyStderr()
+    write = cli._artifact_progress_writer(tty)
+    write("metrics: [#-] 1/2 job")
+    write.warn("warning: GET x failed; retrying")
+    write("metrics: [##] 2/2 job")
+    write("\n")
+    assert tty.getvalue() == (
+        "\rmetrics: [#-] 1/2 job"
+        "\nwarning: GET x failed; retrying\n"
+        "\rmetrics: [#-] 1/2 job"
+        "\rmetrics: [##] 2/2 job\n"
+    )
+
+    plain = io.StringIO()
+    write = cli._artifact_progress_writer(plain)
+    write("metrics: [#-] 1/2 job")
+    write.warn("warning: GET x failed; retrying")
+    write("\n")
+    assert plain.getvalue() == "warning: GET x failed; retrying\nmetrics: [#-] 1/2 job\n"
+
+
+class _SlowTty(_TtyStderr):
+    """A terminal whose writes yield between characters, so unserialized writes interleave."""
+
+    def write(self, message):
+        for char in message:
+            super().write(char)
+            time.sleep(0)
+        return len(message)
+
+
+def test_progress_writer_keeps_lines_whole_under_concurrent_warnings():
+    tty = _SlowTty()
+    write = cli._artifact_progress_writer(tty)
+    statuses = [f"metrics: [{'#' * (i % 20):-<20}] {i}/200 job" for i in range(200)]
+    warnings = [f"warning: GET chunk-{t}-{i} failed; retrying" for t in range(4) for i in range(25)]
+
+    def warn_all(thread):
+        for i in range(25):
+            write.warn(f"warning: GET chunk-{thread}-{i} failed; retrying")
+
+    threads = [threading.Thread(target=warn_all, args=(t,)) for t in range(4)]
+    for thread in threads:
+        thread.start()
+    for status in statuses:
+        write(status)
+    for thread in threads:
+        thread.join()
+    write("\n")
+
+    text = tty.getvalue()
+    lines = text.split("\n")
+    assert sorted(line for line in lines if line.startswith("warning:")) == sorted(warnings)
+    for line in lines:
+        if line.startswith("warning:"):
+            continue
+        # Every other line is a run of whole status redraws.
+        for segment in line.split("\r")[1:]:
+            assert segment in statuses, repr(segment)
+    assert text.endswith(statuses[-1] + "\n")
+
+
+def test_session_close_failure_is_one_warning_line(monkeypatch):
+    from cortex_training import _artifact_download
+
+    class Broken:
+        def close(self):
+            raise RuntimeError("close failed")
+
+    stderr = io.StringIO()
+    writer = cli._artifact_progress_writer(stderr)
+    with cli._library_warnings_to(writer):
+        _artifact_download.SharedConnection(Broken).close()
+    assert stderr.getvalue() == (
+        "warning: could not close the artifact download session: close failed\n"
+    )
 
 
 def test_download_metrics_defaults_to_cwd(tmp_path, monkeypatch):
@@ -2808,6 +3340,21 @@ def test_build_client_uses_named_snowflake_connection(tmp_path, monkeypatch):
     )
 
 
+def test_build_client_forwards_read_bounds_only_when_set(tmp_path, monkeypatch):
+    # `cortex-training tui` sets these on its args; the CLI commands never do,
+    # so they keep the client's defaults (the test above).
+    monkeypatch.setenv(
+        "CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "missing.json")
+    )
+    args = cli.parse_args(["--connection", "training-profile", "list"])
+    args.max_retries, args.request_timeout = 2, (10.0, 45.0)
+    client_cls = MagicMock()
+
+    cli.build_client(args, client_cls)
+    kwargs = client_cls.from_connection_name.call_args.kwargs
+    assert (kwargs["max_retries"], kwargs["request_timeout"]) == (2, (10.0, 45.0))
+
+
 def _http_error(status_code: int, headers: dict[str, str] | None = None):
     import requests
 
@@ -2860,3 +3407,113 @@ def test_format_error_does_not_repeat_request_id_already_in_message() -> None:
 
     assert message.count("sf-req-1") == 1
     assert "response body:" in message
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["download-log", "job-1", "--log-type", "stdout"],
+        ["download-metrics", "job-1"],
+    ],
+)
+def test_chunk_download_refuses_a_directory_the_tui_is_downloading(tmp_path, command):
+    fcntl = pytest.importorskip("fcntl")
+    out_dir = tmp_path / "stdout"
+    lock_path = tmp_path / ".stdout.lock"
+    stderr = io.StringIO()
+    client = FakeClient()
+    # A separate open file description stands in for the TUI process.
+    with open(lock_path, "a+b") as tui:
+        fcntl.flock(tui.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        rc = cli.main(
+            _base_args() + command + ["--output-dir", str(out_dir)],
+            client_factory=lambda _: client,
+            stdout=io.StringIO(),
+            stderr=stderr,
+        )
+    assert rc == 1
+    assert f"another download is using {out_dir}" in stderr.getvalue()
+    assert not out_dir.exists()
+
+
+def test_chunk_download_takes_a_free_tui_lock_and_creates_none(tmp_path):
+    client = FakeClient()
+    free = tmp_path / "free"
+    (tmp_path / ".free.lock").touch()
+    rc = cli.main(
+        _base_args() + ["download-metrics", "job-1", "--output-dir", str(free)],
+        client_factory=lambda _: client,
+        stdout=io.StringIO(),
+    )
+    assert rc == 0
+    plain = tmp_path / "plain"
+    rc = cli.main(
+        _base_args() + ["download-log", "job-1", "--log-type", "stdout", "--output-dir", str(plain)],
+        client_factory=lambda _: client,
+        stdout=io.StringIO(),
+    )
+    assert rc == 0
+    assert not (tmp_path / ".plain.lock").exists(), "a plain CLI download created a lock file"
+
+
+_CHUNK_COMMANDS = [
+    pytest.param(["download-log", "job-1", "--log-type", "stdout"], "stdout.log", id="download-log"),
+    pytest.param(["download-metrics", "job-1"], "gpu.jsonl", id="download-metrics"),
+]
+
+
+@pytest.mark.parametrize("command, filename", _CHUNK_COMMANDS)
+@pytest.mark.parametrize("output_dir", [None, ".", "./", "sub", "sub/../sub", "other/.."])
+def test_chunk_download_accepts_relative_and_default_output_dirs(tmp_path, monkeypatch, command, filename, output_dir):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "other").mkdir()
+    stderr = io.StringIO()
+    args = command + ([] if output_dir is None else ["--output-dir", output_dir])
+    rc = cli.main(_base_args() + args, client_factory=lambda _: FakeClient(), stdout=io.StringIO(), stderr=stderr)
+    assert rc == 0, stderr.getvalue()
+    expected = (tmp_path / (output_dir or ".")).resolve()
+    assert (expected / "job-1:training:0" / filename).is_file()
+    # No TUI lock existed, so none was created anywhere.
+    assert not list(tmp_path.glob(".*.lock")) and not list(tmp_path.parent.glob(f".{tmp_path.name}.lock"))
+
+
+@pytest.mark.parametrize("command, filename", _CHUNK_COMMANDS)
+@pytest.mark.parametrize("cwd, output_dir", [("cache", None), ("cache", "."), ("cache", "./"), (".", "cache"),
+                                             (".", "x/../cache"), ("x", "../cache")])
+def test_chunk_download_finds_the_tui_lock_from_any_spelling(tmp_path, monkeypatch, command, filename, cwd, output_dir):
+    from cortex_training._download_lock import DownloadLock
+
+    fcntl = pytest.importorskip("fcntl")
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (tmp_path / "x").mkdir()
+    monkeypatch.chdir(tmp_path / cwd)
+    tui_lock = DownloadLock(cache)
+    assert tui_lock.lock_path == tmp_path / ".cache.lock"
+    stderr = io.StringIO()
+    args = command + ([] if output_dir is None else ["--output-dir", output_dir])
+    # A separate open file description stands in for the TUI process.
+    with open(tui_lock.lock_path, "a+b") as tui:
+        fcntl.flock(tui.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        rc = cli.main(_base_args() + args, client_factory=lambda _: FakeClient(), stdout=io.StringIO(), stderr=stderr)
+    assert rc == 1
+    assert "another download is using" in stderr.getvalue()
+    assert not (cache / "job-1:training:0").exists()
+
+
+def test_download_lock_paths_are_resolved(tmp_path, monkeypatch):
+    from cortex_training._download_lock import DownloadLock
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "foo").mkdir()
+    absolute = DownloadLock(tmp_path / "cache").lock_path
+    assert absolute == tmp_path / ".cache.lock"
+    for spelling in ["cache", "./cache", "foo/../cache", str(tmp_path / "foo" / ".." / "cache")]:
+        assert DownloadLock(Path(spelling)).lock_path == absolute
+    assert DownloadLock(Path(".")).lock_path == tmp_path.parent / f".{tmp_path.name}.lock"
+    root = DownloadLock(Path("/"))
+    assert root.lock_path is None
+    assert root.try_acquire()
+    root.release()
+    with cli._output_dir_lock(Path("/")):
+        pass
