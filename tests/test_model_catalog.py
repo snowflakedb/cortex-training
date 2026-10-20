@@ -198,7 +198,7 @@ def test_moe_sft_recipes_have_runnable_parallelism():
             8,
             1,
         ),
-        "glm53_flash.json": (
+        "glm53_flash_lora.json": (
             "zai-org/GLM-5.3-Flash",
             8,
             8,
@@ -249,7 +249,7 @@ def test_moe_sft_recipes_have_runnable_parallelism():
         assert sub_job["model_name"] == model_id
         assert sub_job["dtype"] == "bfloat16"
         assert training["model_provider"] == "prime_rl"
-        if filename == "glm53_flash.json":
+        if filename == "glm53_flash_lora.json":
             assert training["prime_rl"] == {
                 "ep_comm_backend": "deepep",
                 "deepep_token_chunk_size": 8192,
@@ -280,7 +280,7 @@ def test_moe_sft_recipes_have_runnable_parallelism():
             assert ds_config["bf16"]["bf16_optimizer_states"] is True
             assert ds_config["bf16"]["bf16_master_weights_and_grads"] is True
         if filename in {
-            "glm53_flash.json",
+            "glm53_flash_lora.json",
             "glm53_flash_bf16.json",
         }:
             expected_chunk = 512 if "_bf16" in filename else 1024
@@ -346,7 +346,7 @@ def test_moe_rl_recipes_have_runnable_parallelism():
             8,
             1,
         ),
-        "glm53_flash.json": (
+        "glm53_flash_lora.json": (
             "zai-org/GLM-5.3-Flash",
             8,
             8,
@@ -417,7 +417,7 @@ def test_moe_rl_recipes_have_runnable_parallelism():
         assert training["model_name"] == model_id
         assert training["dtype"] == "bfloat16"
         assert training_config["model_provider"] == "prime_rl"
-        if filename == "glm53_flash.json":
+        if filename == "glm53_flash_lora.json":
             assert training_config["prime_rl"] == {
                 "ep_comm_backend": "deepep",
                 "deepep_token_chunk_size": 8192,
@@ -452,7 +452,7 @@ def test_moe_rl_recipes_have_runnable_parallelism():
             assert ds_config["bf16"]["bf16_optimizer_states"] is True
             assert ds_config["bf16"]["bf16_master_weights_and_grads"] is True
         if filename in {
-            "glm53_flash.json",
+            "glm53_flash_lora.json",
             "glm53_flash_bf16.json",
         }:
             expected_chunk = 512 if "_bf16" in filename else 1024

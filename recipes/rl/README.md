@@ -103,7 +103,7 @@ Other full-parameter job bodies are:
 - `configs/glm45_air.json`
 - `configs/nemotron3_nano_30b.json`: Nemotron-3-Nano, 8 training GPUs, SP8, EP4, 8 sampling GPUs at TP8, 256K. The training mesh matches the SFT recipe, which completed an AdamW step on H200. Sampling was not probed.
 - `configs/nemotron35_lightning_30b.json`: Nemotron-3.5-Lightning, same 256K mesh as Nano. MTP weights are not trained.
-- `configs/glm53_flash.json` (FP8 checkpoint, attention-only LoRA)
+- `configs/glm53_flash_lora.json` (FP8 checkpoint, attention-only LoRA)
 - `configs/glm53_flash_bf16.json`
 - `configs/qwen38_flash_next.json`
 - `configs/deepseek_v4_flash.json`
@@ -114,7 +114,7 @@ training mesh as the SFT recipe, including bf16 master weights and optimizer
 states. Its sampler stays at 8 GPUs and TP8, with `weight_format: vllm` and
 router replay. The completed evidence is the training optimizer step;
 sampling was not probed.
-`glm53_flash.json` uses the same 8-GPU, SP8, EP8, DeepEP
+`glm53_flash_lora.json` uses the same 8-GPU, SP8, EP8, DeepEP
 training mesh as the SFT recipe, including the DeepEP token chunk of 8192,
 the tiled MLP chunk of 1024, and attention-only LoRA. Fused cross-entropy
 is off so the training step can return per-token log probabilities.
