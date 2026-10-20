@@ -108,9 +108,14 @@ class TrainingLog:
             metrics = _metrics(result, nested=op == OP_FWD_BWD)
             with self._lock:
                 if op == OP_FWD_BWD:
-                    call = self._calls.get(job_id, 0) + 1
-                    self._calls[job_id] = call
                     step = self._next_step.get(job_id)
+                    # Without a step (before this client saw a /step, e.g. one CLI process per
+                    # call), a count would restart at 1 each time; leave both empty and let the
+                    # reader attach the call to the next step row, as it does the service's.
+                    call = None
+                    if step is not None:
+                        call = self._calls.get(job_id, 0) + 1
+                        self._calls[job_id] = call
                 else:
                     call = None
                     raw = _number(result.get("global_steps"))

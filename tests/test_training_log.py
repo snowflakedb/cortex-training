@@ -46,7 +46,22 @@ def test_calls_before_any_step_and_after_a_load_have_no_step(tmp_path):
     log.record(JOB, "step", "s1", {**STEP, "global_steps": 1.0})
     log.forget_step(JOB)  # a load-checkpoint
     log.record(JOB, "fwd_bwd", "c2", CALL)
-    assert [(r["op"], r["step"]) for r in _rows(tmp_path)] == [("fwd_bwd", None), ("step", 1), ("fwd_bwd", None)]
+    log.record(JOB, "fwd_bwd", "c3", CALL)
+    # No step, no call count either: it would restart at 1 in every new process.
+    assert [(r["op"], r["step"], r["call"]) for r in _rows(tmp_path)] == [
+        ("fwd_bwd", None, None), ("step", 1, None), ("fwd_bwd", None, None), ("fwd_bwd", None, None),
+    ]
+
+
+def test_each_new_process_leaves_the_call_count_empty(tmp_path):
+    # The CLI runs one process per command, so each call comes from a fresh log.
+    for request_id in ("c1", "c2"):
+        _training_log.TrainingLog(tmp_path).record(JOB, "fwd_bwd", request_id, CALL)
+    _training_log.TrainingLog(tmp_path).record(JOB, "step", "s1", {**STEP, "global_steps": 1.0})
+    rows = _rows(tmp_path)
+    assert [(r["step"], r["call"]) for r in rows] == [(None, None), (None, None), (1, None)]
+    data = training.TrainingLoader(tmp_path / "no-stage", _training_log.local_dir(JOB, tmp_path)).load().get(SUB)
+    assert data.calls == 2 and [data.step_of_call(c) for c in (1, 2)] == [1, 1]
 
 
 def test_recording_never_raises_and_skips_what_it_cannot_write(tmp_path):
