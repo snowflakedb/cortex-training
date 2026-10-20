@@ -2791,7 +2791,9 @@ async def _run_a_drag_in_a_job_list_cell_highlights_and_copies_just_its_text():
         assert _highlighted_columns(app, y + 3, table) == list(range(10, 21))
         x = lines[table.region.y].index("Created")  # the column names, over the column scrolled into view
         await _drag(mouse, (x, y + 5), (x + 10, y + 5), via=[(x + 5, y + 5)])
-        assert await _copied(app, pilot, copied) == lines[y + 5][x:x + 11]
+        # The Created cell covered whole copies as the time itself; the Duration cell's start as drawn.
+        assert re.fullmatch(r"\d{4}-\d\d-\d\d \d\d:\d\d  " + re.escape(lines[y + 5][x + 10]),
+                            await _copied(app, pilot, copied))
         assert _highlighted_columns(app, y + 5, table) == list(range(x, x + 11))
         await _settle(app, pilot)
 
@@ -2863,8 +2865,15 @@ async def _run_a_drag_across_job_list_rows_copies_that_span():
         lines = [line[:width] for line in _screen_lines(app)]
         y = _first_job_line(lines)
         await _drag(mouse, (20, y), (60, y + 3), via=[(30, y + 1), (50, y + 2)])
-        assert await _copied(app, pilot, copied) == "\n".join(
-            [lines[y][20:].rstrip(), lines[y + 1].rstrip(), lines[y + 2].rstrip(), lines[y + 3][:61].rstrip()])
+        text = await _copied(app, pilot, copied)
+        first, *_middle, last = text.split("\n")
+        assert len(text.split("\n")) == 4
+        # Cells covered in part copy as drawn; cells covered whole as their copy text: times
+        # in full, each status as its word, no glyph and no relative age.
+        assert first.startswith(lines[y][20:40]) and last.startswith(lines[y + 3][:40])
+        assert last.endswith(lines[y + 3][56:61]) and "PENDING" in last
+        assert re.search(r"\d{4}-\d\d-\d\d \d\d:\d\d", first) and "ago" not in text
+        assert not set("●◔◐○✕⊘✓") & set(text)
         # Drawn over the same characters (a line's trailing blank isn't copied, nor drawn).
         assert _highlighted_columns(app, y, table) == list(range(20, len(lines[y].rstrip())))
         assert _highlighted_columns(app, y + 1, table) == list(range(len(lines[y + 1].rstrip())))
@@ -4091,6 +4100,44 @@ def test_a_copy_of_the_job_list_has_whole_times_and_status_words():
             assert "RUNNING" in job and "●" not in copied and "◔" not in copied
             assert "RUNNING" in training and "PLACING" in sampling  # drawn as the glyph alone, and glyph and word
             assert "─" not in heading  # the LIVE heading's rule is drawn only
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def test_a_highlight_of_job_list_rows_copies_whole_times_and_status_words():
+    created = (datetime.now(timezone.utc) - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    c = _client()
+    c.list_jobs.return_value = [{"job_id": "7", "status": "RUNNING", "created_at": created, "updated_at": created,
+                                 "sub_jobs": [{"sub_job_id": "7:training:0", "job_type": "training",
+                                               "status": "RUNNING"},
+                                              {"sub_job_id": "7:sampling:0", "job_type": "sampling",
+                                               "status": "PLACING"}]}]
+
+    async def run():
+        app = CortexTrainingLogTUI(c, poll_interval=0.01)
+        copied: list[str] = []
+        app.copy_to_clipboard = copied.append
+        async with app.run_test(size=(160, 40)) as pilot:
+            assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._job_by_item)
+            await pilot.pause(0.1)
+            table = app.screen.query_one("#jobs", DataTable)
+            mouse = _pointer(app, pilot)
+            lines = _screen_lines(app)
+            y = next(y for y, line in enumerate(lines) if "3h ago" in line)  # the job's row, drawn relative
+            assert "●" in lines[y]
+            # One whole row: the times as YYYY-MM-DD HH:MM, the status as its word, no glyph, no age.
+            await _drag(mouse, (0, y), (table.region.right - 1, y), via=[(40, y)])
+            row = await _copied(app, pilot, copied)
+            assert "RUNNING" in row and re.search(r"\d{4}-\d\d-\d\d \d\d:\d\d", row)
+            assert "ago" not in row and not set("●◔◐○✕⊘✓") & set(row)
+            # From the LIVE heading through the sub-jobs: the heading's rule isn't copied, a
+            # sub-job drawn as the glyph alone copies its word, and the columns stay in line.
+            await _drag(mouse, (0, y - 1), (table.region.right - 1, y + 2), via=[(40, y)])
+            heading, job, training, sampling = (await _copied(app, pilot, copied)).split("\n")
+            assert heading.strip() == "LIVE  1" and "─" not in heading
+            assert job == row and "RUNNING" in training and "PLACING" in sampling
+            assert training.index("RUNNING") == sampling.index("PLACING") == job.index("RUNNING")
             await _settle(app, pilot)
 
     asyncio.run(run())

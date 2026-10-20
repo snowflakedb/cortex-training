@@ -837,8 +837,7 @@ uses the configured schema and suggests location flags after a 404.
 
 `LIVE` groups active states and `unknown` (unless its reason says not found);
 `HISTORY` groups the rest. Each group starts with a heading row that gives its
-count, with a rule across the other columns (drawn only: a copy of the list
-leaves it out).
+count, with a rule across the other columns (drawn only: no copy has it).
 
 The line above the list counts the live jobs by status, then the rest, for
 example `● 4 running   ◔ 1 placing   ○ 1 pending   ? 1 unknown  │  21 in
@@ -852,17 +851,17 @@ first`). The Status column draws each status as a glyph and the word:
 Rows show the job id, status, type, created time, duration and owner, then
 model, requested GPUs, optional location, and updated time. Created and Updated
 say how long ago (`just now`, `12m ago`, `3h ago`, `45d ago`); the job preview
-has both times in full, and so does a copy of the list (`ctrl+c`), as
-`YYYY-MM-DD HH:MM` in local time. A time up to five minutes ahead of this
+has both times in full, and a copy has them as `YYYY-MM-DD HH:MM` in local
+time (see below). A time up to five minutes ahead of this
 computer's clock reads `just now`; one further ahead reads how far ahead it is
 (`in 2h`), which means this computer's clock and the service's disagree.
 Duration is how long a live job has run so far (since it was created, so it
 counts time spent waiting to be placed; in its status's color), or how long a
 finished one ran until its last state change (`40s`, `12m`, `3h 05m`,
 `2d 4h`). The times are as of the last refresh, which redraws them. On a narrow
-screen the Job ID column narrows (its id ends in `…`; a copy has it whole) and
-stays in view while the other columns scroll. `shared` marks multiplexed GPU
-use and `log_prob` requests zero GPUs.
+screen the Job ID column narrows (its id ends in `…`) and stays in view while
+the other columns scroll. `shared` marks multiplexed GPU use and `log_prob`
+requests zero GPUs.
 
 A sub-job row is fainter than its job's and shows what it doesn't share with
 it: its label (`training #0`), its status as the glyph alone while it is its
@@ -871,6 +870,18 @@ than one, and its GPUs. `▸`/`▾`, arrows, clicks, and `e` control sub-job row
 A live job starts unfolded where its sub-job rows tell more than its own row:
 it has more than one sub-job, or its status is `unknown`; a live job of one
 sub-job starts folded.
+
+`ctrl+c` copies text that holds up once pasted. With nothing highlighted, it
+copies every row of the list (scrolled out of view too) in aligned columns,
+each cell as its copy text, with a `Whole ID` column at the end holding each
+row's whole job or sub-job id. A drag highlights characters on screen; `ctrl+c`
+then copies those rows, where each cell the highlight covers whole is its copy
+text, a cell it covers only in part is the characters it draws there, and the
+columns stay in line. A cell's copy text is what it draws, but: Created and
+Updated are the time itself, `YYYY-MM-DD HH:MM` in local time, rather than
+`3h ago`; Status is the word alone (`RUNNING`, also on a sub-job row that draws
+only the glyph), without the glyph; and an id cut with `…` is the whole id. The
+rule of a `LIVE` or `HISTORY` row is never copied.
 
 An `unknown` row retains known creation time and derives missing sub-job ids as
 `JOB_ID:TYPE:INDEX`; incomplete configs read `config #N`. A supplied
@@ -919,7 +930,7 @@ operators shows under it only while it has focus.
 | click `▸` / `▾` | Unfold or fold that job, as `→` / `←` do |
 | `e` | Expand or collapse every job's sub-jobs |
 | `a` | All schemas / current schema: switch to the account-level list of every database and schema the role can see (the footer's `a All schemas`), or back to the configured one (`a Current schema`) |
-| `ctrl+c` | Copy what is highlighted, else every job in the list, each with its whole job id, its full Created and Updated times and its status as a word (`RUNNING`), without the glyph; in the preview, the highlight, else the whole preview |
+| `ctrl+c` | Copy what is highlighted, else every row in the list with a `Whole ID` column (see above for what each cell copies as); in the preview, the highlight, else the whole preview |
 | `r` | Refresh (the list also refreshes every 60 seconds while it is showing); while it shows the configured schema in place of the account-level list (`Current schema only: DB.SCHEMA (reason)`), `r` asks that list again once a minute has passed since the last ask |
 | `?` | Show or close the keys panel |
 | `q` | Quit |
