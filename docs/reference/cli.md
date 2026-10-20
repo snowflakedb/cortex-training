@@ -793,18 +793,23 @@ each later page as it comes: the highlighted row stays where it is on screen,
 and folds and a search stay as they are. From its second page on, it also reads
 the active jobs (see below) beside the newest ones, at most two requests at a
 time. Until the last page, the header reads `all schemas · loading older jobs…
-N so far` (`+ every active job` once the active jobs are listed; then `newest
-2,000; loading older active jobs…` if they are still being read), the counts
-above the list and a search's matches end in `so far`, and the LIVE and HISTORY
-rows' counts in `…`; the live counts and the LIVE row drop theirs once the
-active jobs are listed.
+N so far` (`+ every active job` once the active jobs are listed, `(older active
+jobs may be missing)` if reading them failed or stopped short), the counts above
+the list and a search's matches end in `so far`, and the LIVE and HISTORY rows'
+counts in `…`. Once the active jobs are listed, the active statuses' counts drop
+their `so far`; the `unknown` count and the LIVE row keep theirs until the last
+page, as no status filter lists an `unknown` job. If the newest jobs are all in
+while the active jobs are still being read, the header reads `newest 2,000;
+loading older active jobs…`: the history count and the HISTORY row drop their
+marks, and the live counts and the LIVE row keep theirs.
 The list also shows its pages as they come when it first opens on all schemas;
 a refresh of a whole list keeps showing it until the next one is whole.
 `a` while the pages are read stops reading them: the pages read stay, no longer
 marked, under `loading the current schema, DB.SCHEMA… · showing the partial
 all-schemas list` until that list answers. `r` meanwhile does nothing (and
 nothing is read again after): it says so, `Still loading older jobs (Ns); r
-works once it's done.` Once the list is whole, the header names it:
+works once it's done.` (`older active jobs` while the header says so). Once the
+list is whole, the header names it:
 
 | Header | The list holds |
 |---|---|

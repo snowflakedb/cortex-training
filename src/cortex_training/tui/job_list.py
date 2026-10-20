@@ -46,6 +46,8 @@ from textual.worker import get_current_worker
 from cortex_training.tui import theme
 from cortex_training.tui import views
 from cortex_training.tui.account import ACCOUNT
+from cortex_training.tui.account import ACTIVE_NEXT
+from cortex_training.tui.account import OLDER
 from cortex_training.tui.logs import LogScreen
 from cortex_training.tui.account import SCHEMA
 from cortex_training.tui.account import JobClients
@@ -134,11 +136,14 @@ _CHIP_ORDER = ("running", "initializing", "placing", "pending", "unknown")
 _CHIP_OF = {"creating": "placing", "queued": "pending"}
 
 
-def _status_chips(live: list, history: int, *, live_so_far: bool = False, history_so_far: bool = False) -> Content:
+def _status_chips(live: list, history: int, *, live_so_far: bool = False, unknown_so_far: bool = False,
+                  history_so_far: bool = False) -> Content:
     """The counts on the line above the list, each live status as its glyph, count and
     word, then the history: ``● 4 running   ◔ 1 placing   ? 1 unknown  │  21 in history``.
-    The live counts (``live_so_far``) and the history (``history_so_far``) end in "so far"
-    while the list is still loading jobs they would count."""
+    A count the list is still loading jobs for ends in "so far": every live one
+    (``live_so_far``, after the last), the unknown one alone (``unknown_so_far``: the
+    active jobs are all listed, but no status filter lists an unknown job), the history
+    (``history_so_far``)."""
     so_far = Content.styled(" so far", theme.FAINT)
     counts = Counter(_CHIP_OF.get(key, key) for key in (theme.status_key(job.get("status")) for job in live))
     chips = []
@@ -146,7 +151,8 @@ def _status_chips(live: list, history: int, *, live_so_far: bool = False, histor
         if counts.get(key):
             look = theme.status_look(key)
             chips.append(Content.assemble((f"{look.glyph} ", look.color), (f"{counts[key]:,} ", f"bold {theme.TEXT}"),
-                                          (key, theme.MUTED)))
+                                          (key, theme.MUTED),
+                                          so_far if key == "unknown" and unknown_so_far and not live_so_far else ""))
     chips = chips or [Content.styled("no live jobs", theme.MUTED)]
     ended = Content.assemble("  ", ("│", theme.FAINT), "  ", (f"{history:,} ", f"bold {theme.TEXT}"),
                              ("in history", theme.MUTED))
@@ -553,7 +559,9 @@ class JobListScreen(FollowsPointer, Screen):
             if manual and not quiet:
                 waited = int(time.monotonic() - (self._refresh_started or time.monotonic()))
                 if self._partial_gen == self._load_gen:  # nothing is read again after: r is for then
-                    self.notify(f"Still loading older jobs ({waited}s); r works once it's done.", markup=False)
+                    # The header's words: the older jobs, or the older active jobs once the newest are in.
+                    which = "older active jobs" if self._scope.loading == ACTIVE_NEXT else "older jobs"
+                    self.notify(f"Still loading {which} ({waited}s); r works once it's done.", markup=False)
                 else:
                     self.notify(f"Still waiting for the last refresh ({waited}s); r asks again once it answers.",
                                 markup=False)
@@ -1305,11 +1313,16 @@ class JobListScreen(FollowsPointer, Screen):
         live = [j for j in ordered if views.is_live(j)]
         history = [j for j in ordered if not views.is_live(j)]
 
-        # While the list loads, its counts are of the jobs read so far; the live ones are
-        # whole once the active jobs are read (beside the newest jobs).
+        # While the list loads, its counts are of the jobs read so far: the history until the
+        # newest jobs are read, the active statuses until the active jobs are (beside the
+        # newest), and the unknown one (and so the LIVE row) until the newest jobs are too, as
+        # no status filter lists an unknown job.
         loading = self._scope is not None and bool(self._scope.loading)
-        live_so_far = loading and not self._scope.live_whole
-        left = [_status_chips(live, len(history), live_so_far=live_so_far, history_so_far=loading)]
+        older = loading and self._scope.loading == OLDER
+        active_so_far = loading and not self._scope.active_whole
+        live_so_far = active_so_far or older
+        left = [_status_chips(live, len(history), live_so_far=active_so_far, unknown_so_far=older,
+                              history_so_far=older)]
         if self._filter:
             # The count before the query: a long query wraps, the count stays in view.
             # The search text is shown literally (assembled, never parsed as markup).
@@ -1350,7 +1363,7 @@ class JobListScreen(FollowsPointer, Screen):
         for group, jobs in groups:
             if not jobs:
                 continue
-            so_far = live_so_far if group == "LIVE" else loading
+            so_far = live_so_far if group == "LIVE" else older
             plan.append((f"hdr-{group.lower()}", self._header(group, len(jobs), layout, so_far)))
             if plan[-1][0] == keep_header:
                 target_row = len(plan) - 1

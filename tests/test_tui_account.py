@@ -400,7 +400,7 @@ def test_the_active_jobs_read_beside_the_newest_show_before_the_newest_are_read(
     assert _until(lambda: len(partials) == 3), [p.scope for p in partials]
     shown = partials[-1]
     assert shown.scope == ListScope(ACCOUNT, walked=1_000, loading=OLDER, active_read=True, active_missing=fails)
-    assert shown.scope.live_whole is not fails
+    assert shown.scope.active_whole is not fails
     if fails:
         assert len(shown.jobs) == 1_000
         assert scope_text(shown.scope, location="") == "loading older jobs… 1,000 so far (older active jobs may be missing)"

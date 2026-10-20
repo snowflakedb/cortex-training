@@ -4074,20 +4074,23 @@ def test_a_says_at_once_that_it_is_loading_all_schemas(in_flight):
 
 class _PagedDemo(DemoClient):
     """A demo whose account-wide pages of the newest jobs answer one per ``release()`` while
-    ``gated`` (the active jobs' walk answers at once, and ``pages`` doesn't count it). For the
-    newest jobs' walk: ``fail_at`` is the page (1 is the first) that fails, ``unavailable_at``
-    the one that answers the list is not deployed, ``bad_token_at`` the one whose token the
-    service can't open (once), ``running_at`` the one whose first job is running. ``schema_fails``:
-    the configured schema's list fails. ``pages`` counts the pages asked for."""
+    ``gated``, and whose active jobs' walk (read beside them) answers while ``active_gate`` is
+    set. For the newest jobs' walk: ``fail_at`` is the page (1 is the first) that fails,
+    ``unavailable_at`` the one that answers the list is not deployed, ``bad_token_at`` the one
+    whose token the service can't open (once), ``running_at`` / ``unknown_at`` the one whose first
+    job is running / of unknown status. ``schema_fails``: the configured schema's list fails.
+    ``pages`` / ``active_pages`` count the pages each walk asked for."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.gated = False
-        self.fail_at = self.unavailable_at = self.bad_token_at = self.running_at = None
+        self.fail_at = self.unavailable_at = self.bad_token_at = self.running_at = self.unknown_at = None
         self.schema_fails = False
         self.schema_gate = threading.Event()  # the configured schema's list answers while it is set
         self.schema_gate.set()
-        self.pages = 0
+        self.active_gate = threading.Event()
+        self.active_gate.set()
+        self.pages = self.active_pages = 0
         self._permits = threading.Semaphore(0)
 
     def release(self, pages: int = 1) -> None:
@@ -4101,7 +4104,9 @@ class _PagedDemo(DemoClient):
         return super().list_jobs(*args, **kwargs)
 
     def list_jobs_page(self, **kwargs):
-        if kwargs.get("status"):  # the active jobs' walk, read beside: ungated, uncounted
+        if kwargs.get("status"):  # the active jobs' walk, read beside the newest
+            self.active_pages += 1
+            self.active_gate.wait(10)
             return super().list_jobs_page(**kwargs)
         self.pages += 1
         if self.gated:
@@ -4119,6 +4124,8 @@ class _PagedDemo(DemoClient):
         answer = super().list_jobs_page(**kwargs)
         if page == self.running_at and not kwargs.get("status") and answer["jobs"]:
             answer["jobs"][0]["status"] = "RUNNING"  # an older job still running: it shows under LIVE
+        if page == self.unknown_at and not kwargs.get("status") and answer["jobs"]:
+            answer["jobs"][0]["status"] = "UNKNOWN"  # live, but no status filter lists it
         return answer
 
 
@@ -4149,15 +4156,14 @@ async def _run_all_schemas_shows_each_page_as_it_comes(refill):
         assert await _pause_until(pilot, lambda: len(screen._all_jobs) == rows, seconds=10.0), len(screen._all_jobs)
         await pilot.pause(0.2)
         assert screen._scope.kind == ACCOUNT and screen._scope.loading and screen._refreshing
-        # The active jobs, read beside the newest (at once, here): the live counts are whole, the history not.
+        # The active jobs, read beside the newest (at once, here): the active statuses' counts are whole;
+        # the history, the unknown count and the LIVE row (an unknown job may still come) are not.
         assert await _pause_until(pilot, lambda: screen._scope.active_read, seconds=10.0)
         assert app.sub_title == f"all schemas  ·  loading older jobs… {rows} so far + every active job", (
             app.sub_title)
         live_part, history_part = _info_text(screen).split("│")
-        assert "so far" not in live_part and "in history so far" in history_part, _info_text(screen)
-        group_rows = [str(table.get_row_at(i)[0]) for i in range(table.row_count)
-                      if str(table.get_row_at(i)[0]).startswith(("LIVE", "HISTORY"))]
-        assert [row.endswith("…") for row in group_rows] == [False, True], group_rows
+        assert "running so far" not in live_part and "in history so far" in history_part, _info_text(screen)
+        assert all(row.endswith("…") for row in _group_rows(table).values()), _group_rows(table)
 
         client.release()
         assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 2 * rows, seconds=10.0)
@@ -4364,6 +4370,94 @@ async def _run_a_that_stops_the_pages_says_at_once_what_the_list_on_screen_is():
 
 def test_a_that_stops_the_pages_says_at_once_what_the_list_on_screen_is():
     asyncio.run(_run_a_that_stops_the_pages_says_at_once_what_the_list_on_screen_is())
+
+
+def _group_rows(table) -> dict:
+    """The LIVE and HISTORY rows' text, by group."""
+    rows = [str(table.get_row_at(i)[0]) for i in range(table.row_count)]
+    return {row.split()[0]: row for row in rows if row.startswith(("LIVE", "HISTORY"))}
+
+
+async def _run_an_unknown_job_keeps_the_live_count_open_until_the_newest_jobs_are_in():
+    client = _PagedDemo()
+    client.unknown_at = 3  # an unknown job comes on page 3: live, but not among the active jobs
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        rows = client._ACCOUNT_PAGE_ROWS
+        client.gated = True
+        await pilot.press("a")
+        client.release()
+        assert await _pause_until(pilot, lambda: screen._scope.loading and screen._scope.active_read, seconds=10.0)
+        await pilot.pause(0.2)
+
+        def unknown() -> int:  # live ones (one the control plane has no record of has ended)
+            return sum(views.is_unknown(job) and views.is_live(job) for job in screen._all_jobs)
+
+        live_part, _history = _info_text(screen).split("│")
+        # The active statuses are whole; the unknown count (and so LIVE) may still grow.
+        assert "running so far" not in live_part and live_part.count("so far") == 1, live_part
+        assert f"{unknown()} unknown so far" in live_part, live_part
+        assert _group_rows(table)["LIVE"].endswith("…")
+        before = unknown()
+        client.release(2)
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 3 * rows, seconds=10.0)
+        await pilot.pause(0.2)
+        assert unknown() == before + 1  # page 3 brought one, after the active jobs were all listed
+        live_part, _history = _info_text(screen).split("│")
+        assert f"{unknown()} unknown so far" in live_part and live_part.count("so far") == 1
+        assert _group_rows(table)["LIVE"].endswith("…")
+        client.release(10)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        await pilot.pause(0.2)
+        assert "so far" not in _info_text(screen) and "unknown" in _info_text(screen)
+        assert not any(row.endswith("…") for row in _group_rows(table).values())
+        await _settle(app, pilot)
+
+
+def test_an_unknown_job_keeps_the_live_count_open_until_the_newest_jobs_are_in():
+    asyncio.run(_run_an_unknown_job_keeps_the_live_count_open_until_the_newest_jobs_are_in())
+
+
+async def _run_a_slow_active_jobs_walk_after_the_newest_are_in(monkeypatch, then):
+    from cortex_training.tui import account
+    monkeypatch.setattr(account, "ACCOUNT_LIST_MAX_PAGES", 2)  # the newest jobs' walk stops after 2 pages
+    client = _PagedDemo()
+    client.active_gate.clear()  # the active jobs' walk takes its time
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        newest = 2 * client._ACCOUNT_PAGE_ROWS
+        await pilot.press("a")
+        assert await _pause_until(pilot, lambda: screen._scope.loading == "active", seconds=10.0), app.sub_title
+        await pilot.pause(0.2)
+        # The history is whole; only the live jobs may grow, and the header says what is still read.
+        assert app.sub_title == f"all schemas  ·  newest {newest}; loading older active jobs…", app.sub_title
+        live_part, history_part = _info_text(screen).split("│")
+        assert "so far" in live_part and "so far" not in history_part, _info_text(screen)
+        groups = _group_rows(table)
+        assert groups["LIVE"].endswith("…") and not groups["HISTORY"].endswith("…"), groups
+        await pilot.press("r")
+        said = [str(note.message) for note in app._notifications]
+        assert any(m.startswith("Still loading older active jobs (") for m in said), said
+        if then == "wait":
+            client.active_gate.set()
+            assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+            assert app.sub_title.endswith(f"first 2 pages: {newest} jobs + every active job (more may exist)"), (
+                app.sub_title)
+        else:  # a, while the load waits for the active jobs: it stops, and nothing of it comes after
+            await pilot.press("a")
+            assert await _pause_until(pilot, lambda: screen._scope.kind == SCHEMA, seconds=10.0), app.sub_title
+            client.active_gate.set()
+            await pilot.pause(0.5)
+            assert screen._scope.kind == SCHEMA and app.sub_title.endswith("Current schema: " + screen._schema_label())
+            assert client.active_pages == 1  # the walk asked for no page after the one in flight
+        await _settle(app, pilot)
+
+
+@pytest.mark.parametrize("then", ["wait", "a"])
+def test_a_slow_active_jobs_walk_after_the_newest_are_in(monkeypatch, then):
+    asyncio.run(_run_a_slow_active_jobs_walk_after_the_newest_are_in(monkeypatch, then))
 
 
 def test_a_cursor_on_a_group_row_stays_on_it_as_pages_come():

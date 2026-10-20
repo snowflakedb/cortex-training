@@ -96,8 +96,10 @@ class ListScope:
         return self.stopped is not None or bool(self.loading)
 
     @property
-    def live_whole(self) -> bool:
-        """Every active job is listed: the list is whole, or its active jobs' walk is read in full."""
+    def active_whole(self) -> bool:
+        """Every active job is listed: the list is whole, or its active jobs' walk is read in full.
+        (Not every live one: an ``unknown`` job, which no status filter lists, may still come with
+        a later page of the newest jobs.)"""
         return not self.loading or (self.active_read and not self.active_missing)
 
 
@@ -106,7 +108,7 @@ def stopped_scope(scope: ListScope) -> ListScope:
     if not scope.loading:
         return scope
     return replace(scope, loading="", stopped=scope.stopped if scope.loading == ACTIVE_NEXT else FAILED,
-                   active_read=False, active_missing=not scope.live_whole)
+                   active_read=False, active_missing=not scope.active_whole)
 
 
 @dataclass
