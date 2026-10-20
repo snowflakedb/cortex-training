@@ -796,8 +796,9 @@ active jobs…` while it reads the active jobs), the counts above the list and a
 search's matches end in `so far`, and the LIVE and HISTORY rows' counts in `…`.
 The list also shows its pages as they come when it first opens on all schemas;
 a refresh of a whole list keeps showing it until the next one is whole.
-`a` while the pages are read stops reading them; `r` waits for the last page.
-Once the list is whole, the header names it:
+`a` while the pages are read stops reading them. `r` meanwhile starts no second
+read: it says the list is still loading (`Still loading older jobs (Ns); r asks
+again once it answers.`). Once the list is whole, the header names it:
 
 | Header | The list holds |
 |---|---|
@@ -842,8 +843,10 @@ On refresh failure, the previous list stays under a red error and a
 `refresh failed TIME (list from TIME)` header. A first-load error replaces the
 list; `r` retries. When a later page of the account-level list fails after the
 first pages showed, those stay, under a red error, with a `load failed TIME ·
-newest N (the rest didn't load; r retries; …)` header. The list pauses under details and refreshes on return when
-its last read is over 60 seconds old.
+newest N (the rest didn't load; r retries; …)` header; if the list turns
+unavailable there (404), the configured schema's list takes their place, as
+when `a` finds it unavailable. The list pauses under details and refreshes on
+return when its last read is over 60 seconds old.
 
 When the list holds jobs from more than one database and schema, a
 **Location** column after GPUs shows `DB.SCHEMA` (SQL-quoted when needed) and

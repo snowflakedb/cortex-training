@@ -224,8 +224,12 @@ class JobLister:
         try:
             listing = self._walk(now, is_cancelled, None if probing else on_partial)
         except AccountJobListUnavailable as exc:
+            if is_cancelled():
+                return None  # superseded while its page was read: the load in its place decides
             return self._unavailable(exc, probing)
         except Exception as exc:
+            if is_cancelled():
+                return None
             if not probing:
                 raise JobListError(_failure_text(_ACCOUNT_ROUTE, exc)) from exc
             # Asking again failed some other way (a timeout, a 503): keep listing
@@ -233,7 +237,7 @@ class JobLister:
             self._asked_at = self._clock()
             logger.info("job list: the account-level list failed again; listing the configured schema", exc_info=True)
             return self._schema(ListScope(FALLBACK, reason=self._fallback))
-        if listing is not None:
+        if listing is not None and not is_cancelled():
             self._fallback = None
         return listing
 

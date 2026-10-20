@@ -42,6 +42,7 @@ from textual.widgets import TabbedContent  # noqa: E402
 
 from cortex_training import AccountJobListUnavailable  # noqa: E402
 from cortex_training import CortexTrainingClient  # noqa: E402
+from cortex_training import InvalidPageToken  # noqa: E402
 from cortex_training.client import DownloadCancelled  # noqa: E402
 from cortex_training.tui import __main__ as tui_main  # noqa: E402
 from cortex_training.tui.account import ACCOUNT  # noqa: E402
@@ -4072,13 +4073,17 @@ def test_a_says_at_once_that_it_is_loading_all_schemas(in_flight):
 
 
 class _PagedDemo(DemoClient):
-    """A demo whose account-wide pages answer one per ``release()`` while ``gated``; ``fail_at``:
-    the page (1 is the first) of the newest jobs that fails. ``pages`` counts the pages asked for."""
+    """A demo whose account-wide pages answer one per ``release()`` while ``gated``. For the
+    newest jobs' walk: ``fail_at`` is the page (1 is the first) that fails, ``unavailable_at``
+    the one that answers the list is not deployed, ``bad_token_at`` the one whose token the
+    service can't open (once). ``schema_fails``: the configured schema's list fails. ``pages``
+    counts the pages asked for."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.gated = False
-        self.fail_at = None
+        self.fail_at = self.unavailable_at = self.bad_token_at = None
+        self.schema_fails = False
         self.pages = 0
         self._permits = threading.Semaphore(0)
 
@@ -4086,13 +4091,25 @@ class _PagedDemo(DemoClient):
         for _ in range(pages):
             self._permits.release()
 
+    def list_jobs(self, *args, **kwargs):
+        if self.schema_fails:
+            raise ConnectionError("schema down")
+        return super().list_jobs(*args, **kwargs)
+
     def list_jobs_page(self, **kwargs):
         self.pages += 1
         if self.gated:
             self._permits.acquire(timeout=10)
         page = int(kwargs.get("page_token") or 0) // self._ACCOUNT_PAGE_ROWS + 1
-        if page == self.fail_at and not kwargs.get("status"):
-            raise ConnectionError("connection reset")
+        if not kwargs.get("status"):
+            if page == self.fail_at:
+                raise ConnectionError("connection reset")
+            if page == self.unavailable_at:
+                raise AccountJobListUnavailable("the account-level list is not deployed",
+                                                reason=AccountJobListUnavailable.NOT_DEPLOYED)
+            if page == self.bad_token_at:
+                self.bad_token_at = None
+                raise InvalidPageToken("400 Invalid page_token")
         return super().list_jobs_page(**kwargs)
 
 
@@ -4108,11 +4125,13 @@ def _all_at_once(client) -> tuple:
     return {views.job_key(job) for job in listing.jobs}, listing.scope
 
 
-async def _run_all_schemas_shows_each_page_as_it_comes():
+async def _run_all_schemas_shows_each_page_as_it_comes(refill):
     client = _PagedDemo()
     app = CortexTrainingLogTUI(client, poll_interval=0.01)
     async with app.run_test(size=(140, 30)) as pilot:
         screen, table = await _demo_list(app, pilot)
+        if refill:
+            screen._PATCH_REMOVALS = -1  # each page fills the table again (as when many rows go)
         rows = client._ACCOUNT_PAGE_ROWS
         client.gated = True
         await pilot.press("a")
@@ -4169,8 +4188,157 @@ async def _run_all_schemas_shows_each_page_as_it_comes():
         await _settle(app, pilot)
 
 
-def test_all_schemas_shows_each_page_as_it_comes():
-    asyncio.run(_run_all_schemas_shows_each_page_as_it_comes())
+@pytest.mark.parametrize("refill", [False, True], ids=["in-place", "refilled"])
+def test_all_schemas_shows_each_page_as_it_comes(refill):
+    asyncio.run(_run_all_schemas_shows_each_page_as_it_comes(refill))
+
+
+async def _run_a_cursor_on_a_group_row_stays_on_it_as_pages_come():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 30)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        client.gated = True
+        await pilot.press("a")
+        client.release()
+        assert await _pause_until(pilot, lambda: screen._scope.loading, seconds=10.0)
+        await pilot.pause(0.2)
+        table.focus()
+        table.move_cursor(row=table.get_row_index("hdr-history"), animate=False)
+        await pilot.pause(0.2)
+        line = table.cursor_row - round(table.scroll_y)
+        for pages in (2, 3):
+            client.release()
+            assert await _pause_until(pilot, lambda: len(screen._all_jobs) == pages * client._ACCOUNT_PAGE_ROWS,
+                                      seconds=10.0)
+            await pilot.pause(0.3)
+            assert screen._highlighted()[0] == "hdr-history", screen._highlighted()
+            assert table.cursor_row - round(table.scroll_y) == line
+        client.release(10)
+        await _settle(app, pilot)
+
+
+def test_a_cursor_on_a_group_row_stays_on_it_as_pages_come():
+    asyncio.run(_run_a_cursor_on_a_group_row_stays_on_it_as_pages_come())
+
+
+async def _run_a_fresh_list_of_pages_shows_no_earlier_failure(how):
+    client = _PagedDemo()
+    client.schema_fails = how == "r"
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        if how == "a":  # a refresh of the configured schema's list fails, then a
+            screen, _table = await _demo_list(app, pilot)
+            notice = screen.query_one("#listnotice", Static)
+            client.schema_fails = True
+            screen._refresh_jobs(manual=True)
+            assert await _pause_until(pilot, lambda: notice.display, seconds=10.0)
+            client.gated = True
+            await pilot.press("a")
+        else:  # the first load fails, and r reads all schemas (the list's own, shared lister's)
+            assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen)
+                               and app.screen._list_error, tries=400)
+            screen = app.screen
+            notice = screen.query_one("#listnotice", Static)
+            assert "list_jobs failed" in app.screen.query_one("#listinfo", Static).render().plain
+            screen._lister.account_wide = True
+            client.gated = True
+            await pilot.press("r")
+        client.release()
+        assert await _pause_until(pilot, lambda: screen._scope is not None and screen._scope.loading,
+                                  seconds=10.0), app.sub_title
+        await pilot.pause(0.2)
+        assert not notice.display and screen._list_error is None
+        assert not screen.query_one("#listinfo", Static).has_class("error")
+        assert app.sub_title.startswith("all schemas  ·  loading older jobs…"), app.sub_title
+        client.release(10)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        assert not notice.display and "failed" not in app.sub_title
+        await _settle(app, pilot)
+
+
+@pytest.mark.parametrize("how", ["a", "r"])
+def test_a_fresh_list_of_pages_shows_no_earlier_failure(how):
+    asyncio.run(_run_a_fresh_list_of_pages_shows_no_earlier_failure(how))
+
+
+async def _run_a_failure_of_the_schema_list_after_a_stopped_the_pages_is_the_schema_lists():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, _table = await _demo_list(app, pilot)
+        client.gated = True
+        await pilot.press("a")
+        client.release()
+        assert await _pause_until(pilot, lambda: screen._scope.loading, seconds=10.0)
+        client.schema_fails = True
+        await pilot.press("a")  # back to the configured schema, whose list fails
+        assert await _pause_until(pilot, lambda: not screen._refreshing and screen._list_error, seconds=10.0)
+        await pilot.pause(0.2)
+        assert app.sub_title.startswith("refresh failed "), app.sub_title
+        assert "schema down" in screen._notice.plain and "read before it" not in screen._notice.plain
+        assert screen.check_action("show_list", ("account",)) is True  # the footer offers all schemas
+        client.release(10)
+        await _settle(app, pilot)
+
+
+def test_a_failure_of_the_schema_list_after_a_stopped_the_pages_is_the_schema_lists():
+    asyncio.run(_run_a_failure_of_the_schema_list_after_a_stopped_the_pages_is_the_schema_lists())
+
+
+async def _run_an_account_list_unavailable_after_its_first_pages_says_so():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, _table = await _demo_list(app, pilot)
+        schema_jobs = len(screen._all_jobs)
+        client.unavailable_at = 3
+        await pilot.press("a")
+        assert await _pause_until(pilot, lambda: "Current schema only: " in app.sub_title, seconds=10.0), (
+            app.sub_title)
+        assert "no account-wide list yet" in app.sub_title
+        assert screen._scope.kind == SCHEMA and len(screen._all_jobs) == schema_jobs
+        assert screen.check_action("show_list", ("account",)) is True
+        assert any("Can't show all schemas" in str(n.message) for n in app._notifications)
+        await _settle(app, pilot)
+
+
+def test_an_account_list_unavailable_after_its_first_pages_says_so():
+    asyncio.run(_run_an_account_list_unavailable_after_its_first_pages_says_so())
+
+
+async def _run_pages_read_again_from_the_start_keep_the_list_and_the_cursor():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 30)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        rows = client._ACCOUNT_PAGE_ROWS
+        client.gated, client.bad_token_at = True, 3
+        await pilot.press("a")
+        client.release(2)
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 2 * rows, seconds=10.0)
+        await pilot.pause(0.2)
+        shown = []
+        apply = screen._on_partial
+        screen._on_partial = lambda gen, listing: (shown.append(len(listing.jobs)), apply(gen, listing))
+        table.focus()
+        table.move_cursor(row=table.row_count - 2, animate=False)
+        await pilot.pause(0.2)
+        key, line = screen._highlighted()[0], table.cursor_row - round(table.scroll_y)
+        client.release(4)  # page 3's token fails: pages 1 and 2 again, then page 3
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 3 * rows, seconds=10.0)
+        await pilot.pause(0.3)
+        assert min(shown) == 2 * rows  # the list never went back to its first page
+        assert screen._highlighted()[0] == key and table.cursor_row - round(table.scroll_y) == line
+        client.release(10)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        keys, scope = _all_at_once(DemoClient())
+        assert {screen._job_key(job) for job in screen._all_jobs} == keys and screen._scope == scope
+        await _settle(app, pilot)
+
+
+def test_pages_read_again_from_the_start_keep_the_list_and_the_cursor():
+    asyncio.run(_run_pages_read_again_from_the_start_keep_the_list_and_the_cursor())
 
 
 async def _run_a_or_r_while_all_schemas_loads_supersedes_it_cleanly():
