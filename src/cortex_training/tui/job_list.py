@@ -328,6 +328,7 @@ class JobListScreen(FollowsPointer, Screen):
         self._descending = True
         self._expanded: set = set()
         self._collapsed: set = set()  # live jobs the user folded
+        self._all_folded: bool | None = None  # e: every job folded (True) or unfolded (False); None before
         self._last_refreshed = None
         self._loaded_at: float | None = None  # monotonic time of the last good load
         self._failed_at: str | None = None  # HH:MM:SS of the last failed load, while it stands
@@ -696,7 +697,10 @@ class JobListScreen(FollowsPointer, Screen):
         job_key = self._job_key(job)
         if job_key in self._collapsed:
             return False
-        return job_key in self._expanded or self._starts_unfolded(job)
+        if job_key in self._expanded:
+            return True
+        # e's choice holds for the jobs listed after it, too (a later page's).
+        return self._starts_unfolded(job) if self._all_folded is None else not self._all_folded
 
     @staticmethod
     def _starts_unfolded(job: dict) -> bool:
@@ -775,12 +779,11 @@ class JobListScreen(FollowsPointer, Screen):
 
     def action_expand_all(self) -> None:
         with_subs = [j for j in self._all_jobs if self._expandable(j)]
-        if with_subs and all(self._is_expanded(j) for j in with_subs):
-            self._expanded.clear()
-            self._collapsed = {self._job_key(j) for j in self._all_jobs if self._starts_unfolded(j)}
-        else:
-            self._collapsed.clear()
-            self._expanded = {self._job_key(j) for j in self._all_jobs}
+        # Every job folded, or every one unfolded: those listed since too; a fold or unfold
+        # after it is the job's own.
+        self._all_folded = bool(with_subs) and all(self._is_expanded(j) for j in with_subs)
+        self._expanded.clear()
+        self._collapsed.clear()
         self._render_jobs()
 
     def on_input_changed(self, event: Input.Changed) -> None:

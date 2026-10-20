@@ -4257,6 +4257,40 @@ def test_a_list_the_reader_has_not_moved_stays_at_its_top_as_live_jobs_come():
     asyncio.run(_run_a_list_the_reader_has_not_moved_stays_at_its_top_as_live_jobs_come())
 
 
+async def _run_e_unfolds_the_jobs_of_later_pages_too_and_then_folds_them_all():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        client.gated = True
+        await pilot.press("a")
+        client.release()
+        assert await _pause_until(pilot, lambda: screen._scope.loading, seconds=10.0)
+        table.focus()
+        await pilot.press("e")
+
+        def expandable():
+            return [job for job in screen._all_jobs if screen._expandable(job)]
+
+        assert all(screen._is_expanded(job) for job in expandable())
+        client.release()
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 2 * client._ACCOUNT_PAGE_ROWS,
+                                  seconds=10.0)
+        await pilot.pause(0.2)
+        assert any(not views.is_live(job) for job in expandable())  # history jobs that unfold came
+        assert all(screen._is_expanded(job) for job in expandable())  # unfolded, as e asked
+        await pilot.press("e")
+        assert not any(screen._is_expanded(job) for job in expandable())  # every one folds
+        client.release(10)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        assert not any(screen._is_expanded(job) for job in expandable())
+        await _settle(app, pilot)
+
+
+def test_e_unfolds_the_jobs_of_later_pages_too_and_then_folds_them_all():
+    asyncio.run(_run_e_unfolds_the_jobs_of_later_pages_too_and_then_folds_them_all())
+
+
 def test_a_cursor_on_a_group_row_stays_on_it_as_pages_come():
     asyncio.run(_run_a_cursor_on_a_group_row_stays_on_it_as_pages_come())
 
