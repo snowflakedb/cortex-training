@@ -29,8 +29,8 @@ cortex-training download-metrics JOB_ID --output-dir /path/to/metrics --resume
 GPU and host metrics are written to `<output_dir>/<sub_job_id>/gpu.jsonl`. A
 training sub-job's **training metrics** — the loss, gradient norm, learning
 rate and whatever else its loss function returns — go to
-`<output_dir>/<sub_job_id>/training.jsonl`, one row per step for its
-`/fwd-bwd` calls and one for the `/step`. See
+`<output_dir>/<sub_job_id>/training.jsonl`, one row per `/fwd-bwd` call and
+one per `/step`, each with the numbers that call returned. See
 [GPU metrics download](../../reference/rest-api.md#124-gpu-metrics-download)
 and
 [Training metrics download](../../reference/rest-api.md#125-training-metrics-download)

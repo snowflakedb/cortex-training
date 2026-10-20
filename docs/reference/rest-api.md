@@ -2916,49 +2916,55 @@ them; a job opts out by setting `training_config.save_training_metrics` to
 `false`. So, unlike the GPU stream, a sub-job with saved stdout and no training
 chunks is not warned about.
 
-At each successful `/step` the zone appends one row combining every `/fwd-bwd`
-call of that step and one row for the step itself, with `"kind": "training"`
-and `record_version` `1`:
+The zone appends one row per successful `/fwd-bwd` call and one per successful
+`/step`, with `"kind": "training"` and `record_version` `2`. Each row holds the
+numbers its call's result carries, as the client receives them; nothing is
+combined or computed:
 
 ```json
-{"kind": "training", "record_version": 1, "sub_job_id": "JOB_ID:training:0",
+{"kind": "training", "record_version": 2, "sub_job_id": "JOB_ID:training:0",
  "sample_ts": "2026-10-16T18:02:14Z", "seq": 84, "seq_epoch": "...",
- "op": "fwd_bwd", "step": 7, "request_id": null,
- "metrics": {"avg_loss": 0.0137, "approx_kl": 0.0021, "entropy": 0.8636, "num_calls": 2.0}}
-{"kind": "training", "record_version": 1, "sub_job_id": "JOB_ID:training:0",
- "sample_ts": "2026-10-16T18:02:14Z", "seq": 85, "seq_epoch": "...",
- "op": "step", "step": 7, "request_id": "REQUEST_ID",
- "metrics": {"grad_norm": 0.873, "last_lr": 1e-05}}
+ "op": "fwd_bwd", "step": 3, "call": 1, "request_id": "REQUEST_ID",
+ "metrics": {"avg_loss": 2.0419, "rank": 0, "sft_model_calls": 1, "sft_packed_rows": 1}}
+{"kind": "training", "record_version": 2, "sub_job_id": "JOB_ID:training:0",
+ "sample_ts": "2026-10-16T18:02:15Z", "seq": 86, "seq_epoch": "...",
+ "op": "step", "step": 3, "call": null, "request_id": "REQUEST_ID",
+ "metrics": {"global_steps": 3.0, "grad_norm": 84.37, "last_lr": 0.0001,
+             "update_successful": 1.0, "weight_delta_norm_rank0_sample": 0.1447}}
 ```
 
 | Field | Meaning |
 |---|---|
 | `kind` | `"training"` |
-| `record_version` | `1` |
-| `sub_job_id`, `sample_ts`, `seq`, `seq_epoch` | As for GPU rows; `sample_ts` is when the step completed |
-| `op` | `"fwd_bwd"` (every `/fwd-bwd` call since the previous step, combined) or `"step"` |
-| `step` | The training step the row belongs to |
-| `request_id` | The `/step` request's id on a `step` row; `null` on a `fwd_bwd` row |
-| `metrics` | Numeric metrics, by name |
+| `record_version` | `2` |
+| `sub_job_id`, `seq`, `seq_epoch` | As for GPU rows; a gap in `seq` means rows were lost |
+| `sample_ts` | When the call completed |
+| `op` | `"fwd_bwd"` (one `/fwd-bwd` call) or `"step"` (one `/step`) |
+| `step` | On a `step` row, the step's `global_steps`. On a `fwd_bwd` row, the step the call counts toward: the previous `/step`'s `global_steps` + 1, or `null` when the zone doesn't know it yet: before it has seen a `/step` (a job's first calls, or the first after the zone restarted), and after a `load-checkpoint` moves the job to another step. Such a call belongs to the `step` row that follows it. A `/fwd-bwd` retried and answered from the first run's cached result is saved once |
+| `call` | On a `fwd_bwd` row, the call's place among its step's calls, from 1; `null` on a `step` row |
+| `request_id` | The call's request id |
+| `metrics` | Every finite number in the result, by its own name |
 
-A `fwd_bwd` row's `metrics` hold `sum_loss`, the sum of the calls' losses, and
-`num_calls`, the number of calls combined, plus every other numeric metric the
-`/fwd-bwd` responses returned (their totals and counts summed, rates
-recomputed by the loss function) except `rank`. There is deliberately no
-mean: whether a step's loss is the sum or the mean of its calls' losses depends
-on how the loss was scaled, so the row carries both numbers and leaves the
-choice to the reader. A `step` row holds `grad_norm` (omitted when the
-optimizer reported none) and `last_lr`.
+A `fwd_bwd` row's `metrics` are the result's top-level numbers (`avg_loss`,
+that call's own loss) and every number in its `metrics` (`rank`,
+`sft_model_calls`, `sft_packed_rows`, or whatever the loss function reports);
+a top-level field wins over a nested metric of the same name. A `step` row's
+`metrics` are every number in the `/step` result (`global_steps`, `grad_norm`,
+`last_lr`, `update_successful`, `weight_delta_*`, ...). Text (such as
+`job_id`), lists, booleans, `null`, NaN and infinities are left out, and a row
+keeps at most 256 metrics with names of at most 200 bytes.
 
-A failed step saves no rows, and its `/fwd-bwd` calls count toward no step. The
-metrics a loss function returns vary, so consumers should read whatever names a
-row has.
+A step's loss is not saved as such: whether it is the sum or the mean of its
+calls' `avg_loss` depends on how the loss was scaled, so each call's own
+`avg_loss` is saved and the choice is left to the reader. A `/step` that fails
+saves no row, and calls made before it count toward the same step as the retry's
+calls. The metrics a loss function returns vary, so consumers should read
+whatever names a row has.
 
 In the GPU file, a row without `kind` is a GPU row; a later GPU row may carry
 `kind: "gpu"`. Consumers should select rows by `kind` and ignore kinds they do
 not support. The TUI's Resources tab uses GPU and system rows; its Training
-metrics tab reads `training.jsonl` and charts `sum_loss / num_calls` beside
-`sum_loss`.
+metrics tab reads `training.jsonl` and shows it per step and per call.
 
 ### 12.6 Zone scheduling events
 
