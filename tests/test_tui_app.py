@@ -1496,11 +1496,167 @@ def test_a_log_line_that_reads_like_a_note_is_still_a_log_line():
             logs = s._shown_logs
             _live_page(s, ["— live —"])  # a log line with the text of the TUI's own note
             assert s._shown_logs == logs + 1
-            assert s._logview.lines[-1].startswith("training:0 │ ")  # tagged as the sub-job's
-            assert s._logview.row_kinds[-1] != NOTE_KIND
+            assert s._logview.lines[-1] == "— live —"  # (no sub-job tag: the pane shows one sub-job)
+            assert s._logview.row_kinds[-1] != NOTE_KIND and s._shown_kinds[-1] != NOTE_KIND
             s._write_line("— live —")  # the TUI's own note
             assert s._shown_logs == logs + 1
             assert s._logview.lines[-1] == "— live —" and s._logview.row_kinds[-1] == NOTE_KIND
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def test_the_pane_shows_the_time_with_each_day_on_a_rule_and_save_keeps_the_lines():
+    from cortex_training.tui.format import day_rule
+    from cortex_training.tui.format import display_line
+    from cortex_training.tui.log_style import DAY_KIND
+
+    lines = ["2026-10-17T12:00:00Z INFO step 1", "2026-10-17T12:00:05Z INFO step 2", "2026-10-19T12:00:00Z INFO step 3"]
+
+    async def run():
+        app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
+        async with app.run_test() as pilot:
+            s = await _open_live_tail(app, pilot)
+            _live_page(s, lines)
+            shown = [display_line(line) for line in lines]
+            rows = list(s._logview.lines[-5:])
+            width = s._content_width()
+            assert rows == [day_rule(shown[0][:10], width), shown[0][11:], shown[1][11:],
+                            day_rule(shown[2][:10], width), shown[2][11:]]
+            assert s._logview.row_kinds[-5] == DAY_KIND and s._logview.row_kinds[-2] == DAY_KIND
+            assert s._shown_lines[-3:] == lines  # the buffer (and save, and copy) keep the lines as they came
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def test_a_highlight_across_a_day_rule_and_a_wrapped_line_copies_the_lines_as_logged(monkeypatch):
+    from textual import events
+    from textual.geometry import Offset
+    from textual.selection import Selection
+
+    from cortex_training.tui.clipboard import screen_dump
+    from cortex_training.tui.format import is_day_rule
+
+    lines = ["2026-10-17T05:00:00Z INFO step 1", "2026-10-17T05:00:01Z INFO step 2 " + "loss=0.5 " * 12]
+    copied: list = []
+
+    async def run():
+        app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
+        monkeypatch.setattr(app, "copy_out", lambda text, what: copied.append(text))
+        async with app.run_test(size=(100, 30)) as pilot:
+            s = await _open_live_tail(app, pilot)
+            _live_page(s, lines)
+            await pilot.pause()
+            lv = s._logview
+            rows = list(lv.lines)
+            top = len(rows) - sum(s._shown_rows[-2:])  # the first of the two lines' rows: its day's rule
+            assert is_day_rule(rows[top]) and s._shown_rows[-1] > 1  # (the second line wraps)
+            # A drag with the mouse from inside the rule to past the end of the wrapped line, then
+            # ctrl+c: both lines whole, as logged (whole stamps, no rule, no indent).
+            region = lv.content_region
+            assert lv.scroll_offset.y == 0 and len(rows) <= region.height  # (every row in view)
+
+            async def mouse(cls, x, y):  # as a terminal sends it: the button held through a drag
+                app.post_message(cls(None, x, y, 0, 0, 1, False, False, False, screen_x=x, screen_y=y))
+                await pilot.pause()
+
+            await mouse(events.MouseDown, region.x + 4, region.y + top)
+            await mouse(events.MouseMove, region.right - 1, region.y + len(rows) - 1)
+            await mouse(events.MouseUp, region.right - 1, region.y + len(rows) - 1)
+            await pilot.press("ctrl+c")
+            assert await _pause_until(pilot, lambda: copied) and copied[-1] == "\n".join(lines)
+            # The same highlight set directly, as the screen keeps it.
+            s.selections = {lv: Selection(Offset(4, top), Offset(len(rows[-1]), len(rows) - 1))}
+            s.action_copy_text()
+            assert copied[-1] == "\n".join(lines)
+            # Part of the wrapped line, across its wrap: its text, without the rows' indent.
+            s.selections = {lv: Selection(Offset(30, len(rows) - 2), Offset(14, len(rows) - 1))}
+            s.action_copy_text()
+            part = copied[-1]
+            assert part and "         " not in part and part in s._display(lines[1])
+            # Copying the whole screen takes the pane's lines as logged too.
+            dump = screen_dump(s)
+            assert lines[0] in dump and lines[1].rstrip() in dump and "── " not in dump
+            # With nothing highlighted, ctrl+c copies the log as s saves it (from the lines the
+            # tail cached, as its worker caches them): as the lines came.
+            s._cache.append_entries(s._current_source, [{"_raw": line} for line in lines])
+            assert s._exported_text(s._current_source, []) == "\n".join(lines)
+            s.selections = {}
+            count = len(copied)
+            s.action_copy_text()
+            assert await _pause_until(pilot, lambda: len(copied) > count)
+            assert copied[-1] == "\n".join(lines)
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def test_the_day_rule_comes_back_on_top_as_the_oldest_lines_go(monkeypatch):
+    from cortex_training.tui.log_style import DAY_KIND
+
+    monkeypatch.setattr(LogScreen, "_MAX_LINES", 10)
+
+    async def run():
+        app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
+        async with app.run_test() as pilot:
+            s = await _open_live_tail(app, pilot)
+            for page in range(3):
+                _live_page(s, [f"2026-10-17T05:00:{page * 10 + i:02d}Z INFO line {page}-{i}" for i in range(10)])
+            lv = s._logview
+            assert len(s._shown_lines) == 10 and s._shown_lines[0].endswith("line 2-0")
+            assert lv.row_kinds[0] == DAY_KIND and lv.row_kinds.count(DAY_KIND) == 1
+            assert len(lv.lines) == sum(s._shown_rows) == s._rows_total
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def test_e_jumps_to_the_errors_and_the_bar_says_where_the_reader_is():
+    def bar(s):
+        return str(s.query_one("#log-live", Static).render()), str(s.query_one("#log-chips", Static).render())
+
+    async def run():
+        app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
+        async with app.run_test(size=(120, 30)) as pilot:
+            s = await _open_live_tail(app, pilot)
+            _live_page(s, ["2026-10-18T12:00:00Z ERROR first failure", *(f"line {i}" for i in range(60)),
+                           "2026-10-18T12:01:00Z ERROR second failure", "line after"])
+            await pilot.pause()
+            assert bar(s)[0] == "● LIVE · following"
+            await pilot.press("e")  # from the end of the log: the newest error
+            await pilot.pause()
+            marked = s._line_at_row(s._logview.mark[0])
+            assert s._shown_lines[marked].endswith("second failure") and s._jump == ("error", 2, 2)
+            assert s._paused and "PAUSED" in app.sub_title and bar(s)[1].strip() == "error 2/2"
+            await pilot.press("e")  # round past the end, to the first
+            await pilot.pause()
+            assert s._shown_lines[s._line_at_row(s._logview.mark[0])].endswith("first failure")
+            assert s._jump == ("error", 1, 2)
+            # A re-wrap (a resize) while paused keeps the mark and the chip.
+            width = s._content_width()
+            s._content_width = lambda: width - 20
+            s._rewrap()
+            assert await _pause_until(pilot, lambda: s._repaint_job is None and s._wrap_width == width - 20)
+            assert s._shown_lines[s._line_at_row(s._logview.mark[0])].endswith("first failure")
+            assert s._jump == ("error", 1, 2) and bar(s)[1].strip() == "error 1/2"
+            await pilot.press("N")  # n / N stop at warnings too: problems
+            await pilot.pause()
+            assert s._jump == ("problem", 2, 2) and bar(s)[1].strip() == "problem 2/2"
+            _live_page(s, ["line new"])
+            await pilot.pause()
+            assert bar(s)[0] == "⏸ PAUSED · 1 new line · p resumes"
+            await pilot.press("p")
+            await pilot.pause()
+            assert not s._paused and s._logview.mark is None and s._jump is None
+            assert bar(s)[0] == "● LIVE · following"
+            # Scrolled up, not paused (the subtitle says no PAUSED): the bar says so, and p follows again.
+            s._logview.scroll_home(animate=False, immediate=True)
+            await pilot.pause()
+            assert bar(s)[0] == "↑ SCROLLED UP · p follows" and "PAUSED" not in app.sub_title
+            await pilot.press("p")
+            await pilot.pause()
+            assert not s._paused and bar(s)[0] == "● LIVE · following"
             await _settle(app, pilot)
 
     asyncio.run(run())

@@ -37,6 +37,7 @@ from textual.containers import ScrollableContainer
 from textual.content import Content
 from textual.geometry import Offset
 from textual.geometry import Region
+from textual.geometry import Size
 from textual.css.query import NoMatches
 from textual.dom import NoScreen
 from textual.screen import Screen
@@ -57,6 +58,10 @@ from textual.widgets.data_table import RowDoesNotExist
 from cortex_training.tui import theme
 from cortex_training.tui import views
 from cortex_training.tui.clipboard import aligned
+from cortex_training.tui.log_style import MARK_BACKGROUND
+from cortex_training.tui.log_style import TRACE_KIND
+from cortex_training.tui.log_style import TRACEBACK_BACKGROUND
+from cortex_training.tui.log_style import TRACEBACK_KIND
 import os
 import traceback
 
@@ -136,21 +141,87 @@ def call_on_screen(screen: Screen, fn, *args, **kwargs) -> bool:
 
 
 class _LogPane(Log):
-    """The Logs pane, retaining each wrapped row's highlighter kind."""
+    """The Logs pane, retaining each wrapped row's highlighter kind (a level, a traceback,
+    a day's rule, a note). A traceback's rows, and the line a jump landed on (``mark``),
+    are drawn on their own background across the pane's width."""
+
+    _BACKGROUNDS = {TRACEBACK_KIND: TRACEBACK_BACKGROUND, TRACE_KIND: TRACEBACK_BACKGROUND}
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.row_kinds: list[str | None] = []
+        self.mark: tuple[int, int] | None = None  # the rows [start, end) of the line a jump landed on
+        self.on_scrolled = None  # called (UI thread) whenever the view scrolls, by any means
+        # ``copy_text(start, end)``: the lines a highlight from ``start`` to ``end`` ((row,
+        # column), None for either end of the pane) covers, as they were logged (see
+        # format.copied_text). Unset, a highlight copies the rows as drawn, as Log does.
+        self.copy_text = None
+
+    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
+        if self.copy_text is None:
+            return super().get_selection(selection)
+        ends = [None if at is None else (at.y, at.x) for at in (selection.start, selection.end)]
+        return self.copy_text(*ends), "\n"
+
+    def plain_lines(self) -> list[str]:
+        """Every line the pane holds, as it was logged (what a copy of the whole screen takes)."""
+        if self.copy_text is None:
+            return list(self.lines)
+        text = self.copy_text(None, None)
+        return text.split("\n") if text else []
 
     def write_rows(self, rows: list[str], kinds: list[str | None], *, scroll_end: bool | None = None) -> None:
         """``rows`` as :meth:`write_lines` writes them, ``kinds`` one per row it makes."""
         self.row_kinds.extend(kinds)
         self.write_lines(rows, scroll_end=scroll_end)
-        del self.row_kinds[:max(0, len(self.row_kinds) - len(self.lines))]  # as the oldest rows went
+        dropped = max(0, len(self.row_kinds) - len(self.lines))  # as the oldest rows went
+        del self.row_kinds[:dropped]
+        if dropped and self.mark is not None:
+            start, end = self.mark[0] - dropped, self.mark[1] - dropped
+            self.mark = (start, end) if start >= 0 else None
 
     def clear(self):
         self.row_kinds = []
+        self.mark = None
         return super().clear()
+
+    def insert_row(self, y: int, row: str, kind: str | None) -> None:
+        """Put ``row`` in above row ``y`` (a day's rule, back on top once the oldest rows went)."""
+        self._lines.insert(y, row)
+        self.row_kinds.insert(y, kind)
+        if self.mark is not None and self.mark[0] >= y:
+            self.mark = (self.mark[0] + 1, self.mark[1] + 1)
+        self._width = max(self._width, cell_len(row))
+        self.virtual_size = Size(self._width, len(self._lines))
+        self._render_line_cache.clear()
+        self.refresh()
+
+    def set_mark(self, rows: tuple[int, int] | None) -> None:
+        if rows != self.mark:
+            self.mark = rows
+            self.refresh()
+
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        super().watch_scroll_y(old_value, new_value)
+        if self.on_scrolled is not None:
+            self.on_scrolled()
+
+    def _row_background(self, y: int) -> str | None:
+        mark = self.mark
+        if mark is not None and mark[0] <= y < mark[1]:
+            return MARK_BACKGROUND
+        return self._BACKGROUNDS.get(self.row_kinds[y]) if 0 <= y < len(self.row_kinds) else None
+
+    def _render_line(self, y: int, scroll_x: int, width: int):
+        # As Log draws a row, on the row's own background when it has one: the
+        # pane's width, past the text too, so a traceback reads as one block.
+        background = self._row_background(y) if y < len(self._lines) else None
+        if background is None:
+            return super()._render_line(y, scroll_x, width)
+        rich_style = self.rich_style + Style(bgcolor=background)
+        line = self._render_line_strip(y, rich_style)
+        line = line.crop_extend(scroll_x, scroll_x + width, rich_style)
+        return line.apply_offsets(scroll_x, y)
 
     def _render_line_strip(self, y: int, rich_style):
         highlighter = self.highlighter
