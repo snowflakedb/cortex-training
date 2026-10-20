@@ -549,8 +549,11 @@ class JobListScreen(FollowsPointer, Screen):
         if self._refreshing:
             if manual and not quiet:
                 waited = int(time.monotonic() - (self._refresh_started or time.monotonic()))
-                what = "loading older jobs" if self._partial_gen == self._load_gen else "waiting for the last refresh"
-                self.notify(f"Still {what} ({waited}s); r asks again once it answers.", markup=False)
+                if self._partial_gen == self._load_gen:  # nothing is read again after: r is for then
+                    self.notify(f"Still loading older jobs ({waited}s); r works once it's done.", markup=False)
+                else:
+                    self.notify(f"Still waiting for the last refresh ({waited}s); r asks again once it answers.",
+                                markup=False)
             return
         self._refreshing = True
         self._refresh_started = time.monotonic()

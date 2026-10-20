@@ -4464,6 +4464,9 @@ async def _run_a_or_r_while_all_schemas_loads_supersedes_it_cleanly():
         screen._refresh_tick()
         await pilot.pause(0.2)
         assert client.pages == asked and screen._scope.loading
+        said = [str(note.message) for note in app._notifications]
+        assert any(m.startswith("Still loading older jobs (") and m.endswith("r works once it's done.")
+                   for m in said), said
         # a goes back to the configured schema at once; the walk stops at its page in flight.
         await pilot.press("a")
         assert await _pause_until(pilot, lambda: screen._scope.kind == SCHEMA, seconds=10.0), app.sub_title
