@@ -48,6 +48,12 @@ BRAND_ICON = "❄"
 BACKGROUND = "#0d1117"
 SURFACE = "#161b22"
 PANEL = "#21262d"
+# The Logs pane: a warning's and an error's message (WARN and ERR a step lighter, to read
+# as text), a traceback's rows, and the line a jump (e, n) landed on.
+WARN_TEXT = "#e3b341"
+ERR_TEXT = "#ff7b72"
+ERR_SURFACE = "#24161a"
+MARK_SURFACE = "#1c2a3a"
 
 CORTEX_THEME = Theme(
     name="cortex",

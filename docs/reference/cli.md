@@ -928,13 +928,19 @@ sends them. A sub-job's details name it by its id once (`sub-job
 JOB_ID:training:0`). Switch tabs with `l` (Logs) and `g` (Resources), or `t`
 for the next tab.
 
-- **Logs** is the live and historical log view described below. Each line is
-  tagged with the sub-job being tailed, for example `training:0 │ …`, and its
-  wrapped rows line up under its text. Saved logs (`s`) and whole-log copies
-  (a copy with nothing highlighted) stay untagged and uncoloured. In the pane,
-  the tag has its sub-job type's colour, the level its severity's (a
-  warning's or an error's message is tinted to match), tracebacks are red,
-  and what the filter matches is marked in amber.
+- **Logs** is the live and historical log view described below. The pane shows
+  one sub-job at a time, the one selected in the list beside it, so its lines
+  carry no sub-job tag; each starts with its time (`HH:MM:SS`), and its
+  wrapped rows start under the end of that time. The list marks each sub-job
+  with its status's glyph and colour (`●` running, `◐` initializing, `○`
+  pending, `✕` failed, `✓` ended), with the status under its name; the one the
+  pane shows has an accent edge and a bold name. Saved logs (`s`) and copies
+  stay as the lines came, uncoloured. In the pane the time is faint, the level
+  has its severity's colour (a warning's or an error's message is tinted to
+  match), the logger name is muted, a traceback is one block on a dark red
+  background from its `Traceback (most recent call last):` to the exception
+  that ends it (with any chained to it), and what the filter matches is marked
+  in amber.
 - **Resources** shows telemetry (`download_metrics`) for one sub-job at a
   time. `Space` (or a click on its name) shows the next one; `<` and `>` go
   back and forth. Its two-line pinned header names the sub-job, position,
@@ -989,8 +995,13 @@ The pane draws each line as text only: escape sequences in a line (colours,
 cursor moves, clipboard or title writes) are removed and other control
 characters show as `�`, so nothing in a log acts on your terminal; a line that
 rewrites itself with carriage returns (a progress bar) shows its last state.
-A leading timestamp shows in local time, as `YYYY-MM-DD HH:MM:SS`, like every
-other time in the TUI. A JSON log record, after the timestamp and any Ray
+A leading timestamp shows in local time, as `HH:MM:SS`; the date is on a faint
+rule above the first line of each day (`── Sun 18 Oct 2026 ─────`), at the top
+of the pane and wherever the day changes (when the pane drops its oldest lines,
+the rule comes back above the first one left). A highlight copies the lines as
+they were logged, as `s` saves them: each line it covers whole with its whole
+timestamp, without the day's rules or the indent of wrapped rows; a line it
+covers only in part gives the highlighted part. A JSON log record, after the timestamp and any Ray
 `(Actor pid=...)` prefix, shows as `time LEVEL logger: message`, with the
 message's line breaks kept and an error or exception chain on the lines under
 it; its other fields (host, ids) are left out. `s` saves the lines as they came.
@@ -1000,7 +1011,23 @@ The header's subtitle starts with the job's status. On the Logs tab it adds
 (`last line received` with the time it arrived, for a line without one), and
 any filter, level, or pause.
 
-The line under the log pane is the Logs tab's status line. It appears when the
+The bar under the pane says, at its left end, what the pane shows and whether
+it follows the log: `● LIVE · following` while it tails a running sub-job and
+keeps to the newest line; `⏸ PAUSED · 12 new lines · p resumes` once you pause
+(`p`) or jump to an error (`e`), as the subtitle's `PAUSED` says;
+`↑ SCROLLED UP · 12 new lines · p follows` once you scroll up from the end
+(each counts the lines that came since); `✓ SAVED CONSOLE` for a finished
+job's saved console; `↓ DOWNLOADING training #0`, a bar and `8/12 chunks`
+while that console downloads; `○ WAITING` while the job or sub-job waits to
+start (the status line says why); and `✕ STOPPED · r retries` when the tail
+stopped on an error. In the middle is the filter box (`/` focuses it). At its
+right end are chips for what is found or set, in this order: where the last
+jump landed (`error 2/5` or `no errors` for `e` / `E`, `problem 2/5` or
+`no problems` for `n` / `N`), the level (`≥ WARNING`), and the filter's count
+(`12 matches`, over the whole saved console, or the lines the pane holds for a
+live tail). A re-wrap (a resize) keeps the jump's mark and chip.
+
+The line between the pane and that bar is the Logs tab's status line. It appears when the
 job read is slow, when the tail is waiting, paused, or restarted, when the
 filter or level hides every line (`no lines match …`), after `s` (for 15
 seconds), or when the pane doesn't hold a sub-job's oldest lines:
@@ -1044,7 +1071,8 @@ seconds), or when the pane doesn't hold a sub-job's oldest lines:
 A finished job loads its saved console (the whole job's output, which can
 take minutes for a long job) when its Logs tab is first shown: the selected
 sub-job's first, shown as soon as it is in, then the others' in the
-background, with the chunk count on the status line meanwhile. The pane says
+background, with its progress on the bar under the pane meanwhile (the other
+sub-jobs' chunk count on the status line, once the selected one's is in). The pane says
 which sub-job's console comes first, and, for a sub-job you select before its
 console is in, that it comes with the others'. A job that ended more than 10
 minutes earlier keeps that console in its per-location job cache, so
@@ -1103,7 +1131,7 @@ Use the terminal's selection modifier instead when needed (Option in iTerm2,
 Fn in macOS Terminal, or configured Option in VS Code). With the keys panel
 open, a whole-screen copy includes its keys.
 
-Keys in the job details view (`/`, `p`, `s`, `[` and `]` work on Logs):
+Keys in the job details view (`/`, `e`, `n`, `p`, `s`, `[` and `]` work on Logs):
 
 | Key | Action |
 |-----|--------|
@@ -1114,7 +1142,9 @@ Keys in the job details view (`/`, `p`, `s`, `[` and `]` work on Logs):
 | `↑` `↓` | Pick GPU Resources or System Resources, `ALL` or one GPU or node in the panel; the charts follow the highlight (Resources) |
 | `/` | Filter the current source |
 | `l` | Cycle minimum log level (INFO / WARNING / ERROR) (Logs; `L` works too); elsewhere the Logs tab |
-| `p` | Pause / resume auto-scroll |
+| `e` / `E` | Next / previous error in the pane (an `ERROR`, `CRITICAL` or `FATAL` line, or a traceback: one stop with the exceptions chained to it, at the error line right above it when there is one), marked and a third of the way down the view, with its place among them on the bar (`error 2/5`). From the end of a followed log, `e` goes to the newest; both go round past either end. A jump pauses following, as `p` does |
+| `n` / `N` | Next / previous warning or error, as `e` / `E`; the bar counts them as problems (`problem 2/5`, or `no problems`) |
+| `p` | Pause / resume auto-scroll. Scrolled up from the end of a live log, or after a jump, `p` goes back to the end and follows again |
 | `s` | Save the current source to `~/cortex-training-<job8>-<source>.log` |
 | `ctrl+c` | Copy what is highlighted, else everything the tab holds: the log (its newest lines, up to 1 MiB) on Logs; the panel, header, stats and every chart on Resources (any tab) |
 | `[` / `]` | Narrow / widen the sources panel |

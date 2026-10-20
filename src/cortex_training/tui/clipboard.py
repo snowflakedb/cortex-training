@@ -121,7 +121,9 @@ def screen_dump(screen) -> str:
         if isinstance(widget, DataTable):
             lines += _table_text(widget)
         elif isinstance(widget, Log):
-            lines += list(widget.lines)
+            # The Logs pane's lines as they were logged (no day's rules, whole times), else the rows.
+            own = getattr(widget, "plain_lines", None)
+            lines += own() if callable(own) else list(widget.lines)
         elif isinstance(widget, Input):
             if widget.value:
                 lines.append(widget.value)

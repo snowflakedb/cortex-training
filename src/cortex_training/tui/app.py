@@ -234,8 +234,14 @@ class CortexTrainingLogTUI(App):
     }
     #logview { height: 1fr; padding: 0 1; }
     #log-status { height: auto; padding: 0 1; color: $warning; }
+    #log-bar { height: 1; background: $surface; }
+    #log-live, #log-chips { width: auto; padding: 0 1; }
+    /* The sub-job the Logs pane shows: an accent edge, on the cursor's highlight or off it. */
+    #sources > ListItem { border-left: blank; }
+    #sources > ListItem.-shown { border-left: outer $accent; }
     #summary { color: $text-muted; padding: 0 1; }
-    #logfilter { border: tall $panel; }
+    #logfilter { border: none; height: 1; width: 1fr; padding: 0 1; background: $surface; }
+    #logfilter:focus { background: $panel; }
     #jobfilter { border: tall $panel; }
     #resource-body { height: 1fr; }
     #resource-list { width: 16; border-right: solid $panel; scrollbar-size-vertical: 1; }

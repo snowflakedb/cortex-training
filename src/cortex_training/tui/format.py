@@ -381,6 +381,125 @@ def display_line(text: Any) -> str:
     return f"{when} {s}" if when else s
 
 
+def display_day(text: str) -> str | None:
+    """The ``YYYY-MM-DD`` a display line (see :func:`display_line`) starts with, or None.
+
+    Checked by position, not a regex: the pane asks this of every line it writes."""
+    if len(text) >= 19 and text[4] == "-" and text[10] == " " and text[13] == ":" and text[16] == ":" \
+            and (len(text) == 19 or text[19] == " ") and text[:4].isdigit() and text[11:13].isdigit():
+        return text[:10]
+    return None
+
+
+def compact_stamp(text: str) -> str:
+    """A display line as the pane draws it: ``HH:MM:SS``, its date on the day's rule
+    (see :func:`day_rule`). ``s``, a copy, and a highlight over whole lines take each
+    line as it came, its date too (see :func:`copied_text`)."""
+    return text[11:] if display_day(text) else text
+
+
+_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+_DAY_RULE = re.compile(r"── [A-Z][a-z]{2} \d{1,2} [A-Z][a-z]{2} \d{4} ─*")
+
+
+def day_rule(day: str, width: int) -> str:
+    """The pane's row above the first line of ``day`` (``YYYY-MM-DD``): ``── Sun 18 Oct 2026 ───…``,
+    ruled across ``width`` cells (at least its words, when the pane isn't laid out yet)."""
+    try:
+        moment = datetime.strptime(day, "%Y-%m-%d")
+    except ValueError:
+        words = day
+    else:  # in English whatever the locale, as every other word the TUI shows
+        words = f"{_WEEKDAYS[moment.weekday()]} {moment.day} {_MONTHS[moment.month - 1]} {moment.year}"
+    head = f"── {words} "
+    return head + "─" * max(2, width - len(head))
+
+
+def is_day_rule(row: str) -> bool:
+    """Whether a pane row is one :func:`day_rule` drew (checked cheaply first: every row is asked)."""
+    return row.startswith("── ") and _DAY_RULE.fullmatch(row) is not None
+
+
+def copied_text(rows: list, line_rows: list, whole, shown, start=None, end=None, *, indent: str = "") -> str:
+    """What a highlight over the Logs pane copies: the lines as they were logged.
+
+    ``rows`` are the pane's rows and ``line_rows`` how many of them each line takes, in
+    order; ``whole(i)`` is line ``i`` as it came (what ``s`` saves) and ``shown(i)`` the
+    text its rows were wrapped from (the time without its date). ``start`` and ``end``
+    are the highlight's ``(row, column)`` ends, None for the pane's first and last.
+
+    A line highlighted whole, from the start of its first row to the end of its last,
+    is copied whole; one highlighted in part (where the highlight begins or ends) gives
+    the part, as its text has it: the spaces a wrap took and the later rows' ``indent``
+    left out, its own line breaks kept. A day's rule is never copied.
+    """
+    count = len(rows)
+    if not count:
+        return ""
+    first_row, first_col = start if start is not None else (0, 0)
+    last_row, last_col = end if end is not None else (count - 1, len(rows[-1]))
+    if last_row >= count:
+        last_row, last_col = count - 1, len(rows[-1])
+    out: list = []
+    top = 0
+    for index, taken in enumerate(line_rows):
+        a, b = top, top + taken - 1  # the line's rows
+        top += taken
+        if b < first_row:
+            continue
+        if a > last_row:
+            break
+        if taken > 1 and is_day_rule(rows[a]):
+            a += 1  # its text starts under its day's rule
+        if b < first_row or a > last_row:
+            continue  # only the rule is highlighted
+        begins = first_row < a or (first_row == a and first_col <= 0)
+        ends = last_row > b or (last_row == b and last_col >= len(rows[b]))
+        if begins and ends:
+            out.append(str(whole(index)))
+            continue
+        out.append(_part_of(shown(index), rows, a, b, (first_row, first_col) if not begins else None,
+                            (last_row, last_col) if not ends else None, indent))
+    return "\n".join(out)
+
+
+def _part_of(text: str, rows: list, a: int, b: int, start, end, indent: str) -> str:
+    """The part of a line's ``text`` that rows ``a``..``b`` show from ``start`` to ``end``
+    (``(row, column)``; None: from its start, or to its end). Each row is found in the
+    text in turn, so the text's own spaces and line breaks come back (and the rows a very
+    long line leaves out, between two that are found). A highlight that ends on a row
+    that isn't in the text (the one that says how many rows are left out) takes the
+    highlighted rows as shown, without their indents."""
+    pieces: list = []  # (where in text it starts, or -1; the row without its indent; columns cut)
+    at = 0
+    for row in range(a, b + 1):
+        piece, cut = rows[row], 0
+        if row > a and indent and piece.startswith(indent):
+            piece, cut = piece[len(indent):], len(indent)
+        found = text.find(piece, at) if piece else at
+        pieces.append((found, piece, cut))
+        if found >= 0:
+            at = found + len(piece)
+
+    def offset(row: int, col: int) -> int | None:
+        found, piece, cut = pieces[row - a]
+        return None if found < 0 else found + min(len(piece), max(0, col - cut))
+
+    lo = 0 if start is None else offset(*start)
+    hi = len(text) if end is None else offset(*end)
+    if lo is not None and hi is not None:
+        return text[lo:hi]
+    # Some row isn't in the text: the highlighted rows as they are, without their indents.
+    parts = []
+    for row in range(max(a, start[0] if start else a), min(b, end[0] if end else b) + 1):
+        _found, piece, cut = pieces[row - a]
+        from_col = max(0, start[1] - cut) if start and row == start[0] else 0
+        to_col = max(0, end[1] - cut) if end and row == end[0] else len(piece)
+        parts.append(piece[from_col:to_col])
+    return "\n".join(parts)
+
+
 def wrap_lines(lines: list, width: int, *, first: str = "", rest: str = "", max_lines: int, max_rows: int,
                max_rows_per_line: int = 0) -> tuple[list, dict, bool]:
     """Log lines as the pane shows them, wrapped from the newest back as far as
@@ -399,7 +518,7 @@ def wrap_lines(lines: list, width: int, *, first: str = "", rest: str = "", max_
         text = displays.get(line)
         if text is None:
             text = displays[line] = display_line(line)
-        rows = wrap_log_line(text, width, first=first, rest=rest, max_rows=max_rows_per_line)
+        rows = wrap_log_line(compact_stamp(text), width, first=first, rest=rest, max_rows=max_rows_per_line)
         if chunks and total + len(rows) > max_rows:
             break
         chunks.append((line, rows, len(rows)))
