@@ -9,7 +9,9 @@ model availability, context limits, and recommended starting configurations.
   profile catalog. `model.json` records the model id, license, architecture
   (`dense` or `moe`), and last-validated dates. MoE models also record
   `moe.num_moe_layers`, `moe.topk`, and `moe.num_experts`.
-  `standard/` and `long/` hold the context-length configs. A file named
+  `standard/` is the shorter context: 64K where that profile exists,
+  32,768 for Qwen3-8B, and 40,960 for Qwen3-30B-A3B. `long/` is the longer
+  mesh. A file named
   `<hw>-training-lora.json`, `<hw>-training-full.json`,
   `<hw>-inference-lora.json`, or `<hw>-inference-full.json` means that
   model supports that configuration on that GPU. The file's `hardware`

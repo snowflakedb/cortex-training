@@ -1,0 +1,8 @@
+{
+  "modelId": "Qwen/Qwen3.8-27B",
+  "license": {
+    "name": "Apache 2.0",
+    "url": "https://huggingface.co/Qwen/Qwen3.8-27B/blob/main/LICENSE"
+  },
+  "architecture": "dense"
+}

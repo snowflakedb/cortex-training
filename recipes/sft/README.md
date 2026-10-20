@@ -54,7 +54,7 @@ python -m recipes.sft.conversational.train \
 # Train split has 7473 rows. With the 8B configs (batch 8) one epoch is 934 steps.
 python -m recipes.sft.conversational.train \
   config=/path/to/config.json \
-  job_config=configs/qwen3_8b_lora.json \
+  job_config=model-catalog/models/qwen3-8b/standard/h200-training-lora.json \
   dataset=openai/gsm8k \
   dataset_split=train \
   max_steps=934
@@ -210,7 +210,7 @@ python -m recipes.sft.conversational.train \
 # Qwen3-8B LoRA
 python -m recipes.sft.conversational.train \
   config=/path/to/config.json \
-  job_config=configs/qwen3_8b_lora.json
+  job_config=model-catalog/models/qwen3-8b/standard/h200-training-lora.json
 
 # Qwen3-4B-Instruct-2507 full-parameter, 256K context, 8 GPUs, SP8
 python -m recipes.sft.conversational.train \
@@ -220,7 +220,7 @@ python -m recipes.sft.conversational.train \
 # Qwen3.5-9B LoRA / full
 python -m recipes.sft.conversational.train \
   config=/path/to/config.json \
-  job_config=configs/qwen35_9b_lora.json
+  job_config=model-catalog/models/qwen3.5-9b/standard/h200-training-lora.json
 
 # Qwen3.5-9B full-parameter, 256K context, 8 GPUs, SP8
 python -m recipes.sft.conversational.train \
@@ -249,20 +249,20 @@ python -m recipes.sft.conversational.train \
 # Qwen3.8-27B LoRA / full
 python -m recipes.sft.conversational.train \
   config=/path/to/config.json \
-  job_config=configs/qwen38_27b_lora.json
+  job_config=model-catalog/models/qwen3.8-27b/standard/h200-training-lora.json
 
 python -m recipes.sft.conversational.train \
   config=/path/to/config.json \
-  job_config=configs/qwen38_27b_full.json
+  job_config=model-catalog/models/qwen3.8-27b/standard/h200-training-full.json
 
 # Qwen3.6-35B-A3B LoRA / full
 python -m recipes.sft.conversational.train \
   config=/path/to/config.json \
-  job_config=configs/qwen36_35b_a3b_lora.json
+  job_config=model-catalog/models/qwen3.6-35b-a3b/long/h200-training-lora.json
 
 python -m recipes.sft.conversational.train \
   config=/path/to/config.json \
-  job_config=configs/qwen36_35b_a3b_full.json
+  job_config=model-catalog/models/qwen3.6-35b-a3b/long/h200-training-full.json
 ```
 
 ## Logs and Expected Results
@@ -298,7 +298,7 @@ command, Assistant text should be `Snowflake AI Research`.
 ```bash
 python -m recipes.inference.generate \
   config=/path/to/config.json \
-  job_config=recipes/inference/configs/JOB_CONFIG \
+  job_config=model-catalog/models/qwen3-8b/standard/h200-inference-full.json \
   source_job_id=TRAINING_JOB_ID \
   checkpoint_id=CHECKPOINT_ID \
   temperature=0 \
@@ -312,7 +312,7 @@ on contest math, run MATH-500 against the same checkpoint (harder than GSM8K):
 ```bash
 python -m recipes.inference.evaluate \
   config=/path/to/config.json \
-  job_config=configs/qwen3_8b_lora.json \
+  job_config=model-catalog/models/qwen3-8b/standard/h200-training-lora.json \
   source_job_id=TRAINING_JOB_ID \
   checkpoint_id=CHECKPOINT_ID \
   task=gsm8k \
@@ -326,7 +326,7 @@ After identity SFT, score the percent of completions that contain
 ```bash
 python -m recipes.inference.evaluate \
   config=/path/to/config.json \
-  job_config=configs/qwen3_8b_lora.json \
+  job_config=model-catalog/models/qwen3-8b/standard/h200-training-lora.json \
   source_job_id=TRAINING_JOB_ID \
   checkpoint_id=CHECKPOINT_ID \
   task=identity \

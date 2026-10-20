@@ -118,36 +118,30 @@ def test_shipped_qwen_recipes_use_model_limits_and_long_context_sp():
         "Qwen/Qwen3-30B-A3B",
         "Qwen/Qwen3.8-Flash-Next",
     }
-    shorter_context_configs = {
-        REPO_ROOT / "recipes/rl/configs/qwen38_27b_full.json": 32768,
-        REPO_ROOT / "recipes/sft/configs/qwen35_9b_lora.json": 65536,
-        REPO_ROOT / "recipes/inference/configs/qwen35_9b_full.json": 65536,
-        REPO_ROOT / "recipes/inference/configs/qwen35_9b_lora.json": 65536,
-    }
+    shorter_context_configs = {}
     config_paths = []
-    for path in [
-        *REPO_ROOT.glob("recipes/inference/configs/qwen*.json"),
-        *REPO_ROOT.glob("recipes/rl/configs/qwen*.json"),
-        *REPO_ROOT.glob("recipes/sft/configs/qwen*.json"),
-        *REPO_ROOT.glob("model-catalog/models/qwen*/**/*h200-*.json"),
-    ]:
+    for path in REPO_ROOT.glob("model-catalog/models/qwen*/**/*h200-*.json"):
         request = json.loads(path.read_text())
         model_ids = {sub_job["model_name"] for sub_job in request["sub_job_configs"]}
         if model_ids <= shorter_context_models and path not in shorter_context_configs:
             continue
         config_paths.append(path)
 
-    assert len(config_paths) == 24
+    assert len(config_paths) == 22
     for path in config_paths:
         request = json.loads(path.read_text())
         for sub_job in request["sub_job_configs"]:
             model_id = sub_job["model_name"]
             config = sub_job.get("training_config") or sub_job.get("inference_config")
-            expected_seq_len = (
-                shorter_context_configs[path]
-                if path in shorter_context_configs
-                else expected_limits[model_id]
-            )
+            if path in shorter_context_configs:
+                expected_seq_len = shorter_context_configs[path]
+            elif (
+                "/standard/" in path.as_posix()
+                and expected_limits[model_id] > 65536
+            ):
+                expected_seq_len = 65536
+            else:
+                expected_seq_len = expected_limits[model_id]
             assert config["max_seq_len"] == expected_seq_len
             if sub_job["job_type"] == "training":
                 ds_config = config["ds_config"]

@@ -109,7 +109,7 @@ confirm the model learned the expected answer:
 ```bash
 python -m recipes.inference.generate \
   config=/path/to/your-config.json \
-  job_config=recipes/inference/configs/qwen3_8b_full.json \
+  job_config=model-catalog/models/qwen3-8b/standard/h200-inference-full.json \
   source_job_id=<training_job_id> \
   checkpoint_id=<checkpoint_id> \
   temperature=0 \
@@ -135,7 +135,7 @@ You have a working setup. From here:
 
 - **Try different training methods**: adjust the job config JSON to use
   [LoRA](../../recipes/sft/README.md)
-  (`job_config=configs/qwen3_8b_lora.json`), a different model, or different
+  (`job_config=model-catalog/models/qwen3-8b/standard/h200-training-lora.json`), a different model, or different
   hyperparameters
 - **Try reinforcement learning**: run the
   [Math GRPO recipe](../../recipes/rl/README.md)

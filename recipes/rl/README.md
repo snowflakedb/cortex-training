@@ -32,7 +32,7 @@ python -m recipes.rl.math_grpo.train \
 # Qwen3-8B full-parameter
 python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json \
-  job_config=configs/qwen3_8b_full.json
+  job_config=model-catalog/models/qwen3-8b/standard/h200-training-full.json
 
 # Qwen3.5-9B full-parameter, 256K context
 python -m recipes.rl.math_grpo.train \
@@ -61,19 +61,19 @@ python -m recipes.rl.math_grpo.train \
 # Qwen3.6-35B-A3B LoRA
 python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json \
-  job_config=configs/qwen36_35b_a3b_lora.json \
+  job_config=model-catalog/models/qwen3.6-35b-a3b/long/h200-training-lora.json \
   max_tokens=2048
 
 # Qwen3.6-35B-A3B full-parameter
 python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json \
-  job_config=configs/qwen36_35b_a3b_full.json \
+  job_config=model-catalog/models/qwen3.6-35b-a3b/long/h200-training-full.json \
   max_tokens=2048
 
 # Qwen3.8-27B full-parameter
 python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json \
-  job_config=configs/qwen38_27b_full.json \
+  job_config=model-catalog/models/qwen3.8-27b/standard/h200-training-full.json \
   weight_sync_bucket_size=3221225472 \
   max_tokens=2048
 
@@ -91,7 +91,7 @@ python -m recipes.rl.math_grpo.train \
 `config=` is the Snowflake connection file. Adapt from
 `examples/config/connection.json.template`.
 
-The default job body is `configs/qwen3_8b_lora.json`. The default run will be finished within 1h.
+The default job body is `model-catalog/models/qwen3-8b/standard/h200-training-lora.json`. The default run will be finished within 1h.
 
 Other full-parameter job bodies are:
 

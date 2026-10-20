@@ -38,7 +38,7 @@ class Config:
     config: str
     job_id: str | None = None  # attach to a running inference endpoint
 
-    job_config: str = "configs/qwen3_8b_full.json"
+    job_config: str = "model-catalog/models/qwen3-8b/standard/h200-inference-full.json"
     debug_image_tag: str | None = None
     keep_job: bool = True
 

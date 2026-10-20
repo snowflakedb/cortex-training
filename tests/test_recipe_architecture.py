@@ -54,12 +54,12 @@ def test_task_helpers_remain_available_from_task_entrypoints():
     [
         (
             "recipes.sft.conversational.train",
-            "configs/qwen3_8b_full.json",
+            "model-catalog/models/qwen3-8b/standard/h200-training-full.json",
             "Qwen/Qwen3-8B",
         ),
         (
             "recipes.rl.math_grpo.train",
-            "configs/qwen3_8b_lora.json",
+            "model-catalog/models/qwen3-8b/standard/h200-training-lora.json",
             "Qwen/Qwen3-8B",
         ),
     ],

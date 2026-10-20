@@ -41,7 +41,8 @@ logging.getLogger("urllib3").setLevel(logging.WARN)
 logging.getLogger("tinker_cookbook.renderers.base").setLevel(logging.ERROR)
 
 _RECIPE_DIR = Path(__file__).resolve().parent
-_CONFIG_SEARCH_DIRS = (_RECIPE_DIR, _RECIPE_DIR / "configs")
+_REPO_ROOT = _RECIPE_DIR.parents[1]
+_CONFIG_SEARCH_DIRS = (_REPO_ROOT, _RECIPE_DIR, _RECIPE_DIR / "configs")
 
 
 class Config(Protocol):

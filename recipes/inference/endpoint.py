@@ -33,7 +33,8 @@ from recipes.utils import source_checkpoint_info
 logger = logging.getLogger(__name__)
 
 _RECIPE_DIR = Path(__file__).resolve().parent
-CONFIG_SEARCH_DIRS: tuple[Path, ...] = (_RECIPE_DIR, _RECIPE_DIR / "configs")
+_REPO_ROOT = _RECIPE_DIR.parents[1]
+CONFIG_SEARCH_DIRS: tuple[Path, ...] = (_REPO_ROOT, _RECIPE_DIR, _RECIPE_DIR / "configs")
 
 
 def inference_endpoint_body(
