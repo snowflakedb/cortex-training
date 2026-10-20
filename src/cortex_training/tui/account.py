@@ -216,6 +216,8 @@ class JobLister:
         self._clock = clock
         self._fallback: Optional[str] = None  # why the account-level list is unavailable, while it is
         self._asked_at = 0.0  # in fallback: when the account-level list last answered (or failed)
+        self._reader: Optional[threading.Thread] = None  # the last active jobs' walk read beside the newest
+        self._reader_lock = threading.Lock()
 
     def load(self, now: datetime, *, is_cancelled: Callable[[], bool] = lambda: False,
              manual: bool = False, account: Optional[bool] = None, asked: bool = False,
@@ -308,6 +310,16 @@ class JobLister:
             return None
         return _listing(newest, active)
 
+    def _start_reader(self, read: Callable[[], None]) -> Optional[threading.Thread]:
+        """A thread reading the active jobs beside the newest (``read``), started; None while the
+        last one started is still reading (a load cancelled in its request): no second beside it."""
+        with self._reader_lock:
+            if self._reader is not None and self._reader.is_alive():
+                return None
+            self._reader = threading.Thread(target=read, name="active-jobs-walk", daemon=True)
+            self._reader.start()
+            return self._reader
+
     def _active(self, created_after: datetime, is_cancelled: Callable[[], bool]) -> Optional[tuple]:
         """``(jobs, stopped)`` of the active-job walk (stopped "failed" when it failed); None when cancelled."""
         walk = _Walk(self._client, created_after, ACTIVE)
@@ -334,7 +346,11 @@ class _Beside:
     """One walk of the account-level list that shows its pages: the newest jobs' walk on the
     caller's thread and, from its second page on, the active jobs' walk on another (at most two
     requests in flight), each list shown made under one lock, so they reach ``on_partial`` in
-    the order they were made, and none once the walk has answered."""
+    the order they were made, and none once the walk has answered or was cancelled.
+
+    An active jobs' walk of an earlier load that is still reading (it was cancelled during a
+    request) keeps its thread until that request answers; while it does, a new load reads the
+    active jobs after the newest ones instead, so loads in a row don't pile requests up."""
 
     _POLL_SECONDS = 0.1  # how soon a walk waiting for the active jobs sees it was cancelled
 
@@ -343,24 +359,27 @@ class _Beside:
         self._lister, self._created_after = lister, created_after
         self._is_cancelled, self._on_partial = is_cancelled, on_partial
         self._lock = threading.Lock()
-        self._stop = threading.Event()  # the walk answered: the active jobs' walk stops at its next page
+        self._stop = threading.Event()  # the walk answered: the active jobs' walk asks for no other page
         self._newest = _Walk(lister._client, created_after, None)
         self._shown: Optional[list] = None  # the newest jobs last shown (a walk read again shows none fewer)
         self._active: Optional[tuple] = None  # the active jobs' walk, once done
+        # The newest jobs' walk as of the last list made: whether it is done, and how it stopped.
         self._newest_done = False
+        self._newest_stopped: Optional[str] = None
 
     def walk(self) -> Optional[Listing]:
         newest = self._newest
         reader = None
+        beside = True  # the active jobs may be read beside the newest
         try:
             while not newest.done:
                 if not newest.step(self._is_cancelled):
                     return None
-                if reader is None and not newest.done:
-                    reader = threading.Thread(target=self._read_active, name="active-jobs-walk", daemon=True)
-                    reader.start()
+                if reader is None and beside and not newest.done:
+                    reader = self._lister._start_reader(self._read_active)
+                    beside = reader is not None
                 with self._lock:
-                    self._newest_done = newest.done
+                    self._newest_done, self._newest_stopped = newest.done, newest.stopped
                     if newest.done and newest.stopped is None:
                         break  # whole: the result comes next
                     if self._shown is None or len(newest.jobs) >= len(self._shown):
@@ -369,14 +388,15 @@ class _Beside:
                             self._report()
             if newest.stopped is None:
                 return Listing(newest.jobs, ListScope(ACCOUNT))
-            if reader is None:  # the first page stopped it short
+            if reader is None:  # the first page stopped it short, or an earlier walk still reads
                 active = self._lister._active(self._created_after, self._is_cancelled)
             else:
                 while reader.is_alive():
                     reader.join(self._POLL_SECONDS)
                     if self._is_cancelled():
                         return None
-                active = self._active
+                # A walk that ended with no answer failed past its own handling (it was logged).
+                active = self._active if self._active is not None else ([], "failed")
             if active is None or self._is_cancelled():
                 return None
             return _listing(newest, active)
@@ -385,22 +405,29 @@ class _Beside:
                 self._stop.set()
 
     def _read_active(self) -> None:
-        active = self._lister._active(self._created_after, lambda: self._is_cancelled() or self._stop.is_set())
-        with self._lock:
-            if active is None or self._stop.is_set():
-                return
-            self._active = active
-            # Shown with the newest jobs: now, or with their next list if none is made yet; once
-            # the newest jobs' walk is done, the walk answers with them.
-            if not self._newest_done and self._shown is not None:
-                self._report()
+        try:
+            active = self._lister._active(self._created_after, lambda: self._is_cancelled() or self._stop.is_set())
+            with self._lock:
+                if active is None or self._stop.is_set() or self._is_cancelled():
+                    return
+                self._active = active
+                # Shown with the newest jobs: now, or with their next list if none is made yet; once
+                # the newest jobs' walk is done, the walk answers with them.
+                if not self._newest_done and self._shown is not None:
+                    self._report()
+        except Exception:  # noqa: BLE001 - not to the thread's hook, which would print over the TUI
+            logger.warning("job list: reading the active jobs beside the newest failed", exc_info=True)
 
     def _report(self) -> None:
-        """Show what is read so far (called under the lock)."""
-        newest, active = self._newest, self._active
-        if newest.done:  # stopped short, the active jobs not read yet
-            scope = ListScope(ACCOUNT, stopped=newest.stopped, walked=len(self._shown), loading=ACTIVE_NEXT,
-                              pages=ACCOUNT_LIST_MAX_PAGES if newest.stopped == PAGE_LIMIT else 0)
+        """Show what is read so far (called under the lock, from the walk's state as of the last list made);
+        nothing once the load was cancelled (a page that answers after it is not shown)."""
+        if self._is_cancelled():
+            return
+        active = self._active
+        if self._newest_done:  # stopped short, the active jobs not read yet
+            stopped = self._newest_stopped
+            scope = ListScope(ACCOUNT, stopped=stopped, walked=len(self._shown), loading=ACTIVE_NEXT,
+                              pages=ACCOUNT_LIST_MAX_PAGES if stopped == PAGE_LIMIT else 0)
         else:
             scope = ListScope(ACCOUNT, walked=len(self._shown), loading=OLDER, active_read=active is not None,
                               active_missing=active is not None and active[1] is not None)

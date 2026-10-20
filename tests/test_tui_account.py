@@ -27,6 +27,7 @@ import requests
 
 from cortex_training import AccountJobListUnavailable
 from cortex_training import InvalidPageToken
+from cortex_training.tui import account
 from cortex_training.tui import views
 from cortex_training.tui.account import ACCOUNT
 from cortex_training.tui.account import ACCOUNT_LIST_CAP
@@ -484,6 +485,91 @@ def test_a_cancelled_walk_stops_before_its_next_page():
     listing = JobLister(client, account_wide=True).load(NOW, on_partial=partials.append,
                                                         is_cancelled=lambda: len(partials) >= 2)
     assert listing is None and len(_walk_calls(client.calls, "newest")) <= 3
+
+
+def test_a_load_while_an_earlier_active_jobs_walk_still_reads_reads_them_after_the_newest():
+    client, cancelled = _Held(ACCOUNT_LIST_CAP + 300), threading.Event()
+    lister = JobLister(client, account_wide=True)
+    client.hold["newest"].set()  # the active jobs' first page takes its time
+    first, answer = _load_in_thread(lister, on_partial=lambda listing: None, is_cancelled=cancelled.is_set)
+    assert _until(lambda: client.entered["active"] == 1)
+    cancelled.set()  # a: superseded while its active jobs' page is in flight
+    first.join(1.0)
+    assert answer == {"listing": None} and lister._reader.is_alive()
+    seen = []  # the active jobs' pages asked for so far, at each newest page the next load asks for
+    real = client.list_jobs_page
+
+    def watched(**kwargs):
+        if not kwargs.get("status"):
+            seen.append(client.entered["active"])
+        return real(**kwargs)
+
+    client.list_jobs_page = watched
+    partials = []
+    second, answer = _load_in_thread(lister, on_partial=partials.append)
+    assert _until(lambda: partials and partials[-1].scope.loading == ACTIVE_NEXT)
+    assert set(seen) == {1}  # no second active jobs' walk beside the first: it comes after the newest
+    client.hold["active"].set()
+    second.join(5)
+    assert answer["listing"] == _old_walk(_Paged(ACCOUNT_LIST_CAP + 300))
+    assert _until(lambda: not lister._reader.is_alive())
+
+
+def test_a_list_whole_when_the_active_jobs_come_shows_no_list_of_them(monkeypatch):
+    # The active jobs answer while the newest jobs' last page is read but before the walk has made
+    # its list of it (as when its thread waits for the lock): no "loading older active jobs" list.
+    real_step = account._Walk.step
+
+    def step_then_wait(self, is_cancelled):
+        done = real_step(self, is_cancelled)
+        if done and self.done and "status" not in self._filters:
+            time.sleep(0.05)
+        return done
+
+    monkeypatch.setattr(account._Walk, "step", step_then_wait)
+    for _ in range(10):
+        client, partials = _Paged(900), []
+        real = client.list_jobs_page
+        client.list_jobs_page = lambda **kw: (time.sleep(0.02) if kw.get("status") else None) or real(**kw)
+        listing = JobLister(client, account_wide=True).load(NOW, on_partial=partials.append)
+        assert listing == _old_walk(_Paged(900))
+        assert all(p.scope.loading == OLDER for p in partials), [p.scope for p in partials]
+
+
+def test_no_list_is_shown_once_the_load_is_cancelled():
+    for _ in range(20):
+        client, cancelled = _Held(ACCOUNT_LIST_CAP + 300), threading.Event()
+        client.hold["active"].set()
+        real = client.list_jobs_page
+
+        def slow_third_page(**kwargs):  # cancelled while the third newest page is read
+            if not kwargs.get("status") and (kwargs.get("page_token") or "").endswith(":2"):
+                cancelled.set()
+                time.sleep(0.02)
+            return real(**kwargs)
+
+        client.list_jobs_page = slow_third_page
+        client.hold["newest"].set()
+        late = []
+        JobLister(client, account_wide=True).load(
+            NOW, is_cancelled=cancelled.is_set, on_partial=lambda listing: late.append(cancelled.is_set()))
+        time.sleep(0.05)
+        assert not any(late)
+
+
+def test_a_failure_reading_the_active_jobs_beside_goes_to_the_log_not_the_thread_hook(monkeypatch, caplog):
+    def broken(self, *args):
+        raise RuntimeError("broken")
+
+    monkeypatch.setattr(JobLister, "_active", broken)
+    hooked = []
+    monkeypatch.setattr(threading, "excepthook", hooked.append)
+    lister = JobLister(_Paged(ACCOUNT_LIST_CAP + 300), account_wide=True)
+    listing = lister.load(NOW, on_partial=lambda listing: None)
+    assert _until(lambda: lister._reader is not None and not lister._reader.is_alive())
+    assert hooked == [] and "reading the active jobs beside the newest failed" in caplog.text
+    # The newest jobs stand, saying active ones may be missing, as when the walk fails in a request.
+    assert listing.scope == ListScope(ACCOUNT, stopped=CAPPED, walked=ACCOUNT_LIST_CAP, active_missing=True)
 
 
 def test_asking_again_in_fallback_shows_no_pages():

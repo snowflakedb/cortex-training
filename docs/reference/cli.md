@@ -821,10 +821,14 @@ have more after it: a refresh never walks the whole history. It asks for no
 status, so jobs whose status the service can't read (`unknown`) are listed too.
 When it stops with jobs left, it also reads the active jobs (`pending`,
 `placing`, `initializing` and `running`) and adds those created before the
-newest ones, so a long-running job stays under live. (A refresh of a whole list
-reads them after the newest jobs, only when it stops with jobs left; a list
-showing its pages reads them beside the newest jobs, and drops them if the
-newest turn out whole.) An `unknown` job older than
+newest ones, so a long-running job stays under live. A refresh of a whole list
+reads them after the newest jobs, only when it stops with jobs left. A list
+showing its pages reads them beside the newest jobs; if the newest turn out
+whole, the active jobs' walk asks for no page after the one in flight (a quick
+walk may have read all of its pages by then, one or two in the usual case) and
+its jobs are dropped. While an earlier load's active jobs' request is still in
+flight (after `a` pressed again), a new load reads them after the newest jobs
+instead. An `unknown` job older than
 the newest 2,000 is not listed, as a status filter leaves those out, and if
 reading the active jobs fails or is cut short too, the header says `older active
 jobs may be missing`. A walk that stops at 20 pages with no job to show says
