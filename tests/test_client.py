@@ -791,7 +791,7 @@ class TestClientConstruction:
         assert c._prefix == "http://x.test/api/v2/databases/MY$DB/schemas/S$1/cortex-training"
 
     def test_from_pat_sets_headers_and_verify(self):
-        c = CortexTrainingClient.from_pat(
+        c = CortexTrainingClient._from_pat(
             host="x.test",
             pat="tok-xyz",
             database="DB",
@@ -807,7 +807,7 @@ class TestClientConstruction:
 
     def test_from_pat_skips_telemetry_when_disabled(self, monkeypatch):
         monkeypatch.setenv(nc.DISABLE_TELEMETRY_ENV, "1")
-        c = CortexTrainingClient.from_pat(
+        c = CortexTrainingClient._from_pat(
             host="x.test",
             pat="tok-xyz",
             database="DB",
@@ -817,7 +817,7 @@ class TestClientConstruction:
         assert c.emit_metric("event") is None
 
     def test_from_pat_propagates_telemetry_timeout(self):
-        c = CortexTrainingClient.from_pat(
+        c = CortexTrainingClient._from_pat(
             host="x.test",
             pat="tok-xyz",
             database="DB",
@@ -836,7 +836,7 @@ class TestClientConstruction:
         auth_type = MagicMock(return_value=auth)
         monkeypatch.setattr(nc, "SnowflakeProfileAuth", auth_type)
 
-        c = CortexTrainingClient.from_connection_name("training-profile")
+        c = CortexTrainingClient._from_profile("training-profile")
 
         auth_type.assert_called_once_with("training-profile")
         assert c.base_url == "https://profile.example:8443"
@@ -860,7 +860,7 @@ class TestClientConstruction:
         auth.schema = "PROFILE_SCHEMA"
         monkeypatch.setattr(nc, "SnowflakeProfileAuth", MagicMock(return_value=auth))
 
-        c = CortexTrainingClient.from_connection_name(
+        c = CortexTrainingClient._from_profile(
             "training-profile", database="OVERRIDE_DB", schema="OVERRIDE_SCHEMA"
         )
 
@@ -875,7 +875,7 @@ class TestClientConstruction:
         monkeypatch.setattr(nc, "SnowflakeProfileAuth", MagicMock(return_value=auth))
 
         with pytest.raises(ValueError, match="must set database"):
-            CortexTrainingClient.from_connection_name("training-profile")
+            CortexTrainingClient._from_profile("training-profile")
 
         auth.close.assert_called_once()
 
@@ -4879,7 +4879,7 @@ class TestExecutionLogDownload:
     )
     def test_connection_kwargs_use_pat_host_as_account(self, monkeypatch, host, account):
         monkeypatch.setenv(nc.DISABLE_TELEMETRY_ENV, "1")
-        c = CortexTrainingClient.from_pat(
+        c = CortexTrainingClient._from_pat(
             host=host,
             pat="tok-xyz",
             database="DB",
