@@ -35,6 +35,7 @@ from textual.widgets import ListView
 from textual.widgets import Static
 from textual.worker import get_current_worker
 from cortex_training._download_lock import DownloadLock
+from cortex_training.tui.cache_cleanup import telemetry_bytes
 from cortex_training.tui import views
 from cortex_training.tui.format import safe_text
 from cortex_training.tui.widgets import _download_options
@@ -149,6 +150,22 @@ class ResourceTab:
             self._render_resource()  # "cached · refreshing…" while it runs
         self._refresh_resource()
 
+    def _after_telemetry_download(self, before: int) -> None:
+        """Worker thread. A download that grew the job's telemetry from ``before`` bytes by
+        much asks the app to hold the cache to its limit soon (see hold_cache_soon). Never
+        fails the download: the cache is the TUI's own business."""
+        try:
+            grown = telemetry_bytes(self._metrics_root) - before
+            if grown > 0:
+                self._post(self._ask_for_cache_pass, grown)
+        except Exception:  # noqa: BLE001
+            log_traceback("asking for a cache pass failed")
+
+    def _ask_for_cache_pass(self, grown: int) -> None:
+        app = self.app
+        if grown >= getattr(app, "CACHE_PASS_AFTER_BYTES", float("inf")):
+            app.hold_cache_soon()
+
     @work(thread=True, group="resource")
     def _refresh_resource(self) -> None:
         worker = get_current_worker()
@@ -242,6 +259,7 @@ class ResourceTab:
             options: dict = {"on_chunk": progress}
             if source and source not in shown_here and source not in self._resource_data.kinds:
                 options.update(preview_seconds=self._RESOURCE_PREVIEW_SECONDS, on_preview=previewed)
+            before = telemetry_bytes(self._metrics_root)
             results = self._client.download_metrics(
                 self._job_id,
                 self._metrics_root,
@@ -251,6 +269,7 @@ class ResourceTab:
                 **_quiet_download(self._client.download_metrics),
                 **_download_options(self._client.download_metrics, options),
             )
+            self._after_telemetry_download(before)
             # Chunks the download gave up on: say so, with the command that retries them.
             self._post(self._accept_download_warnings, "metrics",
                        _result_warnings(results, kind="metrics", job_id=self._job_id,

@@ -15,6 +15,7 @@
 
 """Keeping the TUI's local cache within bounds (tui/cache_cleanup.py)."""
 
+import contextlib
 import os
 import shutil
 import subprocess
@@ -25,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+from cortex_training import _training_log
 from cortex_training._download_lock import DownloadLock
 from cortex_training.tui import cache_cleanup
 from cortex_training.tui.cache_cleanup import JobLease
@@ -197,6 +199,278 @@ def test_a_pass_runs_without_its_lock_file_but_skips_a_job_without_its_lease(tmp
     assert not old.exists() and no_lease.exists()
 
 
+def _local_rows(root, job, mib, *, age=0.0):
+    """A job's local training rows, laid out as the client writes them."""
+    sub = root / _training_log.DIR_NAME / job / f"{job}:training:0"
+    sub.mkdir(parents=True)
+    rows = sub / _training_log.FILE_NAME
+    rows.write_bytes(b"x" * int(mib * MIB))
+    then = time.time() - age
+    for path in (rows, sub, sub.parent):
+        os.utime(path, (then, then))
+    return sub.parent
+
+
+A_MONTH_AND_A_DAY = _training_log.MAX_AGE_SECONDS + 86400
+
+
+def test_the_limit_counts_the_client_s_local_training_rows(tmp_path):
+    # Counted apart, the job cache and the local rows would put the real ceiling at the two
+    # budgets added together. The jobs go to make the room: 2 MiB fits 4 MiB alone, not with 3 more.
+    closed = _job(tmp_path, "closed", mib=2, age=9000)
+    local = _local_rows(tmp_path, "a-job-run-here", mib=3)
+
+    assert _names(cache_cleanup.enforce_cache_limit(tmp_path, limit=4 * MIB)) == ["closed"]
+    assert not closed.exists() and local.exists()
+
+
+def test_local_training_rows_are_never_removed_to_make_room(tmp_path):
+    # They are what the Training metrics tab shows of a step run from this machine before the
+    # stage has it. An open job alone over the limit once had every one of them removed, the
+    # running job's included, and the cache was still exactly as far over afterwards.
+    open_job = _job(tmp_path, "open", mib=4, age=10)
+    local = _local_rows(tmp_path, "a-job-running-now", mib=1)
+    rows = next(local.rglob(_training_log.FILE_NAME))
+    before = rows.read_bytes()
+    lease = JobLease(open_job)
+    lease.acquire()
+    try:
+        for _ in range(3):  # every pass, not just the first
+            assert cache_cleanup.enforce_cache_limit(tmp_path, limit=2 * MIB) == []
+        assert open_job.exists()
+        assert rows.read_bytes() == before, "the running job's local rows were touched"
+    finally:
+        lease.release()
+
+
+def test_local_training_rows_are_left_to_the_client_however_old(tmp_path):
+    # For a job that does not save its training metrics to the stage they are the only copy:
+    # the client removes them by its own rules, on its own first write, as without a TUI.
+    stale = _local_rows(tmp_path, "a-job-nobody-ran-for-a-month", mib=1, age=A_MONTH_AND_A_DAY)
+
+    assert cache_cleanup.enforce_cache_limit(tmp_path, limit=100 * MIB) == []
+    assert stale.exists(), "the TUI removed the client's rows"
+
+
+def test_the_local_rows_count_at_most_the_bound_the_client_holds_them_to(tmp_path, monkeypatch):
+    # Past the client's own bound (a long-lived process prunes them only once), counting them
+    # whole held the cache over its limit whatever was removed, and every closed job went for it.
+    monkeypatch.setattr(_training_log, "MAX_TOTAL_BYTES", 1 * MIB)
+    _local_rows(tmp_path, "a-big-job", mib=3)
+    closed = _job(tmp_path, "closed", mib=0.5, age=9000)
+
+    assert cache_cleanup.enforce_cache_limit(tmp_path, limit=2 * MIB) == []
+    assert closed.exists()
+
+
+def test_finder_s_metadata_in_the_local_rows_does_not_take_them_out_of_the_count(tmp_path):
+    local = _local_rows(tmp_path, "a-job-run-here", mib=3)
+    (local / ".DS_Store").write_bytes(b"\0" * 6148)
+    (local / "a-job-run-here:training:0" / "._training.jsonl").write_bytes(b"\0" * 4096)
+    closed = _job(tmp_path, "closed", mib=2, age=9000)
+
+    assert _names(cache_cleanup.enforce_cache_limit(tmp_path, limit=4 * MIB)) == ["closed"]
+    assert local.exists()
+
+
+def test_a_linked_local_training_directory_is_neither_counted_nor_entered(tmp_path):
+    # Followed, the link put another disk's directories in reach of rmtree, a stranger's included.
+    elsewhere = tmp_path / "elsewhere"
+    target = elsewhere / "lt"
+    _local_rows(elsewhere, "unused", mib=0)  # makes elsewhere/local-training; moved below
+    (elsewhere / _training_log.DIR_NAME).rename(target)
+    foreign = target / "not-the-client-s"
+    foreign.mkdir()
+    (foreign / "important.txt").write_text("keep me")
+    stale = target / "an-old-job"
+    (stale / "an-old-job:training:0").mkdir(parents=True)
+    (stale / "an-old-job:training:0" / _training_log.FILE_NAME).write_bytes(b"x" * (3 * MIB))
+    for path in (stale, *stale.rglob("*")):
+        os.utime(path, (0, 0))
+    root = tmp_path / "cache"
+    root.mkdir()
+    (root / _training_log.DIR_NAME).symlink_to(target, target_is_directory=True)
+    closed = _job(root, "closed", mib=1, age=9000)
+
+    assert cache_cleanup.enforce_cache_limit(root, limit=2 * MIB) == [], "bytes behind the link were counted"
+    assert closed.exists()
+    assert (foreign / "important.txt").read_text() == "keep me"
+    assert stale.exists(), "the pass reached through the link"
+
+
+def test_entries_the_client_does_not_write_are_left_alone_and_not_counted(tmp_path):
+    base = tmp_path / _training_log.DIR_NAME
+    base.mkdir()
+    (base / "a-stray-file").write_bytes(b"x" * (4 * MIB))  # once kept the cache over its limit for good
+    odd = base / "notes"
+    odd.mkdir()
+    (odd / "notes.txt").write_text("mine")
+    # Laid out like a job's, but with a file the client never writes beside (or in place of) its rows.
+    mixed = base / "a-job" / "a-job:training:0"
+    mixed.mkdir(parents=True)
+    (mixed / "my-analysis.csv").write_bytes(b"x" * (4 * MIB))
+    for path in (odd / "notes.txt", odd, mixed / "my-analysis.csv", mixed, mixed.parent):
+        os.utime(path, (0, 0))  # far past the age rule, so only the layout keeps them
+    closed = _job(tmp_path, "closed", mib=1, age=9000)
+
+    assert cache_cleanup.enforce_cache_limit(tmp_path, limit=2 * MIB) == [], "foreign bytes were counted"
+    assert closed.exists()
+    assert (base / "a-stray-file").exists() and (odd / "notes.txt").exists()
+    assert (mixed / "my-analysis.csv").exists(), "a file the client never wrote was removed"
+
+
+def test_the_local_rows_are_counted_after_the_pass_lock_is_taken(tmp_path, monkeypatch):
+    # Counted before it, rows another TUI's pass removed while this one waited for the lock
+    # were still in the total, and a job the cache had room for was removed in their place.
+    closed = _job(tmp_path, "closed", mib=1, age=9000)
+    local = _local_rows(tmp_path, "a-job-run-here", mib=3)
+    real_pass_lock = cache_cleanup._pass_lock
+
+    @contextlib.contextmanager
+    def another_pass_ran_first(root):
+        shutil.rmtree(local)  # what the other TUI's pass removed while this one waited
+        with real_pass_lock(root) as ours:
+            yield ours
+
+    monkeypatch.setattr(cache_cleanup, "_pass_lock", another_pass_ran_first)
+    assert cache_cleanup.enforce_cache_limit(tmp_path, limit=2 * MIB) == []
+    assert closed.exists(), "a job was removed to make room for rows that were already gone"
+
+
+def test_only_files_count_as_the_operating_system_s(tmp_path):
+    # A directory by such a name, or a name only close to NFS's, is someone's: its job is
+    # neither the cache's to count nor to remove.
+    for name, make in (("._notes", "dir"), (".nfs-exports-backup", "dir"), (".nfsnotes", "file")):
+        job = _job(tmp_path, f"with-{name}", mib=1, age=9000)
+        if make == "dir":
+            (job / name).mkdir()
+            (job / name / "mine.txt").write_text("keep me")
+        else:
+            (job / name).write_text("keep me")
+    nfs = _job(tmp_path, "silly-renamed", mib=1, age=9000)
+    (nfs / ".nfs0123456789abcdef00000001").write_bytes(b"x")
+
+    assert _names(cache_cleanup.enforce_cache_limit(tmp_path, limit=1)) == ["silly-renamed"]
+    assert all((job / "mine.txt").exists() for job in tmp_path.glob("jobs/*/._notes"))
+
+
+def test_finder_s_metadata_in_a_job_s_leases_is_not_a_lease(tmp_path):
+    job = _job(tmp_path, "looked-at", mib=1, age=9000)
+    (job / ".leases").mkdir()
+    (job / ".leases" / ".DS_Store").write_bytes(b"\0" * 6148)
+
+    assert not cache_cleanup.job_in_use(job)
+    assert _names(cache_cleanup.enforce_cache_limit(tmp_path, limit=1)) == ["looked-at"]
+
+
+def test_a_job_cached_by_a_tui_from_before_console_is_still_counted_and_removed(tmp_path):
+    job = _job(tmp_path, "legacy", mib=0, age=9000)
+    (job / "stdout" / "7:training:0").mkdir(parents=True)
+    (job / "stdout" / "7:training:0" / "stdout.log").write_bytes(b"x" * (2 * MIB))
+    (job / ".stdout.lock").touch()
+
+    assert _names(cache_cleanup.enforce_cache_limit(tmp_path, limit=MIB)) == ["legacy"]
+
+
+def test_a_job_another_pass_removed_meanwhile_counts_as_gone(tmp_path, monkeypatch):
+    # Where locks don't serialize passes, the job the other pass took read as a failed
+    # removal: its bytes stayed in this pass's total, and it removed more jobs for them.
+    first = _job(tmp_path, "first", mib=2, age=9000)
+    _job(tmp_path, "second", mib=1, age=8000)
+    _job(tmp_path, "third", mib=1, age=7000)
+    real_remove = cache_cleanup._remove_unless_in_use
+
+    def another_pass_took_it(job_dir, now):
+        if job_dir == first:
+            shutil.rmtree(job_dir)
+            return "failed"
+        return real_remove(job_dir, now)
+
+    monkeypatch.setattr(cache_cleanup, "_remove_unless_in_use", another_pass_took_it)
+    assert cache_cleanup.enforce_cache_limit(tmp_path, limit=int(2.5 * MIB)) == []
+    assert len(list((tmp_path / "jobs").iterdir())) == 2, "the pass removed a job for bytes already gone"
+
+
+@pytest.mark.skipif(not os.path.isdir("/dev/fd"), reason="counts descriptors through /dev/fd")
+def test_screens_closed_in_the_last_minutes_hold_no_descriptor(tmp_path):
+    # Each closed screen held its lease's descriptor for the 5-minute grace: a TUI opening job
+    # after job ran out of them (256 by default on macOS) and exited.
+    before = len(os.listdir("/dev/fd"))
+    leases = []
+    try:
+        for i in range(60):
+            lease = JobLease(_job(tmp_path, f"opened-{i}", mib=0))
+            lease.acquire()
+            lease.release_later(3600)
+            leases.append(lease)
+        assert len(os.listdir("/dev/fd")) - before < 5, "each screen in its grace still holds a descriptor"
+        assert all(lease.held and cache_cleanup.job_in_use(lease._job_dir) for lease in leases)
+        assert cache_cleanup.enforce_cache_limit(tmp_path, limit=1) == [], "a job in its grace was removed"
+    finally:
+        for lease in leases:
+            lease.release()
+
+
+def test_a_long_grace_keeps_its_marker_fresh(tmp_path, monkeypatch):
+    monkeypatch.setattr(cache_cleanup, "LEASE_HEARTBEAT_SECONDS", 0.1)
+    job = _job(tmp_path, "closing", mib=0)
+    lease = JobLease(job)
+    lease.acquire()
+    lease.release_later(3600)
+    try:
+        first = lease._marker.stat().st_mtime
+        deadline = time.time() + 5
+        while lease._marker.stat().st_mtime == first and time.time() < deadline:
+            time.sleep(0.05)
+            os.utime(lease._marker, (first, first))  # as if it had aged; the grace refreshes it
+            time.sleep(0.15)
+        assert lease._marker.stat().st_mtime > first, "the marker was not refreshed through the grace"
+    finally:
+        lease.release()
+
+
+def test_a_long_host_name_still_makes_a_stage(tmp_path, monkeypatch):
+    assert len(cache_cleanup._HOST) <= 64
+    monkeypatch.setattr(cache_cleanup.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(cache_cleanup, "_HOST", "h" * 64)
+    stage, fd = cache_cleanup.make_stage()
+    cache_cleanup.release_stage(stage, fd)
+
+
+def test_a_stage_s_owner_file_goes_when_its_tui_exits_without_releasing_it(tmp_path):
+    code = ("import sys, tempfile; tempfile.tempdir = sys.argv[1]; "
+            "from cortex_training.tui import cache_cleanup; stage, fd = cache_cleanup.make_stage()")
+    subprocess.run([sys.executable, "-c", code, str(tmp_path)], check=True)
+    assert not [p.name for p in tmp_path.iterdir() if p.name.startswith(cache_cleanup.STAGE_PREFIX)]
+
+
+def test_a_job_s_telemetry_size_is_its_sub_jobs_files(tmp_path):
+    metrics = tmp_path / "metrics"
+    (metrics / "a").mkdir(parents=True)
+    (metrics / "a" / "gpu.jsonl").write_bytes(b"x" * 100)
+    (metrics / "a" / "training.jsonl").write_bytes(b"x" * 20)
+    (metrics / "b").mkdir()
+    (metrics / "b" / "gpu.jsonl").write_bytes(b"x" * 3)
+    (metrics / "loose-file").write_bytes(b"x" * 1000)
+    (tmp_path / "elsewhere").mkdir()
+    (tmp_path / "elsewhere" / "big").write_bytes(b"x" * 5000)
+    (metrics / "linked").symlink_to(tmp_path / "elsewhere", target_is_directory=True)
+
+    assert cache_cleanup.telemetry_bytes(metrics) == 123
+    assert cache_cleanup.telemetry_bytes(tmp_path / "no-such-dir") == 0
+
+
+def test_finder_s_metadata_in_a_job_does_not_exempt_it_from_the_limit(tmp_path):
+    # Opening the cache in Finder leaves a .DS_Store: the job then read as a stranger's
+    # directory, was never counted or removed, and the cache grew past its limit unseen.
+    looked_at = _job(tmp_path, "looked-at", mib=2, age=9000)
+    (looked_at / ".DS_Store").write_bytes(b"\0" * 6148)
+    (looked_at / "._cursors.json").write_bytes(b"\0" * 4096)
+    _job(tmp_path, "recent", mib=1, age=10)
+
+    assert _names(cache_cleanup.enforce_cache_limit(tmp_path, limit=int(1.5 * MIB))) == ["looked-at"]
+
+
 def test_a_job_open_in_a_running_tui_is_never_removed(tmp_path):
     open_job = _job(tmp_path, "open", mib=3, age=5000)
     _job(tmp_path, "other", mib=3, age=100)
@@ -270,7 +544,7 @@ def test_a_removal_moves_the_job_aside_so_a_screen_opening_meanwhile_never_write
     (job / "logs" / "new.jsonl").write_text("{}\n")
     finish.set()
     remover.join(5)
-    assert outcome["r"][0] == "removed"
+    assert outcome["r"] == "removed"
     assert (job / "logs" / "new.jsonl").exists(), "the delete reached what the new screen wrote"
     assert lease._fd is not None and cache_cleanup._same_file(lease._fd, job / ".lease")
     assert not list(job.parent.glob(".removing-*"))
@@ -413,6 +687,27 @@ def test_a_stage_made_for_a_screen_is_swept_once_its_tui_is_gone(tmp_path, monke
     assert not Path(f"{stage.name}.owner").exists()
 
 
+def test_a_stage_whose_owner_lock_fails_is_not_swept_from_under_a_live_tui(tmp_path, monkeypatch):
+    """An unlocked .owner would read as abandoned to any sweep on this host."""
+    monkeypatch.setattr(cache_cleanup.tempfile, "tempdir", str(tmp_path))
+    real_flock = cache_cleanup.fcntl.flock
+    failed = []
+
+    def flock(fd, operation):
+        if not failed:  # only the owner lock make_stage takes, not the sweep's own probes
+            failed.append(fd)
+            raise OSError("this filesystem has no locks")
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(cache_cleanup.fcntl, "flock", flock)
+    stage, fd = cache_cleanup.make_stage()
+    assert fd is None and failed
+    assert not Path(f"{stage.name}.owner").exists()
+    # With no owner file the stage falls back to the legacy age rule, which a new one fails.
+    assert cache_cleanup.sweep_stale(tmp_path / "cache") == []
+    assert Path(stage.name).is_dir()
+
+
 def test_a_job_that_cannot_be_moved_aside_is_skipped_and_the_pass_goes_on(tmp_path, monkeypatch):
     stuck = _job(tmp_path, "stuck", mib=1, age=9000)
     _job(tmp_path, "next", mib=1, age=8000)
@@ -429,48 +724,64 @@ def test_a_job_that_cannot_be_moved_aside_is_skipped_and_the_pass_goes_on(tmp_pa
     assert stuck.exists()
 
 
-def test_the_error_log_rotates_instead_of_growing_without_end(tmp_path):
-    path = str(tmp_path / "errors.log")
-    for _ in range(50):
-        append_error_log("x" * 100 + "\n", path=path, max_bytes=1000)
-    assert os.path.getsize(path) <= 1000 + 101 and os.path.getsize(path + ".1") <= 1000 + 101
-    append_error_log("y\n", path=str(tmp_path / "no-such-dir" / "errors.log"))
+def test_the_error_log_keeps_its_newest_lines_in_the_one_file(tmp_path):
+    path = tmp_path / "errors.log"
+    path.write_text("")
+    inode = path.stat().st_ino
+    for n in range(60):
+        append_error_log(f"line {n:03d} " + "x" * 90 + "\n", path=str(path), max_bytes=1000)
+    lines = path.read_text().splitlines()
+    assert path.stat().st_size <= 1000 + 101
+    assert lines[-1].startswith("line 059") and all(len(line) == 99 for line in lines), "a line was cut"
+    assert path.stat().st_ino == inode, "the log was replaced rather than trimmed in place"
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith("errors.log")] == ["errors.log"], \
+        "a second file appeared beside it"
+    append_error_log("y\n", path=str(tmp_path / "no-such-dir" / "errors.log"))  # never raises
 
 
-def test_two_writers_rotating_at_once_keep_the_older_lines(tmp_path, monkeypatch):
+def test_a_line_written_while_another_tui_trims_the_log_is_kept(tmp_path, monkeypatch):
     import cortex_training.tui.log_cache as log_cache
 
-    path = str(tmp_path / "errors.log")
-    Path(path).write_text("old history\n" * 1000)
-    real_replace = log_cache.os.replace
+    path = tmp_path / "errors.log"
+    path.write_text("old history\n" * 1000)
+    def slow_keep(target, keep):
+        # _keep_newest with a pause between reading the newest bytes and writing them back:
+        # a line appended in that pause, unlocked, is cut off by the rewrite.
+        with open(target, "r+b") as f:
+            start = max(0, f.seek(0, os.SEEK_END) - keep)
+            f.seek(start)
+            tail = f.read()
+            if start:
+                tail = tail[tail.find(b"\n") + 1:]
+            time.sleep(0.2)
+            f.seek(0)
+            f.write(tail)
+            f.truncate()
 
-    def slow_replace(src, dst):
-        time.sleep(0.2)
-        return real_replace(src, dst)
-
-    monkeypatch.setattr(log_cache.os, "replace", slow_replace)
-    writers = [threading.Thread(target=append_error_log, args=(f"new {i}\n",), kwargs={"path": path, "max_bytes": 100})
-               for i in range(2)]
+    monkeypatch.setattr(log_cache, "_keep_newest", slow_keep)
+    writers = [threading.Thread(target=append_error_log, args=(f"new {i}\n",),
+                                kwargs={"path": str(path), "max_bytes": 100}) for i in range(2)]
     for writer in writers:
         writer.start()
     for writer in writers:
         writer.join()
-    assert Path(path + ".1").read_text().startswith("old history"), "the older lines were lost"
-    assert sorted(Path(path).read_text().split("\n")[:-1]) == ["new 0", "new 1"]
+    text = path.read_text()
+    assert "new 0\n" in text and "new 1\n" in text, "a line written during a trim was lost"
 
 
-def test_a_traceback_goes_through_the_rotation(tmp_path, monkeypatch):
+def test_a_traceback_goes_through_the_trim(tmp_path, monkeypatch):
     import cortex_training.tui.widgets as widgets
 
     path = tmp_path / "errors.log"
-    path.write_bytes(b"x" * (6 * MIB))
+    path.write_bytes(b"x" * (6 * MIB) + b"\n")
     monkeypatch.setattr(widgets, "_ERROR_LOG", str(path))
     try:
         raise RuntimeError("boom")
     except RuntimeError:
         widgets.log_traceback("a failure")
-    assert (tmp_path / "errors.log.1").stat().st_size == 6 * MIB
+    assert path.stat().st_size < 6 * MIB
     assert "RuntimeError: boom" in path.read_text()
+    assert not (tmp_path / "errors.log.1").exists()
 
 
 def test_two_tuis_updating_cursors_of_one_job_lose_neither(tmp_path):

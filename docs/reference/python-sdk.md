@@ -138,8 +138,12 @@ client, including notebooks, CI and containers that never open the TUI.
   `$XDG_CACHE_HOME/cortex-training`, else `~/.cache/cortex-training`.
 - **How much:** a file stops growing at 64 MiB. The first write of each client
   prunes the directory: jobs not written to for 30 days, then the least
-  recently written jobs until the rest fit in 1 GiB. The stage keeps every job
-  whole, so a capped or pruned file only loses the head start.
+  recently written jobs until the rest fit in 1 GiB. The TUI never removes
+  these rows; it counts them, up to that 1 GiB, in its cache's 5 GiB, so the
+  two are one budget rather than two that add up. The stage keeps every job
+  whole, so a capped or pruned file only loses the head start, except for a
+  job that does not save its training metrics to the stage, whose rows this
+  file holds alone.
 - **Safety:** writes are best-effort. A read-only or full disk never fails the
   call, and the result returned is unchanged.
 - **Turning it off:** set `CORTEX_TRAINING_DISABLE_LOCAL_TRAINING_METRICS=1`.

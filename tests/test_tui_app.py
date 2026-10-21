@@ -2386,6 +2386,8 @@ async def _run_leave_during_download(release, started, dirs):
         release.set()
         ok = await _wait(pilot, app, lambda: dirs and not Path(dirs[0]).exists())
         assert ok, "temp dir was not removed after leaving"
+        # Its owner lock goes with it (release_stage): left behind, the next sweep has a file to clear.
+        assert not os.path.lexists(f"{dirs[0]}.owner"), "the stage's owner lock outlived it"
         assert not any("too late" in line for line in getattr(app.screen, "_shown_lines", []))
         await _settle(app, pilot)
 
@@ -3306,6 +3308,42 @@ async def _run_saved_console_waits_for_logs_and_is_kept(c):
         assert ok
         assert c.download_stdout_logs.call_count == 1
         await _settle(app, pilot)
+
+
+async def _run_the_pane_has_its_console_before_the_cache_limit_pass(c, holder, seen):
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    holder["app"] = app
+    async with app.run_test(size=(140, 40)) as pilot:
+        ok = await _wait(pilot, app, lambda: seen, tries=300)
+        assert ok, "keeping the console never ran the limit pass"
+        ok = await _wait(pilot, app, lambda: "saved line" in app.screen._shown_lines, tries=200)
+        assert ok, "the console was never painted"
+        await _settle(app, pilot)
+
+
+def test_the_pane_has_its_console_before_the_cache_limit_pass_reads_the_cache(monkeypatch):
+    # The pass reads the size of everything in the cache first: run before the pane was told,
+    # it held a finished job's console back behind it (seconds, on a network home directory).
+    import cortex_training.tui.logs as logs_module
+
+    c = _client()
+    c.get_job.return_value = _old_terminal_job(minutes_ago=30)
+
+    def download(job_id, output_dir):
+        _write_stdout(output_dir, "7:training:0", "saved line\n")
+        return []
+
+    c.download_stdout_logs.side_effect = download
+    holder, seen = {}, []
+
+    def limit_pass(root, limit):
+        screen = holder["app"].screen
+        seen.append((screen._stdout_inflight, screen._stdout_ready))  # _finish_download delivered
+        return []
+
+    monkeypatch.setattr(logs_module, "enforce_cache_limit", limit_pass)
+    asyncio.run(_run_the_pane_has_its_console_before_the_cache_limit_pass(c, holder, seen))
+    assert seen == [(False, True)], "the limit pass ran before the pane had the console"
 
 
 def test_saved_console_downloads_only_on_logs_and_is_kept_for_old_jobs():
@@ -5179,6 +5217,57 @@ async def _run_a_narrowing_with_no_jobs_says_so_rather_than_failing():
 
 def test_a_narrowing_with_no_jobs_says_so_rather_than_failing():
     asyncio.run(_run_a_narrowing_with_no_jobs_says_so_rather_than_failing())
+
+
+async def _run_a_download_that_grows_the_cache_by_much(tmp_path, monkeypatch, *, grow):
+    import cortex_training.tui.app as app_module
+    from cortex_training.tui.log_cache import job_cache_dir
+
+    old = job_cache_dir("0123456789abcdef:old-job", root=tmp_path / "isolated-cache")
+    (old / "metrics").mkdir(parents=True)
+    (old / "metrics" / "gpu.jsonl").write_bytes(b"x" * 4096)
+    long_ago = time.time() - 86400
+    for path in (old, *old.rglob("*")):
+        os.utime(path, (long_ago, long_ago))
+    cls = app_module.CortexTrainingLogTUI
+    monkeypatch.setattr(cls, "_CACHE_CLEANUP_FIRST_SECONDS", 3600)  # only the pass a download asks for
+    monkeypatch.setattr(cls, "_CACHE_CLEANUP_SECONDS", 3600)
+    monkeypatch.setattr(cls, "_CACHE_LIMIT", 1024)
+    monkeypatch.setattr(cls, "CACHE_PASS_AFTER_BYTES", 10_000)
+    monkeypatch.setattr(cls, "_CACHE_PASS_AFTER_DOWNLOAD_SECONDS", 0.1)
+    c = _located_client()
+
+    def download(job_id, output_dir, **_kwargs):
+        _write_gpu_metrics(output_dir, "7:training:0", gpu_count=2)
+        if grow:
+            with (Path(output_dir) / "7:training:0" / "gpu.jsonl").open("ab") as f:
+                f.write(b"\n" * 20_000)  # a long job's history, past the threshold
+        return []
+
+    c.download_metrics.side_effect = download
+    app = cls(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(130, 36)) as pilot:
+        assert await _pause_until(pilot, lambda: isinstance(app.screen, LogScreen) and app.screen._current_source)
+        app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        assert await _pause_until(pilot, lambda: c.download_metrics.call_count >= 1, seconds=5.0)
+        await _pause_until(pilot, lambda: not old.exists(), seconds=3.0)
+        gone = not old.exists()
+        await _settle(app, pilot)
+    return gone
+
+
+def test_a_download_that_grows_the_cache_by_much_holds_it_to_its_limit_soon(tmp_path, monkeypatch):
+    # The next pass was up to 10 minutes away, and none if the TUI quit first: a long job's
+    # first open left the cache gigabytes over its limit until the next start.
+    assert asyncio.run(_run_a_download_that_grows_the_cache_by_much(tmp_path, monkeypatch, grow=True)), \
+        "a big download left the cache over its limit until the next pass"
+
+
+def test_a_download_that_adds_little_waits_for_the_next_pass(tmp_path, monkeypatch):
+    assert not asyncio.run(_run_a_download_that_grows_the_cache_by_much(tmp_path, monkeypatch, grow=False)), \
+        "every download ran a pass of its own"
+
+
 async def _run_the_open_job_survives_the_cache_limit_and_the_rest_goes(tmp_path, monkeypatch):
     import cortex_training.tui.app as app_module
     from cortex_training.tui.cache_cleanup import STAGE_PREFIX
@@ -5188,6 +5277,7 @@ async def _run_the_open_job_survives_the_cache_limit_and_the_rest_goes(tmp_path,
     from cortex_training.tui.cache_cleanup import job_in_use
     from cortex_training.tui.log_cache import job_cache_dir
     from cortex_training.tui.widgets import _cache_job_id
+    from cortex_training import _training_log
 
     root = tmp_path / "isolated-cache"
     client = _located_client()
@@ -5200,6 +5290,17 @@ async def _run_the_open_job_survives_the_cache_limit_and_the_rest_goes(tmp_path,
     long_ago = time.time() - 86400
     for path in (old, *old.rglob("*"), open_dir, *open_dir.rglob("*")):
         os.utime(path, (long_ago, long_ago))
+    # The client writes these, so only a process that runs a job would ever prune them.
+    # Laid out as the client writes them: <job>/<sub_job_id>/training.jsonl.
+    stale_local = _training_log.local_dir("a-job-nobody-has-run-for-a-month", root=root)
+    (stale_local / "a-job-nobody-has-run-for-a-month:training:0").mkdir(parents=True)
+    (stale_local / "a-job-nobody-has-run-for-a-month:training:0" / _training_log.FILE_NAME).write_bytes(b"{}\n")
+    a_month_ago = time.time() - _training_log.MAX_AGE_SECONDS - 86400
+    for path in (stale_local, *stale_local.rglob("*")):
+        os.utime(path, (a_month_ago, a_month_ago))
+    fresh_local = _training_log.local_dir("a-job-running-now", root=root)
+    (fresh_local / "a-job-running-now:training:0").mkdir(parents=True)
+    (fresh_local / "a-job-running-now:training:0" / _training_log.FILE_NAME).write_bytes(b"{}\n")
     stage = Path(tempfile.gettempdir()) / f"{STAGE_PREFIX}{_HOST}+999999+gone"
     stage.mkdir()
     Path(f"{stage}.owner").touch()
@@ -5215,16 +5316,28 @@ async def _run_the_open_job_survives_the_cache_limit_and_the_rest_goes(tmp_path,
         assert lease._job_dir == open_dir and _is_job_dir(open_dir), "the open job isn't the cache's to remove"
         assert job_in_use(open_dir), "the open job holds no lease"
         os.utime(lease._marker, (long_ago, long_ago))
-        assert await _pause_until(pilot, lambda: time.time() - lease._marker.stat().st_mtime < 60), \
+
+        def marker_refreshed():
+            # The sweep removes a marker this stale; the live screen's heartbeat writes it
+            # again, so a moment with no marker at all is not a failure.
+            try:
+                return time.time() - lease._marker.stat().st_mtime < 60
+            except FileNotFoundError:
+                return False
+
+        assert await _pause_until(pilot, marker_refreshed, seconds=10.0), \
             "the open job's lease is never refreshed: another machine would take the job for closed"
         assert await _pause_until(pilot, lambda: not old.exists(), seconds=10.0), "the old job was kept"
         assert open_dir.exists(), "cache cleanup removed the open job"
         assert job_in_use(open_dir), "the open job lost its lease"
-        assert await _pause_until(pilot, lambda: any(note.startswith("Freed ") for note in _notes(app))), \
-            "removing the old job said nothing"
-        freed = next(note for note in _notes(app) if note.startswith("Freed "))
-        assert freed.startswith("Freed 2.0 MiB of cached data from 1 job ") and "under 1.0 KiB" in freed, freed
+        await pilot.pause(0.3)
+        assert not [note for note in _notes(app) if "cached data" in note or "Freed" in note], \
+            "the cache's own housekeeping was announced"
         assert not stage.exists() and not os.path.lexists(f"{stage}.owner"), "the abandoned stage was left"
+        assert stale_local.exists(), "the TUI removed the client's own rows (the client's rules do that)"
+        # The open job holds the cache over its limit on every pass, and the local rows of a job
+        # still being written stay through all of them: they are never removed to make room.
+        assert fresh_local.exists(), "the pass took local training rows still being written"
         await _settle(app, pilot)
     assert lease.held and job_in_use(open_dir)
     _release_pending()
@@ -5241,7 +5354,7 @@ def test_the_cache_keeps_under_the_5_gib_the_docs_state():
     assert CortexTrainingLogTUI._CACHE_LIMIT == DEFAULT_CACHE_LIMIT == 5 * 1024 ** 3
 
 
-def test_a_console_is_kept_only_under_the_job_s_lease_and_the_cache_then_fits_its_limit(tmp_path, monkeypatch):
+def test_a_console_is_kept_only_under_the_job_s_lease_and_the_jobs_used_least_recently_then_go(tmp_path, monkeypatch):
     from cortex_training._download_lock import DownloadLock
     from cortex_training.tui.log_cache import job_cache_dir
 
@@ -5262,28 +5375,43 @@ def test_a_console_is_kept_only_under_the_job_s_lease_and_the_cache_then_fits_it
     screen._post = lambda fn, *args, **kwargs: notes.append(args[0]) or True
     kept = screen._console_dir / ".complete"
 
-    screen._keep_console(plan)  # lease not held
+    assert screen._keep_console(plan) is False  # lease not held
     assert not kept.exists() and other.exists() and not notes
 
-    real_acquire = DownloadLock.acquire
+    real_try = DownloadLock.try_acquire
 
-    def acquire_as_the_lease_goes(self, keep_waiting, **kwargs):
-        taken = real_acquire(self, keep_waiting, **kwargs)
+    def try_acquire_as_the_lease_goes(self):
+        taken = real_try(self)
         screen._lease.release()
         return taken
 
     screen._lease.acquire()
-    monkeypatch.setattr(DownloadLock, "acquire", acquire_as_the_lease_goes)
-    screen._keep_console(plan)
+    monkeypatch.setattr(DownloadLock, "try_acquire", try_acquire_as_the_lease_goes)
+    assert screen._keep_console(plan) is False
     assert not kept.exists() and other.exists() and not notes
-    monkeypatch.setattr(DownloadLock, "acquire", real_acquire)
+    monkeypatch.setattr(DownloadLock, "try_acquire", real_try)
+
+    # Another TUI keeping this same console holds its lock: not waited for (the pane showed
+    # its console seconds late behind that copy, or never, if that TUI was stopped mid-copy).
+    other_tui = DownloadLock(screen._console_dir)
+    assert other_tui.try_acquire()
+    screen._lease.acquire()
+    try:
+        started = time.monotonic()
+        assert screen._keep_console(plan) is False
+        assert time.monotonic() - started < 0.5, "keeping the console waited for another TUI's copy"
+    finally:
+        other_tui.release()
+        screen._lease.release()
 
     screen._lease.acquire()
     try:
-        screen._keep_console(plan)
+        assert screen._keep_console(plan) is True
         assert kept.read_text(encoding="utf-8") == "created"
-        assert not other.exists(), "the kept console left the cache over its limit"
-        assert len(notes) == 1 and notes[0].startswith("Freed 600 B of cached data from 1 job "), notes
+        assert other.exists(), "keeping the console waited for the limit pass (see _hold_cache_to_limit)"
+        screen._hold_cache_to_limit()
+        assert not other.exists(), "the job used least recently stayed after the console was kept"
+        assert not notes, "the cache's own housekeeping was announced"
     finally:
         screen._lease.release()
 

@@ -55,7 +55,6 @@ from textual.widgets._toast import ToastRack
 from cortex_training.tui import theme
 from cortex_training.tui.cache_cleanup import DEFAULT_CACHE_LIMIT
 from cortex_training.tui.cache_cleanup import enforce_cache_limit
-from cortex_training.tui.cache_cleanup import freed_text
 from cortex_training.tui.cache_cleanup import sweep_stale
 from cortex_training.tui.account import JobClients
 from cortex_training.tui.widgets import log_traceback
@@ -319,6 +318,7 @@ class CortexTrainingLogTUI(App):
         self._press_at = None
         self._press_moved = False
         self._copy_note: Notification | None = None  # the last copy's note (see copy_out)
+        self._cache_pass_soon = None  # the timer hold_cache_soon set, until it fires
         self._copy_what: str | None = None  # while copy_out copies: what its note calls the text
         # This machine's clipboard takes one copy at a time, in order (see _copy_locally).
         self._copy_lock = threading.Lock()
@@ -497,26 +497,35 @@ class CortexTrainingLogTUI(App):
     _CACHE_CLEANUP_FIRST_SECONDS = 5
     _CACHE_CLEANUP_SECONDS = 10 * 60
     _CACHE_LIMIT = DEFAULT_CACHE_LIMIT  # also what a job screen holds the cache to after keeping a console
+    # A download that grew a job's telemetry by this much asks for a pass soon after it, once
+    # however many ask: a long job's first open can add gigabytes, and the cache would
+    # otherwise stay over its limit until the next pass, or, if the TUI quits first, until
+    # the next start.
+    CACHE_PASS_AFTER_BYTES = 64 * 1024 * 1024
+    _CACHE_PASS_AFTER_DOWNLOAD_SECONDS = 5
+
+    def hold_cache_soon(self) -> None:
+        """UI thread. Hold the cache to its limit shortly: once, however many ask meanwhile."""
+        if self._cache_pass_soon is None:
+            self._cache_pass_soon = self.set_timer(self._CACHE_PASS_AFTER_DOWNLOAD_SECONDS, self._cache_pass_now)
+
+    def _cache_pass_now(self) -> None:
+        self._cache_pass_soon = None
+        self._clean_cache()
 
     @work(thread=True, group="cache-cleanup", exclusive=True)
     def _clean_cache(self) -> None:
         """Remove what no running TUI owns, then the jobs used least recently while the
-        cache is over its limit; say so when that freed anything. Each runs whatever the
-        other met: a sweep that fails must not keep the cache over its limit."""
+        cache is over its limit, saying nothing: the cache is the TUI's own business. Each
+        runs whatever the other met: a sweep that fails must not keep the cache over its limit."""
         try:
             sweep_stale()
         except Exception:  # noqa: BLE001 - cache cleanup must never stop the TUI
             log_traceback("cache sweep failed")
         try:
-            removed = enforce_cache_limit(limit=self._CACHE_LIMIT)
+            enforce_cache_limit(limit=self._CACHE_LIMIT)
         except Exception:  # noqa: BLE001
             log_traceback("cache limit failed")
-            return
-        if removed:
-            try:
-                self.call_from_thread(self.notify, freed_text(removed, self._CACHE_LIMIT), timeout=8, markup=False)
-            except RuntimeError:
-                pass  # the app stopped while the pass ran
 
     async def on_event(self, event: events.Event) -> None:
         # A key, click, scroll or paste means someone is at the screen (a mouse

@@ -19,7 +19,9 @@ Each opened job caches its log tail (``logs/``), finished console (``console/``)
 and telemetry (``metrics/``) under ``<cache_root>/jobs/<job>/``. :func:`enforce_cache_limit`
 evicts least-recently-used jobs past ``DEFAULT_CACHE_LIMIT`` while skipping non-cache
 entries, symlinks, leased open jobs (:class:`JobLease`), and active downloads
-(:class:`DownloadLock`). :func:`sweep_stale` removes leftovers from interrupted TUIs.
+(:class:`DownloadLock`). The client's own training rows (``local-training/``) count toward
+the limit but are never removed by it. :func:`sweep_stale` removes leftovers from
+interrupted TUIs.
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ import tempfile
 import threading
 import time
 import uuid
+import weakref
 from pathlib import Path
 from typing import Optional
 
@@ -44,6 +47,7 @@ try:  # POSIX only; elsewhere a lease is its marker file alone, and stages aren'
 except ImportError:  # pragma: no cover - exercised on Windows
     fcntl = None  # type: ignore[assignment]
 
+from cortex_training import _training_log
 from cortex_training._download_lock import DownloadLock
 from cortex_training.tui.log_cache import cache_root
 from cortex_training.tui.log_cache import unsafe_source_name
@@ -64,15 +68,23 @@ _STALE_PARTIAL_SECONDS = 60 * 60
 _LEGACY_STAGE_SECONDS = 7 * 24 * 3600
 
 STAGE_PREFIX = "cortex-training-stage-"
-_HOST = re.sub(r"[^A-Za-z0-9.-]", "-", socket.gethostname()) or "host"
+# Cut short so a stage's or marker's name stays within a file name's 255 bytes.
+_HOST = (re.sub(r"[^A-Za-z0-9.-]", "-", socket.gethostname()) or "host")[:64]
 _STAGE_NAME = re.compile(re.escape(STAGE_PREFIX) + r"(?P<host>[A-Za-z0-9.-]+)\+(?P<pid>\d+)\+")
 _STAGE_OWNER = ".owner"
 
 _KEYED_JOB = re.compile(r"[0-9a-f]{16}%3A[A-Za-z0-9._%-]+")
 _BARE_JOB = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+# ``stdout`` and ``.stdout.lock``: where TUIs from before the saved console moved to
+# ``console`` kept it, so a job one of them cached is still the cache's to count and remove.
 _JOB_ENTRIES = frozenset({"logs", "console", "metrics", "cursors.json", ".lease", ".leases", ".last-used",
-                          ".metrics.lock", ".console.lock", ".cursors.lock"})
+                          ".metrics.lock", ".console.lock", ".cursors.lock", "stdout", ".stdout.lock"})
 _JOB_ENTRY_PREFIXES = (".console-", ".tmp-")
+# Files the operating system leaves in a directory someone looked at: Finder's .DS_Store and
+# AppleDouble ._ files, and NFS's .nfs files for one deleted while open. Counted as part of
+# the job, not as a stranger's entry: one would otherwise exempt its job from the limit.
+# Regular files only: a directory by such a name is someone's.
+_OS_FILE = re.compile(r"\.DS_Store|\._.+|\.nfs[0-9A-Fa-f]{8,}")
 _LEASE_LOCK = ".lease"
 _LEASES = ".leases"
 _LAST_USED = ".last-used"
@@ -80,21 +92,12 @@ _REMOVING = ".removing-"
 _PASS_LOCK = ".cleanup.lock"
 
 
-def format_size(size: float) -> str:
-    """``1.2 GiB``, ``340.0 MiB``: what a person reads in a notice."""
-    for unit in ("B", "KiB", "MiB"):
-        if abs(size) < 1024:
-            return f"{size:.0f} B" if unit == "B" else f"{size:.1f} {unit}"
-        size /= 1024
-    return f"{size:.1f} GiB"
-
-
-def freed_text(removed: list, limit: Optional[int]) -> str:
-    """The notice for the jobs a pass removed (``(job_id, bytes)`` pairs)."""
-    freed = sum(size for _job, size in removed)
-    jobs = f"{len(removed)} job{'s' if len(removed) != 1 else ''}"
-    keeps = f" (the cache keeps under {format_size(limit)})" if limit is not None else ""
-    return f"Freed {format_size(freed)} of cached data from {jobs} not used lately{keeps}."
+def _os_file(entry: os.DirEntry) -> bool:
+    """Whether ``entry`` is a file the operating system left (see _OS_FILE)."""
+    try:
+        return bool(_OS_FILE.fullmatch(entry.name)) and entry.is_file(follow_symlinks=False)
+    except OSError:
+        return False
 
 
 def _disk_bytes(path: Path) -> int:
@@ -113,14 +116,15 @@ def _last_used(job_dir: Path) -> float:
     """When the job was last open: its lease's last refresh, else its newest non-lock file.
 
     A download can write files into a job after a screen last had it open, and lock probes
-    create ``.lease`` / ``*.lock`` files, so ``.last-used`` wins and lock files are ignored.
+    create ``.lease`` / ``*.lock`` files, so ``.last-used`` wins and lock files are ignored,
+    as are the operating system's own (Finder writes a .DS_Store when the folder is looked at).
     """
     with contextlib.suppress(OSError):
         return os.lstat(job_dir / _LAST_USED).st_mtime
     newest = 0.0
     for dirpath, _dirnames, filenames in os.walk(job_dir):
         for name in filenames:
-            if name == _LEASE_LOCK or name.endswith(".lock"):
+            if name == _LEASE_LOCK or name.endswith(".lock") or _OS_FILE.fullmatch(name):
                 continue
             with contextlib.suppress(OSError):
                 newest = max(newest, os.lstat(os.path.join(dirpath, name)).st_mtime)
@@ -143,10 +147,11 @@ def _is_job_dir(path: Path) -> bool:
     try:
         if path.is_symlink() or not path.is_dir():
             return False
-        entries = os.listdir(path)
+        with os.scandir(path) as entries:
+            return all(entry.name in _JOB_ENTRIES or entry.name.startswith(_JOB_ENTRY_PREFIXES)
+                       or _os_file(entry) for entry in entries)
     except OSError:
         return False
-    return all(entry in _JOB_ENTRIES or entry.startswith(_JOB_ENTRY_PREFIXES) for entry in entries)
 
 
 def _jobs(root: Path) -> list:
@@ -240,6 +245,7 @@ class JobLease:
         self._marker = self._job_dir / _LEASES / name
         self._fd: Optional[int] = None
         self._held = False
+        self._closing = False  # in the grace after its screen closed (see release_later)
         self._mutex = threading.Lock()
 
     @property
@@ -249,7 +255,7 @@ class JobLease:
 
     def acquire(self) -> None:
         with self._mutex:
-            self._held = True
+            self._held, self._closing = True, False
         # Touch the marker before waiting on the lock so a concurrent removal checking
         # markers sees the job open immediately, and again after in case a removal moved
         # the job aside while _lock waited.
@@ -257,7 +263,7 @@ class JobLease:
         self._retry_lock()
 
     def _retry_lock(self) -> None:
-        if not self._held or self._fd is not None:
+        if not self._held or self._closing or self._fd is not None:
             return
         self._lock()
         self._touch()  # refresh in case a removal moved the directory aside before _lock
@@ -268,7 +274,7 @@ class JobLease:
         if fcntl is None:
             return
         deadline = time.monotonic() + _LEASE_WAIT_SECONDS
-        while self._held:
+        while self._held and not self._closing:
             fd = _open_lock(self._lock_path)
             if fd is None:
                 return
@@ -285,7 +291,7 @@ class JobLease:
                 return
             if _same_file(fd, self._lock_path):
                 with self._mutex:
-                    if self._held and self._fd is None:
+                    if self._held and not self._closing and self._fd is None:
                         self._fd = fd
                         return
                 os.close(fd)
@@ -298,6 +304,9 @@ class JobLease:
     def heartbeat(self) -> None:
         """Refresh the marker and last-used timestamp, reacquiring the lock if needed."""
         if not self._held:
+            return
+        if self._closing:
+            self._touch()
             return
         with self._mutex:
             stale = self._fd is not None and not _same_file(self._fd, self._lock_path)
@@ -324,9 +333,28 @@ class JobLease:
                     return
 
     def release_later(self, delay: float = LEASE_GRACE_SECONDS) -> None:
-        """Release after ``delay``, or at process exit if sooner."""
+        """Release after ``delay``, or at process exit if sooner.
+
+        Meanwhile the marker alone protects the job, refreshed now and through the grace;
+        the lock's descriptor is closed at once. Kept open, a TUI that opens job after job
+        held one for each screen of the last few minutes, and ran out of descriptors.
+        """
+        with self._mutex:
+            self._closing = True
+            fd, self._fd = self._fd, None
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        self._touch()
         _PENDING.add(self)
         _SCHEDULER.after(delay, self.release)
+        if delay > LEASE_HEARTBEAT_SECONDS:
+            _SCHEDULER.after(LEASE_HEARTBEAT_SECONDS, self._grace_heartbeat)
+
+    def _grace_heartbeat(self) -> None:
+        if self._held and self._closing:
+            self._touch()
+            _SCHEDULER.after(LEASE_HEARTBEAT_SECONDS, self._grace_heartbeat)
 
     def release(self) -> None:
         with self._mutex:
@@ -358,6 +386,8 @@ def _fresh_marker(job_dir: Path, now: float) -> bool:
     except OSError:
         return False
     for marker in markers:
+        if _OS_FILE.fullmatch(marker.name):
+            continue  # Finder's or NFS's, not a lease's
         with contextlib.suppress(OSError):
             if now - marker.lstat().st_mtime < LEASE_STALE_SECONDS:
                 return True
@@ -382,14 +412,16 @@ def job_in_use(job_dir: Path, *, now: Optional[float] = None) -> bool:
         os.close(fd)
 
 
-def _remove_unless_in_use(job_dir: Path, now: float) -> tuple:
-    """``("removed", bytes)``, ``("in_use", 0)`` or ``("failed", 0)`` for one job.
+def _remove_unless_in_use(job_dir: Path, now: float) -> str:
+    """``"removed"``, ``"in_use"`` or ``"failed"`` for one job.
 
     Under the lease and download locks the job is renamed aside before deletion, so an
-    arriving screen or download never writes into a directory being deleted.
+    arriving screen or download never writes into a directory being deleted. Nothing is
+    read between the last check for a screen's marker and the rename, so the locks are
+    held for as short a time as they can be: a screen opening the job waits on them.
     """
     if _fresh_marker(job_dir, now):
-        return "in_use", 0
+        return "in_use"
     fd = None
     downloads: list = []
     try:
@@ -398,23 +430,22 @@ def _remove_unless_in_use(job_dir: Path, now: float) -> tuple:
             # Unlike the pass lock, no .lease means no removal: without it exclusively,
             # removing the job could race a screen opening it.
             if fd is None or _try_exclusive(fd) is False:
-                return "in_use", 0
+                return "in_use"
         for part in ("metrics", "console"):
             path = job_dir / part
             if path.is_symlink():
                 continue
             lock = DownloadLock(path)
             if not lock.try_acquire():
-                return "in_use", 0
+                return "in_use"
             downloads.append(lock)
         if _fresh_marker(job_dir, now):
-            return "in_use", 0
-        size = _disk_bytes(job_dir)
+            return "in_use"
         aside = job_dir.parent / f"{_REMOVING}{uuid.uuid4().hex}"
         try:
             os.rename(job_dir, aside)
         except OSError:
-            return "failed", 0
+            return "failed"
     finally:
         for lock in downloads:
             lock.release()
@@ -422,7 +453,7 @@ def _remove_unless_in_use(job_dir: Path, now: float) -> tuple:
             with contextlib.suppress(OSError):
                 os.close(fd)
     shutil.rmtree(aside, ignore_errors=True)
-    return "removed", size
+    return "removed"
 
 
 @contextlib.contextmanager
@@ -441,32 +472,112 @@ def _pass_lock(root: Path):
             os.close(fd)
 
 
+def _local_training_bytes(root: Path) -> int:
+    """What the client's own training rows under ``root`` count toward the limit.
+
+    Only what the client writes, ``local-training/<job>/<sub_job>/training.jsonl``, read
+    without following a link; a directory holding anything else, beside the files an
+    operating system leaves, is someone else's and is not counted. At most the client's own
+    bound on them (:data:`_training_log.MAX_TOTAL_BYTES`): past it, they would hold the
+    cache over its limit whatever the TUI removed.
+    """
+    base = root / _training_log.DIR_NAME
+    total = 0
+    try:
+        if base.is_symlink() or not base.is_dir():
+            return 0
+        with os.scandir(base) as jobs:
+            for job in jobs:
+                total += _local_training_job_bytes(job) or 0
+    except OSError:
+        pass
+    return min(total, _training_log.MAX_TOTAL_BYTES)
+
+
+def _local_training_job_bytes(job: os.DirEntry) -> Optional[int]:
+    """The bytes of one job's rows files; None when its directory holds anything else."""
+    total = 0
+    try:
+        if not job.is_dir(follow_symlinks=False):
+            return None
+        with os.scandir(job.path) as subs:
+            for sub in subs:
+                if _os_file(sub):
+                    total += sub.stat(follow_symlinks=False).st_size
+                    continue
+                if not sub.is_dir(follow_symlinks=False):
+                    return None
+                with os.scandir(sub.path) as rows:
+                    for entry in rows:
+                        if not (entry.name == _training_log.FILE_NAME and entry.is_file(follow_symlinks=False)
+                                or _os_file(entry)):
+                            return None
+                        total += entry.stat(follow_symlinks=False).st_size
+    except OSError:
+        return None
+    return total
+
+
+def telemetry_bytes(metrics_root: Path) -> int:
+    """The size of a job's reconstructed telemetry files (``<sub_job>/*`` under ``metrics_root``).
+
+    One listing per sub-job, not a walk: cheap enough to take before and after every download.
+    """
+    total = 0
+    try:
+        with os.scandir(metrics_root) as subs:
+            for sub in subs:
+                if not sub.is_dir(follow_symlinks=False):
+                    continue
+                with contextlib.suppress(OSError), os.scandir(sub.path) as files:
+                    for entry in files:
+                        if entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+    except OSError:
+        pass
+    return total
+
+
 def enforce_cache_limit(root: Optional[Path] = None, limit: Optional[int] = DEFAULT_CACHE_LIMIT) -> list:
     """Remove least-recently-used jobs until the cache fits ``limit`` (None: no limit),
-    skipping jobs open in a TUI or being downloaded into. Returns ``(job_id, bytes)`` pairs."""
+    skipping jobs open in a TUI or being downloaded into. Returns ``(job_id, bytes)`` pairs.
+
+    The limit covers the cache's jobs and the client's local training rows together:
+    counted apart, the real ceiling would be the two budgets added together. Those rows are
+    counted but never removed here (they are how the Training metrics tab shows a step run
+    from this machine before the stage has it, and the only copy of a job that does not
+    save its training metrics to the stage), so it is the jobs that go."""
     if limit is None:
         return []
     root = Path(root) if root is not None else cache_root()
-    if not _jobs(root):
+    if _jobs_dir(root) is None and not (root / _training_log.DIR_NAME).is_dir():
         return []
     with _pass_lock(root) as ours:
         if not ours:
             return []
+        # Measured under the pass lock: what another TUI's pass removed while this one
+        # waited would otherwise be counted, and a job the cache has room for removed.
         jobs = _jobs(root)
         sizes = {job: _disk_bytes(job) for job in jobs}
-        total = sum(sizes.values())
+        total = sum(sizes.values()) + _local_training_bytes(root)
         removed = []
+        if total <= limit:
+            return removed
         now = time.time()
         for job_dir in sorted(jobs, key=_last_used):
             if total <= limit:
                 break
             try:
-                outcome, size = _remove_unless_in_use(job_dir, now)
+                outcome = _remove_unless_in_use(job_dir, now)
             except OSError:
-                continue
+                outcome = "failed"
             if outcome == "removed":
                 total -= sizes[job_dir]
-                removed.append((_job_label(job_dir), size))
+                removed.append((_job_label(job_dir), sizes[job_dir]))
+            elif not os.path.lexists(job_dir):
+                # Another pass removed it (where locks don't serialize passes): its bytes
+                # are gone all the same, and counting them would remove more jobs for them.
+                total -= sizes[job_dir]
         return removed
 
 
@@ -560,7 +671,13 @@ def make_stage() -> tuple:
         except OSError:
             if fd is not None:
                 os.close(fd)
+            # An unlocked .owner would read as abandoned to another TUI's sweep, which
+            # would remove this stage while it is being written into. Without one the
+            # stage falls back to the legacy age rule, which no live stage ever meets.
+            _unlink(Path(f"{stage.name}{_STAGE_OWNER}"))
             fd = None
+    if fd is not None:
+        weakref.finalize(stage, _unlink, Path(f"{stage.name}{_STAGE_OWNER}"))
     return stage, fd
 
 

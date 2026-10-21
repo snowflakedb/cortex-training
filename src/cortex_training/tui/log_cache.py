@@ -376,30 +376,49 @@ class LogCache:
                 pass
 
 
-# Past this the error log becomes ``<log>.1`` (replacing an older one) and a new one
-# starts: a TUI that hits the same error on every poll for days must not fill the disk.
+# Past this the error log keeps only its newest half, in the same file: a TUI that hits the
+# same error on every poll for days must not fill the disk, and the log stays the one file
+# the TUI's messages send people to, with nothing beside it.
 ERROR_LOG_MAX_BYTES = 5 * 1024 * 1024
+# The lock lives in the cache directory, not beside the log: the log sits in $HOME because
+# the TUI's messages send people there, and its lock is plumbing that should not join it.
+# Every write takes it, so a line written while another TUI trims the log is not lost.
+_ERROR_LOG_LOCK = ".errors.lock"
 
 
 def append_error_log(text: str, *, path: Optional[str] = None, max_bytes: int = ERROR_LOG_MAX_BYTES) -> None:
-    """Append ``text`` to the error log, rotating it first once it is past ``max_bytes``.
+    """Append ``text`` to the error log, first dropping its oldest half once it is past ``max_bytes``.
 
-    Never raises: reporting an error must not cause one. Rotation runs under a lock
-    (``<log>.lock``), so two writers can't both rotate and lose the older lines.
+    Never raises: reporting an error must not cause one. The log stays one file at one
+    path, its newest lines kept in place, under a lock in the cache directory that every
+    write takes (see _ERROR_LOG_LOCK).
     """
     path = path or _ERROR_LOG
     try:
-        if os.path.getsize(path) > max_bytes:
-            with _exclusive(Path(path + ".lock")):
-                if os.path.getsize(path) > max_bytes:  # another writer may have just rotated it
-                    os.replace(path, path + ".1")
+        with _exclusive(cache_root() / _ERROR_LOG_LOCK):
+            try:
+                if os.path.getsize(path) > max_bytes:
+                    _keep_newest(path, max_bytes // 2)
+            except OSError:
+                pass
+            with open(path, "a", encoding="utf-8", errors="replace") as f:
+                f.write(text)
     except OSError:
         pass
-    try:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(text)
-    except OSError:
-        pass
+
+
+def _keep_newest(path: str, keep: int) -> None:
+    """Rewrite ``path`` in place to its last ``keep`` bytes, from the first whole line in them."""
+    with open(path, "r+b") as f:
+        start = max(0, f.seek(0, os.SEEK_END) - keep)
+        f.seek(start)
+        tail = f.read()
+        if start:
+            newline = tail.find(b"\n")
+            tail = tail[newline + 1:] if newline >= 0 else b""
+        f.seek(0)
+        f.write(tail)
+        f.truncate()
 
 
 def _note_persist_error(exc: BaseException) -> None:

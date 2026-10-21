@@ -58,7 +58,6 @@ from textual.widgets import Static
 from textual.widgets import TabbedContent
 from textual.widgets import TabPane
 from textual.worker import get_current_worker
-from cortex_training._download_lock import DownloadLock
 from cortex_training.client import DownloadCancelled
 from cortex_training.client import NoChunksError
 from cortex_training.tui import theme
@@ -86,7 +85,7 @@ from cortex_training.tui.format import wrap_log_line
 from cortex_training.tui.cache_cleanup import DEFAULT_CACHE_LIMIT
 from cortex_training.tui.cache_cleanup import LEASE_HEARTBEAT_SECONDS
 from cortex_training.tui.cache_cleanup import enforce_cache_limit
-from cortex_training.tui.cache_cleanup import freed_text
+from cortex_training.tui.cache_cleanup import telemetry_bytes
 from cortex_training.tui.cache_cleanup import make_stage
 from cortex_training.tui.cache_cleanup import release_stage
 from cortex_training.tui.cache_cleanup import JobLease
@@ -403,6 +402,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         lock = DownloadLock(self._metrics_root)
         if not lock.acquire(lambda: self._screen_open and not cancelled()):
             return False
+        before = telemetry_bytes(self._metrics_root)
         try:
             self._client.download_training_metrics(
                 self._job_id,
@@ -414,6 +414,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
             )
         finally:
             lock.release()
+        self._after_telemetry_download(before)
         return True
 
     def action_show_tab(self, tab: str) -> None:
@@ -1322,28 +1323,39 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
             return False
         return (datetime.now(timezone.utc) - ended).total_seconds() < self._KEEP_CONSOLE_AFTER_SECONDS
 
-    def _keep_console(self, plan: LogScreen._Download) -> None:
-        """Worker thread. Copy the console ``plan`` downloaded into the job's cache for the next open."""
+    def _keep_console(self, plan: LogScreen._Download) -> bool:
+        """Worker thread. Copy the console ``plan`` downloaded into the job's cache for the next
+        open; True when the copy landed (the cache may then be over its limit: see
+        _hold_cache_to_limit)."""
         if not plan.root or views.parse_ts(plan.ended_at) is None or not plan.created_at:
-            return
+            return False
         if self._console_may_be_incomplete(plan.seen, plan.ended_at):
-            return  # it may still be missing its last chunks: download it again next time
+            return False  # it may still be missing its last chunks: download it again next time
         lock = DownloadLock(self._console_dir)
         # Hold the console lock so a removal cannot move the job aside mid-copy, and skip
-        # keeping it if the screen's lease expired meanwhile.
-        if not lock.acquire(lambda: self._lease.held):
-            return
+        # keeping it if the screen's lease expired meanwhile. Not waited for: whoever holds
+        # it is another TUI keeping this same console, or a removal of the job, and either
+        # way this view must not show its console later for it.
+        if not lock.try_acquire():
+            return False
         try:
             if not self._lease.held:
-                return
-            self._copy_console(plan)
+                return False
+            return self._copy_console(plan)
         finally:
             lock.release()
-        removed = enforce_cache_limit(self._console_dir.parent.parent.parent, limit=self._cache_limit)
-        if removed:
-            self._post(self.notify, freed_text(removed, self._cache_limit), timeout=8, markup=False)
 
-    def _copy_console(self, plan: LogScreen._Download) -> None:
+    def _hold_cache_to_limit(self) -> None:
+        """Worker thread. After a console was kept: the jobs used least recently go while the
+        cache is over its limit. Run once the pane has the console, as the pass reads the size
+        of everything in the cache first."""
+        try:
+            enforce_cache_limit(self._console_dir.parent.parent.parent, limit=self._cache_limit)
+        except Exception:  # noqa: BLE001 - cache cleanup must never stop the view
+            log_traceback("cache limit failed")
+
+    def _copy_console(self, plan: LogScreen._Download) -> bool:
+        """Whether the console is now in the job's cache."""
         tmp = None
         try:
             self._console_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -1354,8 +1366,9 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
             shutil.rmtree(self._console_dir, ignore_errors=True)
             os.replace(tmp, self._console_dir)
             tmp = None
+            return True
         except OSError:
-            pass  # this view keeps reading its temporary copy
+            return False  # this view keeps reading its temporary copy
         finally:
             if tmp is not None:
                 shutil.rmtree(tmp, ignore_errors=True)
@@ -2585,6 +2598,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         ok = False
         problem = None
         recent = False
+        kept = False
         try:
             # The saved console is the whole job's output, minutes for a long job: start it
             # only once Logs is on screen, so a look at another tab doesn't pay for it.
@@ -2597,7 +2611,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
             if plan is not None and self._fetch_consoles(plan):
                 ok = True
                 recent = self._console_may_be_incomplete(plan.seen, plan.ended_at)
-                self._keep_console(plan)
+                kept = self._keep_console(plan)
         except DownloadCancelled:
             pass  # the view closed; the next one resumes from what was saved
         except self._CallbackError:
@@ -2606,8 +2620,12 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
             # Saved consoles are SQL on the job's Experiment: say so when the role can't read it.
             problem = views.access_hint(exc, "saved logs")
             log_traceback(f"saved log {sub_job_id} failed")
-        if not self._post(self._finish_download, ok, problem, recent):
-            self._cleanup_stage()
+        try:
+            if not self._post(self._finish_download, ok, problem, recent):
+                self._cleanup_stage()
+        finally:
+            if kept:  # even if showing the console failed: the copy is in the cache either way
+                self._hold_cache_to_limit()
 
     @dataclass(frozen=True)
     class _Download:

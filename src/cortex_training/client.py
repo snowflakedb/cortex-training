@@ -3482,6 +3482,8 @@ class CortexTrainingClient:
             f".{destination.name}.manifest-*.tmp",
             f".{destination.name}.partial.manifest-*.tmp",
             ".manifest-*.tmp",
+            # A compaction that was killed (see _artifact_download.compact_window).
+            f".{destination.name}.compact-*.tmp",
         )
         # Only files nobody has written to for a while: a download still
         # running in the same directory keeps touching its temp files.
