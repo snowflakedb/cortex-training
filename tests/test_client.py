@@ -8165,10 +8165,6 @@ def _created(message="Statement executed successfully."):
     return _sql_rows(["status"], [[message]])
 
 
-def _role(name):
-    return _sql_rows(["CURRENT_ROLE()"], [[name]])
-
-
 def _sql_error(sqlstate, message):
     """A failed SQL API statement, shaped like the API's error body."""
     return _make_error_response({"code": "000000", "sqlState": sqlstate, "message": message}, 422)
@@ -8281,17 +8277,16 @@ class TestEnsureDatabase:
         c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
         c._session.post.side_effect = [
             _listed(),
-            _sql_error(_NO_CREATE_PRIVILEGE, "Your primary role must have CREATE DATABASE granted on ACCOUNT."),
-            _role("TRAINER"),
+            _sql_error(_NO_CREATE_PRIVILEGE, "Your primary role must have CREATE DATABASE granted on ACCOUNT.")
         ]
         with pytest.raises(nc.DatabaseAccessError) as exc:
             c._send("GET", f"{c.base_url}/test")
         message = str(exc.value)
-        assert message.startswith("Role TRAINER can't find database MY_DB and can't create it.")
-        assert "GRANT CREATE DATABASE ON ACCOUNT TO ROLE TRAINER" in message
-        assert "GRANT USAGE ON DATABASE MY_DB TO ROLE TRAINER" in message
+        assert message.startswith("Role <ROLE> (couldn't determine your role) can't find database MY_DB and can't create it.")
+        assert "GRANT CREATE DATABASE ON ACCOUNT TO ROLE <ROLE>" in message
+        assert "GRANT USAGE ON DATABASE MY_DB TO ROLE <ROLE>" in message
         assert (exc.value.kind, exc.value.name, exc.value.role, exc.value.exists) == (
-            "database", "MY_DB", "TRAINER", None
+            "database", "MY_DB", None, None
         )
         assert exc.value.statement == "CREATE DATABASE IF NOT EXISTS MY_DB"
         assert isinstance(exc.value, RuntimeError)
@@ -8303,14 +8298,13 @@ class TestEnsureDatabase:
         c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
         c._session.post.side_effect = [
             _listed(),
-            _sql_error(_EXISTS_WITHOUT_ACCESS, "Database 'MY_DB' already exists, but current role has no privileges on it."),
-            _role("TRAINER"),
+            _sql_error(_EXISTS_WITHOUT_ACCESS, "Database 'MY_DB' already exists, but current role has no privileges on it.")
         ]
         with pytest.raises(nc.DatabaseAccessError) as exc:
             c._send("GET", f"{c.base_url}/test")
         assert str(exc.value) == (
-            "Database MY_DB exists, but role TRAINER can't access it. Ask an admin to run "
-            "`GRANT USAGE ON DATABASE MY_DB TO ROLE TRAINER`, or use a role or database you can access."
+            "Database MY_DB exists, but role <ROLE> (couldn't determine your role) can't access it. Ask an admin "
+            "to run `GRANT USAGE ON DATABASE MY_DB TO ROLE <ROLE>`, or use a role or database you can access."
         )
         assert exc.value.exists is True
         # No retry: the request cannot succeed until access is granted.
@@ -8319,11 +8313,11 @@ class TestEnsureDatabase:
     def test_other_create_failure_names_the_statement(self):
         c = self._client(schema="PUBLIC")
         c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
-        c._session.post.side_effect = [_listed(), _make_response({}, status_code=202), _role("TRAINER")]
+        c._session.post.side_effect = [_listed(), _make_response({}, status_code=202)]
         with pytest.raises(nc.DatabaseAccessError) as exc:
             c._send("GET", f"{c.base_url}/test")
         assert str(exc.value) == (
-            "Could not create database MY_DB with role TRAINER. "
+            "Could not create database MY_DB with role <ROLE> (couldn't determine your role). "
             "Run `CREATE DATABASE IF NOT EXISTS MY_DB` in Snowsight, or ask an admin to."
         )
 
@@ -8336,17 +8330,14 @@ class TestEnsureDatabase:
         assert c._session.get.call_count == 2
         assert len(self._statements(c)) == 2
 
-    def test_unknown_role_says_your_role(self):
+    def test_pat_clients_never_query_the_role(self):
         c = self._client(schema="PUBLIC")
         c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
-        c._session.post.side_effect = [
-            _listed(),
-            _sql_error(_NO_CREATE_PRIVILEGE, "Insufficient privileges"),
-            _make_error_response({"message": "denied"}, 403),
-        ]
+        c._session.post.side_effect = [_listed(), _sql_error(_NO_CREATE_PRIVILEGE, "Insufficient privileges")]
         with pytest.raises(nc.DatabaseAccessError) as exc:
             c._send("GET", f"{c.base_url}/test")
-        assert str(exc.value).startswith("Your role can't find database MY_DB and can't create it.")
+        assert "SELECT CURRENT_ROLE()" not in self._statements(c)
+        assert exc.value.role is None
         assert "TO ROLE <ROLE>" in str(exc.value)
 
     def test_lowercase_database_name_matches_its_stored_name(self):
@@ -8394,15 +8385,14 @@ class TestEnsureDatabase:
         c._session.post.side_effect = [
             _listed("MY_DB"),
             _listed(),
-            _sql_error(_NO_CREATE_PRIVILEGE, "Insufficient privileges"),
-            _role("TRAINER"),
+            _sql_error(_NO_CREATE_PRIVILEGE, "Insufficient privileges")
         ]
         with pytest.raises(nc.DatabaseAccessError) as exc:
             c._send("GET", f"{c.base_url}/test")
         message = str(exc.value)
-        assert message.startswith("Role TRAINER can't find schema MY_DB.CUSTOM and can't create it.")
-        assert "GRANT CREATE SCHEMA ON DATABASE MY_DB TO ROLE TRAINER" in message
-        assert "GRANT USAGE ON SCHEMA MY_DB.CUSTOM TO ROLE TRAINER" in message
+        assert message.startswith("Role <ROLE> (couldn't determine your role) can't find schema MY_DB.CUSTOM and can't create it.")
+        assert "GRANT CREATE SCHEMA ON DATABASE MY_DB TO ROLE <ROLE>" in message
+        assert "GRANT USAGE ON SCHEMA MY_DB.CUSTOM TO ROLE <ROLE>" in message
 
     def test_hidden_schema_says_it_exists_but_is_not_accessible(self):
         c = self._client(schema="CUSTOM")
@@ -8410,13 +8400,12 @@ class TestEnsureDatabase:
         c._session.post.side_effect = [
             _listed("MY_DB"),
             _listed(),
-            _sql_error(_EXISTS_WITHOUT_ACCESS, "Schema 'CUSTOM' already exists, but current role has no privileges on it."),
-            _role("TRAINER"),
+            _sql_error(_EXISTS_WITHOUT_ACCESS, "Schema 'CUSTOM' already exists, but current role has no privileges on it.")
         ]
         with pytest.raises(nc.DatabaseAccessError) as exc:
             c._send("GET", f"{c.base_url}/test")
-        assert str(exc.value).startswith("Schema MY_DB.CUSTOM exists, but role TRAINER can't access it.")
-        assert "GRANT USAGE ON SCHEMA MY_DB.CUSTOM TO ROLE TRAINER" in str(exc.value)
+        assert str(exc.value).startswith("Schema MY_DB.CUSTOM exists, but role <ROLE> (couldn't determine your role) can't access it.")
+        assert "GRANT USAGE ON SCHEMA MY_DB.CUSTOM TO ROLE <ROLE>" in str(exc.value)
 
 
 # ─── Not-found handling and log-tail stopping ────────────────────────────────
@@ -9546,6 +9535,7 @@ class TestEnsureDatabaseForProfileClients:
         c._session = MagicMock()
         c._auth_provider = MagicMock()
         c._auth_provider.get_token.return_value = "session-token"
+        c._auth_provider.role = "TRAINER"
         c._auth_provider.run_statement.side_effect = statements
         return c
 
@@ -9578,8 +9568,7 @@ class TestEnsureDatabaseForProfileClients:
     def test_hidden_database_uses_the_connector_sqlstate(self):
         c = self._client([
             [],
-            _ConnectorSqlError("42710", "Database 'MY_DB' already exists, but current role has no privileges on it."),
-            [{"current_role()": "TRAINER"}],
+            _ConnectorSqlError("42710", "Database 'MY_DB' already exists, but current role has no privileges on it.")
         ])
         c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
 
@@ -9591,8 +9580,7 @@ class TestEnsureDatabaseForProfileClients:
     def test_no_create_privilege_uses_the_connector_sqlstate(self):
         c = self._client([
             [],
-            _ConnectorSqlError("42501", "Insufficient privileges to operate on account."),
-            [{"current_role()": "TRAINER"}],
+            _ConnectorSqlError("42501", "Insufficient privileges to operate on account.")
         ])
         c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
 
@@ -9608,6 +9596,15 @@ class TestEnsureDatabaseForProfileClients:
             c._send("GET", f"{c.base_url}/test")
         assert self._statements(c) == ["SHOW DATABASES LIKE 'MY_DB'"]
         assert c._db_ensured is True
+
+
+    def test_the_role_comes_from_the_session_not_sql(self):
+        c = self._client([[], _ConnectorSqlError("42501", "Insufficient privileges")])
+        c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
+        with pytest.raises(nc.DatabaseAccessError) as exc:
+            c._send("GET", f"{c.base_url}/test")
+        assert "SELECT CURRENT_ROLE()" not in self._statements(c)
+        assert exc.value.role == "TRAINER"
 
 
 def test_sqlstate_reads_connector_errors_and_sql_api_bodies():

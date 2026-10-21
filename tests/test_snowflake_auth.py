@@ -61,6 +61,7 @@ class FakeConnection:
         self.rest = SimpleNamespace(token=token, server_url=server_url)
         self.database = database
         self.schema = schema
+        self.role = "TRAINER"
         self.close_count = 0
         self._cursor = cursor or FakeCursor()
 
@@ -320,3 +321,12 @@ def test_run_statement_without_a_result_set_returns_no_rows() -> None:
     auth = SnowflakeProfileAuth("training-profile", connect_factory=lambda **_: FakeConnection(cursor=FakeCursor()))
 
     assert auth.run_statement("USE ROLE TRAINER") == []
+
+
+def test_role_comes_from_the_connection_without_sql() -> None:
+    connection = FakeConnection()
+    auth = SnowflakeProfileAuth("training-profile", connect_factory=lambda **_: connection)
+    assert auth.role == "TRAINER"
+    assert connection._cursor.executed == []
+    connection.role = None
+    assert auth.role is None

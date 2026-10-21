@@ -344,7 +344,7 @@ These calls are outside the Cortex Training prefix:
 |---|---|---|---|
 | `/api/v2/{endpoint}` | `GET` | `iter_jobs` | List jobs across the account ([section 5.3](#across-the-account---get-apiv2endpoint)) |
 | `/api/v2/statements` | `POST` | artifact download methods | Resolve the current Snowflake identity |
-| `/api/v2/statements` | `POST` | a PAT client's request that fails with HTTP 400 and code `517602` (once per client); a profile client runs the same statements on its Connector session instead | `SHOW DATABASES`/`SHOW SCHEMAS` to check the configured database and schema; `CREATE ... IF NOT EXISTS` only when not listed; `SELECT CURRENT_ROLE()` for the error message |
+| `/api/v2/statements` | `POST` | a PAT client's request that fails with HTTP 400 and code `517602` (once per client); a profile client runs the same statements on its Connector session instead | `SHOW DATABASES`/`SHOW SCHEMAS` to check the configured database and schema; `CREATE ... IF NOT EXISTS` only when not listed |
 
 ---
 

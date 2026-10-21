@@ -2316,11 +2316,18 @@ class CortexTrainingClient:
         return any(row.get("name") == expected for row in self._run_statement(statement))
 
     def _current_role(self) -> str | None:
+        """The role this client signs in with, without running SQL.
+
+        Profile clients read it from their Connector session, which Snowflake
+        fills at sign-in, even when the profile sets no role. PAT clients have
+        no session, so their role can't be determined.
+        """
+        if self._auth_provider is None:
+            return None
         try:
-            rows = self._run_statement("SELECT CURRENT_ROLE()")
-            return next(iter(rows[0].values())) if rows else None
+            return self._auth_provider.role
         except Exception:
-            logger.debug("Could not read the current role.", exc_info=True)
+            logger.debug("Could not read the session's role.", exc_info=True)
             return None
 
     def _check_database(self) -> list[tuple[str, str]] | None:
@@ -2355,7 +2362,7 @@ class CortexTrainingClient:
     def _access_error(self, kind: str, name: str, statement: str, sqlstate: str | None) -> DatabaseAccessError:
         """Explain a failed CREATE, using its SQLSTATE to tell the cases apart."""
         role = self._current_role()
-        who = f"role {role}" if role else "your role"
+        who = f"role {role}" if role else "role <ROLE> (couldn't determine your role)"
         grantee = role or "<ROLE>"
         full_name = self._full_name(kind, name)
         usage_grant = f"GRANT USAGE ON {kind.upper()} {full_name} TO ROLE {grantee}"
