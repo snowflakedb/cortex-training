@@ -19,7 +19,7 @@ The zone saves the result of each of a training sub-job's ``/fwd-bwd`` and
                  "update_successful": 1.0, "weight_delta_norm_rank0_sample": 0.145}}
 
 Each row carries the numbers its call's result has, as the client got them, so
-nothing is computed here either. The tab has two views of them:
+nothing is computed here either. The tab shows two views of them, one above the other:
 
 - **per step**: each ``step`` row's metrics, against the step;
 - **per call**: each ``fwd_bwd`` row's metrics, against the call, in the order
@@ -65,11 +65,10 @@ FILE_NAME = "training.jsonl"
 OP_FWD_BWD = "fwd_bwd"
 OP_STEP = "step"
 
-# The two views ``v`` switches between.
+# The tab's two views, drawn one after the other: per step, then per call.
 VIEW_STEP = "step"
 VIEW_CALL = "call"
 VIEWS = (VIEW_STEP, VIEW_CALL)
-DEFAULT_VIEW = VIEW_STEP
 VIEW_NAMES = {VIEW_STEP: "per step", VIEW_CALL: "per call"}
 # Shown first in a view, in this order, when its rows have them; the rest follow in the order the
 # file first has them.
@@ -91,11 +90,6 @@ def window_label(window: int | None) -> str:
 def next_window(window: int | None) -> int | None:
     index = WINDOWS.index(window) if window in WINDOWS else 0
     return WINDOWS[(index + 1) % len(WINDOWS)]
-
-
-def next_view(view: str) -> str:
-    index = VIEWS.index(view) if view in VIEWS else 0
-    return VIEWS[(index + 1) % len(VIEWS)]
 
 
 # ─── snapshots ───────────────────────────────────────────────────────────────
@@ -689,7 +683,7 @@ def _runs(cells: str) -> list[str]:
 
 
 def no_metrics_text(sub_job_label: str, status: str, *, training: bool, downloaded: bool,
-                    view: str = DEFAULT_VIEW, old_format: int = 0) -> str:
+                    view: str = VIEW_STEP, old_format: int = 0) -> str:
     """Why the tab has nothing to show for a sub-job in ``view``."""
     if old_format:
         return (f"{sub_job_label}'s {old_format:,} training rows were saved in an earlier format, which "

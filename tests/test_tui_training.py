@@ -224,9 +224,8 @@ def test_a_steps_window_in_the_per_call_view_starts_at_that_steps_first_call():
     assert running.metrics(CALL)[0].window(running.first_x(CALL, 1))[0] == (5, 6, 7)
 
 
-def test_views_cycle():
-    assert [training.next_view(v) for v in training.VIEWS] == [CALL, STEP]
-    assert training.DEFAULT_VIEW == STEP
+def test_both_views_are_drawn_per_step_first():
+    assert training.VIEWS == (STEP, CALL)
 
 
 def test_format_metric():

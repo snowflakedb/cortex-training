@@ -119,29 +119,30 @@ def test_training_tab_downloads_and_draws_each_metric():
             assert c.download_training_metrics.call_args.kwargs["priority"] == [TRAINING]
             status = _text(screen, "#training-status")
             assert "training #0" in status and "step 2" in status and "5 calls" in status
-            assert "per step (v)" in status and "all steps (w)" in status
-            # Per step: the step rows' numbers, as saved.
-            stats = _text(screen, "#training-stats")
-            assert [line.split()[0] for line in stats.splitlines()[1:]] == ["grad_norm", "last_lr", "global_steps"]
+            assert "all steps (w)" in status and "(v)" not in status
+            # Both views on the one tab. Per step first: the step rows' numbers, as saved.
+            stats = _text(screen, "#training-step-stats")
+            assert stats.splitlines()[0] == "Per step"
+            assert [line.split()[0] for line in stats.splitlines()[2:]] == ["grad_norm", "last_lr", "global_steps"]
             assert "0.5 @ 2" in stats  # grad_norm's latest, at step 2
-            charts = _text(screen, "#training-charts")
+            charts = _text(screen, "#training-step-charts")
             assert "grad_norm · per step · all steps" in charts and "avg_loss" not in charts
 
-            # Per call: each call's numbers, as saved, numbered in the order they ran with each one's step.
-            await pilot.press("v")
-            status = _text(screen, "#training-status")
-            assert "per call (v)" in status
-            stats = _text(screen, "#training-stats")
+            # Then per call: each call's numbers, as saved, numbered in the order they ran with each one's step.
+            stats = _text(screen, "#training-call-stats")
+            assert stats.splitlines()[0] == "Per call"
             assert "latest @ call (step)" in stats
-            assert [line.split()[0] for line in stats.splitlines()[1:]] == ["avg_loss", "rank"]
+            assert [line.split()[0] for line in stats.splitlines()[2:]] == ["avg_loss", "rank"]
             assert "0.7 @ 5 (next)" in stats  # the newest call: its step is the one still running
             assert "2.1 @ 1 (1)" in stats  # the max: call 1, of step 1
-            assert "avg_loss · per call · all steps" in _text(screen, "#training-charts")
+            charts = _text(screen, "#training-call-charts")
+            assert "avg_loss · per call · all steps" in charts and "grad_norm" not in charts
 
+            # The window applies to both.
             await pilot.press("w")
             assert "last 100 steps (w)" in _text(screen, "#training-status")
-            await pilot.press("v")
-            assert "per step (v)" in _text(screen, "#training-status")
+            assert "grad_norm · per step · last 100 steps" in _text(screen, "#training-step-charts")
+            assert "avg_loss · per call · last 100 steps" in _text(screen, "#training-call-charts")
             await _settle(app, pilot)
 
     asyncio.run(run())
@@ -170,7 +171,7 @@ def test_training_tab_of_a_job_without_training_downloads_nothing():
         async with app.run_test(size=(120, 40)) as pilot:
             screen = await _open(app, pilot)
             await pilot.press("m")
-            assert await _wait(pilot, lambda: "no training sub-job" in _text(screen, "#training-stats"))
+            assert await _wait(pilot, lambda: "no training sub-job" in _text(screen, "#training-step-stats"))
             assert not c.download_training_metrics.called
             await _settle(app, pilot)
 
@@ -241,7 +242,7 @@ def test_a_job_saved_in_the_earlier_format_says_so_instead_of_nothing_saved():
             await pilot.press("m")
             pane = screen.query_one("#training-tab")
             assert await _wait(pilot, lambda: pane._downloaded and not pane._loading)
-            assert "saved in an earlier format" in _text(screen, "#training-stats")
+            assert "saved in an earlier format" in _text(screen, "#training-step-stats")
             assert "2 rows in an earlier format not shown" in _text(screen, "#training-status")
             await _settle(app, pilot)
 
