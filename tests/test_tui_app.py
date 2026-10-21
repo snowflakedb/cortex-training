@@ -2732,9 +2732,10 @@ def test_highlighting_copies_nothing_until_ctrl_c():
 
 
 async def _demo_list(app, pilot):
-    """The demo's job list, drawn: the screen and its table."""
+    """The demo's job list, drawn whole (not its first pages only): the screen and its table."""
     assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen)
-                       and len(app.screen._job_by_item) >= 2, tries=400)
+                       and len(app.screen._job_by_item) >= 2
+                       and app.screen._scope is not None and not app.screen._scope.loading, tries=400)
     await pilot.pause(0.1)
     return app.screen, app.screen.query_one("#jobs", DataTable)
 
@@ -4085,8 +4086,11 @@ class _PagedDemo(DemoClient):
     set. For the newest jobs' walk: ``fail_at`` is the page (1 is the first) that fails,
     ``unavailable_at`` the one that answers the list is not deployed, ``bad_token_at`` the one
     whose token the service can't open (once), ``running_at`` / ``unknown_at`` the one whose first
-    job is running / of unknown status. ``schema_fails``: the configured schema's list fails.
-    ``pages`` / ``active_pages`` count the pages each walk asked for."""
+    job is running / of unknown status. ``schema_gate`` / ``schema_fails`` hold up or fail the
+    configured schema's list, by either route it reads: the account-wide one scoped to that schema
+    (pages naming this client's own database and schema), and ``list_jobs`` where that one is
+    unavailable; while ``schema_paced``, its scoped pages answer one per ``release_schema()``.
+    ``pages`` / ``active_pages`` / ``schema_pages`` count the pages each walk asked for."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -4097,12 +4101,24 @@ class _PagedDemo(DemoClient):
         self.schema_gate.set()
         self.active_gate = threading.Event()
         self.active_gate.set()
-        self.pages = self.active_pages = 0
+        self.pages = self.active_pages = self.schema_pages = 0
         self._permits = threading.Semaphore(0)
+        self.schema_paced = False
+        self._schema_permits = threading.Semaphore(0)
 
     def release(self, pages: int = 1) -> None:
         for _ in range(pages):
             self._permits.release()
+
+    def release_schema(self, pages: int = 1) -> None:
+        for _ in range(pages):
+            self._schema_permits.release()
+
+    def _configured(self, kwargs: dict) -> bool:
+        """Whether a page is the configured schema's own list: scoped to this client's location."""
+        database, schema = kwargs.get("database"), kwargs.get("schema")
+        return (database is not None and schema is not None
+                and (views.identifier_name(database), views.identifier_name(schema)) == self._location)
 
     def list_jobs(self, *args, **kwargs):
         self.schema_gate.wait(10)
@@ -4111,6 +4127,16 @@ class _PagedDemo(DemoClient):
         return super().list_jobs(*args, **kwargs)
 
     def list_jobs_page(self, **kwargs):
+        if self._configured(kwargs):
+            # The configured schema's own list: the same route, scoped to one schema. Its pages
+            # answer under the gate that list has always had, not the all-schemas walk's.
+            self.schema_pages += 1
+            self.schema_gate.wait(10)
+            if self.schema_paced:
+                self._schema_permits.acquire(timeout=10)
+            if self.schema_fails:
+                raise ConnectionError("schema down")
+            return super().list_jobs_page(**kwargs)
         if kwargs.get("status"):  # the active jobs' walk, read beside the newest
             self.active_pages += 1
             self.active_gate.wait(10)
@@ -4489,7 +4515,12 @@ async def _run_a_slow_active_jobs_walk_after_the_newest_are_in(monkeypatch, then
             assert await _pause_until(pilot, lambda: screen._scope.kind == SCHEMA, seconds=10.0), app.sub_title
             client.active_gate.set()
             await pilot.pause(0.5)
-            assert screen._scope.kind == SCHEMA and app.sub_title.endswith("Current schema: " + screen._schema_label())
+            # ACCOUNT_LIST_MAX_PAGES is 2 here, and the schema's own list is read a page at a time
+            # too, so it stops short as well and says what it holds after naming the schema.
+            assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+            assert screen._scope.kind == SCHEMA
+            assert app.sub_title.endswith(f"Current schema: {screen._schema_label()}, first 2 pages: "
+                                          f"{newest} jobs + every active job (more may exist)"), app.sub_title
             assert client.active_pages == 1  # the walk asked for no page after the one in flight
         await _settle(app, pilot)
 
@@ -4578,7 +4609,11 @@ async def _run_an_account_list_unavailable_after_its_first_pages_says_so():
         assert await _pause_until(pilot, lambda: "Current schema only: " in app.sub_title, seconds=10.0), (
             app.sub_title)
         assert "no account-wide list yet" in app.sub_title
-        assert screen._scope.kind == SCHEMA and len(screen._all_jobs) == schema_jobs
+        # The fallback lists exactly list_jobs' jobs. That route sends no created_after, so it
+        # also holds the schema's jobs older than six months, which the scoped walk leaves out.
+        listed = {views.job_id_of(job) for job in client.list_jobs()}
+        assert screen._scope.kind == SCHEMA and {views.job_id_of(job) for job in screen._all_jobs} == listed
+        assert len(listed) > schema_jobs
         assert screen.check_action("show_list", ("account",)) is True
         assert any("Can't show all schemas" in str(n.message) for n in app._notifications)
         await _settle(app, pilot)
@@ -4586,6 +4621,61 @@ async def _run_an_account_list_unavailable_after_its_first_pages_says_so():
 
 def test_an_account_list_unavailable_after_its_first_pages_says_so():
     asyncio.run(_run_an_account_list_unavailable_after_its_first_pages_says_so())
+
+
+async def _first_schema_page(app, pilot, client):
+    """The configured schema's list as its first page shows, the rest still held back: the screen."""
+    client.release_schema()  # its first page only
+    assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen)
+                       and len(app.screen._all_jobs) == client._ACCOUNT_PAGE_ROWS, tries=400)
+    await pilot.pause(0.2)
+    return app.screen
+
+
+async def _run_the_configured_schemas_list_shows_its_pages_as_they_come():
+    client = _PagedDemo()
+    client.schema_paced = True
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen = await _first_schema_page(app, pilot, client)
+        # The first page shows while the rest are read, and the header says how far it is.
+        assert screen._refreshing and screen._scope.kind == SCHEMA and screen._scope.loading
+        assert len(screen._all_jobs) == client._ACCOUNT_PAGE_ROWS
+        assert app.sub_title == (f"Current schema: {screen._schema_label()}, "
+                                 f"loading older jobs… {client._ACCOUNT_PAGE_ROWS} so far"), app.sub_title
+        client.release_schema(20)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        assert app.sub_title.endswith(f"Current schema: {screen._schema_label()}"), app.sub_title
+        assert len(screen._all_jobs) > client._ACCOUNT_PAGE_ROWS and client.schema_pages > 2
+        await _settle(app, pilot)
+
+
+def test_the_configured_schemas_list_shows_its_pages_as_they_come():
+    asyncio.run(_run_the_configured_schemas_list_shows_its_pages_as_they_come())
+
+
+async def _run_a_while_the_configured_schemas_pages_load_stops_them():
+    client = _PagedDemo()
+    client.schema_paced = True
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen = await _first_schema_page(app, pilot, client)
+        client.gated = True  # the all-schemas list's pages wait too, so its header can be read
+        await pilot.press("a")  # without waiting for the rest of this schema's pages
+        await pilot.pause(0.2)
+        assert app.sub_title == "loading all schemas…  ·  showing the partial current-schema list", app.sub_title
+        asked = client.schema_pages
+        client.release_schema(20)  # the schema's pages in flight answer; no more are asked for
+        client.release(20)
+        assert await _pause_until(pilot, lambda: screen._scope.kind == ACCOUNT and not screen._refreshing,
+                                  seconds=10.0), app.sub_title
+        await pilot.pause(0.3)
+        assert client.schema_pages == asked
+        await _settle(app, pilot)
+
+
+def test_a_while_the_configured_schemas_pages_load_stops_them():
+    asyncio.run(_run_a_while_the_configured_schemas_pages_load_stops_them())
 
 
 async def _run_pages_read_again_from_the_start_keep_the_list_and_the_cursor():

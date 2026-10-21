@@ -496,7 +496,8 @@ class JobListScreen(FollowsPointer, Screen):
             table.add_column(label, width=width, key=label)
 
     def _recent(self) -> list:
-        """The jobs of the retention window (the configured schema's list has older ones too)."""
+        """The jobs of the retention window (``list_jobs``, which the configured schema's list
+        reads where the account-wide route refuses, fails or answers no job, returns older ones too)."""
         now = self._clock()
         return [j for j in self._all_jobs if views.within_retention(j, now)]
 
@@ -522,7 +523,9 @@ class JobListScreen(FollowsPointer, Screen):
             # a was pressed and the other list is still being read: say so first,
             # rather than the scope of the list it replaces.
             if self._partial_stays:
-                shown = "showing the partial all-schemas list"  # the pages a stopped reading
+                # The pages a stopped reading, of whichever list they were.
+                which = "all-schemas" if self._scope.kind == ACCOUNT else "current-schema"
+                shown = f"showing the partial {which} list"
             else:
                 shown = f"list from {self._last_refreshed}" if self._last_refreshed else ""
             bits = [switching, shown]
@@ -530,7 +533,9 @@ class JobListScreen(FollowsPointer, Screen):
             return
         if self._scope is not None and self._scope.loading:
             # The list's first pages: how far it is, in place of when it was refreshed.
-            self.app.sub_title = "  ·  ".join(("all schemas", self._scope_text()))
+            # Only the account-wide list names itself here; the schema's own text already does.
+            bits = ("all schemas" if self._scope.kind == ACCOUNT else "", self._scope_text())
+            self.app.sub_title = "  ·  ".join(bit for bit in bits if bit)
             return
         if self._refreshing:
             refresh_status = "refreshing…"
@@ -568,7 +573,8 @@ class JobListScreen(FollowsPointer, Screen):
         if self._scope is None:
             return ""
         if self._declined and self._scope.kind == SCHEMA:
-            return f"Current schema only: {self._schema_label()} ({self._declined})"
+            # Why a couldn't show all schemas, and still what the list holds when it is cut short.
+            return scope_text(self._scope, location=self._schema_label(), declined=self._declined)
         if self._scope.narrowed:
             # The rows share one location because the walk asked for it, not because the account
             # holds no other, so the header must not claim it covered every schema.
@@ -600,7 +606,8 @@ class JobListScreen(FollowsPointer, Screen):
         # Pages show as they come only where no list of this kind shows yet (the first
         # load, or after a), or where this load narrows to a location the list on screen
         # wasn't read under: a refresh keeps the whole list it has until the next is whole.
-        self._progressive = account and (self._loaded_at is None or self._switching or self._narrowing)
+        # Both lists are read a page at a time; only the account-wide one narrows.
+        self._progressive = self._loaded_at is None or self._switching or (account and self._narrowing)
         self._load_gen += 1
         self._load_worker = self._load_jobs(manual, account, account and self._asked, self._load_gen,
                                             self._progressive, self._load_location)
@@ -876,8 +883,8 @@ class JobListScreen(FollowsPointer, Screen):
     def _pushdown_for(self) -> tuple | None:
         """The ``(database, schema)`` the account-wide walk should ask the service for; None for every schema.
 
-        Only the account-wide list narrows: the configured schema's route names one schema in its
-        URL and takes no such filter.
+        Only the account-wide list narrows: the configured schema's list is already scoped to its
+        one schema.
         """
         if not self._account_wanted():
             return None
@@ -895,8 +902,8 @@ class JobListScreen(FollowsPointer, Screen):
             return
         if self._scope is None or self._scope.kind != ACCOUNT:
             # The configured schema's list is showing (its own, or in place of an unavailable
-            # account-wide one): its route names one schema and takes no such filter, so a
-            # search must not have it read again on every edit.
+            # account-wide one): it is already scoped to its one schema, so a search must not
+            # have it read again on every edit.
             return
         self._narrowing = True
         self._supersede()  # the load in flight read another scope; its pages are not these
@@ -929,8 +936,9 @@ class JobListScreen(FollowsPointer, Screen):
         call_on_screen(self, self._on_jobs, listing, error, account, gen)
 
     def _on_partial(self, gen: int, listing: Listing) -> None:
-        """The first pages of the account-wide list the load ``gen`` reads, shown while it reads the rest."""
-        if gen != self._load_gen or not self._refreshing or not self._account_wanted():
+        """The first pages of the list the load ``gen`` reads, shown while it reads the rest."""
+        wanted = ACCOUNT if self._account_wanted() else SCHEMA
+        if gen != self._load_gen or not self._refreshing or listing.scope.kind != wanted:
             return  # superseded (by a, or a load since): its pages are not the list asked for
         steady = self._partial_gen == gen  # its earlier pages show: the user may be reading them
         self._partial_gen = gen
