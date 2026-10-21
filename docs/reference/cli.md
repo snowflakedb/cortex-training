@@ -715,8 +715,11 @@ for it (for example, because the job ran on an image from before GPU metrics
 were uploaded). `training_metrics` carries no such warning: only training
 sub-jobs save training metrics, and only where the deployment saves them (a job
 opts out with `training_config.save_training_metrics` false), so a sub-job
-without them is simply absent. Two downloads of the same directory at once are
-unsupported.
+without them is simply absent, including one named with `--sub-job`. If the
+training stream fails or is interrupted after the GPU stream finished, the
+command still offers `--resume`, and on an error it prints the GPU result with
+`training_metrics` `null` before exiting 1. Two downloads of the same directory
+at once are unsupported.
 
 ### Job TUI
 

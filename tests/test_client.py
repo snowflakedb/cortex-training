@@ -5968,26 +5968,43 @@ class TestExecutionLogDownload:
 
     def test_an_empty_training_stream_is_named_as_training_metrics(self, tmp_path, monkeypatch):
         """The training stream shares ``_metrics/`` with the GPU one, so its empty line
-        and a missing sub-job's error must not read as if the GPU download failed."""
-        sub = "job-1:training:0"
-        chunk = f"_metrics/{sub}/training.20260904-120001.a.gz"
+        must not read as if the GPU download found nothing."""
         c, _connection, _run_uri = self._gzip_download(monkeypatch, tmp_path, "metrics", [], {})
         monkeypatch.setattr(c, "_job_for_upload_warnings", lambda _: ({"status": "SUCCEEDED"}, None))
         calls = []
         assert c.download_training_metrics("job-1", tmp_path, progress=calls.append) == []
         assert calls == ["training metrics: found 0 chunks\n"]
 
+    def test_a_named_sub_job_without_training_rows_is_left_out_not_an_error(self, tmp_path, monkeypatch):
+        """Only training sub-jobs write training rows, so naming a sampling sub-job beside a
+        training one returns the training one's rows instead of raising NoChunksError."""
+        sub = "job-1:training:0"
+        chunk = f"_metrics/{sub}/training.20260904-120001.a.gz"
         c, _connection, _run_uri = self._gzip_download(
             monkeypatch, tmp_path, "metrics", [chunk], {chunk: b'{"kind": "training"}\n'}
         )
         monkeypatch.setattr(c, "_job_for_upload_warnings", lambda _: ({"status": "SUCCEEDED"}, None))
-        with pytest.raises(nc.NoChunksError) as excinfo:
-            c.download_training_metrics("job-1", tmp_path / "named", sub_job_ids=["job-1:sampling:0"])
-        assert str(excinfo.value) == (
-            "no training metrics chunks for sub-job(s) job-1:sampling:0; "
-            "sub-jobs with training metrics: job-1:training:0"
+
+        result = c.download_training_metrics("job-1", tmp_path, sub_job_ids=[sub, "job-1:sampling:0"])
+        assert [entry["sub_job_id"] for entry in result] == [sub]
+        assert (tmp_path / sub / "training.jsonl").read_bytes() == b'{"kind": "training"}\n'
+
+        # Naming only sub-jobs without rows is an empty result, not an error.
+        assert c.download_training_metrics("job-1", tmp_path / "none", sub_job_ids=["job-1:sampling:0"]) == []
+
+    def test_a_named_sub_job_without_gpu_metrics_still_raises(self, tmp_path, monkeypatch):
+        """The GPU stream keeps raising: every sub-job with GPUs uploads it."""
+        sub = "job-1:training:0"
+        chunk = f"_metrics/{sub}/gpu.20260904-120001.a.gz"
+        c, _connection, _run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "metrics", [chunk], {chunk: b'{"gpu_util_pct": 1}\n'}
         )
-        assert excinfo.value.sub_job_ids == ["job-1:sampling:0"]
+        monkeypatch.setattr(c, "_job_for_upload_warnings", lambda _: ({"status": "SUCCEEDED"}, None))
+        with pytest.raises(nc.NoChunksError) as excinfo:
+            c.download_metrics("job-1", tmp_path, sub_job_ids=["job-1:sampling:0"])
+        assert str(excinfo.value) == (
+            "no metrics chunks for sub-job(s) job-1:sampling:0; sub-jobs with metrics: job-1:training:0"
+        )
 
     def test_download_progress_empty_and_directory_destination(self, tmp_path, monkeypatch):
         c, _connection, _run_uri = self._gzip_download(monkeypatch, tmp_path, "stdout", [], {})

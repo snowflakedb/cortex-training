@@ -2368,51 +2368,64 @@ def test_download_metrics_passes_parallel_and_sub_jobs_and_reports_progress(tmp_
     assert json.loads(stdout.getvalue())["metrics"][0]["filename"] == "gpu.jsonl"
 
 
-def test_download_metrics_of_a_sub_job_without_training_rows_succeeds(tmp_path):
-    """A named sub-job with GPU chunks but no training chunks (a sampling sub-job, an
-    opted-out job, a deployment that doesn't save them) is not a failure: the command
-    keeps its GPU file and reports the training stream as empty."""
-    from cortex_training.client import NoChunksError
-
+def test_download_metrics_interrupted_in_the_training_stream_offers_resume(tmp_path):
+    """The GPU stream has committed its file before the training stream starts, so an
+    interrupt there must say output was saved and offer --resume, not claim nothing was."""
     client = FakeClient()
-    client.training_download_interrupt = NoChunksError(
-        "no training metrics chunks for sub-job(s) job-1:sampling:0; "
-        "sub-jobs with training metrics: none",
-        sub_job_ids=["job-1:sampling:0"],
-        available=[],
-    )
-    stdout = io.StringIO()
+    client.training_download_interrupt = KeyboardInterrupt()
+    stderr = io.StringIO()
 
     rc = cli.main(
-        _base_args()
-        + ["download-metrics", "job-1", "--sub-job", "job-1:sampling:0", "--output-dir", str(tmp_path)],
+        _base_args() + ["download-metrics", "job-1", "--output-dir", str(tmp_path)],
         client_factory=lambda _: client,
-        stdout=stdout,
-        stderr=io.StringIO(),
+        stdout=io.StringIO(),
+        stderr=stderr,
     )
 
-    assert rc == 0
+    assert rc == 130
+    assert (tmp_path / "job-1:training:0" / "gpu.jsonl").exists()
+    assert stderr.getvalue().endswith(f"interrupted; {cli._RESUME_HINT}\n")
+    assert "before any output was saved" not in stderr.getvalue()
+
+
+def test_download_metrics_error_in_the_training_stream_still_reports_the_gpu_stream(tmp_path):
+    """An error from the training stream fails the command, but the finished GPU stream is
+    still printed (so a pipe to jq gets it) and --resume is offered."""
+    client = FakeClient()
+    client.training_download_interrupt = OSError("transient stage listing failure")
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["download-metrics", "job-1", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: client,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert rc == 1
     body = json.loads(stdout.getvalue())
-    assert body["training_metrics"] == []
     assert body["metrics"][0]["filename"] == "gpu.jsonl"
+    assert body["training_metrics"] is None
+    assert "error: transient stage listing failure" in stderr.getvalue()
+    assert cli._FAILED_RESUME_HINT in stderr.getvalue()
 
 
-def test_download_metrics_still_fails_on_other_training_download_errors(tmp_path):
-    """Only a missing training stream is forgiven: any other error from the training
-    download still fails the command and prints no result."""
+def test_download_metrics_interrupted_before_any_stream_saved_says_so(tmp_path):
     client = FakeClient()
-    client.training_download_interrupt = ValueError("chunk will not decompress")
-    stdout = io.StringIO()
+    client.download_interrupt = KeyboardInterrupt()
+    stderr = io.StringIO()
 
     rc = cli.main(
-        _base_args() + ["download-metrics", "job-1", "--strict", "--output-dir", str(tmp_path)],
+        _base_args() + ["download-metrics", "job-1", "--output-dir", str(tmp_path)],
         client_factory=lambda _: client,
-        stdout=stdout,
-        stderr=io.StringIO(),
+        stdout=io.StringIO(),
+        stderr=stderr,
     )
 
-    assert rc != 0
-    assert stdout.getvalue() == ""
+    assert rc == 130
+    assert stderr.getvalue().endswith("interrupted before any output was saved\n")
+    assert not hasattr(client, "training_download_options")  # the training stream never started
 
 
 def test_download_log_stdout_defaults_leave_parallel_to_client(tmp_path):

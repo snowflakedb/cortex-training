@@ -4232,6 +4232,7 @@ class CortexTrainingClient:
         label: str | None = None,
         check_missing: bool | None = None,
         warn_if_stalled: bool = True,
+        skip_missing: bool = False,
         resume: bool = False,
         max_workers: int | None = None,
         progress: Callable[[str], None] | None = None,
@@ -4264,7 +4265,9 @@ class CortexTrainingClient:
         The two metric streams share a stage root, so neither can be derived from
         ``artifact_name``. ``warn_if_stalled`` false skips the warning for a
         running job whose newest chunk is old, for a stream that is written only
-        when the job is asked to do something.
+        when the job is asked to do something. ``skip_missing`` true leaves out a
+        sub-job named in ``sub_job_ids`` that has no chunks instead of raising
+        :class:`NoChunksError`, for a stream only some sub-jobs write.
         """
         # What the warnings call this stream, and whether a sub-job with saved stdout
         # but none of these chunks is worth a warning. Only the GPU stream is: every
@@ -4358,7 +4361,7 @@ class CortexTrainingClient:
                     return {}
                 return stall_check.result(self._STALL_CHECK_WAIT_SECONDS, {})
 
-            if wanted is not None and wanted - set(chunks_by_sub_job):
+            if wanted is not None and wanted - set(chunks_by_sub_job) and not skip_missing:
                 # A named sub-job without chunks is fine only if it has a warning.
                 unsaved = set(stale_warnings()) - set(chunks_by_sub_job)
                 missing = sorted(wanted - set(chunks_by_sub_job) - unsaved)
@@ -4606,7 +4609,9 @@ class CortexTrainingClient:
         Only training sub-jobs have these rows, and only where the deployment
         saves them (a job opts out with ``training_config.save_training_metrics``
         false), so a sub-job without them is not warned about, unlike a sub-job
-        with no GPU metrics.
+        with no GPU metrics. For the same reason, a sub-job named in
+        ``sub_job_ids`` without them is left out of the result rather than
+        raising :class:`NoChunksError`.
         """
         return self._download_gzip_artifacts(
             job_id,
@@ -4622,6 +4627,8 @@ class CortexTrainingClient:
             # Rows are written only when the job is asked for /fwd-bwd or /step, so an
             # idle session or a long rollout between steps is not a stall.
             warn_if_stalled=False,
+            # Only training sub-jobs write them: naming a sampling sub-job is not an error.
+            skip_missing=True,
             resume=resume,
             max_workers=max_workers,
             progress=progress,

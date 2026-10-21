@@ -2914,7 +2914,8 @@ other's file. `cortex-training download-metrics` runs both and reports them as
 Only training sub-jobs have these rows, and only where the deployment saves
 them; a job opts out by setting `training_config.save_training_metrics` to
 `false`. So, unlike the GPU stream, a sub-job with saved stdout and no training
-chunks is not warned about.
+chunks is not warned about, and a sub-job named in `sub_job_ids` without
+training chunks is left out of the result rather than raising `NoChunksError`.
 
 The zone appends one row per successful `/fwd-bwd` call and one per successful
 `/step`, with `"kind": "training"` and `record_version` `2`. Each row holds the
