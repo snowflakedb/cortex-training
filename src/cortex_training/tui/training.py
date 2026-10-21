@@ -79,16 +79,18 @@ LEADING_METRICS = {VIEW_STEP: ("grad_norm", "last_lr"), VIEW_CALL: ("avg_loss",)
 # Numbers a result carries that aren't training signals, left out of a view until ``a`` shows every
 # metric: the step itself (``global_steps``), whether the update ran (said in the header when one
 # didn't, see :attr:`SubJobTraining.failed_updates`), the fixed size of the weight and gradient
-# samples, the worker the result came from (always worker 0), and how requests were packed into
-# model calls.
+# samples, and how requests were packed into model calls.
 UPDATE_SUCCESSFUL = "update_successful"
 HIDDEN_METRICS = {
     VIEW_STEP: frozenset({
         "global_steps", UPDATE_SUCCESSFUL, "weight_delta_rank0_sample_numel", "weight_delta_rank0_sample_bytes",
         "weight_delta_rank0_sample_tensors", "gradient_sample_numel",
     }),
-    VIEW_CALL: frozenset({"rank", "rl_model_calls", "sft_model_calls", "sft_packed_rows"}),
+    VIEW_CALL: frozenset({"rl_model_calls", "sft_model_calls", "sft_packed_rows"}),
 }
+# Also left out, but only while every value is 0: the worker a call's result came from, which is
+# currently always worker 0. A call from another worker is worth seeing, so then it shows.
+HIDDEN_WHILE_ZERO = {VIEW_STEP: frozenset(), VIEW_CALL: frozenset({"rank"})}
 # A metric name is drawn as it is, so only plain names are read; anything else is passed over.
 _NAME = re.compile(r"[A-Za-z0-9_.:/-]{1,64}")
 # The fast filter: a line without this can't be a training row, and isn't parsed.
@@ -146,6 +148,12 @@ def window_stats(xs: tuple[int, ...], values: tuple[float, ...]) -> WindowStats 
     return WindowStats(len(values), values[-1], xs[-1], values[low], xs[low], values[high], xs[high])
 
 
+def _hidden(view: str, series: MetricSeries) -> bool:
+    if series.name in HIDDEN_METRICS[view]:
+        return True
+    return series.name in HIDDEN_WHILE_ZERO[view] and all(value == 0 for value in series.values)
+
+
 @dataclass(frozen=True)
 class SubJobTraining:
     """One sub-job's training metrics, as of one read."""
@@ -168,11 +176,12 @@ class SubJobTraining:
         return len(self.call_steps)
 
     def metrics(self, view: str, *, everything: bool = False) -> tuple[MetricSeries, ...]:
-        """``view``'s metrics; without ``everything``, those in :data:`HIDDEN_METRICS` are left out."""
+        """``view``'s metrics; without ``everything``, those in :data:`HIDDEN_METRICS` are left out, and
+        those in :data:`HIDDEN_WHILE_ZERO` while every value is 0."""
         series = self.call_metrics if view == VIEW_CALL else self.step_metrics
         if everything:
             return series
-        return tuple(item for item in series if item.name not in HIDDEN_METRICS[view])
+        return tuple(item for item in series if not _hidden(view, item))
 
     def hidden(self, view: str) -> int:
         """How many of ``view``'s metrics are left out until every metric is shown."""

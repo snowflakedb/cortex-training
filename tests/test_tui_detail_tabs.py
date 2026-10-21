@@ -21,6 +21,9 @@ from textual.widgets import TabbedContent  # noqa: E402
 from cortex_training import AccountJobListUnavailable  # noqa: E402
 from cortex_training.tui.app import CortexTrainingLogTUI  # noqa: E402
 from cortex_training.tui.logs import LogScreen  # noqa: E402
+from cortex_training.tui import training  # noqa: E402
+from cortex_training.tui.detail_tabs import TrainingPane  # noqa: E402
+from cortex_training.tui.resource import chart_hue  # noqa: E402
 
 TRAINING = "7:training:0"
 
@@ -160,6 +163,51 @@ def test_training_tab_downloads_and_draws_each_metric():
             await _settle(app, pilot)
 
     asyncio.run(run())
+
+
+def test_a_section_whose_every_metric_is_hidden_says_so():
+    async def run():
+        c = _client()
+        # The calls carry only rank, which is 0 throughout: hidden, though the calls were saved.
+        c.download_training_metrics.side_effect = _download([
+            _row(1, call=1, rank=0), _row(1, op="step", grad_norm=0.9), _row(2, call=1, rank=0),
+        ])
+        app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = await _open(app, pilot)
+            await pilot.press("m")
+            pane = screen.query_one("#training-tab")
+            assert await _wait(pilot, lambda: pane._downloaded and not pane._loading)
+            assert "grad_norm" in _text(screen, "#training-step-stats")
+            calls = _text(screen, "#training-call-stats")
+            assert "1 metric, all hidden as bookkeeping (a shows every metric)" in calls
+            assert "saved no calls" not in calls
+            await pilot.press("a")
+            assert "rank" in _text(screen, "#training-call-stats")
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def _name_styles(text) -> dict[str, str]:
+    """Each metric name's style in a stats table (its first span on a line)."""
+    plain = text.plain
+    return {plain[span.start:span.end].strip(): str(span.style) for span in text.spans
+            if plain[span.start:span.end].strip() and plain[span.start - 1:span.start] in ("", "\n")}
+
+
+def test_a_metric_keeps_its_colour_when_every_metric_is_shown():
+    state = training._SubJobState(TRAINING)
+    for step in (1, 2):
+        state.ingest(_row(step, op="step", grad_norm=0.9, global_steps=float(step), weight_delta_norm_rank0_sample=0.1))
+    sub_job = state.snapshot()
+    pane = TrainingPane(MagicMock(), "7", Path("."), job=dict, download=lambda **_: True)
+    hidden = _name_styles(pane._stats_text(sub_job, training.VIEW_STEP, None, 120))
+    pane._everything = True
+    shown = _name_styles(pane._stats_text(sub_job, training.VIEW_STEP, None, 120))
+    assert "global_steps" not in hidden and "global_steps" in shown
+    # weight_delta is the third metric either way, so it has the third colour either way.
+    assert hidden["weight_delta_norm_rank0_sample"] == shown["weight_delta_norm_rank0_sample"] == chart_hue(2)
 
 
 def test_training_tab_download_failure_is_said_in_its_header():

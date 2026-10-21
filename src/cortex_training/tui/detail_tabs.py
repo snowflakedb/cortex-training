@@ -248,6 +248,11 @@ class TrainingPane(_Pane):
     def _metrics(self, sub_job: training.SubJobTraining, view: str) -> tuple[training.MetricSeries, ...]:
         return sub_job.metrics(view, everything=self._everything)
 
+    @staticmethod
+    def _hues(sub_job: training.SubJobTraining, view: str) -> dict[str, str]:
+        """Each metric's colour, by its place among all of ``view``'s metrics, so ``a`` doesn't recolour any."""
+        return {series.name: chart_hue(index) for index, series in enumerate(sub_job.metrics(view, everything=True))}
+
     # ── reading ──
     def reload(self) -> None:
         if self._loading:
@@ -429,8 +434,9 @@ class TrainingPane(_Pane):
         text = Text()
         text.append("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(header)).rstrip()[:width] + "\n",
                     style=CHART_AXIS)
-        for index, row in enumerate(rows):
-            text.append(row[0].ljust(widths[0]), style=chart_hue(index))
+        hues = self._hues(sub_job, view)
+        for row in rows:
+            text.append(row[0].ljust(widths[0]), style=hues[row[0]])
             text.append(("  " + "  ".join(cell.ljust(widths[i + 1]) for i, cell in enumerate(row[1:]))).rstrip())
             text.append("\n")
         return text
@@ -439,8 +445,9 @@ class TrainingPane(_Pane):
         per_row = 2 if width >= _TWO_CHARTS_WIDTH else 1
         gap = 3
         chart_width = (width - gap * (per_row - 1)) // per_row
-        blocks = [self._chart_block(series, view, first, chart_width, chart_hue(index))
-                  for index, series in enumerate(self._metrics(sub_job, view))]
+        hues = self._hues(sub_job, view)
+        blocks = [self._chart_block(series, view, first, chart_width, hues[series.name])
+                  for series in self._metrics(sub_job, view)]
         text = Text()
         for start in range(0, len(blocks), per_row):
             row = blocks[start:start + per_row]

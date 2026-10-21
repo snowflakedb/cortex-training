@@ -1190,9 +1190,10 @@ next tab, round to Logs after the last.
     metric (`a` again hides them): per step, `global_steps` (the step itself),
     `update_successful`, and the fixed size of the weight and gradient samples
     (`weight_delta_rank0_sample_numel`, `_bytes`, `_tensors`,
-    `gradient_sample_numel`); per call, `rank` (the worker the result came
-    from, always 0) and the packing counts (`rl_model_calls`,
-    `sft_model_calls`, `sft_packed_rows`). The header says how many are hidden
+    `gradient_sample_numel`); per call, the packing counts
+    (`rl_model_calls`, `sft_model_calls`, `sft_packed_rows`), and `rank` (the
+    worker the result came from, currently always 0) while every call's is 0:
+    a call from another worker shows it. The header says how many are hidden
     (`5 hidden (a)`), or `all metrics (a)` while they show.
   - The header names the sub-job, its newest step, how many calls were saved,
     the age of the newest row and the window, and with two or more

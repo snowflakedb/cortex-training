@@ -249,6 +249,16 @@ def test_bookkeeping_numbers_are_hidden_until_every_metric_is_shown():
     assert parsed.failed_updates == 0
 
 
+def test_rank_is_hidden_only_while_every_call_came_from_worker_0():
+    from_zero = _parse([_call(1, 1, avg_loss=2.0, rank=0), _call(1, 2, avg_loss=1.9, rank=0)])
+    assert [s.name for s in from_zero.metrics(CALL)] == ["avg_loss"]
+    assert from_zero.hidden(CALL) == 1
+    # A call from another worker is worth seeing, so rank shows by default once one has it.
+    mixed = _parse([_call(1, 1, avg_loss=2.0, rank=0), _call(1, 2, avg_loss=1.9, rank=1)])
+    assert [s.name for s in mixed.metrics(CALL)] == ["avg_loss", "rank"]
+    assert mixed.hidden(CALL) == 0
+
+
 def test_steps_that_skipped_the_update_are_counted():
     parsed = _parse([_step(step, grad_norm=1.0, update_successful=ok) for step, ok in [(1, 1.0), (2, 0.0), (3, 1.0)]])
     assert parsed.failed_updates == 1
