@@ -10,7 +10,7 @@ screen knows it through the ``job`` callable it is given, and fetches its rows
 through the screen's ``download``, which writes into the same cache directory
 as the Resources tab, under the same lock.
 
-The pane's keys (``w``, ``Space``, ``r``) are its own bindings, which win
+The pane's keys (``w``, ``a``, ``Space``, ``r``) are its own bindings, which win
 over the screen's while the focus is inside the pane.
 """
 
@@ -157,6 +157,7 @@ class TrainingPane(_Pane):
 
     BINDINGS = [
         Binding("w", "cycle_window", "Window"),
+        Binding("a", "toggle_everything", "All metrics"),
         Binding("space", "next_sub_job", "Sub-job", key_display="space"),
         Binding("r", "refresh", "Refresh"),
     ]
@@ -171,6 +172,7 @@ class TrainingPane(_Pane):
         self._data = training.TrainingData()
         self._downloaded = False  # a download finished: a sub-job without rows has none
         self._window = training.DEFAULT_WINDOW
+        self._everything = False  # also the metrics in training.HIDDEN_METRICS
         self._pick: str | None = None  # the sub-job Space last showed
 
     # How often the local log is read while the tab is shown: it gains a row the moment a result
@@ -223,7 +225,7 @@ class TrainingPane(_Pane):
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         if action == "next_sub_job":
             return len(self._sub_job_ids()) > 1
-        if action == "cycle_window":
+        if action in ("cycle_window", "toggle_everything"):
             return self._source() is not None
         return True
 
@@ -238,6 +240,13 @@ class TrainingPane(_Pane):
     def action_cycle_window(self) -> None:
         self._window = training.next_window(self._window)
         self.redraw()
+
+    def action_toggle_everything(self) -> None:
+        self._everything = not self._everything
+        self.redraw()
+
+    def _metrics(self, sub_job: training.SubJobTraining, view: str) -> tuple[training.MetricSeries, ...]:
+        return sub_job.metrics(view, everything=self._everything)
 
     # ── reading ──
     def reload(self) -> None:
@@ -311,7 +320,7 @@ class TrainingPane(_Pane):
         self.query_one("#training-status", Static).update(self._status_text(source, sub_job))
         width = self._width()
         # With nothing in either view, the reason is said once rather than under each heading.
-        empty = sub_job is None or not any(sub_job.metrics(view) for view in training.VIEWS)
+        empty = sub_job is None or not any(sub_job.metrics(view, everything=True) for view in training.VIEWS)
         for index, view in enumerate(training.VIEWS):
             stats = self.query_one(f"#training-{view}-stats", Static)
             charts = self.query_one(f"#training-{view}-charts", Static)
@@ -320,8 +329,9 @@ class TrainingPane(_Pane):
                 charts.update("")
                 continue
             heading = Text(training.VIEW_NAMES[view].capitalize() + "\n", style="bold")
-            if not sub_job.metrics(view):
-                stats.update(heading + self._empty_text(source, view))
+            if not self._metrics(sub_job, view):
+                stats.update(heading + (self._all_hidden_text(sub_job, view) if sub_job.metrics(view, everything=True)
+                                        else self._empty_text(source, view)))
                 charts.update("")
                 continue
             first = sub_job.first_x(view, self._window)
@@ -345,12 +355,20 @@ class TrainingPane(_Pane):
                 text.append(f"  ·  newest row {views.fmt_ago(sub_job.newest, datetime.now(timezone.utc))}")
         if source is not None:
             text.append(f"  ·  {training.window_label(self._window)} (w)")
+            hidden = sum(sub_job.hidden(view) for view in training.VIEWS) if sub_job is not None else 0
+            if self._everything:
+                text.append("  ·  all metrics (a)")
+            elif hidden:
+                text.append(f"  ·  {hidden:,} hidden (a)")
         notes = []
         if self._loading:
             notes.append(("cached · refreshing…" if sub_job else "loading training metrics…", CHART_MUTED))
         elif self._error:
             notes.append((f"{'cached · refresh failed' if sub_job else 'training metrics unavailable'}: "
                           f"{self._error}", _WARNING))
+        if sub_job is not None and sub_job.failed_updates:
+            notes.append((f"{sub_job.failed_updates:,} step{'s' if sub_job.failed_updates != 1 else ''} skipped "
+                          "the optimizer update (update_successful ≠ 1)", _WARNING))
         if sub_job is not None and sub_job.skipped:
             notes.append((f"{sub_job.skipped:,} training row{'s' if sub_job.skipped != 1 else ''} skipped "
                           "(malformed or unsupported)", _WARNING))
@@ -381,6 +399,12 @@ class TrainingPane(_Pane):
                                              downloaded=self._downloaded, view=view,
                                              old_format=sub_job.old_format if sub_job else 0))
 
+    @staticmethod
+    def _all_hidden_text(sub_job: training.SubJobTraining, view: str) -> Text:
+        count = sub_job.hidden(view)
+        return Text(f"{count:,} metric{'s' if count != 1 else ''}, all hidden as bookkeeping (a shows every metric)",
+                    style=CHART_MUTED)
+
     def _at(self, sub_job: training.SubJobTraining, view: str, x: int) -> str:
         """Where a value is from: its step, or its call and (in parentheses) that call's step."""
         if view != training.VIEW_CALL:
@@ -390,7 +414,7 @@ class TrainingPane(_Pane):
 
     def _stats_text(self, sub_job: training.SubJobTraining, view: str, first: int | None, width: int) -> Text:
         rows = []
-        for series in sub_job.metrics(view):
+        for series in self._metrics(sub_job, view):
             found = training.window_stats(*series.window(first))
             if found is None:
                 rows.append((series.name, "—", "—", "—"))
@@ -416,7 +440,7 @@ class TrainingPane(_Pane):
         gap = 3
         chart_width = (width - gap * (per_row - 1)) // per_row
         blocks = [self._chart_block(series, view, first, chart_width, chart_hue(index))
-                  for index, series in enumerate(sub_job.metrics(view))]
+                  for index, series in enumerate(self._metrics(sub_job, view))]
         text = Text()
         for start in range(0, len(blocks), per_row):
             row = blocks[start:start + per_row]

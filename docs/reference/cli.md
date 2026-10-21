@@ -1175,20 +1175,30 @@ next tab, round to Logs after the last.
   `/fwd-bwd` calls returned, read from its own `training.jsonl`
   ([Training metrics download](rest-api.md#125-training-metrics-download)),
   which holds a row per call with that call's numbers as the client got them.
-  Nothing is computed: the tab shows each saved number as it is, in two
+  Nothing is computed: the tab shows the saved numbers as they are, in two
   sections, one above the other:
-  - **Per step**: every number in each `/step` result, against
-    the step: `grad_norm` and `last_lr` first, then the rest in the order the
-    rows have them (`global_steps`, `update_successful`, `weight_delta_*`, …).
-  - **Per call**, below it: every number in each `/fwd-bwd` result and its `metrics`,
-    against the call, numbered in the order the calls ran: `avg_loss` first,
-    then the rest (`rank`, `sft_model_calls`, `sft_packed_rows`, or whatever
-    the loss function returns). Each call keeps its own `avg_loss`; a step with
+  - **Per step**: the numbers in each `/step` result, against the step:
+    `grad_norm` and `last_lr` first, then the rest in the order the rows have
+    them (`weight_delta_norm_rank0_sample`,
+    `weight_delta_norm_over_lr_rank0_sample`, …).
+  - **Per call**, below it: the numbers in each `/fwd-bwd` result and its
+    `metrics`, against the call, numbered in the order the calls ran:
+    `avg_loss` first, then whatever the loss function returns (`approx_kl`,
+    `entropy`, `ratio_*`, …). Each call keeps its own `avg_loss`; a step with
     two calls shows two points.
+  - Numbers that aren't training signals are hidden until `a` shows every
+    metric (`a` again hides them): per step, `global_steps` (the step itself),
+    `update_successful`, and the fixed size of the weight and gradient samples
+    (`weight_delta_rank0_sample_numel`, `_bytes`, `_tensors`,
+    `gradient_sample_numel`); per call, `rank` (the worker the result came
+    from, always 0) and the packing counts (`rl_model_calls`,
+    `sft_model_calls`, `sft_packed_rows`). The header says how many are hidden
+    (`5 hidden (a)`), or `all metrics (a)` while they show.
   - The header names the sub-job, its newest step, how many calls were saved,
     the age of the newest row and the window, and with two or more
     training sub-jobs its place among them. `Space` shows the next one.
-    Unreadable rows are counted there.
+    Unreadable rows are counted there, and so are steps whose
+    `update_successful` isn't 1 (`2 steps skipped the optimizer update`).
   - Per metric: latest, min and max over the window, each with where it came
     from (`0.8 @ 2` per step; `0.8 @ 4 (2)` per call: call 4, of step 2), then
     a chart per metric, two per row at 90 cells or wider. The y axis spans the
@@ -1413,6 +1423,7 @@ Keys in the job details view (`/`, `e`, `n`, `p`, `s`, `[` and `]` work on Logs;
 |-----|--------|
 | `l` `g` `m` | Logs / Resources / Training metrics tab, as in the preview, except `l` on Logs (below) |
 | `t` | Next tab, round to Logs after the last |
+| `a` | Show every metric, or hide again the ones that aren't training signals (Training metrics) |
 | `w` | Cycle the window; so does a click on the window in the header, and a click on a window in the selector at the bottom shows it (Resources); `w` also cycles all steps, the last 100 and the last 1,000 (Training metrics) |
 | `Space` | Next sub-job, round to the first after the last, when the job has two or more; the view stays, back to `ALL`. `<` / `>` go back / forward; a click on the sub-job's name in the header goes forward (Resources). On Training metrics, the next training sub-job |
 | `↑` `↓` | Pick GPU Resources or System Resources, `ALL` or one GPU or node in the panel; the charts follow the highlight (Resources) |

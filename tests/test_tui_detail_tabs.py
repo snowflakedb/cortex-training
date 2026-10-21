@@ -74,9 +74,9 @@ def _client(sub_jobs=None, status="RUNNING"):
     # Two steps of two calls each, as the zone saves them: a row per call and a row per step.
     c.download_training_metrics.side_effect = _download([
         _row(1, call=1, avg_loss=2.1, rank=0), _row(1, call=2, avg_loss=1.9, rank=0),
-        _row(1, op="step", grad_norm=0.9, last_lr=1e-5, global_steps=1.0),
+        _row(1, op="step", grad_norm=0.9, last_lr=1e-5, global_steps=1.0, update_successful=1.0),
         _row(2, call=1, avg_loss=1.2, rank=0), _row(2, call=2, avg_loss=0.8, rank=0),
-        _row(2, op="step", grad_norm=0.5, last_lr=1e-5, global_steps=2.0),
+        _row(2, op="step", grad_norm=0.5, last_lr=1e-5, global_steps=2.0, update_successful=0.0),
         _row(None, call=1, avg_loss=0.7, rank=0),  # step 3's first call, before the zone saw a /step
     ])
     return c
@@ -120,10 +120,13 @@ def test_training_tab_downloads_and_draws_each_metric():
             status = _text(screen, "#training-status")
             assert "training #0" in status and "step 2" in status and "5 calls" in status
             assert "all steps (w)" in status and "(v)" not in status
+            # global_steps and update_successful (per step) and rank (per call) are bookkeeping.
+            assert "3 hidden (a)" in status
+            assert "1 step skipped the optimizer update (update_successful ≠ 1)" in status
             # Both views on the one tab. Per step first: the step rows' numbers, as saved.
             stats = _text(screen, "#training-step-stats")
             assert stats.splitlines()[0] == "Per step"
-            assert [line.split()[0] for line in stats.splitlines()[2:]] == ["grad_norm", "last_lr", "global_steps"]
+            assert [line.split()[0] for line in stats.splitlines()[2:]] == ["grad_norm", "last_lr"]
             assert "0.5 @ 2" in stats  # grad_norm's latest, at step 2
             charts = _text(screen, "#training-step-charts")
             assert "grad_norm · per step · all steps" in charts and "avg_loss" not in charts
@@ -132,11 +135,22 @@ def test_training_tab_downloads_and_draws_each_metric():
             stats = _text(screen, "#training-call-stats")
             assert stats.splitlines()[0] == "Per call"
             assert "latest @ call (step)" in stats
-            assert [line.split()[0] for line in stats.splitlines()[2:]] == ["avg_loss", "rank"]
+            assert [line.split()[0] for line in stats.splitlines()[2:]] == ["avg_loss"]
             assert "0.7 @ 5 (next)" in stats  # the newest call: its step is the one still running
             assert "2.1 @ 1 (1)" in stats  # the max: call 1, of step 1
             charts = _text(screen, "#training-call-charts")
-            assert "avg_loss · per call · all steps" in charts and "grad_norm" not in charts
+            assert "avg_loss · per call · all steps" in charts and "grad_norm" not in charts and "rank" not in charts
+
+            # a shows every saved number, and again hides the bookkeeping.
+            await pilot.press("a")
+            assert "all metrics (a)" in _text(screen, "#training-status")
+            assert [line.split()[0] for line in _text(screen, "#training-step-stats").splitlines()[2:]] == \
+                ["grad_norm", "last_lr", "global_steps", "update_successful"]
+            assert [line.split()[0] for line in _text(screen, "#training-call-stats").splitlines()[2:]] == \
+                ["avg_loss", "rank"]
+            await pilot.press("a")
+            assert "3 hidden (a)" in _text(screen, "#training-status")
+            assert "rank" not in _text(screen, "#training-call-stats")
 
             # The window applies to both.
             await pilot.press("w")
