@@ -490,7 +490,10 @@ class TrainingLoader:
         base = (known.identity, known.offset) if stage is not None and known is not None else None
         if base != local.base or local.applied < len(local.pending):
             # The stage or the local log gained rows: drop the local ones the stage has, and every
-            # one before them, since the stage has caught up to there.
+            # one before them, since the stage has caught up to there. That assumes both copies
+            # record calls in the same order. Concurrent /fwd-bwd calls can reach the stage in
+            # the other order, so an earlier call's local row can be dropped before the stage
+            # has it; it reappears with the stage's next batch, which carries it.
             covered = stage.keys if stage is not None else ()
             last = max((i for i, doc in enumerate(local.pending) if row_key(doc) in covered), default=-1)
             if last >= 0:
