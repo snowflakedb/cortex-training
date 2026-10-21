@@ -477,7 +477,7 @@ def download_checkpoint(client: Any, job_id: str, checkpoint_id: str, export: An
 def _report_download(client: Any, job_id: str, checkpoint_id: str, started: float, values: dict, *,
                      error: Optional[BaseException] = None, cancelled: bool = False) -> None:
     try:
-        report = getattr(client, "_emit_operation_outcome", None)  # the --debug client has no telemetry
+        report = getattr(client, "_emit_operation_outcome", None)  # a test's fake client has no telemetry
         if report is not None:
             report("download_checkpoint", started, {"job_id": job_id, "checkpoint_id": checkpoint_id},
                    values=values, error=error, cancelled=cancelled,

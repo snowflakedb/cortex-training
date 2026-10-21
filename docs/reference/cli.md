@@ -730,7 +730,6 @@ including named and configured-default Snowflake profiles:
 ```bash
 cortex-training tui                 # opens the job list of the configured database and schema
 cortex-training tui JOB_ID          # opens that job's dashboard directly
-cortex-training tui --debug         # synthetic jobs, no connection needed
 ```
 
 Without login state, pass connection details the same way as the CLI:
@@ -793,16 +792,7 @@ Pass `--sub-job-id JOB_ID:training:0` to scope the job details to one matching
 sub-job. An unmatched id is shown as an error rather than falling back to a
 different sub-job.
 The error lists the job's sub-job ids; without `JOB_ID`, `--sub-job-id` opens
-that sub-job's job. `--debug` runs against generated jobs and telemetry, and
-keeps its caches in a temporary directory, removed when it ends; the title says
-`(debug)`. Its jobs are in three locations (the configured
-`CORTEX_TRAINING_DB.PUBLIC`, `TEAM_DB.EXPERIMENTS`, and a lowercase
-`"sandbox"."dev"`) and run on the wall clock: live jobs keep logging and
-reporting GPU and node samples (one reports its GPUs only), a placing job
-starts within two minutes, a
-running one is cancelled, a tail gets stuck behind a long line and restarts from
-the end, and others have ended, failed, are `UNKNOWN`, or sit on an Experiment
-this role can't read.
+that sub-job's job.
 
 #### Job list
 

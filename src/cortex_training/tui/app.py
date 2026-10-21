@@ -294,7 +294,7 @@ class CortexTrainingLogTUI(App):
     ENABLE_COMMAND_PALETTE = False
     # How the client connects, set by `cortex-training tui` (never a secret), so
     # the commands the TUI shows to copy connect the same way; None when unknown
-    # (the demo, tests). See views.sign_in_options.
+    # (a test's client). See views.sign_in_options.
     sign_in: dict | None = None
 
     def __init__(self, client, job_id=None, *, sub_job_id=None, poll_interval=1.0, now=None):

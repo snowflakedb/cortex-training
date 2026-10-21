@@ -392,16 +392,16 @@ def test_a_sub_job_with_only_empty_step_rows_still_has_its_step():
     assert parsed.last_step == 4 and parsed.metrics(STEP) == ()
 
 
-def test_the_demo_writes_rows_the_tab_reads_whole():
-    from cortex_training.tui.demo import DemoClient
+def test_the_fake_writes_rows_the_tab_reads_whole():
+    from tests.tui_fake import FakeClient
     from cortex_training.tui import views as tui_views
 
-    client = DemoClient()
+    client = FakeClient()
     job = next(j for j in client.list_jobs() if j["status"] == "RUNNING" and tui_views.job_types(j) == ["training"])
     sub_job = next(sj for sj in job["sub_jobs"] if tui_views.sub_job_kind(sj) == "training")
     from datetime import datetime, timezone
     rows = client._training_rows(client._find(job["job_id"]), sub_job, datetime.now(timezone.utc))
     parsed = training.parse_lines(sub_job["sub_job_id"], [row.encode() for row in rows]).snapshot()
     assert parsed.skipped == 0 and parsed.hidden_names == 0
-    assert parsed.calls == 2 * parsed.last_step  # an SFT demo job: two calls a step
+    assert parsed.calls == 2 * parsed.last_step  # the fake's SFT job: two calls a step
     assert [s.name for s in parsed.metrics(CALL)][0] == "avg_loss"

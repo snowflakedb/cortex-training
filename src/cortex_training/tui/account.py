@@ -278,7 +278,7 @@ def _service_explained(exc: BaseException) -> bool:
 
 def _configured_location(client: Any) -> Optional[tuple]:
     """``(database, schema)`` the client is bound to, to scope a walk to its schema; None when the
-    client doesn't say which (a demo or test client's attributes may be anything).
+    client doesn't say which (a test client's attributes may be anything).
 
     Each name goes out as a SQL identifier, as ``CortexTrainingClient.for_job`` builds them, so a
     quoted or lowercase configured name resolves back to the same schema at the service.

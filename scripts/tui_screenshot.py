@@ -1,14 +1,16 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Save an SVG screenshot of the TUI on its synthetic ``--debug`` jobs.
+"""Save an SVG screenshot of the TUI, read-only, against a real account.
 
-For reviewing how a screen looks without a terminal or a connection:
+For reviewing how a screen looks without a terminal. The account comes from
+``--connection NAME``, else the same configuration ``cortex-training tui``
+reads (``--config``, ``CORTEX_TRAINING_CONFIG``, login state):
 
     python scripts/tui_screenshot.py list.svg
     python scripts/tui_screenshot.py logs.svg --keys "slash,type:gsm8k,enter,enter,wait:1,l,wait:4"
     python scripts/tui_screenshot.py job.svg --size 120x36 --job-id JOB_ID
-    python scripts/tui_screenshot.py list.svg --connection NAME   # a real account, read-only
+    python scripts/tui_screenshot.py list.svg --connection NAME
 
 ``--keys`` is comma-separated Textual key names, plus ``type:TEXT`` (types each
 character) and ``wait:SECONDS``. ``--png`` also writes a PNG beside the SVG
@@ -28,29 +30,28 @@ import tempfile
 from pathlib import Path
 
 
-def _real_client(connection: str):
-    """A client for a Snowflake connection profile, resolved as ``cortex-training tui`` does."""
+def _client(connection: str | None):
+    """A read-only client, resolved as ``cortex-training tui`` does: ``connection``'s
+    Snowflake profile, else whatever the usual configuration gives."""
     import cortex_training._cli as cli
     from cortex_training.tui.__main__ import _build_arg_parser
 
     from cortex_training.client import TUI_SURFACE
 
-    args = cli._resolve_args(_build_arg_parser().parse_args(["--connection", connection]))
+    argv = ["--connection", connection] if connection else []
+    args = cli._resolve_args(_build_arg_parser().parse_args(argv))
     args = cli._normalize_connection_args(args)
     client = cli.build_client(args, cli._load_cortex_training_client_class())
     client._telemetry_surface = TUI_SURFACE  # its calls are the TUI's, as in `cortex-training tui`
+    client.auto_create_database = False  # a screenshot reads; it never creates a database or schema
     return client
 
 
 async def _shoot(out: Path, size: tuple[int, int], keys: list[str], job_id: str | None,
                  connection: str | None) -> None:
     from cortex_training.tui.app import CortexTrainingLogTUI
-    from cortex_training.tui.demo import DemoClient
 
-    client = _real_client(connection) if connection else DemoClient()
-    app = CortexTrainingLogTUI(client, job_id, poll_interval=1.0)
-    if not connection:
-        app.title = "cortex training (debug)"
+    app = CortexTrainingLogTUI(_client(connection), job_id, poll_interval=1.0)
     async with app.run_test(size=size) as pilot:
         await pilot.pause(1.5)
         for key in keys:
@@ -85,17 +86,17 @@ def _to_png(svg: Path) -> Path:
 
 
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(description="Save an SVG screenshot of the TUI on synthetic jobs.")
+    p = argparse.ArgumentParser(description="Save an SVG screenshot of the TUI, read-only, against a real account.")
     p.add_argument("output", help="SVG file to write")
     p.add_argument("--size", default="150x42", help="COLUMNSxROWS (default 150x42)")
     p.add_argument("--keys", default="", help="comma-separated keys to press first")
     p.add_argument("--job-id", help="open this job's dashboard directly")
-    p.add_argument("--connection", help="use this Snowflake connection profile instead of the synthetic jobs")
+    p.add_argument("--connection", help="use this Snowflake connection profile (default: the usual configuration)")
     p.add_argument("--png", action="store_true", help="also write a PNG beside the SVG (needs rsvg-convert)")
     args = p.parse_args(argv)
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-    # Demo names and caches must never land in the real cache dir.
+    # A screenshot's caches must never land in the real cache dir.
     os.environ["CORTEX_TRAINING_TUI_CACHE_DIR"] = tempfile.mkdtemp(prefix="cortex-training-shot-")
     columns, rows = (int(n) for n in args.size.lower().split("x"))
     keys = [k for k in args.keys.split(",") if k]

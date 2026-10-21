@@ -987,8 +987,8 @@ def _quiet_download(method) -> dict:
 
 
 def _download_options(method, options: dict) -> dict:
-    """The ``options`` a client's download method takes: an older client's, or the
-    demo's, takes fewer. A preview's two options go together or not at all."""
+    """The ``options`` a client's download method takes: an older client's, or a
+    test's fake, takes fewer. A preview's two options go together or not at all."""
     try:
         parameters = inspect.signature(method).parameters
     except (TypeError, ValueError):

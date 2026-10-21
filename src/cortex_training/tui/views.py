@@ -1272,7 +1272,7 @@ def location_names(job: Any) -> Optional[tuple]:
 
 def client_location(client: Any) -> Optional[tuple]:
     """``(database_name, schema_name)`` a client is bound to, resolved from its identifiers;
-    None when it doesn't say (a demo or test client's attributes may be anything)."""
+    None when it doesn't say (a test client's attributes may be anything)."""
     db, sch = getattr(client, "database", None), getattr(client, "schema", None)
     if isinstance(db, str) and db.strip() and isinstance(sch, str) and sch.strip():
         return identifier_name(db), identifier_name(sch)

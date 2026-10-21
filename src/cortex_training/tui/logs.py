@@ -2706,7 +2706,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
 
     def _downloads_by_sub_job(self) -> bool:
         """Whether this client's download_stdout_logs takes sub_job_ids and on_chunk
-        (an older client, or the demo's, downloads the whole job at once)."""
+        (an older client, or a test's fake, downloads the whole job at once)."""
         try:
             parameters = inspect.signature(self._client.download_stdout_logs).parameters
         except (TypeError, ValueError):
@@ -2809,7 +2809,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         found = {"database": getattr(self._client, "database", None), "schema": getattr(self._client, "schema", None),
                  "connection": getattr(auth, "connection_name", None),
                  "endpoint": getattr(self._client, "endpoint", None)}
-        # Only real names: a demo or test client's attributes may be anything.
+        # Only real names: a test client's attributes may be anything.
         where = {key: value if isinstance(value, str) and value else None for key, value in found.items()}
         if where["endpoint"] == "cortex-training":
             where["endpoint"] = None

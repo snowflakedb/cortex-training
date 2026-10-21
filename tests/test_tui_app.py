@@ -54,7 +54,7 @@ from cortex_training.tui.account import scope_text  # noqa: E402
 from cortex_training.tui.app import CortexTrainingLogTUI  # noqa: E402
 from cortex_training.tui.job_list import JobListScreen  # noqa: E402
 from cortex_training.tui.logs import LogScreen  # noqa: E402
-from cortex_training.tui.demo import DemoClient  # noqa: E402
+from tests.tui_fake import FakeClient  # noqa: E402
 from cortex_training.tui.theme import ACCENT  # noqa: E402
 from cortex_training.tui import views  # noqa: E402
 from cortex_training.tui.untrusted import printable_client  # noqa: E402
@@ -2753,7 +2753,7 @@ def test_highlighting_copies_nothing_until_ctrl_c():
 
 
 async def _demo_list(app, pilot):
-    """The demo's job list, drawn whole (not its first pages only): the screen and its table."""
+    """The fake's job list, drawn whole (not its first pages only): the screen and its table."""
     assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen)
                        and len(app.screen._job_by_item) >= 2
                        and app.screen._scope is not None and not app.screen._scope.loading, tries=400)
@@ -2827,7 +2827,7 @@ async def _copied(app, pilot, copied):
 async def _run_a_drag_in_a_job_list_cell_highlights_and_copies_just_its_text():
     from cortex_training.tui.clipboard import selected_text
 
-    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    app = CortexTrainingLogTUI(FakeClient(), poll_interval=0.01)
     copied: list[str] = []
     app.copy_to_clipboard = copied.append
     async with app.run_test(size=(130, 40)) as pilot:
@@ -2865,7 +2865,7 @@ def test_a_drag_in_a_job_list_cell_highlights_and_copies_just_its_text():
 
 
 async def _run_a_double_click_that_opens_a_job_leaves_the_list_unhighlighted():
-    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    app = CortexTrainingLogTUI(FakeClient(), poll_interval=0.01)
     async with app.run_test(size=(150, 40)) as pilot:
         screen, table = await _demo_list(app, pilot)
         mouse = _pointer(app, pilot)
@@ -2896,7 +2896,7 @@ def test_a_double_click_that_opens_a_job_leaves_the_list_unhighlighted():
 
 
 async def _run_a_click_on_the_sort_s_name_or_arrow_changes_it():
-    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    app = CortexTrainingLogTUI(FakeClient(), poll_interval=0.01)
     async with app.run_test(size=(130, 40)) as pilot:
         screen, _table = await _demo_list(app, pilot)
         mouse = _pointer(app, pilot)
@@ -2917,7 +2917,7 @@ def test_a_click_on_the_sort_s_name_or_arrow_changes_it():
 
 
 async def _run_a_click_on_the_resources_header_s_sub_job_or_window_switches_it():
-    client = DemoClient()
+    client = FakeClient()
     job = next(j for j in client.list_jobs() if j["status"] == "RUNNING" and len(j["sub_jobs"]) >= 2)
     app = CortexTrainingLogTUI(client, job["job_id"], poll_interval=0.01)
     async with app.run_test(size=(150, 40)) as pilot:
@@ -2948,7 +2948,7 @@ def test_a_click_on_the_resources_header_s_sub_job_or_window_switches_it():
 
 
 async def _run_a_drag_across_job_list_rows_copies_that_span():
-    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    app = CortexTrainingLogTUI(FakeClient(), poll_interval=0.01)
     copied: list[str] = []
     app.copy_to_clipboard = copied.append
     async with app.run_test(size=(200, 40)) as pilot:  # every column in view
@@ -2994,7 +2994,7 @@ def test_a_drag_across_job_list_rows_copies_that_span():
 
 
 async def _run_job_list_clicks_still_click_with_text_selection():
-    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    app = CortexTrainingLogTUI(FakeClient(), poll_interval=0.01)
     async with app.run_test(size=(130, 40)) as pilot:
         screen, table = await _demo_list(app, pilot)
         mouse = _pointer(app, pilot)
@@ -3036,7 +3036,7 @@ def test_job_list_clicks_still_click_with_text_selection():
 
 
 async def _run_the_preview_s_sub_job_table_selects_text():
-    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    app = CortexTrainingLogTUI(FakeClient(), poll_interval=0.01)
     copied: list[str] = []
     app.copy_to_clipboard = copied.append
     async with app.run_test(size=(130, 40)) as pilot:
@@ -3065,7 +3065,7 @@ async def _run_a_job_list_row_s_text_is_its_cells_as_drawn():
     # A row of cells that fit their columns is read from its cells' text, not drawn
     # (copying thousands of rows): it must read as the table draws it, every column.
     for width in (130, 80):  # at 80, job ids are cut short ("…"): those rows are drawn
-        app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+        app = CortexTrainingLogTUI(FakeClient(), poll_interval=0.01)
         async with app.run_test(size=(width, 40)) as pilot:
             _screen, table = await _demo_list(app, pilot)
             read = 0
@@ -3487,8 +3487,8 @@ def test_the_tui_tags_its_client_and_the_job_clients_it_opens(monkeypatch):
         client.close()
 
 
-def test_the_screenshot_script_tags_its_real_client_as_the_tui(monkeypatch):
-    # With --connection it drives the TUI against an account: its calls are the TUI's.
+def test_the_screenshot_script_tags_its_client_as_the_tui_and_creates_nothing(monkeypatch):
+    # It drives the TUI against an account: its calls are the TUI's, and it only reads.
     import importlib.util
 
     import cortex_training._cli as cli
@@ -3505,10 +3505,11 @@ def test_the_screenshot_script_tags_its_real_client_as_the_tui(monkeypatch):
     # Nothing connects: the profile is only named, and no client is built for real.
     monkeypatch.setattr(cli, "build_client", lambda args, cls: built.append(args.connection) or Built())
 
-    client = tui_screenshot._real_client("some-connection")
+    client = tui_screenshot._client("some-connection")
 
     assert built == ["some-connection"]
     assert isinstance(client, Built) and client._telemetry_surface == "tui"
+    assert client.auto_create_database is False  # a screenshot never creates a database or schema
 
 
 @pytest.mark.parametrize(
@@ -3556,7 +3557,7 @@ def test_a_config_the_tui_cannot_use_is_an_error_not_a_traceback(tmp_path, monke
 @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf"])
 def test_the_log_poll_interval_must_be_positive_and_finite(value, capsys):
     with pytest.raises(SystemExit) as exit_:
-        tui_main.run(["--debug", f"--poll-interval={value}"])
+        tui_main.run([f"--poll-interval={value}"])  # refused as the flag is read, before any connection
     assert exit_.value.code == 2
     assert "must be a finite number greater than zero" in capsys.readouterr().err
 
@@ -3863,7 +3864,7 @@ def test_an_ended_job_without_an_end_time_gets_no_upload_hint():
 # The client methods the TUI calls.
 TUI_CALLS = ("get_job", "list_jobs", "list_jobs_page", "for_job", "tail_logs", "download_metrics",
              "download_stdout_logs", "fetch_execution_logs")
-# Parameters of the real client the demo leaves out: the TUI never passes them, or
+# Parameters of the real client the fake leaves out: the TUI never passes them, or
 # checks the client's signature for them first (sub_job_ids, on_chunk, stale_after_seconds,
 # and a download's preview).
 _ENGINE = {"max_workers", "progress", "on_chunk", "sub_job_ids", "strict", "stale_after_seconds",
@@ -3882,11 +3883,11 @@ def _parameters(method, leave_out=frozenset()) -> list:
 
 
 @pytest.mark.parametrize("name", TUI_CALLS)
-def test_the_demo_client_takes_what_the_real_client_takes(name):
+def test_the_fake_client_takes_what_the_real_client_takes(name):
     real = getattr(CortexTrainingClient, name)
     left_out = NOT_IN_DEMO.get(name, set())
     assert left_out <= set(inspect.signature(real).parameters)  # each one left out is still the client's
-    assert _parameters(getattr(DemoClient, name)) == _parameters(real, left_out)
+    assert _parameters(getattr(FakeClient, name)) == _parameters(real, left_out)
 
 
 ESC, BEL = "\x1b", "\x07"
@@ -3964,7 +3965,7 @@ def test_one_job_has_one_cache_wherever_it_was_opened_from():
     # A quoted lower-case name is its own identifier, and another schema is another cache.
     assert _cache_job_id(Client("DB", "ONE"), "J") != _cache_job_id(Client("DB", "TWO"), "J")
     assert _cache_job_id(Client("ONE", "S"), "J") != _cache_job_id(Client("TWO", "S"), "J")
-    # Nothing to key on (the demo, a test double): the job id stands alone.
+    # Nothing to key on (a test double): the job id stands alone.
     assert _cache_job_id(object(), "J") == "J"
 
 
@@ -4106,7 +4107,7 @@ def test_hostile_service_text_never_reaches_the_terminal():
 
 
 async def _run_the_keys_do_what_their_context_means():
-    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    app = CortexTrainingLogTUI(FakeClient(), poll_interval=0.01)
     async with app.run_test(size=(140, 40)) as pilot:
         screen, _table = await _demo_list(app, pilot)
         # a has two bindings on the job list; check_action enables the one for the other list.
@@ -4142,8 +4143,8 @@ def test_the_keys_do_what_their_context_means():
     asyncio.run(_run_the_keys_do_what_their_context_means())
 
 
-class _GatedDemo(DemoClient):
-    """A demo whose job lists (schema and account-level) answer only once ``gate`` is set."""
+class _GatedFake(FakeClient):
+    """A fake whose job lists (schema and account-level) answer only once ``gate`` is set."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -4160,7 +4161,7 @@ class _GatedDemo(DemoClient):
 
 
 async def _run_a_says_at_once_that_it_is_loading_all_schemas(in_flight):
-    client = _GatedDemo()
+    client = _GatedFake()
     app = CortexTrainingLogTUI(client, poll_interval=0.01)
     async with app.run_test(size=(140, 40)) as pilot:
         screen, _table = await _demo_list(app, pilot)
@@ -4192,8 +4193,8 @@ def test_a_says_at_once_that_it_is_loading_all_schemas(in_flight):
     asyncio.run(_run_a_says_at_once_that_it_is_loading_all_schemas(in_flight))
 
 
-class _PagedDemo(DemoClient):
-    """A demo whose account-wide pages of the newest jobs answer one per ``release()`` while
+class _PagedFake(FakeClient):
+    """A fake whose account-wide pages of the newest jobs answer one per ``release()`` while
     ``gated``, and whose active jobs' walk (read beside them) answers while ``active_gate`` is
     set. For the newest jobs' walk: ``fail_at`` is the page (1 is the first) that fails,
     ``unavailable_at`` the one that answers the list is not deployed, ``bad_token_at`` the one
@@ -4287,7 +4288,7 @@ def _all_at_once(client) -> tuple:
 
 
 async def _run_all_schemas_shows_each_page_as_it_comes(refill):
-    client = _PagedDemo()
+    client = _PagedFake()
     app = CortexTrainingLogTUI(client, poll_interval=0.01)
     async with app.run_test(size=(140, 30)) as pilot:
         screen, table = await _demo_list(app, pilot)
@@ -4346,7 +4347,7 @@ async def _run_all_schemas_shows_each_page_as_it_comes(refill):
         assert screen._filter == "status:done"
         assert "so far" not in _info_text(screen) and re.search(r"match(es)? for status:done", _info_text(screen))
         # Whole: what the list read all at once would have shown.
-        keys, scope = _all_at_once(DemoClient())
+        keys, scope = _all_at_once(FakeClient())
         assert {screen._job_key(job) for job in screen._all_jobs} == keys and screen._scope == scope
         assert app.sub_title.endswith("  ·  " + scope_text(scope, location="")), app.sub_title
         assert not any(str(table.get_row_at(i)[0]).endswith("…") for i in range(table.row_count))
@@ -4359,7 +4360,7 @@ def test_all_schemas_shows_each_page_as_it_comes(refill):
 
 
 async def _run_a_cursor_on_a_group_row_stays_on_it_as_pages_come():
-    client = _PagedDemo()
+    client = _PagedFake()
     app = CortexTrainingLogTUI(client, poll_interval=0.01)
     async with app.run_test(size=(140, 30)) as pilot:
         screen, table = await _demo_list(app, pilot)
@@ -4384,7 +4385,7 @@ async def _run_a_cursor_on_a_group_row_stays_on_it_as_pages_come():
 
 
 async def _run_a_list_the_reader_has_not_moved_stays_at_its_top_as_live_jobs_come():
-    client = _PagedDemo()
+    client = _PagedFake()
     client.running_at = 3  # an older job still running comes on page 3, above the cursor
     app = CortexTrainingLogTUI(client, poll_interval=0.01)
     async with app.run_test(size=(140, 40)) as pilot:
@@ -4420,7 +4421,7 @@ def test_a_list_the_reader_has_not_moved_stays_at_its_top_as_live_jobs_come():
 
 
 async def _run_a_reader_who_moved_keeps_their_line_on_every_page_after(how):
-    client = _PagedDemo()
+    client = _PagedFake()
     client.running_at = 3  # a running job comes on page 3, above the cursor
     app = CortexTrainingLogTUI(client, poll_interval=0.01)
     async with app.run_test(size=(140, 40)) as pilot:
@@ -4455,7 +4456,7 @@ def test_a_reader_who_moved_keeps_their_line_on_every_page_after(how):
 
 
 async def _run_e_unfolds_the_jobs_of_later_pages_too_and_then_folds_them_all():
-    client = _PagedDemo()
+    client = _PagedFake()
     app = CortexTrainingLogTUI(client, poll_interval=0.01)
     async with app.run_test(size=(140, 40)) as pilot:
         screen, table = await _demo_list(app, pilot)
@@ -4491,7 +4492,7 @@ def test_e_unfolds_the_jobs_of_later_pages_too_and_then_folds_them_all():
 async def _run_e_holds_for_its_list_and_jobs_a_refresh_adds_start_as_usual(fold):
     from cortex_training.tui.account import Listing
     from cortex_training.tui.account import ListScope
-    app = CortexTrainingLogTUI(_PagedDemo(), poll_interval=0.01)
+    app = CortexTrainingLogTUI(_PagedFake(), poll_interval=0.01)
     async with app.run_test(size=(140, 40)) as pilot:
         screen, table = await _demo_list(app, pilot)
         table.focus()
@@ -4521,7 +4522,7 @@ def test_e_holds_for_its_list_and_jobs_a_refresh_adds_start_as_usual(fold):
 
 
 async def _run_a_that_stops_the_pages_says_at_once_what_the_list_on_screen_is():
-    client = _PagedDemo()
+    client = _PagedFake()
     app = CortexTrainingLogTUI(client, poll_interval=0.01)
     async with app.run_test(size=(140, 40)) as pilot:
         screen, table = await _demo_list(app, pilot)
@@ -4558,7 +4559,7 @@ def _group_rows(table) -> dict:
 
 
 async def _run_an_unknown_job_keeps_the_live_count_open_until_the_newest_jobs_are_in():
-    client = _PagedDemo()
+    client = _PagedFake()
     client.unknown_at = 3  # an unknown job comes on page 3: live, but not among the active jobs
     app = CortexTrainingLogTUI(client, poll_interval=0.01)
     async with app.run_test(size=(140, 40)) as pilot:
@@ -4601,7 +4602,7 @@ def test_an_unknown_job_keeps_the_live_count_open_until_the_newest_jobs_are_in()
 async def _run_a_slow_active_jobs_walk_after_the_newest_are_in(monkeypatch, then):
     from cortex_training.tui import account
     monkeypatch.setattr(account, "ACCOUNT_LIST_MAX_PAGES", 2)  # the newest jobs' walk stops after 2 pages
-    client = _PagedDemo()
+    client = _PagedFake()
     client.active_gate.clear()  # the active jobs' walk takes its time
     app = CortexTrainingLogTUI(client, poll_interval=0.01)
     async with app.run_test(size=(140, 40)) as pilot:
@@ -4649,7 +4650,7 @@ def test_a_cursor_on_a_group_row_stays_on_it_as_pages_come():
 
 
 async def _run_a_fresh_list_of_pages_shows_no_earlier_failure(how):
-    client = _PagedDemo()
+    client = _PagedFake()
     client.schema_fails = how == "r"
     app = CortexTrainingLogTUI(client, poll_interval=0.01)
     async with app.run_test(size=(140, 40)) as pilot:
@@ -4689,7 +4690,7 @@ def test_a_fresh_list_of_pages_shows_no_earlier_failure(how):
 
 
 async def _run_a_failure_of_the_schema_list_after_a_stopped_the_pages_is_the_schema_lists():
-    client = _PagedDemo()
+    client = _PagedFake()
     app = CortexTrainingLogTUI(client, poll_interval=0.01)
     async with app.run_test(size=(140, 40)) as pilot:
         screen, _table = await _demo_list(app, pilot)
@@ -4713,7 +4714,7 @@ def test_a_failure_of_the_schema_list_after_a_stopped_the_pages_is_the_schema_li
 
 
 async def _run_an_account_list_unavailable_after_its_first_pages_says_so():
-    client = _PagedDemo()
+    client = _PagedFake()
     app = CortexTrainingLogTUI(client, poll_interval=0.01)
     async with app.run_test(size=(140, 40)) as pilot:
         screen, _table = await _demo_list(app, pilot)
@@ -4747,7 +4748,7 @@ async def _first_schema_page(app, pilot, client):
 
 
 async def _run_the_configured_schemas_list_shows_its_pages_as_they_come():
-    client = _PagedDemo()
+    client = _PagedFake()
     client.schema_paced = True
     app = CortexTrainingLogTUI(client, poll_interval=0.01)
     async with app.run_test(size=(140, 40)) as pilot:
@@ -4769,7 +4770,7 @@ def test_the_configured_schemas_list_shows_its_pages_as_they_come():
 
 
 async def _run_a_while_the_configured_schemas_pages_load_stops_them():
-    client = _PagedDemo()
+    client = _PagedFake()
     client.schema_paced = True
     app = CortexTrainingLogTUI(client, poll_interval=0.01)
     async with app.run_test(size=(140, 40)) as pilot:
@@ -4793,7 +4794,7 @@ def test_a_while_the_configured_schemas_pages_load_stops_them():
 
 
 async def _run_pages_read_again_from_the_start_keep_the_list_and_the_cursor():
-    client = _PagedDemo()
+    client = _PagedFake()
     app = CortexTrainingLogTUI(client, poll_interval=0.01)
     async with app.run_test(size=(140, 30)) as pilot:
         screen, table = await _demo_list(app, pilot)
@@ -4817,7 +4818,7 @@ async def _run_pages_read_again_from_the_start_keep_the_list_and_the_cursor():
         assert screen._highlighted()[0] == key and table.cursor_row - round(table.scroll_y) == line
         client.release(10)
         assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
-        keys, scope = _all_at_once(DemoClient())
+        keys, scope = _all_at_once(FakeClient())
         assert {screen._job_key(job) for job in screen._all_jobs} == keys and screen._scope == scope
         await _settle(app, pilot)
 
@@ -4827,7 +4828,7 @@ def test_pages_read_again_from_the_start_keep_the_list_and_the_cursor():
 
 
 async def _run_a_or_r_while_all_schemas_loads_supersedes_it_cleanly():
-    client = _PagedDemo()
+    client = _PagedFake()
     app = CortexTrainingLogTUI(client, poll_interval=0.01)
     async with app.run_test(size=(140, 40)) as pilot:
         screen, _table = await _demo_list(app, pilot)
@@ -4860,7 +4861,7 @@ async def _run_a_or_r_while_all_schemas_loads_supersedes_it_cleanly():
         await pilot.press("a")
         assert await _pause_until(pilot, lambda: screen._scope.kind == ACCOUNT and not screen._refreshing,
                                   seconds=10.0)
-        keys, scope = _all_at_once(DemoClient())
+        keys, scope = _all_at_once(FakeClient())
         assert {screen._job_key(job) for job in screen._all_jobs} == keys and screen._scope == scope
         await _settle(app, pilot)
 
@@ -4870,7 +4871,7 @@ def test_a_or_r_while_all_schemas_loads_supersedes_it_cleanly():
 
 
 async def _run_a_page_that_fails_keeps_the_pages_read_and_r_reads_them_again():
-    client = _PagedDemo()
+    client = _PagedFake()
     app = CortexTrainingLogTUI(client, poll_interval=0.01)
     async with app.run_test(size=(140, 40)) as pilot:
         screen, _table = await _demo_list(app, pilot)
@@ -4891,7 +4892,7 @@ async def _run_a_page_that_fails_keeps_the_pages_read_and_r_reads_them_again():
         await pilot.press("r")
         assert await _pause_until(pilot, lambda: not screen._refreshing and screen._list_error is None,
                                   seconds=10.0), app.sub_title
-        keys, scope = _all_at_once(DemoClient())
+        keys, scope = _all_at_once(FakeClient())
         assert {screen._job_key(job) for job in screen._all_jobs} == keys and screen._scope == scope
         assert not notice.display
         await _settle(app, pilot)
@@ -4902,7 +4903,7 @@ def test_a_page_that_fails_keeps_the_pages_read_and_r_reads_them_again():
 
 
 async def _run_a_refresh_of_the_whole_list_shows_it_until_the_next_is_whole():
-    client = _PagedDemo()
+    client = _PagedFake()
     app = CortexTrainingLogTUI(client, poll_interval=0.01)
     async with app.run_test(size=(140, 40)) as pilot:
         screen, _table = await _demo_list(app, pilot)
@@ -4927,7 +4928,7 @@ def test_a_refresh_of_the_whole_list_shows_it_until_the_next_is_whole():
 
 
 async def _run_a_keeps_why_all_schemas_are_unavailable_in_the_header(reason, why):
-    app = CortexTrainingLogTUI(DemoClient(account_list=reason), poll_interval=0.01)
+    app = CortexTrainingLogTUI(FakeClient(account_list=reason), poll_interval=0.01)
     async with app.run_test(size=(140, 40)) as pilot:
         screen, _table = await _demo_list(app, pilot)
         await pilot.press("a")
@@ -4951,7 +4952,7 @@ def test_a_keeps_why_all_schemas_are_unavailable_in_the_header(reason, why):
 
 
 async def _run_the_group_rows_count_the_jobs_under_them():
-    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    app = CortexTrainingLogTUI(FakeClient(), poll_interval=0.01)
     async with app.run_test(size=(140, 44)) as pilot:
         screen, table = await _demo_list(app, pilot)
         await pilot.pause(0.3)
@@ -5268,7 +5269,7 @@ def test_a_finished_job_s_console_shows_its_last_lines_while_the_rest_downloads(
 
 
 async def _account_list(app, pilot):
-    """The demo's account-wide job list (``a``), drawn: the screen and its table."""
+    """The fake's account-wide job list (``a``), drawn: the screen and its table."""
     screen, table = await _demo_list(app, pilot)
     await pilot.press("a")
     assert await _pause_until(pilot, lambda: screen._scope is not None and screen._scope.kind == ACCOUNT
@@ -5278,7 +5279,7 @@ async def _account_list(app, pilot):
 
 
 async def _run_the_schema_column_names_each_jobs_database_and_schema():
-    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    app = CortexTrainingLogTUI(FakeClient(), poll_interval=0.01)
     async with app.run_test(size=(200, 40)) as pilot:  # wide enough for every column
         screen, table = await _account_list(app, pilot)
         labels = [str(column.label) for column in table.columns.values()]
@@ -5297,7 +5298,7 @@ def test_the_schema_column_names_each_jobs_database_and_schema():
 
 
 async def _run_a_whole_location_in_the_search_is_read_from_the_service():
-    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    app = CortexTrainingLogTUI(FakeClient(), poll_interval=0.01)
     async with app.run_test(size=(200, 40)) as pilot:
         screen, _table = await _account_list(app, pilot)
         assert screen._pushdown is None  # every schema, so far
@@ -5328,7 +5329,7 @@ def test_a_whole_location_in_the_search_is_read_from_the_service():
 
 
 async def _run_a_search_that_cannot_narrow_reads_every_schema(text):
-    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    app = CortexTrainingLogTUI(FakeClient(), poll_interval=0.01)
     async with app.run_test(size=(200, 40)) as pilot:
         screen, _table = await _account_list(app, pilot)
         screen.query_one("#jobfilter", Input).value = text
@@ -5348,7 +5349,7 @@ def test_a_search_that_cannot_narrow_reads_every_schema(text):
 
 
 async def _run_a_narrowing_with_no_jobs_says_so_rather_than_failing():
-    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    app = CortexTrainingLogTUI(FakeClient(), poll_interval=0.01)
     async with app.run_test(size=(200, 40)) as pilot:
         screen, _table = await _account_list(app, pilot)
         screen.query_one("#jobfilter", Input).value = "db=NOPE schema=NOPE"

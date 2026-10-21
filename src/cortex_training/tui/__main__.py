@@ -24,8 +24,7 @@ import re
 from pathlib import Path
 
 _CONNECT_HINT = ("to connect, run 'cortex-training login config.json', set CORTEX_TRAINING_CONFIG, pass "
-                 "--config config.json, --connection NAME, --base-url (local/mock), or --host + --pat; "
-                 "or try the TUI without a connection: --debug")
+                 "--config config.json, --connection NAME, --base-url (local/mock), or --host + --pat")
 # Bounds for every TUI read.
 READ_MAX_RETRIES = 2
 READ_TIMEOUT = (10.0, 45.0)
@@ -123,11 +122,6 @@ def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.Argument
     )
     p.add_argument("--no-verify-ssl", action="store_true",
                    help="Disable SSL certificate verification for authenticated requests.")
-    p.add_argument(
-        "--debug",
-        action="store_true",
-        help="Run the TUI on synthetic jobs and telemetry, with no connection (to try it or debug it).",
-    )
     return p
 
 
@@ -149,9 +143,6 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     except ImportError as exc:
         parser.exit(2, f"{parser.prog}: error: the TUI couldn't load ({exc}); reinstall cortex-training, "
                        f"or pip install --upgrade '{_TEXTUAL_REQUIREMENT}'\n")
-
-    if args.debug:
-        return _run_demo(args, CortexTrainingLogTUI)
 
     import cortex_training._cli as cli
 
@@ -237,30 +228,6 @@ def _config_connection(cli, values: dict) -> dict:
     if base_url and not cli._has_url_scheme(base_url) and host is None:
         base_url, host = None, base_url  # the CLI reads a base URL without a scheme as the PAT host
     return {"base_url": base_url, "host": cli._normalize_host(host) if host else None}
-
-
-def _run_demo(args, app_class, *, account_list: str | None = None) -> int:
-    """Run against :class:`~cortex_training.tui.demo.DemoClient` with throwaway local stores."""
-    import tempfile
-
-    from cortex_training.tui.demo import DemoClient
-
-    previous = os.environ.get("CORTEX_TRAINING_TUI_CACHE_DIR")
-    with tempfile.TemporaryDirectory(prefix="cortex-training-demo-") as cache:
-        # Demo caches must never land in the real cache dir.
-        os.environ["CORTEX_TRAINING_TUI_CACHE_DIR"] = cache
-        try:
-            client = DemoClient(account_list=account_list)
-            app = app_class(client, args.job_id, sub_job_id=args.sub_job_id, poll_interval=args.poll_interval)
-            app.title = "cortex training (debug)"  # synthetic jobs: say so on every screen
-            app.run()
-        finally:
-            # In-process callers (and tests) must not keep pointing at the deleted dir.
-            if previous is None:
-                os.environ.pop("CORTEX_TRAINING_TUI_CACHE_DIR", None)
-            else:
-                os.environ["CORTEX_TRAINING_TUI_CACHE_DIR"] = previous
-    return app.return_code or 0
 
 
 if __name__ == "__main__":
