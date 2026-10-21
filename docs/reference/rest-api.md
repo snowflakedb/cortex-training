@@ -385,8 +385,10 @@ outer body, the non-empty list, the training-sub-job count, and each sub-job's
 `job_type` for the unsupported log-probability spellings before forwarding it.
 It also normalizes every `peft_config` the body carries, rewriting it in
 place and rejecting an invalid one before the request is sent (see
-[section 8.2](#82-trainingconfig)). Everything else in a raw body, `optimizer`
-included, is forwarded exactly as given. `cortex-training submit` repeats those
+[section 8.2](#82-trainingconfig)), and rejects a training
+`ds_config.zero_optimization.stage` of 3 or higher (ZeRO-3 is not supported).
+Everything else in a raw body, `optimizer` included, is forwarded exactly as
+given. `cortex-training submit` repeats those
 checks so `--dry-run` fails the same way without a connection.
 
 #### GPU hardware - `hardware`
@@ -1680,7 +1682,10 @@ resized; a `true`/default resume against a different DP/world size fails fast
 with an actionable error. `None` (omitted) uses the server default (`true`).
 
 `extra_training` is merged as open passthrough data, without overriding typed
-keys. Examples include `model_provider`, `ep_size`, `ds_config`,
+keys. `ds_config.zero_optimization.stage` must be 0, 1, or 2: ZeRO-3 is not
+supported and is rejected before the request is sent; for CPU optimizer offload
+use stage 2 with `zero_optimization.offload_optimizer`. Examples include
+`model_provider`, `ep_size`, `ds_config`,
 `activation_checkpointing`, `prime_rl` (deprecated, see
 [below](#prime_rl-block-deprecated)), `router_replay`, `peft_config`,
 `model_options` (see [below](#model_options)), the memory-diagnostics settings

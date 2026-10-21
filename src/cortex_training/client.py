@@ -1063,6 +1063,7 @@ class TrainingConfig(BaseModel):
             raise ValueError("training.optimizer is required and must be a non-empty dict")
         extra = self.model_extra or {}
         _validate_primerl_lm_head_config(extra, location="training.extra")
+        _reject_zero_stage_3(extra.get("ds_config"), location="training.extra.ds_config")
         prime_rl = extra.get("prime_rl")
         if isinstance(prime_rl, dict):
             _validate_primerl_lm_head_config(prime_rl, location="training.extra.prime_rl")
@@ -1306,14 +1307,29 @@ class SubJobConfig(BaseModel):
         return wire
 
 
-def _validate_raw_sub_job_configs(sub_job_configs: list) -> None:
-    """Canonicalize every ``peft_config`` in a raw create-job body, in place.
+def _reject_zero_stage_3(ds_config: Any, *, location: str) -> None:
+    """Reject DeepSpeed ZeRO stage 3, which the service does not support."""
+    zero_config = ds_config.get("zero_optimization") if isinstance(ds_config, dict) else None
+    stage = zero_config.get("stage") if isinstance(zero_config, dict) else None
+    try:
+        stage = int(stage) if stage is not None else None
+    except (TypeError, ValueError):
+        return
+    if stage is not None and stage >= 3:
+        raise ValueError(
+            f"{location}.zero_optimization.stage={stage} (ZeRO-3) is not supported; use stage 1 or 2, "
+            "with zero_optimization.offload_optimizer for CPU optimizer offload."
+        )
 
-    The typed path validates LoRA through :class:`TrainingConfig` /
+
+def _validate_raw_sub_job_configs(sub_job_configs: list) -> None:
+    """Validate a raw create-job body in place: canonicalize every ``peft_config`` and reject ZeRO-3.
+
+    The typed path validates these through :class:`TrainingConfig` /
     :class:`InferenceConfig`; this gives raw bodies the same guarantee so an
-    adapter that weight sync cannot carry is rejected before the request is
-    sent. Everything else in the body, including ``optimizer``, is forwarded as
-    given.
+    adapter that weight sync cannot carry, or an unsupported ZeRO stage, is
+    rejected before the request is sent. Everything else in the body, including
+    ``optimizer``, is forwarded as given.
     """
     for index, sub_job in enumerate(sub_job_configs):
         if not isinstance(sub_job, dict):
@@ -1321,6 +1337,11 @@ def _validate_raw_sub_job_configs(sub_job_configs: list) -> None:
         job_type = _normalized_job_type(sub_job.get("job_type"))
         config_key = "training_config" if job_type == JobType.TRAINING.value else "inference_config"
         job_config = sub_job.get(config_key)
+        if job_type == JobType.TRAINING.value and isinstance(job_config, dict):
+            _reject_zero_stage_3(
+                job_config.get("ds_config"),
+                location=f"sub_job_configs[{index}].training_config.ds_config",
+            )
         peft_config = job_config.get("peft_config") if isinstance(job_config, dict) else None
         if peft_config is None:
             continue
