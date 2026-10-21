@@ -850,7 +850,7 @@ list is whole, the header names it:
 | Header | The list holds |
 |---|---|
 | `Current schema: DB.SCHEMA` | the jobs of the configured database and schema, as the list opens |
-| `Current schema: DB.SCHEMA, newest 2,000 + every active job (more exist)` | the same, cut short as the all-schemas list can be (below, `first 40 pages: …` included): that one schema holds more jobs than one refresh reads |
+| `Current schema: DB.SCHEMA, newest 2,000 + every active job (more exist)` | the same, cut short as the all-schemas list can be (below, `first 40 pages: …` included): that one schema holds more jobs than one refresh reads; and where the account-level list is unavailable, so the schema's list comes whole, when it holds more than 2,000 jobs: `f` shows every one of them, and again the newest 2,000 |
 | `all schemas` | after `a`: the jobs in every database and schema the role can see, from the account-level list; `all schemas (all in DB.SCHEMA)` when every one of them is in the same location |
 | `all schemas, narrowed to DB.SCHEMA` | after a whole `db=` search (see below): the jobs of that one location, asked of the service rather than filtered out of the newest 2,000. A narrowed list cut short reads `narrowed to DB.SCHEMA: newest 2,000 + every active job (more exist)`, and `narrowing to DB.SCHEMA…` while it is read |
 | `newest 2,000 + every active job (more exist)` | the same, cut at the newest 2,000 because more exist, plus the active jobs created before those |
@@ -1035,6 +1035,7 @@ operators shows under it only while it has focus.
 | click `▸` / `▾` | Unfold or fold that job, as `→` / `←` do |
 | `e` | Expand or collapse every job's sub-jobs, also those of jobs that later pages of the list being read bring (jobs a later refresh adds start as usual) |
 | `a` | All schemas / current schema: switch to the account-level list of every database and schema the role can see (the footer's `a All schemas`), or back to the configured one (`a Current schema`) |
+| `f` | All jobs / newest 2,000: when the configured schema's list came whole (the account-level list is unavailable) and holds more than 2,000 jobs, the list shows the newest 2,000 and every active job, as the account-level list does, and search covers those (one that matches none of them says `f searches all N jobs of the schema.`); `f` shows every job of it (drawing tens of thousands takes a few seconds), and again the newest 2,000. Refreshes keep the choice until another list is shown |
 | `ctrl+c` | Copy what is highlighted, else every row in the list with a `Whole ID` column (see above for what each cell copies as); in the preview, the highlight, else the whole preview |
 | `r` | Refresh (the list also refreshes every 60 seconds while it is showing); while it shows the configured schema in place of the account-level list (`Current schema only: DB.SCHEMA (reason)`), `r` asks that list again once a minute has passed since the last ask |
 | `?` | Show or close the keys panel |
@@ -1170,7 +1171,10 @@ next tab, round to Logs after the last.
     `↑↓ node`) when the view has more than one; the footer shows the other
     keys.
   - Telemetry downloads when shown, refreshes every 30 seconds for a running
-    selected sub-job, and refreshes on `r`. While a download runs, the header
+    selected sub-job, and refreshes on `r`. A refresh rebuilds the window on
+    screen and the whole job's (the stats beside every window); `w` to a window
+    not on screen since shows it as it last was, with `refreshing…` in the
+    header, for the moment it takes to rebuild. While a download runs, the header
     counts the selected sub-job's chunks:
     `loading GPU metrics ━━━━━━━━━━━━ 340/1,440 chunks`. A view with nothing to chart shows
     a quiet card instead of the stats and charts: a title (`Waiting for the

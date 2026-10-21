@@ -127,6 +127,10 @@ class ResourceTab:
             return
         self._resource_range = name
         self._render_resource()
+        resource = self._resource_kind_data()
+        if resource is not None and not resource.fresh(name):
+            # A refresh builds only the window on screen: this one is as of its last showing.
+            self._rebuild_resource_window()
 
     def action_cycle_window(self) -> None:
         names = list(RANGES)
@@ -166,6 +170,38 @@ class ResourceTab:
         if grown >= getattr(app, "CACHE_PASS_AFTER_BYTES", float("inf")):
             app.hold_cache_soon()
 
+    @work(thread=True, group="resource-window", exclusive=True)
+    def _rebuild_resource_window(self) -> None:
+        """Worker thread. The window just picked, built from the rows the loader holds, with
+        no download. Under the download lock, as every load is: while a download holds it, its
+        own loads build the window on screen, and this one then finds it built."""
+        worker = get_current_worker()
+        lock = DownloadLock(self._metrics_root)
+        if not lock.acquire(lambda: self._screen_open and not worker.is_cancelled):
+            return
+        loader = resource_loader(self._metrics_root)
+        try:
+            if worker.is_cancelled or not self._screen_open:
+                return
+            data = loader.load(priority=self._resource_source(), window=RANGES.get(self._resource_range),
+                               shown=self._resource_range)
+        except Exception:  # noqa: BLE001 - the window stays as it last was; r rebuilds it with a refresh
+            log_traceback(f"rebuilding the {self._resource_range} window of {self._job_id} failed")
+            return
+        finally:
+            lock.release()
+        if not worker.is_cancelled:
+            self._post(self._accept_rebuilt_window, data, loader)
+
+    def _accept_rebuilt_window(self, data: ResourceData, loader) -> None:
+        """UI thread. A window rebuilt for showing: the data, and nothing of a refresh's state.
+        Only while it is the loader's newest: a refresh that loaded after it may answer first."""
+        if not self._screen_open or data is not loader.last:
+            return
+        self._resource_data = data
+        if self._resource_active():
+            self._render_resource()
+
     @work(thread=True, group="resource")
     def _refresh_resource(self) -> None:
         worker = get_current_worker()
@@ -191,7 +227,7 @@ class ResourceTab:
             # with its newest few minutes.
             source = self._resource_source()
             blank = source not in self._resource_data.kinds and source not in shown_here
-            return loader.load(priority=source, window=RANGES.get(self._resource_range),
+            return loader.load(priority=source, window=RANGES.get(self._resource_range), shown=self._resource_range,
                                on_partial=show_partial if blank else None)
 
         try:
@@ -285,7 +321,8 @@ class ResourceTab:
             if not worker.is_cancelled:
                 try:
                     # Only the lock holder may load; without it, show what the loader read last.
-                    partial = loader.load() if acquired else (loader.last or ResourceData({}))
+                    partial = (loader.load(shown=self._resource_range) if acquired
+                               else (loader.last or ResourceData({})))
                 except Exception:  # noqa: BLE001 - preserve the original refresh error
                     partial = ResourceData({})
                 self._post(
@@ -547,6 +584,8 @@ class ResourceTab:
                 return self._with_progress(source, self._RESOURCE_REFRESHING)
             # A sub-job with nothing of its own after a whole download has none to load.
             return self._with_progress(source, ("refreshing…",) if self._resource_downloaded else (f"loading {what}…",))
+        if resource is not None and not resource.fresh(self._resource_range):
+            return ("refreshing…",)  # the window just picked, as of its last showing, until rebuilt
         if self._resource_error:
             return (("cached · [$warning]refresh failed: $problem[/]", "[$warning]refresh failed: $problem[/]")
                     if cached else (f"[$warning]{what} unavailable: $problem[/]",))

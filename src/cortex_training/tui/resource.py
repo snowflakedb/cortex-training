@@ -185,6 +185,17 @@ class KindResource:
     latest: Mapping[str, float | None] = field(default_factory=dict)
     _frames: Mapping[str, "_Frame"] = field(default_factory=dict, repr=False)
     _views: dict = field(default_factory=dict, repr=False)
+    # The windows whose frame was carried from an earlier snapshot (see ResourceLoader.load's
+    # ``shown``): as of their last showing, and rebuilt once shown again.
+    _stale: frozenset = field(default_factory=frozenset, repr=False)
+    _native: object = field(default=None, repr=False)  # its _Native, for a rebuild of the same rows
+
+    def fresh(self, window: str | None = None) -> bool:
+        """Whether ``window``'s frame, and the whole job's its stats come from, are this
+        snapshot's rather than carried from an earlier one; with None, every window's."""
+        if window is None:
+            return not self._stale
+        return window not in self._stale and "all" not in self._stale
 
     @property
     def unit_ids(self) -> tuple[int, ...]:
@@ -1543,8 +1554,17 @@ def _binned_frame(series: _Series, name: str, capture: _Capture, native: _Native
                          unit_extremes, averages)
 
 
-def _snapshot(series: _Series, partial: bool) -> KindResource:
-    """Everything the UI shows of one kind, built once per change (on the loading thread)."""
+def _snapshot(series: _Series, partial: bool, shown_window: str | None = None,
+              previous: KindResource | None = None, same_rows: bool = False) -> KindResource:
+    """Everything the UI shows of one kind, built once per change (on the loading thread).
+
+    With ``shown_window`` and a ``previous`` snapshot, only the frames of the window on screen and of
+    the whole job (the stats beside every window) are built; the others are carried from
+    ``previous``, marked stale. On a job with hundreds of GPUs the long windows took seconds
+    a refresh, and were rebuilt every refresh whether shown or not. With ``same_rows`` (no row
+    read since ``previous``: a window was picked), only the stale frames asked for are built,
+    and the rest of ``previous`` is carried as it was, fresh or not.
+    """
     series.bin_pending()
     spec = series.spec
     interval = _derived_interval(series)
@@ -1554,16 +1574,27 @@ def _snapshot(series: _Series, partial: bool) -> KindResource:
     slots = series.charted()
     # The fields the header names are in each unit's newest values, but in no chart or stats row.
     shown = [slot for slot in slots if series.fields[slot].key not in spec.constant]
-    native = _Native(series, hold_s, shown)
+    reuse = same_rows and previous is not None and previous._native is not None
+    native = previous._native if reuse else _Native(series, hold_s, shown)
     raw_covers_job = series.raw_start <= series.chart_start
-    frames = {
-        name: (
-            _raw_frame(series, name, duration, capture, native, hold_s, shown)
-            if duration is not None or raw_covers_job
-            else _binned_frame(series, name, capture, native, shown)
-        )
-        for name, duration in RANGES.items()
-    }
+    if shown_window is None or previous is None:
+        wanted = None
+    elif same_rows:
+        wanted = {name for name in (shown_window, "all") if name in previous._stale}
+    else:
+        wanted = {shown_window, "all"}
+    frames = {}
+    stale = set()
+    for name, duration in RANGES.items():
+        carried = previous._frames.get(name) if wanted is not None and name not in wanted else None
+        if carried is not None:
+            frames[name] = carried
+            if not same_rows or name in previous._stale:
+                stale.add(name)
+        else:
+            frames[name] = (_raw_frame(series, name, duration, capture, native, hold_s, shown)
+                            if duration is not None or raw_covers_job
+                            else _binned_frame(series, name, capture, native, shown))
     metrics = []
     for slot in shown:
         column = series.fields[slot]
@@ -1602,6 +1633,8 @@ def _snapshot(series: _Series, partial: bool) -> KindResource:
         reporting_unit_ids=capture.reporting,
         latest={key: _scaled(capture.mean[slot], factor) for key, slot, factor in zip(keys, slots, factors)},
         _frames=frames,
+        _stale=frozenset(stale),
+        _native=native,
     )
 
 
@@ -1663,8 +1696,14 @@ class ResourceLoader:
         priority: str | None = None,
         window: timedelta | None = None,
         on_partial: Callable[[ResourceData], None] | None = None,
+        shown: str | None = None,
     ) -> ResourceData:
-        """Read changes, publishing a priority file's newest window first."""
+        """Read changes, publishing a priority file's newest window first.
+
+        ``shown``, the window on screen (a key of RANGES), builds only its frame and the whole
+        job's on a change, carrying the rest from the snapshot before (see KindResource.fresh);
+        None builds every window.
+        """
         present: dict[str, tuple[Path, list[str], int]] = {}
         for path in _metric_files(self.metrics_root):
             manifest = _read_manifest(path)
@@ -1685,7 +1724,7 @@ class ResourceLoader:
                 # A partial failed update must restart to avoid double counting.
                 self._files.pop(sub_job_id, None)
                 raise
-        data = self._data(set())
+        data = self._data(set(), shown)
         self.last = data
         return data
 
@@ -1711,7 +1750,7 @@ class ResourceLoader:
         return ResourceData(kinds={sub_job_id: found} if found else {},
                             ignored_rows_by_sub_job={sub_job_id: state.ignored} if state.ignored else {})
 
-    def _data(self, partial: set[str]) -> ResourceData:
+    def _data(self, partial: set[str], shown: str | None = None) -> ResourceData:
         ignored: dict[str, int] = {}
         kinds: dict[str, dict[str, KindResource]] = {}
         for sub_job_id in sorted(self._files):
@@ -1727,8 +1766,10 @@ class ResourceLoader:
                     resource = _snapshot(series, True)
                 else:
                     built = state.built.get(kind)
-                    if built is None or built[0] != series.version:
-                        resource = _snapshot(series, False)
+                    if built is None or built[0] != series.version or not built[1].fresh(shown):
+                        # The first snapshot builds every window, so none is ever missing.
+                        resource = _snapshot(series, False, shown, built[1] if built else None,
+                                             same_rows=built is not None and built[0] == series.version)
                         state.built[kind] = (series.version, resource)
                     else:
                         resource = built[1]

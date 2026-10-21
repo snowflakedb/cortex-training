@@ -1172,7 +1172,7 @@ def narrowable_name(name: str) -> bool:
 
 
 def no_match_message(text: str, query: Query, searched: int, *, cut: str = "", older: Iterable[str] = (),
-                     location: str = "", widen: bool = False, narrow: bool = False) -> str:
+                     location: str = "", widen: bool = False, narrow: bool = False, everything: int = 0) -> str:
     """Explain an empty search, including truncated, old, or wider matches."""
     older = list(older)
     if cut:
@@ -1181,6 +1181,8 @@ def no_match_message(text: str, query: Query, searched: int, *, cut: str = "", o
     else:
         where = f" in {location}" if location else ""
         lines = [f"No jobs match “{text}” among {searched:,} job(s){where} in the last 6 months."]
+    if everything:
+        lines.append(f"  f searches all {everything:,} jobs of the schema.")
     if older:
         many = len(older) > 1
         lines.append(f"  {len(older):,} older job{'s' if many else ''} match{'' if many else 'es'} (the list hides "
