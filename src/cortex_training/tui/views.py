@@ -411,13 +411,6 @@ def sub_job_gpu_text(sj: dict) -> str:
     return str(requested_gpus(sj) or ("0" if sub_job_kind(sj) == "log_prob" else "—"))
 
 
-def short_sub_job_id(sub_job_id: str) -> str:
-    """A ``JOB_ID:TYPE:INDEX`` id with its job id cut to 8 characters, such as
-    ``0a1b2c3d…:training:0``; any other id as it is."""
-    job_id, sep, rest = str(sub_job_id).partition(":")
-    return f"{job_id[:8]}…:{rest}" if sep and rest and len(job_id) > 9 else str(sub_job_id)
-
-
 def job_gpu_cell(job: dict, unit: str = "") -> str:
     """A job's GPU cell: what it requested (``8 H200``, ``8 requested``), else
     ``shared`` when it runs only on another job's GPUs, ``0`` when its only
