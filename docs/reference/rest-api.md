@@ -292,7 +292,7 @@ Paths are relative to the prefix in [section 2.1](#21-base-url).
 |---|---|---|---|
 | `/` | `POST` | `create_job`, `create_job_from_body` | Create a job |
 | `/` | `GET` | `list_jobs` | List jobs, optionally filtered by status |
-| `/models` | `GET` | `list_models` | List active configured models |
+| `/api/v2/cortex-training/models` | `GET` | `list_models` | Account-level active models; not under the schema prefix |
 | `/capacity` | `GET` | `get_capacity`, `get_capacity_breakdown` | Account reservation and GPU usage, optionally broken down |
 | `/{job_id}` | `GET` | `get_job`, `wait_for_job` | Job and sub-job status |
 | `/{job_id}:cancel` | `POST` | `cancel_job` | Cancel a job |
@@ -528,9 +528,11 @@ the configured database. `for_job(job)` returns a client bound to a listed
 job's `database_name` and `schema_name`; it borrows the parent's session and
 creates no database either.
 
-### 5.4 List models - `GET /models`
+### 5.4 List models - `GET /api/v2/cortex-training/models`
 
-This schema-scoped endpoint returns active models configured for new jobs:
+This account-scoped endpoint returns active models configured for new jobs.
+It is not under the database and schema prefix. The server resolves the
+account from the authenticated session:
 
 ```json
 {"models": [{"name": "Qwen/Qwen3-8B"}]}

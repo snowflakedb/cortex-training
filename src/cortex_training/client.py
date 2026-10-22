@@ -2399,8 +2399,18 @@ class CortexTrainingClient:
 
     @_track_operation("list_models")
     def list_models(self) -> list:
-        """Return active models configured for new jobs."""
-        resp = self._send("GET", f"{self._prefix}/models")
+        """Return active models configured for new jobs.
+
+        Account-scoped ``GET /api/v2/{endpoint}/models``. The catalog is not
+        database- or schema-specific, so the configured database and schema
+        are not part of the path. A not-found response does not create the
+        configured database.
+        """
+        resp = self._send(
+            "GET",
+            f"{self.base_url}/api/v2/{self.endpoint}/models",
+            ensure_database=False,
+        )
         return resp.json().get("models", [])
 
     def iter_jobs(

@@ -330,9 +330,10 @@ List active models configured for new jobs:
 cortex-training models
 ```
 
-The command prints `{"models": [{"name": "..."}]}`. This is a policy catalog,
-not a cache-readiness guarantee; a submitted job may wait while model sync
-completes.
+The command prints `{"models": [{"name": "..."}]}`. It calls the account-level
+route and does not use the configured database or schema. This is a policy
+catalog, not a cache-readiness guarantee; a submitted job may wait while model
+sync completes.
 
 ### Show Current GPU Capacity
 

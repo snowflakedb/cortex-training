@@ -2213,7 +2213,9 @@ class TestReadAndControl:
         c = _make_client(get_json={"models": models})
 
         assert c.list_models() == models
-        c._session.get.assert_called_once_with(f"{c._prefix}/models")
+        c._session.get.assert_called_once_with(
+            f"{c.base_url}/api/v2/{c.endpoint}/models"
+        )
 
     def test_cancel_job_uses_colon_action(self):
         c = _make_client(post_json={})
