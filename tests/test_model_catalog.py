@@ -418,7 +418,7 @@ def test_moe_rl_recipes_have_runnable_parallelism():
         assert sampling_config["n_gpus"] == sampling_gpus
         expected_tp = 8 if "qwen3.8-flash-next" in filename else sampling_gpus
         assert sampling_config["vllm_config"]["tensor_parallel_size"] == expected_tp
-        assert sampling_config["vllm_config"]["trust_remote_code"] is True
+        assert "trust_remote_code" not in sampling_config["vllm_config"]
         assert training["job_type"] == "training"
         assert training["model_name"] == model_id
         assert training["dtype"] == "bfloat16"

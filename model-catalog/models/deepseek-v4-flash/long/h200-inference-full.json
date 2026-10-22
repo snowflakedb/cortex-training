@@ -12,7 +12,6 @@
         "max_seq_len": 262144,
         "vllm_config": {
           "tensor_parallel_size": 8,
-          "trust_remote_code": true,
           "gpu_memory_utilization": 0.8,
           "reasoning_parser": "deepseek_v4"
         }

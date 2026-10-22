@@ -12,7 +12,6 @@
         "max_seq_len": 262144,
         "vllm_config": {
           "tensor_parallel_size": 8,
-          "trust_remote_code": true,
           "gpu_memory_utilization": 0.9,
           "max_num_seqs": 16,
           "distributed_executor_backend": "mp",
