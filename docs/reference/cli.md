@@ -323,6 +323,33 @@ export CORTEX_TRAINING_CONFIG=/path/to/config.json
 
 Explicit CLI flags override config values.
 
+To turn a JSON config into a Snowflake connection profile instead:
+
+```bash
+cortex-training login --convert-old-config PATH
+```
+
+It reads the file's `host`, `pat`, `database`, and `schema` (also inside a
+`"connection"` object, and spelled `db`), and asks before signing in with the
+PAT to look up its user and role, to check that Cortex Training is enabled, and
+to check the database. It creates a missing database only after showing the SQL
+and asking. Then it shows every change and asks once:
+
+- it adds a profile with `authenticator = "PROGRAMMATIC_ACCESS_TOKEN"`. The
+  profile is named `cortex-training`, or the next free name (an existing
+  profile is never replaced). Its host is kept as written, and its account is
+  the host's first part;
+- it saves the profile name in `config.json`, with the file's `endpoint`,
+  `poll_interval`, `poll_timeout`, and `verify_ssl` (`no_verify_ssl` becomes
+  `verify_ssl`). When `config.json` already sets one of these differently, it
+  asks which to keep;
+- it saves a copy of the file without the PAT as `PATH.bak`;
+- it deletes the file, and `login.json` if it points to it.
+
+Either every change happens, or every file is put back as it was. If a check
+fails, or the file has no `pat`, or has a `base_url` instead of a `host`, it says
+why and changes nothing. It needs a terminal, and takes no profile name.
+
 ### Manage Existing Jobs
 
 ```bash

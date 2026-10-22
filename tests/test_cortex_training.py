@@ -91,7 +91,7 @@ def test_login_help_shows_the_profile_name(capsys):
         cortex_cli.parse_args(["login", "--help"])
     assert exc.value.code == 0
     help_text = capsys.readouterr().out
-    assert "usage: cortex-training login [-h] [NAME]" in help_text
+    assert "usage: cortex-training login [-h] [--convert-old-config PATH] [NAME]" in help_text
     assert "Connect Cortex Training to your Snowflake account." in help_text
 
 
