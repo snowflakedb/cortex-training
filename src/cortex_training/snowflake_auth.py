@@ -54,7 +54,7 @@ def rest_host(host: str) -> str:
 
     Snowsight shows an account named ``MY_ACCT`` as ``my_acct.<region>...``,
     and the Connector signs in with it. But Snowflake's certificates are
-    wildcards (``*.<region>.snowflakecomputing.com``), and a wildcard can't
+    wildcards (for example, ``*.snowflakecomputing.com``), and a wildcard can't
     match a label containing ``_``, so standard HTTPS clients reject the
     underscore form. Hosts outside Snowflake's domains are returned unchanged.
     """

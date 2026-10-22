@@ -75,7 +75,7 @@ chmod 600 ~/.snowflake/connections.toml
 - **host**: `ACCOUNT.snowflakecomputing.com`, e.g.,
   `myorg-myaccount.snowflakecomputing.com`. Snowsight may show an account name
   with an underscore (`my_acct.…`). Snowflake's certificates are wildcards
-  (`*.<region>.snowflakecomputing.com`), and a wildcard can't match a name
+  (for example, `*.snowflakecomputing.com`), and a wildcard can't match a name
   containing `_`, so the client uses the hyphen form (`my-acct.…`) for its own
   HTTPS calls. Either form works in your profile.
 
