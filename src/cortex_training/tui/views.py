@@ -496,16 +496,28 @@ def _config_value(value: Any) -> str:
 
 
 def _config_order(item: tuple) -> tuple:
-    """By key, ``multiplex_job_id`` first: where a row's GPUs come from, before a cut."""
+    """By key, ``multiplex_job_id`` first: where a sub-job's GPUs come from."""
     return item[0] != "multiplex_job_id", str(item[0])
 
 
-def subjob_config_summary(sj: dict) -> str:
-    """One sub-job's config as submitted, ``key=value`` by key, with nothing added
-    or left out: ``max_seq_len=4096 · n_gpus=8 · optimizer={lr: 1e-05, name: adamw}``.
-    A multiplexed sub-job's ``multiplex_job_id`` comes first, so a cut cell keeps it."""
-    cfg = _type_config(sj)
-    return " · ".join(f"{collapse(key)}={_config_value(value)}" for key, value in sorted(cfg.items(), key=_config_order))
+def subjob_config_items(sj: dict) -> list:
+    """One sub-job's config as submitted, as ``(key, value)`` rows by key, with
+    nothing added or left out. A nested object's keys are dotted under its own
+    (``optimizer.lr``, as the job list's filter spells them); a list stays on one
+    row. A multiplexed sub-job's ``multiplex_job_id`` comes first: where its GPUs
+    come from."""
+    items: list = []
+
+    def walk(prefix: str, cfg: dict) -> None:
+        for key, value in sorted(cfg.items(), key=_config_order):
+            name = f"{prefix}{collapse(key)}"
+            if isinstance(value, dict) and value:
+                walk(f"{name}.", value)
+            else:
+                items.append((name, _config_value(value)))
+
+    walk("", _type_config(sj))
+    return items
 
 
 def preview_facts(job: dict, now: datetime) -> list:

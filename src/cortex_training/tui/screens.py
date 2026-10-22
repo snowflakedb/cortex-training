@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from datetime import datetime
 from datetime import timezone
@@ -55,12 +56,13 @@ def status_text(status) -> Text:
     return Text.assemble((f"{look.glyph} ", look.color), (word.upper(), look.style)) if word != "?" else Text("?")
 
 
-_SUBJOB_COLUMNS = ("Sub-job", "Type", "Status", "Model", "GPUs", "Config")
-_TYPE, _MODEL, _CONFIG = 1, 3, 5
+# The highlighted sub-job's config has a card of its own, under the table.
+_SUBJOB_COLUMNS = ("Sub-job", "Type", "Status", "Model", "GPUs")
+_TYPE, _MODEL = 1, 3
 # Columns dropped and minimum widths tried before horizontal scrolling.
 _TABLE_FITS = (
-    ((), ((_MODEL, 36), (_CONFIG, 24))),
-    ((_TYPE,), ((_MODEL, 36), (_CONFIG, 24), (_MODEL, 10), (_CONFIG, 12))),
+    ((), ((_MODEL, 36),)),
+    ((_TYPE,), ((_MODEL, 36), (_MODEL, 10))),
 )
 
 
@@ -102,7 +104,8 @@ def _fit_text(text: Text, width: int) -> Text:
 
 
 class JobSummaryScreen(FollowsPointer, Screen):
-    """Preview of one job: identity, config, status, and a sub-job breakdown."""
+    """Preview of one job: identity, status, a sub-job breakdown, and the
+    highlighted sub-job's config."""
 
     BINDINGS = [
         ("b", "back", "Back"),
@@ -120,7 +123,8 @@ class JobSummaryScreen(FollowsPointer, Screen):
     ]
 
     # Cards: the job (its head, facts and lifecycle), the callout (its border
-    # colored by _render_health) and the sub-jobs; _inner_width counts the cells
+    # colored by _render_health), the sub-jobs and the highlighted row's config
+    # (the job card's border and padding); _inner_width counts the cells
     # their borders and paddings take. The scrollbar's room is kept while the
     # preview fits, so its text never changes width (and re-wraps at the edge)
     # when a refresh makes it scroll.
@@ -134,6 +138,9 @@ class JobSummaryScreen(FollowsPointer, Screen):
                     border-title-align: left; border-subtitle-align: right; }
     #subjobs { height: auto; max-height: 12; }
     #subjobs > .datatable--header { background: $surface; color: $text-muted; }
+    #config-card { height: auto; margin-top: 1; border: round $border; padding: 0 1;
+                   border-title-align: left; border-subtitle-align: right; }
+    #config { height: auto; }
     """
 
     def __init__(self, client, job_id: str, *, job: dict | None = None,
@@ -151,6 +158,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
         self._fetched_at: str | None = None  # local HH:MM:SS of the last good get_job answer
         self._fetch_error: str | None = None  # why the last get_job gave no copy, until one does
         self._scope_by_row: dict = {}
+        self._sub_job_by_row: dict = {}  # each sub-job row's entry, for the config card
         self._reread_on_resume = False  # set when the details open over this preview
         self._expanded = False  # e: every value whole, however long, and the whole sub-job table
         self._long = False  # some value or table cell is (or, expanded, would be) cut
@@ -166,6 +174,8 @@ class JobSummaryScreen(FollowsPointer, Screen):
             yield Static("", id="health")  # why the job is where it is
             with Vertical(id="subjobs-card"):  # its border says what Enter on a row opens
                 yield SelectableTable(id="subjobs", cursor_type="row")  # its text highlights to copy
+            with Vertical(id="config-card"):  # its title names whose config it is
+                yield Static("", id="config")  # the highlighted row's config, key by key
         yield Footer()
 
     _REFRESH_SECONDS = 60
@@ -259,8 +269,8 @@ class JobSummaryScreen(FollowsPointer, Screen):
         if self._expanded:  # every column, every cell whole: the table scrolls sideways when it must
             labels, fitted = list(_SUBJOB_COLUMNS), subjob_rows
             wider = sum(w + 2 * table.cell_padding for w in _column_widths(labels, fitted)) > table_width
-        long = long or cut
         self._show_table(table, labels, fitted, wider)
+        long = self._render_config(width) or long or cut
         # What Enter (or a click on the highlighted row) opens, then the keys for a
         # table that is cut to fit, or wider than the screen: on the card's border,
         # so they take no row of their own.
@@ -400,22 +410,131 @@ class JobSummaryScreen(FollowsPointer, Screen):
     def _subjob_rows(self, job: dict) -> list:
         """The sub-job table's rows as ``(key, cells)``; also maps each row to its scope."""
         self._scope_by_row = {"all": None}
+        self._sub_job_by_row = {}
         rows = [("all", [Text("▸ entire job", style="bold"), Text(v.job_type_label(job)), status_text(job.get("status")),
-                         Text(", ".join(v.job_models(job)) or "—"), Text(v.job_gpu_cell(job, "requested")),
-                         Text("all sub-jobs", style=theme.MUTED)])]
-        subs = v.sub_jobs(job)
+                         Text(", ".join(v.job_models(job)) or "—"), Text(v.job_gpu_cell(job, "requested"))])]
         if v.is_unknown(job):
             rows.append(("note", [Text("  ? status unavailable", style=theme.WARN), Text(""), status_text("unknown"),
-                                  Text(""), Text(""), Text("configs at creation" if subs else
-                                                           "the service sent no sub-job configs", style=theme.MUTED)]))
-        for i, sj in enumerate(subs):
+                                  Text(""), Text("")]))
+        for i, sj in enumerate(v.sub_jobs(job)):
             key = f"sj-{i}"
             self._scope_by_row[key] = sj.get("sub_job_id")
-            config = v.subjob_config_summary(sj)
+            self._sub_job_by_row[key] = sj
             rows.append((key, [Text(f"  {v.sub_job_label(sj)}"), Text(v.sub_job_type(sj)),
                                status_text(sj.get("status")), Text(str(sj.get("model_name") or "—")),
-                               Text(v.sub_job_gpu_text(sj)), Text(config)]))
+                               Text(v.sub_job_gpu_text(sj))]))
         return rows
+
+    # The config card's columns: each at least this many cells, at most this many
+    # of them, a key column of at most this share of its column, and fewer
+    # columns while less than this share of the keys fit beside their values.
+    _CONFIG_COLUMN_LEAST = 40
+    _CONFIG_COLUMNS_MOST = 3
+    _CONFIG_KEY_SHARE = 0.6
+    _CONFIG_KEYS_BESIDE = 0.8
+
+    def _render_config(self, width: int) -> bool:
+        """Fill the config card for the highlighted row: that sub-job's config, or
+        on the job's row (and the "status unavailable" one), each sub-job's in
+        turn under its name. Return whether a value is (or, expanded, would be) cut."""
+        card = self.query_one("#config-card")
+        subs = list(self._sub_job_by_row.values())
+        picked = self._sub_job_by_row.get(self._highlighted_key())
+        shown = [picked] if picked is not None else subs
+        whose = v.sub_job_label(shown[0]) if len(shown) == 1 else "every sub-job"
+        card.border_title = Content.assemble((" Config ", f"bold {theme.TEXT}"), (f"· {whose} ", theme.MUTED))
+        card.border_subtitle = Content.styled(" as submitted ", theme.MUTED)
+        if not shown:
+            self.query_one("#config", Static).update(
+                Content.styled("the service sent no sub-job configs", theme.FAINT))
+            return False
+        rows, long = [], False
+        for sj in shown:
+            if len(shown) > 1:  # a section per sub-job, after a blank row
+                if rows:
+                    rows.append(Content(""))
+                model = str(sj.get("model_name") or "")
+                rows.append(Content.assemble((v.sub_job_label(sj), f"bold {theme.TEXT}"),
+                                             *([(f"   {v.printable(model)}", theme.MUTED)] if model else [])))
+            items = v.subjob_config_items(sj)
+            if not items:
+                rows.append(Content.styled("no config sent", theme.FAINT))
+                continue
+            grid, cut = self._config_grid(items, width)
+            rows += grid
+            long = long or cut
+        self.query_one("#config", Static).update(Content("\n").join(rows))
+        return long
+
+    @staticmethod
+    def _config_key(key: str) -> Content:
+        """A dotted config key, its parents fainter than its own name."""
+        parent, dot, leaf = key.rpartition(".")
+        return Content.assemble((parent + dot, theme.FAINT), (leaf, theme.MUTED))
+
+    def _config_key_rows(self, key: str, width: int) -> list:
+        """A key too long for its column's key column, whole, in rows of ``width``
+        cells broken after a dot where it can be, each row after the first indented."""
+        rows, row = [], ""
+        for part in (p for segment in re.findall(r"[^.]+\.?|\.", key)
+                     for p in v.wrap_cells(segment, width - 2)):
+            if row and v.cell_width(row) + v.cell_width(part) > (width if not rows else width - 2):
+                rows.append(row)
+                row = ""
+            row += part
+        rows.append(row)
+        # Each row's own parents and name: the key's last segment is its name.
+        return [Content("  " if i else "") + (self._config_key(text) if i == len(rows) - 1
+                                              else Content.styled(text, theme.FAINT))
+                for i, text in enumerate(rows)]
+
+    def _config_grid(self, items: list, width: int) -> tuple:
+        """``(rows, long)``: config ``(key, value)`` rows in ``width`` cells, down
+        as many columns as fit and then the next, each value wrapped beside its
+        key and, without e, cut after a few rows."""
+        most = max(1, min(self._CONFIG_COLUMNS_MOST, len(items),
+                          (width + self._GUTTER) // (self._CONFIG_COLUMN_LEAST + self._GUTTER)))
+        keys = [v.cell_width(key) for key, _ in items]
+        for count in range(most, 0, -1):  # the most columns whose key column holds nearly every key
+            column = (width - self._GUTTER * (count - 1)) // count
+            fits = sum(w <= int(column * self._CONFIG_KEY_SHARE) for w in keys)
+            if fits >= self._CONFIG_KEYS_BESIDE * len(keys):
+                break
+        per = -(-len(items) // count)
+        chunks = [items[i:i + per] for i in range(0, len(items), per)]
+        long = False
+        cells = []  # each column's items, each item its rows
+        for chunk in chunks:
+            # The key column fits the column's longest key within its share; a
+            # longer key takes rows of its own, whole, its value under it.
+            cap = int(column * self._CONFIG_KEY_SHARE)
+            key_width = max([w for w in (v.cell_width(key) for key, _ in chunk) if w <= cap] or [cap])
+            value_width = max(10, column - key_width - 2)
+            pad = Content(" " * (key_width + 2))
+            out = []
+            for key, value in chunk:
+                lines = self._value_lines(value, value_width)
+                if len(lines) > self._VALUE_ROWS:
+                    long = True
+                    if not self._expanded:
+                        lines = self._cut_rows(lines, self._VALUE_ROWS, value_width)
+                values = [Content.styled(line, theme.TEXT) for line in lines]
+                if v.cell_width(key) <= key_width:
+                    label = self._config_key(key) + Content(" " * (key_width - v.cell_width(key) + 2))
+                    out.append([label + values[0], *(pad + value for value in values[1:])])
+                else:
+                    out.append([*self._config_key_rows(key, column), *(pad + value for value in values)])
+            cells.append(out)
+        rows = []
+        for i in range(per):  # the i-th item of each column side by side, as tall as the tallest
+            group = [col[i] if i < len(col) else [] for col in cells]
+            for r in range(max(len(item) for item in group)):
+                row = Content("")
+                for c, item in enumerate(group):
+                    if r < len(item):
+                        row = row + Content(" " * (c * (column + self._GUTTER) - row.cell_length)) + item[r]
+                rows.append(row)
+        return rows, long
 
     def _table_width(self, table: DataTable, rows: int) -> int:
         """Available table cells, accounting for a needed vertical scrollbar."""
@@ -548,13 +667,19 @@ class JobSummaryScreen(FollowsPointer, Screen):
             return
         self._start_fetch()
 
-    def _highlighted_scope(self):
+    def _highlighted_key(self) -> str:
         table = self.query_one("#subjobs", DataTable)
         try:
-            key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+            return table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
         except Exception:  # noqa: BLE001 - empty table
-            key = "all"
-        return self._scope_by_row.get(key)
+            return "all"
+
+    def _highlighted_scope(self):
+        return self._scope_by_row.get(self._highlighted_key())
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if self.query_one("#subjobs", DataTable).columns:  # the config card follows the highlighted row
+            self._refresh_view()
 
     def whole_id(self, key) -> str | None:
         """The whole id of the sub-job on row ``key``, the job's on the "all" row."""

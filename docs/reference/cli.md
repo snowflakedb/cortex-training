@@ -1077,12 +1077,20 @@ was cancelled, terminated or completed. It shows the service's `reason` and
 `reason_details` (a failure always has a reason, `not reported` when none is
 sent), or what the state means, and where to look next. A running job has no
 box unless the service sends a reason. The Sub-jobs card shows type, status
-(a badge such as `● RUNNING`), model, GPUs and the sub-job's config as
-submitted, `key=value` by key (`max_seq_len=4096 · n_gpus=8 · optimizer={lr:
-1e-05, name: adamw}`), with nothing derived added; a multiplexed row's config
-starts with `multiplex_job_id`, the sub-job whose GPUs it runs on. Long cells
-use `…`, narrow screens omit Type, and wider tables scroll with `←` / `→` or `Home` / `End`; the card's bottom border
-says so (`e whole table`, `← → scroll`).
+(a badge such as `● RUNNING`), model and GPUs. Long cells use `…`, narrow
+screens omit Type, and wider tables scroll with `←` / `→` or `Home` / `End`;
+the card's bottom border says so (`e whole table`, `← → scroll`).
+
+The Config card under it follows the highlighted row: that sub-job's config as
+submitted, or, on the entire-job row, each sub-job's under its name. It lists
+one key per row, by key, in as many columns as the screen fits (up to three;
+fewer when the keys are long, so that nearly every key fits beside its value),
+with nothing derived added. A nested object's keys are dotted under their
+parent (`optimizer.lr  1e-05`, as the job list's filter spells them), a list
+stays on one row (`optimizer.betas  [0.9, 0.95]`), and whole-number floats
+drop the `.0`. A multiplexed sub-job's `multiplex_job_id`, the sub-job whose
+GPUs it runs on, comes first. Values longer than three rows are cut with `…`
+until `e`.
 
 Live previews refresh every 60 seconds, on return from details, or on `r`; a
 dim line at the end of the job card reports reads, slow reads and refresh
