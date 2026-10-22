@@ -157,20 +157,46 @@ def _telemetry_disabled() -> bool:
 # timings) are emitted unless the environment says otherwise. Other operations
 # can run thousands of times per job and stay failure-only by default.
 _SUCCESS_TELEMETRY_BY_DEFAULT = frozenset(
-    {"download_stdout_logs", "download_metrics", "fetch_execution_logs"}
+    {
+        "download_stdout_logs",
+        "download_metrics",
+        "download_training_metrics",
+        "download_execution_logs",
+        "fetch_execution_logs",
+    }
 )
 
+# Which program made a client's calls, sent on every metric as ``client.surface``.
+# A client is "sdk" until an entry point says otherwise: the ``cortex-training``
+# commands set "cli" and ``cortex-training tui`` sets "tui" on the clients they build.
+SURFACE_ATTRIBUTE = "client.surface"
+SDK_SURFACE = "sdk"
+CLI_SURFACE = "cli"
+TUI_SURFACE = "tui"
+# A TUI client's calls are the waits its user sees, and timing them is the point,
+# so it emits every successful outcome by default. The busiest are a running job's
+# log tail (up to about once a second while its Logs tab is on screen and the log
+# moves, every 6 s once quiet, faster while catching up) and the job list (a page
+# per 100 jobs, every 60 s while shown); a live job's tabs refresh every 30-60 s.
+_SUCCESS_TELEMETRY_SURFACES = frozenset({TUI_SURFACE})
 
-def _success_telemetry_enabled(operation: str | None = None) -> bool:
+
+def _success_telemetry_enabled(
+    operation: str | None = None, surface: str | None = None
+) -> bool:
     """True when successful automatic operation outcomes should be emitted.
 
     An explicit ``CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY`` value wins for every
-    operation; unset, only the operations in ``_SUCCESS_TELEMETRY_BY_DEFAULT``
-    emit successes.
+    operation and surface; unset, the operations in ``_SUCCESS_TELEMETRY_BY_DEFAULT``
+    emit successes, and so does every operation of a client whose surface is in
+    ``_SUCCESS_TELEMETRY_SURFACES``.
     """
     if os.environ.get(ENABLE_SUCCESS_TELEMETRY_ENV, "").strip():
         return _env_flag_enabled(ENABLE_SUCCESS_TELEMETRY_ENV)
-    return operation in _SUCCESS_TELEMETRY_BY_DEFAULT
+    return (
+        operation in _SUCCESS_TELEMETRY_BY_DEFAULT
+        or surface in _SUCCESS_TELEMETRY_SURFACES
+    )
 
 
 # HTTP statuses worth retrying: the request was well-formed, so the same call
@@ -1899,6 +1925,8 @@ class CortexTrainingClient:
         self._owns_session = True
         self._auto_create_database = True
         self._metric_emitter: OtlpMetricEmitter | None = None
+        # Sent with every metric as SURFACE_ATTRIBUTE; entry points set their own.
+        self._telemetry_surface = SDK_SURFACE
         self._operation_metric_state = threading.local()
         self._session = _DefaultTimeoutSession(self.request_timeout)
         adapter = HTTPAdapter(pool_connections=pool_maxsize, pool_maxsize=pool_maxsize)
@@ -2036,10 +2064,19 @@ class CortexTrainingClient:
         Local/mock clients, or clients constructed with
         ``CORTEX_TRAINING_DISABLE_TELEMETRY`` set, treat this method as a no-op.
         All authentication, discovery, and export errors are ignored.
+
+        Every record carries the ``client.surface`` attribute (``sdk`` unless
+        the ``cortex-training`` CLI or TUI built this client); a value in
+        ``attributes`` takes precedence.
         """
         try:
             if self._metric_emitter is not None:
-                self._metric_emitter.emit(operation, value, attributes=attributes)
+                surface = getattr(self, "_telemetry_surface", SDK_SURFACE)
+                self._metric_emitter.emit(
+                    operation,
+                    value,
+                    attributes={SURFACE_ATTRIBUTE: surface, **(attributes or {})},
+                )
         except Exception:
             return
 
@@ -2077,6 +2114,8 @@ class CortexTrainingClient:
         result: Any = None,
         error: BaseException | None = None,
         cancelled: bool = False,
+        values: Mapping[str, Any] | None = None,
+        error_message: str | None = None,
     ) -> None:
         """Emit one structured outcome without changing the operation result.
 
@@ -2084,10 +2123,18 @@ class CortexTrainingClient:
         telemetry is enabled), with ``success`` false and ``cancelled`` true.
         Values an operation recorded with :meth:`_operation_values` are added to
         the value; the common fields take precedence.
+
+        Work done outside this client's methods (the TUI's checkpoint file
+        download) reports here too: ``values`` are its outcome values, and
+        ``error_message`` replaces the error's own text when that could quote a
+        credential, such as a presigned link. Its request counts are this
+        thread's REST calls, so none.
         """
         if self._metric_emitter is None:
             return
-        if error is None and not _success_telemetry_enabled(operation):
+        if error is None and not _success_telemetry_enabled(
+            operation, getattr(self, "_telemetry_surface", SDK_SURFACE)
+        ):
             return
         try:
             attempt_count = int(
@@ -2099,6 +2146,7 @@ class CortexTrainingClient:
             value: dict[str, Any] = dict(
                 getattr(self._operation_metric_state, "values", None) or {}
             )
+            value.update(values or {})
             value |= {
                 "attempt_count": attempt_count,
                 "duration_ms": round((time.monotonic() - started) * 1000, 3),
@@ -2110,7 +2158,11 @@ class CortexTrainingClient:
                 value["cancelled"] = True
             attributes = _metric_identity(operation, arguments, result)
             if error is not None:
-                value["error_message"] = _safe_metric_error_message(error)
+                value["error_message"] = (
+                    _safe_metric_error_message(error)
+                    if error_message is None
+                    else error_message[:_METRIC_ERROR_MESSAGE_LIMIT]
+                )
                 attributes.update(_metric_error_attributes(error))
             attributes.update(
                 _snowflake_request_attributes(
@@ -2824,8 +2876,9 @@ class CortexTrainingClient:
         """Return a client bound to ``job``'s schema, for per-job calls on a
         row from :meth:`iter_jobs` or :meth:`list_jobs_page`.
 
-        The new client borrows this client's session, auth and telemetry, so
-        keep this one open and close it rather than the new one. It never
+        The new client borrows this client's session, auth and telemetry, its
+        ``client.surface`` included, so keep this one open and close it rather
+        than the new one. It never
         creates the job's database, which exists and may be another role's: a
         not-found answer surfaces as the HTTP error it is.
         """
@@ -2848,6 +2901,7 @@ class CortexTrainingClient:
         client._auto_create_database = False
         client._auth_provider = self._auth_provider
         client._metric_emitter = self._metric_emitter
+        client._telemetry_surface = self._telemetry_surface
         client._artifact_connection_config = self._artifact_connection_config
         client._artifact_connection_factory = self._artifact_connection_factory
         return client
@@ -3306,6 +3360,19 @@ class CortexTrainingClient:
         "bytes", "unchanged"}``, where ``unchanged`` means resume kept the saved
         copy.
         """
+        # Before the argument checks, so a call they refuse still sends these fields.
+        values = self._operation_values()
+        values.update(
+            artifact="execution_logs",
+            file_count=0,
+            files_skipped=0,
+            bytes_written=0,
+            list_ms=0.0,
+            fetch_ms=0.0,
+            artifact_retry_count=0,
+            transfer_timeout_count=0,
+            cancelled=False,
+        )
         if isinstance(sub_job_ids, (str, bytes)):
             raise TypeError("sub_job_ids must be an iterable of sub-job ids, not a single string")
         wanted = None if sub_job_ids is None else set(sub_job_ids)
@@ -3324,6 +3391,7 @@ class CortexTrainingClient:
         )
         policy = self._artifact_retry_policy
         try:
+            started = time.monotonic()
             targets: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
             # "_logs/" last, so its copy wins over "checkpoints/_logs/".
             for artifact_root in ("checkpoints/_logs", "_logs"):
@@ -3341,6 +3409,7 @@ class CortexTrainingClient:
                     target = self._execution_log_target(job_id, relative_path)
                     if target is not None:
                         targets[target] = (relative_path, info)
+            values["list_ms"] = round((time.monotonic() - started) * 1000, 3)
             if wanted is not None:
                 found = {sub_job_id for sub_job_id, _ in targets}
                 targets = {key: value for key, value in targets.items() if key[0] in wanted}
@@ -3354,10 +3423,12 @@ class CortexTrainingClient:
                     )
             if not targets:
                 self._report_artifact_progress(progress, "execution logs: found 0 files\n")
+            values["file_count"] = len(targets)
             results = []
-            for (sub_job_id, filename), (relative_path, info) in sorted(targets.items()):
-                results.append(
-                    self._save_execution_log(
+            started = time.monotonic()
+            try:
+                for (sub_job_id, filename), (relative_path, info) in sorted(targets.items()):
+                    saved = self._save_execution_log(
                         shared,
                         run_uri,
                         relative_path,
@@ -3368,9 +3439,17 @@ class CortexTrainingClient:
                         resume=resume,
                         progress=progress,
                     )
-                )
+                    if saved["unchanged"]:
+                        values["files_skipped"] += 1
+                    else:
+                        values["bytes_written"] += saved["bytes"]
+                    results.append(saved)
+            finally:
+                values["fetch_ms"] = round((time.monotonic() - started) * 1000, 3)
             return results
         finally:
+            values["artifact_retry_count"] = shared.retry_count
+            values["transfer_timeout_count"] = shared.transfer_timeout_count
             shared.close()
 
     def _save_execution_log(
@@ -4468,6 +4547,19 @@ class CortexTrainingClient:
             transfer_timeout_count=0,
             cancelled=False,
         )
+        # When the caller had its first look, not only when the whole download ended:
+        # preview_ms once on_preview returned, first_commit_ms once the first file was
+        # whole and on_commit returned (the TUI has drawn the data by then).
+        began = time.monotonic()
+
+        def timed(key: str, callback: Callable[[dict[str, Any]], None] | None):
+            def call(info: dict[str, Any]) -> None:
+                if callback is not None:
+                    callback(info)
+                values.setdefault(key, round((time.monotonic() - began) * 1000, 3))
+
+            return call
+
         run_uri, run_name = self._experiment_run_uri(job_id)
         shared = _artifact_download.SharedConnection(
             self._open_experiment_artifact_connection, transfer_timeout_seconds
@@ -4542,7 +4634,7 @@ class CortexTrainingClient:
             if on_preview is not None and plans and plans[0].sub_job_id in first:
                 paths = self._preview_paths(plans[0], chunk_pattern, preview_seconds)
                 if paths:
-                    preview = (plans[0].sub_job_id, paths, on_preview)
+                    preview = (plans[0].sub_job_id, paths, timed("preview_ms", on_preview))
             values["sub_job_count"] = len(plans)
             modes = {
                 "append"
@@ -4574,7 +4666,7 @@ class CortexTrainingClient:
                         on_chunk=on_chunk,
                         strict=strict,
                         warnings_by_sub_job=warnings_by_sub_job,
-                        on_commit=on_commit,
+                        on_commit=timed("first_commit_ms", on_commit),
                         preview=preview,
                     )
                 finally:
@@ -5865,6 +5957,7 @@ class CortexTrainingClient:
 
     # ─── Logs (read-only) ────────────────────────────────────────────────
 
+    @_track_operation("tail_logs")
     def tail_logs(
         self,
         job_id: str,
@@ -5907,6 +6000,11 @@ class CortexTrainingClient:
             )
         except requests.exceptions.HTTPError as exc:
             hint = self._tail_hint(exc, job_id, sub_job_id, checked)
+            if checked.get("status"):
+                # Tells a tail that failed as the job started or ended from one that failed
+                # while it ran. Only a failed call says so: a lookup made for an attempt that
+                # a retry got past says nothing about the page that came back.
+                self._operation_values()["job_status"] = checked["status"][:32]
             if hint is None:
                 raise
             error = requests.exceptions.HTTPError(
@@ -5914,7 +6012,16 @@ class CortexTrainingClient:
             )
             # Lets stream_logs end a tail cleanly when the job ends under it.
             error.job_ended = bool(checked.get("ended"))  # type: ignore[attr-defined]
+            if error.job_ended:  # type: ignore[attr-defined]
+                # Still a failed call, but an expected one: the metric says so.
+                self._operation_values()["job_ended"] = True
             raise error from exc
+        except Exception:
+            # A later attempt failed another way (a reset, a timeout, no auth token) after
+            # an earlier one's answer had the job looked up: a failed call all the same.
+            if checked.get("status"):
+                self._operation_values()["job_status"] = checked["status"][:32]
+            raise
 
     def _tail_hint(
         self,
@@ -5926,9 +6033,10 @@ class CortexTrainingClient:
         """Explain a tail-logs failure that no retry can fix, else ``None``.
 
         A 404, 409 or 410 from tail-logs means the sub-job's session is not there.
-        The job is looked up once per call: if it has ended, its live logs are
-        gone; if ``sub_job_id`` is not one of its sub-jobs, it never had any.
-        Otherwise (for example, a job still starting) the error stays retryable.
+        The job is looked up once per call, and its status kept in ``checked``: if
+        it has ended, its live logs are gone; if ``sub_job_id`` is not one of its
+        sub-jobs, it never had any. Otherwise (for example, a job still starting)
+        the error stays retryable.
         """
         if not isinstance(exc, requests.exceptions.HTTPError):
             return None
@@ -5948,6 +6056,7 @@ class CortexTrainingClient:
         if not isinstance(job, dict):
             return None
         status = self._normalize_job_status(job.get("status"))
+        checked["status"] = status  # for the metric of a call that fails (see tail_logs)
         if status in _ENDED_JOB_STATES:
             checked["ended"] = True
             return (

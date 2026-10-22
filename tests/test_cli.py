@@ -3486,6 +3486,16 @@ def test_build_client_forwards_read_bounds_only_when_set(tmp_path, monkeypatch):
     assert (kwargs["max_retries"], kwargs["request_timeout"]) == (2, (10.0, 45.0))
 
 
+def test_the_commands_tag_the_client_they_build_as_the_cli(monkeypatch):
+    # Its metrics then say a command made the call (client.surface).
+    built = []
+    monkeypatch.setattr(cli, "build_client", lambda args, cls: built.append(FakeClient()) or built[-1])
+
+    assert cli.main(_base_args() + ["list"], stdout=io.StringIO()) == 0
+
+    assert [client._telemetry_surface for client in built] == ["cli"]
+
+
 def _http_error(status_code: int, headers: dict[str, str] | None = None):
     import requests
 

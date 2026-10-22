@@ -20,12 +20,14 @@ its export says about each checkpoint's files.
 type and loss come when the service sends them. A checkpoint's export lists its
 files, and those say the rest: the ``global_step<N>/`` folder they are under, and
 whether they hold optimizer state (resumable) or only weights (weights-only).
-Nothing here draws or calls the service; tui/checkpoint_view.py does.
+Nothing here draws or calls the service; tui/checkpoint_view.py does. A download of
+a checkpoint's files reports its outcome through the client's metrics.
 """
 
 from __future__ import annotations
 import json
 import re
+import time
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import datetime
@@ -382,20 +384,27 @@ def local_path(root: Path, filename: str) -> Optional[Path]:
 
 
 def download_export(export: Any, root: Path, *, get=None, on_progress=None, cancelled=lambda: False,
-                    chunk_bytes: int = 1 << 20) -> list:
+                    chunk_bytes: int = 1 << 20, stats: Optional[dict] = None) -> list:
     """Download every file of ``export_checkpoint``'s answer under ``root``; return the paths.
 
     A file already there at its exported size is kept, so a stopped download picks up
     with the next file. Each file is written beside its final name and renamed into
     place once whole. ``on_progress(done_bytes, total_bytes, files_done, files)`` is
-    called as bytes arrive; ``cancelled()`` stops it between chunks.
+    called as bytes arrive; ``cancelled()`` stops it between chunks, and a file that
+    fails once it is true counts as stopped too. ``stats``, when given, says as it goes
+    how many files it covers (``file_count``: the export's files that come with a link)
+    and their size (``total_bytes``, when the export gives every file's), how many it
+    downloaded (``files_written``) or kept (``files_skipped``), and how many bytes it
+    wrote (``bytes_written``), however it ends.
     """
     import requests
 
     get = get or requests.get
+    stats = {} if stats is None else stats
     raw = export.get("files") if isinstance(export, dict) else None
     entries = [e for e in raw if isinstance(e, dict) and isinstance(e.get("filename"), str)
                and isinstance(e.get("url"), str)] if isinstance(raw, list) else []
+    stats.update(file_count=len(entries), files_written=0, files_skipped=0, bytes_written=0)
     plan = []
     for entry in entries:
         path = local_path(root, entry["filename"])
@@ -403,6 +412,8 @@ def download_export(export: Any, root: Path, *, get=None, on_progress=None, canc
             raise ValueError(f"refusing to write {printable(entry['filename'])!r} outside {root}")
         plan.append((path, entry["url"], _as_int(entry.get("size_bytes"))))
     total = sum(size or 0 for _path, _url, size in plan)
+    if all(size is not None for _path, _url, size in plan):
+        stats["total_bytes"] = total
     done = 0
     written = []
     for index, (path, url, size) in enumerate(plan):
@@ -411,23 +422,82 @@ def download_export(export: Any, root: Path, *, get=None, on_progress=None, canc
         if size is not None and path.is_file() and path.stat().st_size == size:
             done += size
             written.append(path)
+            stats["files_skipped"] += 1
             if on_progress:
                 on_progress(done, total, index + 1, len(plan))
             continue
         path.parent.mkdir(parents=True, exist_ok=True)
         partial = path.with_name(path.name + ".partial")
-        with get(url, stream=True, timeout=(10, 60)) as response:
-            response.raise_for_status()
-            with open(partial, "wb") as out:
-                for chunk in response.iter_content(chunk_bytes):
-                    if cancelled():
-                        raise DownloadCancelled()
-                    out.write(chunk)
-                    done += len(chunk)
-                    if on_progress:
-                        on_progress(done, total, index, len(plan))
+        try:
+            with get(url, stream=True, timeout=(10, 60)) as response:
+                response.raise_for_status()
+                with open(partial, "wb") as out:
+                    for chunk in response.iter_content(chunk_bytes):
+                        if cancelled():
+                            raise DownloadCancelled()
+                        out.write(chunk)
+                        done += len(chunk)
+                        stats["bytes_written"] += len(chunk)
+                        if on_progress:
+                            on_progress(done, total, index, len(plan))
+        except DownloadCancelled:
+            raise
+        except Exception as exc:
+            if cancelled():  # it failed after the stop (a read still waiting, say): a stop, not a failure
+                raise DownloadCancelled() from exc
+            raise
         partial.replace(path)
         written.append(path)
+        stats["files_written"] += 1
         if on_progress:
             on_progress(done, total, index + 1, len(plan))
     return written
+
+
+def download_checkpoint(client: Any, job_id: str, checkpoint_id: str, export: Any, root: Path,
+                        **options: Any) -> list:
+    """:func:`download_export` with ``options``, reported as one ``download_checkpoint``
+    metric through ``client``'s own telemetry: how long it took, its files and bytes,
+    and whether it finished, failed or was stopped (a stop is its own outcome, not a
+    failure). The report never changes what the download returns or raises."""
+    values: dict = {"artifact": "checkpoint", "cancelled": False}
+    started = time.monotonic()
+    try:
+        paths = download_export(export, root, stats=values, **options)
+    except (DownloadCancelled, KeyboardInterrupt):
+        _report_download(client, job_id, checkpoint_id, started, values, cancelled=True)
+        raise
+    except Exception as exc:
+        _report_download(client, job_id, checkpoint_id, started, values, error=exc)
+        raise
+    _report_download(client, job_id, checkpoint_id, started, values)
+    return paths
+
+
+def _report_download(client: Any, job_id: str, checkpoint_id: str, started: float, values: dict, *,
+                     error: Optional[BaseException] = None, cancelled: bool = False) -> None:
+    try:
+        report = getattr(client, "_emit_operation_outcome", None)  # the --debug client has no telemetry
+        if report is not None:
+            report("download_checkpoint", started, {"job_id": job_id, "checkpoint_id": checkpoint_id},
+                   values=values, error=error, cancelled=cancelled,
+                   error_message=None if error is None else _metric_error_text(error))
+    except Exception:  # noqa: BLE001 - telemetry is best effort
+        pass
+
+
+def _metric_error_text(exc: BaseException) -> str:
+    """What a failed download's metric says about ``exc``: its type, and its HTTP status or
+    OS error. Never its own text, which can quote a file's presigned link (a credential) or
+    a local path."""
+    import requests
+
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(status, int):
+        return f"{type(exc).__name__}: HTTP {status}"
+    strerror = getattr(exc, "strerror", None)
+    # A requests error is an OSError too, but its text is about the link, not the disk.
+    if isinstance(exc, OSError) and not isinstance(exc, requests.RequestException) \
+            and isinstance(strerror, str) and strerror:
+        return f"{type(exc).__name__}: {strerror}"
+    return type(exc).__name__

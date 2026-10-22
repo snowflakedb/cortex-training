@@ -45,14 +45,35 @@ is then raised as it is. A client from `for_job` starts with it off.
 ## Client metrics
 
 Snowflake profile and PAT clients automatically emit one best-effort event
-when an essential operation fails. `download_stdout_logs`, `download_metrics`,
-and `fetch_execution_logs` also emit successful and cancelled outcomes by
-default, because they are infrequent and their timing is the point. Set
+when an essential operation fails. The downloads, `download_stdout_logs`,
+`download_metrics`, `download_training_metrics`, `download_execution_logs` and
+`fetch_execution_logs`, also emit successful and cancelled outcomes by
+default, because they are infrequent and their timing is the point. So does
+every operation of a client that `cortex-training tui` builds: its calls are
+the waits its user sees, and their timing is the point. While a running job's
+Logs tab is shown, its tail sends up to about one event a second while the log
+moves, one every 6 seconds once it is quiet, and a few a second while it catches
+up. The job list sends one per page of 100 jobs each time it refreshes (every 60
+seconds while it is shown), and a live job's preview or details screen one
+`get_job` every 60 seconds. A live job's Resources or Training metrics tab
+downloads every 30 seconds while shown, and so does its Checkpoints tab's list,
+with one export per checkpoint whose files it reads (once per opening of the
+job, up to 50 at a time) and one more per download. Set
 `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY=1` to emit successful outcomes for
-every operation, or `=0` to emit only failures for every operation.
+every operation, or `=0` to emit only failures for every operation, the TUI's
+included.
 Local or mock clients constructed with an explicit `base_url` treat
 `emit_metric` as a no-op. Set `CORTEX_TRAINING_DISABLE_TELEMETRY=1` to skip
 constructing the emitter.
+
+Every event carries the `client.surface` record attribute, which names the
+program that made the call:
+
+| Value | Calls made by |
+|---|---|
+| `sdk` | Python code using the client (the default) |
+| `cli` | A `cortex-training` command |
+| `tui` | `cortex-training tui`, including the clients it opens with `for_job` for jobs in other schemas |
 
 Tracked operations:
 
@@ -61,39 +82,60 @@ Tracked operations:
   `get_capacity_breakdown`, `get_experiment_run`
 - Compute: `forward_backward`, `forward`, `generate`, `generate_stream`, `step`
 - Checkpoints and logs: `save`, `load`, `list_checkpoints`,
-  `export_checkpoint`, `delete_checkpoint`, `fetch_execution_logs`,
+  `export_checkpoint`, `delete_checkpoint`, `tail_logs` (one event per page,
+  so per poll of `stream_logs`), `fetch_execution_logs`,
   `download_execution_logs`, `download_stdout_logs`, `download_metrics`,
   `download_training_metrics`
 - Multi-sub-job operations: `weight_sync`, `bootstrap_router_replay`,
   `router_replay_discard`, `reset_prefix_cache`
 - Async requests: `poll_request`, `get_request_status`, `cancel_request`
 
+The TUI also sends one `download_checkpoint` event for each checkpoint it
+downloads, after the `export_checkpoint` call that gets the files' links.
+
 Each emitted event body contains `success`, `duration_ms`, `request_count`,
 `attempt_count`, and `retry_count`. Failures also include a bounded
 `error_message` with common credential patterns redacted. A cancelled
 operation has `cancelled: true`: `DownloadCancelled`, or Ctrl-C
 (`KeyboardInterrupt`) during any tracked operation. Cancellations are sent
-under the same rule as successes, so by default only for the three download
-operations.
+under the same rule as successes, so by default only for the downloads and
+the TUI's operations. A `tail_logs` failure because the job has ended adds
+`job_ended: true`; once `stream_logs` has read from the job, it ends on that
+failure without raising.
+When the client looked the job up to explain a `tail_logs` failure, the event
+also has the `job_status` it read, such as `placing` for a job whose logs are
+not there yet; a call that succeeded on a retry has none.
 
 Download events add these body fields:
 
 | Field | Meaning |
 |---|---|
-| `artifact` | `stdout`, `metrics`, or `execution_logs` |
+| `artifact` | `stdout`, `metrics`, `training-metrics`, `execution_logs`, or `checkpoint` |
 | `list_ms` / `fetch_ms` | Time listing the run's artifacts, and fetching and writing them |
+| `preview_ms` / `first_commit_ms` | When the caller could first show something, from the call's start: `on_preview` returned with the newest chunks, and the first sub-job's file was whole and `on_commit`, if given, returned. Each is sent once it happens (`download_stdout_logs` / `download_metrics` / `download_training_metrics`; only the first two take a preview). On a first download (`resume_mode` `fresh`) these are the TUI's first page or graph: the preview for Logs and Resources, the first file for Training metrics. When the TUI already holds a copy it draws that first, and these then time the newest data |
 | `sub_job_count` | Sub-jobs written (`download_stdout_logs` / `download_metrics` / `download_training_metrics`) |
-| `chunk_count` / `chunks_skipped` | Chunks this call appended or skipped; skipped ones are also counted in `chunk_count` |
+| `chunk_count` / `chunks_skipped` | Chunks this call appended or skipped; skipped ones are also counted in `chunk_count` (`download_stdout_logs` / `download_metrics` / `download_training_metrics`) |
 | `bytes_written` | Bytes this call added to the output files |
-| `max_workers` | Concurrent GETs used |
-| `resume` / `resume_mode` | Whether `resume` was passed, and what happened: `fresh` (no earlier file), `rebuild` (replaced an earlier file), `append`, `partial` (continued an interrupted download), `mixed` across sub-jobs, or `none` |
+| `max_workers` | Concurrent GETs used (`download_stdout_logs` / `download_metrics` / `download_training_metrics`) |
+| `resume` / `resume_mode` | Whether `resume` was passed, and what happened: `fresh` (no earlier file), `rebuild` (replaced an earlier file), `append`, `partial` (continued an interrupted download), `mixed` across sub-jobs, or `none` (`download_stdout_logs` / `download_metrics` / `download_training_metrics`) |
 | `artifact_retry_count` / `transfer_timeout_count` | Retried `LIST`/`GET` attempts, and attempts abandoned after `transfer_timeout_seconds` |
 | `cancelled` | The call was stopped by its caller; sent on every download and execution-log event |
 | `file_count` / `bytes_read` | Files read and decoded, and their size (`fetch_execution_logs`) |
+| `file_count` / `files_skipped` | Files the download covers, and those a `resume=True` call kept because they are unchanged since an earlier download saved them (`download_execution_logs`) |
+| `file_count` / `files_written` / `files_skipped` / `total_bytes` | Files the download covers (the export's files that come with a link), those this call downloaded, those already whole on disk and kept, and their size when the export gives every file's (`download_checkpoint`) |
 
-On failure the fields describe the work done before it. Queryable attributes
-include available `job_id`, sub-job identifiers, `request_id`,
-`checkpoint_id`, `error.type`, HTTP status, and server error code.
+On failure the fields describe the work done before it. A
+`download_execution_logs` event has `artifact`, `list_ms` / `fetch_ms`,
+`bytes_written`, `artifact_retry_count` / `transfer_timeout_count`,
+`cancelled`, and its `file_count` / `files_skipped` row. A `download_checkpoint`
+event has `artifact`, `bytes_written`, `cancelled`, and the `file_count` /
+`files_written` / `files_skipped` / `total_bytes` row; a file that fails after
+the download was stopped counts as stopped. It fetches its files from the export's
+links rather than through the REST API, so its `request_count` and
+`attempt_count` are 0, and its `error_message` names only the error's type and
+HTTP status or OS error: the error's own text can quote a link. Queryable attributes
+include `client.surface`, and available `job_id`, sub-job identifiers,
+`request_id`, `checkpoint_id`, `error.type`, HTTP status, and server error code.
 Two attributes carry Snowflake request IDs:
 
 | Attribute | Meaning | When set |
@@ -106,7 +148,8 @@ emitted for one release. Records use OTLP resource attributes
 `service.name = cortex-training` and
 `snowflake.account_host = <normalized connection hostname>`.
 
-Applications can emit additional events through the same helper:
+Applications can emit additional events through the same helper. They carry
+`client.surface` too, unless `attributes` gives one:
 
 ```python
 client.emit_metric(
@@ -158,7 +201,7 @@ client, including notebooks, CI and containers that never open the TUI.
 | `list_jobs(status=None)` | list of jobs | Returns the inner list, not the envelope |
 | `iter_jobs(*, database=None, schema=None, status=None, submitted_by=None, created_after=None, created_before=None, page_size=100)` | iterator of jobs | Jobs across the account that the caller can see, newest first, following page tokens; each also carries `database_name` and `schema_name`. The server applies every filter. Arguments are checked on the call: `page_size` is 1 to 1000, and `schema` needs `database` with it. A 404 means account-level listing is not enabled for the account. See [REST API section 5.3](rest-api.md#across-the-account---get-apiv2endpoint) |
 | `list_jobs_page(*, database=None, schema=None, status=None, submitted_by=None, created_after=None, created_before=None, page_size=100, page_token=None, max_retries=None, request_timeout=None)` | `{"jobs": [...], "next_page_token": str \| None}` | One page of what `iter_jobs` walks, with the same filters read the same way. Pass `next_page_token` back as `page_token`, with the same filters, for the next page; `None` means no more. A page can be short or empty and still have a token. `max_retries` (retries after the first attempt) and `request_timeout` (seconds, or `(connect, read)`) bound this page; omitted, the client's own apply. Raises `AccountJobListUnavailable` (`reason`: `not_deployed`, `disabled`, `forbidden`, `rest_disabled`) for 404, 403 and 405 without retrying, and `InvalidPageToken` for 400 `Invalid page_token` (start again from the first page); both subclass `requests.HTTPError`. Bad arguments, or a page body that is not a job list, raise `ValueError`. See [REST API section 5.3](rest-api.md#across-the-account---get-apiv2endpoint) |
-| `for_job(job)` | `CortexTrainingClient` | Bound to a job from `iter_jobs` or `list_jobs_page` for per-job calls. Borrows this client's session, auth, and telemetry, so keep this one open; closing the returned client is a no-op. Never creates the job's database |
+| `for_job(job)` | `CortexTrainingClient` | Bound to a job from `iter_jobs` or `list_jobs_page` for per-job calls. Borrows this client's session, auth, and telemetry, its `client.surface` included, so keep this one open; closing the returned client is a no-op. Never creates the job's database |
 | `wait_for_job(job_id)` | job dict | Polls until `running`; raises once the job has ended (`failed`, `cancelled`, `terminated`) or on timeout |
 | `cancel_job(job_id)` | `None` | Idempotent while cancelling/cancelled |
 | `get_capacity(hardware=None)` | capacity dict | `has_reservation`, `max_total_gpus`, `reserved_gpus`, `in_use_gpus`, `pending_gpus`, `available_gpus`, scoped to `hardware` (omitted means the server default, H200). The CLI `capacity` command queries every type unless `--hardware` is set. `max_total_gpus` is the canonical ceiling (`-1` uncapped); `reserved_gpus` is deprecated |

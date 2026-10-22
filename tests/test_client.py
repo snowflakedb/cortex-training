@@ -1004,6 +1004,7 @@ class TestOperationMetrics:
         "download_execution_logs",
         "download_stdout_logs",
         "download_metrics",
+        "download_training_metrics",
         "forward_backward",
         "generate",
         "generate_stream",
@@ -1021,6 +1022,7 @@ class TestOperationMetrics:
         "list_checkpoints",
         "export_checkpoint",
         "delete_checkpoint",
+        "tail_logs",
     }
 
     def test_essential_operations_are_tracked(self):
@@ -1051,7 +1053,7 @@ class TestOperationMetrics:
         assert value["attempt_count"] == 1
         assert value["request_count"] == 1
         assert value["retry_count"] == 0
-        assert attributes == {"job_id": "job-1", "request_id": "r1"}
+        assert attributes == {"client.surface": "sdk", "job_id": "job-1", "request_id": "r1"}
 
     def test_client_validation_error_metric_preserves_original_error(self):
         c = _make_client()
@@ -1069,6 +1071,7 @@ class TestOperationMetrics:
         assert value["retry_count"] == 0
         assert "checkpoint_type" in value["error_message"]
         assert attributes == {
+            "client.surface": "sdk",
             "job_id": "job-1",
             "error.type": "ValueError",
         }
@@ -1095,6 +1098,7 @@ class TestOperationMetrics:
         assert value["retry_count"] == 0
         assert "snowflake request id: sf-request-1" in value["error_message"]
         assert attributes == {
+            "client.surface": "sdk",
             "job_id": "job-1",
             "error.type": "HTTPError",
             "error.http_status": 400,
@@ -1523,7 +1527,7 @@ class TestOperationMetrics:
         attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
         assert operation == "create_job"
         assert value["success"] is True
-        assert attributes == {"job_id": "server-job"}
+        assert attributes == {"client.surface": "sdk", "job_id": "server-job"}
 
     def test_sub_job_identity_is_included(self, monkeypatch):
         monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "1")
@@ -1538,6 +1542,7 @@ class TestOperationMetrics:
 
         attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
         assert attributes == {
+            "client.surface": "sdk",
             "job_id": "job-1",
             "source_sub_job_id": "job-1:training:0",
             "target_sub_job_ids": ["job-1:sampling:0"],
@@ -1554,7 +1559,7 @@ class TestOperationMetrics:
         c.forward_backward("job-1", b"customer-payload")
 
         attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
-        assert attributes == {"job_id": "job-1", "request_id": "r1"}
+        assert attributes == {"client.surface": "sdk", "job_id": "job-1", "request_id": "r1"}
         assert "customer-payload" not in repr(c._metric_emitter.emit.call_args)
 
     def test_error_message_redacts_obvious_secrets(self):
@@ -1628,6 +1633,125 @@ class TestOperationMetrics:
 
         c._metric_emitter.emit.assert_called_once()
         assert c._metric_emitter.emit.call_args.args[0] == "wait_for_job"
+
+
+class TestTelemetrySurface:
+    """Every metric says which program made the call: sdk, cli or tui."""
+
+    @pytest.fixture(autouse=True)
+    def _default_success_policy(self, monkeypatch):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+
+    def _client(self, surface=None, **responses):
+        c = _make_client(**responses)
+        c._metric_emitter = MagicMock()
+        if surface is not None:
+            c._telemetry_surface = surface
+        return c
+
+    def _attributes(self, c):
+        return [call.kwargs["attributes"] for call in c._metric_emitter.emit.call_args_list]
+
+    def test_a_client_is_sdk_until_an_entry_point_says_otherwise(self):
+        c = self._client()
+        c._session.get.return_value = _make_error_response({"message": "bad"}, 400)
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.get_job("job-1")
+
+        assert self._attributes(c)[0][nc.SURFACE_ATTRIBUTE] == nc.SDK_SURFACE == "sdk"
+
+    @pytest.mark.parametrize(
+        ("operation", "call"),
+        [
+            ("get_job", lambda c: c.get_job("job-1")),
+            ("list_jobs", lambda c: c.list_jobs()),
+            ("list_jobs_page", lambda c: c.list_jobs_page()),
+            ("list_checkpoints", lambda c: c.list_checkpoints("job-1")),
+        ],
+    )
+    def test_a_tui_client_reports_each_success_with_its_timing(self, operation, call):
+        c = self._client(nc.TUI_SURFACE, get_json={"job_id": "job-1", "jobs": [], "checkpoints": []})
+
+        call(c)
+
+        c._metric_emitter.emit.assert_called_once()
+        name, value = c._metric_emitter.emit.call_args.args
+        assert name == operation
+        assert value["success"] is True and value["duration_ms"] >= 0
+        assert self._attributes(c)[0][nc.SURFACE_ATTRIBUTE] == "tui"
+
+    @pytest.mark.parametrize("surface", [nc.SDK_SURFACE, nc.CLI_SURFACE])
+    def test_the_same_calls_from_sdk_or_cli_code_stay_failure_only(self, surface):
+        c = self._client(surface, get_json={"job_id": "job-1"})
+
+        c.get_job("job-1")
+
+        c._metric_emitter.emit.assert_not_called()
+
+    # The operations whose successes every program sends by default, as the Client
+    # metrics section of the Python SDK reference names them.
+    DEFAULT_SUCCESS_OPERATIONS = {
+        "download_stdout_logs",
+        "download_metrics",
+        "download_training_metrics",
+        "download_execution_logs",
+        "fetch_execution_logs",
+    }
+
+    @pytest.mark.parametrize("surface", [nc.SDK_SURFACE, nc.CLI_SURFACE, nc.TUI_SURFACE])
+    def test_by_default_only_the_downloads_and_the_tui_send_successes(self, surface):
+        # Every operation a metric can name: create_job_from_body reports as create_job, the
+        # job-list pages as iter_jobs and list_jobs_page, and the TUI's file download on its own.
+        operations = (TestOperationMetrics.TRACKED_METHODS - {"create_job_from_body"}) | {
+            "iter_jobs", "list_jobs_page", "download_checkpoint"}
+
+        sent = {operation for operation in operations if nc._success_telemetry_enabled(operation, surface)}
+
+        assert sent == (operations if surface == nc.TUI_SURFACE else self.DEFAULT_SUCCESS_OPERATIONS)
+
+    def test_an_explicit_setting_still_wins_on_the_tui(self, monkeypatch):
+        monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "0")
+        c = self._client(nc.TUI_SURFACE, get_json={"job_id": "job-1"})
+
+        c.get_job("job-1")
+        c._metric_emitter.emit.assert_not_called()
+
+        c._session.get.return_value = _make_error_response({"message": "bad"}, 400)
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.get_job("job-1")
+        # Failures are always sent, and still say where they came from.
+        assert [attributes[nc.SURFACE_ATTRIBUTE] for attributes in self._attributes(c)] == ["tui"]
+
+    def test_a_tui_client_s_per_job_clients_report_as_the_tui(self):
+        c = self._client(nc.TUI_SURFACE, get_json={"job_id": "j1"})
+
+        c.for_job({"job_id": "j1", "database_name": "ML", "schema_name": "EXP"}).get_job("j1")
+
+        assert self._attributes(c) == [{"client.surface": "tui", "job_id": "j1"}]
+
+    def test_custom_metrics_carry_the_surface_unless_they_name_one(self):
+        c = self._client(nc.CLI_SURFACE)
+
+        c.emit_metric("custom", {"n": 1}, attributes={"job_id": "job-1"})
+        c.emit_metric("custom", {"n": 2}, attributes={nc.SURFACE_ATTRIBUTE: "notebook"})
+        c.emit_metric("custom")
+
+        assert self._attributes(c) == [
+            {"client.surface": "cli", "job_id": "job-1"},
+            {"client.surface": "notebook"},
+            {"client.surface": "cli"},
+        ]
+
+    def test_with_telemetry_off_a_tui_client_has_nothing_to_send_with(self, monkeypatch):
+        monkeypatch.setenv(nc.DISABLE_TELEMETRY_ENV, "1")
+        monkeypatch.setattr(nc, "OtlpMetricEmitter", MagicMock(side_effect=AssertionError("built an emitter")))
+        c = CortexTrainingClient.from_pat(host="account.test", pat="pat", database="DB", schema="SCH")
+        c._telemetry_surface = nc.TUI_SURFACE
+
+        c.emit_metric("custom", {"n": 1})
+
+        assert c._metric_emitter is None
 
 
 # ─── CortexTrainingClient — create_job ────────────────────────────────────────
@@ -2606,8 +2730,8 @@ class TestIterJobs:
         assert [call.args[1]["success"] for call in calls] == [True, False]
         assert [call.args[1]["request_count"] for call in calls] == [1, 1]
         assert [call.kwargs["attributes"] for call in calls] == [
-            {},
-            {"error.type": "HTTPError", "error.http_status": 404},
+            {"client.surface": "sdk"},
+            {"client.surface": "sdk", "error.type": "HTTPError", "error.http_status": 404},
         ]
         assert "jdoe" not in repr(calls)
 
@@ -2658,6 +2782,7 @@ class TestForJob:
         c._auth_provider = MagicMock()
         c._auth_provider.get_token.return_value = "tok"
         c._metric_emitter = MagicMock()
+        c._telemetry_surface = nc.TUI_SURFACE
         c._artifact_connection_config = {"host": "x.test", "pat": "pat"}
         c._artifact_connection_factory = MagicMock()
 
@@ -2669,6 +2794,7 @@ class TestForJob:
         assert job_client._session is c._session
         assert job_client._auth_provider is c._auth_provider
         assert job_client._metric_emitter is c._metric_emitter
+        assert job_client._telemetry_surface == nc.TUI_SURFACE
         assert job_client._artifact_connection_config is c._artifact_connection_config
         assert job_client._artifact_connection_factory is c._artifact_connection_factory
         assert (
@@ -3218,7 +3344,7 @@ class TestCapacityBreakdown:
         assert value["request_count"] == 1
         assert value["attempt_count"] == 1
         # The result names the caller, so none of it becomes part of the metric.
-        assert attributes == {}
+        assert attributes == {"client.surface": "sdk"}
         assert "ALICE" not in repr(c._metric_emitter.emit.call_args)
 
     def test_bad_dimensions_record_a_failed_operation_without_a_request(self):
@@ -3235,7 +3361,7 @@ class TestCapacityBreakdown:
         assert operation == "get_capacity_breakdown"
         assert value["success"] is False
         assert value["request_count"] == 0
-        assert attributes == {"error.type": "ValueError"}
+        assert attributes == {"client.surface": "sdk", "error.type": "ValueError"}
 
     def test_get_capacity_still_returns_only_the_six_totals(self):
         c = _make_client(get_json=_CAPACITY_BREAKDOWN_BODY)
@@ -6754,6 +6880,19 @@ class TestChunkedArtifactDownload:
         assert len(calls) == 1, calls
         return calls[0].args[1], calls[0].kwargs["attributes"]
 
+    def test_training_metrics_download_successes_are_on_by_default_too(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c, _connection, _paths, _sleeps, _opened = self._setup(
+            monkeypatch, count=3, artifact_name="metrics", chunk_name="training"
+        )
+        c._metric_emitter = MagicMock()
+
+        c.download_training_metrics("job-1", tmp_path)
+
+        value, attributes = self._emitted(c, "download_training_metrics")
+        assert (value["success"], value["chunk_count"], value["cancelled"]) == (True, 3, False)
+        assert attributes == {"client.surface": "sdk", "job_id": "job-1"}
+
     def test_download_success_telemetry_is_on_by_default(self, tmp_path, monkeypatch):
         monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
         c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=3)
@@ -6761,7 +6900,7 @@ class TestChunkedArtifactDownload:
         c.download_stdout_logs("job-1", tmp_path)
         value, attributes = self._emitted(c)
         size = (tmp_path / self.SUB / "stdout.log").stat().st_size
-        varying = ("duration_ms", "list_ms", "fetch_ms", "attempt_count", "request_count")
+        varying = ("duration_ms", "list_ms", "fetch_ms", "first_commit_ms", "attempt_count", "request_count")
         assert {key: value[key] for key in value if key not in varying} == {
             "artifact": "stdout",
             "max_workers": 16,
@@ -6779,8 +6918,10 @@ class TestChunkedArtifactDownload:
         }
         assert value["list_ms"] >= 0 and value["fetch_ms"] >= 0
         assert value["duration_ms"] >= value["fetch_ms"]
-        # Identity only: per-download detail stays in the value, not attributes.
-        assert attributes == {"job_id": "job-1"}
+        # Its one file was whole before the call ended; with no on_preview there is no preview_ms.
+        assert 0 <= value["first_commit_ms"] <= value["duration_ms"] and "preview_ms" not in value
+        # Surface and identity only: per-download detail stays in the value.
+        assert attributes == {"client.surface": "sdk", "job_id": "job-1"}
 
         # Other operations keep successes opt-in.
         c._metric_emitter.reset_mock()
@@ -8286,6 +8427,295 @@ class TestTailOnEndedJobs:
         assert c._session.get.call_count == 1
         assert c._session.post.call_count == 3
 
+    def test_each_tui_tail_page_is_one_metric_without_its_cursor(self, monkeypatch):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c = _make_client(post_json={"entries": [{"_raw": "x"}], "next_cursor": "c-secret", "eof": False})
+        c._metric_emitter = MagicMock()
+        c._telemetry_surface = nc.TUI_SURFACE
+
+        c.tail_logs("j1", sub_job_id="j1:sampling:0")
+        c.tail_logs("j1", cursor="c-secret", max_lines=50, sub_job_id="j1:sampling:0")
+
+        calls = c._metric_emitter.emit.call_args_list
+        assert [call.args[0] for call in calls] == ["tail_logs", "tail_logs"]
+        assert [call.args[1]["success"] for call in calls] == [True, True]
+        assert [call.kwargs["attributes"] for call in calls] == [
+            {"client.surface": "tui", "job_id": "j1", "sub_job_id": "j1:sampling:0"}
+        ] * 2
+        assert "c-secret" not in repr(calls)
+
+    @pytest.mark.parametrize(
+        ("status_code", "message", "status", "job_status"),
+        [
+            (404, "session s not found", "TERMINATED", "terminated"),
+            (409, "session s not found", "TERMINATED", "terminated"),
+            # Not retried, so the job is looked up only once the call has failed.
+            (410, "session s has failed: runtime_sub_job_failed", "JOB_STATE_FAILED", "failed"),
+        ],
+        ids=["404", "409", "410"],
+    )
+    def test_an_ended_job_s_tail_is_one_failure_marked_job_ended(
+        self, monkeypatch, status_code, message, status, job_status
+    ):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        c._session.post.return_value = _not_found("517604", message, status=status_code)
+        c._session.get.return_value = self._job(status)
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        assert (c._session.post.call_count, c._session.get.call_count) == (1, 1)
+        c._metric_emitter.emit.assert_called_once()
+        operation, value = c._metric_emitter.emit.call_args.args
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert operation == "tail_logs"
+        assert value["success"] is False and value["job_ended"] is True
+        assert value["job_status"] == job_status
+        assert value["request_count"] == 2  # the tail, and the job lookup that explains it
+        assert (attributes["job_id"], attributes["sub_job_id"]) == ("j1", "j1:sampling:0")
+        assert (attributes["error.type"], attributes["error.http_status"]) == ("HTTPError", status_code)
+
+    def test_other_tail_failures_are_not_marked_job_ended(self):
+        c = _make_client()
+        c.max_retries = 0
+        c._metric_emitter = MagicMock()
+        c._session.post.return_value = _make_error_response({"message": "bad"}, 400)
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        value = c._metric_emitter.emit.call_args.args[1]
+        assert value["success"] is False and "job_ended" not in value and "job_status" not in value
+
+    def test_a_tail_failing_while_the_job_is_placed_says_so(self):
+        # The service answers 409 until the job's session exists: expected while placing.
+        c = _make_client()
+        c.max_retries = 0
+        c._metric_emitter = MagicMock()
+        c._session.post.return_value = _not_found("517604", "job j1 is pending placement", status=409)
+        c._session.get.return_value = self._job("JOB_STATE_PLACING")
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        value = c._metric_emitter.emit.call_args.args[1]
+        assert (value["success"], value["job_status"]) == (False, "placing")
+        assert "job_ended" not in value
+
+    def test_a_status_the_server_makes_up_is_cut_short_in_the_metric(self):
+        c = _make_client()
+        c.max_retries = 0
+        c._metric_emitter = MagicMock()
+        c._session.post.return_value = _not_found("517604", "session s not found", status=409)
+        c._session.get.return_value = _make_response(
+            {"job_id": "j1", "status": "JOB_STATE_" + "X" * 100, "sub_jobs": [{"sub_job_id": "j1:sampling:0"}]}
+        )
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        assert c._metric_emitter.emit.call_args.args[1]["job_status"] == "x" * 32
+
+    def test_a_tail_of_a_sub_job_the_job_lacks_is_not_marked_job_ended(self):
+        # The job runs; the sub-job id is what is wrong, so the failure is a real one.
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        c._session.post.return_value = _not_found("517604", "session s not found")
+        c._session.get.return_value = self._job("RUNNING")
+
+        with pytest.raises(nc.requests.exceptions.HTTPError, match="is not part of job j1") as raised:
+            c.tail_logs("j1", sub_job_id="j1:training:0")
+
+        assert raised.value.job_ended is False
+        c._metric_emitter.emit.assert_called_once()
+        value = c._metric_emitter.emit.call_args.args[1]
+        assert (value["success"], value["job_status"]) == (False, "running")
+        assert "job_ended" not in value
+
+    def test_a_410_while_the_job_still_runs_has_its_status_but_is_not_marked_job_ended(self):
+        # A 410 is not retried, so only the failure's own lookup reads the status.
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        c._session.post.return_value = _not_found(
+            "517604", "session s has failed: runtime_sub_job_failed", status=410)
+        c._session.get.return_value = self._job("RUNNING")
+
+        with pytest.raises(nc.requests.exceptions.HTTPError) as raised:
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        assert raised.value.response.status_code == 410
+        assert (c._session.post.call_count, c._session.get.call_count) == (1, 1)
+        c._metric_emitter.emit.assert_called_once()
+        value = c._metric_emitter.emit.call_args.args[1]
+        assert (value["success"], value["job_status"]) == (False, "running")
+        assert "job_ended" not in value
+
+    @pytest.mark.parametrize("status", [{}, {"status": None}, {"status": ""}], ids=["missing", "null", "empty"])
+    def test_a_job_lookup_without_a_status_sends_no_job_status(self, status):
+        c = _make_client()
+        c.max_retries = 0
+        c._metric_emitter = MagicMock()
+        c._session.post.return_value = _not_found("517604", "session s not found", status=409)
+        c._session.get.return_value = _make_response(
+            {"job_id": "j1", **status, "sub_jobs": [{"sub_job_id": "j1:sampling:0"}]}
+        )
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        assert c._session.get.call_count == 1  # the lookup was made, and read no status
+        value = c._metric_emitter.emit.call_args.args[1]
+        assert value["success"] is False
+        assert "job_status" not in value and "job_ended" not in value
+
+    @pytest.mark.parametrize(
+        ("first", "status"),
+        [
+            (lambda: _not_found("517604", "session s not found"), "PLACING"),
+            (lambda: _not_found("517604", "job j1 is pending placement", status=409), "JOB_STATE_PLACING"),
+            (lambda: _make_error_response({"message": "the target zone is restarting"}, 409), "RUNNING"),
+        ],
+        ids=["404-placing", "409-placing", "409-running"],
+    )
+    def test_a_tail_a_retry_gets_through_sends_no_job_status(self, monkeypatch, first, status):
+        # The lookup explained an attempt the retry got past, not the page that came back.
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c = _make_client()
+        c.max_retries = 2  # as the TUI reads
+        c._metric_emitter = MagicMock()
+        c._telemetry_surface = nc.TUI_SURFACE
+        c._session.post.side_effect = [
+            first(),
+            _make_response({"entries": [{"_raw": "x"}], "next_cursor": "1", "eof": False}),
+        ]
+        c._session.get.return_value = self._job(status)
+
+        assert c.tail_logs("j1", sub_job_id="j1:sampling:0")["entries"] == [{"_raw": "x"}]
+
+        assert c._session.get.call_count == 1  # the job was looked up
+        c._metric_emitter.emit.assert_called_once()
+        value = c._metric_emitter.emit.call_args.args[1]
+        assert (value["success"], value["retry_count"]) == (True, 1)
+        assert "job_status" not in value and "job_ended" not in value
+
+    def test_a_retried_tail_that_still_fails_has_the_job_status_its_lookup_read(self):
+        c = _make_client()
+        c.max_retries = 2
+        c._metric_emitter = MagicMock()
+        c._session.post.return_value = _not_found("517604", "job j1 is pending placement", status=409)
+        c._session.get.return_value = self._job("JOB_STATE_PLACING")
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        assert (c._session.post.call_count, c._session.get.call_count) == (3, 1)
+        c._metric_emitter.emit.assert_called_once()
+        value = c._metric_emitter.emit.call_args.args[1]
+        assert (value["success"], value["retry_count"], value["job_status"]) == (False, 2, "placing")
+
+    @pytest.mark.parametrize(
+        ("job", "job_status"),
+        [
+            ({"status": "JOB_STATE_PLACING"}, "placing"),
+            ({"status": "JOB_STATE_" + "X" * 100}, "x" * 32),  # made up by the server: cut short
+            ({}, None),
+            ({"status": None}, None),
+            ({"status": ""}, None),
+        ],
+        ids=["placing", "made-up", "missing", "null", "empty"],
+    )
+    @pytest.mark.parametrize(
+        "error",
+        [
+            nc.requests.exceptions.ConnectionError("connection reset by peer"),
+            nc.requests.exceptions.ReadTimeout("read timed out"),
+        ],
+        ids=["reset", "timeout"],
+    )
+    def test_a_tail_whose_retries_then_fail_off_the_wire_has_the_job_status_too(self, error, job, job_status):
+        # The first attempt's 409 had the job looked up; the retries got no answer at all.
+        # Its status is sent as for a tail whose own answer failed it: cut short, and only when read.
+        c = _make_client()
+        c.max_retries = 2  # as the TUI reads
+        c._metric_emitter = MagicMock()
+        c._session.post.side_effect = [
+            _not_found("517604", "job j1 is pending placement", status=409), error, error]
+        c._session.get.return_value = _make_response(
+            {"job_id": "j1", **job, "sub_jobs": [{"sub_job_id": "j1:sampling:0"}]}
+        )
+
+        with pytest.raises(type(error)):
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        assert (c._session.post.call_count, c._session.get.call_count) == (3, 1)
+        c._metric_emitter.emit.assert_called_once()
+        value = c._metric_emitter.emit.call_args.args[1]
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert (value["success"], value.get("job_status")) == (False, job_status)
+        assert attributes["error.type"] == type(error).__name__
+        assert "job_ended" not in value
+
+    def test_a_tail_whose_retry_cannot_get_a_token_has_the_job_status_too(self):
+        # Not every later attempt fails off the wire: one that gets no token fails the call too.
+        from cortex_training.snowflake_auth import SnowflakeProfileError
+
+        c = _make_client()
+        c.max_retries = 2  # as the TUI reads
+        c._metric_emitter = MagicMock()
+        auth = MagicMock()
+        # The first attempt and its job lookup get a token; the retry's request for one fails.
+        no_token = SnowflakeProfileError("Snowflake Connector did not expose a session token")
+        auth.get_token.side_effect = ["session-token", "session-token", no_token]
+        c._auth_provider = auth
+        c._session.post.return_value = _not_found("517604", "job j1 is pending placement", status=409)
+        c._session.get.return_value = self._job("JOB_STATE_PLACING")
+
+        with pytest.raises(SnowflakeProfileError):
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        assert (c._session.post.call_count, c._session.get.call_count, auth.get_token.call_count) == (1, 1, 3)
+        c._metric_emitter.emit.assert_called_once()
+        value = c._metric_emitter.emit.call_args.args[1]
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert (value["success"], value["job_status"]) == (False, "placing")
+        assert attributes["error.type"] == "SnowflakeProfileError"
+        assert "job_ended" not in value
+
+    def test_a_tail_that_never_got_an_answer_sends_no_job_status(self):
+        c = _make_client()
+        c.max_retries = 2
+        c._metric_emitter = MagicMock()
+        c._session.post.side_effect = nc.requests.exceptions.ConnectionError("connection reset by peer")
+
+        with pytest.raises(nc.requests.exceptions.ConnectionError):
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        assert (c._session.post.call_count, c._session.get.call_count) == (3, 0)  # nothing to look up for
+        value = c._metric_emitter.emit.call_args.args[1]
+        assert value["success"] is False and "job_status" not in value
+
+    def test_a_tail_stopped_after_a_lookup_is_cancelled_without_a_job_status(self, monkeypatch):
+        # Only a failed call's event has the status; Ctrl-C is a stop, not a failure.
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c = _make_client()
+        c.max_retries = 2
+        c._metric_emitter = MagicMock()
+        c._telemetry_surface = nc.TUI_SURFACE
+        c._session.post.side_effect = [
+            _not_found("517604", "job j1 is pending placement", status=409), KeyboardInterrupt()]
+        c._session.get.return_value = self._job("JOB_STATE_PLACING")
+
+        with pytest.raises(KeyboardInterrupt):
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        assert c._session.get.call_count == 1  # the job was looked up
+        c._metric_emitter.emit.assert_called_once()
+        value = c._metric_emitter.emit.call_args.args[1]
+        assert (value["success"], value["cancelled"]) == (False, True)
+        assert "job_status" not in value
+
 
 class TestStreamStopsWithoutEof:
     def test_follow_false_stops_at_the_first_empty_page_without_eof(self, monkeypatch):
@@ -8349,6 +8779,27 @@ class TestStreamEndsWhenTheJobEnds:
         c._session.get.return_value = self._job("CANCELLED")
         assert [e["msg"] for e in c.stream_logs("j1", sub_job_id="j1:s:0", follow=True)] == ["a"]
         assert c._session.get.call_count == 1
+
+    def test_by_default_a_follow_sends_only_the_end_of_the_job(self, monkeypatch):
+        # A CLI or SDK follow polls for as long as the job runs, so its pages stay
+        # failure-only; the one event is the tail the job's end stopped.
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        c._telemetry_surface = nc.CLI_SURFACE
+        c._session.post.side_effect = [
+            _make_response({"entries": [{"msg": "a"}], "next_cursor": "c1", "eof": False}),
+            _make_response({"entries": [], "next_cursor": "c1", "eof": False}),
+            _not_found("517604", "session s not found", status=409),
+        ]
+        c._session.get.return_value = self._job("CANCELLED")
+
+        assert [e["msg"] for e in c.stream_logs("j1", sub_job_id="j1:s:0", follow=True)] == ["a"]
+
+        c._metric_emitter.emit.assert_called_once()
+        operation, value = c._metric_emitter.emit.call_args.args
+        assert (operation, value["success"], value["job_ended"]) == ("tail_logs", False, True)
+        assert c._metric_emitter.emit.call_args.kwargs["attributes"][nc.SURFACE_ATTRIBUTE] == "cli"
 
     def test_a_job_that_ended_before_the_first_read_still_raises(self):
         c = _make_client()
@@ -8443,12 +8894,234 @@ class TestDownloadExecutionLogs:
         assert "execution logs: job-1:sampling:0/execution.jsonl: saved 8.8 KiB" in "".join(messages)
         assert connection.closed
 
-    def test_resume_skips_unchanged_files_and_refetches_changed_ones(self, tmp_path, monkeypatch):
+    def test_execution_log_download_successes_are_on_by_default(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c, _connection = self._setup(monkeypatch, {"job-1:sampling:0/execution.jsonl": (b"one\n", "m1")})
+        c._metric_emitter = MagicMock()
+
+        c.download_execution_logs("job-1", tmp_path)
+        c.download_execution_logs("job-1", tmp_path, resume=True)  # unchanged: kept, not fetched
+
+        calls = [call for call in c._metric_emitter.emit.call_args_list
+                 if call.args[0] == "download_execution_logs"]
+        fields = ("success", "artifact", "file_count", "files_skipped", "bytes_written", "cancelled")
+        assert [{key: call.args[1][key] for key in fields} for call in calls] == [
+            {"success": True, "artifact": "execution_logs", "file_count": 1, "files_skipped": 0,
+             "bytes_written": 4, "cancelled": False},
+            {"success": True, "artifact": "execution_logs", "file_count": 1, "files_skipped": 1,
+             "bytes_written": 0, "cancelled": False},
+        ]
+        assert calls[0].kwargs["attributes"] == {"client.surface": "sdk", "job_id": "job-1"}
+
+    @staticmethod
+    def _events(c):
+        return [call.args[1] for call in c._metric_emitter.emit.call_args_list
+                if call.args[0] == "download_execution_logs"]
+
+    def test_an_execution_log_download_times_its_list_and_fetch_and_counts_retried_gets(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c, connection = self._setup(monkeypatch, {"job-1:sampling:0/execution.jsonl": (b"one\n", "m1")})
+        c._metric_emitter = MagicMock()
+        now = [1000.0]
+        monkeypatch.setattr(nc.time, "monotonic", lambda: now[0])
+        run = c._session.get.return_value
+
+        def slow_run_lookup(*args, **kwargs):  # the experiment-run lookup takes 3 s
+            now[0] += 3.0
+            return run
+
+        def slow_open():  # and opening the artifact connection 1.5 s
+            now[0] += 1.5
+            return connection
+
+        listing = c._list_experiment_artifact_files
+
+        def slow_list(*args, **kwargs):  # each of its two LISTs takes 0.5 s
+            now[0] += 0.5
+            return listing(*args, **kwargs)
+
+        gets = []
+
+        def slow_get(source):  # each GET attempt takes 2 s; the first runs past its time limit
+            gets.append(source)
+            now[0] += 2.0
+            if len(gets) == 1:
+                raise nc._artifact_download.TransferTimeout(f"GET {source} did not finish in time")
+
+        c._session.get.side_effect = slow_run_lookup
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", slow_open)
+        monkeypatch.setattr(c, "_list_experiment_artifact_files", slow_list)
+        connection.on_get = slow_get
+        c.download_execution_logs("job-1", tmp_path)
+
+        assert len(gets) == 2
+        (value,) = self._events(c)
+        assert (value["success"], value["artifact_retry_count"], value["transfer_timeout_count"]) == (True, 1, 1)
+        assert value["retry_count"] == 0  # REST retries only: the GET's retry is counted above
+        # The run lookup and the connection come before the listing: only the whole call's time has them.
+        assert (value["list_ms"], value["fetch_ms"], value["duration_ms"]) == (1000.0, 4000.0, 9500.0)
+
+    def test_an_execution_log_download_that_keeps_timing_out_counts_its_retries_in_the_failure(
+        self, tmp_path, monkeypatch
+    ):
+        c, connection = self._setup(monkeypatch, {"job-1:sampling:0/execution.jsonl": (b"one\n", "m1")})
+        c._metric_emitter = MagicMock()
+
+        def get(source):  # every attempt runs past its time limit
+            raise nc._artifact_download.TransferTimeout(f"GET {source} did not finish in time")
+
+        connection.on_get = get
+        with pytest.raises(nc._artifact_download.TransferTimeout):
+            c.download_execution_logs("job-1", tmp_path)
+
+        attempts = c._artifact_retry_policy.attempts
+        assert len(self._gets(connection)) == attempts
+        (value,) = self._events(c)
+        # Every attempt timed out; all but the last were retried.
+        assert (value["success"], value["artifact_retry_count"], value["transfer_timeout_count"]) == (
+            False, attempts - 1, attempts)
+
+    def test_an_execution_log_download_tells_retried_gets_from_timed_out_ones(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c, connection = self._setup(monkeypatch, {"job-1:sampling:0/execution.jsonl": (b"one\n", "m1")})
+        c._metric_emitter = MagicMock()
+        # The first GET's connection is reset, the second runs past its time limit, the third works.
+        failures = [ConnectionResetError("connection reset by peer"),
+                    nc._artifact_download.TransferTimeout("GET did not finish in time")]
+
+        def get(source):
+            if failures:
+                raise failures.pop(0)
+
+        connection.on_get = get
+        c.download_execution_logs("job-1", tmp_path)
+
+        assert len(self._gets(connection)) == 3
+        (value,) = self._events(c)
+        assert (value["success"], value["artifact_retry_count"], value["transfer_timeout_count"]) == (True, 2, 1)
+
+    def test_an_execution_log_download_counts_every_file_its_sub_job_filter_keeps(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        files = {
+            "job-1:sampling:0/execution.jsonl": (b"one\n", "m1"),  # 4 bytes
+            "job-1:sampling:0/server.log": (b"server\n", "s1"),  # 7 bytes
+            "job-1:training:0/execution.jsonl": (b"training\n", "t1"),  # not asked for
+        }
+        c, _connection = self._setup(monkeypatch, files)
+        c._metric_emitter = MagicMock()
+
+        c.download_execution_logs("job-1", tmp_path, sub_job_ids=["job-1:sampling:0"])
+        c.download_execution_logs("job-1", tmp_path, sub_job_ids=["job-1:sampling:0"], resume=True)  # both kept
+
+        fields = ("success", "file_count", "files_skipped", "bytes_written")
+        assert [tuple(value[key] for key in fields) for value in self._events(c)] == [
+            (True, 2, 0, 11), (True, 2, 2, 0)]
+
+    @pytest.mark.parametrize(
+        ("error", "cancelled"),
+        [(nc._artifact_download.DownloadCancelled("stopped"), True), (RuntimeError("GET refused"), False)],
+        ids=["stopped", "failed"],
+    )
+    def test_a_stopped_or_failed_execution_log_download_reports_the_work_before_it(
+        self, tmp_path, monkeypatch, error, cancelled
+    ):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
         files = {
             "job-1:sampling:0/execution.jsonl": (b"one\n", "m1"),
             "job-1:sampling:0/server.log": (b"server\n", "s1"),
         }
         c, connection = self._setup(monkeypatch, files)
+        c._metric_emitter = MagicMock()
+        now = [1000.0]
+        monkeypatch.setattr(nc.time, "monotonic", lambda: now[0])
+
+        def get(source):  # each GET takes 2 s; server.log's, the second, ends the download
+            now[0] += 2.0
+            if source.endswith("/server.log"):
+                raise error
+
+        connection.on_get = get
+        with pytest.raises(type(error)):
+            c.download_execution_logs("job-1", tmp_path)
+
+        (value,) = self._events(c)
+        fields = ("success", "artifact", "file_count", "files_skipped", "bytes_written", "cancelled", "fetch_ms")
+        assert {key: value[key] for key in fields} == {
+            "success": False, "artifact": "execution_logs", "file_count": 2, "files_skipped": 0,
+            "bytes_written": 4, "cancelled": cancelled, "fetch_ms": 4000.0}
+
+    # Every field a download_execution_logs event has, for a failure before any work.
+    _NOTHING_DONE = {
+        "success": False, "artifact": "execution_logs", "file_count": 0, "files_skipped": 0,
+        "bytes_written": 0, "list_ms": 0.0, "fetch_ms": 0.0, "artifact_retry_count": 0,
+        "transfer_timeout_count": 0, "cancelled": False}
+
+    def test_a_failed_run_lookup_is_still_an_execution_log_download_event(self, tmp_path, monkeypatch):
+        c, connection = self._setup(monkeypatch, {"job-1:sampling:0/execution.jsonl": (b"one\n", "m1")})
+        c.max_retries = 0
+        c._metric_emitter = MagicMock()
+        c._session.get.return_value = _make_error_response({"message": "experiment run unavailable"}, 404)
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.download_execution_logs("job-1", tmp_path)
+
+        assert connection.commands == []  # it failed before listing anything
+        (value,) = self._events(c)
+        assert {key: value[key] for key in self._NOTHING_DONE} == self._NOTHING_DONE
+
+    @pytest.mark.parametrize(
+        ("arguments", "error"),
+        [
+            ({"sub_job_ids": "job-1:sampling:0"}, TypeError),
+            ({"sub_job_ids": []}, ValueError),
+            ({"transfer_timeout_seconds": 0}, ValueError),
+        ],
+        ids=["one-string", "no-sub-jobs", "no-time"],
+    )
+    def test_a_download_refused_for_its_arguments_is_still_an_execution_log_download_event(
+        self, tmp_path, monkeypatch, arguments, error
+    ):
+        c, connection = self._setup(monkeypatch, {"job-1:sampling:0/execution.jsonl": (b"one\n", "m1")})
+        c._metric_emitter = MagicMock()
+
+        with pytest.raises(error):
+            c.download_execution_logs("job-1", tmp_path, **arguments)
+
+        assert (c._session.get.call_count, connection.commands) == (0, [])  # refused before any work
+        (value,) = self._events(c)
+        assert {key: value[key] for key in self._NOTHING_DONE} == self._NOTHING_DONE
+        assert c._metric_emitter.emit.call_args.kwargs["attributes"]["error.type"] == error.__name__
+
+    def test_a_download_for_a_sub_job_without_execution_logs_still_times_its_listing(self, tmp_path, monkeypatch):
+        # The listing finds which sub-jobs have logs, so a missing one fails after it.
+        c, connection = self._setup(monkeypatch, {"job-1:sampling:0/execution.jsonl": (b"one\n", "m1")})
+        c._metric_emitter = MagicMock()
+        now = [1000.0]
+        monkeypatch.setattr(nc.time, "monotonic", lambda: now[0])
+        listing = c._list_experiment_artifact_files
+
+        def slow_list(*args, **kwargs):  # each of its two LISTs takes 0.5 s
+            now[0] += 0.5
+            return listing(*args, **kwargs)
+
+        monkeypatch.setattr(c, "_list_experiment_artifact_files", slow_list)
+        with pytest.raises(nc.NoChunksError, match="job-1:training:0"):
+            c.download_execution_logs("job-1", tmp_path, sub_job_ids=["job-1:training:0"])
+
+        assert self._gets(connection) == []  # nothing fetched
+        (value,) = self._events(c)
+        assert (value["success"], value["list_ms"], value["fetch_ms"], value["file_count"]) == (
+            False, 1000.0, 0.0, 0)
+        assert c._metric_emitter.emit.call_args.kwargs["attributes"]["error.type"] == "NoChunksError"
+
+    def test_resume_skips_unchanged_files_and_refetches_changed_ones(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        files = {
+            "job-1:sampling:0/execution.jsonl": (b"one\n", "m1"),  # 4 bytes
+            "job-1:sampling:0/server.log": (b"server\n", "s1"),  # 7 bytes
+        }
+        c, connection = self._setup(monkeypatch, files)
+        c._metric_emitter = MagicMock()
         c.download_execution_logs("job-1", tmp_path)
         assert len(self._gets(connection)) == 2
 
@@ -8470,6 +9143,10 @@ class TestDownloadExecutionLogs:
         assert get.startswith(f"GET '{uri}' ")
         assert (tmp_path / "job-1:sampling:0" / "execution.jsonl").read_bytes() == grown
         assert [r["unchanged"] for r in third] == [False, True]
+        # Each call's event says the same: the third kept server.log and wrote the 8 new bytes.
+        fields = ("success", "file_count", "files_skipped", "bytes_written")
+        assert [tuple(value[key] for key in fields) for value in self._events(c)] == [
+            (True, 2, 0, 11), (True, 2, 2, 0), (True, 2, 1, 8)]
 
     def test_without_resume_every_file_is_fetched_again(self, tmp_path, monkeypatch):
         c, connection = self._setup(monkeypatch, {"job-1:sampling:0/execution.jsonl": (b"x\n", "m1")})

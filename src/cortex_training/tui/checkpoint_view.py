@@ -51,7 +51,7 @@ from cortex_training.tui.checkpoints import SAMPLING
 from cortex_training.tui.checkpoints import TRAINING
 from cortex_training.tui.checkpoints import USES
 from cortex_training.tui.checkpoints import DownloadCancelled
-from cortex_training.tui.checkpoints import download_export
+from cortex_training.tui.checkpoints import download_checkpoint
 from cortex_training.tui.checkpoints import new_job_body
 from cortex_training.tui.checkpoints import use_plan
 from cortex_training.tui.checkpoints import SORTS
@@ -294,8 +294,9 @@ class CheckpointTab:
         try:
             # Fresh links: the ones read for the files' sizes may have expired.
             export = self._client.export_checkpoint(self._job_id, checkpoint_id)
-            paths = download_export(export, root, on_progress=progress,
-                                    cancelled=lambda: stop.is_set() or not self._screen_open)
+            paths = download_checkpoint(self._client, self._job_id, checkpoint_id, export, root,
+                                        on_progress=progress,
+                                        cancelled=lambda: stop.is_set() or not self._screen_open)
             outcome, error = f"{len(paths)} files", None
         except DownloadCancelled:
             outcome, error = None, "stopped"

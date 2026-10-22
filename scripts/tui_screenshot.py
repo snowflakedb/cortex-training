@@ -33,9 +33,13 @@ def _real_client(connection: str):
     import cortex_training._cli as cli
     from cortex_training.tui.__main__ import _build_arg_parser
 
+    from cortex_training.client import TUI_SURFACE
+
     args = cli._resolve_args(_build_arg_parser().parse_args(["--connection", connection]))
     args = cli._normalize_connection_args(args)
-    return cli.build_client(args, cli._load_cortex_training_client_class())
+    client = cli.build_client(args, cli._load_cortex_training_client_class())
+    client._telemetry_surface = TUI_SURFACE  # its calls are the TUI's, as in `cortex-training tui`
+    return client
 
 
 async def _shoot(out: Path, size: tuple[int, int], keys: list[str], job_id: str | None,

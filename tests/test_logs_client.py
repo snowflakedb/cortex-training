@@ -242,3 +242,101 @@ def test_download_stdout_logs_previews_the_first_named_sub_job_s_newest_output(t
     previews.clear()
     client.download_stdout_logs("job-1", tmp_path / "all", preview_seconds=600, on_preview=on_preview)
     assert previews == [] and (tmp_path / "all" / SAMPLING / "stdout.log").exists()
+
+
+# ─── How long the first page took (preview_ms, first_commit_ms) ───────────────
+
+
+def _telemetry(monkeypatch, client):
+    """``client`` recording its metrics; downloads send their successes by default."""
+    from unittest.mock import MagicMock
+
+    monkeypatch.delenv(_client_tests.nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+    client._metric_emitter = MagicMock()
+    return client
+
+
+def _outcome(client, operation):
+    [call] = [call for call in client._metric_emitter.emit.call_args_list if call.args[0] == operation]
+    return call.args[1]
+
+
+def _slow(seconds, then=None):
+    """A callback that takes ``seconds``, as the TUI's do while they draw what they were given."""
+    import time
+
+    def callback(entry):
+        time.sleep(seconds)
+        if then is not None:
+            then(entry)
+
+    return callback
+
+
+def test_a_metrics_download_says_when_its_preview_and_first_file_were_shown(tmp_path, monkeypatch):
+    client, _ = _staged(monkeypatch, "_metrics", {**_minutes(TRAINING, 40), **_minutes(SAMPLING, 5)})
+    _telemetry(monkeypatch, client)
+    commits = []
+
+    def on_commit(entry):
+        commits.append(entry["sub_job_id"])
+        if len(commits) == 2:  # the second file is slow: first_commit_ms is the first file's
+            _slow(0.2)(entry)
+
+    client.download_metrics("job-1", tmp_path, priority=[TRAINING], preview_seconds=600,
+                            on_preview=_slow(0.05), on_commit=_slow(0.05, on_commit))
+
+    value = _outcome(client, "download_metrics")
+    assert value["success"] is True and commits == [TRAINING, SAMPLING]
+    assert value["preview_ms"] >= 50  # once on_preview returned, its drawing included
+    assert value["preview_ms"] + 50 <= value["first_commit_ms"] <= value["duration_ms"] - 200
+
+
+def test_a_download_without_callbacks_still_says_when_its_first_file_was_whole(tmp_path, monkeypatch):
+    client, _ = _staged(monkeypatch, "_metrics", _minutes(TRAINING, 3))
+    _telemetry(monkeypatch, client)
+
+    client.download_metrics("job-1", tmp_path)
+
+    value = _outcome(client, "download_metrics")
+    assert 0 <= value["first_commit_ms"] <= value["duration_ms"] and "preview_ms" not in value
+
+
+def test_a_training_metrics_download_says_when_its_first_graph_was_shown(tmp_path, monkeypatch):
+    # The Training metrics tab has no preview: its first graph is drawn from the first file.
+    files = {f"{TRAINING}/training.20260904-1200{i:02d}.c{i}.gz": gzip.compress(f'{{"step": {i}}}\n'.encode())
+             for i in range(3)}
+    client, _ = _staged(monkeypatch, "_metrics", files)
+    _telemetry(monkeypatch, client)
+
+    client.download_training_metrics("job-1", tmp_path, priority=[TRAINING], on_commit=_slow(0.05))
+
+    value = _outcome(client, "download_training_metrics")
+    assert value["success"] is True and "preview_ms" not in value
+    assert 50 <= value["first_commit_ms"] <= value["duration_ms"]
+
+
+def test_a_saved_console_download_says_when_its_newest_page_was_shown(tmp_path, monkeypatch):
+    client, _ = _staged(monkeypatch, "_stdout", _console_minutes(TRAINING, 40))
+    _telemetry(monkeypatch, client)
+
+    client.download_stdout_logs("job-1", tmp_path, sub_job_ids=[TRAINING], preview_seconds=600,
+                                on_preview=_slow(0.05))
+
+    value = _outcome(client, "download_stdout_logs")
+    assert 50 <= value["preview_ms"] <= value["first_commit_ms"] <= value["duration_ms"]
+
+
+def test_a_preview_the_caller_could_not_show_sends_no_preview_ms(tmp_path, monkeypatch):
+    client, _ = _staged(monkeypatch, "_metrics", _minutes(TRAINING, 40))
+    _telemetry(monkeypatch, client)
+
+    def on_preview(entry):
+        raise RuntimeError("could not draw it")
+
+    with pytest.raises(RuntimeError, match="could not draw it"):
+        client.download_metrics("job-1", tmp_path, priority=[TRAINING], preview_seconds=600,
+                                on_preview=on_preview)
+
+    value = _outcome(client, "download_metrics")
+    assert value["success"] is False and "preview_ms" not in value and "first_commit_ms" not in value

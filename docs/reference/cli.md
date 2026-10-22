@@ -763,6 +763,14 @@ section 3.5](rest-api.md#35-retries)). So a job id that isn't found (404), or
 a service that keeps failing, shows its error within a few seconds rather than
 after about a minute. Pressing `r` while a refresh is still reading says so.
 
+Each call the TUI makes, and each checkpoint download, sends one best-effort
+client metric with its outcome and duration, successes included, tagged
+`client.surface = tui` so the TUI's use can be told from the CLI's and the
+SDK's. The downloads behind the Logs, Resources and Training metrics tabs also
+say how long the first page or graph of a first download took (`preview_ms`,
+`first_commit_ms`), not only the whole download. `CORTEX_TRAINING_DISABLE_TELEMETRY` turns them
+off; see [Client metrics](python-sdk.md#client-metrics).
+
 The TUI explains a refused read in one line on the view that needed it, worded
 the same on every view: the Logs tab's saved console and execution log, and the
 Resources tab (`GPU metrics unavailable: ...`). When the service can't resolve
@@ -1544,9 +1552,12 @@ the TUI's Training metrics tab reads the newest steps from (see
 
 `CORTEX_TRAINING_DISABLE_TELEMETRY` (truthy) skips OTLP client metrics on
 Snowflake profile and PAT clients. Failures are emitted by default, and so are
-successful downloads (`download-log`, `download-metrics`) with their timings.
-`CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY` set truthy also emits successful
-outcomes for every other essential operation; set falsy, it emits failures only. See the [Python SDK reference](python-sdk.md#client-metrics).
+successful downloads (`download-log`, `download-metrics`) with their timings,
+and every successful call `cortex-training tui` makes. Each metric names the
+program that made the call in `client.surface`: `cli` for these commands, `tui`
+for the TUI, `sdk` for Python code. `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY`
+set truthy also emits successful outcomes for every other essential operation;
+set falsy, it emits failures only, the TUI's included. See the [Python SDK reference](python-sdk.md#client-metrics).
 
 `CORTEX_TRAINING_DISABLE_TENSOR_PROMPTS` (truthy) sends pre-tokenized prompts
 as JSON lists inside the request frame instead of as tensors. The request body

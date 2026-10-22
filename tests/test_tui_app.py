@@ -3455,6 +3455,61 @@ def test_quit_without_job_id_derives_it_from_sub_job_id_and_reports_crashes(monk
         tui_main.run(["--sub-job-id", "not-a-sub-job-id", "--base-url", "http://localhost:1", "--database", "DB"])
 
 
+def test_the_tui_tags_its_client_and_the_job_clients_it_opens(monkeypatch):
+    # Their metrics then say the TUI made the call (client.surface), successes included.
+    seen = []
+    surfaces = []  # the client's tag while the app runs, which is when it makes its calls
+
+    class FakeApp:
+        return_code = 0
+
+        def __init__(self, client, job_id, *, sub_job_id=None, poll_interval=1.0):
+            seen.append(client)
+
+        def run(self):
+            surfaces.append(seen[-1]._telemetry_surface)
+
+    monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", FakeApp)
+    assert tui_main.run(["--base-url", "http://localhost:1", "--database", "DB"]) == 0
+    client = seen[0]
+    try:
+        assert surfaces == ["tui"]
+        assert client._telemetry_surface == "tui"
+        # A job from another schema's row gets its own client, as the job list opens it.
+        from cortex_training.tui.account import JobClients
+        from cortex_training.tui.untrusted import printable_client
+
+        row = {"job_id": "j1", "database_name": "ML", "schema_name": "EXP"}
+        job_client = JobClients(printable_client(client)).for_job(row)
+        assert job_client.wrapped is not client and job_client._telemetry_surface == "tui"
+    finally:
+        client.close()
+
+
+def test_the_screenshot_script_tags_its_real_client_as_the_tui(monkeypatch):
+    # With --connection it drives the TUI against an account: its calls are the TUI's.
+    import importlib.util
+
+    import cortex_training._cli as cli
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "tui_screenshot.py"
+    spec = importlib.util.spec_from_file_location("tui_screenshot", path)
+    tui_screenshot = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tui_screenshot)
+    built = []
+
+    class Built:
+        pass
+
+    # Nothing connects: the profile is only named, and no client is built for real.
+    monkeypatch.setattr(cli, "build_client", lambda args, cls: built.append(args.connection) or Built())
+
+    client = tui_screenshot._real_client("some-connection")
+
+    assert built == ["some-connection"]
+    assert isinstance(client, Built) and client._telemetry_surface == "tui"
+
+
 @pytest.mark.parametrize(
     "config, message, usage",
     [
