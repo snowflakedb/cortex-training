@@ -1174,8 +1174,9 @@ next tab, round to Logs after the last.
     selected sub-job, and refreshes on `r`. A refresh rebuilds the window on
     screen and the whole job's (the stats beside every window); `w` to a window
     not on screen since shows it as it last was, with `refreshing…` in the
-    header, for the moment it takes to rebuild. While a download runs, the header
-    counts the selected sub-job's chunks:
+    header, for the moment it takes to rebuild. A rebuild that fails says
+    `cached · refresh failed: …` instead, until `r` or the next refresh builds the
+    window. While a download runs, the header counts the selected sub-job's chunks:
     `loading GPU metrics ━━━━━━━━━━━━ 340/1,440 chunks`. A view with nothing to chart shows
     a quiet card instead of the stats and charts: a title (`Waiting for the
     job to start`, `Waiting for the first samples`, `GPU metrics are on

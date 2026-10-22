@@ -256,6 +256,8 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         self._resource_loading = False
         self._resource_refresh_succeeded = False
         self._resource_error: str | None = None
+        # The window whose rebuild failed (see _rebuild_resource_window) and why, until it is rebuilt.
+        self._resource_window_error: tuple[str, str] | None = None
         self._resource_range = DEFAULT_RANGE
         self._resource_downloaded = False
         self._resource_progress: dict[str, tuple[int, int]] = {}  # per sub-job, a download's (chunks done, of them)

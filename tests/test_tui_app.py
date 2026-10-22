@@ -5640,6 +5640,47 @@ def test_a_schema_list_past_the_cap_draws_its_newest_and_f_draws_every_job():
     asyncio.run(_run_a_schema_list_past_the_cap(c))
 
 
+async def _run_a_on_a_schema_list_past_the_cap(c):
+    app = CortexTrainingLogTUI(c, poll_interval=0.01)
+    async with app.run_test(size=(160, 40)) as pilot:
+        assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._job_by_item,
+                           tries=400)
+        screen = app.screen
+        drawn = lambda: len(screen._job_by_item)  # noqa: E731
+        cut = "newest 2,000 + every active job (more exist)"
+
+        async def press_a():
+            calls = c.list_jobs.call_count
+            await pilot.press("a")
+            assert await _wait(pilot, app, lambda: screen._declined and c.list_jobs.call_count > calls
+                               and not screen._refreshing, tries=400), "a never came back to the schema"
+
+        assert drawn() == 2_001 and cut in screen._scope_text()
+        await press_a()  # all schemas aren't there: the list stays the schema's, cut as it was
+        assert drawn() == 2_001, "a drew a different list"
+        assert cut in screen._scope_text(), f"the header lost the cut: {screen._scope_text()!r}"
+        assert screen.check_action("full_list", ("all",)), "a hid f"
+        await pilot.press("f")
+        assert await _wait(pilot, app, lambda: drawn() == 2_500, tries=400), "f drew no more after a"
+        await press_a()  # with every job drawn, they stay drawn: it is the same list
+        assert drawn() == 2_500 and screen.check_action("full_list", ("newest",))
+        await pilot.press("f")
+        assert await _wait(pilot, app, lambda: drawn() == 2_001, tries=400), "f did not go back"
+        assert cut in screen._scope_text()
+        await _settle(app, pilot)
+
+
+def test_a_on_a_schema_list_past_the_cap_keeps_it_cut_and_f_at_hand():
+    # Where the account-level list isn't there, a reads the configured schema's whole list
+    # again; it is shown as the schema list it is, so cut, saying so, with every job for f.
+    now = datetime.now(timezone.utc)
+    c = _client()
+    c.list_jobs.return_value = [{"job_id": f"j{i}", "status": "SUCCEEDED",
+                                 "created_at": (now - timedelta(minutes=i)).isoformat()} for i in range(2_500)]
+    c.list_jobs.return_value[-1]["status"] = "RUNNING"  # the oldest, still running: always listed
+    asyncio.run(_run_a_on_a_schema_list_past_the_cap(c))
+
+
 async def _run_f_does_nothing_on_a_list_not_cut_short(c):
     app = CortexTrainingLogTUI(c, poll_interval=0.01)
     async with app.run_test() as pilot:
@@ -5723,17 +5764,45 @@ async def _run_a_window_picked_after_a_refresh(tmp_path, monkeypatch):
         screen._accept_rebuilt_window(resource_module.ResourceData({}), resource_module.resource_loader(screen._metrics_root))
         assert screen._resource_data is current, "an older rebuild replaced newer rows"
 
+        failures = ["rebuild broke"]
+
         def broken(self, **kwargs):
             if kwargs.get("shown") == "1h":
-                raise RuntimeError("rebuild broke")
+                raise RuntimeError(failures[0])
             return real_load(self, **kwargs)
 
         real_load = resource_module.ResourceLoader.load
         monkeypatch.setattr(resource_module.ResourceLoader, "load", broken)
+        header = lambda: str(screen.query_one("#resource-status", Static).render())  # noqa: E731
         await pilot.press("w")  # to 1h: its rebuild fails
         assert await _pause_until(pilot, lambda: "rebuild broke" in _error_log_text(widgets_module), seconds=10)
-        await pilot.pause(0.2)
+        assert await _pause_until(pilot, lambda: "refresh failed: RuntimeError: rebuild broke" in header(),
+                                  seconds=10), header()
         assert app.is_running and screen._resource_range == "1h", "a failed rebuild took the app down"
+        assert "refreshing…" not in header(), "a failed rebuild still says it is refreshing"
+        # Picking the window again is another try: refreshing… until it answers, then what it found.
+        assert held.try_acquire()
+        for _ in range(len(RANGES)):  # once round, back to 1h
+            await pilot.press("w")
+        await pilot.pause(0.2)
+        assert screen._resource_range == "1h"
+        assert screen._resource_state(screen._resource_kind_data()) == ("refreshing…",), header()
+        held.release()
+        assert await _pause_until(pilot, lambda: "refresh failed: RuntimeError: rebuild broke" in header(),
+                                  seconds=10), header()
+        # A refresh whose loads fail too: once it is over, the header names that newer failure.
+        failures[0] = "the load broke too"
+        await pilot.press("r")
+        assert await _pause_until(pilot, lambda: not screen._resource_loading
+                                  and "the load broke too" in (screen._resource_error or ""), seconds=15)
+        assert "refresh failed: RuntimeError: the load broke too" in header(), header()
+        assert "refreshing…" not in header(), header()
+        # Once the window can be built, the next refresh builds it, and nothing failed.
+        monkeypatch.setattr(resource_module.ResourceLoader, "load", real_load)
+        await pilot.press("r")
+        assert await _pause_until(pilot, lambda: not screen._resource_loading and screen._resource_error is None
+                                  and screen._resource_kind_data().fresh("1h"), seconds=15)
+        assert "failed" not in header() and "refreshing…" not in header(), header()
         await _settle(app, pilot)
 
 

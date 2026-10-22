@@ -1068,7 +1068,9 @@ class JobListScreen(FollowsPointer, Screen):
         # The header keeps saying why, in short, after the notice has gone.
         self._declined = views.fit_cells(why, self._DECLINED_CELLS) or "all schemas unavailable"
         if error is None:
-            return Listing(listing.jobs, ListScope(SCHEMA))
+            # The configured schema's list as the fallback read it, as that list: one too long to
+            # draw whole stays cut, with its every job kept for f (see cut_whole_listing).
+            return replace(listing, scope=replace(listing.scope, kind=SCHEMA, reason=None))
         self._update_subtitle()
         if self._loaded_at is None:
             self._refresh_jobs()  # nothing listed yet (a came first): read the configured schema's list
