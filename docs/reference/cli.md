@@ -1077,8 +1077,10 @@ was cancelled, terminated or completed. It shows the service's `reason` and
 `reason_details` (a failure always has a reason, `not reported` when none is
 sent), or what the state means, and where to look next. A running job has no
 box unless the service sends a reason. The Sub-jobs card shows type, status
-(a badge such as `● RUNNING`), model, GPUs and key config; multiplexed rows
-name the source sub-job. Long cells use `…`, narrow screens omit Type, and
+(a badge such as `● RUNNING`), model, GPUs and the sub-job's config as
+submitted, `key=value` by key (`max_seq_len=4096 · n_gpus=8 · optimizer={lr:
+1e-05, name: adamw}`), with nothing derived added; a multiplexed row's config
+names its source sub-job in `multiplex_job_id`. Long cells use `…`, narrow screens omit Type, and
 wider tables scroll with `←` / `→` or `Home` / `End`; the card's bottom border
 says so (`e whole table`, `← → scroll`).
 

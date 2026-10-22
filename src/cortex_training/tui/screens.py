@@ -412,9 +412,6 @@ class JobSummaryScreen(FollowsPointer, Screen):
             key = f"sj-{i}"
             self._scope_by_row[key] = sj.get("sub_job_id")
             config = v.subjob_config_summary(sj)
-            target = v.multiplex_target(sj)
-            if target:
-                config = " · ".join(p for p in (config, f"runs on {v.short_sub_job_id(target)}") if p)
             rows.append((key, [Text(f"  {v.sub_job_label(sj)}"), Text(v.sub_job_type(sj)),
                                status_text(sj.get("status")), Text(str(sj.get("model_name") or "—")),
                                Text(v.sub_job_gpu_text(sj)), Text(config)]))

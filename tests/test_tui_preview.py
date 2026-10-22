@@ -63,6 +63,21 @@ def test_preview_facts_leave_the_hero_and_lifecycle_out():
     assert [label for label, _value in v.preview_facts(located, NOW)][-1] == "Schema"
 
 
+def test_subjob_config_summary_is_the_submitted_config():
+    sj = {"job_type": "training", "model_name": "Qwen/Qwen3-8B", "dtype": "bfloat16",
+          "training_config": {"n_gpus": 8.0, "max_seq_len": 4096.0, "save_training_metrics": False,
+                              "optimizer": {"name": "adamw", "lr": 1e-5, "betas": [0.9, 0.95]}}}
+    assert v.subjob_config_summary(sj) == ("max_seq_len=4096 · n_gpus=8 · "
+                                           "optimizer={betas: [0.9, 0.95], lr: 1e-05, name: adamw} · "
+                                           "save_training_metrics=false")
+    # Nothing derived is added: no "full-param" for a training sub-job without peft_config.
+    assert "full-param" not in v.subjob_config_summary(sj)
+    assert v.subjob_config_summary({"job_type": "sampling",
+                                    "inference_config": {"n_gpus": 2.0, "gpu_memory_utilization": 0.9}}) \
+        == "gpu_memory_utilization=0.9 · n_gpus=2"
+    assert v.subjob_config_summary({"job_type": "training"}) == ""
+
+
 def test_elapsed_text_runs_from_creation():
     assert v.elapsed_text(_job("RUNNING"), NOW) == "2h 00m so far"
     # Ended: to when it entered its last state, and "lasted", since it may never have run.

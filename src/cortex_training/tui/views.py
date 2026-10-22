@@ -487,33 +487,24 @@ def within_retention(job: dict, now: datetime, days: int = RETENTION_DAYS) -> bo
     return created is None or (now - created).total_seconds() <= days * 86400
 
 
+def _config_value(value: Any) -> str:
+    """A submitted config value on one line: JSON without quotes, whole floats as ints."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{printable(str(k))}: {_config_value(v)}" for k, v in sorted(value.items())) + "}"
+    if isinstance(value, list):
+        return "[" + ", ".join(_config_value(v) for v in value) + "]"
+    return collapse(compact_number(value))
+
+
 def subjob_config_summary(sj: dict) -> str:
-    """Compact human summary of one sub-job's create-time config."""
-    cfg = subjob_config(sj)
-    bits = []
-    opt = cfg.get("optimizer")
-    if isinstance(opt, dict):
-        o = str(opt.get("name") or "")
-        if opt.get("lr") is not None:
-            o = f"{o} lr={compact_number(opt['lr'])}".strip()
-        if o:
-            bits.append(o)
-    for key, label in (("train_batch_size", "bs"), ("max_seq_len", "seq")):
-        if cfg.get(key) is not None:
-            bits.append(f"{label}={compact_number(cfg[key])}")
-    peft = cfg.get("peft_config")
-    if isinstance(peft, dict):
-        lora = "LoRA"
-        if peft.get("r") is not None:
-            lora += f" r={compact_number(peft['r'])}"
-        if peft.get("lora_alpha") is not None:
-            lora += f" α={compact_number(peft['lora_alpha'])}"
-        bits.append(lora)
-    elif str(sj.get("job_type") or "").lower() == "training":
-        bits.append("full-param")
-    if cfg.get("gpu_memory_utilization") is not None:
-        bits.append(f"mem={compact_number(cfg['gpu_memory_utilization'])}")
-    return " · ".join(bits)
+    """One sub-job's config as submitted, ``key=value`` by key, with nothing added
+    or left out: ``max_seq_len=4096 · n_gpus=8 · optimizer={lr: 1e-05, name: adamw}``."""
+    cfg = _type_config(sj)
+    return " · ".join(f"{printable(str(key))}={_config_value(value)}" for key, value in sorted(cfg.items()))
 
 
 def preview_facts(job: dict, now: datetime) -> list:
