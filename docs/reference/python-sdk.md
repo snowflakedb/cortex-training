@@ -8,39 +8,61 @@ from cortex_training import CortexTrainingClient, SubJobConfig, JobType
 client: every data-plane call returns a `request_id` that you poll, and results
 are whatever the backend returns.
 
-Construct it with a named Snowflake connection profile:
+Construct it with `from_configs()`, which uses your Snowflake connection
+profile:
 
 ```python
-client = CortexTrainingClient.from_connection_name("training")
+client = CortexTrainingClient.from_configs()                # pick the profile as below
+client = CortexTrainingClient.from_configs(connection="training")
 ```
 
-Pass no name to use the Connector-configured default profile. The profile's
-database and schema are used unless explicitly overridden. The client shares
-the profile's live Snowflake session token with REST and telemetry calls,
-reconnecting once when the API reports token expiry.
+`from_configs(connection=None, *, ct_config=None, database=None, schema=None, **kwargs)`
+picks, first match wins:
 
-Direct Programmatic Access Token construction remains supported:
+- **Profile:** `connection`; then `"profile"` in `config.json`; then the
+  Snowflake default profile. `CORTEX_TRAINING_HOST` and `CORTEX_TRAINING_PAT`
+  are used only when no Snowflake profile exists, for CI; when a profile is used
+  they are ignored and a warning says so.
+- **Database:** `database`; then `CORTEX_TRAINING_DATABASE` (logged when used);
+  then the profile's database; then `CORTEX_TRAINING_DB`.
+- **Schema:** `schema`; then `CORTEX_TRAINING_SCHEMA`; then the profile's
+  schema; then `PUBLIC`.
 
-```python
-client = CortexTrainingClient.from_pat(
-    host="ACCOUNT.snowflakecomputing.com",
-    pat=PAT,
-    database="CORTEX_TRAINING_DB",
-    schema="PUBLIC",
-)
+It logs one line naming the target and where each part came from, for example
+`profile training (from config.json), db TRAIN_DB (from profile training), schema PUBLIC (default)`.
+The client shares the profile's live Snowflake session token with REST and
+telemetry calls, reconnecting once when the API reports token expiry.
+
+`config.json` holds Cortex Training settings only, never credentials or a
+database. It is read from `~/.config/cortex-training/config.json` (honoring
+`XDG_CONFIG_HOME`), or from `ct_config=` when given:
+
+```json
+{"profile": "training", "endpoint": "cortex-training", "poll_interval": 0.5, "poll_timeout": 1800, "verify_ssl": true}
 ```
+
+Every key is optional. Keys that belong in a Snowflake profile (`host`, `pat`,
+`database`, `schema`, ...) are rejected with an error that says where they go.
+Other keyword arguments to `from_configs()` go to the constructor and win over
+`config.json`.
+
+`from_connection_name()` and `from_pat()` still work but are deprecated: each
+emits a `FutureWarning` and will be removed in a future release. Use
+`from_configs()` instead.
 
 Tuning knobs on the constructor: `endpoint`, `poll_interval` (0.5s),
 `poll_timeout` (1800s), `poll_backoff_multiplier` (1.25), `poll_max_interval`
 (6s), `pool_maxsize` (1024), `max_retries` (10), and `request_timeout`
 (`(30s connect, 600s read)`). Pass a positive scalar to use the same connect
-and read timeout, or a `(connect, read)` pair. `from_connection_name` and
-`from_pat` also accept `telemetry_timeout` (3s) for best-effort client metrics.
+and read timeout, or a `(connect, read)` pair. `from_configs` also accepts
+`telemetry_timeout` (3s) for best-effort client metrics.
 
-By default a request answered "database or schema not found" makes the client
-run `CREATE DATABASE` (and `CREATE SCHEMA`) and retry. Set
-`client.auto_create_database = False` for a client that only reads: the error
-is then raised as it is. A client from `for_job` starts with it off.
+The client never creates a database. A request that fails because the
+database or schema in its URL can't be found (HTTP 400, code `517602`) raises
+`DatabaseAccessError` (see [Exceptions](#exceptions)), which says how to create
+it, get access to it, or use another one. A client from `for_job` raises the
+plain `requests.HTTPError` instead. `client.auto_create_database` is deprecated:
+it is always False, and setting it only emits a `FutureWarning`.
 
 ## Client metrics
 
@@ -393,6 +415,13 @@ carry a `.detail` dict for chunk-group failures. `AccountJobListUnavailable` (wi
 `.reason`) and `InvalidPageToken`, also `HTTPError` subclasses, come from
 `list_jobs_page`. Polling raises `RuntimeError`
 on a failed/cancelled request and `TimeoutError` at the deadline.
+
+`DatabaseAccessError` (a subclass of both `requests.exceptions.HTTPError` and
+`RuntimeError`) means the configured database or schema can't be found by the
+current role: it doesn't exist, or the role can't access it. It carries
+`.response` (the HTTP 400), `.kind` (`"database"` or `"schema"`), `.name`,
+`.role` (the session's role, or None when it can't be determined, as for PAT
+clients), and `.statement`, the `CREATE` statement that would set it up.
 
 ## Details not covered here
 

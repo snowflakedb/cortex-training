@@ -289,6 +289,28 @@ def _positive_int(value: str) -> int:
     return number
 
 
+_LOGIN_DESCRIPTION = """\
+Connect Cortex Training to your Snowflake account. Run this once when you start.
+
+Cortex Training signs in with a Snowflake connection profile: a saved
+connection that the Snowflake CLI (snow) and other Snowflake tools use too.
+login helps you use a profile you already have, or create a new one, and
+checks that:
+
+  - it can sign in to your Snowflake account,
+  - Cortex Training is enabled on that account, and
+  - there is a database for Cortex Training to keep your training jobs and
+    checkpoints in (we recommend CORTEX_TRAINING_DB).
+
+login never changes your existing profiles, and asks before it creates
+anything. Your choice is saved in ~/.config/cortex-training/config.json.
+
+examples:
+  cortex-training login            # set up, or check your current setup
+  cortex-training login training   # use the profile "training", or create it
+"""
+
+
 def build_parser(
     *,
     prog: str = "cortex-training",
@@ -618,22 +640,19 @@ def build_parser(
 
     login = subparsers.add_parser(
         "login",
-        usage="%(prog)s [-h] (config | --config config)",
-        help="Remember a Cortex Training config file for future commands.",
+        help="Connect Cortex Training to your Snowflake account (run this first).",
+        description=_LOGIN_DESCRIPTION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    login_config = login.add_mutually_exclusive_group(required=True)
-    login_config.add_argument(
-        "login_config",
+    login.add_argument(
+        "login_name",
         nargs="?",
-        metavar="config",
-        help="Path to the Cortex Training CLI config JSON file to remember.",
+        metavar="NAME",
+        help="A profile name to use, or to create if it doesn't exist. Leave it out to pick one.",
     )
-    login_config.add_argument(
-        "--config",
-        dest="login_config_option",
-        metavar="config",
-        help="Alternative to the positional config path.",
-    )
+    # The old forms, `login config.json` and `login --config config.json`, are
+    # still parsed so they can explain what replaced them.
+    login.add_argument("--config", dest="login_config_option", help=argparse.SUPPRESS)
 
     if include_tui:
         subparsers.add_parser(
@@ -885,7 +904,6 @@ def parse_args(
         if args.user is not None and not args.user.strip():
             parser.error("--user must not be empty")
     if args.command == "login":
-        args.login_config = args.login_config or args.login_config_option
         return args
 
     dry_run = args.command == "submit" and args.dry_run
@@ -919,12 +937,12 @@ def build_client(args: argparse.Namespace, cortex_training_client_cls):
     if args.base_url:
         return cortex_training_client_cls(base_url=args.base_url, **kwargs)
     if args.use_connection_profile:
-        return cortex_training_client_cls.from_connection_name(
+        return cortex_training_client_cls._from_profile(
             connection_name=args.connection,
             verify_ssl=not args.no_verify_ssl,
             **kwargs,
         )
-    return cortex_training_client_cls.from_pat(
+    return cortex_training_client_cls._from_pat(
         host=_normalize_host(args.host),
         pat=args.pat,
         verify_ssl=not args.no_verify_ssl,
@@ -1083,14 +1101,20 @@ def _cmd_list(args: argparse.Namespace, client, stdout: TextIO) -> int:
     return 0
 
 
-def _cmd_login(args: argparse.Namespace, stdout: TextIO) -> int:
-    config_path = _write_login_config_path(args.login_config)
-    _print_json(
-        {"config_path": config_path, "logged_in": True},
-        stdout,
-        compact=args.compact,
-    )
-    return 0
+def _cmd_login(args: argparse.Namespace, stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
+    name = args.login_name
+    old_form = args.login_config_option or (name is not None and ("." in name or "/" in name))
+    if old_form:
+        typed = f"--config {args.login_config_option}" if args.login_config_option else name
+        stderr.write(
+            f"error: `cortex-training login {typed}` (remembering a JSON "
+            "config) is no longer supported. Run `cortex-training login` to set up a Snowflake "
+            "connection profile instead.\n"
+        )
+        return 2
+    from cortex_training._login import run_login
+
+    return run_login(name, stdin=stdin, stdout=stdout, stderr=stderr)
 
 
 def _cmd_capacity(args: argparse.Namespace, client, stdout: TextIO) -> int:
@@ -1600,7 +1624,7 @@ def _run(
 ) -> int:
     stderr = stderr or sys.stderr
     if args.command == "login":
-        return _cmd_login(args, stdout)
+        return _cmd_login(args, stdin, stdout, stderr)
 
     if args.command == "submit" and args.dry_run:
         return _cmd_submit(args, None, stdout, stdin)

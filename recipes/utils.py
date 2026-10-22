@@ -78,7 +78,7 @@ def make_client(config_path: str, **overrides: Any) -> CortexTrainingClient:
         raise ValueError("connection config needs `host` (Snowflake PAT auth)")
     if pat is None:
         raise ValueError("no PAT found: put `pat` in the connection config")
-    return CortexTrainingClient.from_pat(
+    return CortexTrainingClient._from_pat(
         host=host,
         pat=pat,
         verify_ssl=bool(config.get("verify_ssl", True)),

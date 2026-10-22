@@ -27,10 +27,12 @@ the adapter and grader in `rollout.py`, the wiring in `entrypoint.py`.
 ## Prerequisites
 
 A Cortex account with capacity for 8 GPUs: 4 for training and 4 for sampling.
-Follow [connection setup](../getting-started/setup.md), then confirm capacity:
+Follow [connection setup](../getting-started/setup.md), or run
+`cortex-training login` to set up a Snowflake connection profile, then confirm
+capacity:
 
 ```bash
-cortex-training login ~/cortex-training-config.json
+cortex-training login
 cortex-training capacity
 ```
 

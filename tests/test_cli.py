@@ -3208,24 +3208,20 @@ def test_invalid_config_value_type_returns_error(tmp_path):
 
 
 @pytest.mark.parametrize("config_flags", [[], ["--config"]])
-def test_login_persists_config_path(tmp_path, monkeypatch, config_flags):
+def test_the_old_login_form_no_longer_saves_the_config(tmp_path, monkeypatch, config_flags):
     login_state = tmp_path / "login.json"
     config = _write_config(
         tmp_path,
         {"base_url": "http://login.local", "database": "LOGIN_DB"},
     )
     monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
-    stdout = io.StringIO()
+    stderr = io.StringIO()
 
-    rc = cli.main(["login"] + config_flags + [str(config)], stdout=stdout)
+    rc = cli.main(["login"] + config_flags + [str(config)], stdout=io.StringIO(), stderr=stderr)
 
-    assert rc == 0
-    saved = json.loads(login_state.read_text(encoding="utf-8"))
-    assert saved == {"config_path": str(config.resolve())}
-    assert json.loads(stdout.getvalue()) == {
-        "config_path": str(config.resolve()),
-        "logged_in": True,
-    }
+    assert rc == 2
+    assert not login_state.exists()
+    assert "no longer supported. Run `cortex-training login`" in stderr.getvalue()
 
 
 def test_logged_in_config_is_used_without_config_arg(tmp_path, monkeypatch):
@@ -3297,20 +3293,6 @@ def test_direct_connection_flags_do_not_read_login_state(tmp_path, monkeypatch):
     )
 
     assert rc == 0
-
-
-@pytest.mark.parametrize("config_flags", [[], ["--config"]])
-def test_login_rejects_invalid_config(tmp_path, monkeypatch, config_flags):
-    login_state = tmp_path / "login.json"
-    config = _write_config(tmp_path, {"typo": "value"})
-    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
-    stderr = io.StringIO()
-
-    rc = cli.main(["login"] + config_flags + [str(config)], stderr=stderr)
-
-    assert rc == 1
-    assert not login_state.exists()
-    assert "unknown config key" in stderr.getvalue()
 
 
 def test_no_legacy_config_falls_back_to_default_snowflake_profile(
@@ -3457,10 +3439,10 @@ def test_build_client_uses_named_snowflake_connection(tmp_path, monkeypatch):
     args = cli.parse_args(["--connection", "training-profile", "list"])
     client_cls = MagicMock()
     connected = object()
-    client_cls.from_connection_name.return_value = connected
+    client_cls._from_profile.return_value = connected
 
     assert cli.build_client(args, client_cls) is connected
-    client_cls.from_connection_name.assert_called_once_with(
+    client_cls._from_profile.assert_called_once_with(
         connection_name="training-profile",
         database=None,
         schema=None,
@@ -3482,7 +3464,7 @@ def test_build_client_forwards_read_bounds_only_when_set(tmp_path, monkeypatch):
     client_cls = MagicMock()
 
     cli.build_client(args, client_cls)
-    kwargs = client_cls.from_connection_name.call_args.kwargs
+    kwargs = client_cls._from_profile.call_args.kwargs
     assert (kwargs["max_retries"], kwargs["request_timeout"]) == (2, (10.0, 45.0))
 
 

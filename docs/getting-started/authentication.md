@@ -95,13 +95,19 @@ any of these methods:
 cortex-training capacity
 ```
 
-This should print your available GPU capacity. The client automatically creates
-the configured database if it does not exist. If automatic creation fails (for
-example, your role lacks `CREATE DATABASE`), create it manually in Snowsight:
+This should print your available GPU capacity.
+
+Cortex Training keeps your jobs and checkpoints in the profile's database, and
+it never creates that database for you. Create it once, in Snowsight:
 
 ```sql
 CREATE DATABASE IF NOT EXISTS CORTEX_TRAINING_DB;
 ```
+
+or run `cortex-training login`, which offers to create it after showing you
+the SQL. If a command can't find the database, it stops with an error that names
+your role and the database, and how to fix it: create it, ask an admin for
+`GRANT USAGE`, or use another database with `--database`.
 
 ### Option B: JSON config (legacy)
 
@@ -116,12 +122,15 @@ Create a JSON file outside the repository:
 }
 ```
 
-Register it once so subsequent commands use it automatically:
+Pass it to each command with `--config`:
 
 ```bash
-cortex-training login ~/cortex-training-config.json
-cortex-training capacity
+cortex-training --config ~/cortex-training-config.json capacity
 ```
+
+`cortex-training login` no longer remembers a JSON file. To set things up once,
+use a Snowflake connection profile (Option A), or run `cortex-training login`,
+which creates or picks one for you.
 
 ### Option C: Environment variables
 

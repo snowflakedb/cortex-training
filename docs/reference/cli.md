@@ -5,7 +5,7 @@ supported command-line and SDK interfaces for Cortex Training.
 
 `ct` is installed as an alias for `cortex-training` and supports the same
 commands and flags. You can replace `cortex-training` with `ct` in any example
-below, such as `ct login config.json` or `ct --job JOB_ID step`.
+below, such as `ct login` or `ct --job JOB_ID step`.
 
 ## Installation
 
@@ -64,8 +64,7 @@ See [jobs and sub-jobs](../concepts/jobs-and-subjobs.md) and the
 ## Quick Reference
 
 Global flags such as `--config`, `--job`, and `--compact` go **before** the
-subcommand. `login` also accepts its own `--config` after the subcommand.
-`--job-id` is an alias for `--job`:
+subcommand. `--job-id` is an alias for `--job`:
 
 ```bash
 cortex-training --config config.json list
@@ -83,8 +82,8 @@ positional `JOB_ID` after the subcommand.
 ```bash
 cortex-training --connection training list    # Use a Snowflake profile
 cortex-training list                          # Use the configured default profile
-cortex-training login config.json             # Remember config for future commands
-cortex-training login --config config.json    # Equivalent login syntax
+cortex-training login                         # Set up or check the profile to use
+cortex-training login training                # Use or create the profile "training"
 cortex-training --config config.json list     # Use config for one command
 ```
 
@@ -252,25 +251,65 @@ account, use `base_url` with an explicit scheme. This skips PAT auth:
 }
 ```
 
-### Legacy Login
+### Login
 
-Login validates the config and stores only the config path, not the config
-contents:
+`cortex-training login` sets up the Snowflake connection profile Cortex Training
+uses, and remembers it as `"profile"` in `~/.config/cortex-training/config.json`
+(or `$XDG_CONFIG_HOME/cortex-training/config.json`):
 
 ```bash
-cortex-training login config.json
-cortex-training login --config config.json
+cortex-training login            # check the current setup, or pick a profile
+cortex-training login training   # use or create the profile "training"
 ```
 
-Provide exactly one config path, either positionally or with `--config` after
-`login`. Both forms validate and remember the same file. Login requires an
-explicit path even when a global `--config`, `CORTEX_TRAINING_CONFIG`, or a
-previous login is available.
+1. It first checks your shell for environment variables that would override
+   this setup or change its defaults (such as `CORTEX_TRAINING_CONFIG`,
+   `CORTEX_TRAINING_HOST`, `SNOWFLAKE_PAT`, `SNOWFLAKE_HOME`, or
+   `XDG_CONFIG_HOME`), says what each does, and shows the command that clears
+   it in your shell. Secret values are never shown. It only reads your
+   environment, and it reminds you at the end if an override is still set.
+   If `config.json` already names a profile, login checks it and offers to
+   keep it.
+2. Otherwise it lists your Snowflake connection profiles to pick from, each
+   with a verdict and hints read from its settings (nothing signs in yet): how
+   it signs in (a token or key pair signs in without prompts; browser and MFA
+   sign-ins stop to ask), its database, and its role. A profile without an
+   account or user can't be picked. You can also create one from an account
+   host (a Snowsight URL also works), a user, an optional role, and a
+   programmatic access token (typed hidden); new profiles default to the name
+   `cortex-training`. Pick a profile on an account where Cortex Training is
+   enabled. Before listing, login offers to check which accounts have it by
+   signing in once to each account (read-only), using only profiles that sign
+   in without prompts; it lists the accounts it would contact and asks first.
+   Each profile then shows whether Cortex Training is enabled on its account
+   (✓), not enabled (✗, can't be picked), or not checked yet (?).
+   After you pick, login signs in and asks Cortex Training right away. If the
+   profile can't sign in, or Cortex Training isn't enabled on its account,
+   login says why and returns to the list before anything is created.
+   A profile you create is saved first, and login asks before signing in to
+   check it. If you say no, login uses it unchecked and says so. If the check
+   fails, login says why and offers to delete the new profile; it never
+   offers to delete a profile it didn't create.
+3. It shows the database Cortex Training will keep jobs and checkpoints in (the
+   profile's) and offers a separate one; `CORTEX_TRAINING_DB` is recommended.
+4. If that database is missing or the role can't access it, login offers
+   another profile with the same account, user, and role whose database works.
+   Otherwise it offers a new profile with the same sign-in and its own database,
+   and creates the database only after showing the SQL and asking.
+5. It checks the result with one more capacity request, then saves the profile
+   name. The name is saved only when a profile passes, or when you chose not
+   to check a new one.
 
-The login state is written to `~/.config/cortex-training/login.json` by default,
-or `$XDG_CONFIG_HOME/cortex-training/login.json` when `XDG_CONFIG_HOME` is set.
+Login never changes an existing profile. New profiles go to the file the
+Snowflake Connector reads: `connections.toml`, or `config.toml` when your
+profiles live there. Prompts and progress go to stderr, in color in a terminal
+(set `NO_COLOR` to turn color off); a JSON summary goes to stdout only when it
+is piped. Login needs a terminal; in CI, set `CORTEX_TRAINING_HOST` and
+`CORTEX_TRAINING_PAT` instead.
 
-You can bypass login for one command with:
+`cortex-training login config.json` and `login --config config.json`, which
+remembered a JSON config, are no longer supported. A JSON config still works
+for one command with:
 
 ```bash
 cortex-training --config config.json list
