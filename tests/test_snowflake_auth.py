@@ -299,30 +299,6 @@ def test_rejected_pat_error_points_to_network_policy(exc) -> None:
     assert "authentication.md#network-policy-requirement" in message
 
 
-def test_run_statement_returns_rows_keyed_by_lower_case_column() -> None:
-    cursor = FakeCursor(columns=["created_on", "NAME"], rows=[("2026-01-01", "MY_DB")])
-    auth = SnowflakeProfileAuth("training-profile", connect_factory=lambda **_: FakeConnection(cursor=cursor))
-
-    assert auth.run_statement("SHOW DATABASES LIKE 'MY_DB'") == [{"created_on": "2026-01-01", "name": "MY_DB"}]
-    assert cursor.executed == [("SHOW DATABASES LIKE 'MY_DB'", {"timeout": 60})]
-    assert cursor.closed
-
-
-def test_run_statement_closes_the_cursor_when_the_statement_fails() -> None:
-    cursor = FakeCursor(error=RuntimeError("denied"))
-    auth = SnowflakeProfileAuth("training-profile", connect_factory=lambda **_: FakeConnection(cursor=cursor))
-
-    with pytest.raises(RuntimeError, match="denied"):
-        auth.run_statement("CREATE DATABASE IF NOT EXISTS MY_DB")
-    assert cursor.closed
-
-
-def test_run_statement_without_a_result_set_returns_no_rows() -> None:
-    auth = SnowflakeProfileAuth("training-profile", connect_factory=lambda **_: FakeConnection(cursor=FakeCursor()))
-
-    assert auth.run_statement("USE ROLE TRAINER") == []
-
-
 def test_role_comes_from_the_connection_without_sql() -> None:
     connection = FakeConnection()
     auth = SnowflakeProfileAuth("training-profile", connect_factory=lambda **_: connection)

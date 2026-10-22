@@ -97,16 +97,19 @@ any of these methods:
 cortex-training capacity
 ```
 
-This should print your available GPU capacity. When a request fails because the
-configured database or schema can't be found, the client checks once with
-`SHOW DATABASES` whether your role can see it, and creates it only if it is not
-listed. If the database exists but your role can't access it, the error says so
-and names the `GRANT` to ask an admin for. If automatic creation fails (for
-example, your role lacks `CREATE DATABASE`), create it manually in Snowsight:
+This should print your available GPU capacity.
+
+Cortex Training keeps your jobs and checkpoints in the profile's database, and
+it never creates that database for you. Create it once, in Snowsight:
 
 ```sql
 CREATE DATABASE IF NOT EXISTS CORTEX_TRAINING_DB;
 ```
+
+or run `cortex-training login`, which offers to create it after showing you
+the SQL. If a command can't find the database, it stops with an error that names
+your role and the database, and how to fix it: create it, ask an admin for
+`GRANT USAGE`, or use another database with `--database`.
 
 ### Option B: JSON config (legacy)
 

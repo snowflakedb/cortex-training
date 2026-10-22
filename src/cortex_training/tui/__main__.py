@@ -201,7 +201,6 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
         parser.exit(2, f"{parser.prog}: error: {exc}\n{_CONNECT_HINT}\n")
     # The TUI only reads: "database or schema not found" is shown, as a for_job client
     # shows it, not answered with CREATE DATABASE / SCHEMA and a retry.
-    client.auto_create_database = False
     # Its metrics, and its for_job clients', say the TUI made the call (client.surface),
     # and so also report successes and their timings.
     from cortex_training.client import TUI_SURFACE

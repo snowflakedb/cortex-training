@@ -272,24 +272,6 @@ class SnowflakeProfileAuth:
                 return
             self._invalidated_token = self._read_token(self._connection)
 
-    def run_statement(self, statement: str) -> list[dict[str, Any]]:
-        """Run one SQL statement on the owned Connector session and return its rows.
-
-        Each row maps lower-case column names to values. The SQL REST API does
-        not accept the Connector's session token, so statements go through the
-        session itself.
-        """
-        self._ensure_process()
-        with self._lock:
-            self._require_open()
-            cursor = self._connection.cursor()
-            try:
-                cursor.execute(statement, timeout=60)
-                columns = [column[0].lower() for column in cursor.description or ()]
-                return [dict(zip(columns, row)) for row in cursor.fetchall()]
-            finally:
-                cursor.close()
-
     def open_artifact_connection(self) -> Any:
         """Open an independent same-profile connection for artifact LIST/GET."""
         self._ensure_process()

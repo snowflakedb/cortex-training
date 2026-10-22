@@ -37,13 +37,12 @@ Tuning knobs on the constructor: `endpoint`, `poll_interval` (0.5s),
 and read timeout, or a `(connect, read)` pair. `from_connection_name` and
 `from_pat` also accept `telemetry_timeout` (3s) for best-effort client metrics.
 
-By default, when a request fails because the database or schema in its URL
-can't be resolved (HTTP 400, code `517602`), the client checks once with
-`SHOW DATABASES` and `SHOW SCHEMAS`. It runs `CREATE DATABASE` (or
-`CREATE SCHEMA`) only for what the role can't see, then retries; if the
-`CREATE` fails it raises `DatabaseAccessError` (see [Exceptions](#exceptions)).
-Set `client.auto_create_database = False` for a client that only reads: the
-error is then raised as it is. A client from `for_job` starts with it off.
+The client never creates a database. A request that fails because the
+database or schema in its URL can't be found (HTTP 400, code `517602`) raises
+`DatabaseAccessError` (see [Exceptions](#exceptions)), which says how to create
+it, get access to it, or use another one. A client from `for_job` raises the
+plain `requests.HTTPError` instead. `client.auto_create_database` is deprecated:
+it is always False, and setting it only emits a `FutureWarning`.
 
 ## Client metrics
 
@@ -440,12 +439,12 @@ carry a `.detail` dict for chunk-group failures. `AccountJobListUnavailable` (wi
 `list_jobs_page`. Polling raises `RuntimeError`
 on a failed/cancelled request and `TimeoutError` at the deadline.
 
-`DatabaseAccessError` (a subclass of `RuntimeError`) means the configured
-database or schema is not usable by the current role. It carries `.kind`
-(`"database"` or `"schema"`), `.name`, `.role` (None if unknown), `.exists`
-(True when Snowflake reports the object exists but the role has no privileges
-on it, None when the client cannot tell), and `.statement`, the
-`CREATE ... IF NOT EXISTS` statement that would set it up.
+`DatabaseAccessError` (a subclass of both `requests.exceptions.HTTPError` and
+`RuntimeError`) means the configured database or schema can't be found by the
+current role: it doesn't exist, or the role can't access it. It carries
+`.response` (the HTTP 400), `.kind` (`"database"` or `"schema"`), `.name`,
+`.role` (the session's role, or None when it can't be determined, as for PAT
+clients), and `.statement`, the `CREATE` statement that would set it up.
 
 ## Details not covered here
 
