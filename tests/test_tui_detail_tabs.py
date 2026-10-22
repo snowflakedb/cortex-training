@@ -125,7 +125,7 @@ def test_training_tab_downloads_and_draws_each_metric():
             assert "all steps (w)" in status and "(v)" not in status
             # global_steps and update_successful (per step) and rank (per call) are bookkeeping.
             assert "3 hidden (a)" in status
-            assert "1 step skipped the optimizer update (update_successful ≠ 1)" in status
+            assert "1 step reported update_successful ≠ 1" in status
             # Both views on the one tab. Per step first: the step rows' numbers, as saved.
             stats = _text(screen, "#training-step-stats")
             assert stats.splitlines()[0] == "Per step"

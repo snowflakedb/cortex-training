@@ -372,8 +372,8 @@ class TrainingPane(_Pane):
             notes.append((f"{'cached · refresh failed' if sub_job else 'training metrics unavailable'}: "
                           f"{self._error}", _WARNING))
         if sub_job is not None and sub_job.failed_updates:
-            notes.append((f"{sub_job.failed_updates:,} step{'s' if sub_job.failed_updates != 1 else ''} skipped "
-                          "the optimizer update (update_successful ≠ 1)", _WARNING))
+            notes.append((f"{sub_job.failed_updates:,} step{'s' if sub_job.failed_updates != 1 else ''} reported "
+                          "update_successful ≠ 1", _WARNING))
         if sub_job is not None and sub_job.skipped:
             notes.append((f"{sub_job.skipped:,} training row{'s' if sub_job.skipped != 1 else ''} skipped "
                           "(malformed or unsupported)", _WARNING))

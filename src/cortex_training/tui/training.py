@@ -77,16 +77,17 @@ VIEW_NAMES = {VIEW_STEP: "per step", VIEW_CALL: "per call"}
 # file first has them.
 LEADING_METRICS = {VIEW_STEP: ("grad_norm", "last_lr"), VIEW_CALL: ("avg_loss",)}
 # Numbers a result carries that aren't training signals, left out of a view until ``a`` shows every
-# metric: the step itself (``global_steps``), whether the update ran (said in the header when one
-# didn't, see :attr:`SubJobTraining.failed_updates`), the fixed size of the weight and gradient
-# samples, and how requests were packed into model calls.
+# metric: the step itself (``global_steps``), ``update_successful`` (the header counts the steps
+# that report it isn't 1, see :attr:`SubJobTraining.failed_updates`), and the fixed size of the
+# weight and gradient samples. The packing counts (``rl_model_calls``, ``sft_model_calls``,
+# ``sft_packed_rows``) show: they are how a job shows that rows shared a call, or a rank ran fewer.
 UPDATE_SUCCESSFUL = "update_successful"
 HIDDEN_METRICS = {
     VIEW_STEP: frozenset({
         "global_steps", UPDATE_SUCCESSFUL, "weight_delta_rank0_sample_numel", "weight_delta_rank0_sample_bytes",
         "weight_delta_rank0_sample_tensors", "gradient_sample_numel",
     }),
-    VIEW_CALL: frozenset({"rl_model_calls", "sft_model_calls", "sft_packed_rows"}),
+    VIEW_CALL: frozenset(),
 }
 # Also left out, but only while every value is 0: the worker a call's result came from, which is
 # currently always worker 0. A call from another worker is worth seeing, so then it shows.
@@ -169,7 +170,7 @@ class SubJobTraining:
     skipped: int  # training rows that couldn't be read
     old_format: int = 0  # rows of an earlier record version, saved before this format and not read
     hidden_names: int = 0  # metric names left out because they can't be drawn as they are
-    failed_updates: int = 0  # steps whose ``update_successful`` isn't 1: the optimizer skipped the update
+    failed_updates: int = 0  # steps that reported ``update_successful`` isn't 1
 
     @property
     def calls(self) -> int:

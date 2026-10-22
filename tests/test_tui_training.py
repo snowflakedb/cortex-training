@@ -88,7 +88,8 @@ def test_per_call_shows_every_number_in_each_call_with_its_step():
     parsed = _parse(RUN)
     assert [s.name for s in parsed.metrics(CALL, everything=True)] == [
         "avg_loss", "rank", "sft_model_calls", "sft_packed_rows"]
-    assert [s.name for s in parsed.metrics(CALL)] == ["avg_loss"]
+    # rank is 0 in every call, so it is hidden; the packing counts show.
+    assert [s.name for s in parsed.metrics(CALL)] == ["avg_loss", "sft_model_calls", "sft_packed_rows"]
     # Six calls, numbered in the order they ran, each with its own avg_loss.
     assert _by_name(parsed.metrics(CALL))["avg_loss"] == (
         (1, 2, 3, 4, 5, 6), (9.8489, 9.8489, 5.0613, 5.0613, 2.0419, 2.0419))
@@ -242,8 +243,10 @@ def test_bookkeeping_numbers_are_hidden_until_every_metric_is_shown():
     assert [s.name for s in parsed.metrics(STEP)] == [
         "grad_norm", "last_lr", "weight_delta_norm_rank0_sample", "weight_delta_norm_over_lr_rank0_sample"]
     # A loss function's own metrics (approx_kl) stay: only names known to be bookkeeping are left out.
-    assert [s.name for s in parsed.metrics(CALL)] == ["avg_loss", "approx_kl"]
-    assert (parsed.hidden(STEP), parsed.hidden(CALL)) == (5, 4)
+    # The packing counts stay too: they show rows sharing a call, or a rank running fewer calls.
+    assert [s.name for s in parsed.metrics(CALL)] == [
+        "avg_loss", "sft_model_calls", "sft_packed_rows", "rl_model_calls", "approx_kl"]
+    assert (parsed.hidden(STEP), parsed.hidden(CALL)) == (5, 1)
     assert len(parsed.metrics(STEP, everything=True)) == 9
     assert "rank" in [s.name for s in parsed.metrics(CALL, everything=True)]
     assert parsed.failed_updates == 0
@@ -259,7 +262,7 @@ def test_rank_is_hidden_only_while_every_call_came_from_worker_0():
     assert mixed.hidden(CALL) == 0
 
 
-def test_steps_that_skipped_the_update_are_counted():
+def test_steps_that_reported_update_successful_not_1_are_counted():
     parsed = _parse([_step(step, grad_norm=1.0, update_successful=ok) for step, ok in [(1, 1.0), (2, 0.0), (3, 1.0)]])
     assert parsed.failed_updates == 1
     # A step run again after a resume replaces its row, so only the latest run of a step counts.
