@@ -1973,12 +1973,15 @@ class CortexTrainingClient:
 
     @auto_create_database.setter
     def auto_create_database(self, value: bool) -> None:
-        warnings.warn(
-            "CortexTrainingClient.auto_create_database is deprecated and does nothing: the client "
-            "never creates a database. Create it once (for example with cortex-training login).",
-            FutureWarning,
-            stacklevel=2,
-        )
+        # False is already the only behavior, so only asking for creation warns.
+        if value:
+            warnings.warn(
+                "CortexTrainingClient.auto_create_database is deprecated and does nothing: the "
+                "client never creates a database. Create it once, for example with "
+                "CREATE DATABASE IF NOT EXISTS in Snowsight.",
+                FutureWarning,
+                stacklevel=2,
+            )
 
     @classmethod
     def from_pat(
@@ -2280,7 +2283,7 @@ class CortexTrainingClient:
             source = f" (from profile {profile})" if profile else " (from your default Snowflake profile)"
         database, schema = self.database, self.schema
         if schema.upper() == "PUBLIC":
-            kind, name, statement = "database", database, f"CREATE DATABASE {database}"
+            kind, name, statement = "database", database, f"CREATE DATABASE IF NOT EXISTS {database}"
             lines = [
                 f"{who} can't find database {database}{source}.",
                 f"- If it doesn't exist: run `{statement}` (or ask an admin to).",
@@ -2288,18 +2291,16 @@ class CortexTrainingClient:
             ]
         else:
             kind, name = "schema", f"{database}.{schema}"
-            statement = f"CREATE SCHEMA {database}.{schema}"
+            create_database = f"CREATE DATABASE IF NOT EXISTS {database}"
+            create_schema = f"CREATE SCHEMA IF NOT EXISTS {database}.{schema}"
+            statement = f"{create_database}; {create_schema}"
             lines = [
                 f"{who} can't find database {database} or its schema {schema}{source}.",
-                f"- If they don't exist: run `CREATE DATABASE IF NOT EXISTS {database}` and `{statement}` "
-                "(or ask an admin to).",
+                f"- If they don't exist: run `{create_database}` and `{create_schema}` (or ask an admin to).",
                 f"- If they exist: ask an admin to run `GRANT USAGE ON DATABASE {database} TO ROLE {grantee}` "
                 f"and `GRANT USAGE ON SCHEMA {database}.{schema} TO ROLE {grantee}`.",
             ]
-        lines += [
-            "- Or use another database: --database NAME / CORTEX_TRAINING_DATABASE.",
-            "- Or run `cortex-training login` to set it up.",
-        ]
+        lines.append("- Or use another database: --database NAME / CORTEX_TRAINING_DATABASE.")
         return DatabaseAccessError(
             "\n".join(lines), response=response, kind=kind, name=name, role=role, statement=statement
         )

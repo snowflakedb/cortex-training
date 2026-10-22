@@ -753,10 +753,9 @@ cortex-training tui \
   --database CORTEX_TRAINING_DB --schema PUBLIC
 ```
 
-Like `checkpoints` and `list --all`, the TUI never creates the configured
-database or schema, which the other commands do when the service answers that
-they are not found: it shows that error instead, as it does when this role
-can't use them. Every request the TUI sends is retried at most twice, with a
+No command, the TUI included, creates the configured database or schema; when
+the service answers that they are not found, the command stops with an error
+that says how to fix it. Every request the TUI sends is retried at most twice, with a
 10-second connect and a 45-second read timeout, where the other commands use
 the SDK's defaults (ten retries, 30 and 600 seconds; [REST API reference
 section 3.5](rest-api.md#35-retries)). So a job id that isn't found (404), or

@@ -106,9 +106,8 @@ it never creates that database for you. Create it once, in Snowsight:
 CREATE DATABASE IF NOT EXISTS CORTEX_TRAINING_DB;
 ```
 
-or run `cortex-training login`, which offers to create it after showing you
-the SQL. If a command can't find the database, it stops with an error that names
-your role and the database, and how to fix it: create it, ask an admin for
+If a command can't find the database, it stops with an error that names your
+role and the database, and how to fix it: create it, ask an admin for
 `GRANT USAGE`, or use another database with `--database`.
 
 ### Option B: JSON config (legacy)

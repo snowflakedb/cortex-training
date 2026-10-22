@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import sys
+import warnings
 import tempfile
 import threading
 import time
@@ -8172,15 +8173,17 @@ class TestMissingDatabase:
             c._send("GET", f"{c.base_url}/test")
         assert str(exc.value) == (
             "Role <ROLE> (couldn't determine your role) can't find database MY_DB.\n"
-            "- If it doesn't exist: run `CREATE DATABASE MY_DB` (or ask an admin to).\n"
+            "- If it doesn't exist: run `CREATE DATABASE IF NOT EXISTS MY_DB` (or ask an admin to).\n"
             "- If it exists: ask an admin to run `GRANT USAGE ON DATABASE MY_DB TO ROLE <ROLE>`.\n"
-            "- Or use another database: --database NAME / CORTEX_TRAINING_DATABASE.\n"
-            "- Or run `cortex-training login` to set it up."
+            "- Or use another database: --database NAME / CORTEX_TRAINING_DATABASE."
         )
         c._session.post.assert_not_called()  # no SQL, nothing created
         c._session.get.assert_called_once()  # not retried
         error = exc.value
-        assert (error.kind, error.name, error.role, error.statement) == ("database", "MY_DB", None, "CREATE DATABASE MY_DB")
+        assert (error.kind, error.name, error.role, error.statement) == (
+            "database", "MY_DB", None, "CREATE DATABASE IF NOT EXISTS MY_DB"
+        )
+        assert "cortex-training login" not in str(error)  # not on main until the new login ships
         assert error.response.status_code == 400
         assert isinstance(error, nc.requests.exceptions.HTTPError) and isinstance(error, RuntimeError)
 
@@ -8208,11 +8211,14 @@ class TestMissingDatabase:
             c._send("GET", f"{c.base_url}/test")
         assert str(exc.value).splitlines()[:3] == [
             "Role TRAINER can't find database MY_DB or its schema CUSTOM (from profile prod).",
-            "- If they don't exist: run `CREATE DATABASE IF NOT EXISTS MY_DB` and `CREATE SCHEMA MY_DB.CUSTOM` (or ask an admin to).",
+            "- If they don't exist: run `CREATE DATABASE IF NOT EXISTS MY_DB` and "
+            "`CREATE SCHEMA IF NOT EXISTS MY_DB.CUSTOM` (or ask an admin to).",
             "- If they exist: ask an admin to run `GRANT USAGE ON DATABASE MY_DB TO ROLE TRAINER` and "
             "`GRANT USAGE ON SCHEMA MY_DB.CUSTOM TO ROLE TRAINER`.",
         ]
-        assert (exc.value.kind, exc.value.name, exc.value.statement) == ("schema", "MY_DB.CUSTOM", "CREATE SCHEMA MY_DB.CUSTOM")
+        assert (exc.value.kind, exc.value.name, exc.value.statement) == (
+            "schema", "MY_DB.CUSTOM", "CREATE DATABASE IF NOT EXISTS MY_DB; CREATE SCHEMA IF NOT EXISTS MY_DB.CUSTOM"
+        )
 
     @pytest.mark.parametrize(
         ("body", "status"),
@@ -8252,6 +8258,13 @@ class TestMissingDatabase:
         assert c.auto_create_database is False
         with pytest.warns(FutureWarning, match="auto_create_database is deprecated and does nothing"):
             c.auto_create_database = True
+        assert c.auto_create_database is False
+
+    def test_setting_auto_create_database_to_false_is_silent(self):
+        c = self._client()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            c.auto_create_database = False
         assert c.auto_create_database is False
 
 

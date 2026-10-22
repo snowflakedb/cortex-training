@@ -42,7 +42,8 @@ database or schema in its URL can't be found (HTTP 400, code `517602`) raises
 `DatabaseAccessError` (see [Exceptions](#exceptions)), which says how to create
 it, get access to it, or use another one. A client from `for_job` raises the
 plain `requests.HTTPError` instead. `client.auto_create_database` is deprecated:
-it is always False, and setting it only emits a `FutureWarning`.
+it is always False. Setting it to True emits a `FutureWarning`; setting it to False
+needs no change.
 
 ## Client metrics
 
@@ -444,7 +445,9 @@ on a failed/cancelled request and `TimeoutError` at the deadline.
 current role: it doesn't exist, or the role can't access it. It carries
 `.response` (the HTTP 400), `.kind` (`"database"` or `"schema"`), `.name`,
 `.role` (the session's role, or None when it can't be determined, as for PAT
-clients), and `.statement`, the `CREATE` statement that would set it up.
+clients), and `.statement`, the SQL that would set it up: `CREATE DATABASE IF NOT
+EXISTS ...`, or for a schema other than `PUBLIC`, that statement and
+`CREATE SCHEMA IF NOT EXISTS ...`, separated by `; `.
 
 ## Details not covered here
 

@@ -199,8 +199,6 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
         # With no config, login state or flags, the TUI tries the configured-default
         # Snowflake connection, which a first run doesn't have: say how to connect.
         parser.exit(2, f"{parser.prog}: error: {exc}\n{_CONNECT_HINT}\n")
-    # The TUI only reads: "database or schema not found" is shown, as a for_job client
-    # shows it, not answered with CREATE DATABASE / SCHEMA and a retry.
     # Its metrics, and its for_job clients', say the TUI made the call (client.surface),
     # and so also report successes and their timings.
     from cortex_training.client import TUI_SURFACE
