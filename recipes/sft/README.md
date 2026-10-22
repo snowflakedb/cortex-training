@@ -104,7 +104,7 @@ shipped example or a copy with `job_config=JOB_CONFIG`.
         "train_batch_size": TRAIN_BATCH_SIZE,
         "sp_size": SEQUENCE_PARALLEL_SIZE,
         "gradient_clipping": GRADIENT_CLIPPING,
-        "model_provider": MODEL_PROVIDER, // Use prime_rl for MoE
+        "model_provider": MODEL_PROVIDER, // Use arctic for MoE
         "attn_implementation": "flash_attention_3",
         "optimizer": {
           "name": "AdamW",
@@ -132,7 +132,7 @@ shipped example or a copy with `job_config=JOB_CONFIG`.
           "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
         },
 
-        // Optional expert parallelism for MoE. With model_provider prime_rl,
+        // Optional expert parallelism for MoE. With model_provider arctic,
         // keep fused cross-entropy off (this block, or model_options with
         // EP_SIZE > 1): the chunked LM head set below cannot be combined with
         // it.
@@ -150,8 +150,8 @@ shipped example or a copy with `job_config=JOB_CONFIG`.
 
 The target list above is for dense Qwen models. For
 `Qwen/Qwen3.6-35B-A3B`, use the shipped LoRA config with
-`model_provider: "prime_rl"` and attention-only targets (`q_proj`, `k_proj`,
-`v_proj`, and `o_proj`). PrimeRL does not yet support LoRA on routed experts;
+`model_provider: "arctic"` and attention-only targets (`q_proj`, `k_proj`,
+`v_proj`, and `o_proj`). Arctic does not yet support LoRA on routed experts;
 `gate_proj`, `up_proj`, and `down_proj` do not select those parameters.
 The shipped Qwen3.6 configs use sequence parallel size 8 and logical batch 1
 to run at the model's 262K context limit. `model-catalog/models/qwen3-4b-instruct/long/h200-training-full.json` and
@@ -198,7 +198,7 @@ has the option but not `model_options` support ignores that entry; see
 Full-parameter recipes. Renamed files use 256K, or the model's position
 limit when that limit is lower. The filename records sequence parallel,
 expert parallel, GPU count, and that length. The matching RL training block
-uses the same mesh. These recipes set `model_provider` to `prime_rl`.
+uses the same mesh. These recipes set `model_provider` to `arctic`.
 The Nemotron-3-Nano and Nemotron-3.5-Lightning SFT and RL training
 recipes are 256K on 8 GPUs, SP8, EP4. Their sampling and inference
 configs are 8 GPUs at TP8 and 256K. The GLM-5.3-Flash LoRA recipe is attention-only LoRA on the FP8 checkpoint,

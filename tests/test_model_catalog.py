@@ -244,7 +244,7 @@ def test_moe_sft_recipes_have_runnable_parallelism():
         assert sub_job["job_type"] == "training"
         assert sub_job["model_name"] == model_id
         assert sub_job["dtype"] == "bfloat16"
-        assert training["model_provider"] == "prime_rl"
+        assert training["model_provider"] == "arctic"
         if filename == "glm-5.3-flash/long/h200-training-lora.json":
             assert training["prime_rl"] == {
                 "ep_comm_backend": "deepep",
@@ -422,7 +422,7 @@ def test_moe_rl_recipes_have_runnable_parallelism():
         assert training["job_type"] == "training"
         assert training["model_name"] == model_id
         assert training["dtype"] == "bfloat16"
-        assert training_config["model_provider"] == "prime_rl"
+        assert training_config["model_provider"] == "arctic"
         if filename == "glm-5.3-flash/long/h200-training-lora.json":
             assert training_config["prime_rl"] == {
                 "ep_comm_backend": "deepep",
@@ -912,7 +912,7 @@ def test_moe_rl_enables_router_replay_on_sampling_only():
     ("long_sequence", "expected_context", "expected_sp"),
     [(False, 32768, 1), (True, 262144, 8)],
 )
-def test_qwen36_lora_uses_prime_rl_attention_targets(
+def test_qwen36_lora_uses_arctic_attention_targets(
     profile_key,
     long_sequence,
     expected_context,
@@ -937,7 +937,7 @@ def test_qwen36_lora_uses_prime_rl_attention_targets(
         for sub_job in request["sub_job_configs"]
         if sub_job["job_type"] == "training"
     )
-    assert training["model_provider"] == "prime_rl"
+    assert training["model_provider"] == "arctic"
     assert training.get("sp_size", 1) == expected_sp
     assert {
         tuple(

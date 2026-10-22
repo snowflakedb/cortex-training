@@ -26,7 +26,7 @@
         },
         "ep_size": 8,
         "gradient_clipping": 1.0,
-        "model_provider": "prime_rl",
+        "model_provider": "arctic",
         "max_seq_len": 128,
         "mb_spec": {
           "max_tokens_per_mb": 10240
