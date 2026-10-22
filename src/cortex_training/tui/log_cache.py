@@ -31,9 +31,9 @@ Pure stdlib, NO ``textual`` import, so it is unit-testable like ``format.py``.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
-import shutil
 import tempfile
 import time
 from collections import OrderedDict
@@ -47,6 +47,11 @@ from typing import Iterable
 from typing import Iterator
 from typing import Optional
 from typing import Tuple
+
+try:  # POSIX only; elsewhere the cursors are written unlocked.
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on Windows
+    fcntl = None  # type: ignore[assignment]
 
 # Cache dir resolution mirrors cortex_training._cli._login_state_path: an explicit
 # override wins, else XDG_CACHE_HOME, else ~/.cache, namespaced under the app.
@@ -157,6 +162,38 @@ def _atomic_write_text(path: Path, text: str) -> None:
         raise
 
 
+@contextlib.contextmanager
+def _exclusive(path: Path, wait: float = 1.0):
+    """An exclusive ``flock`` on ``path`` for the block, across processes. Where locks
+    don't work (no ``fcntl``, a filesystem without them), or another holder keeps it past
+    ``wait`` seconds (a TUI stopped with Ctrl+Z inside its block), the block runs unlocked
+    rather than stall."""
+    handle = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(path, "a+b")
+        if fcntl is not None:
+            deadline = time.monotonic() + wait
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.01)
+    except OSError:
+        pass
+    try:
+        yield
+    finally:
+        if handle is not None:
+            handle.close()  # closing drops the lock
+
+
+_KEEP_CURSOR = object()  # set_cursor: leave the source's cursor as it is
+
+
 class LogCache:
     """Per-job on-disk cache of log entries + resume cursors.
 
@@ -212,17 +249,19 @@ class LogCache:
             return cur if isinstance(cur, str) else None
         return None
 
-    def set_cursor(self, source_id: str, cursor: Optional[str], **fields: Any) -> None:
-        doc = self._read_cursors()
-        sources = doc.setdefault("sources", {})
-        old = sources.get(source_id)  # its other fields (head_missing) stay
-        sources[source_id] = {
-            **(old if isinstance(old, dict) else {}), **fields,
-            "cursor": cursor,
-            "updated": datetime.now(timezone.utc).isoformat(),
-        }
-        doc["version"] = 1
-        _atomic_write_text(self._cursors_path(), json.dumps(doc, sort_keys=True) + "\n")
+    def set_cursor(self, source_id: str, cursor: Any = _KEEP_CURSOR, **fields: Any) -> None:
+        # Read, change, write back under a lock so concurrent TUIs don't overwrite each other.
+        with _exclusive(self._dir / ".cursors.lock"):
+            doc = self._read_cursors()
+            sources = doc.setdefault("sources", {})
+            old = sources.get(source_id)  # its other fields (head_missing) stay
+            entry = {**(old if isinstance(old, dict) else {}), **fields,
+                     "updated": datetime.now(timezone.utc).isoformat()}
+            if cursor is not _KEEP_CURSOR:
+                entry["cursor"] = cursor
+            sources[source_id] = entry
+            doc["version"] = 1
+            _atomic_write_text(self._cursors_path(), json.dumps(doc, sort_keys=True) + "\n")
 
     def head_missing(self, source_id: str) -> bool:
         """Whether this cache lacks the start of the source's log: its first
@@ -232,7 +271,7 @@ class LogCache:
 
     def set_head_missing(self, source_id: str) -> None:
         if not self.head_missing(source_id):
-            self.set_cursor(source_id, self.get_cursor(source_id), head_missing=True)
+            self.set_cursor(source_id, head_missing=True)
 
     # ---- entries ----
     def append_entries(self, source_id: str, entries: Iterable[Any]) -> int:
@@ -337,58 +376,49 @@ class LogCache:
                 pass
 
 
-# Saved consoles the TUI keeps for finished jobs (jobs/<job>/console/), all jobs
-# together: past this, the ones used least recently are removed.
-CONSOLE_CACHE_MAX_BYTES = 1024 ** 3
-CONSOLE_MARKER = ".complete"  # written last into a kept console; its mtime is when it was last used
+# Past this the error log keeps only its newest half, in the same file: a TUI that hits the
+# same error on every poll for days must not fill the disk, and the log stays the one file
+# the TUI's messages send people to, with nothing beside it.
+ERROR_LOG_MAX_BYTES = 5 * 1024 * 1024
+# The lock lives in the cache directory, not beside the log: the log sits in $HOME because
+# the TUI's messages send people there, and its lock is plumbing that should not join it.
+# Every write takes it, so a line written while another TUI trims the log is not lost.
+_ERROR_LOG_LOCK = ".errors.lock"
 
 
-def _tree_bytes(path: Path) -> int:
-    total = 0
-    for child in path.rglob("*"):
-        try:
-            if child.is_file():
-                total += child.stat().st_size
-        except OSError:
-            continue
-    return total
+def append_error_log(text: str, *, path: Optional[str] = None, max_bytes: int = ERROR_LOG_MAX_BYTES) -> None:
+    """Append ``text`` to the error log, first dropping its oldest half once it is past ``max_bytes``.
 
-
-def touch_console(console_dir: Path) -> None:
-    """Mark a kept console as just used (it is the last to be removed)."""
+    Never raises: reporting an error must not cause one. The log stays one file at one
+    path, its newest lines kept in place, under a lock in the cache directory that every
+    write takes (see _ERROR_LOG_LOCK).
+    """
+    path = path or _ERROR_LOG
     try:
-        os.utime(console_dir / CONSOLE_MARKER)
+        with _exclusive(cache_root() / _ERROR_LOG_LOCK):
+            try:
+                if os.path.getsize(path) > max_bytes:
+                    _keep_newest(path, max_bytes // 2)
+            except OSError:
+                pass
+            with open(path, "a", encoding="utf-8", errors="replace") as f:
+                f.write(text)
     except OSError:
         pass
 
 
-def prune_consoles(*, root: Optional[Path] = None, keep: Optional[Path] = None,
-                   max_bytes: Optional[int] = None) -> list:
-    """Remove kept consoles, least recently used first, until the rest fit in
-    ``max_bytes`` (default CONSOLE_CACHE_MAX_BYTES); never ``keep`` (the one
-    just kept), nor one without its marker (still being written). Returns the
-    removed directories."""
-    max_bytes = CONSOLE_CACHE_MAX_BYTES if max_bytes is None else max_bytes
-    jobs = (root if root is not None else cache_root()) / "jobs"
-    kept = []
-    for console in jobs.glob("*/console"):
-        try:
-            used = (console / CONSOLE_MARKER).stat().st_mtime
-        except OSError:
-            continue
-        kept.append((used, _tree_bytes(console), console))
-    total = sum(size for _, size, _ in kept)
-    removed = []
-    keep_path = keep.resolve() if keep is not None else None
-    for _, size, console in sorted(kept, key=lambda item: item[0]):
-        if total <= max_bytes:
-            break
-        if keep_path is not None and console.resolve() == keep_path:
-            continue
-        shutil.rmtree(console, ignore_errors=True)
-        total -= size
-        removed.append(console)
-    return removed
+def _keep_newest(path: str, keep: int) -> None:
+    """Rewrite ``path`` in place to its last ``keep`` bytes, from the first whole line in them."""
+    with open(path, "r+b") as f:
+        start = max(0, f.seek(0, os.SEEK_END) - keep)
+        f.seek(start)
+        tail = f.read()
+        if start:
+            newline = tail.find(b"\n")
+            tail = tail[newline + 1:] if newline >= 0 else b""
+        f.seek(0)
+        f.write(tail)
+        f.truncate()
 
 
 def _note_persist_error(exc: BaseException) -> None:
@@ -396,11 +426,7 @@ def _note_persist_error(exc: BaseException) -> None:
     if _persist_warned:
         return
     _persist_warned = True
-    try:
-        with open(_ERROR_LOG, "a", encoding="utf-8") as f:
-            f.write("log cache persistence disabled (%s: %s)\n" % (type(exc).__name__, exc))
-    except OSError:
-        pass
+    append_error_log("log cache persistence disabled (%s: %s)\n" % (type(exc).__name__, exc))
 
 
 def _safe_append(cache: LogCache, source_id: str, entries: list) -> None:
@@ -571,10 +597,10 @@ def cached_pages(
                     # An empty cursor would make the next poll re-read the log's tail.
                     cursor = end.get("next_cursor") or cursor
                     seen.add_all(fresh)
+                    if cancelled():
+                        return  # persisted nothing: the next open reads from the saved cursor
                     _safe_append(cache, source_id, fresh)
                     _safe_set_cursor(cache, source_id, cursor)
-                    if cancelled():
-                        return
                     yield ("restart", fresh)
                     delay = poll_interval
                     sleep(delay)
@@ -590,6 +616,8 @@ def cached_pages(
                     raise
                 # Drop it (here and in the cache, so r and the next open don't
                 # send it again), and go on from the log's end.
+                if cancelled():
+                    return
                 _safe_set_cursor(cache, source_id, None)
                 end = fetch(None)
                 fresh = end.get(entries_key) or []
@@ -597,12 +625,12 @@ def cached_pages(
                     fresh = seen.unseen(fresh)
                     seen.add_all(fresh)
                 cursor = reset_cursor = end.get("next_cursor") or None
+                if cancelled():
+                    return
                 if fresh:
                     _safe_append(cache, source_id, fresh)
                 _safe_set_cursor(cache, source_id, cursor)
                 still_since, empty_polls, window = clock(), 0, 0
-                if cancelled():
-                    return
                 yield ("reset", fresh)
                 delay = poll_interval
                 sleep(delay)
@@ -615,6 +643,8 @@ def cached_pages(
                 counted = None
                 if not partial:
                     partial = True
+                    if cancelled():
+                        return  # persisted nothing: the next open reads this page again
                     try:
                         cache.set_head_missing(source_id)
                     except OSError as exc:
@@ -625,14 +655,14 @@ def cached_pages(
             elif not catching_up(entries):
                 counted = None  # the window held the whole log, from its first line
         if entries:
+            if cancelled():
+                return  # persisted nothing: the next open reads this page again from the cursor
             _safe_append(cache, source_id, entries)  # entries first...
             _safe_set_cursor(cache, source_id, new_cursor)  # ...then cursor
             cursor = new_cursor
             if seen is not None:
                 seen.add_all(entries)
             still_since, empty_polls, window = clock(), 0, 0
-            if cancelled():
-                return
             yield ("live", entries)  # whole page in one batch
             # Throttle floor: even when the source is busy, wait at least
             # poll_interval before the next request. Biases toward server
@@ -650,6 +680,8 @@ def cached_pages(
                 return
             yield ("caught-up", [])  # the read after full pages brought nothing: the tail is at the log's end
         if new_cursor != cursor:
+            if cancelled():
+                return  # persisted nothing: the next open reads this page again from the cursor
             _safe_set_cursor(cache, source_id, new_cursor)
             cursor = new_cursor
             still_since, empty_polls, window = clock(), 0, 0

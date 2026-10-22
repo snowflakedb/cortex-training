@@ -52,6 +52,7 @@ import shutil
 import tempfile
 import threading
 import time
+import uuid
 from collections import deque
 from collections.abc import Callable
 from collections.abc import Iterable
@@ -87,6 +88,7 @@ from urllib3.exceptions import NewConnectionError
 
 from cortex_training import _account_jobs
 from cortex_training import _artifact_download
+from cortex_training import _training_log
 from cortex_training._account_jobs import AccountJobListUnavailable  # noqa: F401 - exported
 from cortex_training._account_jobs import InvalidPageToken  # noqa: F401 - exported
 from cortex_training._artifact_download import DownloadCancelled
@@ -96,6 +98,7 @@ from cortex_training.optimizer import normalize_optimizer_config
 from cortex_training.peft import normalize_lora_peft_config
 from cortex_training.snowflake_auth import SnowflakeProfileAuth
 from cortex_training.snowflake_auth import SnowflakeTelemetryTokenProvider
+from cortex_training.snowflake_auth import rest_host
 from cortex_training.telemetry import CachedSessionTokenProvider
 from cortex_training.telemetry import OtlpMetricEmitter
 
@@ -106,6 +109,13 @@ _STDOUT_CHUNK_RE = re.compile(
 )
 _GPU_METRICS_CHUNK_RE = re.compile(
     r"^gpu\.(?P<timestamp>\d{8}-\d{6})\.(?P<suffix>[^./\\]+)\.gz$"
+)
+# Training metrics share the ``_metrics/`` root with the GPU chunks but are their
+# own stream: the training runtime writes them to a file of its own, which is
+# staged and reconstructed separately. They must never be matched with the GPU
+# chunks, which would concatenate the two kinds of rows into one file.
+_TRAINING_METRICS_CHUNK_RE = re.compile(
+    r"^training\.(?P<timestamp>\d{8}-\d{6})\.(?P<suffix>[^./\\]+)\.gz$"
 )
 _STREAM_COPY_BUFFER_BYTES = 1024 * 1024
 
@@ -1054,6 +1064,7 @@ class TrainingConfig(BaseModel):
             raise ValueError("training.optimizer is required and must be a non-empty dict")
         extra = self.model_extra or {}
         _validate_primerl_lm_head_config(extra, location="training.extra")
+        _reject_zero_stage_3(extra.get("ds_config"), location="training.extra.ds_config")
         prime_rl = extra.get("prime_rl")
         if isinstance(prime_rl, dict):
             _validate_primerl_lm_head_config(prime_rl, location="training.extra.prime_rl")
@@ -1297,14 +1308,29 @@ class SubJobConfig(BaseModel):
         return wire
 
 
-def _validate_raw_sub_job_configs(sub_job_configs: list) -> None:
-    """Canonicalize every ``peft_config`` in a raw create-job body, in place.
+def _reject_zero_stage_3(ds_config: Any, *, location: str) -> None:
+    """Reject DeepSpeed ZeRO stage 3, which the service does not support."""
+    zero_config = ds_config.get("zero_optimization") if isinstance(ds_config, dict) else None
+    stage = zero_config.get("stage") if isinstance(zero_config, dict) else None
+    try:
+        stage = int(stage) if stage is not None else None
+    except (TypeError, ValueError):
+        return
+    if stage is not None and stage >= 3:
+        raise ValueError(
+            f"{location}.zero_optimization.stage={stage} (ZeRO-3) is not supported; use stage 1 or 2, "
+            "with zero_optimization.offload_optimizer for CPU optimizer offload."
+        )
 
-    The typed path validates LoRA through :class:`TrainingConfig` /
+
+def _validate_raw_sub_job_configs(sub_job_configs: list) -> None:
+    """Validate a raw create-job body in place: canonicalize every ``peft_config`` and reject ZeRO-3.
+
+    The typed path validates these through :class:`TrainingConfig` /
     :class:`InferenceConfig`; this gives raw bodies the same guarantee so an
-    adapter that weight sync cannot carry is rejected before the request is
-    sent. Everything else in the body, including ``optimizer``, is forwarded as
-    given.
+    adapter that weight sync cannot carry, or an unsupported ZeRO stage, is
+    rejected before the request is sent. Everything else in the body, including
+    ``optimizer``, is forwarded as given.
     """
     for index, sub_job in enumerate(sub_job_configs):
         if not isinstance(sub_job, dict):
@@ -1312,6 +1338,11 @@ def _validate_raw_sub_job_configs(sub_job_configs: list) -> None:
         job_type = _normalized_job_type(sub_job.get("job_type"))
         config_key = "training_config" if job_type == JobType.TRAINING.value else "inference_config"
         job_config = sub_job.get(config_key)
+        if job_type == JobType.TRAINING.value and isinstance(job_config, dict):
+            _reject_zero_stage_3(
+                job_config.get("ds_config"),
+                location=f"sub_job_configs[{index}].training_config.ds_config",
+            )
         peft_config = job_config.get("peft_config") if isinstance(job_config, dict) else None
         if peft_config is None:
             continue
@@ -1844,6 +1875,11 @@ class CortexTrainingClient:
         # Forward request ids awaiting poll, so a result that is only
         # ``{"job_id", "payload_b64"}`` (no ``wire_format``) can still be decoded.
         self._forward_request_ids: set[str] = set()
+        # Requests whose results are copied to the local training-metrics log (see _training_log):
+        # request id -> (job id, op, the sub-job a load targets). Shared by threads polling one client.
+        self._training_log_ops: dict[str, tuple[str, str, str | None]] = {}
+        self._training_log_ops_lock = threading.Lock()
+        self._training_log = None if _training_log.disabled() else _training_log.TrainingLog()
         # Per-job cache of the sampling sub-job's ``inference_config.max_seq_len``
         # (the value the backend launches vLLM with as ``max_model_len``). Used
         # to validate generate prompt lengths client-side. A cached ``None``
@@ -1902,7 +1938,7 @@ class CortexTrainingClient:
         on every request. No login round-trip.
         """
         client = cls(
-            base_url=f"https://{host}",
+            base_url=f"https://{rest_host(host)}",
             database=database,
             schema=schema,
             endpoint=endpoint,
@@ -3186,6 +3222,9 @@ class CortexTrainingClient:
     # whichever comes first.
     _DOWNLOAD_CHECKPOINT_CHUNKS = 64
     _DOWNLOAD_CHECKPOINT_SECONDS = 5.0
+    # A preview (``download_metrics``' ``preview_seconds``) reaches this much further back
+    # than asked, since a chunk's name gives the time it starts.
+    _PREVIEW_SLACK_SECONDS = 120.0
     # Leftover temp files are removed only once untouched for this long, so a
     # concurrent download of the same directory is not broken.
     _TEMP_ORPHAN_MIN_AGE_SECONDS = 3600.0
@@ -3465,6 +3504,8 @@ class CortexTrainingClient:
             f".{destination.name}.manifest-*.tmp",
             f".{destination.name}.partial.manifest-*.tmp",
             ".manifest-*.tmp",
+            # A compaction that was killed (see _artifact_download.compact_window).
+            f".{destination.name}.compact-*.tmp",
         )
         # Only files nobody has written to for a while: a download still
         # running in the same directory keeps touching its temp files.
@@ -3691,6 +3732,95 @@ class CortexTrainingClient:
             raise
         self._report_artifact_progress(progress, "\n")
 
+    @classmethod
+    def _preview_paths(
+        cls, plan: _artifact_download.GzipPlan, chunk_pattern: re.Pattern[str], seconds: float
+    ) -> list[str]:
+        """``plan``'s new chunks from ``seconds`` before its newest one, or ``[]`` when they
+        are most of what is new: fetching them first would then save no time."""
+        new = plan.new_paths
+        newest = cls._chunk_time(chunk_pattern, new[-1]) if new else None
+        if newest is None:
+            return []
+        start = newest - seconds - cls._PREVIEW_SLACK_SECONDS
+        paths = [
+            path
+            for path in new
+            if (when := cls._chunk_time(chunk_pattern, path)) is not None and when >= start
+        ]
+        return paths if 2 * len(paths) <= len(new) else []
+
+    def _write_preview(
+        self,
+        shared: _artifact_download.SharedConnection,
+        run_uri: str,
+        pool: ThreadPoolExecutor,
+        spool_root: Path,
+        cancel: threading.Event,
+        sub_job_id: str,
+        chunk_paths: list[str],
+        on_preview: Callable[[dict[str, Any]], None],
+        *,
+        futures: list[Future[Path]],
+    ) -> dict[str, Future[Path]]:
+        """Fetch ``chunk_paths`` (a sub-job's newest chunks, in time order) and call
+        ``on_preview`` with their rows as one file; return the fetches to reuse.
+
+        ``on_preview`` gets ``sub_job_id``, ``path``, ``chunk_count``,
+        ``first_artifact_uri`` and ``last_artifact_uri``; the file at ``path`` holds
+        the chunks' rows in time order and is removed once it returns. A chunk that
+        can't be fetched or decompressed is left out, and the download fetches it
+        again in its turn; with none left there is no preview. ``futures`` gets
+        every fetch, so a download that fails can wait for them before cleaning up.
+        """
+        mine = [
+            pool.submit(self._fetch_artifact_chunk, shared, run_uri, path, spool_root, cancel)
+            for path in chunk_paths
+        ]
+        futures.extend(mine)
+        target = spool_root / f"preview-{uuid.uuid4().hex}.jsonl"
+        kept: dict[str, Future[Path]] = {}
+        shown: list[str] = []
+        try:
+            try:
+                with target.open("wb") as output:
+                    for relative_path, future in zip(chunk_paths, mine):
+                        try:
+                            downloaded = future.result()
+                        except Exception:  # noqa: BLE001 - its turn fetches it again, and says why
+                            logger.debug("metrics preview: %s unavailable", relative_path, exc_info=True)
+                            continue
+                        kept[relative_path] = future
+                        start = output.tell()
+                        try:
+                            _artifact_download.copy_gzip_member(
+                                downloaded, output, _STREAM_COPY_BUFFER_BYTES
+                            )
+                        except _artifact_download.CORRUPT_CHUNK_ERRORS:
+                            output.truncate(start)
+                            output.seek(start)
+                            del kept[relative_path]  # damaged in transit, maybe: fetched again
+                            shutil.rmtree(downloaded.parent, ignore_errors=True)
+                            continue
+                        shown.append(relative_path)
+            except OSError:
+                # No room for the preview, say: the download goes on without one.
+                logger.debug("metrics preview for %s not written", sub_job_id, exc_info=True)
+                shown = []
+            if shown:
+                on_preview(
+                    {
+                        "sub_job_id": sub_job_id,
+                        "path": str(target),
+                        "chunk_count": len(shown),
+                        "first_artifact_uri": run_uri + shown[0],
+                        "last_artifact_uri": run_uri + shown[-1],
+                    }
+                )
+        finally:
+            target.unlink(missing_ok=True)
+        return kept
+
     def _write_gzip_plans(
         self,
         shared: _artifact_download.SharedConnection,
@@ -3700,11 +3830,14 @@ class CortexTrainingClient:
         *,
         max_workers: int,
         temporary_prefix: str,
+        stream: str,
+        label: str | None = None,
         progress: Callable[[str], None] | None = None,
         on_chunk: Callable[[str, int, int, int], None] | None = None,
         strict: bool = False,
         warnings_by_sub_job: Mapping[str, list[str]] | None = None,
         on_commit: Callable[[dict[str, Any]], None] | None = None,
+        preview: tuple[str, list[str], Callable[[dict[str, Any]], None]] | None = None,
     ) -> list[dict[str, Any]]:
         """Fetch every new chunk concurrently and append them in plan order.
 
@@ -3719,6 +3852,11 @@ class CortexTrainingClient:
         ``on_chunk`` gets ``(sub_job_id, done, total, bytes)`` counts, with
         ``done == total`` only after the file is committed. ``on_commit`` then
         gets a copy of that sub-job's result entry.
+
+        ``preview`` is ``(sub_job_id, chunk paths, callback)``: those chunks are
+        fetched before anything else and handed to the callback as one file
+        (see :meth:`_write_preview`), then written in their turn without being
+        fetched again.
         """
         work = [path for plan in plans for path in plan.new_paths]
         window = max_workers * self._DOWNLOAD_WINDOW_PER_WORKER
@@ -3729,7 +3867,12 @@ class CortexTrainingClient:
         cancel = threading.Event()
         # A resumed plan starts from output an earlier download saved.
         saved_progress = any(plan.known for plan in plans)
-        spool_prefix = f"cortex-training-{artifact_name}-artifacts-"
+        # What progress calls this stream. Both metric streams are staged under
+        # ``_metrics/``, so artifact_name alone would label them the same.
+        shown = label or artifact_name
+        # Per stream, not per stage root: Spool.sweep() removes stale directories under
+        # this prefix, so two streams sharing it could sweep a live sibling's spool.
+        spool_prefix = f"cortex-training-{stream}-artifacts-"
         _artifact_download.Spool.sweep(spool_prefix, self._TEMP_ORPHAN_MIN_AGE_SECONDS)
         with _artifact_download.Spool(spool_prefix) as spool:
             spool_root = spool.path
@@ -3740,7 +3883,14 @@ class CortexTrainingClient:
             # The fetch the writer is waiting on; it has left ``pending``.
             head: Future[Path] | None = None
             submitted = 0
+            # The preview's fetches, and those of them its chunks' turn reuses.
+            previewed: list[Future[Path]] = []
+            prefetched: dict[str, Future[Path]] = {}
             try:
+                if preview is not None:
+                    prefetched = self._write_preview(
+                        shared, run_uri, pool, spool_root, cancel, *preview, futures=previewed
+                    )
                 for plan in plans:
                     total = len(plan.chunk_paths)
                     new_total = len(plan.new_paths)
@@ -3753,7 +3903,7 @@ class CortexTrainingClient:
                         )
                     if not new_total:
                         self._report_artifact_progress(
-                            progress, f"{artifact_name}: no new chunks for {plan.sub_job_id}\n"
+                            progress, f"{shown}: no new chunks for {plan.sub_job_id}\n"
                         )
 
                     def report(done: int, plan=plan, new_total=new_total) -> None:
@@ -3761,7 +3911,7 @@ class CortexTrainingClient:
                             self._report_artifact_progress(
                                 progress,
                                 self._artifact_progress_status(
-                                    artifact_name, done, new_total, plan.sub_job_id
+                                    shown, done, new_total, plan.sub_job_id
                                 ),
                             )
 
@@ -3803,8 +3953,11 @@ class CortexTrainingClient:
                                 on_chunk(plan.sub_job_id, len(writer.names), total, writer.offset)
                             for done, relative_path in enumerate(plan.new_paths, start=1):
                                 while submitted < len(work) and len(pending) < window:
+                                    fetched = prefetched.pop(work[submitted], None)
                                     pending.append(
-                                        pool.submit(
+                                        fetched
+                                        if fetched is not None
+                                        else pool.submit(
                                             self._fetch_artifact_chunk,
                                             shared,
                                             run_uri,
@@ -3878,7 +4031,7 @@ class CortexTrainingClient:
                 # already on the wire runs to completion, and it is not awaited.
                 cancel.set()
                 pool.shutdown(wait=False, cancel_futures=True)
-                spool.remove_after([*([head] if head is not None else []), *pending])
+                spool.remove_after([*([head] if head is not None else []), *pending, *previewed])
                 with contextlib.suppress(Exception):
                     if not getattr(exc, "download_progress_saved", False):
                         exc.download_progress_saved = saved_progress  # type: ignore[attr-defined]
@@ -4018,6 +4171,9 @@ class CortexTrainingClient:
         wanted: set[str] | None,
         stale_after_seconds: float | None,
         cancel: threading.Event | None = None,
+        label: str = "",
+        check_missing: bool = False,
+        warn_if_stalled: bool = True,
     ) -> dict[str, list[str]]:
         """Warn when a running job's uploads look stalled; never raises.
 
@@ -4034,20 +4190,23 @@ class CortexTrainingClient:
         For metrics of a job that has ended, a sub-job with saved stdout but no
         metrics gets a warning saying why there may be none, so an empty
         result is not silent.
+
+        ``warn_if_stalled`` false skips the first sign: a stream written only
+        when the job is asked to do something goes quiet whenever it isn't. The
+        warning for a job that ended moments ago is still given.
         """
         if stale_after_seconds is None:
             return {}
         local_now = self._wall_clock()
         candidates: dict[str, float] = {}
         for sub_job_id, paths in chunks_by_sub_job.items():
-            if wanted is not None and sub_job_id not in wanted:
+            if not warn_if_stalled or (wanted is not None and sub_job_id not in wanted):
                 continue
             newest = self._chunk_time(chunk_pattern, paths[-1])
             if newest is not None and local_now - newest > max(
                 stale_after_seconds - self._STALE_PRECHECK_SKEW_SECONDS, 0
             ):
                 candidates[sub_job_id] = newest
-        check_missing = artifact_name == "metrics"
         # A chunk this recent means the job may have only just ended.
         recent_cutoff = local_now - self._RECENTLY_ENDED_SECONDS - self._STALE_PRECHECK_SKEW_SECONDS
         recently_active = any(
@@ -4065,7 +4224,7 @@ class CortexTrainingClient:
         status = self._normalize_job_status(job.get("status"))
         if status in _ENDED_JOB_STATES:
             warnings = self._recently_ended_warnings(
-                job, local_now if server_now is None else server_now, artifact_name, chunks_by_sub_job, wanted
+                job, local_now if server_now is None else server_now, label, chunks_by_sub_job, wanted
             )
             if check_missing:
                 for sub_job_id, messages in self._ended_without_metrics_warnings(
@@ -4092,7 +4251,6 @@ class CortexTrainingClient:
             starts = [t for t in (running_since, started) if t is not None]
             return now - max(starts) if starts else None
 
-        label = "stdout output" if artifact_name == "stdout" else "GPU metrics"
         warnings: dict[str, list[str]] = {}
         for sub_job_id, newest in candidates.items():
             age = now - newest
@@ -4148,7 +4306,7 @@ class CortexTrainingClient:
         self,
         job: Mapping[str, Any],
         now: float,
-        artifact_name: str,
+        label: str,
         chunks_by_sub_job: Mapping[str, list[str]],
         wanted: set[str] | None,
     ) -> dict[str, list[str]]:
@@ -4156,7 +4314,6 @@ class CortexTrainingClient:
         ended_at = self._parse_api_time(job.get("state_changed_at"))
         if ended_at is None or now - ended_at >= self._RECENTLY_ENDED_SECONDS:
             return {}
-        label = "stdout output" if artifact_name == "stdout" else "GPU metrics"
         warnings: dict[str, list[str]] = {}
         for sub_job_id in sorted(chunks_by_sub_job):
             if wanted is not None and sub_job_id not in wanted:
@@ -4209,6 +4366,12 @@ class CortexTrainingClient:
         chunk_pattern: re.Pattern[str],
         destination_name: str,
         temporary_prefix: str,
+        stream: str,
+        progress_label: str,
+        label: str | None = None,
+        check_missing: bool | None = None,
+        warn_if_stalled: bool = True,
+        skip_missing: bool = False,
         resume: bool = False,
         max_workers: int | None = None,
         progress: Callable[[str], None] | None = None,
@@ -4219,6 +4382,8 @@ class CortexTrainingClient:
         transfer_timeout_seconds: float | None = _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS,
         priority: Iterable[str] = (),
         on_commit: Callable[[dict[str, Any]], None] | None = None,
+        preview_seconds: float | None = None,
+        on_preview: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Reconstruct staged gzip chunks into one file per sub-job.
 
@@ -4234,7 +4399,35 @@ class CortexTrainingClient:
         Sub-jobs are written in id order, those named in ``priority`` first
         (in that order); the returned list stays in id order. ``on_commit``
         gets a copy of each sub-job's result entry once its file is committed.
+        With ``preview_seconds`` and ``on_preview``, the first of them gets a
+        preview first (see :meth:`download_metrics`).
+
+        ``stream`` names the reconstructed file's stream: it keeps one stream's
+        temporary spool apart from another's and is recorded with the operation.
+        ``progress_label`` is what progress and a missing sub-job's error call it.
+        The two metric streams share a stage root, so neither can be derived from
+        ``artifact_name``. ``warn_if_stalled`` false skips the warning for a
+        running job whose newest chunk is old, for a stream that is written only
+        when the job is asked to do something. ``skip_missing`` true leaves out a
+        sub-job named in ``sub_job_ids`` that has no chunks instead of raising
+        :class:`NoChunksError`, for a stream only some sub-jobs write.
         """
+        if (preview_seconds is None) != (on_preview is None):
+            raise ValueError("preview_seconds and on_preview are given together")
+        if preview_seconds is not None and (
+            isinstance(preview_seconds, bool)
+            or not isinstance(preview_seconds, (int, float))
+            or not preview_seconds > 0
+        ):
+            raise ValueError("preview_seconds must be a positive number or None")
+        # What the warnings call this stream, and whether a sub-job with saved stdout
+        # but none of these chunks is worth a warning. Only the GPU stream is: every
+        # sub-job with GPUs uploads it, while training metrics are written by training
+        # sub-jobs alone, and only when the deployment saves them.
+        if label is None:
+            label = "stdout output" if artifact_name == "stdout" else "GPU metrics"
+        if check_missing is None:
+            check_missing = artifact_name == "metrics"
         if max_workers is None:
             max_workers = self._DOWNLOAD_DEFAULT_WORKERS
         if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
@@ -4261,7 +4454,7 @@ class CortexTrainingClient:
             raise ValueError("transfer_timeout_seconds must be a positive number or None")
         values = self._operation_values()
         values.update(
-            artifact=artifact_name,
+            artifact=stream,
             max_workers=max_workers,
             resume=bool(resume),
             resume_mode="none",
@@ -4307,6 +4500,9 @@ class CortexTrainingClient:
                         wanted,
                         stale_after_seconds,
                         stall_cancel,
+                        label,
+                        check_missing,
+                        warn_if_stalled,
                     ),
                     name="cortex-training-stall-check",
                 )
@@ -4316,15 +4512,15 @@ class CortexTrainingClient:
                     return {}
                 return stall_check.result(self._STALL_CHECK_WAIT_SECONDS, {})
 
-            if wanted is not None and wanted - set(chunks_by_sub_job):
+            if wanted is not None and wanted - set(chunks_by_sub_job) and not skip_missing:
                 # A named sub-job without chunks is fine only if it has a warning.
                 unsaved = set(stale_warnings()) - set(chunks_by_sub_job)
                 missing = sorted(wanted - set(chunks_by_sub_job) - unsaved)
                 if missing:
                     available = sorted(chunks_by_sub_job)
                     raise NoChunksError(
-                        f"no {artifact_name} chunks for sub-job(s) "
-                        f"{', '.join(missing)}; sub-jobs with {artifact_name}: "
+                        f"no {progress_label} chunks for sub-job(s) "
+                        f"{', '.join(missing)}; sub-jobs with {progress_label}: "
                         f"{', '.join(available) or 'none'}",
                         sub_job_ids=missing,
                         available=available,
@@ -4342,6 +4538,11 @@ class CortexTrainingClient:
             # Those named in priority first, in that order; the sort is stable,
             # so the rest stay in id order.
             plans.sort(key=lambda plan: first.get(plan.sub_job_id, len(first)))
+            preview = None
+            if on_preview is not None and plans and plans[0].sub_job_id in first:
+                paths = self._preview_paths(plans[0], chunk_pattern, preview_seconds)
+                if paths:
+                    preview = (plans[0].sub_job_id, paths, on_preview)
             values["sub_job_count"] = len(plans)
             modes = {
                 "append"
@@ -4356,7 +4557,7 @@ class CortexTrainingClient:
             values["resume_mode"] = modes.pop() if len(modes) == 1 else "mixed" if modes else "none"
             results: list[dict[str, Any]] = []
             if not plans:
-                self._report_artifact_progress(progress, f"{artifact_name}: found 0 chunks\n")
+                self._report_artifact_progress(progress, f"{progress_label}: found 0 chunks\n")
             else:
                 started = time.monotonic()
                 try:
@@ -4367,11 +4568,14 @@ class CortexTrainingClient:
                         plans,
                         max_workers=max_workers,
                         temporary_prefix=temporary_prefix,
+                        stream=stream,
+                        label=progress_label,
                         progress=progress,
                         on_chunk=on_chunk,
                         strict=strict,
                         warnings_by_sub_job=warnings_by_sub_job,
                         on_commit=on_commit,
+                        preview=preview,
                     )
                 finally:
                     values["fetch_ms"] = round((time.monotonic() - started) * 1000, 3)
@@ -4432,6 +4636,8 @@ class CortexTrainingClient:
         strict: bool = False,
         stale_after_seconds: float | None = _DOWNLOAD_STALE_AFTER_SECONDS,
         transfer_timeout_seconds: float | None = _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS,
+        preview_seconds: float | None = None,
+        on_preview: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Reconstruct sealed console artifacts into one file per sub-job.
 
@@ -4460,7 +4666,14 @@ class CortexTrainingClient:
         A LIST or GET attempt still running after ``transfer_timeout_seconds``
         (default 300; ``None`` disables) is abandoned and retried. Two
         downloads of the same output directory at once are unsupported.
+
+        ``preview_seconds`` and ``on_preview`` (given together) give the first
+        sub-job named in ``sub_job_ids`` its newest output before the rest, as
+        :meth:`download_metrics` describes for metrics: the console's last
+        ``preview_seconds`` (and a little more) in one file. That sub-job is
+        written first; without ``sub_job_ids`` there is no preview.
         """
+        named = None if sub_job_ids is None or isinstance(sub_job_ids, (str, bytes)) else list(sub_job_ids)
         return self._download_gzip_artifacts(
             job_id,
             output_dir,
@@ -4468,14 +4681,19 @@ class CortexTrainingClient:
             chunk_pattern=_STDOUT_CHUNK_RE,
             destination_name="stdout.log",
             temporary_prefix=".stdout-",
+            stream="stdout",
+            progress_label="stdout",
             resume=resume,
             max_workers=max_workers,
             progress=progress,
             on_chunk=on_chunk,
-            sub_job_ids=sub_job_ids,
+            sub_job_ids=sub_job_ids if named is None else named,
             strict=strict,
             stale_after_seconds=stale_after_seconds,
             transfer_timeout_seconds=transfer_timeout_seconds,
+            priority=named[:1] if named and on_preview is not None else (),
+            preview_seconds=preview_seconds,
+            on_preview=on_preview,
         )
 
     @_track_operation("download_metrics")
@@ -4494,6 +4712,8 @@ class CortexTrainingClient:
         transfer_timeout_seconds: float | None = _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS,
         priority: Iterable[str] = (),
         on_commit: Callable[[dict[str, Any]], None] | None = None,
+        preview_seconds: float | None = None,
+        on_preview: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Reconstruct staged GPU metric chunks into one JSONL file per sub-job.
 
@@ -4509,6 +4729,19 @@ class CortexTrainingClient:
         saved stdout but no metrics gets a result entry with ``chunk_count`` 0,
         ``saved_path`` ``None``, and a warning. Two downloads
         of the same output directory at once are unsupported.
+
+        With ``preview_seconds`` and ``on_preview`` (given together), the first
+        sub-job in ``priority`` gets its newest samples before the rest: the
+        chunks from ``preview_seconds`` before its newest one (and a little
+        more, since a chunk's name gives the time it starts) are fetched first,
+        and ``on_preview`` is called, on the calling thread, with
+        ``sub_job_id``, ``path``, ``chunk_count``, ``first_artifact_uri`` and
+        ``last_artifact_uri``. The file at ``path`` holds those chunks' rows in
+        time order and is removed once ``on_preview`` returns; an error it
+        raises stops the download as one from ``on_commit`` does. Those chunks
+        are not fetched again, so the download makes no more requests. There is
+        no preview when they are most of what the sub-job has new (a first
+        download of a short job, or a resume), or when none of them can be read.
         """
         return self._download_gzip_artifacts(
             job_id,
@@ -4517,6 +4750,71 @@ class CortexTrainingClient:
             chunk_pattern=_GPU_METRICS_CHUNK_RE,
             destination_name="gpu.jsonl",
             temporary_prefix=".gpu-metrics-",
+            stream="metrics",
+            progress_label="metrics",
+            resume=resume,
+            max_workers=max_workers,
+            progress=progress,
+            on_chunk=on_chunk,
+            sub_job_ids=sub_job_ids,
+            strict=strict,
+            stale_after_seconds=stale_after_seconds,
+            transfer_timeout_seconds=transfer_timeout_seconds,
+            priority=priority,
+            on_commit=on_commit,
+            preview_seconds=preview_seconds,
+            on_preview=on_preview,
+        )
+
+    @_track_operation("download_training_metrics")
+    def download_training_metrics(
+        self,
+        job_id: str,
+        output_dir: str | os.PathLike[str],
+        *,
+        resume: bool = False,
+        max_workers: int | None = None,
+        progress: Callable[[str], None] | None = None,
+        on_chunk: Callable[[str, int, int, int], None] | None = None,
+        sub_job_ids: Iterable[str] | None = None,
+        strict: bool = False,
+        stale_after_seconds: float | None = _DOWNLOAD_STALE_AFTER_SECONDS,
+        transfer_timeout_seconds: float | None = _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS,
+        priority: Iterable[str] = (),
+        on_commit: Callable[[dict[str, Any]], None] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Reconstruct staged training-metric chunks into one JSONL file per sub-job.
+
+        The training metrics a job's ``/fwd-bwd`` and ``/step`` calls returned,
+        written by the zone to its own file and staged beside the GPU chunks as
+        ``training.*.gz``, reconstructed as
+        ``<output_dir>/<sub_job_id>/training.jsonl``. Takes the same options as
+        :meth:`download_metrics`, and the two can share an output directory:
+        each writes its own file and manifest.
+
+        Only training sub-jobs have these rows, and only where the deployment
+        saves them (a job opts out with ``training_config.save_training_metrics``
+        false), so a sub-job without them is not warned about, unlike a sub-job
+        with no GPU metrics. For the same reason, a sub-job named in
+        ``sub_job_ids`` without them is left out of the result rather than
+        raising :class:`NoChunksError`.
+        """
+        return self._download_gzip_artifacts(
+            job_id,
+            output_dir,
+            artifact_name="metrics",
+            chunk_pattern=_TRAINING_METRICS_CHUNK_RE,
+            destination_name="training.jsonl",
+            temporary_prefix=".training-metrics-",
+            stream="training-metrics",
+            progress_label="training metrics",
+            label="training metrics",
+            check_missing=False,
+            # Rows are written only when the job is asked for /fwd-bwd or /step, so an
+            # idle session or a long rollout between steps is not a stall.
+            warn_if_stalled=False,
+            # Only training sub-jobs write them: naming a sampling sub-job is not an error.
+            skip_missing=True,
             resume=resume,
             max_workers=max_workers,
             progress=progress,
@@ -4771,6 +5069,7 @@ class CortexTrainingClient:
             debug_context=debug_context,
         )
         request_id = body["request_id"]
+        self._remember_training_log_op(request_id, job_id, _training_log.OP_FWD_BWD)
         request_debug_context = {
             "phase": "poll",
             "call": call,
@@ -4868,7 +5167,9 @@ class CortexTrainingClient:
         if learning_rate is not None:
             body["learning_rate"] = learning_rate
         resp = self._send("POST", f"{self._prefix}/{job_id}/step", json=body)
-        return resp.json()["request_id"]
+        request_id = resp.json()["request_id"]
+        self._remember_training_log_op(request_id, job_id, _training_log.OP_STEP)
+        return request_id
 
     @_track_operation("save")
     def save(
@@ -4948,7 +5249,10 @@ class CortexTrainingClient:
         if target_sub_job_id is not None:
             body["target_sub_job_id"] = target_sub_job_id
         resp = self._send("POST", f"{self._prefix}/{job_id}/load", json=body)
-        return resp.json()["request_id"]
+        request_id = resp.json()["request_id"]
+        # A load moves the job to another step: the local log learns its step again at the next /step.
+        self._remember_training_log_op(request_id, job_id, _training_log.OP_LOAD, target_sub_job_id)
+        return request_id
 
     def _operation(
         self,
@@ -5273,6 +5577,12 @@ class CortexTrainingClient:
 
     @staticmethod
     def _decode_result_payload(result: dict) -> dict | None:
+        decoded = CortexTrainingClient._decode_result_body(result)
+        return None if decoded is None else CortexTrainingClient._merge_transport_metrics(decoded, result)
+
+    @staticmethod
+    def _decode_result_body(result: dict) -> dict | None:
+        """A DSSST1 envelope's payload, as the sub-job returned it (without the envelope's metrics)."""
         if not isinstance(result, dict):
             return None
         if result.get("wire_format") != wire.WIRE_FORMAT_VERSION:
@@ -5286,7 +5596,7 @@ class CortexTrainingClient:
         decoded = wire.loads(payload)
         if not isinstance(decoded, dict):
             raise RuntimeError("DSSST1 result payload did not decode to a dict")
-        return CortexTrainingClient._merge_transport_metrics(decoded, result)
+        return decoded
 
     @staticmethod
     def _merge_transport_metrics(decoded: dict, envelope: dict) -> dict:
@@ -5339,25 +5649,25 @@ class CortexTrainingClient:
             result["results"] = self._restore_generate_result_lists(result["results"])
         return result
 
-    def _normalize_forward_result_if_needed(self, request_id: str, result: dict) -> dict:
-        """Decode a forward result that is only a base64 DSSST1 blob.
+    def _decode_legacy_forward_result(self, request_id: str, result: dict) -> dict | None:
+        """The payload of a forward result that is only a base64 DSSST1 blob, else None.
 
         A current backend returns a self-describing envelope that
-        :meth:`_decode_result_payload` already handles. An older backend
+        :meth:`_decode_result_body` already handles. An older backend
         returns ``{"job_id", "payload_b64"}`` with no ``wire_format``.
         """
         if request_id not in self._forward_request_ids:
-            return result
+            return None
         self._forward_request_ids.discard(request_id)
         if not isinstance(result, dict) or result.get("wire_format"):
-            return result
+            return None
         raw = result.get("payload_b64")
         if not isinstance(raw, str) or not raw:
-            return result
+            return None
         decoded = wire.loads(base64.b64decode(raw))
         if not isinstance(decoded, dict):
             raise RuntimeError("legacy forward payload_b64 did not decode to a dict")
-        return self._merge_transport_metrics(decoded, result)
+        return decoded
 
     @staticmethod
     def _decode_stream_result_event(event: Any) -> Any:
@@ -5385,6 +5695,46 @@ class CortexTrainingClient:
         status["events"] = decoded
         return status
 
+    # Requests submitted and never polled are dropped past this, oldest first.
+    _MAX_TRAINING_LOG_OPS = 4096
+
+    def _remember_training_log_op(self, request_id: str, job_id: str, op: str,
+                                  target_sub_job_id: str | None = None) -> None:
+        """Note a submitted request for :meth:`_log_training_result`. Never raises: the request is
+        already accepted, and its caller must get its id back."""
+        if self._training_log is None:
+            return
+        try:
+            with self._training_log_ops_lock:
+                ops = self._training_log_ops
+                ops[request_id] = (job_id, op, target_sub_job_id)
+                while len(ops) > self._MAX_TRAINING_LOG_OPS:
+                    ops.pop(next(iter(ops)), None)
+        except Exception:  # noqa: BLE001 - best-effort, like the log itself
+            logger.debug("local training metrics bookkeeping failed", exc_info=True)
+
+    def _log_training_result(self, request_id: str, payload: Any, envelope: Any) -> None:
+        """Copy a finished /fwd-bwd's or /step's result to the local training-metrics log. Never raises.
+
+        ``payload`` is the result as the training sub-job returned it, before the envelope's
+        transport ``metrics`` are merged in: the zone saves the former, so the local row matches
+        the stage's. A result that doesn't name its sub-job takes the envelope's.
+        """
+        try:
+            with self._training_log_ops_lock:
+                logged = self._training_log_ops.pop(request_id, None)
+            if logged is None or self._training_log is None:
+                return
+            job_id, op, target = logged
+            if op == _training_log.OP_LOAD:
+                self._training_log.forget_step(job_id, target)
+                return
+            named = envelope.get("job_id") if isinstance(envelope, dict) else None
+            self._training_log.record(job_id, op, request_id, payload,
+                                      sub_job_id=named if isinstance(named, str) else None)
+        except Exception:  # noqa: BLE001 - best-effort: never fail the call this came from
+            logger.debug("local training metrics record failed", exc_info=True)
+
     @_track_operation("poll_request")
     def poll_request(self, job_id: str, request_id: str) -> dict:
         """Poll until the async request completes. Returns the result dict."""
@@ -5411,21 +5761,26 @@ class CortexTrainingClient:
                 # Drain available result chunks without backing off.
                 continue
             if state in ("completed", "done", "succeeded"):
+                # ``payload`` is the result as the sub-job returned it, for the local
+                # training-metrics log; ``result`` also has the envelope's transport metrics.
+                envelope = status.get("result") or {}
                 if result_chunks:
                     with _server_payload():
-                        result = wire.decode_result_chunks(result_chunks)
-                    result = self._merge_transport_metrics(
-                        result,
-                        status.get("result") or {},
-                    )
+                        payload = wire.decode_result_chunks(result_chunks)
+                    result = self._merge_transport_metrics(payload, envelope)
                 else:
-                    result = status.get("result") or {}
+                    result = payload = envelope
                     with _server_payload():
-                        decoded = self._decode_result_payload(result)
+                        decoded = self._decode_result_body(result)
                     if decoded is not None:
-                        result = decoded
+                        payload = decoded
+                        result = self._merge_transport_metrics(decoded, envelope)
                 result = self._normalize_generate_result_if_needed(request_id, result)
-                result = self._normalize_forward_result_if_needed(request_id, result)
+                legacy = self._decode_legacy_forward_result(request_id, result)
+                if legacy is not None:
+                    payload = legacy
+                    result = self._merge_transport_metrics(legacy, result)
+                self._log_training_result(request_id, payload, envelope)
                 if debug_label is not None:
                     logger.debug(
                         "%s completed state=%s result=%s",

@@ -22,7 +22,8 @@ recipe module with no arguments to see its full list, or read its `Config` class
 
 The job-config object is posted as the create-job body with one exception: each
 `peft_config` it carries is validated and rewritten into its canonical form
-first, and an invalid one fails before anything is submitted. Everything else,
+first, and an invalid one fails before anything is submitted. A `ds_config` with
+ZeRO stage 3 also fails before submission; use stage 1 or 2. Everything else,
 `optimizer` included, is posted unchanged, so
 [REST API section 8](../rest-api.md#8-create-job-schemas) is the authoritative
 schema for its fields. The

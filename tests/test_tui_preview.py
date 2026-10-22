@@ -60,7 +60,7 @@ def test_preview_facts_leave_the_hero_and_lifecycle_out():
     labels = [label for label, _value in v.preview_facts(_job(), NOW)]
     assert labels == ["Model", "Type", "GPUs", "Owner", "Created", "Last update"]
     located = _job(database_name="CORTEX_TRAINING_DB", schema_name="PUBLIC")
-    assert [label for label, _value in v.preview_facts(located, NOW)][-1] == "Location"
+    assert [label for label, _value in v.preview_facts(located, NOW)][-1] == "Schema"
 
 
 def test_elapsed_text_runs_from_creation():

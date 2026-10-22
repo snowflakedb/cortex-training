@@ -385,8 +385,10 @@ outer body, the non-empty list, the training-sub-job count, and each sub-job's
 `job_type` for the unsupported log-probability spellings before forwarding it.
 It also normalizes every `peft_config` the body carries, rewriting it in
 place and rejecting an invalid one before the request is sent (see
-[section 8.2](#82-trainingconfig)). Everything else in a raw body, `optimizer`
-included, is forwarded exactly as given. `cortex-training submit` repeats those
+[section 8.2](#82-trainingconfig)), and rejects a training
+`ds_config.zero_optimization.stage` of 3 or higher (ZeRO-3 is not supported).
+Everything else in a raw body, `optimizer` included, is forwarded exactly as
+given. `cortex-training submit` repeats those
 checks so `--dry-run` fails the same way without a connection.
 
 #### GPU hardware - `hardware`
@@ -553,8 +555,9 @@ size is not a count of what matched.
 
 `CortexTrainingClient.iter_jobs(...)` takes the same filters, with `page_size`
 for `limit`, checks its arguments on the call, and yields jobs across pages as
-you iterate. It raises a 404 at once instead of retrying it, and never creates
-the configured database. `CortexTrainingClient.list_jobs_page(...)` reads one
+you iterate. A `schema` without a `database` is refused before any request, as a
+`ValueError`, rather than reaching the service's 400. It raises a 404 at once
+instead of retrying it, and never creates the configured database. `CortexTrainingClient.list_jobs_page(...)` reads one
 page instead: it takes the same filters plus `page_token`, and per-call
 `max_retries` and `request_timeout`, and returns
 `{"jobs": [...], "next_page_token": str | None}`. It raises 403, 404 and 405
@@ -563,6 +566,11 @@ at once as `AccountJobListUnavailable`, whose `reason` is `forbidden`,
 `Invalid page_token` as `InvalidPageToken`; both subclass `requests.HTTPError`.
 `for_job(job)` returns a client bound to a listed job's `database_name` and
 `schema_name`; it borrows the parent's session and creates no database either.
+
+The TUI's job list sends `database` (and `schema` with it) when a search names a
+whole one, so that location's jobs are read whole rather than filtered out of
+the newest jobs the walk reads; see the job list in `docs/reference/cli.md`. A
+page token is only sent back with the filters it was made under, as above.
 
 ### 5.4 Capacity - `GET /capacity`
 
@@ -1674,7 +1682,10 @@ resized; a `true`/default resume against a different DP/world size fails fast
 with an actionable error. `None` (omitted) uses the server default (`true`).
 
 `extra_training` is merged as open passthrough data, without overriding typed
-keys. Examples include `model_provider`, `ep_size`, `ds_config`,
+keys. `ds_config.zero_optimization.stage` must be 0, 1, or 2: ZeRO-3 is not
+supported and is rejected before the request is sent; for CPU optimizer offload
+use stage 2 with `zero_optimization.offload_optimizer`. Examples include
+`model_provider`, `ep_size`, `ds_config`,
 `activation_checkpointing`, `prime_rl` (deprecated, see
 [below](#prime_rl-block-deprecated)), `router_replay`, `peft_config`,
 `model_options` (see [below](#model_options)), the memory-diagnostics settings
@@ -2729,13 +2740,19 @@ paths or object-store credentials.
 
 `download_stdout_logs(job_id, output_dir, *, resume=False, max_workers=None,
 progress=None, on_chunk=None, sub_job_ids=None, strict=False,
-stale_after_seconds=600, transfer_timeout_seconds=300)`
+stale_after_seconds=600, transfer_timeout_seconds=300, preview_seconds=None,
+on_preview=None)`
 downloads gzip chunks under
 `_stdout/{sub_job_id}/`, orders them by chunk name (which starts with the
 chunk's UTC time), and streams them into `<output_dir>/<sub_job_id>/stdout.log`.
 If a run has chunks for one sub-job under both `_stdout/` and
 `checkpoints/_stdout/`, the two lists are merged by chunk name and a name found
 in both keeps the `_stdout/` copy; the sub-job's result gets a warning.
+`preview_seconds` and `on_preview` give the first sub-job named in
+`sub_job_ids` its console's newest output first, the same way
+`download_metrics` previews metrics (see
+[section 12.4](#124-gpu-metrics-download)); that sub-job is written first, and
+without `sub_job_ids` there is no preview.
 
 Each chunk is one experiment artifact `GET` into a private temporary directory.
 Up to `max_workers` (default 16) run at once on one Connector session, each on
@@ -2837,7 +2854,8 @@ chunks. Two downloads of the same output directory at once are unsupported.
 
 `download_metrics(job_id, output_dir, *, resume=False, max_workers=None,
 progress=None, on_chunk=None, sub_job_ids=None, strict=False,
-stale_after_seconds=600, transfer_timeout_seconds=300)`
+stale_after_seconds=600, transfer_timeout_seconds=300, priority=(),
+on_commit=None, preview_seconds=None, on_preview=None)`
 applies the same reconstruction to
 `gpu.YYYYMMDD-HHMMSS.UUID.gz` chunks under `_metrics/{sub_job_id}/` and writes
 `<output_dir>/<sub_job_id>/gpu.jsonl`, including the options, retries, and the
@@ -2860,6 +2878,21 @@ While a job is running, and for 120 seconds after it ends (judged from
 metrics download in that window gets a warning per sub-job saying so; download
 again with `resume=True` a minute or two later to pick them up. These job
 lookups are skipped when `stale_after_seconds` is `None`.
+
+Sub-jobs named in `priority` are written first, in that order; `on_commit` gets
+each sub-job's result entry once its file is committed. With `preview_seconds`
+and `on_preview` (given together), the first sub-job in `priority` gets its
+newest samples before the rest of its history: its chunks from
+`preview_seconds` before its newest chunk are fetched first (two minutes more,
+since a chunk's name gives the time it starts), and `on_preview` gets
+`sub_job_id`, `path`, `chunk_count`, `first_artifact_uri` and
+`last_artifact_uri`. The file at `path` holds those chunks' rows in time order
+and is removed once `on_preview` returns. The chunks are not fetched again, so
+the download makes no more requests than without a preview; there is none when
+they are most of what the sub-job has new, or when none of them can be read.
+Metrics chunks are uploaded about once a minute per sub-job, so a cold download
+of a long job is mostly per-chunk round trips: this is how the TUI draws a job's
+newest half hour before the rest of its history arrives.
 
 The reconstructed file contains the JSONL records emitted by the deployed
 training runtime. Version 2 GPU rows have no `kind` field and include:
@@ -2899,11 +2932,75 @@ The same file also carries one host row per worker per scrape, with
 | `cpu_count` | Logical CPUs on the host |
 | `mem_used_bytes` / `mem_total_bytes` | Host memory in use and installed |
 
-A row without `kind` is a GPU row; a later GPU row may carry `kind: "gpu"`.
-Consumers should select rows by `kind` and ignore kinds they do not support.
-The TUI's Resource tab uses GPU rows only.
+### 12.5 Training metrics download
 
-### 12.5 Zone scheduling events
+`download_training_metrics(job_id, output_dir, ...)` takes the same options as
+`download_metrics` and reconstructs a training sub-job's **training metrics**:
+what its `/fwd-bwd` and `/step` calls returned, written by the zone to its own
+file and staged beside the GPU chunks as
+`training.YYYYMMDD-HHMMSS.UUID.gz` under `_metrics/{sub_job_id}/`. It writes
+`<output_dir>/<sub_job_id>/training.jsonl`, with its own manifest, so the two
+downloads can share an output directory and neither stream's rows reach the
+other's file. `cortex-training download-metrics` runs both and reports them as
+`metrics` and `training_metrics`.
+
+Only training sub-jobs have these rows, and only where the deployment saves
+them; a job opts out by setting `training_config.save_training_metrics` to
+`false`. So, unlike the GPU stream, a sub-job with saved stdout and no training
+chunks is not warned about, and a sub-job named in `sub_job_ids` without
+training chunks is left out of the result rather than raising `NoChunksError`.
+
+The zone appends one row per successful `/fwd-bwd` call and one per successful
+`/step`, with `"kind": "training"` and `record_version` `2`. Each row holds the
+numbers its call's result carries, as the client receives them; nothing is
+combined or computed:
+
+```json
+{"kind": "training", "record_version": 2, "sub_job_id": "JOB_ID:training:0",
+ "sample_ts": "2026-10-16T18:02:14Z", "seq": 84, "seq_epoch": "...",
+ "op": "fwd_bwd", "step": 3, "call": 1, "request_id": "REQUEST_ID",
+ "metrics": {"avg_loss": 2.0419, "rank": 0, "sft_model_calls": 1, "sft_packed_rows": 1}}
+{"kind": "training", "record_version": 2, "sub_job_id": "JOB_ID:training:0",
+ "sample_ts": "2026-10-16T18:02:15Z", "seq": 86, "seq_epoch": "...",
+ "op": "step", "step": 3, "call": null, "request_id": "REQUEST_ID",
+ "metrics": {"global_steps": 3.0, "grad_norm": 84.37, "last_lr": 0.0001,
+             "update_successful": 1.0, "weight_delta_norm_rank0_sample": 0.1447}}
+```
+
+| Field | Meaning |
+|---|---|
+| `kind` | `"training"` |
+| `record_version` | `2` |
+| `sub_job_id`, `seq`, `seq_epoch` | As for GPU rows; a gap in `seq` means rows were lost |
+| `sample_ts` | When the call completed |
+| `op` | `"fwd_bwd"` (one `/fwd-bwd` call) or `"step"` (one `/step`) |
+| `step` | On a `step` row, the step's `global_steps`. On a `fwd_bwd` row, the step the call counts toward: the previous `/step`'s `global_steps` + 1, or `null` when the zone doesn't know it yet: before it has seen a `/step` (a job's first calls, or the first after the zone restarted), and after a `load-checkpoint` moves the job to another step. Such a call belongs to the `step` row that follows it. A `/fwd-bwd` retried and answered from the first run's cached result is saved once |
+| `call` | On a `fwd_bwd` row, the call's place among its step's calls, from 1; `null` on a `step` row |
+| `request_id` | The call's request id |
+| `metrics` | Every finite number in the result, by its own name |
+
+A `fwd_bwd` row's `metrics` are the result's top-level numbers (`avg_loss`,
+that call's own loss) and every number in its `metrics` (`rank`,
+`sft_model_calls`, `sft_packed_rows`, or whatever the loss function reports);
+a top-level field wins over a nested metric of the same name. A `step` row's
+`metrics` are every number in the `/step` result (`global_steps`, `grad_norm`,
+`last_lr`, `update_successful`, `weight_delta_*`, ...). Text (such as
+`job_id`), lists, booleans, `null`, NaN and infinities are left out, and a row
+keeps at most 256 metrics with names of at most 200 bytes.
+
+A step's loss is not saved as such: whether it is the sum or the mean of its
+calls' `avg_loss` depends on how the loss was scaled, so each call's own
+`avg_loss` is saved and the choice is left to the reader. A `/step` that fails
+saves no row, and calls made before it count toward the same step as the retry's
+calls. The metrics a loss function returns vary, so consumers should read
+whatever names a row has.
+
+In the GPU file, a row without `kind` is a GPU row; a later GPU row may carry
+`kind: "gpu"`. Consumers should select rows by `kind` and ignore kinds they do
+not support. The TUI's Resources tab uses GPU and system rows; its Training
+metrics tab reads `training.jsonl` and shows it per step and per call.
+
+### 12.6 Zone scheduling events
 
 The client contains `tail_events()` and `stream_events()`, but the server does
 not accept their operation type. See

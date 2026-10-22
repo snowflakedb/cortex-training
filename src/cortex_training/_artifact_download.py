@@ -25,13 +25,16 @@ checkpointing chunk writer that keeps a resume manifest in step with the file.
 
 from __future__ import annotations
 
+import contextlib
 import gzip
 import json
 import logging
+import math
 import os
 import random
 import re
 import shutil
+import stat
 import tempfile
 import threading
 import time
@@ -41,6 +44,8 @@ from collections.abc import Iterable
 from concurrent.futures import Future
 from dataclasses import dataclass
 from dataclasses import field
+from datetime import datetime
+from datetime import timezone
 from pathlib import Path
 from typing import Any
 from typing import TypeVar
@@ -477,6 +482,194 @@ def write_manifest(
         except OSError:
             pass
         raise
+
+
+# Compaction: a reconstructed artifact of a job that runs for days grows without end, so
+# the rows before a window are dropped and the manifest's byte count moves down with them.
+# The chunk names stay, so a dropped chunk is never fetched again.
+_COMPACT_TAIL_BYTES = 1 << 16
+_COMPACT_BLOCK = 1 << 20
+# A row longer than this is not one the service writes: the cut stops there rather than
+# read it whole.
+_COMPACT_MAX_ROW = 1 << 20
+# How far past the reference time (see compact_window) a row may be stamped and still count
+# as real. Further ahead, it neither places the window nor stops the cut: one worker's
+# skewed clock would otherwise move the window past every real row, and with the chunk
+# names kept, the rows dropped would never be fetched again. Within it, the window starts
+# this much earlier, so a row stamped up to this far ahead never costs a row inside it.
+_COMPACT_CLOCK_TOLERANCE_S = 60.0
+# RFC 3339 with a "T" and an explicit zone, as the service writes it; the fraction may
+# carry any number of digits (the schema allows nanoseconds), or be absent.
+_STAMP_RE = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)")
+_MIN_STAMP = datetime(1970, 1, 1, tzinfo=timezone.utc).timestamp()
+_MAX_STAMP = datetime(9998, 12, 31, 23, 59, 59, 999999, tzinfo=timezone.utc).timestamp()
+
+
+def row_time(line: bytes, field_name: str) -> float | None:
+    """The epoch seconds of ``field_name`` in one JSONL row; None when it has none to read.
+
+    Only the whole seconds go through ``datetime.fromisoformat`` and the fraction is added
+    after: on 3.10 it reads a fraction of exactly three or six digits, while the schema
+    allows any number of them, or none. Digits past a microsecond are truncated, and times
+    outside 1970 to 9998 are rejected, as the Resources tab reads them.
+    """
+    try:
+        row = json.loads(line)
+    except (ValueError, RecursionError):
+        return None
+    stamp = row.get(field_name) if isinstance(row, dict) else None
+    if not isinstance(stamp, str):
+        return None
+    match = _STAMP_RE.fullmatch(stamp)
+    if match is None:
+        return None
+    base, fraction, zone = match.groups()
+    try:
+        seconds = datetime.fromisoformat(base + ("+00:00" if zone == "Z" else zone)).timestamp()
+    except (OverflowError, ValueError, OSError):
+        return None
+    if fraction:
+        seconds += int(fraction[:6].ljust(6, "0")) / 1_000_000
+    return seconds if _MIN_STAMP <= seconds <= _MAX_STAMP else None
+
+
+def _newest_row_time(data_path: Path, end: int, field_name: str, horizon: float) -> float | None:
+    """The newest time among the rows in the last bytes before ``end``, past ``horizon`` left out.
+
+    ``end`` is the committed length: rows after it are not the file's yet, so they must not
+    place a window the cut cannot reach.
+    """
+    start = max(0, end - _COMPACT_TAIL_BYTES)
+    with data_path.open("rb") as handle:
+        handle.seek(start)
+        lines = handle.read(end - start).split(b"\n")
+    if start > 0:
+        lines = lines[1:]  # the block may start inside a row
+    newest = None
+    for line in lines:
+        stamp = row_time(line, field_name) if line else None
+        if stamp is not None and stamp <= horizon and (newest is None or stamp > newest):
+            newest = stamp
+    return newest
+
+
+def _compact_cut(data_path: Path, field_name: str, cutoff: float, horizon: float, limit: int) -> int:
+    """Where the kept rows start: the first row from ``cutoff`` to ``horizon`` in the first ``limit`` bytes.
+
+    Only whole rows that end inside ``limit`` are passed over, so the cut is always a row
+    boundary and never past the committed bytes. A row stamped past ``horizon`` is passed
+    over as one without a time: taken as recent, one such row near the start of the file
+    would keep everything after it, and the file would grow again without end.
+    """
+    offset = 0
+    with data_path.open("rb") as handle:
+        while offset < limit:
+            line = handle.readline(_COMPACT_MAX_ROW)
+            if not line.endswith(b"\n") or offset + len(line) > limit:
+                break  # the end, a torn or oversized row, or a row past the committed bytes
+            stamp = row_time(line, field_name)
+            if stamp is not None and cutoff <= stamp <= horizon:
+                break
+            offset += len(line)
+    return offset
+
+
+def _fsync_directory(path: Path) -> None:
+    """Make the renames made in ``path`` durable, where the platform can open a directory."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def compact_window(
+    data_path: Path,
+    manifest_path: Path,
+    *,
+    keep_seconds: float,
+    field_name: str = "sample_ts",
+    now: float | None = None,
+) -> int:
+    """Drop ``data_path``'s rows older than ``keep_seconds`` before its newest committed row.
+
+    Returns the bytes freed, 0 when nothing was dropped. The manifest keeps every chunk
+    name and only its byte count moves, so resume appends where the kept rows end and the
+    dropped chunks are never fetched again.
+
+    ``now`` is the latest time a real row can carry: this computer's clock (the default)
+    for a job still running, the time it ended for one that has. Only committed rows place
+    the window, and one stamped more than _COMPACT_CLOCK_TOLERANCE_S past ``now`` is not
+    taken as the newest: a worker whose clock runs ahead would otherwise drop rows that are
+    inside the window, for good. A file its owner cannot write is left as it is.
+
+    Only the committed bytes are kept, and the data file is replaced, and the rename made
+    durable, before the manifest is rewritten: an interruption in between leaves the file
+    shorter than the manifest says, which :func:`read_manifest`'s readers reject and
+    rebuild, never a file a resume would extend in the wrong place. (The uncommitted tail a
+    killed download leaves goes too; resume truncates it all the same.) An ``OSError``
+    before that replacement changes nothing and returns 0.
+
+    The caller holds the download lock of the directory the download writes into
+    (``DownloadLock(data_path.parent.parent)``, the job's ``metrics``): a download that
+    planned its resume before the compaction, or writes the file through a descriptor it
+    opened before, would otherwise extend it at an offset that no longer exists.
+    """
+    if not math.isfinite(keep_seconds) or keep_seconds < 0:
+        raise ValueError(f"keep_seconds must be a finite number of seconds, not {keep_seconds!r}")
+    manifest = read_manifest(manifest_path)
+    if manifest is None:
+        return 0  # nothing to keep the file consistent with
+    try:
+        info = data_path.stat()
+        if info.st_size < manifest.nbytes:
+            return 0  # already short of its manifest: leave it to be rebuilt
+        if not info.st_mode & stat.S_IWUSR:
+            return 0  # made read-only on purpose; on Windows it could not be replaced either
+        horizon = (time.time() if now is None else now) + _COMPACT_CLOCK_TOLERANCE_S
+        newest = _newest_row_time(data_path, manifest.nbytes, field_name, horizon)
+        if newest is None:
+            return 0  # no committed row whose time can be read: nothing to place a window against
+        cutoff = newest - keep_seconds - _COMPACT_CLOCK_TOLERANCE_S
+        cut = _compact_cut(data_path, field_name, cutoff, horizon, manifest.nbytes)
+    except OSError:
+        return 0
+    if cut <= 0 or cut >= manifest.nbytes:
+        return 0  # nothing before the window (the newest row itself always stays)
+    temp = None
+    try:
+        handle, name = tempfile.mkstemp(dir=str(data_path.parent),
+                                        prefix=f".{data_path.name}.compact-", suffix=".tmp")
+        temp = Path(name)
+        with os.fdopen(handle, "wb") as out, data_path.open("rb") as source:
+            source.seek(cut)
+            remaining = manifest.nbytes - cut
+            while remaining:
+                block = source.read(min(_COMPACT_BLOCK, remaining))
+                if not block:
+                    raise OSError(f"{data_path} ended before its committed bytes")
+                out.write(block)
+                remaining -= len(block)
+            out.flush()
+            os.fsync(out.fileno())
+        with contextlib.suppress(OSError):
+            os.chmod(temp, stat.S_IMODE(info.st_mode))  # mkstemp makes it 0600
+        os.replace(temp, data_path)
+        temp = None
+    except OSError:
+        return 0
+    finally:
+        if temp is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temp)
+    _fsync_directory(data_path.parent)
+    write_manifest(manifest_path, manifest.names, manifest.nbytes - cut, manifest.skipped)
+    return cut
 
 
 # Raised while decompressing a damaged or truncated gzip member.

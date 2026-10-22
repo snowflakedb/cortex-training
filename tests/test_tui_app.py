@@ -22,6 +22,7 @@ import inspect
 import json
 import os
 import re
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -70,6 +71,14 @@ def _isolated_cache(tmp_path, monkeypatch):
 
     # ... and out of ~/.cortex-training-errors.log: a test that reads the log finds it in tmp_path.
     monkeypatch.setattr(app_module, "_ERROR_LOG", str(tmp_path / "errors.log"))
+    # ... and out of the system's temporary directory, where the app's sweep removes the
+    # staging directories it takes for abandoned.
+    (tmp_path / "tmp").mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
+    yield
+    from cortex_training.tui.cache_cleanup import _release_pending
+
+    _release_pending()  # a closed screen's lease, still in its grace, holds a lock file open
 
 
 def _client():
@@ -92,6 +101,15 @@ def _client():
     }
     # Finite results so the tail worker doesn't loop forever.
     c.tail_logs.return_value = {"entries": [], "next_cursor": "", "eof": True}
+    return c
+
+
+def _located_client():
+    # Names its jobs' caches as a real client does (by service, endpoint, database and
+    # schema), so they are the cache's to count and remove: a bare "7" is left alone.
+    c = _client()
+    c.base_url, c.endpoint = "https://ACCOUNT.snowflakecomputing.com", "cortex-training"
+    c.database, c.schema = "CORTEX_TRAINING_DB", "PUBLIC"
     return c
 
 
@@ -234,7 +252,7 @@ async def _run_resource_tab(tmp_path):
         assert ok
         tabs = app.screen.query_one("#job-tabs", TabbedContent)
         assert tabs.active == "logs"
-        assert {pane.id for pane in app.screen.query("TabPane")} == {"logs", "resource", "checkpoints"}
+        assert {pane.id for pane in app.screen.query("TabPane")} == {"logs", "resource", "training", "checkpoints"}
         c.download_metrics.assert_not_called()
 
         tabs.active = "resource"
@@ -320,6 +338,9 @@ async def _run_resource_tab(tmp_path):
         assert app.screen._resource_range == previous_range
         await pilot.press("t")
         ok = await _wait(pilot, app, lambda: tabs.active == "resource")
+        assert ok
+        await pilot.press("t")  # t goes on to the next tab, round to Logs after the last
+        ok = await _wait(pilot, app, lambda: tabs.active == "training")
         assert ok
         await pilot.press("t")
         ok = await _wait(pilot, app, lambda: tabs.active == "checkpoints")
@@ -2365,6 +2386,8 @@ async def _run_leave_during_download(release, started, dirs):
         release.set()
         ok = await _wait(pilot, app, lambda: dirs and not Path(dirs[0]).exists())
         assert ok, "temp dir was not removed after leaving"
+        # Its owner lock goes with it (release_stage): left behind, the next sweep has a file to clear.
+        assert not os.path.lexists(f"{dirs[0]}.owner"), "the stage's owner lock outlived it"
         assert not any("too late" in line for line in getattr(app.screen, "_shown_lines", []))
         await _settle(app, pilot)
 
@@ -2729,9 +2752,10 @@ def test_highlighting_copies_nothing_until_ctrl_c():
 
 
 async def _demo_list(app, pilot):
-    """The demo's job list, drawn: the screen and its table."""
+    """The demo's job list, drawn whole (not its first pages only): the screen and its table."""
     assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen)
-                       and len(app.screen._job_by_item) >= 2, tries=400)
+                       and len(app.screen._job_by_item) >= 2
+                       and app.screen._scope is not None and not app.screen._scope.loading, tries=400)
     await pilot.pause(0.1)
     return app.screen, app.screen.query_one("#jobs", DataTable)
 
@@ -3287,6 +3311,42 @@ async def _run_saved_console_waits_for_logs_and_is_kept(c):
         await _settle(app, pilot)
 
 
+async def _run_the_pane_has_its_console_before_the_cache_limit_pass(c, holder, seen):
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    holder["app"] = app
+    async with app.run_test(size=(140, 40)) as pilot:
+        ok = await _wait(pilot, app, lambda: seen, tries=300)
+        assert ok, "keeping the console never ran the limit pass"
+        ok = await _wait(pilot, app, lambda: "saved line" in app.screen._shown_lines, tries=200)
+        assert ok, "the console was never painted"
+        await _settle(app, pilot)
+
+
+def test_the_pane_has_its_console_before_the_cache_limit_pass_reads_the_cache(monkeypatch):
+    # The pass reads the size of everything in the cache first: run before the pane was told,
+    # it held a finished job's console back behind it (seconds, on a network home directory).
+    import cortex_training.tui.logs as logs_module
+
+    c = _client()
+    c.get_job.return_value = _old_terminal_job(minutes_ago=30)
+
+    def download(job_id, output_dir):
+        _write_stdout(output_dir, "7:training:0", "saved line\n")
+        return []
+
+    c.download_stdout_logs.side_effect = download
+    holder, seen = {}, []
+
+    def limit_pass(root, limit):
+        screen = holder["app"].screen
+        seen.append((screen._stdout_inflight, screen._stdout_ready))  # _finish_download delivered
+        return []
+
+    monkeypatch.setattr(logs_module, "enforce_cache_limit", limit_pass)
+    asyncio.run(_run_the_pane_has_its_console_before_the_cache_limit_pass(c, holder, seen))
+    assert seen == [(False, True)], "the limit pass ran before the pane had the console"
+
+
 def test_saved_console_downloads_only_on_logs_and_is_kept_for_old_jobs():
     c = _client()
     c.get_job.return_value = _old_terminal_job(minutes_ago=30)
@@ -3748,9 +3808,10 @@ def test_an_ended_job_without_an_end_time_gets_no_upload_hint():
 TUI_CALLS = ("get_job", "list_jobs", "list_jobs_page", "for_job", "tail_logs", "download_metrics",
              "download_stdout_logs", "fetch_execution_logs")
 # Parameters of the real client the demo leaves out: the TUI never passes them, or
-# checks the client's signature for them first (sub_job_ids, on_chunk, stale_after_seconds).
+# checks the client's signature for them first (sub_job_ids, on_chunk, stale_after_seconds,
+# and a download's preview).
 _ENGINE = {"max_workers", "progress", "on_chunk", "sub_job_ids", "strict", "stale_after_seconds",
-           "transfer_timeout_seconds"}
+           "transfer_timeout_seconds", "preview_seconds", "on_preview"}
 NOT_IN_DEMO = {
     "tail_logs": {"sub_job_type"},
     "download_metrics": _ENGINE,
@@ -4081,8 +4142,11 @@ class _PagedDemo(DemoClient):
     set. For the newest jobs' walk: ``fail_at`` is the page (1 is the first) that fails,
     ``unavailable_at`` the one that answers the list is not deployed, ``bad_token_at`` the one
     whose token the service can't open (once), ``running_at`` / ``unknown_at`` the one whose first
-    job is running / of unknown status. ``schema_fails``: the configured schema's list fails.
-    ``pages`` / ``active_pages`` count the pages each walk asked for."""
+    job is running / of unknown status. ``schema_gate`` / ``schema_fails`` hold up or fail the
+    configured schema's list, by either route it reads: the account-wide one scoped to that schema
+    (pages naming this client's own database and schema), and ``list_jobs`` where that one is
+    unavailable; while ``schema_paced``, its scoped pages answer one per ``release_schema()``.
+    ``pages`` / ``active_pages`` / ``schema_pages`` count the pages each walk asked for."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -4093,12 +4157,24 @@ class _PagedDemo(DemoClient):
         self.schema_gate.set()
         self.active_gate = threading.Event()
         self.active_gate.set()
-        self.pages = self.active_pages = 0
+        self.pages = self.active_pages = self.schema_pages = 0
         self._permits = threading.Semaphore(0)
+        self.schema_paced = False
+        self._schema_permits = threading.Semaphore(0)
 
     def release(self, pages: int = 1) -> None:
         for _ in range(pages):
             self._permits.release()
+
+    def release_schema(self, pages: int = 1) -> None:
+        for _ in range(pages):
+            self._schema_permits.release()
+
+    def _configured(self, kwargs: dict) -> bool:
+        """Whether a page is the configured schema's own list: scoped to this client's location."""
+        database, schema = kwargs.get("database"), kwargs.get("schema")
+        return (database is not None and schema is not None
+                and (views.identifier_name(database), views.identifier_name(schema)) == self._location)
 
     def list_jobs(self, *args, **kwargs):
         self.schema_gate.wait(10)
@@ -4107,6 +4183,16 @@ class _PagedDemo(DemoClient):
         return super().list_jobs(*args, **kwargs)
 
     def list_jobs_page(self, **kwargs):
+        if self._configured(kwargs):
+            # The configured schema's own list: the same route, scoped to one schema. Its pages
+            # answer under the gate that list has always had, not the all-schemas walk's.
+            self.schema_pages += 1
+            self.schema_gate.wait(10)
+            if self.schema_paced:
+                self._schema_permits.acquire(timeout=10)
+            if self.schema_fails:
+                raise ConnectionError("schema down")
+            return super().list_jobs_page(**kwargs)
         if kwargs.get("status"):  # the active jobs' walk, read beside the newest
             self.active_pages += 1
             self.active_gate.wait(10)
@@ -4485,7 +4571,12 @@ async def _run_a_slow_active_jobs_walk_after_the_newest_are_in(monkeypatch, then
             assert await _pause_until(pilot, lambda: screen._scope.kind == SCHEMA, seconds=10.0), app.sub_title
             client.active_gate.set()
             await pilot.pause(0.5)
-            assert screen._scope.kind == SCHEMA and app.sub_title.endswith("Current schema: " + screen._schema_label())
+            # ACCOUNT_LIST_MAX_PAGES is 2 here, and the schema's own list is read a page at a time
+            # too, so it stops short as well and says what it holds after naming the schema.
+            assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+            assert screen._scope.kind == SCHEMA
+            assert app.sub_title.endswith(f"Current schema: {screen._schema_label()}, first 2 pages: "
+                                          f"{newest} jobs + every active job (more may exist)"), app.sub_title
             assert client.active_pages == 1  # the walk asked for no page after the one in flight
         await _settle(app, pilot)
 
@@ -4574,7 +4665,11 @@ async def _run_an_account_list_unavailable_after_its_first_pages_says_so():
         assert await _pause_until(pilot, lambda: "Current schema only: " in app.sub_title, seconds=10.0), (
             app.sub_title)
         assert "no account-wide list yet" in app.sub_title
-        assert screen._scope.kind == SCHEMA and len(screen._all_jobs) == schema_jobs
+        # The fallback lists exactly list_jobs' jobs. That route sends no created_after, so it
+        # also holds the schema's jobs older than six months, which the scoped walk leaves out.
+        listed = {views.job_id_of(job) for job in client.list_jobs()}
+        assert screen._scope.kind == SCHEMA and {views.job_id_of(job) for job in screen._all_jobs} == listed
+        assert len(listed) > schema_jobs
         assert screen.check_action("show_list", ("account",)) is True
         assert any("Can't show all schemas" in str(n.message) for n in app._notifications)
         await _settle(app, pilot)
@@ -4582,6 +4677,61 @@ async def _run_an_account_list_unavailable_after_its_first_pages_says_so():
 
 def test_an_account_list_unavailable_after_its_first_pages_says_so():
     asyncio.run(_run_an_account_list_unavailable_after_its_first_pages_says_so())
+
+
+async def _first_schema_page(app, pilot, client):
+    """The configured schema's list as its first page shows, the rest still held back: the screen."""
+    client.release_schema()  # its first page only
+    assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen)
+                       and len(app.screen._all_jobs) == client._ACCOUNT_PAGE_ROWS, tries=400)
+    await pilot.pause(0.2)
+    return app.screen
+
+
+async def _run_the_configured_schemas_list_shows_its_pages_as_they_come():
+    client = _PagedDemo()
+    client.schema_paced = True
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen = await _first_schema_page(app, pilot, client)
+        # The first page shows while the rest are read, and the header says how far it is.
+        assert screen._refreshing and screen._scope.kind == SCHEMA and screen._scope.loading
+        assert len(screen._all_jobs) == client._ACCOUNT_PAGE_ROWS
+        assert app.sub_title == (f"Current schema: {screen._schema_label()}, "
+                                 f"loading older jobs… {client._ACCOUNT_PAGE_ROWS} so far"), app.sub_title
+        client.release_schema(20)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        assert app.sub_title.endswith(f"Current schema: {screen._schema_label()}"), app.sub_title
+        assert len(screen._all_jobs) > client._ACCOUNT_PAGE_ROWS and client.schema_pages > 2
+        await _settle(app, pilot)
+
+
+def test_the_configured_schemas_list_shows_its_pages_as_they_come():
+    asyncio.run(_run_the_configured_schemas_list_shows_its_pages_as_they_come())
+
+
+async def _run_a_while_the_configured_schemas_pages_load_stops_them():
+    client = _PagedDemo()
+    client.schema_paced = True
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen = await _first_schema_page(app, pilot, client)
+        client.gated = True  # the all-schemas list's pages wait too, so its header can be read
+        await pilot.press("a")  # without waiting for the rest of this schema's pages
+        await pilot.pause(0.2)
+        assert app.sub_title == "loading all schemas…  ·  showing the partial current-schema list", app.sub_title
+        asked = client.schema_pages
+        client.release_schema(20)  # the schema's pages in flight answer; no more are asked for
+        client.release(20)
+        assert await _pause_until(pilot, lambda: screen._scope.kind == ACCOUNT and not screen._refreshing,
+                                  seconds=10.0), app.sub_title
+        await pilot.pause(0.3)
+        assert client.schema_pages == asked
+        await _settle(app, pilot)
+
+
+def test_a_while_the_configured_schemas_pages_load_stops_them():
+    asyncio.run(_run_a_while_the_configured_schemas_pages_load_stops_them())
 
 
 async def _run_pages_read_again_from_the_start_keep_the_list_and_the_cursor():
@@ -4935,3 +5085,470 @@ def test_a_highlight_of_job_list_rows_copies_whole_times_and_status_words():
             await _settle(app, pilot)
 
     asyncio.run(run())
+
+
+def _gpu_rows(sub_job_id, minutes, *, gpus=2):
+    """GPU rows a minute apart, the newest 30 s ago, from ``minutes`` minutes before that."""
+    newest = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=30)
+    rows = [{"record_version": 2, "sub_job_id": sub_job_id, "worker_num": gpu, "local_gpu_index": 0,
+             "global_gpu_index": gpu, "sample_ts": (newest - timedelta(minutes=back)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+             "gpu_util_pct": 50.0, "fb_used_bytes": float(1024**3), "fb_free_bytes": float(8 * 1024**3),
+             "sample_interval_s": 60.0}
+            for back in range(minutes, -1, -1) for gpu in range(gpus)]
+    return "".join(json.dumps(row) + "\n" for row in rows)
+
+
+async def _run_a_first_open_draws_the_newest_half_hour_while_the_rest_downloads(tmp_path):
+    # A long job's first open: its whole history can take minutes, so the client's preview
+    # (the newest half hour) is drawn, marked partial, while the header's bar counts the
+    # chunks; the committed file then replaces it. A refresh with the job on screen asks no preview.
+    sub = "7:training:0"
+    c = _client()
+    calls, previewed, release = [], threading.Event(), threading.Event()
+
+    def download(job_id, output_dir, *, resume=False, priority=(), on_commit=None, on_chunk=None,
+                 preview_seconds=None, on_preview=None, stale_after_seconds=600):
+        calls.append({"priority": list(priority), "preview_seconds": preview_seconds,
+                      "counts": on_chunk is not None})
+        if on_preview is not None:
+            on_chunk(sub, 0, 300, 0)
+            preview = tmp_path / "preview.jsonl"
+            preview.write_text(_gpu_rows(sub, 32), encoding="utf-8")
+            on_preview({"sub_job_id": sub, "path": str(preview), "chunk_count": 33})
+            time.sleep(0.3)  # past the bar's redraw interval
+            on_chunk(sub, 120, 300, 0)
+            previewed.set()
+            release.wait(10)
+        path = Path(output_dir) / sub / "gpu.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_gpu_rows(sub, 300), encoding="utf-8")
+        path.with_name(".gpu.jsonl.manifest.json").write_text(
+            json.dumps({"version": 1, "names": ["chunk.gz"], "bytes": path.stat().st_size}), encoding="utf-8")
+        if on_chunk is not None:
+            on_chunk(sub, 300, 300, 0)
+        if on_commit is not None:
+            on_commit({"sub_job_id": sub, "saved_path": str(path)})
+        return []
+
+    c.download_metrics = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(160, 45)) as pilot:
+        assert await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen) and app.screen._current_source)
+        screen = app.screen
+        header = lambda: str(screen.query_one("#resource-status", Static).render())  # noqa: E731
+        screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        ok = await _pause_until(pilot, lambda: previewed.is_set() and screen._resource_data.kind(sub, "gpu") is not None
+                                and "120/300" in header(), seconds=10.0)
+        assert ok, header()
+        shown = screen._resource_data.kind(sub, "gpu")
+        assert shown.partial  # the newest half hour alone, and marked so
+        assert "loading older samples" in header() and "━" in header() and "120/300 chunks" in header(), header()
+        release.set()
+        assert await _pause_until(pilot, lambda: not screen._resource_loading, seconds=10.0)
+        full = screen._resource_data.kind(sub, "gpu")
+        assert not full.partial and full.first_sample_ts < shown.first_sample_ts  # the whole history
+        assert "chunks" not in header(), header()  # the bar is gone with the download
+        assert calls == [{"priority": [sub], "preview_seconds": 30 * 60, "counts": True}]
+        screen.action_refresh_sources()  # r: the job is on screen now, so only the count
+        assert await _pause_until(pilot, lambda: len(calls) == 2 and not screen._resource_loading, seconds=10.0)
+        assert calls[1] == {"priority": [sub], "preview_seconds": None, "counts": True}
+        await _settle(app, pilot)
+
+
+def test_a_first_open_draws_the_newest_half_hour_while_the_rest_downloads(tmp_path):
+    asyncio.run(_run_a_first_open_draws_the_newest_half_hour_while_the_rest_downloads(tmp_path))
+
+
+async def _run_a_finished_job_s_console_shows_its_last_lines_while_the_rest_downloads(tmp_path):
+    # A long finished job's console takes minutes to download: the sub-job on screen shows
+    # the client's preview (its newest chunks) under a note, until its whole console is in.
+    c = _client()
+    c.get_job.return_value = _old_terminal_job(minutes_ago=30)
+    calls, previewed, release = [], threading.Event(), threading.Event()
+    console = "".join(f"line {i}\n" for i in range(10)) + "".join(f"newest line {i}\n" for i in range(3))
+
+    def download(job_id, output_dir, *, resume=False, sub_job_ids=None, on_chunk=None, preview_seconds=None,
+                 on_preview=None, stale_after_seconds=600):
+        calls.append({"sub_job_ids": sub_job_ids, "preview_seconds": preview_seconds})
+        if sub_job_ids and on_preview is not None:
+            preview = tmp_path / "preview.log"
+            preview.write_text("".join(f"newest line {i}\n" for i in range(3)), encoding="utf-8")
+            on_preview({"sub_job_id": sub_job_ids[0], "path": str(preview), "chunk_count": 3})
+            previewed.set()
+            release.wait(10)
+        for sub in sub_job_ids or ["7:training:0", "7:sampling:0"]:
+            if not (Path(output_dir) / sub / "stdout.log").exists():  # resumed: a console that is in stays as it is
+                _write_stdout(output_dir, sub, console)
+        return []
+
+    c.download_stdout_logs = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        ok = await _wait(pilot, app, lambda: previewed.is_set() and isinstance(app.screen, LogScreen)
+                         and "newest line 2" in app.screen._shown_lines, tries=200)
+        assert ok
+        screen = app.screen
+        assert any("older lines are still downloading" in line for line in screen._shown_lines), screen._shown_lines
+        assert "line 0" not in screen._shown_lines  # the rest isn't in yet
+        release.set()
+        ok = await _wait(pilot, app, lambda: "line 0" in screen._shown_lines and not screen._stdout_inflight, tries=200)
+        assert ok, screen._shown_lines
+        assert not any("still downloading" in line for line in screen._shown_lines)  # the whole console, alone
+        assert calls == [{"sub_job_ids": ["7:training:0"], "preview_seconds": 30 * 60},
+                         {"sub_job_ids": None, "preview_seconds": None}]  # the others', whole
+        # Kept for the next open (the job ended long ago), without the preview.
+        assert (screen._console_dir / "7:training:0" / "stdout.log").exists()
+        assert not (screen._console_dir / ".preview").exists()
+        await _settle(app, pilot)
+
+
+def test_a_finished_job_s_console_shows_its_last_lines_while_the_rest_downloads(tmp_path):
+    asyncio.run(_run_a_finished_job_s_console_shows_its_last_lines_while_the_rest_downloads(tmp_path))
+
+
+# ─── the Schema column, and narrowing the account-wide list to one schema ─────
+
+
+async def _account_list(app, pilot):
+    """The demo's account-wide job list (``a``), drawn: the screen and its table."""
+    screen, table = await _demo_list(app, pilot)
+    await pilot.press("a")
+    assert await _pause_until(pilot, lambda: screen._scope is not None and screen._scope.kind == ACCOUNT
+                              and not screen._refreshing, seconds=10.0), app.sub_title
+    await pilot.pause(0.1)
+    return screen, table
+
+
+async def _run_the_schema_column_names_each_jobs_database_and_schema():
+    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    async with app.run_test(size=(200, 40)) as pilot:  # wide enough for every column
+        screen, table = await _account_list(app, pilot)
+        labels = [str(column.label) for column in table.columns.values()]
+        assert "Schema" in labels, labels
+        assert "Location" not in labels  # the header this column used to carry
+        at = labels.index("Schema")
+        # The cell is built under the same name the column is added under: were the two to drift,
+        # the row lookup would fall back to a blank cell and quietly empty the column.
+        drawn = {str(table.get_row_at(row)[at]).strip() for row in range(table.row_count)}
+        assert {"CORTEX_TRAINING_DB.PUBLIC", "TEAM_DB.EXPERIMENTS", '"sandbox"."dev"'} <= drawn, sorted(drawn)
+        await _settle(app, pilot)
+
+
+def test_the_schema_column_names_each_jobs_database_and_schema():
+    asyncio.run(_run_the_schema_column_names_each_jobs_database_and_schema())
+
+
+async def _run_a_whole_location_in_the_search_is_read_from_the_service():
+    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    async with app.run_test(size=(200, 40)) as pilot:
+        screen, _table = await _account_list(app, pilot)
+        assert screen._pushdown is None  # every schema, so far
+
+        box = screen.query_one("#jobfilter", Input)
+        box.value = "db=TEAM_DB schema=EXPERIMENTS"
+        await pilot.pause(0.3)  # past the search debounce
+        assert await _pause_until(pilot, lambda: screen._pushdown == ("TEAM_DB", "EXPERIMENTS")
+                                  and not screen._refreshing, seconds=10.0), screen._pushdown
+        assert screen._scope.narrowed == "TEAM_DB.EXPERIMENTS"
+        # The header says the list was narrowed, never that it covered every schema.
+        assert "narrowed to TEAM_DB.EXPERIMENTS" in app.sub_title, app.sub_title
+        assert "all in" not in app.sub_title
+        # Every row left is in that schema, so the column collapses and the header carries it.
+        assert [str(column.label) for column in screen.query_one("#jobs", DataTable).columns.values()
+                ].count("Schema") == 0
+
+        box.value = ""  # cleared: the whole account is read again
+        await pilot.pause(0.3)
+        assert await _pause_until(pilot, lambda: screen._pushdown is None and not screen._refreshing,
+                                  seconds=10.0), screen._pushdown
+        assert screen._scope.narrowed == ""
+        await _settle(app, pilot)
+
+
+def test_a_whole_location_in_the_search_is_read_from_the_service():
+    asyncio.run(_run_a_whole_location_in_the_search_is_read_from_the_service())
+
+
+async def _run_a_search_that_cannot_narrow_reads_every_schema(text):
+    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    async with app.run_test(size=(200, 40)) as pilot:
+        screen, _table = await _account_list(app, pilot)
+        screen.query_one("#jobfilter", Input).value = text
+        await pilot.pause(0.3)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        # A partial match, a negation, or a schema with no database of its own: matched here, so
+        # the walk still reads every schema and the header still says so.
+        assert screen._pushdown is None, text
+        assert screen._scope.narrowed == ""
+        assert "narrowed to" not in app.sub_title, app.sub_title
+        await _settle(app, pilot)
+
+
+@pytest.mark.parametrize("text", ["schema:exper", "db!=TEAM_DB", "schema=EXPERIMENTS", "db:team"])
+def test_a_search_that_cannot_narrow_reads_every_schema(text):
+    asyncio.run(_run_a_search_that_cannot_narrow_reads_every_schema(text))
+
+
+async def _run_a_narrowing_with_no_jobs_says_so_rather_than_failing():
+    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    async with app.run_test(size=(200, 40)) as pilot:
+        screen, _table = await _account_list(app, pilot)
+        screen.query_one("#jobfilter", Input).value = "db=NOPE schema=NOPE"
+        await pilot.pause(0.3)
+        assert await _pause_until(pilot, lambda: not screen._refreshing and screen._pushdown is not None,
+                                  seconds=10.0)
+        # No such database here, so the narrowed walk answers an empty page: the search says
+        # nothing matched rather than the list reading as a failure. (A service that refuses the
+        # name outright with a 400 is covered in tests/test_tui_account.py.)
+        assert screen._list_error is None, screen._list_error
+        assert not screen.query_one("#jobs", DataTable).display
+        await _settle(app, pilot)
+
+
+def test_a_narrowing_with_no_jobs_says_so_rather_than_failing():
+    asyncio.run(_run_a_narrowing_with_no_jobs_says_so_rather_than_failing())
+
+
+async def _run_a_download_that_grows_the_cache_by_much(tmp_path, monkeypatch, *, grow):
+    import cortex_training.tui.app as app_module
+    from cortex_training.tui.log_cache import job_cache_dir
+
+    old = job_cache_dir("0123456789abcdef:old-job", root=tmp_path / "isolated-cache")
+    (old / "metrics").mkdir(parents=True)
+    (old / "metrics" / "gpu.jsonl").write_bytes(b"x" * 4096)
+    long_ago = time.time() - 86400
+    for path in (old, *old.rglob("*")):
+        os.utime(path, (long_ago, long_ago))
+    cls = app_module.CortexTrainingLogTUI
+    monkeypatch.setattr(cls, "_CACHE_CLEANUP_FIRST_SECONDS", 3600)  # only the pass a download asks for
+    monkeypatch.setattr(cls, "_CACHE_CLEANUP_SECONDS", 3600)
+    monkeypatch.setattr(cls, "_CACHE_LIMIT", 1024)
+    monkeypatch.setattr(cls, "CACHE_PASS_AFTER_BYTES", 10_000)
+    monkeypatch.setattr(cls, "_CACHE_PASS_AFTER_DOWNLOAD_SECONDS", 0.1)
+    c = _located_client()
+
+    def download(job_id, output_dir, **_kwargs):
+        _write_gpu_metrics(output_dir, "7:training:0", gpu_count=2)
+        if grow:
+            with (Path(output_dir) / "7:training:0" / "gpu.jsonl").open("ab") as f:
+                f.write(b"\n" * 20_000)  # a long job's history, past the threshold
+        return []
+
+    c.download_metrics.side_effect = download
+    app = cls(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(130, 36)) as pilot:
+        assert await _pause_until(pilot, lambda: isinstance(app.screen, LogScreen) and app.screen._current_source)
+        app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        assert await _pause_until(pilot, lambda: c.download_metrics.call_count >= 1, seconds=5.0)
+        await _pause_until(pilot, lambda: not old.exists(), seconds=3.0)
+        gone = not old.exists()
+        await _settle(app, pilot)
+    return gone
+
+
+def test_a_download_that_grows_the_cache_by_much_holds_it_to_its_limit_soon(tmp_path, monkeypatch):
+    # The next pass was up to 10 minutes away, and none if the TUI quit first: a long job's
+    # first open left the cache gigabytes over its limit until the next start.
+    assert asyncio.run(_run_a_download_that_grows_the_cache_by_much(tmp_path, monkeypatch, grow=True)), \
+        "a big download left the cache over its limit until the next pass"
+
+
+def test_a_download_that_adds_little_waits_for_the_next_pass(tmp_path, monkeypatch):
+    assert not asyncio.run(_run_a_download_that_grows_the_cache_by_much(tmp_path, monkeypatch, grow=False)), \
+        "every download ran a pass of its own"
+
+
+async def _run_the_open_job_survives_the_cache_limit_and_the_rest_goes(tmp_path, monkeypatch):
+    import cortex_training.tui.app as app_module
+    from cortex_training.tui.cache_cleanup import STAGE_PREFIX
+    from cortex_training.tui.cache_cleanup import _HOST
+    from cortex_training.tui.cache_cleanup import _is_job_dir
+    from cortex_training.tui.cache_cleanup import _release_pending
+    from cortex_training.tui.cache_cleanup import job_in_use
+    from cortex_training.tui.log_cache import job_cache_dir
+    from cortex_training.tui.widgets import _cache_job_id
+    from cortex_training import _training_log
+
+    root = tmp_path / "isolated-cache"
+    client = _located_client()
+    old = job_cache_dir("0123456789abcdef:old-job", root=root)
+    (old / "metrics").mkdir(parents=True)
+    (old / "metrics" / "gpu.jsonl").write_bytes(b"x" * (2 * 1024 * 1024))
+    open_dir = job_cache_dir(_cache_job_id(client, "7"), root=root)
+    (open_dir / "console" / "7:training:0").mkdir(parents=True)
+    (open_dir / "console" / "7:training:0" / "stdout.log").write_bytes(b"x" * 4096)
+    long_ago = time.time() - 86400
+    for path in (old, *old.rglob("*"), open_dir, *open_dir.rglob("*")):
+        os.utime(path, (long_ago, long_ago))
+    # The client writes these, so only a process that runs a job would ever prune them.
+    # Laid out as the client writes them: <job>/<sub_job_id>/training.jsonl.
+    stale_local = _training_log.local_dir("a-job-nobody-has-run-for-a-month", root=root)
+    (stale_local / "a-job-nobody-has-run-for-a-month:training:0").mkdir(parents=True)
+    (stale_local / "a-job-nobody-has-run-for-a-month:training:0" / _training_log.FILE_NAME).write_bytes(b"{}\n")
+    a_month_ago = time.time() - _training_log.MAX_AGE_SECONDS - 86400
+    for path in (stale_local, *stale_local.rglob("*")):
+        os.utime(path, (a_month_ago, a_month_ago))
+    fresh_local = _training_log.local_dir("a-job-running-now", root=root)
+    (fresh_local / "a-job-running-now:training:0").mkdir(parents=True)
+    (fresh_local / "a-job-running-now:training:0" / _training_log.FILE_NAME).write_bytes(b"{}\n")
+    stage = Path(tempfile.gettempdir()) / f"{STAGE_PREFIX}{_HOST}+999999+gone"
+    stage.mkdir()
+    Path(f"{stage}.owner").touch()
+    monkeypatch.setattr(app_module.CortexTrainingLogTUI, "_CACHE_CLEANUP_FIRST_SECONDS", 0.2)
+    monkeypatch.setattr(app_module.CortexTrainingLogTUI, "_CACHE_LIMIT", 1024)
+    monkeypatch.setattr("cortex_training.tui.logs.LEASE_HEARTBEAT_SECONDS", 0.2)
+
+    app = CortexTrainingLogTUI(client, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        assert await _pause_until(pilot, lambda: isinstance(app.screen, LogScreen) and app.screen._current_source)
+        screen, lease = app.screen, app.screen._lease
+        assert screen._cache_limit == 1024, "a kept console would hold the cache to another limit than the app's"
+        assert lease._job_dir == open_dir and _is_job_dir(open_dir), "the open job isn't the cache's to remove"
+        assert job_in_use(open_dir), "the open job holds no lease"
+        os.utime(lease._marker, (long_ago, long_ago))
+
+        def marker_refreshed():
+            # The sweep removes a marker this stale; the live screen's heartbeat writes it
+            # again, so a moment with no marker at all is not a failure.
+            try:
+                return time.time() - lease._marker.stat().st_mtime < 60
+            except FileNotFoundError:
+                return False
+
+        assert await _pause_until(pilot, marker_refreshed, seconds=10.0), \
+            "the open job's lease is never refreshed: another machine would take the job for closed"
+        assert await _pause_until(pilot, lambda: not old.exists(), seconds=10.0), "the old job was kept"
+        assert open_dir.exists(), "cache cleanup removed the open job"
+        assert job_in_use(open_dir), "the open job lost its lease"
+        await pilot.pause(0.3)
+        assert not [note for note in _notes(app) if "cached data" in note or "Freed" in note], \
+            "the cache's own housekeeping was announced"
+        assert not stage.exists() and not os.path.lexists(f"{stage}.owner"), "the abandoned stage was left"
+        assert stale_local.exists(), "the TUI removed the client's own rows (the client's rules do that)"
+        # The open job holds the cache over its limit on every pass, and the local rows of a job
+        # still being written stay through all of them: they are never removed to make room.
+        assert fresh_local.exists(), "the pass took local training rows still being written"
+        await _settle(app, pilot)
+    assert lease.held and job_in_use(open_dir)
+    _release_pending()
+    assert not lease.held and not job_in_use(open_dir)
+
+
+def test_the_open_job_survives_the_cache_limit_and_the_rest_goes(tmp_path, monkeypatch):
+    asyncio.run(_run_the_open_job_survives_the_cache_limit_and_the_rest_goes(tmp_path, monkeypatch))
+
+
+def test_the_cache_keeps_under_the_5_gib_the_docs_state():
+    from cortex_training.tui.cache_cleanup import DEFAULT_CACHE_LIMIT
+
+    assert CortexTrainingLogTUI._CACHE_LIMIT == DEFAULT_CACHE_LIMIT == 5 * 1024 ** 3
+
+
+def test_a_console_is_kept_only_under_the_job_s_lease_and_the_jobs_used_least_recently_then_go(tmp_path, monkeypatch):
+    from cortex_training._download_lock import DownloadLock
+    from cortex_training.tui.log_cache import job_cache_dir
+
+    other = job_cache_dir("0123456789abcdef:other", root=tmp_path / "isolated-cache")
+    (other / "metrics").mkdir(parents=True)
+    (other / "metrics" / "gpu.jsonl").write_bytes(b"x" * 600)  # within the limit until the console lands
+    long_ago = time.time() - 86400
+    for path in (other, *other.rglob("*")):
+        os.utime(path, (long_ago, long_ago))
+    downloaded = tmp_path / "downloaded"
+    _write_stdout(downloaded, "7:training:0", "x" * 2000 + "\n")
+    ended = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    plan = LogScreen._Download(first=None, again=False, root=str(downloaded), others=False, seen=None,
+                               ended_at=ended, created_at="created")
+    screen = LogScreen(_located_client(), "7", job={"job_id": "7", "status": "FAILED"})
+    screen._cache_limit = 1024
+    notes = []
+    screen._post = lambda fn, *args, **kwargs: notes.append(args[0]) or True
+    kept = screen._console_dir / ".complete"
+
+    assert screen._keep_console(plan) is False  # lease not held
+    assert not kept.exists() and other.exists() and not notes
+
+    real_try = DownloadLock.try_acquire
+
+    def try_acquire_as_the_lease_goes(self):
+        taken = real_try(self)
+        screen._lease.release()
+        return taken
+
+    screen._lease.acquire()
+    monkeypatch.setattr(DownloadLock, "try_acquire", try_acquire_as_the_lease_goes)
+    assert screen._keep_console(plan) is False
+    assert not kept.exists() and other.exists() and not notes
+    monkeypatch.setattr(DownloadLock, "try_acquire", real_try)
+
+    # Another TUI keeping this same console holds its lock: not waited for (the pane showed
+    # its console seconds late behind that copy, or never, if that TUI was stopped mid-copy).
+    other_tui = DownloadLock(screen._console_dir)
+    assert other_tui.try_acquire()
+    screen._lease.acquire()
+    try:
+        started = time.monotonic()
+        assert screen._keep_console(plan) is False
+        assert time.monotonic() - started < 0.5, "keeping the console waited for another TUI's copy"
+    finally:
+        other_tui.release()
+        screen._lease.release()
+
+    screen._lease.acquire()
+    try:
+        assert screen._keep_console(plan) is True
+        assert kept.read_text(encoding="utf-8") == "created"
+        assert other.exists(), "keeping the console waited for the limit pass (see _hold_cache_to_limit)"
+        screen._hold_cache_to_limit()
+        assert not other.exists(), "the job used least recently stayed after the console was kept"
+        assert not notes, "the cache's own housekeeping was announced"
+    finally:
+        screen._lease.release()
+
+
+async def _run_a_new_session_resumes_the_tail_where_the_last_one_stopped(tmp_path):
+    c = _client()
+    c.tail_logs.return_value = {"entries": [{"msg": "first session's line"}], "next_cursor": "cursor-1", "eof": True}
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        assert await _pause_until(pilot, lambda: c.tail_logs.call_count > 0 and "first session's line" in
+                                  "\n".join(getattr(app.screen, "_shown_lines", []) or []), seconds=10.0)
+        await _settle(app, pilot)
+
+    second = _client()
+    second.tail_logs.return_value = {"entries": [], "next_cursor": "cursor-1", "eof": True}
+    app = CortexTrainingLogTUI(second, "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        assert await _pause_until(pilot, lambda: second.tail_logs.call_count > 0, seconds=10.0)
+        assert "first session's line" in "\n".join(app.screen._shown_lines), "the cached lines didn't survive the quit"
+        cursors = [call.kwargs.get("cursor") for call in second.tail_logs.call_args_list]
+        assert cursors[0] == "cursor-1", f"the tail started over instead of resuming: {cursors[:3]}"
+        await _settle(app, pilot)
+
+
+def test_a_new_session_resumes_the_tail_where_the_last_one_stopped(tmp_path):
+    asyncio.run(_run_a_new_session_resumes_the_tail_where_the_last_one_stopped(tmp_path))
+
+
+async def _run_a_tail_nobody_watches_stops_polling(monkeypatch):
+    monkeypatch.setattr(LogScreen, "_IDLE_PAUSE_SECONDS", 1.0)
+    monkeypatch.setattr(LogScreen, "_IDLE_CHECK_SECONDS", 0.2)
+    c = _client()
+    c.tail_logs.return_value = {"entries": [], "next_cursor": "c1", "eof": False}
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.05)
+    async with app.run_test() as pilot:
+        assert await _pause_until(pilot, lambda: isinstance(app.screen, LogScreen) and c.tail_logs.call_count > 0)
+        screen = app.screen
+        assert await _pause_until(pilot, lambda: screen._idle_paused, seconds=10.0), "the tail never paused"
+        await pilot.pause(0.5)
+        polls = c.tail_logs.call_count
+        await pilot.pause(2.0)
+        assert c.tail_logs.call_count == polls, "the paused tail kept polling"
+        await pilot.press("p")
+        assert await _pause_until(pilot, lambda: c.tail_logs.call_count > polls, seconds=10.0), "p didn't resume it"
+        assert not screen._idle_paused
+        await _settle(app, pilot)
+
+
+def test_a_tail_nobody_watches_stops_polling(monkeypatch):
+    asyncio.run(_run_a_tail_nobody_watches_stops_polling(monkeypatch))

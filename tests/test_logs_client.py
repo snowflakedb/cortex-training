@@ -17,6 +17,7 @@
 log, and the order and per-file reports of a GPU metrics download."""
 
 import gzip
+import os
 
 import pytest
 
@@ -119,3 +120,125 @@ def test_an_error_from_on_commit_stops_the_download_and_keeps_what_is_saved(tmp_
     assert getattr(raised.value, "download_progress_saved", False)
     assert (tmp_path / "job-1:training:0" / "gpu.jsonl").read_text().count("\n") == 2
     assert not (tmp_path / "job-1:sampling:0" / "gpu.jsonl").exists()
+
+
+def _minutes(sub, count):
+    """Gzip chunks a minute apart, as metrics are uploaded: chunk ``i`` holds row ``"<sub> i"``."""
+    return {
+        f"{sub}/gpu.20260904-{12 + i // 60:02d}{i % 60:02d}00.c{i}.gz": gzip.compress(f"{sub} {i}\n".encode())
+        for i in range(count)
+    }
+
+
+def _rows(sub, numbers):
+    return "".join(f"{sub} {i}\n" for i in numbers)
+
+
+TRAINING = "job-1:training:0"
+SAMPLING = "job-1:sampling:0"
+
+
+def test_download_metrics_previews_the_newest_chunks_first_and_fetches_each_once(tmp_path, monkeypatch):
+    client, connection = _staged(monkeypatch, "_metrics", {**_minutes(TRAINING, 40), **_minutes(SAMPLING, 5)})
+    events, paths = [], []
+
+    def on_preview(entry):
+        paths.append(entry["path"])
+        assert not (tmp_path / TRAINING / "gpu.jsonl").exists()  # before the sub-job's own file
+        events.append(("preview", entry["sub_job_id"], entry["chunk_count"], open(entry["path"]).read()))
+
+    client.download_metrics("job-1", tmp_path, priority=[TRAINING], preview_seconds=600, on_preview=on_preview,
+                            on_commit=lambda entry: events.append(("commit", entry["sub_job_id"])))
+    # Ten minutes back from the newest chunk and two more (a chunk's name is when it starts): 27 to 39, in order.
+    assert events == [("preview", TRAINING, 13, _rows(TRAINING, range(27, 40))),
+                      ("commit", TRAINING), ("commit", SAMPLING)]
+    assert (tmp_path / TRAINING / "gpu.jsonl").read_text() == _rows(TRAINING, range(40))  # the whole file, in order
+    assert sum(command.startswith("GET ") for command in connection.commands) == 45  # the preview's are reused
+    assert not any(map(os.path.exists, paths))  # the preview's file goes once on_preview returns
+
+
+def test_download_metrics_skips_a_preview_that_would_save_no_time(tmp_path, monkeypatch):
+    # The window's chunks are most of what is new: a short job's first download, then a resume.
+    client, connection = _staged(monkeypatch, "_metrics", _minutes(TRAINING, 20))
+    previews = []
+    client.download_metrics("job-1", tmp_path, resume=True, priority=[TRAINING], preview_seconds=600,
+                            on_preview=previews.append)
+    assert previews == [] and sum(command.startswith("GET ") for command in connection.commands) == 20
+
+    client, _ = _staged(monkeypatch, "_metrics", _minutes(TRAINING, 60))  # 40 more, the newest 13 in the window
+    client.download_metrics("job-1", tmp_path, resume=True, priority=[TRAINING], preview_seconds=600,
+                            on_preview=previews.append)
+    assert [entry["chunk_count"] for entry in previews] == [13]
+    client, _ = _staged(monkeypatch, "_metrics", _minutes(TRAINING, 63))  # 3 more: all of them in the window
+    client.download_metrics("job-1", tmp_path, resume=True, priority=[TRAINING], preview_seconds=600,
+                            on_preview=previews.append)
+    assert len(previews) == 1
+    assert (tmp_path / TRAINING / "gpu.jsonl").read_text() == _rows(TRAINING, range(63))
+
+
+def test_a_preview_leaves_out_a_chunk_it_cannot_read_and_the_download_fetches_it_again(tmp_path, monkeypatch):
+    files = _minutes(TRAINING, 40)
+    damaged = next(path for path in files if ".c35.gz" in path)
+    files[damaged] = b"not gzip"
+    client, connection = _staged(monkeypatch, "_metrics", files)
+    previews = []
+
+    def on_preview(entry):
+        previews.append(open(entry["path"]).read())
+
+    result = client.download_metrics("job-1", tmp_path, priority=[TRAINING], preview_seconds=600,
+                                     on_preview=on_preview)
+    assert previews == [_rows(TRAINING, [i for i in range(27, 40) if i != 35])]
+    # Its turn fetches it again, twice as for any damaged chunk, then skips it and says so.
+    assert sum(command.startswith("GET ") for command in connection.commands) == 42
+    assert (tmp_path / TRAINING / "gpu.jsonl").read_text() == _rows(TRAINING, [i for i in range(40) if i != 35])
+    assert any("could not be decompressed" in warning for warning in result[0]["warnings"])
+
+
+def test_an_error_from_on_preview_stops_the_download(tmp_path, monkeypatch):
+    client, _ = _staged(monkeypatch, "_metrics", _minutes(TRAINING, 40))
+
+    def on_preview(entry):
+        raise RuntimeError("stop at the preview")
+
+    with pytest.raises(RuntimeError, match="stop at the preview"):
+        client.download_metrics("job-1", tmp_path, priority=[TRAINING], preview_seconds=600, on_preview=on_preview)
+    assert not (tmp_path / TRAINING / "gpu.jsonl").exists()
+
+
+@pytest.mark.parametrize("options", [
+    {"preview_seconds": 600},  # nothing to call with it
+    {"on_preview": print},
+    {"preview_seconds": 0, "on_preview": print},
+    {"preview_seconds": True, "on_preview": print},
+])
+def test_download_metrics_refuses_a_preview_it_cannot_make(tmp_path, monkeypatch, options):
+    client, _ = _staged(monkeypatch, "_metrics", _minutes(TRAINING, 40))
+    with pytest.raises(ValueError, match="preview_seconds"):
+        client.download_metrics("job-1", tmp_path, priority=[TRAINING], **options)
+
+
+def _console_minutes(sub, count):
+    """Console chunks a minute apart: chunk ``i`` holds the line ``"<sub> line i"``."""
+    return {
+        f"{sub}/console.20260904-{12 + i // 60:02d}{i % 60:02d}00.c{i}.gz": gzip.compress(f"{sub} line {i}\n".encode())
+        for i in range(count)
+    }
+
+
+def test_download_stdout_logs_previews_the_first_named_sub_job_s_newest_output(tmp_path, monkeypatch):
+    client, connection = _staged(monkeypatch, "_stdout", {**_console_minutes(TRAINING, 40),
+                                                          **_console_minutes(SAMPLING, 40)})
+    previews = []
+
+    def on_preview(entry):
+        previews.append((entry["sub_job_id"], open(entry["path"]).read()))
+
+    client.download_stdout_logs("job-1", tmp_path, sub_job_ids=[TRAINING], preview_seconds=600, on_preview=on_preview)
+    assert previews == [(TRAINING, "".join(f"{TRAINING} line {i}\n" for i in range(27, 40)))]
+    assert (tmp_path / TRAINING / "stdout.log").read_text() == "".join(f"{TRAINING} line {i}\n" for i in range(40))
+    assert sum(command.startswith("GET ") for command in connection.commands) == 40  # each once; sampling's not asked
+    # Without sub_job_ids, there is no first sub-job to preview.
+    previews.clear()
+    client.download_stdout_logs("job-1", tmp_path / "all", preview_seconds=600, on_preview=on_preview)
+    assert previews == [] and (tmp_path / "all" / SAMPLING / "stdout.log").exists()

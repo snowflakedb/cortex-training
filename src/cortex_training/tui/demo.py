@@ -202,6 +202,16 @@ UNAVAILABLE = "unavailable"
 _ACTIVE = ("pending", "queued", "placing", "initializing", "creating", "running")
 
 
+def _in_location(row: dict, wanted: tuple) -> bool:
+    """Whether an account-list row is in the ``(database, schema)`` asked for; either may be None.
+
+    ``wanted`` holds the names already resolved as SQL resolves them, so they compare equal to the
+    names a row stores.
+    """
+    held = (row.get("database_name"), row.get("schema_name"))
+    return all(name is None or name == held[at] for at, name in enumerate(wanted))
+
+
 def _http_error(status: int, message: str) -> requests.HTTPError:
     """The error the client raises for a service answer of ``status`` with ``message``."""
     response = requests.Response()
@@ -377,19 +387,26 @@ class DemoClient:
                        status: Any = None, submitted_by: Optional[str] = None, created_after: Any = None,
                        created_before: Any = None, page_size: int = 100, page_token: Optional[str] = None,
                        max_retries: Optional[int] = None, request_timeout: Any = None) -> dict:
-        """One page of the account-wide list: every location, newest first, a few rows per page.
+        """One page of the account-wide list, newest first, a few rows per page.
 
-        Only what the job list sends applies: ``created_after``, and ``status`` as the active group (a
-        job whose status can't be read never matches a status filter).
+        Only what the job list sends applies: ``created_after``; ``status`` as the active group (a
+        job whose status can't be read never matches a status filter); and ``database`` with an
+        optional ``schema``, read by SQL identifier rules as the service reads them, so a narrowed
+        list narrows here too. A ``schema`` without a ``database`` is refused, as the real client
+        refuses it.
         """
         if self._account_list == UNAVAILABLE:
             raise _http_error(503, "Control Plane unavailable")
         if self._account_list is not None:
             raise AccountJobListUnavailable(_UNAVAILABLE[self._account_list], reason=self._account_list)
+        if schema is not None and database is None:
+            raise ValueError("list_jobs_page: schema needs database with it")
+        wanted = tuple(None if name is None else views.identifier_name(name) for name in (database, schema))
         newest = sorted(self._jobs, key=lambda j: j["created_at"], reverse=True)
         rows = [row for row in map(self._account_row, newest)
                 if (created_after is None or views.parse_ts(row["created_at"]) >= created_after)
-                and (not status or views.status_word(row.get("status")) in _ACTIVE)]
+                and (not status or views.status_word(row.get("status")) in _ACTIVE)
+                and _in_location(row, wanted)]
         start = int(page_token or 0)
         page = rows[start:start + min(int(page_size), self._ACCOUNT_PAGE_ROWS)]
         end = start + len(page)
@@ -506,6 +523,93 @@ class DemoClient:
             if on_commit is not None:
                 on_commit(dict(written[-1]))
         return written
+
+    def _training_metrics(self, job: dict, sj: dict, k: int) -> tuple[list, dict]:
+        """Step ``k``'s calls' and step's metrics, as their results have them (``k`` from 0, the step ``k + 1``).
+
+        An SFT job makes two ``/fwd-bwd`` calls a step and an RL job four, each with its own loss;
+        the log's step lines agree.
+        """
+        rng = random.Random(f"train{job['job_id']}:{k}")
+        lr = float(sj["training_config"]["optimizer"]["lr"])
+        rl = self._kinds.get(job["job_id"]) == "rl"
+        if rl:
+            mean = 0.04 * math.exp(-k / 150)
+            calls = [{
+                "avg_loss": mean + rng.gauss(0, 0.006), "rank": 0,
+                "approx_kl": 0.002 + 0.03 * (1 - math.exp(-k / 300)) + abs(rng.gauss(0, 0.003)),
+                "entropy": 0.95 - 0.35 * (1 - math.exp(-k / 250)) + rng.gauss(0, 0.01),
+                "clip_frac": max(0.0, 0.08 * math.exp(-k / 200) + rng.gauss(0, 0.005)),
+            } for _ in range(4)]
+        else:
+            mean = 0.38 + 1.9 * math.exp(-k / 150)
+            calls = [{"avg_loss": mean + abs(rng.gauss(0, 0.03)), "rank": 0, "sft_model_calls": 1,
+                      "sft_packed_rows": rng.choice([1, 2])} for _ in range(2)]
+        grad = rng.uniform(0.2, 0.9) if rl else rng.uniform(0.3, 1.2)
+        step_lr = lr if rl else lr * min(1.0, (k + 1) / 50)
+        step = {"global_steps": k + 1, "grad_norm": grad, "last_lr": step_lr, "update_successful": 1.0,
+                "weight_delta_norm_rank0_sample": grad * step_lr * 1.6e3}
+        return calls, step
+
+    def download_training_metrics(self, job_id: str, output_dir, *, resume: bool = False, priority=(),
+                                  on_commit=None) -> list:
+        """The client's training-metrics download, generated: one ``training.jsonl`` per training sub-job."""
+        job = self._on_stage(job_id)
+        self._check_experiment(job)
+        if job["status"] in ("PLACING", "PENDING") or job.get("reason") in _NEVER_PLACED:
+            return []
+        end = self._clock() if job["status"] == "RUNNING" else datetime.fromisoformat(
+            job["state_changed_at"].replace("Z", "+00:00"))
+        written = []
+        first = list(priority)
+        ordered = sorted(job["sub_jobs"],
+                         key=lambda sj: first.index(sj["sub_job_id"]) if sj["sub_job_id"] in first else len(first))
+        for sj in ordered:
+            if views.sub_job_kind(sj) != "training":
+                continue  # only a training sub-job has these rows
+            rows = self._training_rows(job, sj, end)
+            if not rows:
+                continue
+            path = Path(output_dir) / sj["sub_job_id"] / "training.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = ("\n".join(rows) + "\n").encode("utf-8")
+            path.write_bytes(data)
+            manifest = path.with_name("." + path.name + ".manifest.json")
+            manifest.write_text(json.dumps({
+                "version": 1,
+                "names": [f"_metrics/{sj['sub_job_id']}/training.demo.jsonl.gz"],
+                "bytes": len(data),
+            }), encoding="utf-8")
+            written.append({"sub_job_id": sj["sub_job_id"], "path": str(path)})
+            if on_commit is not None:
+                on_commit(dict(written[-1]))
+        return written
+
+    def _training_rows(self, job: dict, sj: dict, end: datetime) -> list:
+        """The training sub-job's ``kind: "training"`` rows, as the service writes them: a ``fwd_bwd``
+        row per call and a ``step`` row per step, for every step run by ``end``."""
+        rows = []
+        seq = 0
+
+        def row(op: str, step: int, call, metrics: dict, stamp: str) -> str:
+            return json.dumps({
+                "kind": "training", "record_version": 2, "sub_job_id": sj["sub_job_id"], "sample_ts": stamp,
+                "seq": seq, "seq_epoch": "demo", "op": op, "step": step, "call": call,
+                "request_id": f"rr_demo.{seq}",
+                "metrics": {name: round(float(value), 6) for name, value in metrics.items()},
+            })
+
+        for k, at in enumerate(self._step_times(job["job_id"])):
+            if at > end.timestamp():
+                break
+            stamp = datetime.fromtimestamp(at, timezone.utc).isoformat().replace("+00:00", "Z")
+            calls, step = self._training_metrics(job, sj, k)
+            for index, call in enumerate(calls, start=1):
+                rows.append(row("fwd_bwd", k + 1, index, call, stamp))
+                seq += 1
+            rows.append(row("step", k + 1, None, step, stamp))
+            seq += 1
+        return rows
 
     def _system_row(self, rng: random.Random, sid: str, node: int, gpus: int, t: float, phase: float, stamp: str,
                     seq: int, *, sampling: bool, loading: bool) -> dict:

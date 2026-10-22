@@ -20,6 +20,7 @@ the preview all build their tables, panes, footers and header lines from these.
 """
 
 from __future__ import annotations
+from cortex_training.tui.log_cache import append_error_log
 from cortex_training.tui.resource import ResourceData
 from pathlib import Path
 import time
@@ -54,6 +55,7 @@ from textual.widgets import ListView
 from textual.widgets import Log
 from textual.widgets import Static
 from textual.widgets import TabbedContent
+from textual.widgets import TabPane
 from textual.widgets.data_table import RowDoesNotExist
 from cortex_training.tui import theme
 from cortex_training.tui import views
@@ -106,10 +108,25 @@ def after_refresh(screen: Screen, fn, *args, **kwargs) -> None:
 
 
 class JobTabs(TabbedContent):
-    """Job tabs that report width changes caused by the keys panel."""
+    """Job tabs that report width changes caused by the keys panel, and that only a tab key
+    or a click on a tab changes."""
 
     def on_resize(self, event: events.Resize) -> None:
         self.screen._tabs_resized()
+
+    def _on_tab_pane_focused(self, event: TabPane.Focused) -> None:
+        """Don't switch to the pane a widget was focused in, as TabbedContent does.
+
+        That message is queued when the focus moves, so it can be handled after a tab key
+        that came later: the screen focuses its Logs panel as it opens, and an `m` pressed in
+        that moment was switched straight back to Logs. Every focus this screen sets is
+        already in the tab on screen, so following it never changes anything else.
+
+        ``prevent_default`` is what stops it: Textual also runs TabbedContent's own handler
+        for this message after this one, and only skips it when the default is prevented.
+        """
+        event.stop()
+        event.prevent_default()
 
 
 def call_on_screen(screen: Screen, fn, *args, **kwargs) -> bool:
@@ -845,10 +862,10 @@ _ERROR_LOG = "~/.cortex-training-errors.log"
 
 
 def log_traceback(label: str) -> None:
-    """Worker thread, inside an ``except``: append the traceback to the error log."""
+    """Worker thread, inside an ``except``: append the traceback to the error log (rotated
+    past a few megabytes, see :func:`~cortex_training.tui.log_cache.append_error_log`)."""
     try:
-        with open(os.path.expanduser(_ERROR_LOG), "a", encoding="utf-8") as handle:
-            handle.write(f"{label}:\n{traceback.format_exc()}\n")
+        append_error_log(f"{label}:\n{traceback.format_exc()}\n", path=os.path.expanduser(_ERROR_LOG))
     except Exception:  # noqa: BLE001 - reporting an error must not raise one
         pass
 
@@ -967,6 +984,20 @@ def _quiet_download(method) -> dict:
     except (TypeError, ValueError):
         return {}
     return {"stale_after_seconds": None} if "stale_after_seconds" in parameters else {}
+
+
+def _download_options(method, options: dict) -> dict:
+    """The ``options`` a client's download method takes: an older client's, or the
+    demo's, takes fewer. A preview's two options go together or not at all."""
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return {}
+    taken = {name: value for name, value in options.items() if name in parameters}
+    if not {"preview_seconds", "on_preview"} <= set(taken):
+        taken.pop("preview_seconds", None)
+        taken.pop("on_preview", None)
+    return taken
 
 
 

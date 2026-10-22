@@ -173,6 +173,21 @@ class TestTrainingConfig:
         with pytest.raises(ValidationError, match="optimizer"):
             TrainingConfig(optimizer={}, max_seq_len=128, train_batch_size=1, n_gpus=2)
 
+    @pytest.mark.parametrize("stage", [3, "3"])
+    def test_validate_rejects_zero_stage_3(self, stage):
+        with pytest.raises(ValidationError, match=r"training\.extra\.ds_config\.zero_optimization\.stage=3 \(ZeRO-3\)"):
+            TrainingConfig(
+                optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+                ds_config={"zero_optimization": {"stage": stage}},
+            )
+
+    @pytest.mark.parametrize("stage", [0, 1, 2])
+    def test_validate_accepts_zero_stages_below_3(self, stage):
+        TrainingConfig(
+            optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+            ds_config={"zero_optimization": {"stage": stage}},
+        )
+
     def test_validate_accepts_nested_primerl_fused_ce_false(self):
         TrainingConfig(
             optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=1, n_gpus=2,
@@ -804,6 +819,14 @@ class TestClientConstruction:
         assert c._session.verify is False
         assert c._metric_emitter is not None
         assert c._metric_emitter.timeout == 3.0
+
+    def test_from_pat_uses_dashes_in_the_rest_host(self):
+        c = CortexTrainingClient.from_pat(
+            host="org-my_acct.snowflakecomputing.com", pat="p", database="DB", schema="SCH"
+        )
+        assert c.base_url == "https://org-my-acct.snowflakecomputing.com"
+        # The Connector accepts either form, so artifact connections keep the host as given.
+        assert c._artifact_connection_config["host"] == "org-my_acct.snowflakecomputing.com"
 
     def test_from_pat_skips_telemetry_when_disabled(self, monkeypatch):
         monkeypatch.setenv(nc.DISABLE_TELEMETRY_ENV, "1")
@@ -2010,6 +2033,25 @@ class TestCreateJob:
         with pytest.raises(
             ValueError,
             match=r"sub_job_configs\[0\]\.training_config\.peft_config\.peft_type",
+        ):
+            c.create_job_from_body(body)
+        c._session.post.assert_not_called()
+
+    def test_create_job_from_body_rejects_zero_stage_3_before_post(self):
+        c = _make_client()
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": "training",
+                    "model_name": "gpt2",
+                    "training_config": {"ds_config": {"zero_optimization": {"stage": 3}}},
+                },
+            ],
+        }
+
+        with pytest.raises(
+            ValueError,
+            match=r"sub_job_configs\[0\]\.training_config\.ds_config\.zero_optimization\.stage=3 \(ZeRO-3\)",
         ):
             c.create_job_from_body(body)
         c._session.post.assert_not_called()
@@ -5085,6 +5127,84 @@ class TestExecutionLogDownload:
         assert not list(destination.parent.glob(".*.tmp"))
         assert connection.closed
 
+    def test_the_two_metric_streams_are_reconstructed_into_their_own_files(
+        self, tmp_path, monkeypatch
+    ):
+        """The GPU chunks and the zone's training chunks share ``_metrics/`` but are
+        separate streams: each download takes only its own chunks and writes its own
+        file, so training rows are never concatenated into ``gpu.jsonl``."""
+        c = _make_client()
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        sub_job_id = "job-1:training:0"
+        gpu = f"_metrics/{sub_job_id}/gpu.20260904-120001.a.gz"
+        training_first = f"_metrics/{sub_job_id}/training.20260904-120002.a.gz"
+        training_second = f"_metrics/{sub_job_id}/training.20260904-120003.b.gz"
+        connection = self.FakeArtifactConnection(
+            {
+                run_uri + "_metrics/": [
+                    (f"/versions/RUN_ABC/{gpu}",),
+                    (f"/versions/RUN_ABC/{training_first}",),
+                    (f"/versions/RUN_ABC/{training_second}",),
+                ],
+                run_uri + "checkpoints/_metrics/": [],
+            },
+            {
+                run_uri + gpu: gzip.compress(b'{"gpu_util_pct": 90}\n'),
+                run_uri + training_first: gzip.compress(b'{"kind": "training", "step": 1}\n'),
+                run_uri + training_second: gzip.compress(b'{"kind": "training", "step": 2}\n'),
+            },
+        )
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(
+            c, "_open_experiment_artifact_connection", lambda: connection
+        )
+
+        metrics = c.download_metrics("job-1", tmp_path)
+        training = c.download_training_metrics("job-1", tmp_path)
+
+        assert (tmp_path / sub_job_id / "gpu.jsonl").read_bytes() == b'{"gpu_util_pct": 90}\n'
+        assert (tmp_path / sub_job_id / "training.jsonl").read_bytes() == (
+            b'{"kind": "training", "step": 1}\n{"kind": "training", "step": 2}\n'
+        )
+        assert metrics[0]["chunk_count"] == 1
+        assert training[0]["chunk_count"] == 2
+        # Each stream keeps its own resume manifest beside its own file.
+        assert (tmp_path / sub_job_id / ".gpu.jsonl.manifest.json").exists()
+        assert (tmp_path / sub_job_id / ".training.jsonl.manifest.json").exists()
+
+    def test_a_sub_job_without_training_chunks_is_not_warned_about(
+        self, tmp_path, monkeypatch
+    ):
+        """Unlike the GPU stream, a sub-job with saved stdout and no training chunks
+        gets no warning: only training sub-jobs write them, and only where the
+        deployment saves them."""
+        c = _make_client()
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        sub_job_id = "job-1:training:0"
+        training = f"_metrics/{sub_job_id}/training.20260904-120001.a.gz"
+        connection = self.FakeArtifactConnection(
+            {
+                run_uri + "_metrics/": [(f"/versions/RUN_ABC/{training}",)],
+                run_uri + "checkpoints/_metrics/": [],
+                run_uri + "_stdout/": [
+                    (f"/versions/RUN_ABC/_stdout/job-1:sampling:0/console.20260904-120001.a.gz",),
+                ],
+            },
+            {run_uri + training: gzip.compress(b'{"kind": "training", "step": 1}\n')},
+        )
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(
+            c, "_open_experiment_artifact_connection", lambda: connection
+        )
+        monkeypatch.setattr(
+            c, "_job_for_upload_warnings", lambda _: ({"status": "SUCCEEDED"}, None)
+        )
+
+        result = c.download_training_metrics("job-1", tmp_path)
+
+        assert [entry["sub_job_id"] for entry in result] == [sub_job_id]
+        assert not result[0].get("warnings")
+
     def test_download_metrics_merges_chunks_from_both_roots_in_time_order(
         self, tmp_path, monkeypatch
     ):
@@ -5888,6 +6008,46 @@ class TestExecutionLogDownload:
         assert calls == [c._artifact_progress_status("stdout", 0, 1, sub), "\n"]
         assert not list((tmp_path / sub).glob(".*.tmp"))
 
+    def test_an_empty_training_stream_is_named_as_training_metrics(self, tmp_path, monkeypatch):
+        """The training stream shares ``_metrics/`` with the GPU one, so its empty line
+        must not read as if the GPU download found nothing."""
+        c, _connection, _run_uri = self._gzip_download(monkeypatch, tmp_path, "metrics", [], {})
+        monkeypatch.setattr(c, "_job_for_upload_warnings", lambda _: ({"status": "SUCCEEDED"}, None))
+        calls = []
+        assert c.download_training_metrics("job-1", tmp_path, progress=calls.append) == []
+        assert calls == ["training metrics: found 0 chunks\n"]
+
+    def test_a_named_sub_job_without_training_rows_is_left_out_not_an_error(self, tmp_path, monkeypatch):
+        """Only training sub-jobs write training rows, so naming a sampling sub-job beside a
+        training one returns the training one's rows instead of raising NoChunksError."""
+        sub = "job-1:training:0"
+        chunk = f"_metrics/{sub}/training.20260904-120001.a.gz"
+        c, _connection, _run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "metrics", [chunk], {chunk: b'{"kind": "training"}\n'}
+        )
+        monkeypatch.setattr(c, "_job_for_upload_warnings", lambda _: ({"status": "SUCCEEDED"}, None))
+
+        result = c.download_training_metrics("job-1", tmp_path, sub_job_ids=[sub, "job-1:sampling:0"])
+        assert [entry["sub_job_id"] for entry in result] == [sub]
+        assert (tmp_path / sub / "training.jsonl").read_bytes() == b'{"kind": "training"}\n'
+
+        # Naming only sub-jobs without rows is an empty result, not an error.
+        assert c.download_training_metrics("job-1", tmp_path / "none", sub_job_ids=["job-1:sampling:0"]) == []
+
+    def test_a_named_sub_job_without_gpu_metrics_still_raises(self, tmp_path, monkeypatch):
+        """The GPU stream keeps raising: every sub-job with GPUs uploads it."""
+        sub = "job-1:training:0"
+        chunk = f"_metrics/{sub}/gpu.20260904-120001.a.gz"
+        c, _connection, _run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "metrics", [chunk], {chunk: b'{"gpu_util_pct": 1}\n'}
+        )
+        monkeypatch.setattr(c, "_job_for_upload_warnings", lambda _: ({"status": "SUCCEEDED"}, None))
+        with pytest.raises(nc.NoChunksError) as excinfo:
+            c.download_metrics("job-1", tmp_path, sub_job_ids=["job-1:sampling:0"])
+        assert str(excinfo.value) == (
+            "no metrics chunks for sub-job(s) job-1:sampling:0; sub-jobs with metrics: job-1:training:0"
+        )
+
     def test_download_progress_empty_and_directory_destination(self, tmp_path, monkeypatch):
         c, _connection, _run_uri = self._gzip_download(monkeypatch, tmp_path, "stdout", [], {})
         calls = []
@@ -6003,10 +6163,10 @@ class TestChunkedArtifactDownload:
     RUN_URI = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
     SUB = "job-1:training:0"
 
-    def _setup(self, monkeypatch, *, subs=None, count=6, artifact_name="stdout"):
+    def _setup(self, monkeypatch, *, subs=None, count=6, artifact_name="stdout", chunk_name=None):
         subs = subs or [self.SUB]
         root = f"_{artifact_name}"
-        chunk_name = "console" if artifact_name == "stdout" else "gpu"
+        chunk_name = chunk_name or ("console" if artifact_name == "stdout" else "gpu")
         paths = {
             sub: [
                 f"{root}/{sub}/{chunk_name}.20260904-"
@@ -6983,6 +7143,29 @@ class TestChunkedArtifactDownload:
         assert warning in caplog.text
         assert status_calls == ["job-1"]
         assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(self.SUB, range(3))
+
+    def test_old_training_metrics_of_a_running_job_are_not_called_stalled(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Training rows are written only on /fwd-bwd and /step, so a running job whose
+        newest training chunk is old is idle, not stalled: no warning, unlike GPU metrics."""
+        c, _connection, _paths, _status_calls = self._stale_setup(
+            monkeypatch, count=3, artifact_name="metrics", chunk_name="training"
+        )
+        with caplog.at_level(logging.WARNING):
+            result = c.download_training_metrics("job-1", tmp_path)
+        assert [entry["sub_job_id"] for entry in result] == [self.SUB]
+        assert not result[0].get("warnings")
+        assert "stalled" not in caplog.text
+        assert (tmp_path / self.SUB / "training.jsonl").read_bytes() == self._expected(self.SUB, range(3))
+
+    def test_old_gpu_metrics_of_a_running_job_are_still_called_stalled(self, tmp_path, monkeypatch):
+        c, _connection, _paths, _status_calls = self._stale_setup(
+            monkeypatch, count=3, artifact_name="metrics"
+        )
+        result = c.download_metrics("job-1", tmp_path)
+        [warning] = result[0]["warnings"]
+        assert "uploads may be stalled" in warning
 
     @pytest.mark.parametrize(
         ("status", "age_minutes", "stale_after"),

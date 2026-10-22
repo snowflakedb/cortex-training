@@ -111,6 +111,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
         KEYS_BINDING,
         ("l", "open('logs')", "Logs"),
         ("g", "open('resource')", "Resources"),
+        Binding("m", "open('training')", "Training metrics", show=False),
         ("c", "open('checkpoints')", "Checkpoints"),
         ("r", "refresh", "Refresh"),
         # check_action exposes the applicable expansion binding.

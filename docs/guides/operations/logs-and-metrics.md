@@ -26,7 +26,15 @@ cortex-training download-metrics JOB_ID --output-dir /path/to/metrics
 cortex-training download-metrics JOB_ID --output-dir /path/to/metrics --resume
 ```
 
-Metrics are written to `<output_dir>/<sub_job_id>/gpu.jsonl`.
+GPU and host metrics are written to `<output_dir>/<sub_job_id>/gpu.jsonl`. A
+training sub-job's **training metrics** — the loss, gradient norm, learning
+rate and whatever else its loss function returns — go to
+`<output_dir>/<sub_job_id>/training.jsonl`, one row per `/fwd-bwd` call and
+one per `/step`, each with the numbers that call returned. See
+[GPU metrics download](../../reference/rest-api.md#124-gpu-metrics-download)
+and
+[Training metrics download](../../reference/rest-api.md#125-training-metrics-download)
+for every row's fields, and `training_config.save_training_metrics` to opt out.
 
 Open a job dashboard in the terminal:
 
@@ -37,7 +45,9 @@ cortex-training tui JOB_ID
 The **Logs** tab tails a running job or loads its saved console after it
 finishes. The **Resources** tab charts the selected sub-job's GPU use and lists
 each GPU; `w` cycles 10 minutes (the default), 30 minutes, 1 hour, 6 hours, or
-the whole job, and `r` refreshes. Run `cortex-training tui` without a job id
+the whole job, and `r` refreshes. The **Training metrics** tab charts what the
+training sub-job's calls returned, per step (`grad_norm`, `last_lr`, …) or per
+`/fwd-bwd` call (`avg_loss`, …) with `v`. Run `cortex-training tui` without a job id
 to browse and search your jobs first. See [Job TUI](../../reference/cli.md#job-tui).
 
 Recipe-level metrics are also written under each recipe's `log_path`.

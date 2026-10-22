@@ -35,6 +35,8 @@ class FakeClient:
     def __init__(self):
         self.download_interrupt = None
         self.download_warning = None
+        # The training stream's own failure, so a test can fail one download and not the other.
+        self.training_download_interrupt = None
         self.download_options = None
         self.submitted_body = None
         self.status_filter = None
@@ -341,6 +343,54 @@ class FakeClient:
                 "chunk_count": 1,
                 "first_artifact_uri": "snow://experiment/first.gz",
                 "last_artifact_uri": "snow://experiment/first.gz",
+            }
+        ]
+
+    def download_training_metrics(
+        self,
+        job_id,
+        output_dir,
+        *,
+        resume=False,
+        max_workers=None,
+        progress=None,
+        sub_job_ids=None,
+        strict=False,
+        stale_after_seconds=600.0,
+        transfer_timeout_seconds=300.0,
+    ):
+        """The training stream ``download-metrics`` fetches beside the GPU one.
+
+        It records its own arguments, so a test can tell the two calls apart,
+        and raises or warns as ``download_metrics`` does: the command runs both,
+        so a failure of either has to surface.
+        """
+        self.training_metrics_job_id = job_id
+        self.training_metrics_output_dir = output_dir
+        self.training_metrics_resume = resume
+        self.training_download_options = {
+            "max_workers": max_workers,
+            "sub_job_ids": sub_job_ids,
+            "strict": strict,
+            "stale_after_seconds": stale_after_seconds,
+            "transfer_timeout_seconds": transfer_timeout_seconds,
+        }
+        if self.training_download_interrupt:
+            raise self.training_download_interrupt
+        if progress is not None:
+            progress(f"training metrics: [####################] 1/1 {job_id}:training:0")
+            progress("\n")
+        path = output_dir / f"{job_id}:training:0" / "training.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"kind":"training","step":1}\n', encoding="utf-8")
+        return [
+            {
+                "sub_job_id": f"{job_id}:training:0",
+                "filename": "training.jsonl",
+                "saved_path": str(path),
+                "chunk_count": 1,
+                "first_artifact_uri": "snow://experiment/training-first.gz",
+                "last_artifact_uri": "snow://experiment/training-first.gz",
             }
         ]
 
@@ -2309,8 +2359,73 @@ def test_download_metrics_passes_parallel_and_sub_jobs_and_reports_progress(tmp_
         "stale_after_seconds": 600.0,
         "transfer_timeout_seconds": 300.0,
     }
-    assert stderr.getvalue() == "metrics: [####################] 1/1 job-1:training:0\n"
+    # The command fetches both metric streams, with the same options, and each reports.
+    assert client.training_download_options == client.download_options
+    assert stderr.getvalue() == (
+        "metrics: [####################] 1/1 job-1:training:0\n"
+        "training metrics: [####################] 1/1 job-1:training:0\n"
+    )
     assert json.loads(stdout.getvalue())["metrics"][0]["filename"] == "gpu.jsonl"
+
+
+def test_download_metrics_interrupted_in_the_training_stream_offers_resume(tmp_path):
+    """The GPU stream has committed its file before the training stream starts, so an
+    interrupt there must say output was saved and offer --resume, not claim nothing was."""
+    client = FakeClient()
+    client.training_download_interrupt = KeyboardInterrupt()
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["download-metrics", "job-1", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: client,
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert rc == 130
+    assert (tmp_path / "job-1:training:0" / "gpu.jsonl").exists()
+    assert stderr.getvalue().endswith(f"interrupted; {cli._RESUME_HINT}\n")
+    assert "before any output was saved" not in stderr.getvalue()
+
+
+def test_download_metrics_error_in_the_training_stream_still_reports_the_gpu_stream(tmp_path):
+    """An error from the training stream fails the command, but the finished GPU stream is
+    still printed (so a pipe to jq gets it) and --resume is offered."""
+    client = FakeClient()
+    client.training_download_interrupt = OSError("transient stage listing failure")
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["download-metrics", "job-1", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: client,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    body = json.loads(stdout.getvalue())
+    assert body["metrics"][0]["filename"] == "gpu.jsonl"
+    assert body["training_metrics"] is None
+    assert "error: transient stage listing failure" in stderr.getvalue()
+    assert cli._FAILED_RESUME_HINT in stderr.getvalue()
+
+
+def test_download_metrics_interrupted_before_any_stream_saved_says_so(tmp_path):
+    client = FakeClient()
+    client.download_interrupt = KeyboardInterrupt()
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["download-metrics", "job-1", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: client,
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert rc == 130
+    assert stderr.getvalue().endswith("interrupted before any output was saved\n")
+    assert not hasattr(client, "training_download_options")  # the training stream never started
 
 
 def test_download_log_stdout_defaults_leave_parallel_to_client(tmp_path):
@@ -2628,6 +2743,13 @@ def test_download_commands_write_progress_to_stderr(tmp_path):
                 job_id, output_dir, resume=resume, progress=None, **options
             )
 
+        def download_training_metrics(self, job_id, output_dir, *, resume=False, progress=None, **options):
+            if progress is not None:
+                progress("training metrics: found 1 chunks for job\n")
+            return super().download_training_metrics(
+                job_id, output_dir, resume=resume, progress=None, **options
+            )
+
     stdout = io.StringIO()
     stderr = io.StringIO()
     rc = cli.main(
@@ -2650,8 +2772,13 @@ def test_download_commands_write_progress_to_stderr(tmp_path):
         stderr=stderr,
     )
     assert rc == 0
-    assert json.loads(stdout.getvalue())["metrics"][0]["filename"] == "gpu.jsonl"
-    assert stderr.getvalue() == "metrics: found 1 chunks for job\n"
+    body = json.loads(stdout.getvalue())
+    assert body["metrics"][0]["filename"] == "gpu.jsonl"
+    assert body["training_metrics"][0]["filename"] == "training.jsonl"
+    assert stderr.getvalue() == (
+        "metrics: found 1 chunks for job\n"
+        "training metrics: found 1 chunks for job\n"
+    )
 
 
 class _TtyStderr(io.StringIO):
@@ -2741,6 +2868,10 @@ def test_download_progress_is_one_terminal_line(tmp_path):
                 progress("metrics: [####################] 2/2 job")
                 progress("\n")
             return super().download_metrics(job_id, output_dir, resume=resume, progress=None, **options)
+
+        def download_training_metrics(self, job_id, output_dir, *, progress=None, **options):
+            # Silent: this test is about one stream's line, not how many streams run.
+            return super().download_training_metrics(job_id, output_dir, progress=None, **options)
 
     tty = _TtyStderr()
     rc = cli.main(

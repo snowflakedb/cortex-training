@@ -685,3 +685,24 @@ def test_stats_table_heads_line_up_with_their_columns(tmp_path):
         assert all(row[end - 1] != " " for row in rows), name
     assert head.count("│") == 1 and all(row.count("│") == 1 for row in rows)
     assert len({len(line) for line in lines}) == 1
+
+
+def test_a_preview_is_its_sub_job_s_newest_rows_marked_partial_and_leaves_the_loader_alone(tmp_path):
+    # download_metrics' preview: a sub-job's newest half hour alone, drawn while the rest downloads.
+    sub = "job:training:0"
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    rows = [{**_row(now - timedelta(minutes=back), gpu, 50.0, interval=60.0), "sub_job_id": sub}
+            for back in range(120, -1, -1) for gpu in range(2)]
+    _write_metrics(tmp_path, sub, rows)  # the whole history, as the download will commit it
+    preview = tmp_path / "preview.jsonl"
+    preview.write_text("".join(json.dumps(row) + "\n" for row in rows[-2 * 33:]))  # its newest 32 minutes
+    loader = resource_module.ResourceLoader(tmp_path)
+    shown = loader.preview(sub, preview).kind(sub, "gpu")
+    assert shown.partial and shown.latest_sample_ts == now and shown.first_sample_ts == now - timedelta(minutes=32)
+    # The windows it covers are whole; a longer one waits for the older samples.
+    assert resource_module.window_complete(shown, shown.view("10m"))
+    assert resource_module.window_complete(shown, shown.view("30m"))
+    assert not resource_module.window_complete(shown, shown.view("1h"))
+    # The loader's own state is untouched: the file it reads next is read whole.
+    full = loader.load().kind(sub, "gpu")
+    assert not full.partial and full.first_sample_ts == now - timedelta(minutes=120)
