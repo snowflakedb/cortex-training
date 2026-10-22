@@ -1080,8 +1080,8 @@ box unless the service sends a reason. The Sub-jobs card shows type, status
 (a badge such as `● RUNNING`), model, GPUs and the sub-job's config as
 submitted, `key=value` by key (`max_seq_len=4096 · n_gpus=8 · optimizer={lr:
 1e-05, name: adamw}`), with nothing derived added; a multiplexed row's config
-names its source sub-job in `multiplex_job_id`. Long cells use `…`, narrow screens omit Type, and
-wider tables scroll with `←` / `→` or `Home` / `End`; the card's bottom border
+starts with `multiplex_job_id`, the sub-job whose GPUs it runs on. Long cells
+use `…`, narrow screens omit Type, and wider tables scroll with `←` / `→` or `Home` / `End`; the card's bottom border
 says so (`e whole table`, `← → scroll`).
 
 Live previews refresh every 60 seconds, on return from details, or on `r`; a

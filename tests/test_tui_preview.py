@@ -76,9 +76,37 @@ def test_subjob_config_summary_is_the_submitted_config():
                                     "inference_config": {"n_gpus": 2.0, "gpu_memory_utilization": 0.9}}) \
         == "gpu_memory_utilization=0.9 · n_gpus=2"
     assert v.subjob_config_summary({"job_type": "training"}) == ""
-    # One line whatever the keys or values hold.
-    odd = {"job_type": "training", "training_config": {"a\nb": "x\ny", "n": {"k\nz": None}}}
-    assert v.subjob_config_summary(odd) == "a b=x y · n={k z: null}"
+
+
+@pytest.mark.parametrize("config, shown", [
+    # One line whatever the keys or values hold, nested ones too.
+    ({"a\nb": 1, "n": {"x\ny": 2}}, "a b=1 · n={x y: 2}"),
+    ({"u\u2028v": "p\u2029q"}, "u v=p q"),
+    ({"s": "  two   words\t"}, "s=two words"),
+    ({"bell": "a\x07b"}, "bell=a\ufffdb"),
+    # Empty and null values as JSON writes them.
+    ({"n": None, "d": {}, "l": []}, "d={} · l=[] · n=null"),
+    ({"layers": [{"r": 8.0, "name": "q"}, {"r": 16.0}]}, "layers=[{name: q, r: 8}, {r: 16}]"),
+    # A whole float as an int, unless that would be a 21-digit number.
+    ({"big": 1e20, "neg": -2.0, "frac": 0.5}, "big=1e+20 · frac=0.5 · neg=-2"),
+])
+def test_subjob_config_summary_renders_each_value(config, shown):
+    summary = v.subjob_config_summary({"job_type": "training", "training_config": config})
+    assert summary == shown
+    assert "\n" not in summary and "\u2028" not in summary
+
+
+def test_multiplexed_sub_job_names_its_source_first():
+    target = "JOB_ID:training:0"
+    shared = {"sub_job_id": "JOB_ID:sampling:0", "job_type": "sampling", "status": "RUNNING",
+              "inference_config": {"max_seq_len": 4096.0, "n_gpus": 2.0, "multiplex_job_id": target}}
+    assert v.subjob_config_summary(shared) == f"multiplex_job_id={target} · max_seq_len=4096 · n_gpus=2"
+    job = _job(sub_jobs=[{"sub_job_id": target, "job_type": "training", "status": "RUNNING",
+                          "training_config": {"n_gpus": 4.0}}, shared])
+    rows = dict(JobSummaryScreen(MagicMock(), "JOB_ID", job=job)._subjob_rows(job))
+    assert rows["sj-0"][-1].plain == "n_gpus=4"
+    # The table's cell is the config itself: no note added after it.
+    assert rows["sj-1"][-1].plain == f"multiplex_job_id={target} · max_seq_len=4096 · n_gpus=2"
 
 
 def test_elapsed_text_runs_from_creation():
