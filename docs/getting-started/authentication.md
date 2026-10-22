@@ -74,8 +74,10 @@ chmod 600 ~/.snowflake/connections.toml
   `https://app.snowflake.com/MYORG/MYACCOUNT` → `MYORG-MYACCOUNT`.
 - **host**: `ACCOUNT.snowflakecomputing.com`, e.g.,
   `myorg-myaccount.snowflakecomputing.com`. Snowsight may show an account name
-  with an underscore (`my_acct.…`); the SSL certificate names the hyphen form,
-  and the client uses it for its own HTTPS calls, so either form works.
+  with an underscore (`my_acct.…`). Snowflake's certificates are wildcards
+  (`*.<region>.snowflakecomputing.com`), and a wildcard can't match a name
+  containing `_`, so the client uses the hyphen form (`my-acct.…`) for its own
+  HTTPS calls. Either form works in your profile.
 
 #### Setting the default connection
 
@@ -151,6 +153,7 @@ Snowflake-prefixed variants (`SNOWFLAKE_PAT`, `SNOWFLAKE_HOST`,
 | Error | Cause | Fix |
 |-------|-------|-----|
 | `SSL certificate verify failed` | The `host` is not a `snowflakecomputing.com` address and has an underscore (for example, a custom name such as `ml_team.example.com`), or a company network tool that inspects HTTPS traffic replaces Snowflake's certificate with its own | Use the hyphen form (`ml-team.example.com`), or ask IT for the company certificate file and set `REQUESTS_CA_BUNDLE=/path/to/company-ca.pem` |
+| `Failed to resolve` / `NameResolutionError` for a `…privatelink.snowflakecomputing.com` host with a `-` where your account name has a `_` | With PrivateLink, the client calls the hyphen form of your account host (see the host note above), and your private DNS may only have a record for the underscore form | Ask your network admin to add a DNS record for the hyphen form. `SYSTEM$GET_PRIVATELINK_CONFIG()` lists the hyphenated URLs (for example, `privatelink-dashed-urls-for-duo`) |
 | `no PAT found` | Missing token in config | Add `token` to connections.toml, `pat` to JSON, or set `CORTEX_TRAINING_PAT` |
 | `401 Unauthorized` | PAT expired, invalid, or your user has no network policy | See [Network policy requirement](#network-policy-requirement), or regenerate the PAT |
 | `394400 (08001)` / `Programmatic access token is invalid` | Your user has no network policy, or the PAT is wrong | See [Network policy requirement](#network-policy-requirement) |

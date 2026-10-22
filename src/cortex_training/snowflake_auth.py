@@ -53,9 +53,10 @@ def rest_host(host: str) -> str:
     """Return ``host`` with underscores in its account label turned into dashes.
 
     Snowsight shows an account named ``MY_ACCT`` as ``my_acct.<region>...``,
-    and the Connector signs in with it, but Snowflake's certificates name
-    ``my-acct``, so standard HTTPS clients reject the underscore form. Hosts
-    outside Snowflake's domains are returned unchanged.
+    and the Connector signs in with it. But Snowflake's certificates are
+    wildcards (``*.<region>.snowflakecomputing.com``), and a wildcard can't
+    match a label containing ``_``, so standard HTTPS clients reject the
+    underscore form. Hosts outside Snowflake's domains are returned unchanged.
     """
     name, sep, port = host.partition(":")
     if not name.lower().endswith(_SNOWFLAKE_DOMAINS):

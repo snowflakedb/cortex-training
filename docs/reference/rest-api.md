@@ -101,6 +101,14 @@ Paths in this document are relative to:
 https://{account_host}/api/v2/databases/{database}/schemas/{schema}/{endpoint}
 ```
 
+`{account_host}` is the account host from your connection profile (or
+`CORTEX_TRAINING_HOST`). If its first label, the account name, contains `_`, the
+client sends its REST calls to the hyphen form instead
+(`my_acct.<region>.snowflakecomputing.com` becomes
+`my-acct.<region>.snowflakecomputing.com`). Snowflake's certificates are
+wildcards, and a wildcard can't match a name containing `_`. The Snowflake
+Connector's own sign-in keeps the host as given.
+
 `CortexTrainingClient` defaults `endpoint` to `cortex-training`.
 
 ```python
