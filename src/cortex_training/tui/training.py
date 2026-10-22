@@ -19,11 +19,14 @@ The zone saves the result of each of a training sub-job's ``/fwd-bwd`` and
                  "update_successful": 1.0, "weight_delta_norm_rank0_sample": 0.145}}
 
 Each row carries the numbers its call's result has, as the client got them, so
-nothing is computed here either. The tab has two views of them:
+nothing is computed here either. The tab shows two views of them, one above the other:
 
 - **per step**: each ``step`` row's metrics, against the step;
 - **per call**: each ``fwd_bwd`` row's metrics, against the call, in the order
   the calls ran, each call tagged with the step it counted toward.
+
+Each view leaves out the numbers in :data:`HIDDEN_METRICS`, which aren't training
+signals, until ``a`` shows every metric.
 
 A call's ``step`` is null when the zone hadn't yet seen a ``/step`` (a job's
 first calls, or the first after the zone restarted); such a call is taken with
@@ -65,15 +68,30 @@ FILE_NAME = "training.jsonl"
 OP_FWD_BWD = "fwd_bwd"
 OP_STEP = "step"
 
-# The two views ``v`` switches between.
+# The tab's two views, drawn one after the other: per step, then per call.
 VIEW_STEP = "step"
 VIEW_CALL = "call"
 VIEWS = (VIEW_STEP, VIEW_CALL)
-DEFAULT_VIEW = VIEW_STEP
 VIEW_NAMES = {VIEW_STEP: "per step", VIEW_CALL: "per call"}
 # Shown first in a view, in this order, when its rows have them; the rest follow in the order the
 # file first has them.
 LEADING_METRICS = {VIEW_STEP: ("grad_norm", "last_lr"), VIEW_CALL: ("avg_loss",)}
+# Numbers a result carries that aren't training signals, left out of a view until ``a`` shows every
+# metric: the step itself (``global_steps``), ``update_successful`` (the header counts the steps
+# that report it isn't 1, see :attr:`SubJobTraining.failed_updates`), and the fixed size of the
+# weight and gradient samples. The packing counts (``rl_model_calls``, ``sft_model_calls``,
+# ``sft_packed_rows``) show: they are how a job shows that rows shared a call, or a rank ran fewer.
+UPDATE_SUCCESSFUL = "update_successful"
+HIDDEN_METRICS = {
+    VIEW_STEP: frozenset({
+        "global_steps", UPDATE_SUCCESSFUL, "weight_delta_rank0_sample_numel", "weight_delta_rank0_sample_bytes",
+        "weight_delta_rank0_sample_tensors", "gradient_sample_numel",
+    }),
+    VIEW_CALL: frozenset(),
+}
+# Also left out, but only while every value is 0: the worker a call's result came from, which is
+# currently always worker 0. A call from another worker is worth seeing, so then it shows.
+HIDDEN_WHILE_ZERO = {VIEW_STEP: frozenset(), VIEW_CALL: frozenset({"rank"})}
 # A metric name is drawn as it is, so only plain names are read; anything else is passed over.
 _NAME = re.compile(r"[A-Za-z0-9_.:/-]{1,64}")
 # The fast filter: a line without this can't be a training row, and isn't parsed.
@@ -91,11 +109,6 @@ def window_label(window: int | None) -> str:
 def next_window(window: int | None) -> int | None:
     index = WINDOWS.index(window) if window in WINDOWS else 0
     return WINDOWS[(index + 1) % len(WINDOWS)]
-
-
-def next_view(view: str) -> str:
-    index = VIEWS.index(view) if view in VIEWS else 0
-    return VIEWS[(index + 1) % len(VIEWS)]
 
 
 # ─── snapshots ───────────────────────────────────────────────────────────────
@@ -136,6 +149,12 @@ def window_stats(xs: tuple[int, ...], values: tuple[float, ...]) -> WindowStats 
     return WindowStats(len(values), values[-1], xs[-1], values[low], xs[low], values[high], xs[high])
 
 
+def _hidden(view: str, series: MetricSeries) -> bool:
+    if series.name in HIDDEN_METRICS[view]:
+        return True
+    return series.name in HIDDEN_WHILE_ZERO[view] and all(value == 0 for value in series.values)
+
+
 @dataclass(frozen=True)
 class SubJobTraining:
     """One sub-job's training metrics, as of one read."""
@@ -151,13 +170,23 @@ class SubJobTraining:
     skipped: int  # training rows that couldn't be read
     old_format: int = 0  # rows of an earlier record version, saved before this format and not read
     hidden_names: int = 0  # metric names left out because they can't be drawn as they are
+    failed_updates: int = 0  # steps that reported ``update_successful`` isn't 1
 
     @property
     def calls(self) -> int:
         return len(self.call_steps)
 
-    def metrics(self, view: str) -> tuple[MetricSeries, ...]:
-        return self.call_metrics if view == VIEW_CALL else self.step_metrics
+    def metrics(self, view: str, *, everything: bool = False) -> tuple[MetricSeries, ...]:
+        """``view``'s metrics; without ``everything``, those in :data:`HIDDEN_METRICS` are left out, and
+        those in :data:`HIDDEN_WHILE_ZERO` while every value is 0."""
+        series = self.call_metrics if view == VIEW_CALL else self.step_metrics
+        if everything:
+            return series
+        return tuple(item for item in series if not _hidden(view, item))
+
+    def hidden(self, view: str) -> int:
+        """How many of ``view``'s metrics are left out until every metric is shown."""
+        return len(self.metrics(view, everything=True)) - len(self.metrics(view))
 
     def first_step(self, window: int | None) -> int | None:
         """The first step ``window`` shows: the last ``window`` steps up to the newest one."""
@@ -323,6 +352,7 @@ class _SubJobState:
             self.skipped,
             self.old_format,
             self.hidden_names,
+            sum(1 for value in self.step_values.get(UPDATE_SUCCESSFUL, {}).values() if value != 1),
         )
 
 
@@ -689,7 +719,7 @@ def _runs(cells: str) -> list[str]:
 
 
 def no_metrics_text(sub_job_label: str, status: str, *, training: bool, downloaded: bool,
-                    view: str = DEFAULT_VIEW, old_format: int = 0) -> str:
+                    view: str = VIEW_STEP, old_format: int = 0) -> str:
     """Why the tab has nothing to show for a sub-job in ``view``."""
     if old_format:
         return (f"{sub_job_label}'s {old_format:,} training rows were saved in an earlier format, which "

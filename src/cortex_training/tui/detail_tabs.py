@@ -10,7 +10,7 @@ screen knows it through the ``job`` callable it is given, and fetches its rows
 through the screen's ``download``, which writes into the same cache directory
 as the Resources tab, under the same lock.
 
-The pane's keys (``v``, ``w``, ``Space``, ``r``) are its own bindings, which win
+The pane's keys (``w``, ``a``, ``Space``, ``r``) are its own bindings, which win
 over the screen's while the focus is inside the pane.
 """
 
@@ -152,11 +152,12 @@ _CHART_HEIGHT = 6
 
 
 class TrainingPane(_Pane):
-    """One sub-job's training metrics, per step or per call: stats over the window, and a chart per metric."""
+    """One sub-job's training metrics, per step and then per call: stats over the window, and a chart per
+    metric."""
 
     BINDINGS = [
-        Binding("v", "cycle_view", "Per step/call"),
         Binding("w", "cycle_window", "Window"),
+        Binding("a", "toggle_everything", "All metrics"),
         Binding("space", "next_sub_job", "Sub-job", key_display="space"),
         Binding("r", "refresh", "Refresh"),
     ]
@@ -171,7 +172,7 @@ class TrainingPane(_Pane):
         self._data = training.TrainingData()
         self._downloaded = False  # a download finished: a sub-job without rows has none
         self._window = training.DEFAULT_WINDOW
-        self._view = training.DEFAULT_VIEW  # per step, or per /fwd-bwd call
+        self._everything = False  # also the metrics in training.HIDDEN_METRICS
         self._pick: str | None = None  # the sub-job Space last showed
 
     # How often the local log is read while the tab is shown: it gains a row the moment a result
@@ -200,8 +201,10 @@ class TrainingPane(_Pane):
     def compose(self) -> ComposeResult:
         yield Static("", id="training-status")
         with VerticalScroll(id="training-pane"):
-            yield Static("", id="training-stats")
-            yield Static("", id="training-charts")
+            # Per step, then per /fwd-bwd call, one after the other.
+            for view in training.VIEWS:
+                yield Static("", id=f"training-{view}-stats", classes="training-stats")
+                yield Static("", id=f"training-{view}-charts", classes="training-charts")
 
     def focus_target(self):
         return self.query_one("#training-pane")
@@ -222,7 +225,7 @@ class TrainingPane(_Pane):
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         if action == "next_sub_job":
             return len(self._sub_job_ids()) > 1
-        if action in ("cycle_window", "cycle_view"):
+        if action in ("cycle_window", "toggle_everything"):
             return self._source() is not None
         return True
 
@@ -238,9 +241,17 @@ class TrainingPane(_Pane):
         self._window = training.next_window(self._window)
         self.redraw()
 
-    def action_cycle_view(self) -> None:
-        self._view = training.next_view(self._view)
+    def action_toggle_everything(self) -> None:
+        self._everything = not self._everything
         self.redraw()
+
+    def _metrics(self, sub_job: training.SubJobTraining, view: str) -> tuple[training.MetricSeries, ...]:
+        return sub_job.metrics(view, everything=self._everything)
+
+    @staticmethod
+    def _hues(sub_job: training.SubJobTraining, view: str) -> dict[str, str]:
+        """Each metric's colour, by its place among all of ``view``'s metrics, so ``a`` doesn't recolour any."""
+        return {series.name: chart_hue(index) for index, series in enumerate(sub_job.metrics(view, everything=True))}
 
     # ── reading ──
     def reload(self) -> None:
@@ -309,20 +320,28 @@ class TrainingPane(_Pane):
     def redraw(self) -> None:
         if not self.is_attached:
             return
-        status = self.query_one("#training-status", Static)
-        stats = self.query_one("#training-stats", Static)
-        charts = self.query_one("#training-charts", Static)
         source = self._source()
         sub_job = self._data.get(source)
-        status.update(self._status_text(source, sub_job))
-        if sub_job is None or not sub_job.metrics(self._view):
-            stats.update(self._empty_text(source))
-            charts.update("")
-            return
-        first = sub_job.first_x(self._view, self._window)
+        self.query_one("#training-status", Static).update(self._status_text(source, sub_job))
         width = self._width()
-        stats.update(self._stats_text(sub_job, first, width))
-        charts.update(self._charts_text(sub_job, first, width))
+        # With nothing in either view, the reason is said once rather than under each heading.
+        empty = sub_job is None or not any(sub_job.metrics(view, everything=True) for view in training.VIEWS)
+        for index, view in enumerate(training.VIEWS):
+            stats = self.query_one(f"#training-{view}-stats", Static)
+            charts = self.query_one(f"#training-{view}-charts", Static)
+            if empty:
+                stats.update(self._empty_text(source, view) if index == 0 else "")
+                charts.update("")
+                continue
+            heading = Text(training.VIEW_NAMES[view].capitalize() + "\n", style="bold")
+            if not self._metrics(sub_job, view):
+                stats.update(heading + (self._all_hidden_text(sub_job, view) if sub_job.metrics(view, everything=True)
+                                        else self._empty_text(source, view)))
+                charts.update("")
+                continue
+            first = sub_job.first_x(view, self._window)
+            stats.update(heading + self._stats_text(sub_job, view, first, width))
+            charts.update(self._charts_text(sub_job, view, first, width))
 
     def _status_text(self, source: str | None, sub_job: training.SubJobTraining | None) -> Text:
         text = Text()
@@ -340,14 +359,21 @@ class TrainingPane(_Pane):
             if sub_job.newest is not None:
                 text.append(f"  ·  newest row {views.fmt_ago(sub_job.newest, datetime.now(timezone.utc))}")
         if source is not None:
-            text.append(f"  ·  {training.VIEW_NAMES[self._view]} (v)")
             text.append(f"  ·  {training.window_label(self._window)} (w)")
+            hidden = sum(sub_job.hidden(view) for view in training.VIEWS) if sub_job is not None else 0
+            if self._everything:
+                text.append("  ·  all metrics (a)")
+            elif hidden:
+                text.append(f"  ·  {hidden:,} hidden (a)")
         notes = []
         if self._loading:
             notes.append(("cached · refreshing…" if sub_job else "loading training metrics…", CHART_MUTED))
         elif self._error:
             notes.append((f"{'cached · refresh failed' if sub_job else 'training metrics unavailable'}: "
                           f"{self._error}", _WARNING))
+        if sub_job is not None and sub_job.failed_updates:
+            notes.append((f"{sub_job.failed_updates:,} step{'s' if sub_job.failed_updates != 1 else ''} reported "
+                          "update_successful ≠ 1", _WARNING))
         if sub_job is not None and sub_job.skipped:
             notes.append((f"{sub_job.skipped:,} training row{'s' if sub_job.skipped != 1 else ''} skipped "
                           "(malformed or unsupported)", _WARNING))
@@ -362,7 +388,7 @@ class TrainingPane(_Pane):
             text.append(("  ·  " if index else "") + note, style=style)
         return text
 
-    def _empty_text(self, source: str | None) -> Text:
+    def _empty_text(self, source: str | None, view: str) -> Text:
         job = self._job()
         if source is None:
             if not job.get("sub_jobs"):
@@ -375,45 +401,53 @@ class TrainingPane(_Pane):
         is_training = not entry or views.sub_job_kind(entry) == "training"
         sub_job = self._data.get(source)
         return Text(training.no_metrics_text(views.sub_job_label(source), status, training=is_training,
-                                             downloaded=self._downloaded, view=self._view,
+                                             downloaded=self._downloaded, view=view,
                                              old_format=sub_job.old_format if sub_job else 0))
 
-    def _at(self, sub_job: training.SubJobTraining, x: int) -> str:
+    @staticmethod
+    def _all_hidden_text(sub_job: training.SubJobTraining, view: str) -> Text:
+        count = sub_job.hidden(view)
+        return Text(f"{count:,} metric{'s' if count != 1 else ''}, all hidden as bookkeeping (a shows every metric)",
+                    style=CHART_MUTED)
+
+    def _at(self, sub_job: training.SubJobTraining, view: str, x: int) -> str:
         """Where a value is from: its step, or its call and (in parentheses) that call's step."""
-        if self._view != training.VIEW_CALL:
+        if view != training.VIEW_CALL:
             return training.format_step(x)
         step = sub_job.step_of_call(x)
         return f"{training.format_step(x)} ({training.format_step(step) if step is not None else 'next'})"
 
-    def _stats_text(self, sub_job: training.SubJobTraining, first: int | None, width: int) -> Text:
+    def _stats_text(self, sub_job: training.SubJobTraining, view: str, first: int | None, width: int) -> Text:
         rows = []
-        for series in sub_job.metrics(self._view):
+        for series in self._metrics(sub_job, view):
             found = training.window_stats(*series.window(first))
             if found is None:
                 rows.append((series.name, "—", "—", "—"))
                 continue
             rows.append((series.name,
-                         f"{training.format_metric(found.latest)} @ {self._at(sub_job, found.latest_x)}",
-                         f"{training.format_metric(found.low)} @ {self._at(sub_job, found.low_x)}",
-                         f"{training.format_metric(found.high)} @ {self._at(sub_job, found.high_x)}"))
-        where = "call (step)" if self._view == training.VIEW_CALL else "step"
+                         f"{training.format_metric(found.latest)} @ {self._at(sub_job, view, found.latest_x)}",
+                         f"{training.format_metric(found.low)} @ {self._at(sub_job, view, found.low_x)}",
+                         f"{training.format_metric(found.high)} @ {self._at(sub_job, view, found.high_x)}"))
+        where = "call (step)" if view == training.VIEW_CALL else "step"
         header = ("metric", f"latest @ {where}", f"min @ {where}", f"max @ {where}")
         widths = [max(len(row[i]) for row in [header, *rows]) for i in range(4)]
         text = Text()
         text.append("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(header)).rstrip()[:width] + "\n",
                     style=CHART_AXIS)
-        for index, row in enumerate(rows):
-            text.append(row[0].ljust(widths[0]), style=chart_hue(index))
+        hues = self._hues(sub_job, view)
+        for row in rows:
+            text.append(row[0].ljust(widths[0]), style=hues[row[0]])
             text.append(("  " + "  ".join(cell.ljust(widths[i + 1]) for i, cell in enumerate(row[1:]))).rstrip())
             text.append("\n")
         return text
 
-    def _charts_text(self, sub_job: training.SubJobTraining, first: int | None, width: int) -> Text:
+    def _charts_text(self, sub_job: training.SubJobTraining, view: str, first: int | None, width: int) -> Text:
         per_row = 2 if width >= _TWO_CHARTS_WIDTH else 1
         gap = 3
         chart_width = (width - gap * (per_row - 1)) // per_row
-        blocks = [self._chart_block(series, first, chart_width, chart_hue(index))
-                  for index, series in enumerate(sub_job.metrics(self._view))]
+        hues = self._hues(sub_job, view)
+        blocks = [self._chart_block(series, view, first, chart_width, hues[series.name])
+                  for series in self._metrics(sub_job, view)]
         text = Text()
         for start in range(0, len(blocks), per_row):
             row = blocks[start:start + per_row]
@@ -430,11 +464,11 @@ class TrainingPane(_Pane):
                 text.append("\n")
         return text
 
-    def _chart_block(self, series: training.MetricSeries, first: int | None, width: int,
+    def _chart_block(self, series: training.MetricSeries, view: str, first: int | None, width: int,
                      hue: str) -> list[list[tuple[str, str]]]:
         _xs, values = series.window(first)
         latest = training.format_metric(values[-1]) if values else "—"
-        title = f"{series.name} · {training.VIEW_NAMES[self._view]} · {training.window_label(self._window)}"
+        title = f"{series.name} · {training.VIEW_NAMES[view]} · {training.window_label(self._window)}"
         room = width - len(latest) - 1
         title = title if len(title) <= room else title[: max(0, room - 1)] + "…"
         head = [(title, hue), (" " * max(1, width - len(title) - len(latest)), ""), (latest, f"bold {hue}")]

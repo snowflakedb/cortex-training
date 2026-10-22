@@ -21,6 +21,9 @@ from textual.widgets import TabbedContent  # noqa: E402
 from cortex_training import AccountJobListUnavailable  # noqa: E402
 from cortex_training.tui.app import CortexTrainingLogTUI  # noqa: E402
 from cortex_training.tui.logs import LogScreen  # noqa: E402
+from cortex_training.tui import training  # noqa: E402
+from cortex_training.tui.detail_tabs import TrainingPane  # noqa: E402
+from cortex_training.tui.resource import chart_hue  # noqa: E402
 
 TRAINING = "7:training:0"
 
@@ -74,9 +77,9 @@ def _client(sub_jobs=None, status="RUNNING"):
     # Two steps of two calls each, as the zone saves them: a row per call and a row per step.
     c.download_training_metrics.side_effect = _download([
         _row(1, call=1, avg_loss=2.1, rank=0), _row(1, call=2, avg_loss=1.9, rank=0),
-        _row(1, op="step", grad_norm=0.9, last_lr=1e-5, global_steps=1.0),
+        _row(1, op="step", grad_norm=0.9, last_lr=1e-5, global_steps=1.0, update_successful=1.0),
         _row(2, call=1, avg_loss=1.2, rank=0), _row(2, call=2, avg_loss=0.8, rank=0),
-        _row(2, op="step", grad_norm=0.5, last_lr=1e-5, global_steps=2.0),
+        _row(2, op="step", grad_norm=0.5, last_lr=1e-5, global_steps=2.0, update_successful=0.0),
         _row(None, call=1, avg_loss=0.7, rank=0),  # step 3's first call, before the zone saw a /step
     ])
     return c
@@ -119,32 +122,92 @@ def test_training_tab_downloads_and_draws_each_metric():
             assert c.download_training_metrics.call_args.kwargs["priority"] == [TRAINING]
             status = _text(screen, "#training-status")
             assert "training #0" in status and "step 2" in status and "5 calls" in status
-            assert "per step (v)" in status and "all steps (w)" in status
-            # Per step: the step rows' numbers, as saved.
-            stats = _text(screen, "#training-stats")
-            assert [line.split()[0] for line in stats.splitlines()[1:]] == ["grad_norm", "last_lr", "global_steps"]
+            assert "all steps (w)" in status and "(v)" not in status
+            # global_steps and update_successful (per step) and rank (per call) are bookkeeping.
+            assert "3 hidden (a)" in status
+            assert "1 step reported update_successful ≠ 1" in status
+            # Both views on the one tab. Per step first: the step rows' numbers, as saved.
+            stats = _text(screen, "#training-step-stats")
+            assert stats.splitlines()[0] == "Per step"
+            assert [line.split()[0] for line in stats.splitlines()[2:]] == ["grad_norm", "last_lr"]
             assert "0.5 @ 2" in stats  # grad_norm's latest, at step 2
-            charts = _text(screen, "#training-charts")
+            charts = _text(screen, "#training-step-charts")
             assert "grad_norm · per step · all steps" in charts and "avg_loss" not in charts
 
-            # Per call: each call's numbers, as saved, numbered in the order they ran with each one's step.
-            await pilot.press("v")
-            status = _text(screen, "#training-status")
-            assert "per call (v)" in status
-            stats = _text(screen, "#training-stats")
+            # Then per call: each call's numbers, as saved, numbered in the order they ran with each one's step.
+            stats = _text(screen, "#training-call-stats")
+            assert stats.splitlines()[0] == "Per call"
             assert "latest @ call (step)" in stats
-            assert [line.split()[0] for line in stats.splitlines()[1:]] == ["avg_loss", "rank"]
+            assert [line.split()[0] for line in stats.splitlines()[2:]] == ["avg_loss"]
             assert "0.7 @ 5 (next)" in stats  # the newest call: its step is the one still running
             assert "2.1 @ 1 (1)" in stats  # the max: call 1, of step 1
-            assert "avg_loss · per call · all steps" in _text(screen, "#training-charts")
+            charts = _text(screen, "#training-call-charts")
+            assert "avg_loss · per call · all steps" in charts and "grad_norm" not in charts and "rank" not in charts
 
+            # a shows every saved number, and again hides the bookkeeping.
+            await pilot.press("a")
+            assert "all metrics (a)" in _text(screen, "#training-status")
+            assert [line.split()[0] for line in _text(screen, "#training-step-stats").splitlines()[2:]] == \
+                ["grad_norm", "last_lr", "global_steps", "update_successful"]
+            assert [line.split()[0] for line in _text(screen, "#training-call-stats").splitlines()[2:]] == \
+                ["avg_loss", "rank"]
+            await pilot.press("a")
+            assert "3 hidden (a)" in _text(screen, "#training-status")
+            assert "rank" not in _text(screen, "#training-call-stats")
+
+            # The window applies to both.
             await pilot.press("w")
             assert "last 100 steps (w)" in _text(screen, "#training-status")
-            await pilot.press("v")
-            assert "per step (v)" in _text(screen, "#training-status")
+            assert "grad_norm · per step · last 100 steps" in _text(screen, "#training-step-charts")
+            assert "avg_loss · per call · last 100 steps" in _text(screen, "#training-call-charts")
             await _settle(app, pilot)
 
     asyncio.run(run())
+
+
+def test_a_section_whose_every_metric_is_hidden_says_so():
+    async def run():
+        c = _client()
+        # The calls carry only rank, which is 0 throughout: hidden, though the calls were saved.
+        c.download_training_metrics.side_effect = _download([
+            _row(1, call=1, rank=0), _row(1, op="step", grad_norm=0.9), _row(2, call=1, rank=0),
+        ])
+        app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = await _open(app, pilot)
+            await pilot.press("m")
+            pane = screen.query_one("#training-tab")
+            assert await _wait(pilot, lambda: pane._downloaded and not pane._loading)
+            assert "grad_norm" in _text(screen, "#training-step-stats")
+            calls = _text(screen, "#training-call-stats")
+            assert "1 metric, all hidden as bookkeeping (a shows every metric)" in calls
+            assert "saved no calls" not in calls
+            await pilot.press("a")
+            assert "rank" in _text(screen, "#training-call-stats")
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def _name_styles(text) -> dict[str, str]:
+    """Each metric name's style in a stats table (its first span on a line)."""
+    plain = text.plain
+    return {plain[span.start:span.end].strip(): str(span.style) for span in text.spans
+            if plain[span.start:span.end].strip() and plain[span.start - 1:span.start] in ("", "\n")}
+
+
+def test_a_metric_keeps_its_colour_when_every_metric_is_shown():
+    state = training._SubJobState(TRAINING)
+    for step in (1, 2):
+        state.ingest(_row(step, op="step", grad_norm=0.9, global_steps=float(step), weight_delta_norm_rank0_sample=0.1))
+    sub_job = state.snapshot()
+    pane = TrainingPane(MagicMock(), "7", Path("."), job=dict, download=lambda **_: True)
+    hidden = _name_styles(pane._stats_text(sub_job, training.VIEW_STEP, None, 120))
+    pane._everything = True
+    shown = _name_styles(pane._stats_text(sub_job, training.VIEW_STEP, None, 120))
+    assert "global_steps" not in hidden and "global_steps" in shown
+    # weight_delta is the third metric either way, so it has the third colour either way.
+    assert hidden["weight_delta_norm_rank0_sample"] == shown["weight_delta_norm_rank0_sample"] == chart_hue(2)
 
 
 def test_training_tab_download_failure_is_said_in_its_header():
@@ -170,7 +233,7 @@ def test_training_tab_of_a_job_without_training_downloads_nothing():
         async with app.run_test(size=(120, 40)) as pilot:
             screen = await _open(app, pilot)
             await pilot.press("m")
-            assert await _wait(pilot, lambda: "no training sub-job" in _text(screen, "#training-stats"))
+            assert await _wait(pilot, lambda: "no training sub-job" in _text(screen, "#training-step-stats"))
             assert not c.download_training_metrics.called
             await _settle(app, pilot)
 
@@ -241,7 +304,7 @@ def test_a_job_saved_in_the_earlier_format_says_so_instead_of_nothing_saved():
             await pilot.press("m")
             pane = screen.query_one("#training-tab")
             assert await _wait(pilot, lambda: pane._downloaded and not pane._loading)
-            assert "saved in an earlier format" in _text(screen, "#training-stats")
+            assert "saved in an earlier format" in _text(screen, "#training-step-stats")
             assert "2 rows in an earlier format not shown" in _text(screen, "#training-status")
             await _settle(app, pilot)
 

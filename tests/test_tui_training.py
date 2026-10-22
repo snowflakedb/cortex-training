@@ -77,15 +77,19 @@ for _step_no, _loss, _grad in ((1, 9.8489, 156.866), (2, 5.0613, 77.127), (3, 2.
 def test_per_step_shows_every_number_in_the_step_rows():
     parsed = _parse(RUN)
     # grad_norm and last_lr first, then the rest in the order the file has them; nothing derived.
-    assert [s.name for s in parsed.metrics(STEP)] == [
+    assert [s.name for s in parsed.metrics(STEP, everything=True)] == [
         "grad_norm", "last_lr", "global_steps", "update_successful", "weight_delta_norm_rank0_sample"]
+    assert [s.name for s in parsed.metrics(STEP)] == ["grad_norm", "last_lr", "weight_delta_norm_rank0_sample"]
     assert _by_name(parsed.metrics(STEP))["grad_norm"] == ((1, 2, 3), (156.866, 77.127, 84.373))
     assert parsed.last_step == 3
 
 
 def test_per_call_shows_every_number_in_each_call_with_its_step():
     parsed = _parse(RUN)
-    assert [s.name for s in parsed.metrics(CALL)] == ["avg_loss", "rank", "sft_model_calls", "sft_packed_rows"]
+    assert [s.name for s in parsed.metrics(CALL, everything=True)] == [
+        "avg_loss", "rank", "sft_model_calls", "sft_packed_rows"]
+    # rank is 0 in every call, so it is hidden; the packing counts show.
+    assert [s.name for s in parsed.metrics(CALL)] == ["avg_loss", "sft_model_calls", "sft_packed_rows"]
     # Six calls, numbered in the order they ran, each with its own avg_loss.
     assert _by_name(parsed.metrics(CALL))["avg_loss"] == (
         (1, 2, 3, 4, 5, 6), (9.8489, 9.8489, 5.0613, 5.0613, 2.0419, 2.0419))
@@ -224,9 +228,46 @@ def test_a_steps_window_in_the_per_call_view_starts_at_that_steps_first_call():
     assert running.metrics(CALL)[0].window(running.first_x(CALL, 1))[0] == (5, 6, 7)
 
 
-def test_views_cycle():
-    assert [training.next_view(v) for v in training.VIEWS] == [CALL, STEP]
-    assert training.DEFAULT_VIEW == STEP
+def test_both_views_are_drawn_per_step_first():
+    assert training.VIEWS == (STEP, CALL)
+
+
+def test_bookkeeping_numbers_are_hidden_until_every_metric_is_shown():
+    parsed = _parse([
+        _call(1, 1, avg_loss=2.0, rank=0, sft_model_calls=1, sft_packed_rows=1, rl_model_calls=1, approx_kl=0.01),
+        _step(1, grad_norm=1.5, last_lr=1e-5, global_steps=1, update_successful=1.0,
+              weight_delta_norm_rank0_sample=0.1, weight_delta_norm_over_lr_rank0_sample=1e4,
+              weight_delta_rank0_sample_numel=8388608, weight_delta_rank0_sample_bytes=16777216,
+              weight_delta_rank0_sample_tensors=1),
+    ])
+    assert [s.name for s in parsed.metrics(STEP)] == [
+        "grad_norm", "last_lr", "weight_delta_norm_rank0_sample", "weight_delta_norm_over_lr_rank0_sample"]
+    # A loss function's own metrics (approx_kl) stay: only names known to be bookkeeping are left out.
+    # The packing counts stay too: they show rows sharing a call, or a rank running fewer calls.
+    assert [s.name for s in parsed.metrics(CALL)] == [
+        "avg_loss", "sft_model_calls", "sft_packed_rows", "rl_model_calls", "approx_kl"]
+    assert (parsed.hidden(STEP), parsed.hidden(CALL)) == (5, 1)
+    assert len(parsed.metrics(STEP, everything=True)) == 9
+    assert "rank" in [s.name for s in parsed.metrics(CALL, everything=True)]
+    assert parsed.failed_updates == 0
+
+
+def test_rank_is_hidden_only_while_every_call_came_from_worker_0():
+    from_zero = _parse([_call(1, 1, avg_loss=2.0, rank=0), _call(1, 2, avg_loss=1.9, rank=0)])
+    assert [s.name for s in from_zero.metrics(CALL)] == ["avg_loss"]
+    assert from_zero.hidden(CALL) == 1
+    # A call from another worker is worth seeing, so rank shows by default once one has it.
+    mixed = _parse([_call(1, 1, avg_loss=2.0, rank=0), _call(1, 2, avg_loss=1.9, rank=1)])
+    assert [s.name for s in mixed.metrics(CALL)] == ["avg_loss", "rank"]
+    assert mixed.hidden(CALL) == 0
+
+
+def test_steps_that_reported_update_successful_not_1_are_counted():
+    parsed = _parse([_step(step, grad_norm=1.0, update_successful=ok) for step, ok in [(1, 1.0), (2, 0.0), (3, 1.0)]])
+    assert parsed.failed_updates == 1
+    # A step run again after a resume replaces its row, so only the latest run of a step counts.
+    assert _parse([_step(2, update_successful=0.0), _step(2, update_successful=1.0)]).failed_updates == 0
+    assert _parse([_step(1, grad_norm=1.0)]).failed_updates == 0
 
 
 def test_format_metric():

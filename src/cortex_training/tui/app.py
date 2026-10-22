@@ -281,8 +281,8 @@ class CortexTrainingLogTUI(App):
     /* The Training metrics tab (detail_tabs.py): a header on top, as on Resources. */
     #training-status { color: $text-muted; height: auto; padding: 0 1; }
     #training-pane { height: 1fr; padding: 0 1; scrollbar-gutter: stable; scrollbar-size-vertical: 1; }
-    #training-stats { height: auto; margin-top: 1; text-wrap: nowrap; text-overflow: clip; }
-    #training-charts { height: auto; text-wrap: nowrap; text-overflow: clip; }
+    .training-stats { height: auto; margin-top: 1; text-wrap: nowrap; text-overflow: clip; }
+    .training-charts { height: auto; text-wrap: nowrap; text-overflow: clip; }
     LogScreen > .screen--selection {
         background: $block-cursor-blurred-background;
         color: $block-cursor-blurred-foreground;
