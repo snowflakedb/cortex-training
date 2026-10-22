@@ -494,7 +494,7 @@ def _config_value(value: Any) -> str:
     if value is None:
         return "null"
     if isinstance(value, dict):
-        return "{" + ", ".join(f"{printable(str(k))}: {_config_value(v)}" for k, v in sorted(value.items())) + "}"
+        return "{" + ", ".join(f"{collapse(k)}: {_config_value(v)}" for k, v in sorted(value.items())) + "}"
     if isinstance(value, list):
         return "[" + ", ".join(_config_value(v) for v in value) + "]"
     return collapse(compact_number(value))
@@ -504,7 +504,7 @@ def subjob_config_summary(sj: dict) -> str:
     """One sub-job's config as submitted, ``key=value`` by key, with nothing added
     or left out: ``max_seq_len=4096 · n_gpus=8 · optimizer={lr: 1e-05, name: adamw}``."""
     cfg = _type_config(sj)
-    return " · ".join(f"{printable(str(key))}={_config_value(value)}" for key, value in sorted(cfg.items()))
+    return " · ".join(f"{collapse(key)}={_config_value(value)}" for key, value in sorted(cfg.items()))
 
 
 def preview_facts(job: dict, now: datetime) -> list:

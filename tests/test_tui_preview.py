@@ -76,6 +76,9 @@ def test_subjob_config_summary_is_the_submitted_config():
                                     "inference_config": {"n_gpus": 2.0, "gpu_memory_utilization": 0.9}}) \
         == "gpu_memory_utilization=0.9 · n_gpus=2"
     assert v.subjob_config_summary({"job_type": "training"}) == ""
+    # One line whatever the keys or values hold.
+    odd = {"job_type": "training", "training_config": {"a\nb": "x\ny", "n": {"k\nz": None}}}
+    assert v.subjob_config_summary(odd) == "a b=x y · n={k z: null}"
 
 
 def test_elapsed_text_runs_from_creation():
