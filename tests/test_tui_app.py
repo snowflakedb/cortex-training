@@ -30,6 +30,7 @@ from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -56,6 +57,7 @@ from cortex_training.tui.app import CortexTrainingLogTUI  # noqa: E402
 from cortex_training.tui.job_list import JobListScreen  # noqa: E402
 from cortex_training.tui.logs import LogScreen  # noqa: E402
 from tests.tui_fake import FakeClient  # noqa: E402
+from cortex_training.tui.resource_view import ResourceTab  # noqa: E402
 from cortex_training.tui.theme import ACCENT  # noqa: E402
 from cortex_training.tui import views  # noqa: E402
 from cortex_training.tui.untrusted import printable_client  # noqa: E402
@@ -5249,10 +5251,11 @@ def _gpu_rows(sub_job_id, minutes, *, gpus=2):
     return "".join(json.dumps(row) + "\n" for row in rows)
 
 
-async def _run_a_first_open_draws_the_newest_half_hour_while_the_rest_downloads(tmp_path):
+async def _run_a_first_open_draws_the_newest_window_while_the_rest_downloads(tmp_path):
     # A long job's first open: its whole history can take minutes, so the client's preview
-    # (the newest half hour) is drawn, marked partial, while the header's bar counts the
-    # chunks; the committed file then replaces it. A refresh with the job on screen asks no preview.
+    # (the newest 10 minutes, the window every job opens on) is drawn, marked partial, while
+    # the header's bar counts the chunks; the committed file then replaces it. A refresh with
+    # the job on screen asks no preview.
     sub = "7:training:0"
     c = _client()
     calls, previewed, release = [], threading.Event(), threading.Event()
@@ -5292,22 +5295,164 @@ async def _run_a_first_open_draws_the_newest_half_hour_while_the_rest_downloads(
                                 and "120/300" in header(), seconds=10.0)
         assert ok, header()
         shown = screen._resource_data.kind(sub, "gpu")
-        assert shown.partial  # the newest half hour alone, and marked so
+        assert shown.partial  # the newest window alone, and marked so
         assert "loading older samples" in header() and "━" in header() and "120/300 chunks" in header(), header()
         release.set()
         assert await _pause_until(pilot, lambda: not screen._resource_loading, seconds=10.0)
         full = screen._resource_data.kind(sub, "gpu")
         assert not full.partial and full.first_sample_ts < shown.first_sample_ts  # the whole history
         assert "chunks" not in header(), header()  # the bar is gone with the download
-        assert calls == [{"priority": [sub], "preview_seconds": 30 * 60, "counts": True}]
+        assert calls == [{"priority": [sub], "preview_seconds": 10 * 60, "counts": True}]
         screen.action_refresh_sources()  # r: the job is on screen now, so only the count
         assert await _pause_until(pilot, lambda: len(calls) == 2 and not screen._resource_loading, seconds=10.0)
         assert calls[1] == {"priority": [sub], "preview_seconds": None, "counts": True}
         await _settle(app, pilot)
 
 
-def test_a_first_open_draws_the_newest_half_hour_while_the_rest_downloads(tmp_path):
-    asyncio.run(_run_a_first_open_draws_the_newest_half_hour_while_the_rest_downloads(tmp_path))
+def test_a_first_open_draws_the_newest_window_while_the_rest_downloads(tmp_path):
+    asyncio.run(_run_a_first_open_draws_the_newest_window_while_the_rest_downloads(tmp_path))
+
+
+async def _run_a_job_screen_warms_its_downloads_up_once_its_first_lines_are_drawn(monkeypatch):
+    # The warm-up's import of the Connector would slow the Logs tab's first lines: it starts once
+    # they are drawn, long before its fallback, and once however many lines follow.
+    monkeypatch.setattr(LogScreen, "_WARM_UP_AFTER_SECONDS", 30.0)
+    c = _client()
+    c.tail_logs.side_effect = lambda *a, **k: {"entries": [{"_raw": "a line"}], "next_cursor": "C1", "eof": False}
+    warmed, shown_then = threading.Event(), []
+
+    def warm(job_id):
+        shown_then.append((job_id, app.screen._shown_logs))
+        warmed.set()
+
+    c.warm_artifact_session.side_effect = warm
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(160, 45)) as pilot:
+        assert await _pause_until(pilot, warmed.is_set, seconds=10.0)
+        screen = app.screen
+        assert await _pause_until(pilot, lambda: screen._shown_logs >= 3, seconds=10.0)  # more lines came
+        assert len(shown_then) == 1 and shown_then[0][0] == "7" and shown_then[0][1] >= 1
+        await _settle(app, pilot)
+
+
+def test_a_job_screen_warms_its_downloads_up_once_its_first_lines_are_drawn(monkeypatch):
+    asyncio.run(_run_a_job_screen_warms_its_downloads_up_once_its_first_lines_are_drawn(monkeypatch))
+
+
+async def _run_a_job_screen_without_lines_warms_up_a_moment_after_it_opens(monkeypatch):
+    monkeypatch.setattr(LogScreen, "_WARM_UP_AFTER_SECONDS", 0.2)
+    c = _client()  # its tail has no lines
+    warmed = threading.Event()
+    c.warm_artifact_session.side_effect = lambda job_id: warmed.set()
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(160, 45)) as pilot:
+        assert await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen) and app.screen._current_source)
+        assert await _pause_until(pilot, warmed.is_set, seconds=5.0)
+        assert app.screen._shown_logs == 0
+        c.warm_artifact_session.assert_called_once_with("7")
+        await _settle(app, pilot)
+
+
+def test_a_job_screen_without_lines_warms_up_a_moment_after_it_opens(monkeypatch):
+    asyncio.run(_run_a_job_screen_without_lines_warms_up_a_moment_after_it_opens(monkeypatch))
+
+
+async def _run_a_warm_up_that_fails_shows_and_logs_nothing(tmp_path, monkeypatch):
+    # The download a tab asks for logs in itself and says what failed; the warm-up only saves it time.
+    monkeypatch.setattr(LogScreen, "_WARM_UP_AFTER_SECONDS", 0.05)
+    c = _client()
+    c.warm_artifact_session.side_effect = RuntimeError("login refused")
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(160, 45)) as pilot:
+        assert await _pause_until(pilot, lambda: c.warm_artifact_session.called, seconds=5.0)
+        await pilot.pause(0.2)
+        assert isinstance(app.screen, LogScreen) and app.screen._screen_open
+        assert not [note for note in app._notifications if "login refused" in str(note.message)]
+        await _settle(app, pilot)
+    assert not (tmp_path / "errors.log").exists()
+
+
+def test_a_warm_up_that_fails_shows_and_logs_nothing(tmp_path, monkeypatch):
+    asyncio.run(_run_a_warm_up_that_fails_shows_and_logs_nothing(tmp_path, monkeypatch))
+
+
+class _CountedSession:
+    def __init__(self, hold=None):
+        self.closes, self._hold = 0, hold
+
+    def close(self):
+        if self._hold is not None:
+            self._hold.wait(5)
+        self.closes += 1
+
+
+def _run_tui_main(monkeypatch, client, during_run):
+    class FakeApp:
+        return_code = 0
+        sign_in = None
+
+        def __init__(self, client, job_id, *, sub_job_id=None, poll_interval=1.0):
+            self.client = client
+
+        def run(self):
+            during_run(self.client)
+
+    monkeypatch.delenv("CORTEX_TRAINING_CONNECTION", raising=False)
+    monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", FakeApp)
+    monkeypatch.setattr("cortex_training._cli.build_client", lambda args, cls: client)
+    return tui_main.run(["--base-url", "http://localhost:1", "--database", "DB"])
+
+
+def test_the_tui_keeps_its_download_sessions_and_closes_them_on_quit(monkeypatch):
+    client = CortexTrainingClient(base_url="http://localhost:1", database="DB", schema="PUBLIC")
+    session, kept_while_running = _CountedSession(), []
+
+    def during_run(running):
+        kept_while_running.append(running.keep_artifact_sessions)
+        running._kept_sessions.keep(running._artifact_session_key(), session)  # a download's, kept
+
+    assert _run_tui_main(monkeypatch, client, during_run) == 0
+    assert kept_while_running == [True]
+    assert session.closes == 1 and not client.keep_artifact_sessions
+
+
+def test_quitting_waits_a_moment_at_most_for_the_sessions_to_close(monkeypatch):
+    monkeypatch.setattr(tui_main, "SESSION_CLOSE_SECONDS", 0.1)
+    client = CortexTrainingClient(base_url="http://localhost:1", database="DB", schema="PUBLIC")
+    release = threading.Event()
+    session = _CountedSession(hold=release)  # an unreachable service: its close hangs
+
+    def during_run(running):
+        running._kept_sessions.keep(running._artifact_session_key(), session)
+
+    started = time.monotonic()
+    try:
+        assert _run_tui_main(monkeypatch, client, during_run) == 0
+        assert time.monotonic() - started < 2
+    finally:
+        release.set()
+
+
+def test_quitting_after_the_app_failed_still_closes_the_sessions(monkeypatch):
+    client = CortexTrainingClient(base_url="http://localhost:1", database="DB", schema="PUBLIC")
+    session = _CountedSession()
+
+    def during_run(running):
+        running._kept_sessions.keep(running._artifact_session_key(), session)
+        raise RuntimeError("the app failed")
+
+    with pytest.raises(RuntimeError, match="the app failed"):
+        _run_tui_main(monkeypatch, client, during_run)
+    assert session.closes == 1
+
+
+@pytest.mark.parametrize(("window", "seconds"), [("10m", 600), ("30m", 1800), ("1h", 1800), ("6h", 1800),
+                                                 ("all", 1800)])
+def test_a_first_open_previews_the_window_on_screen_and_at_most_its_half_hour(window, seconds):
+    # One round of chunk fetches draws the 10m window; a larger window shows the newest half
+    # hour, marked loading older samples, as before.
+    screen = SimpleNamespace(_resource_range=window, _RESOURCE_PREVIEW_SECONDS=ResourceTab._RESOURCE_PREVIEW_SECONDS)
+    assert ResourceTab._resource_preview_seconds(screen) == seconds
 
 
 async def _run_a_finished_job_s_console_shows_its_last_lines_while_the_rest_downloads(tmp_path):

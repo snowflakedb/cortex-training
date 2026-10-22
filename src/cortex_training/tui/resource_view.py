@@ -113,8 +113,10 @@ class ResourceTab:
     _RESOURCE_WHAT = {GPU: "GPU metrics", SYSTEM: "system metrics"}
     _RESOURCE_SAMPLES = {GPU: "GPU samples", SYSTEM: "system samples"}
     # While the screen has nothing of the shown sub-job (a first open, when its whole
-    # history can take minutes to download), its newest half hour, which covers the 10m
-    # and 30m windows, is fetched first and drawn while the rest comes.
+    # history can take minutes to download), its newest chunks are fetched first and drawn
+    # while the rest comes: the window on screen (see _resource_preview_seconds), at most
+    # this. A chunk holds about a minute, and a download fetches 16 at once: the 10m window,
+    # where every job opens, takes one round of them; the half hour, three times the chunks.
     _RESOURCE_PREVIEW_SECONDS = RANGES["30m"].total_seconds()
     # The header's bar for a metrics download: its cells, and how often it is redrawn.
     _RESOURCE_PROGRESS_CELLS = 12
@@ -307,7 +309,7 @@ class ResourceTab:
             source = self._resource_source()
             options: dict = {"on_chunk": progress}
             if source and source not in shown_here and source not in self._resource_data.kinds:
-                options.update(preview_seconds=self._RESOURCE_PREVIEW_SECONDS, on_preview=previewed)
+                options.update(preview_seconds=self._resource_preview_seconds(), on_preview=previewed)
             before = telemetry_bytes(self._metrics_root)
             results = self._client.download_metrics(
                 self._job_id,
@@ -355,6 +357,14 @@ class ResourceTab:
         if resource is not None and not resource.fresh(self._resource_range):
             self._resource_window_error = None  # another try, as picking the window again is
             self._rebuild_resource_window()
+
+    def _resource_preview_seconds(self) -> float:
+        """How far back a first open's preview reaches: the window on screen, at most
+        _RESOURCE_PREVIEW_SECONDS (a larger window shows it marked loading older samples)."""
+        window = RANGES.get(self._resource_range)
+        if window is None:
+            return self._RESOURCE_PREVIEW_SECONDS
+        return min(window.total_seconds(), self._RESOURCE_PREVIEW_SECONDS)
 
     def _show_resource_progress(self, sub_job_id: str, done: int, total: int) -> None:
         """UI thread. A metrics download's chunk count: the shown sub-job's is the header's bar (see _resource_state)."""

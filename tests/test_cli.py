@@ -2558,7 +2558,7 @@ def test_download_interrupted_after_the_files_are_written_prints_the_resume_hint
         saved.write_text("{}\n")
         return [{"sub_job_id": sub, "saved_path": str(saved)}]
 
-    def interrupted(*_args):
+    def interrupted(*_args, **_kwargs):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(client, "_experiment_run_uri", lambda _job: ("snow://run/", "RUN"))

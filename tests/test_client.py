@@ -5073,7 +5073,11 @@ class TestExecutionLogDownload:
         connect = MagicMock(return_value=connected)
         monkeypatch.setattr(connector, "connect", connect)
         assert c._open_experiment_artifact_connection() is connected
-        connect.assert_called_once_with(**kwargs)
+        # Without the Connector's cloud-metadata probes, which add up to seconds to a login.
+        assert "platform_detection_timeout_seconds" in importlib.import_module(
+            "snowflake.connector.connection"
+        ).DEFAULT_CONFIGURATION
+        connect.assert_called_once_with(**kwargs, platform_detection_timeout_seconds=0.0)
 
     def test_get_experiment_run_calls_endpoint(self):
         c = _make_client(
@@ -7857,8 +7861,8 @@ class TestChunkedArtifactDownload:
         real_close = nc._artifact_download.SharedConnection.close
         escaped = []
 
-        def interrupted_close(shared):
-            real_close(shared)
+        def interrupted_close(shared, **options):
+            real_close(shared, **options)
             escaped.append(KeyboardInterrupt())
             raise escaped[-1]
 
@@ -7902,8 +7906,8 @@ class TestChunkedArtifactDownload:
         c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=0)
         real_close = nc._artifact_download.SharedConnection.close
 
-        def interrupted_close(shared):
-            real_close(shared)
+        def interrupted_close(shared, **options):
+            real_close(shared, **options)
             raise KeyboardInterrupt
 
         monkeypatch.setattr(nc._artifact_download.SharedConnection, "close", interrupted_close)

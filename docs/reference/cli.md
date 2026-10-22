@@ -1186,10 +1186,14 @@ next tab, round to Logs after the last.
     appear first, and later opens download only new chunks (unless the job
     left the cache to keep it within its limit, which makes the next open a
     first one: see [Local data](#local-data)). On a first open,
-    with nothing cached for the selected sub-job, its newest half hour (the 10m
-    and 30m windows) downloads before the rest of its history and is drawn at
-    once, marked `loading older samples…` until the rest is in; a job short
-    enough that this saves no time downloads whole.
+    with nothing cached for the selected sub-job, the window on screen (the
+    newest 10 minutes, where every job opens; at most the newest half hour)
+    downloads before the rest of its history and is drawn at once, marked
+    `loading older samples…` until the rest is in; a job short enough that this
+    saves no time downloads whole. The download starts on a Snowflake session
+    the job's screen logged in once its first log lines were drawn (see
+    [Download sessions](rest-api.md#127-download-sessions)): the TUI keeps
+    one open for its downloads while it runs, and closes it when it quits.
 - **Training metrics** charts what the training sub-job's `/step` and
   `/fwd-bwd` calls returned, read from its own `training.jsonl`
   ([Training metrics download](rest-api.md#125-training-metrics-download)),

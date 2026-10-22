@@ -1806,6 +1806,24 @@ def _sql_string_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _artifact_login_options() -> dict[str, Any]:
+    """Connector options for the client's own LIST/GET sessions.
+
+    At login the Connector probes cloud metadata endpoints to report the platform
+    it runs on, and waits for every probe to give up: on a laptop that adds from
+    a fraction of a second to over two seconds to each login. A timeout of zero
+    skips the probes (Connector 3.17.2 and later); the login itself is
+    unchanged. A Connector without the option is left as it is.
+    """
+    try:
+        from snowflake.connector.connection import DEFAULT_CONFIGURATION
+    except ImportError:
+        return {}
+    if "platform_detection_timeout_seconds" not in DEFAULT_CONFIGURATION:
+        return {}
+    return {"platform_detection_timeout_seconds": 0.0}
+
+
 _PLAIN_IDENTIFIER_RE = re.compile(r"[A-Z_][A-Z0-9_$]*")
 
 
@@ -1946,6 +1964,11 @@ class CortexTrainingClient:
         self._sampling_max_seq_len: dict[str, int | None] = {}
         self._artifact_connection_config: dict[str, str] | None = None
         self._artifact_connection_factory: Callable[[], Any] | None = None
+        # Download sessions kept open for the next download (see keep_artifact_sessions),
+        # shared with for_job() children; and each job's experiment run, which never changes.
+        self._kept_sessions: _artifact_download.KeptSessions | None = None
+        self._experiment_runs: dict[str, tuple[str, str]] = {}
+        self._experiment_runs_lock = threading.Lock()
         self._auth_provider: SnowflakeProfileAuth | None = None
         # job_id -> monotonic time this client created it (see _definitive_not_found).
         self._recently_created_jobs: dict[str, float] = {}
@@ -1982,6 +2005,30 @@ class CortexTrainingClient:
                 FutureWarning,
                 stacklevel=2,
             )
+
+    @property
+    def keep_artifact_sessions(self) -> bool:
+        """Whether a download keeps its Snowflake session open for the next one.
+
+        False by default: each artifact download logs in and closes its session
+        when it returns. True keeps the session of a download that succeeded, up
+        to two per database and schema (two downloads can run at once), so the
+        next download starts with its first ``LIST``; a session idle for 30
+        minutes is closed instead of reused. For a long-lived reader such as the
+        TUI. :meth:`close` closes the kept sessions, as does setting this back to
+        False on the client that owns them; a client from :meth:`for_job` shares
+        them.
+        """
+        return self._kept_sessions is not None
+
+    @keep_artifact_sessions.setter
+    def keep_artifact_sessions(self, value: bool) -> None:
+        if value and self._kept_sessions is None:
+            self._kept_sessions = _artifact_download.KeptSessions()
+        elif not value and self._kept_sessions is not None:
+            kept, self._kept_sessions = self._kept_sessions, None
+            if self._owns_session:
+                kept.close()
 
     @classmethod
     def from_pat(
@@ -2124,6 +2171,9 @@ class CortexTrainingClient:
         """
         if not self._owns_session:
             return
+        kept, self._kept_sessions = self._kept_sessions, None
+        if kept is not None:
+            kept.close()  # never raises: a session it can't close expires by itself
         try:
             if self._metric_emitter is not None:
                 self._metric_emitter.close()
@@ -2906,6 +2956,7 @@ class CortexTrainingClient:
         client._telemetry_surface = self._telemetry_surface
         client._artifact_connection_config = self._artifact_connection_config
         client._artifact_connection_factory = self._artifact_connection_factory
+        client._kept_sessions = self._kept_sessions
         return client
 
     @_track_operation("cancel_job")
@@ -3029,7 +3080,14 @@ class CortexTrainingClient:
         return rows[0]
 
     def _experiment_run_uri(self, job_id: str) -> tuple[str, str]:
-        """Return the experiment run's ``snow://`` URI and run name."""
+        """Return the experiment run's ``snow://`` URI and run name.
+
+        A job's experiment run never changes, so each job's is read once per client.
+        """
+        with self._experiment_runs_lock:
+            known = self._experiment_runs.get(job_id)
+        if known is not None:
+            return known
         run = self.get_experiment_run(job_id)
         try:
             experiment_name = run["experiment_name"]
@@ -3040,10 +3098,10 @@ class CortexTrainingClient:
             raise ValueError("experiment-run response has invalid experiment_name")
         if not isinstance(run_name, str) or not run_name:
             raise ValueError("experiment-run response has invalid experiment_run_name")
-        return (
-            f"snow://experiment/{experiment_name}/versions/{run_name}/",
-            run_name,
-        )
+        found = (f"snow://experiment/{experiment_name}/versions/{run_name}/", run_name)
+        with self._experiment_runs_lock:
+            self._experiment_runs[job_id] = found
+        return found
 
     def _snowflake_connection_kwargs(self) -> dict[str, Any]:
         """Return connection kwargs derived from this client's PAT credentials."""
@@ -3080,7 +3138,29 @@ class CortexTrainingClient:
             )
         import snowflake.connector
 
-        return snowflake.connector.connect(**self._snowflake_connection_kwargs())
+        return snowflake.connector.connect(
+            **self._snowflake_connection_kwargs(), **_artifact_login_options()
+        )
+
+    def _artifact_session_key(self) -> tuple[str, str]:
+        """What a kept download session is kept under: it was opened for this schema."""
+        return (self.database, self.schema)
+
+    def warm_artifact_session(self, job_id: str) -> None:
+        """Get ready to download ``job_id``'s artifacts before asked to.
+
+        Reads the job's experiment run, which the client then keeps, and, while
+        :attr:`keep_artifact_sessions` is on and no session is kept for this
+        schema, logs one in and keeps it. The next download of the job then
+        starts with its first ``LIST``. Raises what reading the run or logging
+        in raises; nothing is kept then.
+        """
+        self._experiment_run_uri(job_id)
+        kept = self._kept_sessions
+        key = self._artifact_session_key()
+        if kept is None or kept.has(key):
+            return
+        kept.keep(key, self._open_experiment_artifact_connection())
 
     def create_snowpark_session(self) -> Any:
         """Create a Snowpark ``Session`` using this client's PAT credentials."""
@@ -3389,9 +3469,13 @@ class CortexTrainingClient:
         run_uri, run_name = self._experiment_run_uri(job_id)
         root = Path(output_dir).expanduser()
         shared = _artifact_download.SharedConnection(
-            self._open_experiment_artifact_connection, transfer_timeout_seconds
+            self._open_experiment_artifact_connection,
+            transfer_timeout_seconds,
+            kept=self._kept_sessions,
+            key=self._artifact_session_key(),
         )
         policy = self._artifact_retry_policy
+        succeeded = False
         try:
             started = time.monotonic()
             targets: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
@@ -3448,11 +3532,12 @@ class CortexTrainingClient:
                     results.append(saved)
             finally:
                 values["fetch_ms"] = round((time.monotonic() - started) * 1000, 3)
+            succeeded = True
             return results
         finally:
             values["artifact_retry_count"] = shared.retry_count
             values["transfer_timeout_count"] = shared.transfer_timeout_count
-            shared.close()
+            shared.close(keep=succeeded)
 
     def _save_execution_log(
         self,
@@ -4141,19 +4226,27 @@ class CortexTrainingClient:
         """
         policy = self._artifact_retry_policy
         artifact_roots = (f"_{artifact_name}", f"checkpoints/_{artifact_name}")
-        by_root: dict[str, dict[str, dict[str, str]]] = {}
-        for artifact_root in artifact_roots:
-            paths = _artifact_download.call_with_retry(
+
+        def listed(artifact_root: str) -> list[str]:
+            return _artifact_download.call_with_retry(
                 shared,
                 policy,
                 f"LIST {artifact_root}",
-                lambda connection, artifact_root=artifact_root: (
-                    self._list_experiment_artifacts(
-                        connection, run_uri, run_name, artifact_root
-                    )
+                lambda connection: self._list_experiment_artifacts(
+                    connection, run_uri, run_name, artifact_root
                 ),
                 cancel,
             )
+
+        # Both at once, each on its own cursor: a LIST is mostly round-trip latency.
+        later = _artifact_download.Beside(
+            functools.partial(listed, artifact_roots[1]), name="cortex-training-list"
+        )
+        listings = {artifact_roots[0]: listed(artifact_roots[0])}
+        listings[artifact_roots[1]] = later.result()
+        by_root: dict[str, dict[str, dict[str, str]]] = {}
+        for artifact_root in artifact_roots:
+            paths = listings[artifact_root]
             prefix = artifact_root + "/"
             for relative_path in paths:
                 after_root = relative_path.removeprefix(prefix)
@@ -4564,12 +4657,16 @@ class CortexTrainingClient:
 
         run_uri, run_name = self._experiment_run_uri(job_id)
         shared = _artifact_download.SharedConnection(
-            self._open_experiment_artifact_connection, transfer_timeout_seconds
+            self._open_experiment_artifact_connection,
+            transfer_timeout_seconds,
+            kept=self._kept_sessions,
+            key=self._artifact_session_key(),
         )
         root = Path(output_dir).expanduser()
         stall_cancel = threading.Event()
         # True once output is on disk that a resumed download would keep.
         saved = False
+        succeeded = False
         try:
             started = time.monotonic()
             chunks_by_sub_job, warnings_by_sub_job = self._list_gzip_chunks(
@@ -4695,6 +4792,7 @@ class CortexTrainingClient:
                 }
                 for sub_job_id in unsaved
             )
+            succeeded = True
             return sorted(results, key=lambda result: result["sub_job_id"])
         except BaseException as exc:
             if isinstance(exc, (DownloadCancelled, KeyboardInterrupt)):
@@ -4710,7 +4808,7 @@ class CortexTrainingClient:
             values["artifact_retry_count"] = shared.retry_count
             values["transfer_timeout_count"] = shared.transfer_timeout_count
             try:
-                shared.close()
+                shared.close(keep=succeeded)
             except BaseException as exc:
                 # Closing the session can block; Ctrl-C there keeps the flag.
                 self._mark_progress_saved(exc, saved)
