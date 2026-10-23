@@ -5357,8 +5357,9 @@ def test_a_job_screen_without_lines_warms_up_a_moment_after_it_opens(monkeypatch
     asyncio.run(_run_a_job_screen_without_lines_warms_up_a_moment_after_it_opens(monkeypatch))
 
 
-async def _run_a_warm_up_that_fails_shows_and_logs_nothing(tmp_path, monkeypatch):
-    # The download a tab asks for logs in itself and says what failed; the warm-up only saves it time.
+async def _run_a_warm_up_that_fails_shows_nothing_and_logs_it_once(tmp_path, monkeypatch):
+    # The download a tab asks for logs in itself and says what failed; the warm-up only saves it
+    # time. Its failure goes to the error log, once, for when the first chart is slow.
     monkeypatch.setattr(LogScreen, "_WARM_UP_AFTER_SECONDS", 0.05)
     c = _client()
     c.warm_artifact_session.side_effect = RuntimeError("login refused")
@@ -5369,11 +5370,13 @@ async def _run_a_warm_up_that_fails_shows_and_logs_nothing(tmp_path, monkeypatch
         assert isinstance(app.screen, LogScreen) and app.screen._screen_open
         assert not [note for note in app._notifications if "login refused" in str(note.message)]
         await _settle(app, pilot)
-    assert not (tmp_path / "errors.log").exists()
+    logged = (tmp_path / "errors.log").read_text()
+    assert logged.count("getting 7's downloads ready failed") == 1 and "login refused" in logged
+    assert c.warm_artifact_session.call_count == 1
 
 
-def test_a_warm_up_that_fails_shows_and_logs_nothing(tmp_path, monkeypatch):
-    asyncio.run(_run_a_warm_up_that_fails_shows_and_logs_nothing(tmp_path, monkeypatch))
+def test_a_warm_up_that_fails_shows_nothing_and_logs_it_once(tmp_path, monkeypatch):
+    asyncio.run(_run_a_warm_up_that_fails_shows_nothing_and_logs_it_once(tmp_path, monkeypatch))
 
 
 class _CountedSession:

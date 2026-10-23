@@ -148,6 +148,111 @@ def test_closing_closes_the_kept_sessions_and_any_kept_after():
 # ─── SharedConnection with kept sessions ────────────────────────────────────
 
 
+class _ClosedSession(_Session):
+    """A session the Connector reports closed."""
+
+    def is_closed(self):
+        return True
+
+
+def test_a_kept_session_the_connector_reports_closed_is_passed_over():
+    kept, live, dead = KeptSessions(), _Session(), _ClosedSession()
+    kept.keep("k", live)
+    kept.keep("k", dead)  # kept last, so it would be taken first
+    assert kept.has("k")  # the live one
+    assert kept.take("k") is live and dead.closes == 1
+    assert kept.take("k") is None and not kept.has("k")
+    only_dead = KeptSessions()
+    only_dead.keep("k", _ClosedSession())
+    assert not only_dead.has("k")  # a warm-up then logs a live one in
+
+
+class _Gone(Exception):
+    """What a call on a session the service has expired raises."""
+
+    errno = 390112
+
+
+class _Stale(_Session):
+    """A kept session gone stale in the pool: every call on it fails with ``error``."""
+
+    def __init__(self, error):
+        super().__init__()
+        self.error = error
+
+    def run(self):
+        raise self.error
+
+    cursor = run  # a download's first call on a connection
+
+
+class _Live(_Session):
+    def run(self):
+        return "listed"
+
+
+def _retrying(shared, sleeps, operation=lambda connection: connection.run()):
+    """``call_with_retry`` with a policy that records its backoffs in ``sleeps`` instead of waiting."""
+    policy = _artifact_download.RetryPolicy(sleep=sleeps.append)
+    return _artifact_download.call_with_retry(shared, policy, "LIST _metrics", operation)
+
+
+@pytest.mark.parametrize("error", [_Gone("session expired"), ConnectionError("connection reset by peer")],
+                         ids=["expired on the service", "its socket dropped"])
+def test_a_kept_session_gone_stale_in_the_pool_is_replaced_at_once_with_no_backoff(error):
+    # Expired is classed reconnect, a dropped socket retry: either way a fresh login, now.
+    kept, stale, opened, sleeps = KeptSessions(), _Stale(error), [], []
+    kept.keep("k", stale)
+    shared = SharedConnection(lambda: opened.append(_Live()) or opened[-1], kept=kept, key="k")
+    assert _retrying(shared, sleeps) == "listed"
+    assert sleeps == [] and len(opened) == 1  # no backoff before the one fresh login
+    shared.close(keep=True)
+    assert stale.closes == 1 and kept.take("k") is opened[0]  # the fresh one is kept, not the stale
+
+
+def test_a_kept_session_that_worked_and_then_fails_is_retried_as_any_other():
+    kept, opened, sleeps = KeptSessions(), [], []
+    kept.keep("k", _Live())
+    shared = SharedConnection(lambda: opened.append(_Live()) or opened[-1], kept=kept, key="k")
+    assert _retrying(shared, sleeps) == "listed"  # it is live
+    answers = iter([ConnectionError("blip"), "listed"])
+
+    def flaky(_connection):
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    assert _retrying(shared, sleeps, flaky) == "listed"
+    assert len(sleeps) == 1 and opened == []  # the policy's backoff, on the same session
+
+
+def test_a_fresh_login_that_fails_leaves_a_stale_kept_session_to_the_retry_policy():
+    kept, stale, opened, sleeps = KeptSessions(), _Stale(_Gone("session expired")), [], []
+    kept.keep("k", stale)
+    logins = iter([ConnectionError("login timed out"), None])
+
+    def log_in():
+        failure = next(logins)
+        if failure is not None:
+            raise failure
+        opened.append(_Live())
+        return opened[-1]
+
+    shared = SharedConnection(log_in, kept=kept, key="k")
+    assert _retrying(shared, sleeps) == "listed"
+    assert len(sleeps) == 1 and len(opened) == 1  # one backoff, then the policy's own reopen
+
+
+def test_a_session_with_something_left_running_on_it_is_closed_not_kept():
+    kept = KeptSessions()
+    shared = SharedConnection(_Session, kept=kept, key="k")
+    session = shared.current()[0]
+    shared.abandon()  # a listing still running on it, say
+    shared.close(keep=True)
+    assert session.closes == 1 and kept.take("k") is None
+
+
 def test_a_download_starts_on_the_kept_session_and_gives_it_back_once_it_succeeds():
     kept, warm, opened = KeptSessions(), _Session(), []
     kept.keep("k", warm)
@@ -250,6 +355,7 @@ def test_downloads_that_ran_at_once_each_keep_their_session_for_the_next_two(tmp
     client.download_metrics("job-1", tmp_path / "b")  # while the first runs: its own login
     release.set()
     first.join(5)
+    assert not first.is_alive()  # join's timeout returns quietly: a hung download fails here
     assert len(sessions) == 2 and not any(session.closed for session in sessions)
     both = [threading.Thread(target=lambda name=name: client.download_metrics("job-1", tmp_path / name))
             for name in ("c", "d")]
@@ -257,6 +363,7 @@ def test_downloads_that_ran_at_once_each_keep_their_session_for_the_next_two(tmp
         thread.start()
     for thread in both:
         thread.join(5)
+        assert not thread.is_alive()
     assert len(sessions) == 2  # each started on a kept one
     client.close()
     assert all(session.closed for session in sessions)
@@ -384,6 +491,104 @@ def test_a_listing_that_fails_fails_the_download(tmp_path, monkeypatch, failing)
     assert not (tmp_path / SUB / "gpu.jsonl").exists()
 
 
+def test_a_failed_first_listing_waits_for_the_other_before_its_session_is_closed(tmp_path, monkeypatch):
+    client, _sessions = _staged(monkeypatch, _chunks())
+    client.keep_artifact_sessions = True
+    # Classifying an error imports the Connector's error classes once, which can take longer
+    # than the listing below: done now, so only the download's own waiting is measured.
+    _artifact_download.classify_artifact_error(RuntimeError("warm the import"))
+    real = client_module.CortexTrainingClient._list_experiment_artifacts
+    side_started, order = threading.Event(), []
+
+    def listing(connection, run_uri, run_name, artifact_root):
+        if artifact_root == "_metrics":  # the first, on the download's own thread
+            assert side_started.wait(5)
+            raise RuntimeError("LIST _metrics denied")
+        side_started.set()
+        time.sleep(0.5)  # still running when the first fails
+        order.append("side listing done")
+        return real(connection, run_uri, run_name, artifact_root)
+
+    real_close = _FakeArtifactConnection.close
+
+    def close(connection):
+        order.append("session closed")
+        real_close(connection)
+
+    monkeypatch.setattr(client_module.CortexTrainingClient, "_list_experiment_artifacts", staticmethod(listing))
+    monkeypatch.setattr(_FakeArtifactConnection, "close", close)
+    with pytest.raises(RuntimeError, match="LIST _metrics denied"):
+        client.download_metrics("job-1", tmp_path)
+    assert order == ["side listing done", "session closed"]  # never closed under it
+    assert not client._kept_sessions.has(client._artifact_session_key())
+
+
+def test_a_side_listing_still_running_after_the_wait_leaves_its_session_closed(tmp_path, monkeypatch):
+    client, sessions = _staged(monkeypatch, _chunks())
+    client.keep_artifact_sessions = True
+    monkeypatch.setattr(client_module, "_SIDE_LISTING_WAIT_SECONDS", 0.2)
+    real = client_module.CortexTrainingClient._list_experiment_artifacts
+    side_started, release, side_ended = threading.Event(), threading.Event(), threading.Event()
+
+    def listing(connection, run_uri, run_name, artifact_root):
+        if artifact_root == "_metrics":
+            assert side_started.wait(5)
+            raise RuntimeError("LIST _metrics denied")
+        side_started.set()
+        try:
+            assert release.wait(5)  # stuck past the wait
+            return real(connection, run_uri, run_name, artifact_root)
+        finally:
+            side_ended.set()
+
+    monkeypatch.setattr(client_module.CortexTrainingClient, "_list_experiment_artifacts", staticmethod(listing))
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="LIST _metrics denied"):
+        client.download_metrics("job-1", tmp_path)
+    assert time.monotonic() - started < 3  # it waited its bound, not for the listing
+    assert sessions[0].closed and not client._kept_sessions.has(client._artifact_session_key())
+    release.set()
+    assert side_ended.wait(5)
+
+
+def test_a_download_on_a_kept_session_gone_stale_logs_in_afresh_at_once(tmp_path, monkeypatch):
+    # Both listings fail on the stale session at once: one logs in afresh, the other retries on
+    # that login, and neither waits a backoff first.
+    client, sessions = _staged(monkeypatch, _chunks())
+    client.keep_artifact_sessions = True
+    sleeps = []
+    client._artifact_retry_policy = _artifact_download.RetryPolicy(sleep=sleeps.append)
+    stale = _Stale(_Gone("session expired"))
+    client._kept_sessions.keep(client._artifact_session_key(), stale)
+    client.download_metrics("job-1", tmp_path)
+    assert (tmp_path / SUB / "gpu.jsonl").read_text() == "".join(f"{SUB} {i}\n" for i in range(3))
+    assert sleeps == [] and len(sessions) == 1 and stale.closes == 1
+    assert client._kept_sessions.take(client._artifact_session_key()) is sessions[0]
+
+
+def test_clients_from_for_job_share_the_runs_their_parent_read(monkeypatch):
+    client = _make_client()
+    reads = []
+    child = client.for_job({"database_name": "OTHER_DB", "schema_name": "OTHER_SCH"})
+    for reader in (client, child):
+        monkeypatch.setattr(reader, "get_experiment_run", lambda job_id: reads.append(job_id) or RUN)
+    assert client._experiment_run_uri("job-1") == child._experiment_run_uri("job-1") == (RUN_URI, "RUN_ABC")
+    assert child._experiment_run_uri("job-2") == client._experiment_run_uri("job-2")
+    assert reads == ["job-1", "job-2"]  # each job's run read once, by whichever client asked first
+
+
+def test_a_client_remembers_only_its_newest_jobs_runs(monkeypatch):
+    client = _make_client()
+    reads = []
+    monkeypatch.setattr(client, "get_experiment_run", lambda job_id: reads.append(job_id) or RUN)
+    monkeypatch.setattr(client_module, "_EXPERIMENT_RUNS_KEPT", 2)
+    for job_id in ("job-1", "job-2", "job-1", "job-3"):  # job-1, asked again, is newer than job-2
+        client._experiment_run_uri(job_id)
+    client._experiment_run_uri("job-1")  # still remembered
+    client._experiment_run_uri("job-2")  # forgotten: read again
+    assert reads == ["job-1", "job-2", "job-3", "job-2"]
+
+
 def test_artifact_logins_skip_the_connector_s_cloud_metadata_probes(monkeypatch):
     configuration = importlib.import_module("snowflake.connector.connection").DEFAULT_CONFIGURATION
     assert client_module._artifact_login_options() == {"platform_detection_timeout_seconds": 0.0}
@@ -424,4 +629,5 @@ def test_closing_a_client_waits_for_no_download_to_finish(tmp_path, monkeypatch)
     assert time.monotonic() - started < 1
     release.set()
     downloading.join(5)
+    assert not downloading.is_alive()
     assert sessions[0].closed  # given back after close(): closed at once

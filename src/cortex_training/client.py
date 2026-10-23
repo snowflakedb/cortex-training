@@ -54,6 +54,7 @@ import threading
 import time
 import warnings
 import uuid
+from collections import OrderedDict
 from collections import deque
 from collections.abc import Callable
 from collections.abc import Iterable
@@ -119,6 +120,11 @@ _TRAINING_METRICS_CHUNK_RE = re.compile(
     r"^training\.(?P<timestamp>\d{8}-\d{6})\.(?P<suffix>[^./\\]+)\.gz$"
 )
 _STREAM_COPY_BUFFER_BYTES = 1024 * 1024
+# How long a chunked download whose first listing failed waits for its other listing, which
+# runs on the same session, before that session is closed (never kept) under it.
+_SIDE_LISTING_WAIT_SECONDS = 10.0
+# How many jobs' experiment runs a client, and the clients for_job makes from it, remember.
+_EXPERIMENT_RUNS_KEPT = 256
 
 # Env var that unlocks create-job debug options. These are an internal-only
 # capability and are deliberately not documented for external use: the client
@@ -1964,10 +1970,11 @@ class CortexTrainingClient:
         self._sampling_max_seq_len: dict[str, int | None] = {}
         self._artifact_connection_config: dict[str, str] | None = None
         self._artifact_connection_factory: Callable[[], Any] | None = None
-        # Download sessions kept open for the next download (see keep_artifact_sessions),
-        # shared with for_job() children; and each job's experiment run, which never changes.
+        # Download sessions kept open for the next download (see keep_artifact_sessions), and
+        # each job's experiment run, which never changes (the newest _EXPERIMENT_RUNS_KEPT
+        # jobs'); for_job() children share both.
         self._kept_sessions: _artifact_download.KeptSessions | None = None
-        self._experiment_runs: dict[str, tuple[str, str]] = {}
+        self._experiment_runs: OrderedDict[str, tuple[str, str]] = OrderedDict()
         self._experiment_runs_lock = threading.Lock()
         self._auth_provider: SnowflakeProfileAuth | None = None
         # job_id -> monotonic time this client created it (see _definitive_not_found).
@@ -2023,6 +2030,9 @@ class CortexTrainingClient:
 
     @keep_artifact_sessions.setter
     def keep_artifact_sessions(self, value: bool) -> None:
+        # No lock: a download running across the swap gives its session back to the pool it
+        # started with, which closes any session given back after its close(). The race costs
+        # that download its pooling, never a leaked or doubly used session.
         if value and self._kept_sessions is None:
             self._kept_sessions = _artifact_download.KeptSessions()
         elif not value and self._kept_sessions is not None:
@@ -2957,6 +2967,8 @@ class CortexTrainingClient:
         client._artifact_connection_config = self._artifact_connection_config
         client._artifact_connection_factory = self._artifact_connection_factory
         client._kept_sessions = self._kept_sessions
+        client._experiment_runs = self._experiment_runs
+        client._experiment_runs_lock = self._experiment_runs_lock
         return client
 
     @_track_operation("cancel_job")
@@ -3082,10 +3094,14 @@ class CortexTrainingClient:
     def _experiment_run_uri(self, job_id: str) -> tuple[str, str]:
         """Return the experiment run's ``snow://`` URI and run name.
 
-        A job's experiment run never changes, so each job's is read once per client.
+        A job's experiment run never changes, so it is read once for a client and every client
+        :meth:`for_job` makes from it, which share what they read. The newest
+        ``_EXPERIMENT_RUNS_KEPT`` jobs' are remembered; an older one is read again when asked for.
         """
         with self._experiment_runs_lock:
             known = self._experiment_runs.get(job_id)
+            if known is not None:
+                self._experiment_runs.move_to_end(job_id)
         if known is not None:
             return known
         run = self.get_experiment_run(job_id)
@@ -3101,6 +3117,9 @@ class CortexTrainingClient:
         found = (f"snow://experiment/{experiment_name}/versions/{run_name}/", run_name)
         with self._experiment_runs_lock:
             self._experiment_runs[job_id] = found
+            self._experiment_runs.move_to_end(job_id)
+            while len(self._experiment_runs) > _EXPERIMENT_RUNS_KEPT:
+                self._experiment_runs.popitem(last=False)
         return found
 
     def _snowflake_connection_kwargs(self) -> dict[str, Any]:
@@ -4242,8 +4261,16 @@ class CortexTrainingClient:
         later = _artifact_download.Beside(
             functools.partial(listed, artifact_roots[1]), name="cortex-training-list"
         )
-        listings = {artifact_roots[0]: listed(artifact_roots[0])}
-        listings[artifact_roots[1]] = later.result()
+        try:
+            first = listed(artifact_roots[0])
+        except BaseException:
+            # The other listing runs on this download's session, which the caller closes or
+            # keeps next: not under it. One still running after a while is left to finish on a
+            # session that is then closed, never kept.
+            if not later.wait(_SIDE_LISTING_WAIT_SECONDS):
+                shared.abandon()
+            raise
+        listings = {artifact_roots[0]: first, artifact_roots[1]: later.result()}
         by_root: dict[str, dict[str, dict[str, str]]] = {}
         for artifact_root in artifact_roots:
             paths = listings[artifact_root]

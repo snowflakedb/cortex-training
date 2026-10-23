@@ -3025,11 +3025,15 @@ not accept their operation type. See
 
 Each artifact read in sections 12.2 to 12.5 resolves the job's experiment run
 (`GET /{job_id}/experiment-run`) and then lists and fetches on a Connector
-session. A client resolves each job's experiment run once and reuses it, since
-a job's run never changes; a failed read is not kept, so the next call tries
-again. A chunked download (stdout, GPU metrics, training metrics) lists its
-two roots, `_{name}/` and `checkpoints/_{name}/`, at the same time, each on
-its own cursor.
+session. A client, and every client `for_job()` makes from it, resolves each
+job's experiment run once and reuses it, since a job's run never changes: they
+share what they read, and remember the newest 256 jobs' runs. A failed read is
+not kept, so the next call tries again. A chunked download (stdout, GPU
+metrics, training metrics) lists its two roots, `_{name}/` and
+`checkpoints/_{name}/`, at the same time, each on its own cursor. If the first
+listing fails, the download waits up to 10 seconds for the second, which runs
+on the same session, before it closes that session; one still running then
+finishes on a session that is closed, never kept.
 
 A PAT client opens its sessions with `platform_detection_timeout_seconds=0`
 (Connector 3.17.2 and later), which skips the Connector's cloud-metadata
@@ -3044,11 +3048,14 @@ they return, and `fetch_execution_logs` always does. Setting
 `keep_artifact_sessions = True` on the client keeps the session of a download
 that succeeded, up to two per database and schema (two downloads can run at
 once), for the next download, which then starts with its first `LIST` instead
-of a login. A session idle for
-30 minutes is closed instead of reused, and a session that expires while kept
-is reopened as any expired session is. A download that fails or is cancelled,
-or that abandoned an attempt past `transfer_timeout_seconds`, closes its
-session. `close()` closes the kept sessions, and so does setting
+of a login. A session idle for 30 minutes is closed instead of reused, and one
+the Connector reports closed is never handed out. A kept session whose first
+call fails before any call on it has worked, because it expired on the service
+or its connection dropped while kept, is replaced at once by a fresh login,
+without the retry backoff and without using one of the retries; if that fresh
+login fails, the usual retries take over. A download that fails or is
+cancelled, that abandoned an attempt past `transfer_timeout_seconds`, or that
+left a listing running on its session, closes its session. `close()` closes the kept sessions, and so does setting
 `keep_artifact_sessions` back to `False` on the client that owns them; a
 client from `for_job()` shares them and closes none.
 
@@ -3060,8 +3067,11 @@ resolving the run or logging in raises, and then keeps nothing.
 The TUI keeps sessions while it runs. It calls `warm_artifact_session` once a
 job's screen has drawn its first log lines (or 1.5 seconds after the screen
 opens, when no lines come), so that the job's first Resources or Training
-metrics download starts with its listing. When the TUI quits, it closes the
-sessions it kept, waiting at most a second.
+metrics download starts with its listing. A warm-up that fails shows nothing on
+screen, as the download then logs in itself and says what failed; its
+traceback goes to the TUI's error log (`~/.cortex-training-errors.log`), once
+per job screen. When the TUI quits, it closes the sessions it kept, waiting at
+most a second.
 
 ---
 

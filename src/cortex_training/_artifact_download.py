@@ -228,6 +228,18 @@ class SessionClosed(RuntimeError):
     """The download's session was closed; a late attempt must not reopen it."""
 
 
+def _reports_closed(connection: Any) -> bool:
+    """Whether the Connector says ``connection`` is closed; a connection that can't say is open,
+    and one whose answer raises is taken as closed."""
+    is_closed = getattr(connection, "is_closed", None)
+    if not callable(is_closed):
+        return False
+    try:
+        return bool(is_closed())
+    except Exception:  # noqa: BLE001 - it can't even say: no use reusing it
+        return True
+
+
 class KeptSessions:
     """Connector sessions kept open between downloads, a few per key, so the next
     download under that key starts without logging in.
@@ -256,11 +268,18 @@ class KeptSessions:
         self._closed = False
 
     def take(self, key: Hashable) -> Any | None:
-        """A session kept under ``key``, which the caller then owns; None without one."""
+        """A session kept under ``key``, which the caller then owns; None without one. One the
+        Connector reports closed is closed here and passed over: it can serve nothing."""
         with self._lock:
             stale = self._drop_stale(key)
             kept = self._kept.get(key)
-            found = kept.pop()[0] if kept else None
+            found = None
+            while kept and found is None:
+                connection = kept.pop()[0]
+                if _reports_closed(connection):
+                    stale.append(connection)
+                else:
+                    found = connection
             if kept == []:
                 del self._kept[key]
         for connection in stale:
@@ -270,7 +289,8 @@ class KeptSessions:
     def has(self, key: Hashable) -> bool:
         """Whether a session is kept under ``key`` that :meth:`take` would return."""
         with self._lock:
-            return any(self._clock() - since <= self._idle_seconds for _c, since in self._kept.get(key, []))
+            return any(self._clock() - since <= self._idle_seconds and not _reports_closed(connection)
+                       for connection, since in self._kept.get(key, []))
 
     def keep(self, key: Hashable, connection: Any) -> None:
         """Keep ``connection`` under ``key``; close it when ``per_key`` are kept there
@@ -345,8 +365,13 @@ class SharedConnection:
         connection = kept.take(key) if kept is not None else None
         self._connection = connection if connection is not None else opener()
         self._generation = 0
+        # The generation of a kept session this download started on, until an attempt on it
+        # succeeds (or the fresh login replacing it fails): see replace_stale_kept.
+        self._stale_suspect: int | None = 0 if connection is not None else None
         self._replaced: list[Any] = []
         self._closed = False
+        # Something still runs on the connection without an attempt to wait for (see abandon).
+        self._abandoned = False
 
     def note_attempt_failure(self, exc: BaseException, *, retried: bool) -> None:
         with self._lock:
@@ -354,6 +379,48 @@ class SharedConnection:
                 self.retry_count += 1
             if isinstance(exc, TransferTimeout):
                 self.transfer_timeout_count += 1
+
+    def note_attempt_success(self, generation: int) -> None:
+        """An attempt on ``generation`` succeeded: a kept session it was is live after all."""
+        with self._lock:
+            if generation == self._stale_suspect:
+                self._stale_suspect = None
+
+    def replace_stale_kept(self, generation: int) -> bool:
+        """For an attempt that failed on ``generation``: whether it should run again at once on a
+        fresh session, with no backoff and without counting against the retry policy.
+
+        It should when ``generation`` is the kept session this download started on and no
+        attempt on it has succeeded: it most likely went stale while it sat in the pool,
+        expired on the service or its socket dropped, and retrying on it would wait a backoff
+        or fail again. The first such failure logs in afresh; another thread's failure on the
+        same session then retries on that fresh login. A fresh login that fails leaves the
+        attempt to the retry policy.
+        """
+        with self._lock:
+            if self._closed:
+                raise SessionClosed("the artifact download session is closed")
+            if generation != self._stale_suspect:
+                return False
+            if generation != self._generation:
+                return True  # already replaced: the fresh session, at once
+            self._stale_suspect = None  # once only, whether or not the login works
+            try:
+                fresh = self._opener()
+            except Exception:  # noqa: BLE001 - the retry policy reopens it, with its backoff
+                logger.debug("logging in afresh after a stale kept session failed", exc_info=True)
+                return False
+            self._replaced.append(self._connection)
+            self._connection = fresh
+            self._generation += 1
+            self._stale_suspect = generation  # attempts that failed on it retry on the fresh one
+            return True
+
+    def abandon(self) -> None:
+        """Something left running on the connection cannot be waited for: the connection is
+        then closed at the end of the download, never kept, as after a timed-out attempt."""
+        with self._lock:
+            self._abandoned = True
 
     def current(self) -> tuple[Any, int]:
         with self._lock:
@@ -376,12 +443,13 @@ class SharedConnection:
     def close(self, *, keep: bool = False) -> None:
         """Close the connections. With ``keep`` (a download that succeeded), the current one
         goes to the kept sessions instead, for the next download, unless an attempt on it was
-        abandoned (see :func:`run_bounded`): that attempt may still be running on it."""
+        abandoned (see :func:`run_bounded` and :meth:`abandon`): it may still be running on it."""
         with self._lock:
             self._closed = True
             replaced, self._replaced = self._replaced, []
             current = self._connection
-            keep = keep and self._kept is not None and self.transfer_timeout_count == 0
+            keep = (keep and self._kept is not None and self.transfer_timeout_count == 0
+                    and not self._abandoned)
         # A close error must not fail a finished download or hide its real error.
         for connection in replaced if keep else [*replaced, current]:
             try:
@@ -474,12 +542,14 @@ def call_with_retry(
             raise DownloadCancelled(f"{description} cancelled")
         connection, generation = shared.current()
         try:
-            return run_bounded(
+            result = run_bounded(
                 lambda: operation(connection),
                 timeout=shared.transfer_timeout,
                 cancel=cancel,
                 description=description,
             )
+            shared.note_attempt_success(generation)
+            return result
         except DownloadCancelled:
             raise
         except Exception as exc:
@@ -488,6 +558,13 @@ def call_with_retry(
                 # being removed under an in-flight GET) are not worth reporting.
                 raise DownloadCancelled(f"{description} cancelled") from exc
             kind = classify_artifact_error(exc)
+            if kind is not None and shared.replace_stale_kept(generation):
+                # A kept session failed before any attempt on it worked: it went stale in the
+                # pool. Again at once on a fresh login, rather than a backoff on the old one.
+                shared.note_attempt_failure(exc, retried=True)
+                logger.info("%s failed on a kept session (%s); trying a fresh one", description,
+                            type(exc).__name__)
+                continue
             retried = kind is not None and attempt < policy.attempts
             shared.note_attempt_failure(exc, retried=retried)
             if not retried:
@@ -957,6 +1034,10 @@ class Beside:
         if self._error:
             raise self._error[0]
         return self._outcome[0]
+
+    def wait(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` seconds for ``operation`` to end; whether it did."""
+        return self._done.wait(timeout)
 
 
 class Spool:

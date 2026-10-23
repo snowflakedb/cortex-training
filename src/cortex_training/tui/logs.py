@@ -25,7 +25,6 @@ console and what the screen shares.
 from __future__ import annotations
 import codecs
 import inspect
-import logging
 import os
 import re
 import shlex
@@ -127,8 +126,6 @@ from cortex_training.tui.widgets import is_shown
 from cortex_training.tui.widgets import on_stack
 from cortex_training.tui.resource_view import ResourceTab
 from cortex_training.tui.checkpoint_view import CheckpointTab
-
-logger = logging.getLogger(__name__)
 
 
 class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
@@ -422,7 +419,9 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         try:
             warm(self._job_id)
         except Exception:  # noqa: BLE001 - the download logs in itself, and says what failed
-            logger.debug("warming the artifact session for %s failed", self._job_id, exc_info=True)
+            # Not on screen, where the download says what failed, but in the error log, once per
+            # job screen: the place to look when a job's first chart is slow.
+            log_traceback(f"getting {self._job_id}'s downloads ready failed")
 
     def _download_training_metrics(self, *, priority, on_commit, cancelled) -> bool:
         """Worker thread. The Training metrics tab's download: the zone's own training rows,
