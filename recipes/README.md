@@ -14,8 +14,9 @@ under its `configs/` directory.
 | [On-policy distillation](distillation/README.md) | Distillation from a frozen teacher | GSM8K | Runnable |
 | [Inference endpoint](inference/README.md) | Serve, generate, eval | Open weights, checkpoints, MATH-500, GSM8K, identity | Runnable |
 
-GRPO can also be run from [SkyRL](../docs/integrations/skyrl.md), which uses its
-own entry point and install rather than the prerequisites below.
+GRPO can also be run from [SkyRL](../docs/integrations/skyrl.md) or
+[prime-rl](../docs/integrations/prime-rl.md), which use their own entry points
+and installs rather than the prerequisites below.
 
 ## Prerequisites
 
