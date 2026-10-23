@@ -1081,14 +1081,13 @@ box unless the service sends a reason. The Sub-jobs card shows type, status
 screens omit Type, and wider tables scroll with `←` / `→` or `Home` / `End`;
 the card's bottom border says so (`e whole table`, `← → scroll`).
 
-The Config card under it follows the highlighted row: that sub-job's config as
-submitted, as indented JSON by key (as the checkpoint card shows a config), or,
-on the entire-job row, each sub-job's under its name, side by side when each
-has at least 40 cells. Nothing derived is added; whole-number floats drop the
-`.0`, and a list of plain values stays on one line (`"betas": [0.9, 0.95]`). A
-multiplexed sub-job's `multiplex_job_id`, the sub-job whose GPUs it runs on,
-comes first. A line wider than its column is cut with `…` until `e`, which
-also puts the sub-jobs one under the other.
+The Config card under it follows the highlighted row: that sub-job's submitted
+config, exactly as `cortex-training get JOB_ID` prints that sub-job's entry
+(indented JSON by key, values as the service returns them, aliases as
+submitted), without the fields the service adds (`sub_job_id`, `status`). On
+the entire-job row, each sub-job's goes under its name, side by side when each
+has at least 40 cells. A line wider than its column is cut with `…` until `e`,
+which also puts the sub-jobs one under the other.
 
 Live previews refresh every 60 seconds, on return from details, or on `r`; a
 dim line at the end of the job card reports reads, slow reads and refresh

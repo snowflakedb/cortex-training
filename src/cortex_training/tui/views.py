@@ -37,7 +37,6 @@ from typing import Optional
 import requests
 from rich.cells import cell_len
 
-from cortex_training.tui.checkpoints import compact_numbers
 from cortex_training.tui.format import _ACTIVE_STATUSES as ACTIVE_STATUSES
 from cortex_training.tui.format import _num as compact_number
 from cortex_training.tui.format import cut_cells
@@ -482,51 +481,18 @@ def within_retention(job: dict, now: datetime, days: int = RETENTION_DAYS) -> bo
     return created is None or (now - created).total_seconds() <= days * 86400
 
 
-def _config_order(item: tuple) -> tuple:
-    """By key, ``multiplex_job_id`` first: where a sub-job's GPUs come from."""
-    return item[0] != "multiplex_job_id", str(item[0])
-
-
-def _ordered(value: Any) -> Any:
-    """``value`` (decoded JSON) with each object's keys in :func:`_config_order`."""
-    if isinstance(value, dict):
-        return {key: _ordered(item) for key, item in sorted(value.items(), key=_config_order)}
-    if isinstance(value, list):
-        return [_ordered(item) for item in value]
-    return value
+# A sub-job entry's fields the service adds, not part of what was submitted (and
+# the label :func:`sub_jobs` adds to an entry without an id).
+_NOT_SUBMITTED = frozenset({"sub_job_id", "status", "label"})
 
 
 def subjob_config_json(sj: dict) -> list:
-    """One sub-job's config as submitted, as the lines of indented JSON, as the
-    checkpoint card shows a config: by key, whole floats as ints, nothing added
-    or left out. A multiplexed sub-job's ``multiplex_job_id`` comes first."""
-    cfg = compact_numbers(printable_data(_type_config(sj)))
-    return _json_lines(_ordered(cfg), "")
-
-
-def _json_lines(value: Any, indent: str) -> list:
-    """``value`` as indented JSON lines; a list of plain values on one line."""
-    def dump(item: Any) -> str:
-        return json.dumps(item, ensure_ascii=False, default=str)
-
-    if isinstance(value, dict) and value:
-        lines = ["{"]
-        for i, (key, item) in enumerate(value.items()):
-            comma = "," if i < len(value) - 1 else ""
-            inner = _json_lines(item, indent + "  ")
-            lines.append(f"{indent}  {dump(key)}: {inner[0]}")
-            lines += inner[1:]
-            lines[-1] += comma
-        return [*lines, f"{indent}}}"]
-    if isinstance(value, list) and any(isinstance(item, (dict, list)) and item for item in value):
-        lines = ["["]
-        for i, item in enumerate(value):
-            inner = _json_lines(item, indent + "  ")
-            lines.append(f"{indent}  {inner[0]}")
-            lines += inner[1:]
-            lines[-1] += "," if i < len(value) - 1 else ""
-        return [*lines, f"{indent}]"]
-    return [dump(value)]
+    """One sub-job's submitted config as the lines ``cortex-training get`` prints
+    for it: its entry in the job record (type, model, dtype, seed and its
+    training or inference config) without the fields the service adds, as
+    indented JSON by key, values exactly as the service returned them."""
+    submitted = {key: value for key, value in sj.items() if key not in _NOT_SUBMITTED}
+    return json.dumps(submitted, indent=2, sort_keys=True, default=str).splitlines()
 
 
 def preview_facts(job: dict, now: datetime) -> list:
