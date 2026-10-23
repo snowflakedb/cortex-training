@@ -425,18 +425,16 @@ class JobSummaryScreen(FollowsPointer, Screen):
                                Text(v.sub_job_gpu_text(sj))]))
         return rows
 
-    # The config card's columns: each at least this many cells, at most this many
-    # of them, a key column of at most this share of its column, and fewer
-    # columns while less than this share of the keys fit beside their values.
+    # Sub-jobs' configs go side by side on the job's row while each column has
+    # at least this many cells, else one under the other.
     _CONFIG_COLUMN_LEAST = 40
-    _CONFIG_COLUMNS_MOST = 3
-    _CONFIG_KEY_SHARE = 0.6
-    _CONFIG_KEYS_BESIDE = 0.8
+    _JSON_KEY = re.compile(r'^(\s*)("(?:[^"\\]|\\.)*")(: )(.*)$')
 
     def _render_config(self, width: int) -> bool:
-        """Fill the config card for the highlighted row: that sub-job's config, or
-        on the job's row (and the "status unavailable" one), each sub-job's in
-        turn under its name. Return whether a value is (or, expanded, would be) cut."""
+        """Fill the config card for the highlighted row: that sub-job's config as
+        indented JSON, or on the job's row (and the "status unavailable" one),
+        each sub-job's under its name, side by side when they fit. Return whether
+        a line is (or, expanded, would be) cut."""
         card = self.query_one("#config-card")
         subs = list(self._sub_job_by_row.values())
         picked = self._sub_job_by_row.get(self._highlighted_key())
@@ -444,97 +442,55 @@ class JobSummaryScreen(FollowsPointer, Screen):
         whose = v.sub_job_label(shown[0]) if len(shown) == 1 else "every sub-job"
         card.border_title = Content.assemble((" Config ", f"bold {theme.TEXT}"), (f"· {whose} ", theme.MUTED))
         card.border_subtitle = Content.styled(" as submitted ", theme.MUTED)
+        body = self.query_one("#config", Static)
         if not shown:
-            self.query_one("#config", Static).update(
-                Content.styled("the service sent no sub-job configs", theme.FAINT))
+            body.update(Content.styled("the service sent no sub-job configs", theme.FAINT))
             return False
-        rows, long = [], False
+        blocks = []  # each sub-job's rows: its name (when more than one), then its JSON
         for sj in shown:
-            if len(shown) > 1:  # a section per sub-job, after a blank row
-                if rows:
-                    rows.append(Content(""))
+            head = []
+            if len(shown) > 1:
                 model = str(sj.get("model_name") or "")
-                rows.append(Content.assemble((v.sub_job_label(sj), f"bold {theme.TEXT}"),
-                                             *([(f"   {v.printable(model)}", theme.MUTED)] if model else [])))
-            items = v.subjob_config_items(sj)
-            if not items:
-                rows.append(Content.styled("no config sent", theme.FAINT))
-                continue
-            grid, cut = self._config_grid(items, width)
-            rows += grid
-            long = long or cut
-        self.query_one("#config", Static).update(Content("\n").join(rows))
+                head = [Content.assemble((v.sub_job_label(sj), f"bold {theme.TEXT}"),
+                                         *([(f"   {v.printable(model)}", theme.MUTED)] if model else []))]
+            lines = v.subjob_config_json(sj)
+            blocks.append((head, [] if lines == ["{}"] else lines))
+        count = len(blocks)
+        column = (width - self._GUTTER * (count - 1)) // count
+        if self._expanded or column < self._CONFIG_COLUMN_LEAST:
+            count, column = 1, width
+        long = False
+        columns = []
+        for head, lines in blocks:
+            rows = list(head)
+            for line in lines or ["no config sent"]:
+                long = long or v.cell_width(line) > column
+                cut = line if self._expanded else v.fit_cells(line, column)
+                rows.append(self._json_row(cut) if lines else Content.styled(cut, theme.FAINT))
+            columns.append(rows)
+        if count == 1:  # one under the other, a blank row between
+            out = []
+            for rows in columns:
+                out += ([Content("")] if out else []) + rows
+        else:
+            out = []
+            for i in range(max(len(rows) for rows in columns)):
+                row = Content("")
+                for c, rows in enumerate(columns):
+                    if i < len(rows):
+                        row = row + Content(" " * (c * (column + self._GUTTER) - row.cell_length)) + rows[i]
+                out.append(row)
+        body.update(Content("\n").join(out))
         return long
 
-    @staticmethod
-    def _config_key(key: str) -> Content:
-        """A dotted config key, its parents fainter than its own name."""
-        parent, dot, leaf = key.rpartition(".")
-        return Content.assemble((parent + dot, theme.FAINT), (leaf, theme.MUTED))
-
-    def _config_key_rows(self, key: str, width: int) -> list:
-        """A key too long for its column's key column, whole, in rows of ``width``
-        cells broken after a dot where it can be, each row after the first indented."""
-        rows, row = [], ""
-        for part in (p for segment in re.findall(r"[^.]+\.?|\.", key)
-                     for p in v.wrap_cells(segment, width - 2)):
-            if row and v.cell_width(row) + v.cell_width(part) > (width if not rows else width - 2):
-                rows.append(row)
-                row = ""
-            row += part
-        rows.append(row)
-        # Each row's own parents and name: the key's last segment is its name.
-        return [Content("  " if i else "") + (self._config_key(text) if i == len(rows) - 1
-                                              else Content.styled(text, theme.FAINT))
-                for i, text in enumerate(rows)]
-
-    def _config_grid(self, items: list, width: int) -> tuple:
-        """``(rows, long)``: config ``(key, value)`` rows in ``width`` cells, down
-        as many columns as fit and then the next, each value wrapped beside its
-        key and, without e, cut after a few rows."""
-        most = max(1, min(self._CONFIG_COLUMNS_MOST, len(items),
-                          (width + self._GUTTER) // (self._CONFIG_COLUMN_LEAST + self._GUTTER)))
-        keys = [v.cell_width(key) for key, _ in items]
-        for count in range(most, 0, -1):  # the most columns whose key column holds nearly every key
-            column = (width - self._GUTTER * (count - 1)) // count
-            fits = sum(w <= int(column * self._CONFIG_KEY_SHARE) for w in keys)
-            if fits >= self._CONFIG_KEYS_BESIDE * len(keys):
-                break
-        per = -(-len(items) // count)
-        chunks = [items[i:i + per] for i in range(0, len(items), per)]
-        long = False
-        cells = []  # each column's items, each item its rows
-        for chunk in chunks:
-            # The key column fits the column's longest key within its share; a
-            # longer key takes rows of its own, whole, its value under it.
-            cap = int(column * self._CONFIG_KEY_SHARE)
-            key_width = max([w for w in (v.cell_width(key) for key, _ in chunk) if w <= cap] or [cap])
-            value_width = max(10, column - key_width - 2)
-            pad = Content(" " * (key_width + 2))
-            out = []
-            for key, value in chunk:
-                lines = self._value_lines(value, value_width)
-                if len(lines) > self._VALUE_ROWS:
-                    long = True
-                    if not self._expanded:
-                        lines = self._cut_rows(lines, self._VALUE_ROWS, value_width)
-                values = [Content.styled(line, theme.TEXT) for line in lines]
-                if v.cell_width(key) <= key_width:
-                    label = self._config_key(key) + Content(" " * (key_width - v.cell_width(key) + 2))
-                    out.append([label + values[0], *(pad + value for value in values[1:])])
-                else:
-                    out.append([*self._config_key_rows(key, column), *(pad + value for value in values)])
-            cells.append(out)
-        rows = []
-        for i in range(per):  # the i-th item of each column side by side, as tall as the tallest
-            group = [col[i] if i < len(col) else [] for col in cells]
-            for r in range(max(len(item) for item in group)):
-                row = Content("")
-                for c, item in enumerate(group):
-                    if r < len(item):
-                        row = row + Content(" " * (c * (column + self._GUTTER) - row.cell_length)) + item[r]
-                rows.append(row)
-        return rows, long
+    def _json_row(self, line: str) -> Content:
+        """A line of the config's JSON: its key dimmer than its value, its brackets faint."""
+        match = self._JSON_KEY.match(line)
+        if match:
+            indent, key, colon, rest = match.groups()
+            return Content.assemble(indent, (key, theme.MUTED), (colon, theme.FAINT),
+                                    (rest, theme.FAINT if rest in ("{", "[") else theme.TEXT))
+        return Content.styled(line, theme.FAINT if line.strip().rstrip(",") in ("{", "}", "[", "]") else theme.TEXT)
 
     def _table_width(self, table: DataTable, rows: int) -> int:
         """Available table cells, accounting for a needed vertical scrollbar."""

@@ -1082,15 +1082,13 @@ screens omit Type, and wider tables scroll with `←` / `→` or `Home` / `End`;
 the card's bottom border says so (`e whole table`, `← → scroll`).
 
 The Config card under it follows the highlighted row: that sub-job's config as
-submitted, or, on the entire-job row, each sub-job's under its name. It lists
-one key per row, by key, in as many columns as the screen fits (up to three;
-fewer when the keys are long, so that nearly every key fits beside its value),
-with nothing derived added. A nested object's keys are dotted under their
-parent (`optimizer.lr  1e-05`, as the job list's filter spells them), a list
-stays on one row (`optimizer.betas  [0.9, 0.95]`), and whole-number floats
-drop the `.0`. A multiplexed sub-job's `multiplex_job_id`, the sub-job whose
-GPUs it runs on, comes first. Values longer than three rows are cut with `…`
-until `e`.
+submitted, as indented JSON by key (as the checkpoint card shows a config), or,
+on the entire-job row, each sub-job's under its name, side by side when each
+has at least 40 cells. Nothing derived is added; whole-number floats drop the
+`.0`, and a list of plain values stays on one line (`"betas": [0.9, 0.95]`). A
+multiplexed sub-job's `multiplex_job_id`, the sub-job whose GPUs it runs on,
+comes first. A line wider than its column is cut with `…` until `e`, which
+also puts the sub-jobs one under the other.
 
 Live previews refresh every 60 seconds, on return from details, or on `r`; a
 dim line at the end of the job card reports reads, slow reads and refresh

@@ -22,6 +22,7 @@ Search, sorting, and summary fields. Like ``format.py`` this never imports
 from __future__ import annotations
 
 import functools
+import json
 import math
 import re
 import shlex
@@ -36,6 +37,7 @@ from typing import Optional
 import requests
 from rich.cells import cell_len
 
+from cortex_training.tui.checkpoints import compact_numbers
 from cortex_training.tui.format import _ACTIVE_STATUSES as ACTIVE_STATUSES
 from cortex_training.tui.format import _num as compact_number
 from cortex_training.tui.format import cut_cells
@@ -480,44 +482,51 @@ def within_retention(job: dict, now: datetime, days: int = RETENTION_DAYS) -> bo
     return created is None or (now - created).total_seconds() <= days * 86400
 
 
-def _config_value(value: Any) -> str:
-    """A submitted config value on one line: JSON without quotes, whole floats as ints."""
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if value is None:
-        return "null"
-    if isinstance(value, dict):
-        return "{" + ", ".join(f"{collapse(k)}: {_config_value(v)}" for k, v in sorted(value.items())) + "}"
-    if isinstance(value, list):
-        return "[" + ", ".join(_config_value(v) for v in value) + "]"
-    if isinstance(value, float) and abs(value) >= 1e16:
-        return repr(value)  # as JSON writes it (1e+20), not as a 21-digit int
-    return collapse(compact_number(value))
-
-
 def _config_order(item: tuple) -> tuple:
     """By key, ``multiplex_job_id`` first: where a sub-job's GPUs come from."""
     return item[0] != "multiplex_job_id", str(item[0])
 
 
-def subjob_config_items(sj: dict) -> list:
-    """One sub-job's config as submitted, as ``(key, value)`` rows by key, with
-    nothing added or left out. A nested object's keys are dotted under its own
-    (``optimizer.lr``, as the job list's filter spells them); a list stays on one
-    row. A multiplexed sub-job's ``multiplex_job_id`` comes first: where its GPUs
-    come from."""
-    items: list = []
+def _ordered(value: Any) -> Any:
+    """``value`` (decoded JSON) with each object's keys in :func:`_config_order`."""
+    if isinstance(value, dict):
+        return {key: _ordered(item) for key, item in sorted(value.items(), key=_config_order)}
+    if isinstance(value, list):
+        return [_ordered(item) for item in value]
+    return value
 
-    def walk(prefix: str, cfg: dict) -> None:
-        for key, value in sorted(cfg.items(), key=_config_order):
-            name = f"{prefix}{collapse(key)}"
-            if isinstance(value, dict) and value:
-                walk(f"{name}.", value)
-            else:
-                items.append((name, _config_value(value)))
 
-    walk("", _type_config(sj))
-    return items
+def subjob_config_json(sj: dict) -> list:
+    """One sub-job's config as submitted, as the lines of indented JSON, as the
+    checkpoint card shows a config: by key, whole floats as ints, nothing added
+    or left out. A multiplexed sub-job's ``multiplex_job_id`` comes first."""
+    cfg = compact_numbers(printable_data(_type_config(sj)))
+    return _json_lines(_ordered(cfg), "")
+
+
+def _json_lines(value: Any, indent: str) -> list:
+    """``value`` as indented JSON lines; a list of plain values on one line."""
+    def dump(item: Any) -> str:
+        return json.dumps(item, ensure_ascii=False, default=str)
+
+    if isinstance(value, dict) and value:
+        lines = ["{"]
+        for i, (key, item) in enumerate(value.items()):
+            comma = "," if i < len(value) - 1 else ""
+            inner = _json_lines(item, indent + "  ")
+            lines.append(f"{indent}  {dump(key)}: {inner[0]}")
+            lines += inner[1:]
+            lines[-1] += comma
+        return [*lines, f"{indent}}}"]
+    if isinstance(value, list) and any(isinstance(item, (dict, list)) and item for item in value):
+        lines = ["["]
+        for i, item in enumerate(value):
+            inner = _json_lines(item, indent + "  ")
+            lines.append(f"{indent}  {inner[0]}")
+            lines += inner[1:]
+            lines[-1] += "," if i < len(value) - 1 else ""
+        return [*lines, f"{indent}]"]
+    return [dump(value)]
 
 
 def preview_facts(job: dict, now: datetime) -> list:

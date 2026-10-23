@@ -19,6 +19,7 @@ sub-job table's status badges, and the dashboard's identity line."""
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
@@ -63,43 +64,44 @@ def test_preview_facts_leave_the_hero_and_lifecycle_out():
     assert [label for label, _value in v.preview_facts(located, NOW)][-1] == "Schema"
 
 
-def test_subjob_config_items_are_the_submitted_config():
+def _config(sj: dict):
+    lines = v.subjob_config_json(sj)
+    return json.loads("\n".join(lines))
+
+
+def test_subjob_config_json_is_the_submitted_config():
     sj = {"job_type": "training", "model_name": "Qwen/Qwen3-8B", "dtype": "bfloat16",
           "training_config": {"n_gpus": 8.0, "max_seq_len": 4096.0, "save_training_metrics": False,
                               "optimizer": {"name": "adamw", "lr": 1e-5, "betas": [0.9, 0.95]}}}
-    # Nested objects dotted under their key; nothing derived is added (no "full-param").
-    assert v.subjob_config_items(sj) == [("max_seq_len", "4096"), ("n_gpus", "8"),
-                                         ("optimizer.betas", "[0.9, 0.95]"), ("optimizer.lr", "1e-05"),
-                                         ("optimizer.name", "adamw"), ("save_training_metrics", "false")]
-    assert v.subjob_config_items({"job_type": "sampling",
-                                  "inference_config": {"n_gpus": 2.0, "gpu_memory_utilization": 0.9}}) \
-        == [("gpu_memory_utilization", "0.9"), ("n_gpus", "2")]
-    assert v.subjob_config_items({"job_type": "training"}) == []
+    # Indented JSON by key, whole floats as ints, a list of plain values on one line;
+    # nothing derived is added (no "full-param").
+    assert v.subjob_config_json(sj) == [
+        "{", '  "max_seq_len": 4096,', '  "n_gpus": 8,', '  "optimizer": {', '    "betas": [0.9, 0.95],',
+        '    "lr": 1e-05,', '    "name": "adamw"', "  },", '  "save_training_metrics": false', "}"]
+    assert _config({"job_type": "sampling", "inference_config": {"n_gpus": 2.0, "gpu_memory_utilization": 0.9}}) \
+        == {"gpu_memory_utilization": 0.9, "n_gpus": 2}
+    assert v.subjob_config_json({"job_type": "training"}) == ["{}"]
 
 
 @pytest.mark.parametrize("config, shown", [
-    # One line whatever the keys or values hold, nested ones too.
-    ({"a\nb": 1, "n": {"x\ny": 2}}, [("a b", "1"), ("n.x y", "2")]),
-    ({"u\u2028v": "p\u2029q"}, [("u v", "p q")]),
-    ({"s": "  two   words\t"}, [("s", "two words")]),
-    ({"bell": "a\x07b"}, [("bell", "a\ufffdb")]),
+    # Printable whatever the keys or values hold; JSON escapes the rest.
+    ({"bell": "a\x07b"}, {"bell": "a\ufffdb"}),
     # Empty and null values as JSON writes them.
-    ({"n": None, "d": {}, "l": []}, [("d", "{}"), ("l", "[]"), ("n", "null")]),
-    ({"layers": [{"r": 8.0, "name": "q"}, {"r": 16.0}]}, [("layers", "[{name: q, r: 8}, {r: 16}]")]),
-    # A whole float as an int, unless that would be a 21-digit number.
-    ({"big": 1e20, "neg": -2.0, "frac": 0.5}, [("big", "1e+20"), ("frac", "0.5"), ("neg", "-2")]),
+    ({"n": None, "d": {}, "l": []}, {"d": {}, "l": [], "n": None}),
+    ({"layers": [{"r": 8.0, "name": "q"}, {"r": 16.0}]}, {"layers": [{"name": "q", "r": 8}, {"r": 16}]}),
+    ({"neg": -2.0, "frac": 0.5}, {"frac": 0.5, "neg": -2}),
 ])
-def test_subjob_config_items_render_each_value(config, shown):
-    items = v.subjob_config_items({"job_type": "training", "training_config": config})
-    assert items == shown
-    assert not any("\n" in k + val or "\u2028" in k + val for k, val in items)
+def test_subjob_config_json_renders_each_value(config, shown):
+    lines = v.subjob_config_json({"job_type": "training", "training_config": config})
+    assert json.loads("\n".join(lines)) == shown
+    assert not any("\u2028" in line or "\x07" in line for line in lines)
 
 
 def test_multiplexed_sub_job_names_its_source_first():
     target = "JOB_ID:training:0"
     shared = {"sub_job_id": "JOB_ID:sampling:0", "job_type": "sampling", "status": "RUNNING",
               "inference_config": {"max_seq_len": 4096.0, "n_gpus": 2.0, "multiplex_job_id": target}}
-    assert v.subjob_config_items(shared)[0] == ("multiplex_job_id", target)
+    assert v.subjob_config_json(shared)[1] == f'  "multiplex_job_id": "{target}",'
     job = _job(sub_jobs=[{"sub_job_id": target, "job_type": "training", "status": "RUNNING",
                           "training_config": {"n_gpus": 4.0}}, shared])
     rows = dict(JobSummaryScreen(MagicMock(), "JOB_ID", job=job)._subjob_rows(job))
@@ -288,19 +290,20 @@ def test_config_card_follows_the_highlighted_row():
             app.push_screen(JobSummaryScreen(client, "JOB_ID", job=job))
             for _ in range(50):
                 await pilot.pause(0.02)
-                if isinstance(app.screen, JobSummaryScreen) and "optimizer.lr" in "".join(_rows(app, "#config")):
+                if isinstance(app.screen, JobSummaryScreen) and '"lr": 1e-05' in "".join(_rows(app, "#config")):
                     break
             card = app.screen.query_one("#config-card")
-            # The job's row: each sub-job's config under its name, keys dotted.
+            # The job's row: each sub-job's config as JSON under its name.
             text = "\n".join(_rows(app, "#config"))
             assert "every sub-job" in str(card.border_title) and "as submitted" in str(card.border_subtitle)
-            assert "training #0" in text and "sampling #0" in text and "max_seq_len" in text
-            assert "1e-05" in text
+            # Side by side: both sub-jobs' names on the first row.
+            assert "training #0" in text.splitlines()[0] and "sampling #0" in text.splitlines()[0]
+            assert '"max_seq_len": 4096' in text and '"lr": 1e-05' in text
             await pilot.press("down")
             await pilot.pause(0.1)
             text = "\n".join(_rows(app, "#config"))
             assert "training #0" in str(card.border_title)
-            assert "optimizer.name" in text and "max_seq_len" not in text
+            assert '"name": "adamw"' in text and "max_seq_len" not in text
             await pilot.press("down")
             await pilot.pause(0.1)
             assert "sampling #0" in str(card.border_title) and "optimizer" not in "\n".join(_rows(app, "#config"))
@@ -309,15 +312,3 @@ def test_config_card_follows_the_highlighted_row():
 
     asyncio.run(run())
 
-
-def test_config_card_keeps_long_keys_whole():
-    keys = [f"ds_config.zero_optimization.{leaf}" for leaf in
-            ("allgather_bucket_size", "offload_optimizer.device", "reduce_bucket_size", "stage")]
-    screen = JobSummaryScreen(MagicMock(), "JOB_ID", job=_job())
-    rows, long = screen._config_grid([(key, "1") for key in keys] + [("n_gpus", "4")], 44)
-    text = "\n".join(row.plain for row in rows)
-    # Each key whole (across rows, broken after a dot), never cut to the same "…".
-    assert "…" not in text and not long
-    flat = text.replace("\n", "").replace(" ", "")
-    assert all(key in flat for key in keys)
-    assert all(row.cell_length <= 44 for row in rows)
