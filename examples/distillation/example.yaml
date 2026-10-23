@@ -1,0 +1,22 @@
+id: on-policy-distillation
+title: On-policy distillation
+status: runnable
+task: distillation
+methods:
+  - lora
+  - full-parameter
+models:
+  - Qwen/Qwen3-0.6B
+teacher_models:
+  - Qwen/Qwen3-8B
+datasets:
+  - openai/gsm8k
+precision:
+  - bfloat16
+default_training_gpus: 1
+provenance:
+  project: thinking-machines-lab/tinker-cookbook
+  recipe: tinker_cookbook/distillation/train_on_policy.py
+# Pending: the catalog-driven flow has not been validated on a live run yet.
+# The table in README.md will be refreshed when it is.
+last_validated: null

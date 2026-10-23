@@ -153,7 +153,7 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     if args.debug:
         return _run_demo(args, CortexTrainingLogTUI)
 
-    import cortex_training._cli as cli
+    import cortex_training.cli.commands as cli
 
     # Reuse the CLI's resolution: --config / login state / env / defaults.
     try:
@@ -187,7 +187,7 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     # defaults (ten retries, a ten-minute read timeout) left a view silent for
     # about a minute on a 404 or a failing service.
     args.max_retries, args.request_timeout = READ_MAX_RETRIES, READ_TIMEOUT
-    from cortex_training.snowflake_auth import SnowflakeProfileError
+    from cortex_training.client.auth import SnowflakeProfileError
 
     # --poll-interval paces the TUI's log polls only. The client's own poll interval
     # is for waiting on an asynchronous result, which the TUI never does, and it

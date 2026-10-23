@@ -33,7 +33,7 @@ import requests
 from requests.adapters import BaseAdapter
 from tenacity import wait_none
 
-import cortex_training.client as client_module
+import cortex_training.client.core as client_module
 from cortex_training import AccountJobListUnavailable
 from cortex_training import CortexTrainingClient
 from cortex_training import InvalidPageToken

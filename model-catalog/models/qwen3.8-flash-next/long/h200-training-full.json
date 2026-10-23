@@ -66,8 +66,7 @@
           "enabled": true,
           "max_cache_bytes": 2147483648
         }
-      },
-      "weight_format": "vllm"
+      }
     }
   ]
 }

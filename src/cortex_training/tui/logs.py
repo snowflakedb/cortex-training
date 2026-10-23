@@ -58,8 +58,8 @@ from textual.widgets import Static
 from textual.widgets import TabbedContent
 from textual.widgets import TabPane
 from textual.worker import get_current_worker
-from cortex_training.client import DownloadCancelled
-from cortex_training.client import NoChunksError
+from cortex_training._artifact_download import DownloadCancelled
+from cortex_training._artifact_download import NoChunksError
 from cortex_training.tui import theme
 from cortex_training.tui import format as log_format
 from cortex_training.tui import views

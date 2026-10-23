@@ -6,7 +6,7 @@ Install the client:
 uv pip install git+https://github.com/snowflakedb/cortex-training.git
 ```
 
-If you cloned the repository (needed to run the recipes, which are not part of
+If you cloned the repository (needed to run the examples, which are not part of
 the installed package), install it in editable mode instead:
 
 ```bash
@@ -39,16 +39,17 @@ Set `SNOWFLAKE_DEFAULT_CONNECTION_NAME=training`, configure
 the profile `[default]` to run `cortex-training capacity` without
 `--connection`.
 
-### Legacy JSON configuration
+## JSON connection file
 
-Existing JSON connection files and `cortex-training login` remain supported.
-From a clone, copy the template:
+The examples read the connection from a JSON file, passed as `config=`, rather
+than from `connections.toml`. From a clone, copy the
+[template](connection.json.template) to a location outside the repository:
 
 ```bash
-cp examples/config/connection.json.template ~/cortex-training-config.json
+cp docs/getting-started/connection.json.template ~/cortex-training-config.json
 ```
 
-Otherwise create it by hand, outside the repository:
+Otherwise create it by hand:
 
 ```json
 {
@@ -59,10 +60,12 @@ Otherwise create it by hand, outside the repository:
 }
 ```
 
-Fill in the account host, programmatic access token, database, and schema. Keep
-the file outside the repository and do not commit it.
+Fill in the account host, programmatic access token, database, and schema. The
+template also lists the optional `endpoint`, `poll_interval`, `poll_timeout`,
+and `verify_ssl` settings with their defaults. Do not commit the file: it holds
+your token.
 
-Validate and store the legacy config path:
+To use the same file for CLI commands, validate it and store its path:
 
 ```bash
 cortex-training login ~/cortex-training-config.json

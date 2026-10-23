@@ -1,0 +1,15 @@
+id: skyrl-gsm8k-grpo
+title: GSM8K GRPO with SkyRL
+status: runnable
+task: rl
+framework: NovaSky-AI/SkyRL
+methods:
+  - full-parameter
+models:
+  - Qwen/Qwen3-0.6B
+datasets:
+  - openai/gsm8k
+provenance:
+  project: Snowflake-AI-Research/Arctic-Platform
+  recipe: recipes/rl/skyrl/simple_gsm8k_cortex/run_qwen3_0.6b_gsm8k_grpo_cortex.sh
+last_validated: null

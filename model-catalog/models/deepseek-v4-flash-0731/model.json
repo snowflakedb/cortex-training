@@ -1,0 +1,17 @@
+{
+  "$schema": "../../schema.json",
+  "model_id": "deepseek-ai/DeepSeek-V4-Flash-0731",
+  "license": {
+    "name": "MIT",
+    "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/LICENSE"
+  },
+  "architecture": "moe",
+  "moe": {
+    "num_moe_layers": 43,
+    "topk": 6,
+    "num_experts": 256
+  },
+  "last_validated": {
+    "long/h200-inference-full": "2026-09-01"
+  }
+}

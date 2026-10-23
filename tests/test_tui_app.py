@@ -3447,7 +3447,7 @@ def test_quit_without_job_id_derives_it_from_sub_job_id_and_reports_crashes(monk
             pass
 
     monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", FakeApp)
-    monkeypatch.setattr("cortex_training._cli.build_client", lambda args, cls: MagicMock())
+    monkeypatch.setattr("cortex_training.cli.commands.build_client", lambda args, cls: MagicMock())
     rc = tui_main.run(["--sub-job-id", "job-x:sampling:0", "--base-url", "http://localhost:1", "--database", "DB"])
     assert seen == {"job_id": "job-x", "sub_job_id": "job-x:sampling:0"}
     assert rc == 1  # the app's return code, not a blanket 0
@@ -3490,9 +3490,9 @@ def test_the_screenshot_script_tags_its_real_client_as_the_tui(monkeypatch):
     # With --connection it drives the TUI against an account: its calls are the TUI's.
     import importlib.util
 
-    import cortex_training._cli as cli
+    import cortex_training.cli.commands as cli
 
-    path = Path(__file__).resolve().parents[1] / "scripts" / "tui_screenshot.py"
+    path = Path(__file__).resolve().parents[1] / "tools" / "tui_screenshot.py"
     spec = importlib.util.spec_from_file_location("tui_screenshot", path)
     tui_screenshot = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(tui_screenshot)
@@ -3561,7 +3561,7 @@ def test_the_log_poll_interval_must_be_positive_and_finite(value, capsys):
 
 
 def test_the_poll_interval_is_the_flag_s_alone_and_the_sign_in_names_what_the_config_gives(tmp_path, monkeypatch):
-    import cortex_training._cli as cli
+    import cortex_training.cli.commands as cli
 
     seen = []
 
@@ -3581,7 +3581,7 @@ def test_the_poll_interval_is_the_flag_s_alone_and_the_sign_in_names_what_the_co
     monkeypatch.delenv("CORTEX_TRAINING_CONNECTION", raising=False)
     monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", FakeApp)
     built = []  # the poll interval each client is built with
-    monkeypatch.setattr("cortex_training._cli.build_client", lambda args, cls: built.append(args.poll_interval) or MagicMock())
+    monkeypatch.setattr("cortex_training.cli.commands.build_client", lambda args, cls: built.append(args.poll_interval) or MagicMock())
     path = tmp_path / "config.json"
     # The config's poll_interval is the CLI's result polling: neither the TUI's log polls nor a reason not to start.
     path.write_text(json.dumps({"base_url": "http://localhost:1", "database": "DB", "poll_interval": 10}),

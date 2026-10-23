@@ -1,22 +1,13 @@
 # Cortex Training REST API Reference
 
-> **Status.** This page is a repository snapshot for the client version in this
-> branch. The service's own OpenAPI specification remains the source of truth
-> for the wire schema.
+> **Status.** This page is the customer-facing REST contract: the client in this
+> repository codes against it, and it is the reference for anything a caller
+> can observe.
 >
 > **Scope.** This document describes the customer-facing Cortex Training REST
 > surface used by this repository's `CortexTrainingClient`. It covers REST paths,
 > request framing, asynchronous polling, client-visible schemas, checkpoints,
 > generation, operations, and logs.
->
-> **Sources used for this snapshot.** The client and wire implementation in
-> `src/cortex_training/client.py` and `src/cortex_training/wire.py`, the
-> command-line interface in `src/cortex_training/_cli.py`, their unit tests,
-> and their unit tests are the local evidence for this document. The service's
-> own OpenAPI specification remains the source of truth when it is available.
-> The server-side statements in sections 8.2 and 8.3 about `model_options`
-> and the `prime_rl` block describe server behavior and are not exercised by
-> this repository's tests.
 >
 > **Important distinction.** `CortexTrainingClient` is a low-level transport client.
 > ArcticTraining may put additional keys such as `context` and `processing`
@@ -81,13 +72,14 @@ is `log_prob`.
 ### 1.4 Supported models
 
 The machine-readable source of truth for model availability, workflow support,
-context limits, and recommended configurations is
-[`model-catalog/models.json`](../../model-catalog/models.json). Referenced
-profiles live under [`model-catalog/profiles/`](../../model-catalog/profiles/).
+context limits, and recommended configurations is the model catalog under
+[`model-catalog/models/`](../../model-catalog/models/): one folder per model,
+holding a job file for each supported context, hardware, training or inference
+sub-job, and LoRA or full mode. See the
+[catalog README](../../model-catalog/README.md).
 
 This API reference does not duplicate the model table. Run
-`python scripts/validate_model_catalog.py` after changing the catalog or a
-profile.
+`python model-catalog/validate_catalog.py` after changing the catalog.
 
 ---
 
@@ -1217,7 +1209,7 @@ re-tokenizing it: send the sequence as a pre-tokenized prompt with
 `max_tokens: 1` and read `prompt_logprobs[i]` as the log probability of prompt
 token `i`. The prompt must stay shorter than the sampling sub-job's
 `max_seq_len`. The
-[on-policy distillation recipe](../../recipes/distillation/README.md) scores
+[on-policy distillation example](../../examples/distillation/README.md) scores
 student rollouts with a teacher this way.
 
 ### 6.7 Streaming generate - `POST /{job_id}/generate-stream`
@@ -1741,11 +1733,14 @@ long-context/memory knobs:
 expert id as `uint8` when the model has at most 256 experts and as `uint16`
 when it has 257 to 65536 experts. A `uint16` capture uses twice as many bytes
 as a `uint8` capture for the same sequence length, MoE layer count, and top-k.
-The service does not choose the cap. Derive both the sampling and training
-caps with `cortex_training.router_replay_planner`, which selects that width
-from the expert count and includes it in `CachePlan.max_cache_bytes`. The same
-object can be set on a sampling sub-job through `extra_sampling["router_replay"]`.
-See [python-sdk.md](python-sdk.md#router-replay-capacity-planning).
+The service and the client do not choose the cap: set
+`router_replay.max_cache_bytes` in the job body for each sub-job (on a sampling
+sub-job built with the SDK, through `extra_sampling["router_replay"]`). The
+repository's RL example fills in `5368709120` (5 GiB) for training and
+`21474836480` (20 GiB) for sampling on MoE models, and describes an optional
+planner that sizes a cap from the expert count, sequence length, MoE layer
+count, and top-k; see
+[Router-replay capacity planning](../../examples/rl/README.md#router-replay-capacity-planning).
 
 For LoRA training, set `extra_training["peft_config"]` to a PEFT
 `LoraConfig`-compatible object. It is validated and rewritten client-side, so it

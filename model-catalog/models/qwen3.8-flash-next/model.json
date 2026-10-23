@@ -1,5 +1,6 @@
 {
-  "modelId": "Qwen/Qwen3.8-Flash-Next",
+  "$schema": "../../schema.json",
+  "model_id": "Qwen/Qwen3.8-Flash-Next",
   "license": {
     "name": "Apache 2.0",
     "url": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE"
@@ -10,8 +11,13 @@
     "topk": 10,
     "num_experts": 512
   },
-  "lastValidated": {
-    "h200-training-full": "2026-10-19",
-    "h200-training-lora": "2026-10-20"
+  "last_validated": {
+    "long/h200-inference-full": null,
+    "long/h200-training-full": null,
+    "long/h200-training-lora": null,
+    "standard/h200-inference-full": null,
+    "standard/h200-inference-lora": null,
+    "standard/h200-training-full": null,
+    "standard/h200-training-lora": null
   }
 }

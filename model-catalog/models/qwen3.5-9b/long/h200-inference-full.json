@@ -7,10 +7,10 @@
       "dtype": "bfloat16",
       "seed": 42,
       "inference_config": {
-        "max_seq_len": 262144,
-        "n_gpus": 8,
+        "max_seq_len": 65536,
+        "n_gpus": 2,
         "vllm_config": {
-          "tensor_parallel_size": 8,
+          "tensor_parallel_size": 1,
           "gpu_memory_utilization": 0.8
         }
       }

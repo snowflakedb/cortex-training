@@ -1,0 +1,16 @@
+id: math-grpo
+title: Math GRPO
+status: runnable
+task: rl
+methods:
+  - lora
+  - full-parameter
+datasets:
+  - hendrycks/competition_math
+  - HuggingFaceH4/MATH-500
+precision:
+  - bfloat16
+provenance:
+  project: tinker-cookbook
+  recipe: recipes/math_rl/train.py
+last_validated: null
