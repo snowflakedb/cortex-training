@@ -2,15 +2,15 @@
   "sub_job_configs": [
     {
       "job_type": "sampling",
-      "model_name": "Qwen/Qwen3-0.6B",
+      "model_name": "Qwen/Qwen3.5-4B",
       "dtype": "bfloat16",
       "seed": 42,
       "inference_config": {
-        "max_seq_len": 2048,
+        "max_seq_len": 16384,
         "n_gpus": 1,
         "vllm_config": {
           "tensor_parallel_size": 1,
-          "gpu_memory_utilization": 0.8
+          "gpu_memory_utilization": 0.85
         }
       }
     }

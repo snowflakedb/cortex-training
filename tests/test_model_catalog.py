@@ -108,6 +108,7 @@ def test_shipped_qwen_recipes_use_model_limits_and_long_context_sp():
     expected_limits = {
         "Qwen/Qwen3-4B-Instruct-2507": 262144,
         "Qwen/Qwen3-8B": 32768,
+        "Qwen/Qwen3.5-2B": 262144,
         "Qwen/Qwen3.5-9B": 262144,
         "Qwen/Qwen3.8-27B": 65536,
         "Qwen/Qwen3.6-35B-A3B": 262144,
@@ -127,7 +128,7 @@ def test_shipped_qwen_recipes_use_model_limits_and_long_context_sp():
             continue
         config_paths.append(path)
 
-    assert len(config_paths) == 22
+    assert len(config_paths) == 26
     for path in config_paths:
         request = json.loads(path.read_text())
         for sub_job in request["sub_job_configs"]:
