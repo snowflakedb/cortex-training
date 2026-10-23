@@ -21,3 +21,6 @@ GPU count and vLLM settings live in the inference files under
 [Start sampling from saved weights](../../reference/rest-api.md#134-start-sampling-from-saved-weights).
 
 Readiness checks, scaling and teardown are not yet documented.
+
+To serve a checkpoint behind an OpenAI-compatible endpoint and stream replies
+instead, see [Deploy a Model for Streaming Inference](deploy-model.md).

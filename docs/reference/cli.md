@@ -861,7 +861,15 @@ curl "$BASE_URL/chat/completions" \
   -d '{"model": "sf-ct-DEPLOYMENT_UUID", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
-`GET $BASE_URL/models` lists the `READY` deployments you own in that schema.
+Limit the reply length with `max_completion_tokens`; `max_tokens` is rejected
+with HTTP 400 (`unsupported_parameter`). `"stream": true` returns server-sent
+events; see [Deploy a Model for Streaming Inference](../guides/inference/deploy-model.md).
+
+Use `cortex-training model-deployment list` to find deployments: `GET
+$BASE_URL/models` can return an empty list while a deployment is `READY`
+([known limitation 6](rest-api.md#15-known-limitations)). The full request and
+response behavior is in
+[REST API reference section 14.8](rest-api.md#148-calling-a-deployment).
 
 ### Job TUI
 

@@ -13,6 +13,7 @@ under its `configs/` directory.
 | [Math GRPO](rl/README.md) | Reinforcement learning | Hendrycks MATH and MATH-500 | Runnable |
 | [On-policy distillation](distillation/README.md) | Distillation from a frozen teacher | GSM8K | Runnable |
 | [Inference endpoint](inference/README.md) | Serve, generate, eval | Open weights, checkpoints, MATH-500, GSM8K, identity | Runnable |
+| [Model deployment streaming](model_deployment/README.md) | OpenAI-compatible deployment, streamed chat | Open weights, checkpoints | Runnable |
 
 GRPO can also be run from [SkyRL](../docs/integrations/skyrl.md), which uses its
 own entry point and install rather than the prerequisites below.
@@ -55,6 +56,7 @@ python -m recipes.sft.conversational.train config=/path/to/config.json
 python -m recipes.rl.math_grpo.train config=/path/to/config.json
 python -m recipes.distillation.on_policy.train config=/path/to/config.json
 python -m recipes.inference.serve config=/path/to/config.json
+python -m recipes.model_deployment.deploy config=/path/to/config.json
 ```
 
 `config=` is the Snowflake PAT/connection file. See each recipe README for

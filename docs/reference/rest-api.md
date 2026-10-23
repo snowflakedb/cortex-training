@@ -3462,6 +3462,43 @@ Request debug log lines written while a deployment method runs also name the
 deployment ID instead of the backing job ID. Local filesystem errors are
 raised unchanged.
 
+### 14.8 Calling a deployment
+
+`CortexTrainingClient` does not call the deployment itself; any
+OpenAI-compatible client does. This is the behavior a caller sees, as checked
+by the `test_tc6_*` cases in `tests/test_model_deployment_e2e.py`. The
+streaming recipe (`recipes/model_deployment/streaming.py`) codes against it.
+
+| Item | Behavior |
+|---|---|
+| Path | `POST {base_url}/chat/completions`, with `base_url` = `<prefix>/inference/v1` ([section 14.1](#141-deployment-ids)) |
+| Auth | `Authorization: Bearer <PAT>` and `X-Snowflake-Authorization-Token-Type: PROGRAMMATIC_ACCESS_TOKEN` |
+| `model` | The deployment ID, `sf-ct-<UUID>`; responses echo it as `model` |
+| Length limit | `max_completion_tokens`. `max_tokens` is rejected with HTTP 400, `{"error": {"type": "invalid_request_error", "param": "max_tokens", "code": "unsupported_parameter"}}` |
+| Not enabled | HTTP 404 while inference is not enabled for the account |
+
+Without `stream`, the response is one `chat.completion` object with
+`choices[0].message.content`, `finish_reason`, and `usage`.
+
+With `"stream": true`, the response is `Content-Type: text/event-stream` with
+one `data: <chat.completion.chunk JSON>` line per chunk and a final
+`data: [DONE]`:
+
+1. The first chunk's delta is `{"role": "assistant", "content": ""}`.
+2. Each following chunk's `choices[0].delta.content` is the next text.
+3. The last chunk before `[DONE]` has an empty delta and a non-null
+   `finish_reason` (`stop`, or `length` at `max_completion_tokens`).
+4. With `"stream_options": {"include_usage": true}`, every chunk carries
+   `"usage": null` and one more chunk, with `"choices": []`, carries the token
+   counts.
+
+The status is already 200 once streaming starts, so a later failure cannot
+change it. The recipe treats a chunk with an `error` key, a `data` line that
+is not JSON, or a stream that ends without `[DONE]` as a failed call.
+
+`GET {base_url}/models` is meant to list the `READY` deployments the caller
+owns in the schema, but see [section 15](#15-known-limitations), item 6.
+
 ---
 
 ## 15. Known limitations
@@ -3483,3 +3520,8 @@ These are current gaps, not supported API behavior:
    reported with a `base_model` source by `list_model_deployments`,
    `describe_model_deployment`, and `wait_for_model_deployment`
    ([section 14.4](#144-reading-deployments)).
+6. `GET {base_url}/models` has been seen to return HTTP 200 with an empty
+   `data` list while a `READY` deployment in the same schema served chat
+   completions ([section 14.8](#148-calling-a-deployment)). Use
+   `list_model_deployments` or `cortex-training model-deployment list` to find
+   deployments.
