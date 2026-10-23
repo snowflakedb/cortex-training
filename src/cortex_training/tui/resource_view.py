@@ -347,6 +347,15 @@ class ResourceTab:
             if acquired:
                 lock.release()
 
+    def _rebuild_window_left_stale(self) -> None:
+        """UI thread. A refresh builds the window it was asked for when its load began. One picked
+        after that looked fresh on screen, so no rebuild started, and the refresh's rows now have it
+        as of its last showing: rebuild it, or the header would say refreshing… with nothing doing so."""
+        resource = self._resource_kind_data()
+        if resource is not None and not resource.fresh(self._resource_range):
+            self._resource_window_error = None  # another try, as picking the window again is
+            self._rebuild_resource_window()
+
     def _show_resource_progress(self, sub_job_id: str, done: int, total: int) -> None:
         """UI thread. A metrics download's chunk count: the shown sub-job's is the header's bar (see _resource_state)."""
         if not self._screen_open:
@@ -390,6 +399,7 @@ class ResourceTab:
             self._resource_error = error
             if self._resource_active():
                 self._render_resource()
+            self._rebuild_window_left_stale()
             return
         self._resource_error = error
         self._resource_loaded = _has_telemetry(self._resource_data)

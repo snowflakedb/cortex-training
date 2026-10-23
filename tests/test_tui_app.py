@@ -49,6 +49,7 @@ from cortex_training.tui import __main__ as tui_main  # noqa: E402
 from cortex_training.tui.account import ACCOUNT  # noqa: E402
 from cortex_training.tui.account import SCHEMA  # noqa: E402
 from cortex_training.tui.account import JobLister  # noqa: E402
+from cortex_training.tui.account import Listing  # noqa: E402
 from cortex_training.tui.account import scope_text  # noqa: E402
 from cortex_training.tui.app import CortexTrainingLogTUI  # noqa: E402
 from cortex_training.tui.job_list import JobListScreen  # noqa: E402
@@ -5681,6 +5682,45 @@ def test_a_on_a_schema_list_past_the_cap_keeps_it_cut_and_f_at_hand():
     asyncio.run(_run_a_on_a_schema_list_past_the_cap(c))
 
 
+async def _run_f_just_as_a_refresh_lands(c):
+    app = CortexTrainingLogTUI(c, poll_interval=0.01)
+    async with app.run_test(size=(160, 40)) as pilot:
+        assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._job_by_item,
+                           tries=400)
+        screen = app.screen
+        drawn = lambda: len(screen._job_by_item)  # noqa: E731
+        older = screen._cut_listing
+        assert older is not None and drawn() == 2_001
+        created = datetime.now(timezone.utc).isoformat()
+        job = {"job_id": "j-new", "status": "SUCCEEDED", "created_at": created}
+        newer = Listing([job, *older.jobs], older.scope, everything=[job, *older.everything])
+        screen.action_full_list("all")  # its draw waits for the note to be painted
+        screen._show_listing(newer)  # a refresh lands first, drawn whole as f asks
+        assert await _wait(pilot, app, lambda: drawn() == 2_501, tries=400), "the refresh wasn't drawn whole"
+        await pilot.pause(0.5)  # f's own draw has had its turn
+        assert screen._cut_listing is newer and drawn() == 2_501, "f drew the older list back over the refresh"
+        assert "j-new" in {row.get("job_id") for row in screen._all_jobs}
+        # f twice before its draw: the newest stay drawn.
+        screen.action_full_list("newest")
+        assert await _wait(pilot, app, lambda: drawn() == 2_002, tries=400)
+        screen.action_full_list("all")
+        screen.action_full_list("newest")
+        await pilot.pause(0.5)
+        assert drawn() == 2_002 and not screen._full_list, "a draw f no longer asked for was made"
+        await _settle(app, pilot)
+
+
+def test_f_just_as_a_refresh_lands_keeps_the_refresh_s_list():
+    # f draws on the next idle; a refresh that shows in between has drawn its list whole, as f asks,
+    # and the older list f held must not go back over it until the next refresh.
+    now = datetime.now(timezone.utc)
+    c = _client()
+    c.list_jobs.return_value = [{"job_id": f"j{i}", "status": "SUCCEEDED",
+                                 "created_at": (now - timedelta(minutes=i + 1)).isoformat()} for i in range(2_500)]
+    c.list_jobs.return_value[-1]["status"] = "RUNNING"
+    asyncio.run(_run_f_just_as_a_refresh_lands(c))
+
+
 async def _run_f_does_nothing_on_a_list_not_cut_short(c):
     app = CortexTrainingLogTUI(c, poll_interval=0.01)
     async with app.run_test() as pilot:
@@ -5804,6 +5844,49 @@ async def _run_a_window_picked_after_a_refresh(tmp_path, monkeypatch):
                                   and screen._resource_kind_data().fresh("1h"), seconds=15)
         assert "failed" not in header() and "refreshing…" not in header(), header()
         await _settle(app, pilot)
+
+
+async def _run_a_window_picked_while_a_refresh_builds(monkeypatch):
+    import cortex_training.tui.resource as resource_module
+
+    start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=2)
+    c = _client()
+    c.download_metrics.side_effect = _extending_download(start)
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        assert await _pause_until(pilot, lambda: isinstance(app.screen, LogScreen) and app.screen._current_source)
+        screen = app.screen
+        screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        assert await _pause_until(pilot, lambda: c.download_metrics.call_count >= 1 and not screen._resource_loading
+                                  and screen._resource_kind_data(), seconds=15)
+        assert screen._resource_kind_data().fresh("30m"), "a first open builds every window"
+        entered, release = threading.Event(), threading.Event()
+        real_load = resource_module.ResourceLoader.load
+
+        def held(self, **kwargs):
+            # The refresh's load after its download, building the 10m window it was asked for.
+            if kwargs.get("shown") == "10m" and c.download_metrics.call_count >= 2 and not entered.is_set():
+                entered.set()
+                assert release.wait(10)
+            return real_load(self, **kwargs)
+
+        monkeypatch.setattr(resource_module.ResourceLoader, "load", held)
+        await pilot.press("r")
+        assert await _pause_until(pilot, entered.is_set, seconds=15), "the refresh never loaded"
+        await pilot.press("w")  # to 30m, fresh on screen still: nothing to rebuild yet
+        await pilot.pause(0.1)
+        assert screen._resource_range == "30m"
+        release.set()
+        assert await _pause_until(pilot, lambda: not screen._resource_loading
+                                  and screen._resource_kind_data().fresh("30m"), seconds=15), \
+            "the window picked during the refresh was left as of its last showing"
+        assert screen._resource_state(screen._resource_kind_data()) == (), "still says it is refreshing"
+        assert c.download_metrics.call_count == 2, "rebuilding the window downloaded"
+        await _settle(app, pilot)
+
+
+def test_a_window_picked_while_a_refresh_builds_is_rebuilt_once_it_lands(monkeypatch):
+    asyncio.run(_run_a_window_picked_while_a_refresh_builds(monkeypatch))
 
 
 def _error_log_text(widgets_module) -> str:

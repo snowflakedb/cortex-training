@@ -648,8 +648,15 @@ class JobListScreen(FollowsPointer, Screen):
         if self._full_list:
             self._info = Content.from_markup(f"  [dim]drawing all {len(listing.everything):,} jobs…[/dim]")
             self._paint_info()
-            self.call_after_refresh(self._show_listing, listing)
+            self.call_after_refresh(self._draw_full_list, listing)
         else:
+            self._show_listing(listing)
+
+    def _draw_full_list(self, listing: Listing) -> None:
+        """``f``'s draw, once its note is on screen: only while ``listing`` is still the list and every
+        job is still asked for. A refresh that landed meanwhile drew its own list whole, as f asks, and
+        this one's older jobs must not go back over it; a second f meanwhile drew the newest again."""
+        if self._cut_listing is listing and self._full_list:
             self._show_listing(listing)
 
     def action_show_list(self, which: str) -> None:
