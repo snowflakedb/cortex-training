@@ -23,6 +23,7 @@ import logging
 import threading
 import time
 from datetime import date
+import os
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -3040,173 +3041,6 @@ def test_invalid_job_json_returns_error(tmp_path):
     assert "job JSON must be an object" in stderr.getvalue()
 
 
-def test_config_file_supplies_connection_values(tmp_path):
-    config = _write_config(
-        tmp_path,
-        {
-            "base_url": "http://config.local",
-            "database": "CONFIG_DB",
-            "schema": "CONFIG_SCHEMA",
-            "endpoint": "config-endpoint",
-            "poll_interval": 2.0,
-            "poll_timeout": 30.0,
-        },
-    )
-    seen = {}
-    stdout = io.StringIO()
-
-    def make_client(args):
-        seen.update(vars(args))
-        return FakeClient()
-
-    rc = cli.main(["--config", str(config), "list"], client_factory=make_client, stdout=stdout)
-
-    assert rc == 0
-    assert seen["base_url"] == "http://config.local"
-    assert seen["database"] == "CONFIG_DB"
-    assert seen["schema"] == "CONFIG_SCHEMA"
-    assert seen["endpoint"] == "config-endpoint"
-    assert seen["poll_interval"] == 2.0
-    assert seen["poll_timeout"] == 30.0
-
-
-def test_cli_flags_override_config_file(tmp_path):
-    config = _write_config(
-        tmp_path,
-        {
-            "base_url": "http://config.local",
-            "database": "CONFIG_DB",
-            "schema": "CONFIG_SCHEMA",
-        },
-    )
-    seen = {}
-
-    def make_client(args):
-        seen.update(vars(args))
-        return FakeClient()
-
-    rc = cli.main(
-        [
-            "--config",
-            str(config),
-            "--base-url",
-            "http://cli.local",
-            "--database",
-            "CLI_DB",
-            "list",
-        ],
-        client_factory=make_client,
-        stdout=io.StringIO(),
-    )
-
-    assert rc == 0
-    assert seen["base_url"] == "http://cli.local"
-    assert seen["database"] == "CLI_DB"
-    assert seen["schema"] == "CONFIG_SCHEMA"
-
-
-def test_config_can_come_from_env(tmp_path, monkeypatch):
-    config = _write_config(
-        tmp_path,
-        {
-            "base_url": "http://env-config.local",
-            "database": "ENV_CONFIG_DB",
-        },
-    )
-    monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(config))
-    seen = {}
-
-    def make_client(args):
-        seen.update(vars(args))
-        return FakeClient()
-
-    rc = cli.main(["list"], client_factory=make_client, stdout=io.StringIO())
-
-    assert rc == 0
-    assert seen["base_url"] == "http://env-config.local"
-    assert seen["database"] == "ENV_CONFIG_DB"
-
-
-def test_config_accepts_common_aliases(tmp_path):
-    config = _write_config(tmp_path, {"url": "http://alias.local", "db": "ALIAS_DB"})
-    seen = {}
-
-    def make_client(args):
-        seen.update(vars(args))
-        return FakeClient()
-
-    rc = cli.main(["--config", str(config), "list"], client_factory=make_client, stdout=io.StringIO())
-
-    assert rc == 0
-    assert seen["base_url"] == "http://alias.local"
-    assert seen["database"] == "ALIAS_DB"
-
-
-def test_bare_base_url_with_pat_is_treated_as_host(tmp_path):
-    config = _write_config(
-        tmp_path,
-        {
-            "base_url": "ACCOUNT.snowflakecomputing.com",
-            "pat": "test-pat",
-            "database": "CORTEX_TRAINING_DB",
-        },
-    )
-    seen = {}
-
-    def make_client(args):
-        seen.update(vars(args))
-        return FakeClient()
-
-    rc = cli.main(
-        ["--config", str(config), "list"],
-        client_factory=make_client,
-        stdout=io.StringIO(),
-    )
-
-    assert rc == 0
-    assert seen["base_url"] is None
-    assert seen["host"] == "ACCOUNT.snowflakecomputing.com"
-    assert seen["pat"] == "test-pat"
-
-
-def test_bare_base_url_without_pat_returns_clear_error(tmp_path, monkeypatch):
-    monkeypatch.delenv("CORTEX_TRAINING_PAT", raising=False)
-    monkeypatch.delenv("SNOWFLAKE_PAT", raising=False)
-    config = _write_config(
-        tmp_path,
-        {
-            "base_url": "ACCOUNT.snowflakecomputing.com",
-            "database": "CORTEX_TRAINING_DB",
-        },
-    )
-    stderr = io.StringIO()
-
-    rc = cli.main(["--config", str(config), "list"], stderr=stderr)
-
-    assert rc == 1
-    assert "base_url must start with http:// or https://" in stderr.getvalue()
-
-
-def test_invalid_config_returns_error(tmp_path):
-    config = _write_config(tmp_path, {"base_url": "http://test.local", "typo": "value"})
-    stderr = io.StringIO()
-
-    rc = cli.main(["--config", str(config), "submit", "missing.json", "--dry-run"], stderr=stderr)
-
-    assert rc == 1
-    assert "unknown config key" in stderr.getvalue()
-
-
-def test_invalid_config_value_type_returns_error(tmp_path):
-    config = _write_config(tmp_path, {"base_url": 123, "database": "DB"})
-    stderr = io.StringIO()
-
-    rc = cli.main(["--config", str(config), "list"], stderr=stderr)
-
-    assert rc == 1
-    assert "config base_url must be a string" in stderr.getvalue()
-
-
 @pytest.mark.parametrize("config_flags", [[], ["--config"]])
 def test_the_old_login_form_no_longer_saves_the_config(tmp_path, monkeypatch, config_flags):
     login_state = tmp_path / "login.json"
@@ -3224,63 +3058,6 @@ def test_the_old_login_form_no_longer_saves_the_config(tmp_path, monkeypatch, co
     assert "no longer supported. Run `cortex-training login`" in stderr.getvalue()
 
 
-def test_logged_in_config_is_used_without_config_arg(tmp_path, monkeypatch):
-    login_state = tmp_path / "login.json"
-    config = _write_config(
-        tmp_path,
-        {"base_url": "http://login.local", "database": "LOGIN_DB"},
-    )
-    login_state.write_text(
-        json.dumps({"config_path": str(config)}),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
-    seen = {}
-
-    def make_client(args):
-        seen.update(vars(args))
-        return FakeClient()
-
-    rc = cli.main(["list"], client_factory=make_client, stdout=io.StringIO())
-
-    assert rc == 0
-    assert seen["base_url"] == "http://login.local"
-    assert seen["database"] == "LOGIN_DB"
-
-
-def test_cli_flags_override_logged_in_config(tmp_path, monkeypatch):
-    login_state = tmp_path / "login.json"
-    config = _write_config(
-        tmp_path,
-        {
-            "base_url": "http://login.local",
-            "database": "LOGIN_DB",
-            "schema": "LOGIN_SCHEMA",
-        },
-    )
-    login_state.write_text(
-        json.dumps({"config_path": str(config)}),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
-    seen = {}
-
-    def make_client(args):
-        seen.update(vars(args))
-        return FakeClient()
-
-    rc = cli.main(
-        ["--database", "CLI_DB", "list"],
-        client_factory=make_client,
-        stdout=io.StringIO(),
-    )
-
-    assert rc == 0
-    assert seen["base_url"] == "http://login.local"
-    assert seen["database"] == "CLI_DB"
-    assert seen["schema"] == "LOGIN_SCHEMA"
-
-
 def test_direct_connection_flags_do_not_read_login_state(tmp_path, monkeypatch):
     login_state = tmp_path / "login.json"
     login_state.write_text("not json", encoding="utf-8")
@@ -3293,6 +3070,12 @@ def test_direct_connection_flags_do_not_read_login_state(tmp_path, monkeypatch):
     )
 
     assert rc == 0
+
+
+def _write_profiles(*names: str) -> None:
+    """Write minimal profiles to the temporary Snowflake folder (see conftest)."""
+    text = "".join(f'[{name}]\naccount = "ACME"\nuser = "ME"\n' for name in names)
+    (Path(os.environ["SNOWFLAKE_HOME"]) / "connections.toml").write_text(text)
 
 
 def test_no_legacy_config_falls_back_to_default_snowflake_profile(
@@ -3308,21 +3091,29 @@ def test_no_legacy_config_falls_back_to_default_snowflake_profile(
         "SNOWFLAKE_HOST",
         "CORTEX_TRAINING_PAT",
         "SNOWFLAKE_PAT",
+        "CORTEX_TRAINING_DATABASE",
+        "CORTEX_TRAINING_SCHEMA",
     ):
         monkeypatch.delenv(name, raising=False)
+    snowflake = Path(os.environ["SNOWFLAKE_HOME"])
+    (snowflake / "connections.toml").write_text('[default]\naccount = "ACME"\nuser = "ME"\ndatabase = "TRAIN_DB"\n')
     seen = {}
 
     def make_client(args):
         seen.update(vars(args))
         return FakeClient()
 
-    rc = cli.main(["list"], client_factory=make_client, stdout=io.StringIO())
+    stderr = io.StringIO()
+    rc = cli.main(["list"], client_factory=make_client, stdout=io.StringIO(), stderr=stderr)
 
     assert rc == 0
     assert seen["use_connection_profile"] is True
     assert seen["connection"] is None
-    assert seen["database"] is None
-    assert seen["schema"] is None
+    assert seen["resolution"].profile == "default"
+    assert (seen["database"], seen["schema"]) == ("TRAIN_DB", "PUBLIC")
+    assert stderr.getvalue() == (
+        "→ profile default (Snowflake default profile) · database TRAIN_DB (from profile default) · schema PUBLIC\n"
+    )
 
 
 @pytest.mark.parametrize(
@@ -3348,6 +3139,7 @@ def test_incomplete_direct_environment_falls_back_to_default_profile(
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv(environment_name, environment_value)
+    _write_profiles("default")
     seen = {}
 
     def make_client(args):
@@ -3365,6 +3157,7 @@ def test_named_connection_bypasses_invalid_login_state(tmp_path, monkeypatch):
     login_state = tmp_path / "login.json"
     login_state.write_text("not json", encoding="utf-8")
     monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
+    _write_profiles("training-profile")
     seen = {}
 
     def make_client(args):
@@ -3382,74 +3175,33 @@ def test_named_connection_bypasses_invalid_login_state(tmp_path, monkeypatch):
     assert seen["connection"] == "training-profile"
 
 
-def test_existing_legacy_config_wins_over_profile_fallback(tmp_path, monkeypatch):
-    config = _write_config(
-        tmp_path,
-        {"base_url": "http://legacy.local", "database": "LEGACY_DB"},
-    )
-    monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(config))
-    seen = {}
-
-    def make_client(args):
-        seen.update(vars(args))
-        return FakeClient()
-
-    rc = cli.main(["list"], client_factory=make_client, stdout=io.StringIO())
-
-    assert rc == 0
-    assert seen["use_connection_profile"] is False
-    assert seen["base_url"] == "http://legacy.local"
-
-
-def test_missing_remembered_config_falls_back_to_profile(tmp_path, monkeypatch):
-    login_state = tmp_path / "login.json"
-    login_state.write_text(
-        json.dumps({"config_path": str(tmp_path / "removed-config.json")}),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
-    seen = {}
-
-    def make_client(args):
-        seen.update(vars(args))
-        return FakeClient()
-
-    rc = cli.main(["list"], client_factory=make_client, stdout=io.StringIO())
-
-    assert rc == 0
-    assert seen["use_connection_profile"] is True
-
-
-def test_named_connection_conflicts_with_direct_flags():
-    stderr = io.StringIO()
-
-    rc = cli.main(
-        ["--connection", "training-profile", "--host", "x.test", "list"],
-        stderr=stderr,
-    )
-
-    assert rc == 1
-    assert "--connection cannot be combined" in stderr.getvalue()
-
-
 def test_build_client_uses_named_snowflake_connection(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "missing.json")
     )
+    _write_profiles("training-profile")
     args = cli.parse_args(["--connection", "training-profile", "list"])
     client_cls = MagicMock()
     connected = object()
-    client_cls._from_profile.return_value = connected
+    client_cls._from_resolution.return_value = connected
 
     assert cli.build_client(args, client_cls) is connected
-    client_cls._from_profile.assert_called_once_with(
-        connection_name="training-profile",
-        database=None,
-        schema=None,
-        endpoint="cortex-training",
-        poll_interval=0.5,
-        poll_timeout=1800.0,
-        verify_ssl=True,
+    # Only typed flags are passed, so config.json's settings and the client's defaults apply.
+    client_cls._from_resolution.assert_called_once_with(args.resolution)
+    assert args.resolution.profile == "training-profile"
+    client_cls._from_profile.assert_not_called()
+
+
+def test_build_client_passes_typed_flags_over_config_json(tmp_path, monkeypatch):
+    _write_profiles("training-profile")
+    args = cli.parse_args(
+        ["--connection", "training-profile", "--endpoint", "ct", "--poll-timeout", "60", "--no-verify-ssl", "list"]
+    )
+    client_cls = MagicMock()
+
+    cli.build_client(args, client_cls)
+    client_cls._from_resolution.assert_called_once_with(
+        args.resolution, endpoint="ct", poll_timeout=60.0, verify_ssl=False
     )
 
 
@@ -3459,12 +3211,13 @@ def test_build_client_forwards_read_bounds_only_when_set(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "missing.json")
     )
+    _write_profiles("training-profile")
     args = cli.parse_args(["--connection", "training-profile", "list"])
     args.max_retries, args.request_timeout = 2, (10.0, 45.0)
     client_cls = MagicMock()
 
     cli.build_client(args, client_cls)
-    kwargs = client_cls._from_profile.call_args.kwargs
+    kwargs = client_cls._from_resolution.call_args.kwargs
     assert (kwargs["max_retries"], kwargs["request_timeout"]) == (2, (10.0, 45.0))
 
 
@@ -3630,3 +3383,249 @@ def test_download_lock_paths_are_resolved(tmp_path, monkeypatch):
     root.release()
     with cli._output_dir_lock(Path("/")):
         pass
+
+
+# ─── The picker and the target line (2s) ────────────────────────────────────
+
+
+class _Terminal(io.StringIO):
+    def isatty(self):
+        return True
+
+
+def test_the_target_line_names_each_source(monkeypatch):
+    monkeypatch.delenv("CORTEX_TRAINING_DATABASE", raising=False)
+    monkeypatch.delenv("CORTEX_TRAINING_SCHEMA", raising=False)
+    _write_profiles("prod", "train")
+    stderr = io.StringIO()
+    rc = cli.main(
+        ["--connection", "train", "--database", "MY_DB", "--schema", "RUNS", "list"],
+        client_factory=lambda args: FakeClient(),
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+    assert rc == 0
+    assert stderr.getvalue().splitlines()[0] == (
+        "→ profile train (from --connection) · database MY_DB (from --database) · schema RUNS (from --schema)"
+    )
+
+
+def test_the_target_line_uses_config_json_and_flags_a_variable_in_yellow(monkeypatch):
+    _write_profiles("prod")
+    config = Path(os.environ["XDG_CONFIG_HOME"]) / "cortex-training" / "config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text('{"profile": "prod"}')
+    monkeypatch.setenv("CORTEX_TRAINING_DATABASE", "SANDBOX_DB")
+    monkeypatch.delenv("CORTEX_TRAINING_SCHEMA", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    stderr = _Terminal()
+    cli.main(["list"], client_factory=lambda args: FakeClient(), stdout=io.StringIO(), stderr=stderr)
+    line = stderr.getvalue().splitlines()[0]
+    assert "\033[1mprod\033[0m \033[2m(from config.json)\033[0m" in line
+    assert "\033[1mSANDBOX_DB\033[0m \033[33m(from CORTEX_TRAINING_DATABASE)\033[0m" in line
+
+
+def test_the_target_line_is_plain_with_no_color(monkeypatch):
+    _write_profiles("default")
+    monkeypatch.setenv("NO_COLOR", "1")
+    stderr = _Terminal()
+    cli.main(["list"], client_factory=lambda args: FakeClient(), stdout=io.StringIO(), stderr=stderr)
+    assert "\033[" not in stderr.getvalue()
+
+
+def test_ct_config_picks_the_settings_file(tmp_path):
+    _write_profiles("default", "project")
+    settings = tmp_path / "project-config.json"
+    settings.write_text('{"profile": "project", "endpoint": "ct"}')
+    seen = {}
+
+    def make_client(args):
+        seen.update(vars(args))
+        return FakeClient()
+
+    stderr = io.StringIO()
+    rc = cli.main(["--ct-config", str(settings), "list"], client_factory=make_client, stdout=io.StringIO(), stderr=stderr)
+    assert rc == 0
+    assert seen["resolution"].profile == "project"
+    assert seen["resolution"].settings == {"endpoint": "ct"}
+    assert f"(from {settings})" in stderr.getvalue()
+
+
+def test_a_named_profile_that_does_not_exist_is_an_error():
+    _write_profiles("prod")
+    stderr = io.StringIO()
+    rc = cli.main(["--connection", "nope", "list"], client_factory=lambda args: FakeClient(), stderr=stderr)
+    assert rc == 1
+    assert "Snowflake connection profile 'nope' (passed in) does not exist; known profiles: prod." in stderr.getvalue()
+
+
+# ─── Old connection forms (2s) ──────────────────────────────────────────────
+
+
+class _TerminalInput(io.StringIO):
+    def isatty(self):
+        return True
+
+
+def _old_config(tmp_path):
+    return _write_config(tmp_path, {"host": "ACCOUNT.snowflakecomputing.com", "pat": "test-pat", "database": "DB"})
+
+
+@pytest.mark.parametrize("source", ["--config", "CORTEX_TRAINING_CONFIG", "login.json"])
+def test_an_old_config_without_a_terminal_says_how_to_convert_it(tmp_path, monkeypatch, source):
+    config = _old_config(tmp_path)
+    monkeypatch.delenv("CORTEX_TRAINING_CONFIG", raising=False)
+    argv = ["list"]
+    if source == "--config":
+        argv = ["--config", str(config), "list"]
+    elif source == "CORTEX_TRAINING_CONFIG":
+        monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(config))
+    else:
+        login_state = tmp_path / "login.json"
+        login_state.write_text(json.dumps({"config_path": str(config)}))
+        monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
+    stderr = io.StringIO()
+    rc = cli.main(argv, client_factory=lambda args: pytest.fail("must not connect"), stderr=stderr)
+    assert rc == 2
+    err = stderr.getvalue()
+    assert f"signing in with an old JSON config ({config}, from {source}) is no longer supported." in err
+    assert f"To convert it, run in a terminal:  cortex-training login --convert-old-config {config}" in err
+
+
+def test_an_old_config_in_a_terminal_offers_to_convert_it(tmp_path, monkeypatch):
+    config = _old_config(tmp_path)
+    calls = []
+    monkeypatch.setattr("cortex_training._convert.run_convert", lambda path, **streams: calls.append(path) or 0)
+    stderr = _Terminal()
+    rc = cli.main(["--config", str(config), "list"], stdin=_TerminalInput("\n"), stderr=stderr)
+    assert rc == 0
+    assert "Convert it now? [Y/n]" in stderr.getvalue()
+    assert calls == [str(config)]
+
+
+def test_declining_to_convert_changes_nothing_and_says_how_later(tmp_path, monkeypatch):
+    config = _old_config(tmp_path)
+    monkeypatch.setattr("cortex_training._convert.run_convert", lambda *a, **k: pytest.fail("must not convert"))
+    stderr = _Terminal()
+    rc = cli.main(["--config", str(config), "list"], stdin=_TerminalInput("n\n"), stderr=stderr)
+    assert rc == 2
+    assert f"Nothing was changed. To convert it later, run:  cortex-training login --convert-old-config {config}" in stderr.getvalue()
+    assert config.exists()
+
+
+@pytest.mark.parametrize("source", ["--config", "CORTEX_TRAINING_CONFIG"])
+def test_an_old_config_that_is_gone_is_an_error(tmp_path, monkeypatch, source):
+    missing = tmp_path / "gone.json"
+    argv = ["--config", str(missing), "list"] if source == "--config" else ["list"]
+    if source == "CORTEX_TRAINING_CONFIG":
+        monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(missing))
+    stderr = io.StringIO()
+    rc = cli.main(argv, client_factory=lambda args: pytest.fail("must not connect"), stderr=stderr)
+    assert rc == 2
+    assert f"{source} points to an old JSON config, {missing}, which doesn't exist" in stderr.getvalue()
+    assert "Run `cortex-training login`" in stderr.getvalue()
+
+
+def test_a_stale_login_json_is_ignored_with_a_warning(tmp_path, monkeypatch):
+    login_state = tmp_path / "login.json"
+    login_state.write_text(json.dumps({"config_path": str(tmp_path / "removed-config.json")}))
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
+    monkeypatch.delenv("CORTEX_TRAINING_CONFIG", raising=False)
+    _write_profiles("default")
+    seen = {}
+    stderr = io.StringIO()
+    rc = cli.main(["list"], client_factory=lambda args: seen.update(vars(args)) or FakeClient(), stdout=io.StringIO(), stderr=stderr)
+    assert rc == 0
+    assert seen["resolution"].profile == "default"
+    assert f"warning: {login_state} points to {tmp_path / 'removed-config.json'}, which doesn't exist; it's ignored. Delete it." in stderr.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("flags", "named"),
+    [(["--host", "x.test"], "--host is"), (["--pat", "tok"], "--pat is"), (["--host", "x.test", "--pat", "tok"], "--host and --pat are")],
+)
+def test_host_and_pat_flags_point_to_login(flags, named):
+    stderr = io.StringIO()
+    rc = cli.main(flags + ["list"], client_factory=lambda args: pytest.fail("must not connect"), stderr=stderr)
+    assert rc == 2
+    err = stderr.getvalue()
+    assert f"error: {named} no longer supported: Cortex Training signs in with a Snowflake connection profile." in err
+    assert "In CI, set CORTEX_TRAINING_HOST and CORTEX_TRAINING_PAT instead." in err
+
+
+def test_old_flags_are_hidden_from_help(capsys):
+    with pytest.raises(SystemExit):
+        cli.parse_args(["--help"])
+    out = capsys.readouterr().out
+    for flag in ("--config", "--host", "--pat", "--base-url"):
+        assert flag not in out
+    assert "--ct-config" in out and "--connection" in out
+
+
+def test_base_url_still_reaches_a_local_server():
+    seen = {}
+    rc = cli.main(_base_args() + ["list"], client_factory=lambda args: seen.update(vars(args)) or FakeClient(), stdout=io.StringIO())
+    assert rc == 0
+    assert seen["base_url"] == "http://test.local" and getattr(seen.get("resolution"), "profile", None) is None
+
+
+def test_ignored_variables_are_named_with_what_to_use(monkeypatch):
+    _write_profiles("default")
+    monkeypatch.setenv("CORTEX_TRAINING_CONNECTION", "old")
+    monkeypatch.setenv("SNOWFLAKE_DATABASE", "OTHER_TOOL_DB")
+    monkeypatch.setenv("SNOWFLAKE_PAT", "other-tool-pat")
+    seen = {}
+    stderr = io.StringIO()
+    rc = cli.main(["list"], client_factory=lambda args: seen.update(vars(args)) or FakeClient(), stdout=io.StringIO(), stderr=stderr)
+    assert rc == 0
+    err = stderr.getvalue()
+    assert "warning: CORTEX_TRAINING_CONNECTION is set but ignored. Use --connection NAME" in err
+    assert "warning: SNOWFLAKE_DATABASE is set but ignored; Cortex Training uses CORTEX_TRAINING_DATABASE, or the profile's database." in err
+    assert "warning: SNOWFLAKE_PAT is set but ignored" in err
+    assert "other-tool-pat" not in err
+    assert seen["resolution"].profile == "default" and seen["database"] == "CORTEX_TRAINING_DB"
+
+
+def test_ci_credentials_connect_when_no_profile_exists(monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_HOST", "acme.snowflakecomputing.com")
+    monkeypatch.setenv("CORTEX_TRAINING_PAT", "ci-token")
+    seen = {}
+    stderr = io.StringIO()
+    rc = cli.main(["list"], client_factory=lambda args: seen.update(vars(args)) or FakeClient(), stdout=io.StringIO(), stderr=stderr)
+    assert rc == 0
+    assert seen["resolution"].host == "acme.snowflakecomputing.com"
+    assert stderr.getvalue().startswith("→ host acme.snowflakecomputing.com (from CORTEX_TRAINING_HOST)")
+    assert "ci-token" not in stderr.getvalue()
+
+
+def test_no_profile_without_a_terminal_points_to_login(monkeypatch):
+    for name in ("CORTEX_TRAINING_HOST", "CORTEX_TRAINING_PAT"):
+        monkeypatch.delenv(name, raising=False)
+    stderr = io.StringIO()
+    rc = cli.main(["list"], client_factory=lambda args: pytest.fail("must not connect"), stderr=stderr)
+    assert rc == 1
+    assert "error: No Snowflake connection profile is set up. Run `cortex-training login` to set one up" in stderr.getvalue()
+
+
+def test_no_profile_in_a_terminal_offers_login(monkeypatch):
+    for name in ("CORTEX_TRAINING_HOST", "CORTEX_TRAINING_PAT"):
+        monkeypatch.delenv(name, raising=False)
+    calls = []
+    monkeypatch.setattr("cortex_training._login.run_login", lambda name, **streams: calls.append(name) or 0)
+    stderr = _Terminal()
+    rc = cli.main(["list"], stdin=_TerminalInput("\n"), stderr=stderr)
+    assert rc == 0
+    assert "Run `cortex-training login` now? [Y/n]" in stderr.getvalue()
+    assert calls == [None]
+
+
+def test_a_config_json_profile_that_is_gone_points_to_login():
+    _write_profiles("prod")
+    config = Path(os.environ["XDG_CONFIG_HOME"]) / "cortex-training" / "config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text('{"profile": "removed"}')
+    stderr = io.StringIO()
+    rc = cli.main(["list"], client_factory=lambda args: pytest.fail("must not connect"), stderr=stderr)
+    assert rc == 1
+    assert "'removed' (from config.json) does not exist; known profiles: prod. Run `cortex-training login` to pick or create one." in stderr.getvalue()

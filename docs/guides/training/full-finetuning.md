@@ -5,8 +5,7 @@ no `peft_config` block. Its default config, `configs/qwen3_8b_full.json`, is one
 of those, so the plain command is already a full fine-tune:
 
 ```bash
-python -m recipes.sft.conversational.train \
-  config=/path/to/config.json
+python -m recipes.sft.conversational.train
 ```
 
 For a MoE model, use the matching config, which sets `model_provider` and
@@ -14,7 +13,6 @@ For a MoE model, use the matching config, which sets `model_provider` and
 
 ```bash
 python -m recipes.sft.conversational.train \
-  config=/path/to/config.json \
   job_config=configs/qwen36_35b_a3b_full.json
 ```
 

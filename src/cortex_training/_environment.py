@@ -42,30 +42,31 @@ class _Variable:
 
 
 _OLDER_SNOWFLAKE = (
-    "An older setting that other Snowflake tools often set. Cortex Training commands use it too, "
-    "instead of your profile."
+    "An older setting that other Snowflake tools often set. Cortex Training ignores it now, "
+    "and its commands warn while it's set."
 )
 
 _VARIABLES = (
     _Variable(
         "CORTEX_TRAINING_CONFIG",
         OVERRIDES,
-        "Makes cortex-training commands use this JSON file instead of the profile you set up here.",
+        "Points to an old JSON config: cortex-training commands stop and offer to convert it into a "
+        "profile. Remove it once you've converted.",
     ),
     _Variable(
         "CORTEX_TRAINING_CONNECTION",
-        OVERRIDES,
-        "Makes cortex-training commands use this profile instead of the one you set up here.",
+        CHANGES,
+        "No longer used: commands ignore it and warn. Use --connection NAME for one command.",
     ),
     _Variable(
         "CORTEX_TRAINING_HOST",
-        OVERRIDES,
-        "Can make commands sign in to this account instead of your profile's (meant for CI).",
+        CHANGES,
+        "Signs in to this account only when no profile exists (meant for CI); ignored otherwise.",
     ),
     _Variable(
         "CORTEX_TRAINING_PAT",
-        OVERRIDES,
-        "Can make commands sign in with this token instead of your profile (meant for CI).",
+        CHANGES,
+        "Signs in with this token only when no profile exists (meant for CI); ignored otherwise.",
         secret=True,
     ),
     _Variable(
@@ -73,10 +74,10 @@ _VARIABLES = (
         OVERRIDES,
         "Sends cortex-training commands to this server instead of your Snowflake account.",
     ),
-    _Variable("SNOWFLAKE_HOST", OVERRIDES, _OLDER_SNOWFLAKE),
-    _Variable("SNOWFLAKE_PAT", OVERRIDES, _OLDER_SNOWFLAKE, secret=True),
-    _Variable("SNOWFLAKE_DATABASE", OVERRIDES, _OLDER_SNOWFLAKE),
-    _Variable("SNOWFLAKE_SCHEMA", OVERRIDES, _OLDER_SNOWFLAKE),
+    _Variable("SNOWFLAKE_HOST", CHANGES, _OLDER_SNOWFLAKE),
+    _Variable("SNOWFLAKE_PAT", CHANGES, _OLDER_SNOWFLAKE, secret=True),
+    _Variable("SNOWFLAKE_DATABASE", CHANGES, _OLDER_SNOWFLAKE),
+    _Variable("SNOWFLAKE_SCHEMA", CHANGES, _OLDER_SNOWFLAKE),
     _Variable(
         "CORTEX_TRAINING_DATABASE",
         CHANGES,

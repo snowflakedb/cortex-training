@@ -55,8 +55,8 @@ and `eps_clip` has no effect.
 ## Prerequisites
 
 Install the client and recipe dependencies as described in
-[recipes/README.md](../README.md#prerequisites), and create a connection file
-from `examples/config/connection.json.template`. The student and teacher models
+[recipes/README.md](../README.md#prerequisites), and run `cortex-training login`
+once to set up a Snowflake connection profile. The student and teacher models
 are both in the [model catalog](../../docs/reference/model-compatibility.md).
 
 ## Dataset and Model
@@ -83,11 +83,14 @@ cortex-training capacity --hardware H200
 ## Run
 
 ```bash
-python -m recipes.distillation.on_policy.train \
-  config=/path/to/config.json
+python -m recipes.distillation.on_policy.train
 ```
 
-`config=` is the Snowflake connection file. A default run takes about
+Recipes sign in with your Snowflake connection profile: the one
+`cortex-training login` saved, or `connection=NAME` for another. (`config=PATH`,
+an old JSON config, still works until 0.2.0, with a warning.)
+
+A default run takes about
 25 minutes on H200s, including about 5 minutes for both jobs to start. Both
 jobs are cancelled when the run ends, after the final checkpoint is saved.
 
@@ -128,7 +131,6 @@ accuracy.
 
 ```bash
 python -m recipes.distillation.on_policy.train \
-  config=/path/to/config.json \
   max_steps=MAX_STEPS \
   problems_per_batch=PROBLEMS_PER_BATCH \
   group_size=GROUP_SIZE \
@@ -166,7 +168,6 @@ config shipped here:
 
 ```bash
 python -m recipes.inference.serve \
-  config=/path/to/config.json \
   job_config=recipes/distillation/configs/qwen3_0p6b_sampling.json \
   source_job_id=STUDENT_JOB_ID \
   checkpoint_id=CHECKPOINT_ID

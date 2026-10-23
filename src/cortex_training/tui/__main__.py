@@ -21,10 +21,9 @@ import argparse
 import math
 import os
 import re
-from pathlib import Path
+import sys
 
-_CONNECT_HINT = ("to connect, run 'cortex-training login config.json', set CORTEX_TRAINING_CONFIG, pass "
-                 "--config config.json, --connection NAME, --base-url (local/mock), or --host + --pat; "
+_CONNECT_HINT = ("to connect, run 'cortex-training login', or pass --connection NAME; "
                  "or try the TUI without a connection: --debug")
 # Bounds for every TUI read.
 READ_MAX_RETRIES = 2
@@ -87,24 +86,22 @@ def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.Argument
         help=("Open the job details scoped to this sub-job (JOB_ID:TYPE:INDEX, for example JOB_ID:training:0); "
               "JOB_ID may then be omitted."),
     )
+    # The old JSON config and direct credentials: parsed only to explain what replaced them.
+    p.add_argument("--config", dest="config", help=argparse.SUPPRESS)
     p.add_argument(
-        "--config",
-        dest="config",
-        default=os.environ.get("CORTEX_TRAINING_CONFIG"),
-        help=(
-            "Path to a reusable Cortex Training config or credential JSON file "
-            "(same format as the cortex-training CLI config)."
-        ),
+        "--ct-config",
+        metavar="PATH",
+        help="Cortex Training settings file to use instead of ~/.config/cortex-training/config.json.",
     )
     p.add_argument(
         "--connection",
         "-c",
-        default=os.environ.get("CORTEX_TRAINING_CONNECTION"),
-        help="Snowflake connection profile name.",
+        help="Snowflake connection profile to use (default: the one `cortex-training login` saved).",
     )
-    p.add_argument("--base-url", help="Direct base URL for a local or otherwise compatible server.")
-    p.add_argument("--host", help="Snowflake account host for PAT auth.")
-    p.add_argument("--pat", help="Programmatic access token.")
+    # For a local or mock server, during development.
+    p.add_argument("--base-url", help=argparse.SUPPRESS)
+    p.add_argument("--host", help=argparse.SUPPRESS)
+    p.add_argument("--pat", help=argparse.SUPPRESS)
     p.add_argument("--database", help="Database containing the endpoint.")
     # Left as None so config-file / env values can fill them; the CLI resolver
     # applies the PUBLIC / cortex-training defaults when nothing is set.
@@ -155,33 +152,36 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
 
     import cortex_training._cli as cli
 
-    # Reuse the CLI's resolution: --config / login state / env / defaults.
+    # The flags as typed, for the picker. The TUI's --poll-interval paces its log
+    # polls, and its --poll-timeout has no effect, so neither goes to the client.
+    typed = {**cli._typed_settings(args), "poll_interval": None, "poll_timeout": None}
+    # The same connection rules as the CLI: old forms are explained (an old JSON
+    # config can be converted), and the picker chooses the profile.
     try:
-        args = cli._resolve_args(args)
-        # What the resolved arguments don't say, from the TUI's one read of the
-        # config file they came from (the CLI's resolution reads it for itself):
-        # the host or base URL it gives by itself (for the commands the TUI shows to copy).
-        selected = getattr(args, "_legacy_config_selected", False) and args.config
-        config = cli._load_config(args.config) if selected else {}
-        from_config = _config_connection(cli, config)
-    except (OSError, ValueError, RuntimeError) as exc:
-        # A config the TUI can't use (a value of the wrong type, such as a quoted
-        # poll_interval, JSON that doesn't parse, an unknown key, a file that isn't
-        # there), or flags that don't go together: one error line, as the CLI gives,
-        # not a traceback. Escaped: it can quote the file's keys.
+        cli._reject_old_connection(args)
+    except cli.OldConnectionError as exc:
         parser.exit(2, f"{parser.prog}: error: {_escaped(str(exc))}\n")
-    try:
-        args = cli._normalize_connection_args(args)
-    except ValueError as exc:
-        parser.error(str(exc))
-    if not args.use_connection_profile and not args.database:
-        parser.error("provide --database or set CORTEX_TRAINING_DATABASE/SNOWFLAKE_DATABASE")
-    if (
-        not args.use_connection_profile
-        and args.base_url is None
-        and (args.host is None or args.pat is None)
-    ):
-        parser.error(f"no connection configured: {_CONNECT_HINT}")
+    except cli.OldConfigFile as found:
+        return cli.offer_convert(found, sys.stdin, sys.stdout, sys.stderr)
+    if args.base_url or os.environ.get("CORTEX_TRAINING_BASE_URL"):
+        try:
+            args = cli._resolve_local(args)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if not args.database:
+            parser.error("--base-url needs --database (or CORTEX_TRAINING_DATABASE)")
+    else:
+        from cortex_training._picker import NoProfileError
+
+        args.use_connection_profile = True
+        try:
+            args = cli._pick(args, typed)
+        except NoProfileError as exc:
+            return cli.offer_login(exc, sys.stdin, sys.stdout, sys.stderr)
+        except ValueError as exc:
+            parser.exit(2, f"{parser.prog}: error: {_escaped(str(exc))}\n{_CONNECT_HINT}\n")
+        cli.warn_ignored_environment(sys.stderr)
+        sys.stderr.write(cli.target_line(args.resolution, sys.stderr))
 
     # Every read the TUI makes, the job list's too, is bounded here: the client's own
     # defaults (ten retries, a ten-minute read timeout) left a view silent for
@@ -205,35 +205,17 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     # job_id is optional: given, open that job's details; omitted, open the job
     # list so the user can choose one.
     app = CortexTrainingLogTUI(client, args.job_id, sub_job_id=args.sub_job_id, poll_interval=log_poll_interval)
-    app.sign_in = _sign_in(cli, args, from_config)  # for the commands the TUI shows to copy
+    app.sign_in = _sign_in(args)  # for the commands the TUI shows to copy
     app.run()
     return app.return_code or 0  # non-zero when the app stopped on an unhandled error
 
 
-def _sign_in(cli, args, from_config: dict) -> dict:
+def _sign_in(args) -> dict:
     """How the TUI's client connects, for the commands it shows to copy (read by
-    ``views.sign_in_options``). It never holds the PAT; ``config`` is the config
-    file as an absolute path, so a copied command finds it from any directory."""
+    ``views.sign_in_options``). It never holds a token."""
     if args.use_connection_profile:
         return {"kind": "profile"}
-    config = None
-    if getattr(args, "_legacy_config_selected", False) and args.config:
-        config = str(Path(args.config).expanduser().resolve())
-    if args.base_url:
-        return {"kind": "url", "config": config, "base_url": args.base_url,
-                "base_url_in_config": from_config.get("base_url") == args.base_url}
-    host = cli._normalize_host(args.host or "")
-    return {"kind": "pat", "config": config, "host": host,
-            "host_in_config": bool(host) and from_config.get("host") == host}
-
-
-def _config_connection(cli, values: dict) -> dict:
-    """What the config file (``values``, as the CLI reads it; empty for none) gives by
-    itself: its ``base_url`` and PAT ``host`` (normalized), None where it gives neither."""
-    base_url, host = cli._config_str(values, "base_url"), cli._config_str(values, "host")
-    if base_url and not cli._has_url_scheme(base_url) and host is None:
-        base_url, host = None, base_url  # the CLI reads a base URL without a scheme as the PAT host
-    return {"base_url": base_url, "host": cli._normalize_host(host) if host else None}
+    return {"kind": "url", "config": None, "base_url": args.base_url, "base_url_in_config": False}
 
 
 def _run_demo(args, app_class, *, account_list: str | None = None) -> int:

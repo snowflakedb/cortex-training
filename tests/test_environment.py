@@ -24,8 +24,8 @@ def test_findings_name_each_variable_and_never_show_secrets(monkeypatch, tmp_pat
     )
     assert [(f.name, f.shown, f.severity) for f in found] == [
         ("CORTEX_TRAINING_CONFIG", "~/.config/cortex-training/trial-config.json", _environment.OVERRIDES),
-        ("CORTEX_TRAINING_PAT", "(set)", _environment.OVERRIDES),
-        ("SNOWFLAKE_PAT", "(set)", _environment.OVERRIDES),
+        ("CORTEX_TRAINING_PAT", "(set)", _environment.CHANGES),
+        ("SNOWFLAKE_PAT", "(set)", _environment.CHANGES),
         ("SNOWFLAKE_DEFAULT_CONNECTION_NAME", "my_profile", _environment.CHANGES),
     ]
     assert "secret" not in repr(found)
@@ -34,12 +34,15 @@ def test_findings_name_each_variable_and_never_show_secrets(monkeypatch, tmp_pat
 @pytest.mark.parametrize(
     ("name", "severity"),
     [
-        ("CORTEX_TRAINING_CONNECTION", _environment.OVERRIDES),
-        ("CORTEX_TRAINING_HOST", _environment.OVERRIDES),
+        # Only these still override the profile: commands then stop, or use another server.
+        ("CORTEX_TRAINING_CONFIG", _environment.OVERRIDES),
         ("CORTEX_TRAINING_BASE_URL", _environment.OVERRIDES),
-        ("SNOWFLAKE_HOST", _environment.OVERRIDES),
-        ("SNOWFLAKE_DATABASE", _environment.OVERRIDES),
-        ("SNOWFLAKE_SCHEMA", _environment.OVERRIDES),
+        # Ignored, or used only without a profile (CI): shown, but not an override.
+        ("CORTEX_TRAINING_CONNECTION", _environment.CHANGES),
+        ("CORTEX_TRAINING_HOST", _environment.CHANGES),
+        ("SNOWFLAKE_HOST", _environment.CHANGES),
+        ("SNOWFLAKE_DATABASE", _environment.CHANGES),
+        ("SNOWFLAKE_SCHEMA", _environment.CHANGES),
         ("CORTEX_TRAINING_DATABASE", _environment.CHANGES),
         ("CORTEX_TRAINING_SCHEMA", _environment.CHANGES),
         ("SNOWFLAKE_HOME", _environment.CHANGES),
@@ -85,7 +88,7 @@ def test_the_report_says_nothing_overrides_when_clean():
 def test_the_report_explains_an_override_and_how_to_clear_it():
     out = _report(_environment.find({"CORTEX_TRAINING_CONFIG": "/tmp/trial-config.json", "SNOWFLAKE_HOME": "/tmp/sf"}))
     assert "✗ CORTEX_TRAINING_CONFIG = /tmp/trial-config.json" in out
-    assert "use this JSON file instead of the profile you set up here" in out
+    assert "commands stop and offer to convert it into a" in out
     assert "To clear it in this shell:  set -e CORTEX_TRAINING_CONFIG; set -eU CORTEX_TRAINING_CONFIG" in out
     assert "! SNOWFLAKE_HOME = /tmp/sf" in out
     assert "To clear it in this shell:  set -e SNOWFLAKE_HOME" not in out  # only overrides get a clear command

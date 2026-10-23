@@ -29,8 +29,8 @@ uv pip install wandb
 
 (`pip install ...` works in place of `uv pip install ...` if you prefer.)
 
-Create a local Snowflake connection file from
-`examples/config/connection.json.template` (account host and PAT).
+Run `cortex-training login` once to set up a Snowflake connection profile (see
+[Set Up the Client](../docs/getting-started/setup.md)).
 
 To log SFT or GRPO metrics to Weights & Biases, set a project on the train
 command (`wandb_project=...`) and export:
@@ -51,13 +51,15 @@ To log the same metrics to Snowflake experiment tracking, pass
 Recipes are Python modules so they can share code without path manipulation:
 
 ```bash
-python -m recipes.sft.conversational.train config=/path/to/config.json
-python -m recipes.rl.math_grpo.train config=/path/to/config.json
-python -m recipes.distillation.on_policy.train config=/path/to/config.json
-python -m recipes.inference.serve config=/path/to/config.json
+python -m recipes.sft.conversational.train
+python -m recipes.rl.math_grpo.train
+python -m recipes.distillation.on_policy.train
+python -m recipes.inference.serve
 ```
 
-`config=` is the Snowflake PAT/connection file. See each recipe README for
+Recipes sign in with your Snowflake connection profile: the one
+`cortex-training login` saved, or `connection=NAME` for another. (`config=PATH`,
+an old JSON config, still works until 0.2.0, with a warning.) See each recipe README for
 hardware, expected metrics, common variations, and the JSON job configs
 loaded from `configs/` (SFT and GRPO examples, plus inference configs for
 every catalog model).

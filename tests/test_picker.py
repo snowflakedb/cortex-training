@@ -265,6 +265,6 @@ def test_from_configs_builds_a_ci_client_when_no_profile_exists(profiles, config
 
 @pytest.mark.parametrize(("name", "kind"), [("from_pat", "pat"), ("from_connection_name", "profile")])
 def test_old_constructors_warn_and_still_work(constructors, name, kind):
-    with pytest.warns(FutureWarning, match=rf"CortexTrainingClient\.{name}\(\) is deprecated.*from_configs\(\)"):
+    with pytest.warns(FutureWarning, match=rf"CortexTrainingClient\.{name}\(\) is deprecated and will be removed in cortex-training 0\.2\.0\..*from_configs\(\)"):
         assert getattr(CortexTrainingClient, name)("arg", key="value") == "client"
     assert constructors == [(kind, ("arg",), {"key": "value"})]

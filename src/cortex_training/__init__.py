@@ -15,7 +15,7 @@
 
 """Public Python API for Cortex Training."""
 
-__version__ = "0.0.2"
+__version__ = "0.1.0"
 
 from . import router_replay_planner
 from . import wire

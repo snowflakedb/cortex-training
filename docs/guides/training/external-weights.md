@@ -47,10 +47,9 @@ a named internal stage and upload the directory with `PUT`.
 
 ### Before you start
 
-- A working client connection, either a connection profile or a JSON config
-  file, as configured in [Set Up the Client](../../getting-started/setup.md).
-  Confirm it with `cortex-training --connection NAME capacity` (profile) or
-  `cortex-training --config PATH capacity` (JSON config).
+- A working connection profile, as set up in
+  [Set Up the Client](../../getting-started/setup.md). Confirm it with
+  `cortex-training capacity` (or `cortex-training --connection NAME capacity`).
 - A role with `USAGE` on the database and schema and `CREATE STAGE` on the
   schema. The role that creates the stage owns it and can upload to it.
 - The role that submits the training job must be able to read the stage. If it
@@ -93,26 +92,6 @@ with snowflake.connector.connect(connection_name=PROFILE) as conn:
     cur.execute(f"PUT file://{MODEL_DIR}/* {TARGET} AUTO_COMPRESS = FALSE OVERWRITE = TRUE")
     for row in cur.execute(f"LIST {TARGET}"):
         print(row[0], row[1])
-```
-
-If you configured the client with a JSON config file instead of a profile,
-replace the `connect(...)` line with the following. The connector also needs
-your Snowflake user name, which the JSON config does not hold; use the user
-that owns the token.
-
-```python
-import json
-
-cfg = json.load(open("/path/to/config.json"))
-connection = snowflake.connector.connect(
-    host=cfg["host"],
-    account=cfg["host"],                  # the connector derives the account from the host
-    user="YOUR_USER",
-    authenticator="PROGRAMMATIC_ACCESS_TOKEN",
-    token=cfg["pat"],
-)
-with connection as conn:
-    ...                                   # same statements as above
 ```
 
 `LIST` should show `config.json`, the safetensors files, and the tokenizer

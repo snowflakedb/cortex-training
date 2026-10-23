@@ -244,7 +244,10 @@ def _run_math500(
 
 @chz.chz
 class Config:
-    config: str
+    # An old JSON config: deprecated, stops working in 0.2.0. Without it, the
+    # Snowflake profile is used: connection=NAME, else the one `cortex-training login` saved.
+    config: str | None = None
+    connection: str | None = None
     job_id: str | None = None  # attach to a running inference endpoint
 
     job_config: str = "configs/qwen3_8b_full.json"
@@ -270,7 +273,8 @@ class Config:
 
 def run_evaluation(
     *,
-    config_path: str,
+    config_path: str | None = None,
+    connection: str | None = None,
     job_config: str = "configs/qwen3_8b_full.json",
     source_job_id: str | None = None,
     checkpoint_id: str | None = None,
@@ -315,7 +319,7 @@ def run_evaluation(
     )
     logger.info("Using renderer: %s (enable_thinking=%s)", renderer_name, enable_thinking)
 
-    client = make_client(config_path)
+    client = make_client(config_path, connection=connection)
     task_name = task.strip().lower()
     if task_name not in {"math500", "gsm8k", "identity"}:
         raise ValueError(f"unsupported eval task {task!r}; use math500, gsm8k, or identity")
@@ -363,6 +367,7 @@ def main(config: Config):
     )
     run_evaluation(
         config_path=config.config,
+        connection=config.connection,
         job_config=config.job_config,
         source_job_id=config.source_job_id,
         checkpoint_id=config.checkpoint_id,

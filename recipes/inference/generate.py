@@ -66,7 +66,10 @@ logging.getLogger("tinker_cookbook.renderers.base").setLevel(logging.ERROR)
 
 @chz.chz
 class Config:
-    config: str
+    # An old JSON config: deprecated, stops working in 0.2.0. Without it, the
+    # Snowflake profile is used: connection=NAME, else the one `cortex-training login` saved.
+    config: str | None = None
+    connection: str | None = None
     job_id: str | None = None  # attach to a running inference endpoint
 
     job_config: str = "configs/qwen3_8b_full.json"
@@ -117,7 +120,7 @@ def main(config: Config):
         config.enable_thinking,
     )
 
-    client = make_client(config.config)
+    client = make_client(config.config, connection=config.connection)
     if source is not None:
         logger.info(
             "Creating inference endpoint from weights-only checkpoint %s (job %s)",

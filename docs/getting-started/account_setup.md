@@ -83,12 +83,11 @@ The conversational SFT recipe fine-tunes Qwen3-8B on a one-example chat dataset
 
 ```bash
 python -m recipes.sft.conversational.train \
-  config=/path/to/your-config.json \
   max_steps=10
 ```
 
-If you used `connections.toml` with a default connection, the recipe picks it
-up automatically. If you used a JSON config, pass the path as `config=`.
+The recipe signs in with the profile `cortex-training login` saved (or your
+Snowflake default profile); add `connection=NAME` to use another one.
 
 What happens during this run:
 
@@ -108,7 +107,6 @@ confirm the model learned the expected answer:
 
 ```bash
 python -m recipes.inference.generate \
-  config=/path/to/your-config.json \
   job_config=recipes/inference/configs/qwen3_8b_full.json \
   source_job_id=<training_job_id> \
   checkpoint_id=<checkpoint_id> \

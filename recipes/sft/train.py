@@ -37,7 +37,8 @@ _CONFIG_SEARCH_DIRS = (_RECIPE_DIR, _RECIPE_DIR / "configs")
 
 
 class Config(Protocol):
-    config: str
+    config: str | None
+    connection: str | None
     job_id: str | None
     pad_to_max_length: bool
     max_steps: int
@@ -197,7 +198,7 @@ def train(config: Config, task: Task) -> dict[str, Any]:
         if eval_sequences:
             logger.info("valid_nll on %d held-out examples every %d steps", n_eval, eval_every)
 
-    client = make_client(config.config)
+    client = make_client(config.config, connection=config.connection)
 
     def evaluate(job_id: str) -> dict[str, float]:
         eval_start = time.time()
@@ -275,6 +276,7 @@ def train(config: Config, task: Task) -> dict[str, Any]:
         if callable(eval_command):
             log_saved_checkpoints(
                 config_path=config.config,
+                connection=config.connection,
                 job_id=job_id,
                 saved=saved,
             )
@@ -284,6 +286,7 @@ def train(config: Config, task: Task) -> dict[str, Any]:
                     "Evaluate this weights-only checkpoint with:\n  %s",
                     eval_command(
                         config_path=config.config,
+                        connection=config.connection,
                         job_id=job_id,
                         checkpoint_id=checkpoint_id,
                     ),
@@ -292,6 +295,7 @@ def train(config: Config, task: Task) -> dict[str, Any]:
             sample_prompt = task.sample_prompt()
             log_saved_checkpoints(
                 config_path=config.config,
+                connection=config.connection,
                 job_id=job_id,
                 saved=saved,
                 sampling_command="sample",

@@ -21,6 +21,8 @@ import contextlib
 import json
 import logging
 import re
+import shlex
+import sys
 from collections.abc import Iterator
 from collections.abc import Mapping
 from collections.abc import Sequence
@@ -60,7 +62,83 @@ def load_connection_mapping(config_path: str) -> dict[str, Any]:
     return config
 
 
-def make_client(config_path: str, **overrides: Any) -> CortexTrainingClient:
+# The first library version these recipes work with: it has from_configs().
+_MIN_LIBRARY = "0.1.0"
+_REMOVED_IN = "0.2.0"
+
+
+class LibraryTooOld(SystemExit):
+    """The installed cortex-training library is older than these recipes."""
+
+
+def check_library() -> None:
+    """Stop before anything runs if the installed library is older than these recipes.
+
+    Recipes come from a git clone, and the library from wherever it was
+    installed, so the two can differ (for example, a library from PyPI).
+    """
+    if hasattr(CortexTrainingClient, "from_configs"):
+        return
+    try:
+        from importlib.metadata import version
+
+        installed = f"cortex-training {version('cortex-training')}"
+    except Exception:
+        installed = "an older cortex-training"
+    raise LibraryTooOld(
+        f"error: these recipes need cortex-training {_MIN_LIBRARY} or newer, but {installed} is installed.\n"
+        "From the cortex-training folder, run:  uv pip install -e .\n"
+        "(That installs the library from this folder, so the recipes and the library always match.)"
+    )
+
+
+def _command_without_config() -> str:
+    """The command this recipe was run with, without its ``config=`` argument."""
+    spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+    module = spec.name if spec is not None else "recipes.<recipe>"
+    args = [arg for arg in sys.argv[1:] if not arg.startswith("config=")]
+    return " ".join(["python", "-m", module, *(shlex.quote(arg) for arg in args)])
+
+
+def warn_old_config(config_path: str) -> None:
+    """Say that ``config=`` is going away, and exactly what to run instead."""
+    logger.warning(
+        "config= is deprecated and stops working in cortex-training %s. Recipes now sign in with your "
+        "Snowflake connection profile, like the cortex-training CLI.\n\n"
+        "To switch (once):\n"
+        "  1. Convert your old config into a profile:\n"
+        "       cortex-training login --convert-old-config %s\n"
+        "  2. Then run the same command without config=:\n"
+        "       %s\n\n"
+        "To use a profile other than your default, add connection=NAME.",
+        _REMOVED_IN,
+        shlex.quote(config_path),
+        _command_without_config(),
+    )
+
+
+def connection_args(config_path: str | None, connection: str | None) -> str:
+    """The connection part of a recipe command to show, as the user ran it."""
+    if config_path:
+        return f" config={config_path}"
+    if connection:
+        return f" connection={connection}"
+    return ""
+
+
+def make_client(
+    config_path: str | None = None, *, connection: str | None = None, **overrides: Any
+) -> CortexTrainingClient:
+    """Create the recipe's client: from the Snowflake profile, or from an old ``config=`` file.
+
+    Without ``config_path``, the profile is ``connection``, else the one
+    ``cortex-training login`` saved, else the Snowflake default, as for the CLI.
+    ``config_path`` (an old JSON config) still works until 0.2.0, with a warning.
+    """
+    check_library()
+    if not config_path:
+        return CortexTrainingClient.from_configs(connection, **overrides)
+    warn_old_config(config_path)
     config = load_connection_mapping(config_path)
 
     pat = config.get("pat")
@@ -225,11 +303,12 @@ def sampling_job_body(
 def _sampling_cli(
     *,
     module: str,
-    config_path: str,
+    config_path: str | None,
+    connection: str | None = None,
     job_id: str,
     extra: str = "",
 ) -> str:
-    line = f"  python -m {module} config={config_path} source_job_id={job_id}"
+    line = f"  python -m {module}{connection_args(config_path, connection)} source_job_id={job_id}"
     if extra:
         line += extra
     return line
@@ -237,7 +316,8 @@ def _sampling_cli(
 
 def log_saved_checkpoints(
     *,
-    config_path: str,
+    config_path: str | None,
+    connection: str | None = None,
     job_id: str,
     saved: Mapping[str, Mapping[str, Any]],
     sampling_command: str | None = None,
@@ -296,6 +376,7 @@ def log_saved_checkpoints(
         _sampling_cli(
             module=module,
             config_path=config_path,
+            connection=connection,
             job_id=job_id,
             extra=extra,
         ),

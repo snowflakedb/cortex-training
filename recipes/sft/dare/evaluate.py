@@ -69,7 +69,10 @@ CATEGORIES = {
 
 @chz.chz
 class Config:
-    config: str
+    # An old JSON config: deprecated, stops working in 0.2.0. Without it, the
+    # Snowflake profile is used: connection=NAME, else the one `cortex-training login` saved.
+    config: str | None = None
+    connection: str | None = None
     bench_dir: str
     job_id: str | None = None
     job_config: str = "configs/qwen3_8b_full.json"
@@ -291,7 +294,7 @@ def main(config: Config) -> dict[str, float]:
     )
     stop_sequences = renderer.get_stop_sequences()
     params = {"max_tokens": config.max_tokens, "temperature": config.temperature, **stop_params_for(stop_sequences)}
-    client = make_client(config.config)
+    client = make_client(config.config, connection=config.connection)
     with sandbox_server as sandbox_url, running_job(
         client, body, job_id=config.job_id, keep_job=config.keep_job
     ) as job_id:

@@ -25,8 +25,8 @@ picks, first match wins:
   they are ignored and a warning says so.
 - **Database:** `database`; then `CORTEX_TRAINING_DATABASE` (logged when used);
   then the profile's database; then `CORTEX_TRAINING_DB`.
-- **Schema:** `schema`; then `CORTEX_TRAINING_SCHEMA`; then the profile's
-  schema; then `PUBLIC`.
+- **Schema:** `schema`; then `CORTEX_TRAINING_SCHEMA` (logged when used); then
+  the profile's schema; then `PUBLIC`.
 
 It logs one line naming the target and where each part came from, for example
 `profile training (from config.json), db TRAIN_DB (from profile training), schema PUBLIC (default)`.
@@ -47,7 +47,7 @@ Other keyword arguments to `from_configs()` go to the constructor and win over
 `config.json`.
 
 `from_connection_name()` and `from_pat()` still work but are deprecated: each
-emits a `FutureWarning` and will be removed in a future release. Use
+emits a `FutureWarning`, and **both are removed in cortex-training 0.2.0**. Use
 `from_configs()` instead.
 
 Tuning knobs on the constructor: `endpoint`, `poll_interval` (0.5s),

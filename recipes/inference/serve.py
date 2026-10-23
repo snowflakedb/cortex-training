@@ -35,7 +35,10 @@ logging.getLogger("urllib3").setLevel(logging.WARN)
 
 @chz.chz
 class Config:
-    config: str
+    # An old JSON config: deprecated, stops working in 0.2.0. Without it, the
+    # Snowflake profile is used: connection=NAME, else the one `cortex-training login` saved.
+    config: str | None = None
+    connection: str | None = None
     job_id: str | None = None  # attach to a running inference endpoint
 
     job_config: str = "configs/qwen3_8b_full.json"
@@ -52,7 +55,7 @@ def main(config: Config):
     if config.debug_image_tag:
         os.environ[DEBUG_OPTIONS_ENV] = "1"
 
-    client = make_client(config.config)
+    client = make_client(config.config, connection=config.connection)
     body, source = inference_endpoint_body(
         config.job_config,
         source_job_id=config.source_job_id,
@@ -77,7 +80,7 @@ def main(config: Config):
         )
 
     with running_job(client, body, job_id=config.job_id, keep_job=config.keep_job) as job_id:
-        log_endpoint_ready(config.config, job_id)
+        log_endpoint_ready(config.config, job_id, connection=config.connection)
 
 
 if __name__ == "__main__":

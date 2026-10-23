@@ -228,3 +228,16 @@ def test_tui_delegates_named_connection(monkeypatch):
         "argv": ["-c", "training", "job-1"],
         "prog": "cortex-training tui",
     }
+
+
+def test_the_package_version_matches_pyproject():
+    # Bug reports quote cortex_training.__version__ (docs/reference/troubleshooting.md),
+    # so it must be the version that was installed.
+    import re
+    from pathlib import Path
+
+    import cortex_training
+
+    pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+    (version,) = re.findall(r'^version = "([^"]+)"$', pyproject, flags=re.MULTILINE)
+    assert cortex_training.__version__ == version

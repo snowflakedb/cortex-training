@@ -111,29 +111,14 @@ your role and the database, and how to fix it: create it, ask an admin for
 
 ### Option B: JSON config (legacy)
 
-Create a JSON file outside the repository:
+Before 0.1.0, commands could sign in with a JSON file holding a host, a PAT, and
+a database, passed with `--config`, set in `CORTEX_TRAINING_CONFIG`, or
+remembered by `cortex-training login PATH`. That no longer works: a command that
+finds one stops, and in a terminal it offers to convert the file for you.
+(Recipes still accept `config=PATH` until 0.2.0, with a warning.)
 
-```json
-{
-  "host": "ACCOUNT.snowflakecomputing.com",
-  "pat": "YOUR_PAT",
-  "database": "CORTEX_TRAINING_DB",
-  "schema": "PUBLIC"
-}
-```
-
-Pass it to each command with `--config`:
-
-```bash
-cortex-training --config ~/cortex-training-config.json capacity
-```
-
-`cortex-training login` no longer remembers a JSON file. To set things up once,
-use a Snowflake connection profile (Option A), or run `cortex-training login`,
-which creates or picks one for you.
-
-**Convert a JSON config into a profile.** If you already use a JSON config, one
-command turns it into a Snowflake connection profile:
+**Convert a JSON config into a profile.** One command turns it into a Snowflake
+connection profile:
 
 ```bash
 cortex-training login --convert-old-config ~/cortex-training-config.json
@@ -156,28 +141,27 @@ It shows what the file holds (the PAT stays hidden), then asks before each step:
 
 Either every change happens, or every file is put back as it was.
 
-### Option C: Environment variables
+### Option C: Environment variables (CI)
 
-Set credentials directly in your shell:
+In a CI job or pipeline with no profile file, sign in with variables:
 
 ```bash
 export CORTEX_TRAINING_HOST="ACCOUNT.snowflakecomputing.com"
 export CORTEX_TRAINING_PAT="YOUR_PAT"
-export CORTEX_TRAINING_DATABASE="CORTEX_TRAINING_DB"
-export CORTEX_TRAINING_SCHEMA="PUBLIC"
-```
-
-Then run commands directly:
-
-```bash
 cortex-training capacity
 ```
 
-Environment variables override both `connections.toml` and JSON config values.
-This is useful for CI/CD pipelines or when you don't want secrets in files.
+`CORTEX_TRAINING_HOST` and `CORTEX_TRAINING_PAT` are used **only when no
+Snowflake connection profile exists**. On a machine with a profile they are
+ignored, with a warning, so a variable left in a shell can't silently switch
+accounts.
 
-Snowflake-prefixed variants (`SNOWFLAKE_PAT`, `SNOWFLAKE_HOST`,
-`SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA`) are also accepted.
+`CORTEX_TRAINING_DATABASE` and `CORTEX_TRAINING_SCHEMA` override the profile's
+database and schema, in CI and on a laptop, and each command's first line shows
+it: `database SANDBOX_DB (from CORTEX_TRAINING_DATABASE)`.
+
+The older `SNOWFLAKE_HOST`, `SNOWFLAKE_PAT`, `SNOWFLAKE_DATABASE`, and
+`SNOWFLAKE_SCHEMA` are ignored, with a warning: other Snowflake tools set them.
 
 ## Troubleshooting
 

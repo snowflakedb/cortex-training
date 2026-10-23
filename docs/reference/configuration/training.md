@@ -2,8 +2,10 @@
 
 The recipes take two separate things:
 
-- `config=` — the Snowflake connection file (account host, PAT, database,
-  schema). See [Set up the client](../../getting-started/setup.md).
+- `connection=` — the Snowflake connection profile to sign in with. Leave it out
+  to use the one `cortex-training login` saved. (`config=PATH`, an old JSON
+  config, still works until 0.2.0, with a warning.) See
+  [Set up the client](../../getting-started/setup.md).
 - `job_config=` — a JSON create-job body holding the whole training
   configuration. Each recipe ships examples under its own `configs/`
   directory.

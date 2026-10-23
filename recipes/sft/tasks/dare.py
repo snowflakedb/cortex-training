@@ -215,13 +215,16 @@ class DareTask:
     def eval_command(
         self,
         *,
-        config_path: str,
+        config_path: str | None,
         job_id: str,
         checkpoint_id: str,
+        connection: str | None = None,
     ) -> str:
+        from recipes.utils import connection_args
+
         return (
-            "python -m recipes.sft.dare.evaluate "
-            f"config={config_path} "
+            "python -m recipes.sft.dare.evaluate"
+            f"{connection_args(config_path, connection)} "
             "bench_dir=$BENCH_DIR "
             "sandbox_python=$PWD/dare_sandbox_env/bin/python "
             f"source_job_id={job_id} "
