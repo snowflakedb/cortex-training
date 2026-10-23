@@ -1,0 +1,56 @@
+{
+  "sub_job_configs": [
+    {
+      "job_type": "sampling",
+      "model_name": "Qwen/Qwen3.5-4B",
+      "dtype": "bfloat16",
+      "seed": 42,
+      "inference_config": {
+        "max_seq_len": 16384,
+        "n_gpus": 1,
+        "vllm_config": {
+          "tensor_parallel_size": 1,
+          "gpu_memory_utilization": 0.85
+        }
+      }
+    },
+    {
+      "job_type": "training",
+      "model_name": "Qwen/Qwen3.5-4B",
+      "dtype": "bfloat16",
+      "seed": 42,
+      "training_config": {
+        "n_gpus": 1,
+        "max_seq_len": 16384,
+        "train_batch_size": 1,
+        "gradient_clipping": 1.0,
+        "model_provider": "huggingface",
+        "attn_implementation": "flash_attention_3",
+        "fused_lm_head_token_chunk_size": 8192,
+        "mb_spec": {
+          "max_tokens_per_mb": 16384
+        },
+        "optimizer": {
+          "name": "AdamW",
+          "lr": 1e-06,
+          "weight_decay": 0.0,
+          "betas": [
+            0.9,
+            0.999
+          ],
+          "eps": 1e-08
+        },
+        "ds_config": {
+          "zero_optimization": {
+            "stage": 2,
+            "reduce_scatter": true
+          },
+          "bf16": {
+            "enabled": true
+          }
+        },
+        "activation_checkpointing": true
+      }
+    }
+  ]
+}

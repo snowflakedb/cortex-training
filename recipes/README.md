@@ -11,7 +11,7 @@ under its `configs/` directory.
 | [Conversational SFT](sft/README.md) | LoRA or full-parameter SFT | Hugging Face chat datasets, GSM8K, identity | Runnable |
 | [DARE-Bench agent SFT](sft/dare/README.md) | Full-parameter multi-turn tool SFT + agent eval | DARE-Bench | Runnable |
 | [Math GRPO](rl/README.md) | Reinforcement learning | Hendrycks MATH and MATH-500 | Runnable |
-| [On-policy distillation](distillation/README.md) | Distillation from a frozen teacher | GSM8K | Runnable |
+| [On-policy distillation](distillation/README.md) | Multi-turn tool-use distillation from a frozen teacher | Wiki-search trivia | Runnable |
 | [Inference endpoint](inference/README.md) | Serve, generate, eval | Open weights, checkpoints, MATH-500, GSM8K, identity | Runnable |
 
 GRPO can also be run from [SkyRL](../docs/integrations/skyrl.md), which uses its
@@ -25,6 +25,7 @@ Install the client and recipe dependencies from the repository root:
 uv pip install -e .
 uv pip install 'tinker-cookbook[math-rl] @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
 uv pip install wandb
+uv pip install chromadb  # on-policy distillation only
 ```
 
 (`pip install ...` works in place of `uv pip install ...` if you prefer.)

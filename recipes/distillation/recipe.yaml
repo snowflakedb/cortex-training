@@ -1,19 +1,24 @@
 id: on-policy-distillation
-title: On-policy distillation
+title: On-policy distillation for multi-turn tool use
 status: runnable
 task: distillation
 methods:
   - full-parameter
 models:
-  - Qwen/Qwen3-0.6B
+  - Qwen/Qwen3.5-2B
+  - Qwen/Qwen3.5-4B
 teacher_models:
-  - Qwen/Qwen3-8B
+  - Qwen/Qwen3.8-27B
+  - Qwen/Qwen3.8-Flash-Next
+judge_models:
+  - Qwen/Qwen3-30B-A3B
 datasets:
-  - openai/gsm8k
+  - willcb/wiki-trivia-questions-v4
+  - willcb/rare-wiki-pages
 precision:
   - bfloat16
 default_training_gpus: 1
 provenance:
   project: thinking-machines-lab/tinker-cookbook
   recipe: tinker_cookbook/distillation/train_on_policy.py
-last_validated: 2026-10-12
+last_validated: 2026-10-22
