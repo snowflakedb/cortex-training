@@ -144,6 +144,29 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
         parser.exit(2, f"{parser.prog}: error: the TUI couldn't load ({exc}); reinstall cortex-training, "
                        f"or pip install --upgrade '{_TEXTUAL_REQUIREMENT}'\n")
 
+    # --poll-interval paces the TUI's log polls only. The client's own poll interval
+    # is for waiting on an asynchronous result, which the TUI never does, and it
+    # refuses more than 6 s: it keeps the default, so a slow --poll-interval works.
+    log_poll_interval, args.poll_interval = args.poll_interval, parser.get_default("poll_interval")
+    client, sign_in = _build_read_only_client(parser, args)
+
+    # job_id is optional: given, open that job's details; omitted, open the job
+    # list so the user can choose one.
+    app = CortexTrainingLogTUI(client, args.job_id, sub_job_id=args.sub_job_id, poll_interval=log_poll_interval)
+    app.sign_in = sign_in  # for the commands the TUI shows to copy
+    app.run()
+    return app.return_code or 0  # non-zero when the app stopped on an unhandled error
+
+
+def _build_read_only_client(parser: argparse.ArgumentParser, args: argparse.Namespace):
+    """The TUI's client for ``args`` (from :func:`_build_arg_parser`, resolved in place
+    as the CLI resolves them), and how it signs in (``CortexTrainingLogTUI.sign_in``).
+
+    Its reads are bounded and its calls tagged as the TUI's. Whatever keeps it from
+    connecting (a config it can't use, no database, no connection) exits with one of
+    ``parser``'s error lines, not a traceback. ``scripts/tui_screenshot.py`` builds
+    its client here too, so the two stay the same.
+    """
     import cortex_training._cli as cli
 
     # Reuse the CLI's resolution: --config / login state / env / defaults.
@@ -180,10 +203,6 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     args.max_retries, args.request_timeout = READ_MAX_RETRIES, READ_TIMEOUT
     from cortex_training.snowflake_auth import SnowflakeProfileError
 
-    # --poll-interval paces the TUI's log polls only. The client's own poll interval
-    # is for waiting on an asynchronous result, which the TUI never does, and it
-    # refuses more than 6 s: it keeps the default, so a slow --poll-interval works.
-    log_poll_interval, args.poll_interval = args.poll_interval, parser.get_default("poll_interval")
     try:
         client = cli.build_client(args, cli._load_cortex_training_client_class())
     except (SnowflakeProfileError, ValueError) as exc:
@@ -195,13 +214,7 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     from cortex_training.client import TUI_SURFACE
 
     client._telemetry_surface = TUI_SURFACE
-
-    # job_id is optional: given, open that job's details; omitted, open the job
-    # list so the user can choose one.
-    app = CortexTrainingLogTUI(client, args.job_id, sub_job_id=args.sub_job_id, poll_interval=log_poll_interval)
-    app.sign_in = _sign_in(cli, args, from_config)  # for the commands the TUI shows to copy
-    app.run()
-    return app.return_code or 0  # non-zero when the app stopped on an unhandled error
+    return client, _sign_in(cli, args, from_config)
 
 
 def _sign_in(cli, args, from_config: dict) -> dict:

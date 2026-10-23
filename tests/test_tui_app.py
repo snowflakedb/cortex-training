@@ -16,6 +16,7 @@
 """Smoke tests for the Textual app (job picker -> log screen). Skipped unless
 the optional ``textual`` extra is installed (``pip install 'cortex-training[tui]'``)."""
 
+import argparse
 import asyncio
 import glob
 import inspect
@@ -3487,29 +3488,120 @@ def test_the_tui_tags_its_client_and_the_job_clients_it_opens(monkeypatch):
         client.close()
 
 
-def test_the_screenshot_script_tags_its_client_as_the_tui_and_creates_nothing(monkeypatch):
-    # It drives the TUI against an account: its calls are the TUI's, and it only reads.
+def _screenshot_script():
     import importlib.util
-
-    import cortex_training._cli as cli
 
     path = Path(__file__).resolve().parents[1] / "scripts" / "tui_screenshot.py"
     spec = importlib.util.spec_from_file_location("tui_screenshot", path)
-    tui_screenshot = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(tui_screenshot)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _ScreenshotClient:
+    base_url, database, schema = "https://ACCOUNT.snowflakecomputing.com", "CORTEX_TRAINING_DB", "PUBLIC"
+
+
+def test_the_tui_and_the_screenshot_script_build_the_same_bounded_client(monkeypatch):
+    # One helper builds both, so a screenshot's reads are the TUI's: bounded, and tagged as the TUI's.
+    import cortex_training._cli as cli
+
     built = []
 
-    class Built:
-        pass
+    class FakeApp:
+        return_code = 0
+
+        def __init__(self, client, job_id, *, sub_job_id=None, poll_interval=1.0):
+            pass
+
+        def run(self):
+            pass
 
     # Nothing connects: the profile is only named, and no client is built for real.
-    monkeypatch.setattr(cli, "build_client", lambda args, cls: built.append(args.connection) or Built())
+    monkeypatch.setattr(cli, "build_client", lambda args, cls: built.append(
+        (args.connection, args.max_retries, args.request_timeout)) or _ScreenshotClient())
+    monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", FakeApp)
 
-    client = tui_screenshot._client("some-connection")
+    assert tui_main.run(["--connection", "some-connection"]) == 0
+    client = _screenshot_script()._client(argparse.ArgumentParser(), connection="some-connection", config=None)
 
-    assert built == ["some-connection"]
-    assert isinstance(client, Built) and client._telemetry_surface == "tui"
-    assert client.auto_create_database is False  # a screenshot never creates a database or schema
+    # Never the client's own ten retries and ten-minute read, which stall a view on a 404.
+    assert built == [("some-connection", tui_main.READ_MAX_RETRIES, tui_main.READ_TIMEOUT)] * 2
+    assert client._telemetry_surface == "tui"
+
+
+def test_the_screenshot_script_reads_only_the_account_it_is_named(tmp_path, monkeypatch, capsys):
+    import cortex_training._cli as cli
+
+    script = _screenshot_script()
+    built = []
+    monkeypatch.setattr(cli, "build_client",
+                        lambda args, cls: built.append((args.connection, args.config)) or _ScreenshotClient())
+    monkeypatch.setenv("CORTEX_TRAINING_CONNECTION", "ambient")
+    # Run the old way, with no account named, it refuses rather than shoot whatever the environment gives.
+    with pytest.raises(SystemExit) as exit_:
+        script.main([str(tmp_path / "list.svg")])
+    assert exit_.value.code == 2
+    assert "one of the arguments --connection --config is required" in capsys.readouterr().err
+    assert built == []
+
+    # Named by a config file, the account is that file's, not the environment's profile.
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"base_url": "http://localhost:1", "database": "DB"}), encoding="utf-8")
+    script._client(argparse.ArgumentParser(), connection=None, config=str(path))
+    assert built == [(None, str(path))]
+
+
+def test_the_screenshot_script_s_connection_errors_are_the_tui_s(tmp_path, monkeypatch, capsys):
+    # On a machine with no account to read: the TUI's error and how to connect, not a traceback.
+    import cortex_training._cli as cli
+    from cortex_training.snowflake_auth import SnowflakeProfileError
+
+    script = _screenshot_script()
+
+    def no_profile(args, cls):
+        raise SnowflakeProfileError("no connection named NAME")
+
+    monkeypatch.setattr(cli, "build_client", no_profile)
+    with pytest.raises(SystemExit) as exit_:
+        script.main([str(tmp_path / "list.svg"), "--connection", "NAME"])
+    assert exit_.value.code == 2
+    lines = capsys.readouterr().err.splitlines()
+    assert lines[0].endswith(": error: no connection named NAME") and lines[1:] == [tui_main._CONNECT_HINT]
+
+    for name in ("CORTEX_TRAINING_BASE_URL", "CORTEX_TRAINING_HOST", "SNOWFLAKE_HOST",
+                 "CORTEX_TRAINING_PAT", "SNOWFLAKE_PAT"):
+        monkeypatch.delenv(name, raising=False)
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"database": "DB"}), encoding="utf-8")  # no account in it
+    with pytest.raises(SystemExit) as exit_:
+        script.main([str(tmp_path / "list.svg"), "--config", str(path)])
+    assert exit_.value.code == 2
+    assert ": error: no connection configured: " in capsys.readouterr().err
+    assert not (tmp_path / "list.svg").exists()
+
+
+def test_the_screenshot_script_says_what_it_reads_and_leaves_no_cache_behind(tmp_path, monkeypatch, capsys):
+    import cortex_training._cli as cli
+
+    script = _screenshot_script()
+    monkeypatch.setattr(cli, "build_client", lambda args, cls: _ScreenshotClient())
+    caches = []
+
+    async def shoot(out, size, keys, job_id, client):
+        cache = Path(os.environ["CORTEX_TRAINING_TUI_CACHE_DIR"])
+        (cache / "stdout.log").write_text("a downloaded log", encoding="utf-8")
+        caches.append(cache)
+        # Said before it shoots, on stderr: the account and database whose jobs the shot shows.
+        assert ("reading https://ACCOUNT.snowflakecomputing.com, database CORTEX_TRAINING_DB, schema PUBLIC"
+                in capsys.readouterr().err)
+
+    monkeypatch.setattr(script, "_shoot", shoot)
+    real_cache = tmp_path / "real-cache"
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(real_cache))  # and restored after the test
+    assert script.main([str(tmp_path / "list.svg"), "--connection", "NAME"]) == 0
+    assert len(caches) == 1 and caches[0] != real_cache
+    assert not caches[0].exists()  # the shot's logs and telemetry went with it
 
 
 @pytest.mark.parametrize(
