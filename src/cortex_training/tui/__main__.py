@@ -121,8 +121,8 @@ def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.Argument
     )
     p.add_argument(
         "--poll-timeout", type=float, default=1800.0,
-        help=("Seconds the client waits for an asynchronous request's result (default 1800), as in the CLI; "
-              "the TUI sends none, so it has no effect here."),
+        help=("Accepted for compatibility with the cortex-training CLI. "
+              "The TUI makes no asynchronous requests, so this has no effect."),
     )
     p.add_argument("--no-verify-ssl", action="store_true",
                    help="Disable SSL certificate verification for authenticated requests.")

@@ -441,7 +441,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
         shown = [picked] if picked is not None else subs
         whose = v.sub_job_label(shown[0]) if len(shown) == 1 else "every sub-job"
         card.border_title = Content.assemble((" Config ", f"bold {theme.TEXT}"), (f"· {whose} ", theme.MUTED))
-        card.border_subtitle = Content.styled(" submitted config, as cortex-training get shows it ", theme.MUTED)
+        card.border_subtitle = Content.styled(" as submitted ", theme.MUTED)
         body = self.query_one("#config", Static)
         if not shown:
             body.update(Content.styled("the service sent no sub-job configs", theme.FAINT))

@@ -191,7 +191,7 @@ def experiment_access_hint(exc: BaseException) -> str | None:
         return ("this role can't read the job's Experiment, or it no longer exists (saved logs, GPU metrics and "
                 f"checkpoints live there); {_ASK}")
     if _EXPERIMENT_SQL_DENIED.search(text):  # a MONITOR-only role: the service still lists the checkpoints
-        return f"this role can't read the job's Experiment, where saved logs and GPU metrics live (the checkpoints command works); {_ASK}"
+        return f"this role can't read the job's Experiment, where saved logs and GPU metrics live (checkpoints can still be listed); {_ASK}"
     return None
 
 

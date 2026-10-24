@@ -180,7 +180,7 @@ def test_a_section_whose_every_metric_is_hidden_says_so():
             assert await _wait(pilot, lambda: pane._downloaded and not pane._loading)
             assert "grad_norm" in _text(screen, "#training-step-stats")
             calls = _text(screen, "#training-call-stats")
-            assert "1 metric, all hidden as bookkeeping (a shows every metric)" in calls
+            assert "1 internal metric hidden · a shows all metrics" in calls
             assert "saved no calls" not in calls
             await pilot.press("a")
             assert "rank" in _text(screen, "#training-call-stats")

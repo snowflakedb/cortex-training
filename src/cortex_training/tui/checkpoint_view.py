@@ -574,7 +574,7 @@ class CheckpointTab:
             lines = json.dumps(compact_numbers(views.printable_data(shown)), indent=2, sort_keys=True,
                                default=str).splitlines()
             label = "Config" if len(configs) == 1 else f"Config {printable(sj.get('sub_job_id') or '')}"
-            self._fact(text, label, "the job's, as submitted", theme.FAINT)
+            self._fact(text, label, "as submitted", theme.FAINT)
             for line in lines:
                 text.append(f"\n{'':<{self._LABEL}}{line}", style=theme.TEXT)
         return text

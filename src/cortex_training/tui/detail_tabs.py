@@ -407,7 +407,7 @@ class TrainingPane(_Pane):
     @staticmethod
     def _all_hidden_text(sub_job: training.SubJobTraining, view: str) -> Text:
         count = sub_job.hidden(view)
-        return Text(f"{count:,} metric{'s' if count != 1 else ''}, all hidden as bookkeeping (a shows every metric)",
+        return Text(f"{count:,} internal metric{'s' if count != 1 else ''} hidden · a shows all metrics",
                     style=CHART_MUTED)
 
     def _at(self, sub_job: training.SubJobTraining, view: str, x: int) -> str:

@@ -722,8 +722,8 @@ def no_metrics_text(sub_job_label: str, status: str, *, training: bool, download
                     view: str = VIEW_STEP, old_format: int = 0) -> str:
     """Why the tab has nothing to show for a sub-job in ``view``."""
     if old_format:
-        return (f"{sub_job_label}'s {old_format:,} training rows were saved in an earlier format, which "
-                "combined each step's calls; this version of the tab reads one row per call and step")
+        return (f"{sub_job_label}'s {old_format:,} training rows were saved in an earlier format "
+                "(one row per step, calls combined) that this tab can't show")
     if not training:
         return f"{sub_job_label} is not a training sub-job: only training sub-jobs save training metrics"
     if status in ("pending", "placing", "initializing", "queued"):
@@ -732,6 +732,5 @@ def no_metrics_text(sub_job_label: str, status: str, *, training: bool, download
         return "loading training metrics…"
     what = "calls" if view == VIEW_CALL else "steps"
     if status == "running":
-        return (f"no {what} saved yet: {sub_job_label} is RUNNING; a row is saved for each call and step, "
-                "and rows reach the stage in batches")
+        return f"no {what} saved yet: {sub_job_label} is RUNNING; rows arrive in batches"
     return f"{sub_job_label} saved no {what}"

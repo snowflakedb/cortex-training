@@ -282,7 +282,7 @@ def test_config_card_follows_the_highlighted_row():
             card = app.screen.query_one("#config-card")
             # The job's row: each sub-job's config as JSON under its name.
             text = "\n".join(_rows(app, "#config"))
-            assert "every sub-job" in str(card.border_title) and "as cortex-training get shows it" in str(card.border_subtitle)
+            assert "every sub-job" in str(card.border_title) and "as submitted" in str(card.border_subtitle)
             # Side by side: both sub-jobs' names on the first row.
             assert "training #0" in text.splitlines()[0] and "sampling #0" in text.splitlines()[0]
             assert '"max_seq_len": 4096.0' in text and '"lr": 1e-05' in text
