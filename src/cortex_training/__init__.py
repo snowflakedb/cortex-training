@@ -26,6 +26,7 @@ from .client import ChunkGroupRestartError
 from .client import CortexTrainingClient
 from .client import DatabaseAccessError
 from .client import DownloadCancelled
+from .client import GenerateHandle
 from .client import NoChunksError
 from .client import Hardware
 from .client import InferenceConfig
@@ -48,6 +49,7 @@ __all__ = [
     "ChunkGroupConflictError",
     "DatabaseAccessError",
     "DownloadCancelled",
+    "GenerateHandle",
     "NoChunksError",
     "InvalidPageToken",
     "serialize_forward_backward_args",

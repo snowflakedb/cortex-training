@@ -1403,6 +1403,13 @@ def _cmd_generate(
         raise ValueError("generate payload must be an object")
 
     poll = _json_bool(spec.get("poll", True), "generate poll")
+    # Opt-in: a waiting submit gives up the 5xx and read-timeout retries.
+    wait_seconds = spec.get("wait_seconds")
+    if not poll and wait_seconds:
+        raise ValueError(
+            'generate "wait_seconds" only helps when the CLI polls for the result; '
+            'remove it, or remove "poll": false'
+        )
     prompts = payload.get("prompts")
     if not isinstance(prompts, list) or not prompts:
         raise ValueError("generate JSON must contain a non-empty prompts list")
@@ -1427,20 +1434,25 @@ def _cmd_generate(
     if strict is not None:
         strict = _json_bool(strict, "generate strict")
 
-    request_id = client.generate(
+    submitted = client.generate(
         args.job,
         prompts=prompts,
         sampling_params=sampling_params,
         routing_key=payload.get("routing_key"),
         strict=strict,
+        wait_seconds=wait_seconds,
     )
+    if isinstance(submitted, str):
+        request_id, result = submitted, None
+    else:
+        request_id, result = submitted.request_id, submitted.result
     response = {
         "job_id": args.job,
         "prompt_count": prompt_count,
         "request_id": request_id,
     }
     if poll:
-        response["result"] = client.poll_request(args.job, request_id)
+        response["result"] = result if result is not None else client.poll_request(args.job, request_id)
 
     _print_json(response, stdout, compact=args.compact)
     return 0

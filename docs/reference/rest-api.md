@@ -200,6 +200,10 @@ GET /{job_id}/requests/{request_id}
 `CortexTrainingClient.poll_request(job_id, request_id)` handles status normalization,
 backoff, DSSST1 result decoding, and cursor-addressed result chunks.
 
+A generate can also ask the server to hold the call until its result is ready,
+so a short generation needs no poll; see
+[Waiting for the result](#waiting-for-the-result-wait_seconds).
+
 ### 3.2 Job states
 
 Customer-facing job states are:
@@ -289,6 +293,17 @@ The default is ten retries after the first attempt, with exponential jitter.
 
 Create-job uses the narrower connection-establishment retry predicate so an
 ambiguous response does not accidentally create a second server-assigned job.
+
+A generate sent with `wait_seconds` above `0` is retried only on failures that
+come before any generation starts: a connection failure, or HTTP 429, 404, 409,
+307 or 308. The job-not-found 404 exception above still applies, and a
+chunk-group 409 ([section 9.3](#93-request-chunking)) is not retried. A 5xx, a
+read timeout, or a reset after
+the request was sent is raised instead, because the server may already be
+generating and a resend would run the generation twice. That includes 503 and
+504: a gateway can return them after the backend already accepted the call. A
+generate without `wait_seconds` keeps the retries above. See
+[Waiting for the result](#waiting-for-the-result-wait_seconds).
 
 ### 3.6 Errors
 
@@ -1203,6 +1218,60 @@ Typical polled result:
 The backend can add fields such as log probabilities or action masks. For a
 request submitted by the same `CortexTrainingClient` instance, `poll_request()`
 converts tensor values under `results` back to Python lists.
+
+#### Waiting for the result (`wait_seconds`)
+
+On server versions that support it, the generate call can wait for the result
+instead of returning at once:
+
+```text
+POST /{job_id}/generate?wait_seconds=40
+```
+
+- `wait_seconds` is a whole number of seconds. The server holds the call for at
+  most 40 seconds, whatever the value, and may not wait at all. A negative or
+  non-integer value is rejected with HTTP 400. On a request-chunked generate,
+  only the final chunk's POST carries it.
+- When the call did not wait (`wait_seconds` omitted or `0`, waiting not
+  available, or a server that ignores the parameter), the reply is the plain
+  handle `{"request_id", "job_id"}`.
+- When the call waited, the reply is the body that
+  `GET /{job_id}/requests/{request_id}` returns
+  ([section 6.8](#68-poll-request---get-job_idrequestsrequest_id)), plus
+  `job_id`. As on a poll, `status` is the raw enum name. The generation has
+  finished only if it is terminal: `REQUEST_STATE_DONE`,
+  `REQUEST_STATE_FAILED` or `REQUEST_STATE_CANCELLED`. If the wait ran out
+  first, it is `REQUEST_STATE_PENDING` or `REQUEST_STATE_RUNNING`, there is no
+  result yet, and the caller polls `request_id` as usual.
+- A chunked result arrives as it does on a poll: the reply carries the first
+  `result_chunk` events and a `next_cursor`, and the rest are read with
+  `GET /{job_id}/requests/{request_id}?cursor=...`.
+
+Python call:
+
+```python
+handle = client.generate(job_id, prompts=["Hello"], wait_seconds=40)
+result = handle.result
+if result is None:
+    result = client.poll_request(job_id, handle.request_id)
+```
+
+With `wait_seconds`, `generate()` returns a `GenerateHandle` instead of the bare
+`request_id`. Its `result` is the same value `poll_request()` would return, and
+is set only when the reply says the generation succeeded and carries the whole
+result (no `next_cursor`). Otherwise it is `None`: the generation was still
+running, the server did not wait, the result was chunked, or the reply could
+not be decoded, and the caller polls `request_id` as usual. A generation that
+failed or was cancelled within the wait makes `generate()` raise the same error
+`poll_request()` raises. `wait_seconds=0` sends no wait and returns a handle
+with no result. The client keeps no copy of the reply: the handle the caller
+holds is the only one, and the server may already have dropped its own, so a
+later GET is not guaranteed to show the result again.
+
+For a waiting call, the read timeout is raised to at least the capped wait plus
+45 seconds, so the server ends the call before the client gives up on it. The
+call is retried only on failures that come before the generation starts; see
+[section 3.5](#35-retries).
 
 #### Per-token log probabilities
 

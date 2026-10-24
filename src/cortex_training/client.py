@@ -74,6 +74,7 @@ from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
 from typing import TypeVar
+from typing import overload
 from urllib.parse import quote
 from urllib.parse import unquote
 
@@ -312,6 +313,15 @@ _SESSION_EXPIRED_CODES = frozenset({"390111", "390112", "390114"})
 # The Cortex Training API's code, on an HTTP 400, for a database or schema in the
 # URL path that it cannot resolve. The client explains it; it never creates one.
 _DATABASE_NOT_RESOLVED_CODE = "517602"
+# Final request states, in the short form _normalize_request_status() returns.
+_SUCCEEDED_REQUEST_STATES = frozenset({"completed", "done", "succeeded"})
+_FAILED_REQUEST_STATES = frozenset({"failed", "cancelled", "canceled"})
+_TERMINAL_REQUEST_STATES = _SUCCEEDED_REQUEST_STATES | _FAILED_REQUEST_STATES
+# Longest wait the service grants a generate, whatever wait_seconds asks for.
+_MAX_GENERATE_WAIT_SECONDS = 40
+# The service answers a waiting call within 30 s after the wait ends; 45 s
+# leaves 15 s on top, so the reply arrives before the read timeout fires.
+_GENERATE_WAIT_READ_MARGIN_SECONDS = 45.0
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {
     _CHUNK_GROUP_RESTART_REQUIRED,
@@ -1008,7 +1018,42 @@ def _is_connect_error(exc: BaseException) -> bool:
     return False
 
 
+# Statuses that turn a generate away before any generation starts (see
+# _TRANSIENT_STATUSES), so resending one cannot run it twice.
+_WAITING_GENERATE_RETRY_STATUSES = frozenset({429, 404, 409, 307, 308})
+
+
+def _is_waiting_generate_retryable(exc: BaseException) -> bool:
+    """Retry a waiting generate only on failures that come before it starts.
+
+    A read timeout, a reset after send, or any 5xx is raised rather than resent:
+    the service may already be generating, and a gateway can answer 503 or 504
+    after the backend accepted the call. A job-not-found 404 is final, except
+    within the 120 s grace for a job this client just created (see
+    ``_definitive_not_found``).
+    """
+    if isinstance(exc, requests.exceptions.HTTPError):
+        resp = exc.response
+        if resp is None or resp.status_code not in _WAITING_GENERATE_RETRY_STATUSES:
+            return False
+        return _chunk_group_error_detail(resp) is None
+    return _is_connect_error(exc)
+
+
 # ─── Canonical types ─────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class GenerateHandle:
+    """What ``generate(..., wait_seconds=N)`` returns.
+
+    ``result`` is the value :meth:`CortexTrainingClient.poll_request` would
+    return, set only when the generation finished within the wait and the whole
+    result came back in the reply. ``None`` means: poll ``request_id``.
+    """
+
+    request_id: str
+    result: dict | None
 
 
 class JobType(str, Enum):
@@ -6032,6 +6077,9 @@ class CortexTrainingClient:
         force_chunk: bool = False,
         allow_group_restart: bool = False,
         debug_context: dict[str, Any] | None = None,
+        final_params: dict[str, Any] | None = None,
+        final_read_timeout: float | None = None,
+        final_retry_on: Callable[[BaseException], bool] | None = None,
     ) -> dict:
         chunks = wire.encode_byte_chunks(
             frame,
@@ -6051,14 +6099,28 @@ class CortexTrainingClient:
         final_body: dict | None = None
         while idx < len(chunks):
             chunk = chunks[idx]
+            retry_on: Callable[[BaseException], bool] = (
+                _is_chunk_post_transient if allow_group_restart else _is_transient
+            )
+            # Earlier chunks are only staged; the last POST creates the request
+            # and is the one that waits.
+            final_kwargs: dict[str, Any] = {}
+            if idx == len(chunks) - 1:
+                if final_params:
+                    final_kwargs["params"] = final_params
+                if final_read_timeout is not None:
+                    final_kwargs["timeout"] = (self.request_timeout[0], final_read_timeout)
+                if final_retry_on is not None:
+                    retry_on = final_retry_on
             try:
                 resp = self._send(
                     "POST",
                     f"{self._prefix}/{job_id}/{path_suffix}",
                     data=chunk,
                     headers={"Content-Type": "application/octet-stream"},
-                    retry_on=(_is_chunk_post_transient if allow_group_restart else _is_transient),
+                    retry_on=retry_on,
                     debug_context=debug_context,
+                    **final_kwargs,
                 )
             except requests.exceptions.HTTPError as exc:
                 detail = _chunk_group_error_detail(exc.response)
@@ -6136,6 +6198,29 @@ class CortexTrainingClient:
         )
         return request_id
 
+    @overload
+    def generate(
+        self,
+        job_id: str,
+        prompts: list[str | list[int]],
+        sampling_params: dict | list[dict | None] | None = None,
+        routing_key: str | list[str | None] | None = None,
+        strict: bool | None = None,
+        wait_seconds: None = None,
+    ) -> str: ...
+
+    @overload
+    def generate(
+        self,
+        job_id: str,
+        prompts: list[str | list[int]],
+        sampling_params: dict | list[dict | None] | None = None,
+        routing_key: str | list[str | None] | None = None,
+        strict: bool | None = None,
+        *,
+        wait_seconds: int,
+    ) -> GenerateHandle: ...
+
     @_track_operation("generate")
     def generate(
         self,
@@ -6144,8 +6229,12 @@ class CortexTrainingClient:
         sampling_params: dict | list[dict | None] | None = None,
         routing_key: str | list[str | None] | None = None,
         strict: bool | None = None,
-    ) -> str:
-        """Submit a generate request to a sampling sub-job. Returns request_id.
+        wait_seconds: int | None = None,
+    ) -> str | GenerateHandle:
+        """Submit a generate request to a sampling sub-job.
+
+        Returns the request_id, or a :class:`GenerateHandle` when
+        ``wait_seconds`` is given.
 
         The typed fields are serialized as a DSSST1 safetensors frame and sent
         as ``application/octet-stream``. Oversized frames are byte-chunked
@@ -6163,18 +6252,71 @@ class CortexTrainingClient:
           would require replicating the server tokenizer (including special
           tokens), so an over-long string instead fails server-side in vLLM
           with a ``maximum model length`` error rather than client-side.
+
+        ``wait_seconds`` asks the server to hold the call for up to that many
+        whole seconds and reply with the result if the generation ends in
+        time. The server caps the wait and may not support it. The handle's
+        ``result`` is then what :meth:`poll_request` would return; it is
+        ``None`` when the generation was still running, the server did not
+        wait, or the reply could not be read whole, and the caller polls
+        ``request_id`` as usual. A generation that failed or was cancelled
+        within the wait raises the error :meth:`poll_request` raises. ``0``
+        sends no wait and returns a handle with no result.
+
+        A waiting submit is retried only on failures that come before any
+        generation starts: connection failures, and HTTP 429, 404, 409, 307 or
+        308. A 5xx, a read timeout, or a reset after send is raised, because
+        the generation may already be running and a retry would run it twice.
         """
+        if wait_seconds is not None and (
+            isinstance(wait_seconds, bool) or not isinstance(wait_seconds, int) or wait_seconds < 0
+        ):
+            raise ValueError(f"wait_seconds must be a non-negative integer; got {wait_seconds!r}")
         body = self._build_generate_frame("generate", job_id, prompts, sampling_params, routing_key, strict)
+        wait_kwargs: dict[str, Any] = {}
+        if wait_seconds:
+            wait_kwargs = {
+                "final_params": {"wait_seconds": wait_seconds},
+                "final_read_timeout": max(
+                    self.request_timeout[1],
+                    min(wait_seconds, _MAX_GENERATE_WAIT_SECONDS) + _GENERATE_WAIT_READ_MARGIN_SECONDS,
+                ),
+                "final_retry_on": _is_waiting_generate_retryable,
+            }
         response = self._post_octet_request_chunks(
             job_id=job_id,
             path_suffix="generate",
             operation="generate",
             frame=body,
             max_bytes=self._MAX_GENERATE_BYTES,
+            **wait_kwargs,
         )
         request_id = response["request_id"]
         self._generate_request_ids.add(request_id)
-        return request_id
+        if wait_seconds is None:
+            return request_id
+        result = self._waited_generate_result(request_id, response) if wait_seconds else None
+        return GenerateHandle(request_id=request_id, result=result)
+
+    def _waited_generate_result(self, request_id: str, response: dict) -> dict | None:
+        """The result in a waited generate reply, or None when the caller must poll."""
+        state = self._normalize_request_status(str(response.get("status") or ""))
+        if state in _FAILED_REQUEST_STATES:
+            self._finished_request_result(request_id, response, state, [], None)  # raises
+        next_cursor = response.get("next_cursor")
+        if state not in _SUCCEEDED_REQUEST_STATES or (isinstance(next_cursor, str) and next_cursor):
+            return None
+        try:
+            with _server_payload():
+                status = self._decode_stream_result_events(response)
+                chunks = [self._decode_result_chunk_event(event) for event in status.get("events") or []]
+            return self._finished_request_result(
+                request_id, status, state, [chunk for chunk in chunks if chunk is not None], None
+            )
+        except Exception:  # noqa: BLE001 - the request id is still good; a poll reports the error
+            logger.debug("waited generate %s reply not decodable; caller polls", request_id, exc_info=True)
+            self._generate_request_ids.add(request_id)
+            return None
 
     @_track_operation("generate_stream")
     def generate_stream(
@@ -6785,6 +6927,66 @@ class CortexTrainingClient:
         except Exception:  # noqa: BLE001 - best-effort: never fail the call this came from
             logger.debug("local training metrics record failed", exc_info=True)
 
+    def _finished_request_result(
+        self,
+        request_id: str,
+        status: dict,
+        state: str,
+        result_chunks: list[bytes],
+        debug_label: str | None,
+    ) -> dict:
+        """The result of a request in a terminal ``state``; raises if it failed or was cancelled.
+
+        Shared by :meth:`poll_request` and a waited :meth:`generate`, so both
+        decode and record a result the same way.
+        """
+        if state in _SUCCEEDED_REQUEST_STATES:
+            # ``payload`` is the result as the sub-job returned it, for the local
+            # training-metrics log; ``result`` also has the envelope's transport metrics.
+            envelope = status.get("result") or {}
+            if result_chunks:
+                with _server_payload():
+                    payload = wire.decode_result_chunks(result_chunks)
+                result = self._merge_transport_metrics(payload, envelope)
+            else:
+                result = payload = envelope
+                with _server_payload():
+                    decoded = self._decode_result_body(result)
+                if decoded is not None:
+                    payload = decoded
+                    result = self._merge_transport_metrics(decoded, envelope)
+            result = self._normalize_generate_result_if_needed(request_id, result)
+            legacy = self._decode_legacy_forward_result(request_id, result)
+            if legacy is not None:
+                payload = legacy
+                result = self._merge_transport_metrics(legacy, result)
+            self._log_training_result(request_id, payload, envelope)
+            if debug_label is not None:
+                logger.debug(
+                    "%s completed state=%s result=%s",
+                    debug_label,
+                    state,
+                    self._debug_json_summary(result),
+                )
+                self._fwd_bwd_request_debug.pop(request_id, None)
+            return result
+        error = status.get("error", "")
+        if debug_label is not None:
+            logger.debug(
+                "%s failed state=%s error=%s body=%s",
+                debug_label,
+                state,
+                error,
+                self._debug_json_summary(status),
+            )
+            self._fwd_bwd_request_debug.pop(request_id, None)
+        self._generate_request_ids.discard(request_id)
+        self._forward_request_ids.discard(request_id)
+        raise _server_failure(
+            RuntimeError(f"Request {request_id} ended with state '{state}': {error}"),
+            failed=state == "failed",
+        )
+
     @_track_operation("poll_request")
     def poll_request(self, job_id: str, request_id: str) -> dict:
         """Poll until the async request completes. Returns the result dict."""
@@ -6810,53 +7012,8 @@ class CortexTrainingClient:
                 cursor = next_cursor
                 # Drain available result chunks without backing off.
                 continue
-            if state in ("completed", "done", "succeeded"):
-                # ``payload`` is the result as the sub-job returned it, for the local
-                # training-metrics log; ``result`` also has the envelope's transport metrics.
-                envelope = status.get("result") or {}
-                if result_chunks:
-                    with _server_payload():
-                        payload = wire.decode_result_chunks(result_chunks)
-                    result = self._merge_transport_metrics(payload, envelope)
-                else:
-                    result = payload = envelope
-                    with _server_payload():
-                        decoded = self._decode_result_body(result)
-                    if decoded is not None:
-                        payload = decoded
-                        result = self._merge_transport_metrics(decoded, envelope)
-                result = self._normalize_generate_result_if_needed(request_id, result)
-                legacy = self._decode_legacy_forward_result(request_id, result)
-                if legacy is not None:
-                    payload = legacy
-                    result = self._merge_transport_metrics(legacy, result)
-                self._log_training_result(request_id, payload, envelope)
-                if debug_label is not None:
-                    logger.debug(
-                        "%s completed state=%s result=%s",
-                        debug_label,
-                        state,
-                        self._debug_json_summary(result),
-                    )
-                    self._fwd_bwd_request_debug.pop(request_id, None)
-                return result
-            if state in ("failed", "cancelled", "canceled"):
-                error = status.get("error", "")
-                if debug_label is not None:
-                    logger.debug(
-                        "%s failed state=%s error=%s body=%s",
-                        debug_label,
-                        state,
-                        error,
-                        self._debug_json_summary(status),
-                    )
-                    self._fwd_bwd_request_debug.pop(request_id, None)
-                self._generate_request_ids.discard(request_id)
-                self._forward_request_ids.discard(request_id)
-                raise _server_failure(
-                    RuntimeError(f"Request {request_id} ended with state '{state}': {error}"),
-                    failed=state == "failed",
-                )
+            if state in _TERMINAL_REQUEST_STATES:
+                return self._finished_request_result(request_id, status, state, result_chunks, debug_label)
             if received_chunk:
                 # Defensive: if the server returns a chunk without next_cursor
                 # before terminal status, poll again immediately rather than
