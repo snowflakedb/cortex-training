@@ -131,8 +131,8 @@ context and no LoRA. One 8-token vLLM sample, one short AdamW step
 a full-weight NCCL sync (1440 params, 45s), and a post-sync 8-token
 sample completed on four H200 nodes. All 313.9B parameters were trainable.
 `model-catalog/models/deepseek-v4-flash/long/h200-training-full.json` uses the same 16-GPU, SP16, EP16, eager, UCCL
-training mesh as the SFT recipe, including liger fused cross-entropy, bf16
-master weights and optimizer states, and pageable activation offload. Its
+training mesh as the SFT recipe, on the official checkpoint dequantized to bf16, including liger fused cross-entropy, bf16
+master weights and optimizer states, CPU Adam offload, and pageable activation offload. Its
 sampler stays at 8 GPUs and TP8, with `weight_format: vllm`, router replay,
 and `reasoning_parser: deepseek_v4`. The completed evidence is the training
 optimizer step; sampling was not probed.

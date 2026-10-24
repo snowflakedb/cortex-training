@@ -7,7 +7,7 @@
       "dtype": "bfloat16",
       "seed": 42,
       "training_config": {
-        "n_gpus": 8,
+        "n_gpus": 16,
         "max_seq_len": 65536,
         "train_batch_size": 1,
         "gradient_clipping": 1.0,
@@ -15,8 +15,8 @@
         "attn_implementation": "eager",
         "cuda_allocator_conf": "expandable_segments:True",
         "activation_checkpointing": true,
-        "sp_size": 8,
-        "ep_size": 8,
+        "sp_size": 16,
+        "ep_size": 16,
         "ep_group_layout": "auto",
         "mb_spec": {
           "max_tokens_per_mb": 65536

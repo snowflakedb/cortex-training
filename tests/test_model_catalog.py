@@ -217,12 +217,68 @@ def test_moe_sft_recipes_have_runnable_parallelism():
             8,
             1,
         ),
+        "deepseek-v4-flash/standard/h200-training-full.json": (
+            "deepseek-ai/DeepSeek-V4-Flash-0731",
+            16,
+            16,
+            65536,
+            16,
+            1,
+        ),
+        "deepseek-v4-flash/standard/h200-training-lora.json": (
+            "deepseek-ai/DeepSeek-V4-Flash-0731",
+            8,
+            8,
+            65536,
+            8,
+            1,
+        ),
+        "deepseek-v4-flash/long/h200-training-lora.json": (
+            "deepseek-ai/DeepSeek-V4-Flash-0731",
+            8,
+            8,
+            262144,
+            8,
+            1,
+        ),
         "deepseek-v4-flash/long/h200-training-full.json": (
             "deepseek-ai/DeepSeek-V4-Flash-0731",
             16,
             16,
             262144,
             16,
+            1,
+        ),
+        "deepseek-v4.1-flash/standard/h200-training-full.json": (
+            "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            32,
+            32,
+            65536,
+            8,
+            4,
+        ),
+        "deepseek-v4.1-flash/standard/h200-training-lora.json": (
+            "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            16,
+            16,
+            65536,
+            16,
+            1,
+        ),
+        "deepseek-v4.1-flash/long/h200-training-full.json": (
+            "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            32,
+            32,
+            262144,
+            32,
+            1,
+        ),
+        "deepseek-v4.1-flash/long/h200-training-lora.json": (
+            "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            32,
+            32,
+            262144,
+            32,
             1,
         ),
     }
@@ -267,11 +323,7 @@ def test_moe_sft_recipes_have_runnable_parallelism():
             }
             assert training["optimizer"]["lr"] == 2e-5
             assert "peft_config" not in training
-        elif filename == "deepseek-v4-flash/long/h200-training-full.json":
-            assert training["prime_rl"] == {
-                "fused_cross_entropy": "liger",
-                "ep_comm_backend": "uccl",
-            }
+        elif filename.startswith("deepseek-v4-flash/"):
             assert training["attn_implementation"] == "eager"
             offload = training["ac_config"]["offload_config"]
             assert offload["enabled"] is True
@@ -280,6 +332,58 @@ def test_moe_sft_recipes_have_runnable_parallelism():
             assert sub_job["weight_format"] == "vllm"
             assert ds_config["bf16"]["bf16_optimizer_states"] is True
             assert ds_config["bf16"]["bf16_master_weights_and_grads"] is True
+            if filename.endswith("h200-training-lora.json"):
+                assert training["prime_rl"] == {
+                    "fused_cross_entropy": False,
+                    "ep_comm_backend": "uccl",
+                }
+                assert training["optimizer"]["lr"] == 1e-4
+                assert training["peft_config"]["r"] == 32
+                assert training["peft_config"]["target_modules"] == (
+                    r".*self_attn\.(q_a_proj|q_b_proj|kv_proj|o_b_proj)$"
+                )
+            elif filename.endswith("long/h200-training-full.json"):
+                assert training["prime_rl"] == {
+                    "fused_cross_entropy": "liger",
+                    "ep_comm_backend": "uccl",
+                }
+                assert "peft_config" not in training
+            else:
+                assert training["prime_rl"] == {
+                    "fused_cross_entropy": False,
+                    "ep_comm_backend": "uccl",
+                }
+                assert training["optimizer"]["lr"] == 2e-5
+                assert "peft_config" not in training
+            if filename == "deepseek-v4-flash/standard/h200-training-lora.json":
+                assert "offload_optimizer" not in ds_config["zero_optimization"]
+            else:
+                assert ds_config["zero_optimization"]["offload_optimizer"]["device"] == "cpu"
+        elif filename.startswith("deepseek-v4.1-flash/"):
+            assert training["attn_implementation"] == "eager"
+            assert "offload_config" not in training["ac_config"]
+            assert training["prime_rl"] == {
+                "fused_cross_entropy": False,
+                "ep_comm_backend": "uccl",
+            }
+            assert sub_job["weight_format"] == "vllm"
+            assert ds_config["bf16"]["bf16_optimizer_states"] is True
+            assert ds_config["bf16"]["bf16_master_weights_and_grads"] is True
+            # Some V4.1 parameters are not a multiple of 8 elements long.
+            assert ds_config["zero_optimization"]["parameter_alignment"] is True
+            if filename.endswith("h200-training-lora.json"):
+                assert training["optimizer"]["lr"] == 1e-4
+                assert training["peft_config"]["r"] == 32
+                assert training["peft_config"]["target_modules"] == (
+                    r".*self_attn\.(q_a_proj|q_b_proj|kv_proj|o_b_proj)$"
+                )
+            else:
+                assert training["optimizer"]["lr"] == 2e-5
+                assert "peft_config" not in training
+            if filename == "deepseek-v4.1-flash/standard/h200-training-lora.json":
+                assert "offload_optimizer" not in ds_config["zero_optimization"]
+            else:
+                assert ds_config["zero_optimization"]["offload_optimizer"]["device"] == "cpu"
         if filename in {
             "glm-5.3-flash/long/h200-training-lora.json",
             "glm-5.3-flash-bf16/long/h200-training-full.json",
@@ -287,7 +391,7 @@ def test_moe_sft_recipes_have_runnable_parallelism():
             assert training["tiled_mlp_token_chunk_size"] == 1024
             assert training["ds_config"]["bf16"]["bf16_optimizer_states"] is True
             assert training["ds_config"]["bf16"]["bf16_master_weights_and_grads"] is True
-        elif filename != "deepseek-v4-flash/long/h200-training-full.json":
+        elif not filename.startswith(("deepseek-v4-flash/", "deepseek-v4.1-flash/")):
             assert "prime_rl" not in training
         assert training["max_seq_len"] == seq_len
         assert training["n_gpus"] == n_gpus
