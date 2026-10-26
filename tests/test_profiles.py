@@ -354,6 +354,19 @@ def test_values_toml_can_not_hold_fail_clearly(snowflake_home):
     assert not (snowflake_home / "connections.toml").exists()
 
 
+def test_a_value_that_fails_is_never_in_the_error(snowflake_home):
+    class Secret:
+        def __repr__(self):
+            return "pat-SECRET"
+
+        __str__ = __repr__
+
+    with pytest.raises(_profiles.ProfileFileError) as raised:
+        _profiles.write_profile("odd", {"account": "ACME", "token": Secret()})
+    assert str(raised.value) == "profile 'odd': can't write token: a Secret value can't be stored in TOML"
+    assert raised.value.__cause__ is None and raised.value.__suppress_context__
+
+
 def test_replacing_a_profile_drops_keys_not_given(snowflake_home):
     _profiles.write_profile("keys", {"account": "ACME", "private_key_file": "/k.p8"})
     _profiles.write_profile("keys", {"account": "ACME"})

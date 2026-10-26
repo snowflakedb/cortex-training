@@ -150,8 +150,11 @@ def write_profile(name: str, values: Mapping[str, Any]) -> Path:
                 value = os.fspath(value)
             try:
                 table[key] = value
-            except Exception as exc:
-                raise ProfileFileError(f"profile {name!r}: can't write {key} = {value!r}: {exc}") from exc
+            except Exception:
+                # Never echo the value: it may be a token or password.
+                raise ProfileFileError(
+                    f"profile {name!r}: can't write {key}: a {type(value).__name__} value can't be stored in TOML"
+                ) from None
         tables[name] = table
         _replace(path, tomlkit.dumps(document))
     return path
