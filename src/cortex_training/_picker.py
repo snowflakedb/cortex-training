@@ -13,13 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pick the Snowflake profile, database, and settings for a Cortex Training client.
+"""Pick the Snowflake profile and database for a Cortex Training client.
 
 This is the picker behind :meth:`CortexTrainingClient.from_configs`. It reads
 only Snowflake connection profiles, the Cortex Training ``config.json``, and a
 few ``CORTEX_TRAINING_*`` variables. Credentials, the account, and the database
-belong to the Snowflake profile; ``config.json`` holds only which profile to
-use and tool settings, so it never holds a secret.
+belong to the Snowflake profile. ``config.json`` holds only ``"profile"``, the
+name of the profile to use, so it never holds a secret. It lives in the
+Snowflake folder (``<Snowflake folder>/cortex-training/config.json``), so
+``SNOWFLAKE_HOME`` moves it together with the profiles.
 
 Profile, first match wins:
 
@@ -40,11 +42,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
 from typing import Any
+
+from cortex_training import _profiles
 
 logger = logging.getLogger(__name__)
 
@@ -56,20 +61,16 @@ PAT_ENV = "CORTEX_TRAINING_PAT"
 DATABASE_ENV = "CORTEX_TRAINING_DATABASE"
 SCHEMA_ENV = "CORTEX_TRAINING_SCHEMA"
 
-# Settings config.json may hold, and the type each must have.
-_SETTINGS: dict[str, tuple[type, ...]] = {
-    "profile": (str,),
-    "endpoint": (str,),
-    "poll_interval": (int, float),
-    "poll_timeout": (int, float),
-    "verify_ssl": (bool,),
-}
 # Keys that belong in a Snowflake profile, not in config.json.
 _PROFILE_KEYS = ("host", "pat", "base_url", "account", "user", "password", "token", "database", "schema")
 
+# An account host such as ACCOUNT.snowflakecomputing.com, with an optional port.
+_HOST = re.compile(r"[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+(:[0-9]{1,5})?")
+
+_PICK_ANOTHER = "Pass connection=NAME (--connection NAME) to use another profile."
 _SETUP_HINT = (
     "Create a Snowflake connection profile (for example with `snow connection add`) "
-    "and pass connection=NAME, or set \"profile\" in ~/.config/cortex-training/config.json."
+    "and pass connection=NAME, or name it in \"profile\" in config.json."
 )
 
 
@@ -86,7 +87,6 @@ class Resolution:
     pat: str | None = field(repr=False)
     database: str
     schema: str
-    settings: dict[str, Any]
     sources: dict[str, str]
 
     def describe(self) -> str:
@@ -103,57 +103,71 @@ class Resolution:
 
 
 def config_path() -> Path:
-    """The default ``config.json``: ``~/.config/cortex-training/config.json``, honoring ``XDG_CONFIG_HOME``."""
-    config_home = os.environ.get("XDG_CONFIG_HOME")
-    base = Path(config_home).expanduser() if config_home else Path.home() / ".config"
-    return base / "cortex-training" / "config.json"
+    """``config.json`` in the Snowflake folder the profiles come from: ``<folder>/cortex-training/config.json``."""
+    return _profiles.snowflake_dir() / "cortex-training" / "config.json"
 
 
-def load_config(path: str | os.PathLike[str] | None = None) -> tuple[dict[str, Any], Path]:
-    """Read and validate ``config.json``.
-
-    An explicit ``path`` must exist; a missing default file means no settings.
-    """
-    explicit = path is not None
-    resolved = Path(path).expanduser() if explicit else config_path()
-    if not resolved.is_file():
-        if explicit:
-            raise PickerError(f"config.json not found: {resolved}")
-        return {}, resolved
+def load_config() -> tuple[dict[str, Any], Path]:
+    """Read and validate ``config.json``. A missing file means no saved profile."""
+    path = config_path()
+    if not path.is_file():
+        return {}, path
     try:
-        data = json.loads(resolved.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise PickerError(f"invalid JSON in {resolved}: {exc}") from exc
+        raise PickerError(f"invalid JSON in {path}: {exc}") from exc
     if not isinstance(data, dict):
-        raise PickerError(f"{resolved} must hold a JSON object")
+        raise PickerError(f"{path} must hold a JSON object")
     misplaced = sorted(key for key in data if key in _PROFILE_KEYS)
     if misplaced:
         raise PickerError(
-            f"{resolved} sets {', '.join(misplaced)}, which belong in your Snowflake "
-            "connection profile, not in config.json. config.json holds only "
-            f"{', '.join(_SETTINGS)}."
+            f"{path} sets {', '.join(misplaced)}, which belong in your Snowflake "
+            'connection profile, not in config.json. It holds only "profile".'
         )
-    unknown = sorted(key for key in data if key not in _SETTINGS)
+    unknown = sorted(key for key in data if key != "profile")
     if unknown:
         raise PickerError(
-            f"{resolved} has unknown keys {', '.join(unknown)}; allowed keys are {', '.join(_SETTINGS)}."
+            f"{path} has unknown keys {', '.join(unknown)}; it holds only \"profile\". "
+            "Pass other settings (poll_interval=..., ...) to from_configs()."
         )
-    for key, value in data.items():
-        allowed = _SETTINGS[key]
-        if isinstance(value, bool) and bool not in allowed or not isinstance(value, allowed):
-            raise PickerError(f"{resolved}: {key} must be {' or '.join(t.__name__ for t in allowed)}")
-        if key in ("poll_interval", "poll_timeout") and value <= 0:
-            raise PickerError(f"{resolved}: {key} must be greater than 0")
-        if key in ("profile", "endpoint") and not value.strip():
-            raise PickerError(f"{resolved}: {key} must not be empty")
-    return data, resolved
+    if "profile" in data and not (isinstance(data["profile"], str) and data["profile"].strip()):
+        raise PickerError(f"{path}: profile must be a non-empty string")
+    return data, path
 
 
-def snowflake_profiles() -> tuple[str, Mapping[str, Mapping[str, Any]]]:
-    """Return the Connector's default profile name and its profiles, as the Connector reads them."""
-    from snowflake.connector.config_manager import CONFIG_MANAGER
+def snowflake_profiles() -> tuple[str, str, Mapping[str, Mapping[str, Any]]]:
+    """Return the default profile name, where that name comes from, and every profile.
 
-    return str(CONFIG_MANAGER["default_connection_name"]), CONFIG_MANAGER["connections"]
+    Read fresh from the files on each call, the way the Connector reads them.
+    """
+    try:
+        profiles = _profiles.read_profiles()
+        default_name = _profiles.default_profile_name()
+    except _profiles.ProfileFileError as exc:
+        raise PickerError(str(exc)) from exc
+    if (os.environ.get(_profiles.DEFAULT_PROFILE_ENV) or "").strip():
+        default_source = _profiles.DEFAULT_PROFILE_ENV
+    elif default_name != "default":
+        default_source = f"default_connection_name in {_profiles.snowflake_dir() / _profiles.CONFIG_FILE}"
+    else:
+        default_source = "no default is set, so 'default'"
+    return default_name, default_source, profiles
+
+
+def normalize_host(value: str, source: str) -> str:
+    """Return the account host in ``value``, allowing ``https://`` and a trailing ``/``.
+
+    Anything that still isn't a host afterwards is rejected, naming ``source``.
+    """
+    host = value.strip()
+    if host[:8].lower() == "https://":
+        host = host[8:]
+    host = host.rstrip("/")
+    if not _HOST.fullmatch(host):
+        raise PickerError(
+            f"{source} must be your account host, like ACCOUNT.snowflakecomputing.com; got {value!r}."
+        )
+    return host
 
 
 def _env(environ: Mapping[str, str], name: str) -> str | None:
@@ -166,16 +180,14 @@ def _env(environ: Mapping[str, str], name: str) -> str | None:
 def resolve(
     *,
     connection: str | None = None,
-    ct_config: str | os.PathLike[str] | None = None,
     database: str | None = None,
     schema: str | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> Resolution:
-    """Pick the profile (or CI credentials), database, schema, and settings."""
+    """Pick the profile (or CI credentials), database, and schema."""
     environ = os.environ if environ is None else environ
-    settings, settings_path = load_config(ct_config)
-    settings_label = f"from {settings_path}" if ct_config is not None else "from config.json"
-    default_name, profiles = snowflake_profiles()
+    settings, settings_path = load_config()
+    default_name, default_source, profiles = snowflake_profiles()
     env_host, env_pat = _env(environ, HOST_ENV), _env(environ, PAT_ENV)
 
     def known() -> str:
@@ -186,15 +198,22 @@ def resolve(
     if connection is not None and connection.strip():
         profile, sources["profile"] = connection.strip(), "passed in"
     elif "profile" in settings:
-        profile, sources["profile"] = settings["profile"].strip(), settings_label
+        profile, sources["profile"] = settings["profile"].strip(), f"saved in {settings_path}"
     elif default_name in profiles:
-        profile, sources["profile"] = default_name, "Snowflake default profile"
+        profile, sources["profile"] = default_name, "the Snowflake default profile"
+    elif profiles:
+        # The Connector would fail here too, so say what is actually wrong
+        # rather than falling through to the CI variables.
+        raise PickerError(
+            f"Snowflake default profile {default_name!r} ({default_source}) does not exist; "
+            f"known profiles: {known()}. {_PICK_ANOTHER}"
+        )
 
     if profile is not None:
         if profile not in profiles:
             raise PickerError(
                 f"Snowflake connection profile {profile!r} ({sources['profile']}) does not exist; "
-                f"known profiles: {known()}."
+                f"known profiles: {known()}. {_PICK_ANOTHER}"
             )
         if env_host or env_pat:
             logger.warning(
@@ -212,7 +231,7 @@ def resolve(
             if missing:
                 raise PickerError(f"{missing} is not set; CI connections need both {HOST_ENV} and {PAT_ENV}.")
             raise PickerError(f"No Snowflake connection profile is set up. {_SETUP_HINT}")
-        host, pat = env_host, env_pat
+        host, pat = normalize_host(env_host, HOST_ENV), env_pat
         sources["host"] = f"from {HOST_ENV}"
         profile_values = {}
 
@@ -238,6 +257,5 @@ def resolve(
         pat=pat,
         database=resolved_database,
         schema=resolved_schema,
-        settings={key: value for key, value in settings.items() if key != "profile"},
         sources=sources,
     )

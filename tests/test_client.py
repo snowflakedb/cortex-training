@@ -825,7 +825,7 @@ class TestClientConstruction:
         assert c._metric_emitter.timeout == 3.0
 
     def test_from_pat_uses_dashes_in_the_rest_host(self):
-        c = CortexTrainingClient.from_pat(
+        c = CortexTrainingClient._from_pat(
             host="org-my_acct.snowflakecomputing.com", pat="p", database="DB", schema="SCH"
         )
         assert c.base_url == "https://org-my-acct.snowflakecomputing.com"
@@ -1750,7 +1750,7 @@ class TestTelemetrySurface:
     def test_with_telemetry_off_a_tui_client_has_nothing_to_send_with(self, monkeypatch):
         monkeypatch.setenv(nc.DISABLE_TELEMETRY_ENV, "1")
         monkeypatch.setattr(nc, "OtlpMetricEmitter", MagicMock(side_effect=AssertionError("built an emitter")))
-        c = CortexTrainingClient.from_pat(host="account.test", pat="pat", database="DB", schema="SCH")
+        c = CortexTrainingClient._from_pat(host="account.test", pat="pat", database="DB", schema="SCH")
         c._telemetry_surface = nc.TUI_SURFACE
 
         c.emit_metric("custom", {"n": 1})

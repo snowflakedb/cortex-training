@@ -2587,48 +2587,47 @@ class CortexTrainingClient:
         cls,
         connection: str | None = None,
         *,
-        ct_config: str | os.PathLike[str] | None = None,
         database: str | None = None,
         schema: str | None = None,
         **kwargs: Any,
     ) -> "CortexTrainingClient":
-        """Create a client from your Snowflake connection profile and ``config.json``.
+        """Create a client from your Snowflake connection profile.
 
-        The profile is ``connection``, else ``"profile"`` in ``config.json``
-        (``~/.config/cortex-training/config.json``, or ``ct_config``), else the
-        Snowflake default profile. ``CORTEX_TRAINING_HOST`` and
-        ``CORTEX_TRAINING_PAT`` are used only when no profile exists (CI). The
-        database is ``database``, else ``CORTEX_TRAINING_DATABASE``, else the
-        profile's database, else ``CORTEX_TRAINING_DB``; the schema follows the
-        same order and defaults to ``PUBLIC``. ``config.json`` may also set
-        ``endpoint``, ``poll_interval``, ``poll_timeout``, and ``verify_ssl``;
-        other keyword arguments go to the constructor and win over it.
+        The profile is ``connection``, else ``"profile"`` in
+        ``<Snowflake folder>/cortex-training/config.json`` (by default
+        ``~/.snowflake/cortex-training/config.json``), else the Snowflake
+        default profile. ``CORTEX_TRAINING_HOST`` and ``CORTEX_TRAINING_PAT``
+        are used only when no profile exists (CI). The database is
+        ``database``, else ``CORTEX_TRAINING_DATABASE``, else the profile's
+        database, else ``CORTEX_TRAINING_DB``; the schema follows the same order
+        and defaults to ``PUBLIC``. Other keyword arguments (``poll_interval``,
+        ``verify_ssl``, ...) go to the constructor.
         """
         from cortex_training import _picker
+        from cortex_training.snowflake_auth import SnowflakeProfileError
 
-        resolution = _picker.resolve(
-            connection=connection, ct_config=ct_config, database=database, schema=schema
-        )
+        resolution = _picker.resolve(connection=connection, database=database, schema=schema)
         logger.info("Cortex Training target: %s", resolution.describe())
-        settings = dict(resolution.settings)
-        verify_ssl = kwargs.pop("verify_ssl", settings.pop("verify_ssl", True))
-        options = {**settings, **kwargs}
-        if resolution.profile is not None:
+        if resolution.profile is None:
+            return cls._from_pat(
+                host=resolution.host,
+                pat=resolution.pat,
+                database=resolution.database,
+                schema=resolution.schema,
+                **kwargs,
+            )
+        try:
             return cls._from_profile(
                 resolution.profile,
                 database=resolution.database,
                 schema=resolution.schema,
-                verify_ssl=verify_ssl,
-                **options,
+                **kwargs,
             )
-        return cls._from_pat(
-            host=resolution.host,
-            pat=resolution.pat,
-            database=resolution.database,
-            schema=resolution.schema,
-            verify_ssl=verify_ssl,
-            **options,
-        )
+        except SnowflakeProfileError as exc:
+            raise SnowflakeProfileError(
+                f"{exc}\nProfile {resolution.profile!r} was used because it was {resolution.sources['profile']}. "
+                f"{_picker._PICK_ANOTHER}"
+            ) from exc
 
     @classmethod
     def from_pat(cls, *args: Any, **kwargs: Any) -> "CortexTrainingClient":

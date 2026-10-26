@@ -16,7 +16,7 @@ client = CortexTrainingClient.from_configs()                # pick the profile a
 client = CortexTrainingClient.from_configs(connection="training")
 ```
 
-`from_configs(connection=None, *, ct_config=None, database=None, schema=None, **kwargs)`
+`from_configs(connection=None, *, database=None, schema=None, **kwargs)`
 picks, first match wins:
 
 - **Profile:** `connection`; then `"profile"` in `config.json`; then the
@@ -29,22 +29,36 @@ picks, first match wins:
   schema; then `PUBLIC`.
 
 It logs one line naming the target and where each part came from, for example
-`profile training (from config.json), db TRAIN_DB (from profile training), schema PUBLIC (default)`.
+`profile training (saved in ~/.snowflake/cortex-training/config.json), db TRAIN_DB (from profile training), schema PUBLIC (default)`.
 The client shares the profile's live Snowflake session token with REST and
 telemetry calls, reconnecting once when the API reports token expiry.
 
-`config.json` holds Cortex Training settings only, never credentials or a
-database. It is read from `~/.config/cortex-training/config.json` (honoring
-`XDG_CONFIG_HOME`), or from `ct_config=` when given:
+`config.json` holds one key, the name of the Snowflake connection profile to
+use:
 
 ```json
-{"profile": "training", "endpoint": "cortex-training", "poll_interval": 0.5, "poll_timeout": 1800, "verify_ssl": true}
+{"profile": "training"}
 ```
 
-Every key is optional. Keys that belong in a Snowflake profile (`host`, `pat`,
-`database`, `schema`, ...) are rejected with an error that says where they go.
-Other keyword arguments to `from_configs()` go to the constructor and win over
-`config.json`.
+It lives in the Snowflake folder the profiles come from,
+`<Snowflake folder>/cortex-training/config.json`: `$SNOWFLAKE_HOME` if that
+folder exists, else `~/.snowflake`, else the platform's config folder. So
+`SNOWFLAKE_HOME` moves the profiles and `config.json` together. A missing file
+is fine: the Snowflake default profile is used. Any other key is rejected:
+credentials and the database belong in the Snowflake profile, and settings such
+as `poll_interval` or `verify_ssl` are keyword arguments to `from_configs()`,
+which go to the constructor.
+
+These fail with an error that says what's wrong:
+
+- A profile name that doesn't exist (passed in, saved in `config.json`, or the
+  Snowflake default from `SNOWFLAKE_DEFAULT_CONNECTION_NAME` or
+  `default_connection_name`) names where the name came from and lists the
+  profiles that exist.
+- A profile that can't sign in names the profile and where it came from.
+- `CORTEX_TRAINING_HOST` may include `https://` and a trailing `/`. Anything
+  else that isn't an account host, such as `ACCOUNT.snowflakecomputing.com`
+  (with an optional `:port`), is rejected.
 
 `from_connection_name()` and `from_pat()` still work but are deprecated: each
 emits a `FutureWarning` and will be removed in a future release. Use
