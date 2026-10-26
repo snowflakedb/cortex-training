@@ -1863,7 +1863,7 @@ values work, the Value column says so: an even count, or the names that work.
 | `lm_head.token_chunk_size` | trainer | positive integer | `fused_lm_head_token_chunk_size`; also `prime_rl.fused_lm_head_token_chunk_size` when `ep_size` > 1 |
 | `lm_head.vocab_chunk_size` | trainer | positive integer; takes effect only with `lm_head.token_chunk_size` | `fused_lm_head_vocab_chunk_size` |
 | `lm_head.cross_entropy` | trainer | `true`, `false` or `liger` | `prime_rl.fused_cross_entropy` |
-| `liger` | trainer | `true` or `false` | `true` sets `model_provider` to `"liger"`; `false` sets nothing |
+| `liger` | trainer | `true` or `false` | `true` applies Liger kernels on a huggingface model; `false` sets nothing |
 | `moe.grouped_mm` | trainer | `true` or `false` | `prime_rl.moe_use_grouped_mm` |
 | `moe.comm_backend` | trainer | non-empty string (`deepep`, `uccl`) | `prime_rl.ep_comm_backend` |
 | `moe.comm_sms` | trainer | even positive integer | `prime_rl.deepep_num_sms` |
@@ -1887,9 +1887,9 @@ the sub-job starts depends on the model and on `ep_size`:
   `qwen3_5_moe` (or `qwen3_5_moe_text`) (in the
   [model catalog](../../model-catalog/README.md), Qwen3.6-35B-A3B), these fail
   at startup: `compile.fullgraph`, `lm_head.vocab_chunk_size`,
-  `attention.sparse_mla` and `numerics.fp32_residual`. `liger` set to `true`
-  never gets that far: it sets `model_provider` to `"liger"`, while `ep_size`
-  above 1 needs `"prime_rl"`, so the job is rejected before the model loads.
+  `attention.sparse_mla` and `numerics.fp32_residual`. `model_options.liger`
+  set to `true` applies to huggingface models. `ep_size` above 1 needs
+  `model_provider` `"arctic"`, so that combination is rejected before the model loads.
 - With `ep_size` > 1 a model that is not a supported MoE model fails.
 
 Other models or `ep_size` combinations may fail the job at startup.
@@ -1928,8 +1928,8 @@ Notes on single keys:
   `ep_size` > 1 also `prime_rl.fused_lm_head_token_chunk_size`). To turn fused
   cross-entropy off, set `lm_head.cross_entropy` to `false` with `ep_size` > 1,
   or the block entry `prime_rl.fused_cross_entropy` to `false` with
-  `model_provider` `prime_rl` and `ep_size` 1 or omitted; with `model_provider`
-  `liger`, use `huggingface`.
+  `model_provider` `arctic` and `ep_size` 1 or omitted; turn off
+  `model_options.liger`.
 - On server versions that have it, `numerics.fp32_parity` is on by default
   (`true`), so a job that sends no `model_options` runs it, and its
   log-probabilities and loss differ from those of a server version that predates
@@ -2009,7 +2009,7 @@ sent, the first in the order `activation_checkpointing`,
 `activation_checkpointing_freq`, `gradient_checkpointing_freq`,
 `gradient_checkpointing` counts. So `gradient_checkpointing=true` with
 `checkpointing.freq=1` is accepted. Different values are rejected.
-`liger=false` together with `model_provider="liger"` is rejected the same way.
+`liger=false` is rejected when the same training config already applies Liger kernels.
 With `ep_size` above 1 the `fp32_parity` field is not compared: the key writes
 `prime_rl.fp32_parity`, and the key is compared with that entry. The shipped
 dense training configs send `model_provider` `huggingface`, and the Qwen3.5 and
@@ -2084,9 +2084,10 @@ not list, such as `trust_remote_code`, has no key and stays in the block.
 
 With `ep_size` 1 or omitted, `lm_head.cross_entropy` fails at startup and the
 block entry `fused_cross_entropy` is the only spelling: with
-`model_provider="prime_rl"` it decides whether the server refuses
+`model_provider="arctic"` it decides whether the server refuses
 forward/backward requests whose loss needs per-token log-probabilities, and
-with `"liger"` or `"huggingface"` it has no effect.
+with `"huggingface"` it has no effect. `model_options.liger` is separate: it
+applies Liger kernels on a huggingface model.
 
 With `ep_size` 1 or omitted, the block entries `fp32_lm_head`,
 `fused_lm_head_token_chunk_size`, `ac_config` and `fp32_parity` have no effect,

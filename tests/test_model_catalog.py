@@ -351,12 +351,12 @@ def test_qwen3_8b_files_carry_the_example_defaults():
         "long/h200-inference-lora",
     ],
 )
-def test_qwen36_lora_uses_prime_rl_attention_targets(key):
+def test_qwen36_lora_uses_arctic_attention_targets(key):
     config = _config(_body("Qwen/Qwen3.6-35B-A3B", key))
 
     assert config["peft_config"]["target_modules"] == ["q_proj", "k_proj", "v_proj", "o_proj"]
     if "training" in key:
-        assert config["model_provider"] == "prime_rl"
+        assert config["model_provider"] == "arctic"
 
 
 def test_qwen36_long_training_uses_sequence_parallelism():

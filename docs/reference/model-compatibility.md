@@ -72,5 +72,5 @@ renderers, so with a thinking-off default pass `enable_thinking=true` or
 - **DeepSeek V4 and GLM 5.2 FP8:** the 1M-token files were validated with
   1,048,575 pre-tokenized input tokens plus one generated token.
 - **Qwen3.6-35B-A3B:** LoRA training and checkpoint save/load require the
-  `prime_rl` model provider, and LoRA is limited to `q_proj`, `k_proj`,
+  `arctic` model provider, and LoRA is limited to `q_proj`, `k_proj`,
   `v_proj`, and `o_proj`. Routed-expert LoRA is not yet supported.

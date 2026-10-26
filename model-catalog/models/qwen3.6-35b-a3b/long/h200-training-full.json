@@ -12,7 +12,7 @@
         "train_batch_size": 1,
         "sp_size": 8,
         "gradient_clipping": 1.0,
-        "model_provider": "prime_rl",
+        "model_provider": "arctic",
         "attn_implementation": "flash_attention_3",
         "ac_config": {
           "mode": "full",
