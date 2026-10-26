@@ -57,7 +57,8 @@ _LR_SCHEDULES = ("constant", "cosine")
 
 
 class Config(Protocol):
-    config: str
+    config: str | None
+    connection: str | None
     job_id: str | None
     teacher_job_id: str | None
     job_config: str
@@ -362,7 +363,7 @@ def _train(config: Config, task: Task) -> None:
         **stop_params,
     }
 
-    client = make_client(config.config)
+    client = make_client(config.config, connection=config.connection)
     bodies = {"student": student_body}
     if teacher_body is not None:
         bodies["teacher"] = teacher_body

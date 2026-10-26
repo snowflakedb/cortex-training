@@ -20,7 +20,10 @@ from recipes.rl.train import train
 
 @chz.chz
 class Config:
-    config: str
+    # An old JSON config: deprecated, stops working in 0.2.0. Without it, the
+    # Snowflake profile is used: connection=NAME, else the one `cortex-training login` saved.
+    config: str | None = None
+    connection: str | None = None
     job_id: str | None = None
 
     problems_per_batch: int = 64

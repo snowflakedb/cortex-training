@@ -3455,54 +3455,37 @@ def test_quit_without_job_id_derives_it_from_sub_job_id_and_reports_crashes(monk
         tui_main.run(["--sub-job-id", "not-a-sub-job-id", "--base-url", "http://localhost:1", "--database", "DB"])
 
 
-@pytest.mark.parametrize(
-    "config, message, usage",
-    [
-        ({"base_url": "http://localhost:1", "database": "DB", "poll_interval": "2"},
-         "config poll_interval must be a number", False),
-        ({"base_url": "http://localhost:1", "database": "DB", "verify_ssl": "yes"},
-         "config verify_ssl must be a boolean", False),
-        ({"base_url": "http://localhost:1", "\x1b]52;c;eA==\x07": 1}, "unknown config key(s): \\x1b]52;c;eA==\\x07",
-         False),
-        ({"base_url": "http://localhost:1", "bad\nkey": 1}, "unknown config key(s): bad\\nkey", False),
-        ("{not json", "invalid JSON in config", False),
-        (None, "No such file or directory", False),
-        # Never a traceback, this one keeps the usage above its error line, as it always has.
-        ({"base_url": "localhost:1", "database": "DB"}, "base_url must start with http:// or https://", True),
-    ],
-)
-def test_a_config_the_tui_cannot_use_is_an_error_not_a_traceback(tmp_path, monkeypatch, capsys, config, message,
-                                                                 usage):
-    class NeverStarts:
-        def __init__(self, *args, **kwargs):
-            raise AssertionError("the TUI started")
+def test_the_tui_uses_the_picker_and_shows_the_target(monkeypatch, capsys):
+    import os
+    from pathlib import Path
 
-    for name in ("CORTEX_TRAINING_CONNECTION", "CORTEX_TRAINING_BASE_URL", "CORTEX_TRAINING_HOST", "SNOWFLAKE_HOST",
-                 "CORTEX_TRAINING_PAT", "SNOWFLAKE_PAT"):
-        monkeypatch.delenv(name, raising=False)  # a PAT would make the bare base_url a host
-    monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", NeverStarts)
-    path = tmp_path / "config.json"
-    if config is not None:
-        path.write_text(config if isinstance(config, str) else json.dumps(config), encoding="utf-8")
-    with pytest.raises(SystemExit) as exit_:
-        tui_main.run(["--config", str(path)])
-    assert exit_.value.code == 2
-    err = capsys.readouterr().err
-    lines = err.splitlines()
-    if usage:
-        assert lines[0].startswith("usage: cortex-training tui"), err
-    else:
-        assert len(lines) == 1, err  # one line: no usage, no traceback
-    assert lines[-1].startswith("cortex-training tui: error: ") and message in lines[-1], err
-    assert "\x1b" not in err and "\x07" not in err  # a key from the file can't act on the terminal
+    (Path(os.environ["SNOWFLAKE_HOME"]) / "connections.toml").write_text('[train]\naccount = "ACME"\nuser = "ME"\n')
+    for name in ("CORTEX_TRAINING_CONFIG", "CORTEX_TRAINING_CONNECTION", "CORTEX_TRAINING_DATABASE", "CORTEX_TRAINING_SCHEMA"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", "/nonexistent/login.json")
+    seen = {}
 
+    class FakeApp:
+        return_code = 0
 
-@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf"])
-def test_the_log_poll_interval_must_be_positive_and_finite(value, capsys):
-    with pytest.raises(SystemExit) as exit_:
-        tui_main.run(["--debug", f"--poll-interval={value}"])
-    assert exit_.value.code == 2
-    assert "must be a finite number greater than zero" in capsys.readouterr().err
+        def __init__(self, client, job_id, *, sub_job_id=None, poll_interval=1.0):
+            seen["poll_interval"] = poll_interval
+
+        def run(self):
+            pass
+
+    def build_client(args, cls):
+        seen["resolution"] = args.resolution
+        seen["typed"] = args.typed
+        return MagicMock()
+
+    monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", FakeApp)
+    monkeypatch.setattr("cortex_training._cli.build_client", build_client)
+    assert tui_main.run(["--connection", "train", "--poll-interval", "9"]) == 0
+    assert seen["resolution"].profile == "train"
+    # --poll-interval paces the TUI's log polls; it never reaches the client.
+    assert seen["poll_interval"] == 9 and seen["typed"]["poll_interval"] is None
+    assert capsys.readouterr().err.startswith("→ profile train (from --connection) · database CORTEX_TRAINING_DB (default)")
 
 
 def test_the_poll_interval_is_the_flag_s_alone_and_the_sign_in_names_what_the_config_gives(tmp_path, monkeypatch):
@@ -3520,25 +3503,43 @@ def test_the_poll_interval_is_the_flag_s_alone_and_the_sign_in_names_what_the_co
         def run(self):
             seen.append((self.poll_interval, self.sign_in))
 
-    reads = []
-    load_config = cli._load_config
-    monkeypatch.setattr(cli, "_load_config", lambda path: reads.append(path) or load_config(path))
     monkeypatch.delenv("CORTEX_TRAINING_CONNECTION", raising=False)
     monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", FakeApp)
     built = []  # the poll interval each client is built with
     monkeypatch.setattr("cortex_training._cli.build_client", lambda args, cls: built.append(args.poll_interval) or MagicMock())
-    path = tmp_path / "config.json"
-    # The config's poll_interval is the CLI's result polling: neither the TUI's log polls nor a reason not to start.
-    path.write_text(json.dumps({"base_url": "http://localhost:1", "database": "DB", "poll_interval": 10}),
-                    encoding="utf-8")
-    sign_in = {"kind": "url", "config": str(path.resolve()), "base_url": "http://localhost:1",
-               "base_url_in_config": True}
-    assert tui_main.run(["--config", str(path)]) == 0
+    sign_in = {"kind": "url", "config": None, "base_url": "http://localhost:1", "base_url_in_config": False}
+    assert tui_main.run(["--base-url", "http://localhost:1", "--database", "DB"]) == 0
     assert seen == [(1.0, sign_in)]
-    assert len(reads) == 2  # the CLI's resolution, then the TUI's one read for what that doesn't say
-    assert tui_main.run(["--config", str(path), "--poll-interval", "30", "--base-url", "http://other:2"]) == 0
-    assert seen[-1] == (30.0, {**sign_in, "base_url": "http://other:2", "base_url_in_config": False})
+    assert tui_main.run(["--base-url", "http://localhost:1", "--database", "DB", "--poll-interval", "30"]) == 0
+    assert seen[-1] == (30.0, sign_in)
     assert built == [1.0, 1.0]  # never the log polls' 30 s: the client refuses more than 6
+
+
+def test_the_tui_offers_to_convert_an_old_config(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"host": "ACCOUNT.snowflakecomputing.com", "pat": "tok"}))
+    monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", lambda *a, **k: pytest.fail("the TUI started"))
+    assert tui_main.run(["--config", str(path)]) == 2
+    err = capsys.readouterr().err
+    assert f"signing in with an old JSON config ({path}, from --config) is no longer supported." in err
+    assert f"cortex-training login --convert-legacy-config {path}" in err
+
+
+@pytest.mark.parametrize("flags", [["--host", "x.test"], ["--pat", "tok"]])
+def test_the_tui_points_host_and_pat_to_login(monkeypatch, capsys, flags):
+    monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", lambda *a, **k: pytest.fail("the TUI started"))
+    with pytest.raises(SystemExit) as exit_:
+        tui_main.run(flags)
+    assert exit_.value.code == 2
+    assert "no longer supported: Cortex Training signs in with a Snowflake connection profile." in capsys.readouterr().err
+
+
+def test_the_tui_without_a_profile_points_to_login(monkeypatch, capsys):
+    for name in ("CORTEX_TRAINING_HOST", "CORTEX_TRAINING_PAT", "CORTEX_TRAINING_CONFIG", "CORTEX_TRAINING_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", lambda *a, **k: pytest.fail("the TUI started"))
+    assert tui_main.run([]) == 1
+    assert "No Snowflake connection profile is set up. Run `cortex-training login`" in capsys.readouterr().err
 
 
 def test_resource_refresh_skips_the_reparse_when_nothing_new_arrived(monkeypatch):

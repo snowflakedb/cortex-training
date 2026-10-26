@@ -68,13 +68,17 @@ _SETTINGS: dict[str, tuple[type, ...]] = {
 _PROFILE_KEYS = ("host", "pat", "base_url", "account", "user", "password", "token", "database", "schema")
 
 _SETUP_HINT = (
-    "Create a Snowflake connection profile (for example with `snow connection add`) "
-    "and pass connection=NAME, or set \"profile\" in ~/.config/cortex-training/config.json."
+    "Run `cortex-training login` to set one up, or create one with `snow connection add` "
+    "and pass connection=NAME."
 )
 
 
 class PickerError(ValueError):
     """The inputs do not pick a usable connection."""
+
+
+class NoProfileError(PickerError):
+    """No Snowflake connection profile is set up, and no CI credentials are set."""
 
 
 @dataclass(frozen=True)
@@ -207,9 +211,10 @@ def resolve(
 
     if profile is not None:
         if profile not in profiles:
+            hint = " Run `cortex-training login` to pick or create one." if sources["profile"] != "passed in" else ""
             raise PickerError(
                 f"Snowflake connection profile {profile!r} ({sources['profile']}) does not exist; "
-                f"known profiles: {known()}."
+                f"known profiles: {known()}.{hint}"
             )
         if env_host or env_pat:
             logger.warning(
@@ -226,7 +231,7 @@ def resolve(
             missing = PAT_ENV if env_host else HOST_ENV if env_pat else None
             if missing:
                 raise PickerError(f"{missing} is not set; CI connections need both {HOST_ENV} and {PAT_ENV}.")
-            raise PickerError(f"No Snowflake connection profile is set up. {_SETUP_HINT}")
+            raise NoProfileError(f"No Snowflake connection profile is set up. {_SETUP_HINT}")
         host, pat = env_host, env_pat
         sources["host"] = f"from {HOST_ENV}"
         profile_values = {}
@@ -246,6 +251,8 @@ def resolve(
     resolved_schema, sources["schema"] = pick(schema, SCHEMA_ENV, "schema", DEFAULT_SCHEMA)
     if sources["database"] == f"from {DATABASE_ENV}":
         logger.warning("Using database %s from %s.", resolved_database, DATABASE_ENV)
+    if sources["schema"] == f"from {SCHEMA_ENV}":
+        logger.warning("Using schema %s from %s.", resolved_schema, SCHEMA_ENV)
 
     return Resolution(
         profile=profile,

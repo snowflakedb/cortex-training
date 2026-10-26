@@ -72,18 +72,15 @@ The evaluator refuses to start if a reference file is missing.
 ```bash
 # 1. Baseline
 python -m recipes.sft.dare.evaluate \
-  config=/path/to/config.json \
   bench_dir=$BENCH_DIR \
   sandbox_python=$PWD/dare_sandbox_env/bin/python \
   log_path=/tmp/dare/base
 
 # 2. Train (logs the training job and checkpoint IDs when it finishes)
-python -m recipes.sft.dare.train \
-  config=/path/to/config.json
+python -m recipes.sft.dare.train
 
 # 3. Score the checkpoint
 python -m recipes.sft.dare.evaluate \
-  config=/path/to/config.json \
   bench_dir=$BENCH_DIR \
   sandbox_python=$PWD/dare_sandbox_env/bin/python \
   source_job_id=TRAINING_JOB_ID \

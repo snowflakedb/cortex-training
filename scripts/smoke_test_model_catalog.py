@@ -513,26 +513,15 @@ def _first_env(*names: str) -> str | None:
     return None
 
 
-def _required_env(*names: str) -> str:
-    value = _first_env(*names)
-    if value is None:
-        raise ValueError(f"set one of: {', '.join(names)}")
-    return value
-
-
 def _build_client(poll_timeout: float):
     sys.path.insert(0, str(SOURCE_ROOT))
     from cortex_training import CortexTrainingClient
 
-    host = _required_env("SNOWFLAKE_HOST")
-    host = host.removeprefix("https://").removeprefix("http://").rstrip("/")
-    return CortexTrainingClient.from_pat(
-        host=host,
-        pat=_required_env("SNOWFLAKE_PAT"),
-        database=_required_env("SNOWFLAKE_DATABASE"),
-        schema=_first_env("SNOWFLAKE_SCHEMA") or "PUBLIC",
-        endpoint=_first_env("CORTEX_TRAINING_ENDPOINT") or "cortex-training",
-        poll_timeout=poll_timeout,
+    # Connects like the CLI: the saved or default profile, or CORTEX_TRAINING_HOST
+    # and CORTEX_TRAINING_PAT when no profile exists (CI).
+    endpoint = _first_env("CORTEX_TRAINING_ENDPOINT")
+    return CortexTrainingClient.from_configs(
+        poll_timeout=poll_timeout, **({"endpoint": endpoint} if endpoint else {})
     )
 
 

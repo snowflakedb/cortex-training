@@ -14,7 +14,6 @@ Start with a short run:
 
 ```bash
 python -m recipes.sft.conversational.train \
-  config=/path/to/config.json \
   max_steps=2
 ```
 

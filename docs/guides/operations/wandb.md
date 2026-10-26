@@ -13,7 +13,7 @@ Then set a project on the train command:
 
 ```bash
 python -m recipes.sft.conversational.train \
-  config=/path/to/config.json wandb_project=cortex-training
+  wandb_project=cortex-training
 ```
 
 Use `wandb_name` to identify a run. Metrics are always written under `log_path`

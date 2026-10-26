@@ -43,7 +43,8 @@ _CONFIG_SEARCH_DIRS = (_RECIPE_DIR, _RECIPE_DIR / "configs")
 
 
 class Config(Protocol):
-    config: str
+    config: str | None
+    connection: str | None
     job_id: str | None
     problems_per_batch: int
     group_size: int
@@ -216,7 +217,7 @@ def _train(config: Config, task: Task) -> None:
             task.evaluation_name,
         )
 
-    client = make_client(config.config)
+    client = make_client(config.config, connection=config.connection)
 
     with running_job(client, body, job_id=config.job_id) as job_id:
         ml_logger = setup_logging(config, client=client, job_id=job_id)
@@ -413,6 +414,7 @@ def _train(config: Config, task: Task) -> None:
         saved = save_recipe_checkpoints(client, job_id)
         log_saved_checkpoints(
             config_path=config.config,
+            connection=config.connection,
             job_id=job_id,
             saved=saved,
             sampling_command="evaluate",

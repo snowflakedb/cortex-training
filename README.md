@@ -42,7 +42,6 @@ Fine-tune a chat model in one command using our built-in recipes:
 
 ```bash
 python -m recipes.sft.conversational.train \
-  config=~/your-config.json \
   max_steps=50
 ```
 
