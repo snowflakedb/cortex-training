@@ -2002,6 +2002,40 @@ def parallelism_errors(training_config: Mapping[str, Any]) -> list[str]:
     return errors
 
 
+_DEEPSPEED_BATCH_KEYS = ("train_batch_size", "train_micro_batch_size_per_gpu", "gradient_accumulation_steps")
+
+
+def _deepspeed_batch_errors(training_config: Mapping[str, Any]) -> list[str]:
+    """Why a training config's ``ds_config`` batch fields don't fit its GPU layout (empty when they do).
+
+    The server fills DeepSpeed's batch fields from the GPU layout -- a
+    ``train_batch_size`` of ``n_gpus // sp_size``, one micro-batch per GPU and no
+    gradient accumulation -- and merges ``ds_config`` on top, so a file that sets
+    none of them always fits. DeepSpeed then needs ``train_batch_size ==
+    train_micro_batch_size_per_gpu * gradient_accumulation_steps * (n_gpus //
+    sp_size)``. Call it once :func:`parallelism_errors` passes, so ``sp_size``
+    divides ``n_gpus``; values other than integers are left to the server.
+    """
+    n_gpus = training_config.get("n_gpus")
+    if isinstance(n_gpus, bool) or not isinstance(n_gpus, int) or n_gpus <= 0:
+        return []
+    sp_size = training_config.get("sp_size") or 1
+    ranks = n_gpus // sp_size
+    ds_config = training_config.get("ds_config") or {}
+    batch, micro, accumulation = (
+        ds_config.get(key, default) for key, default in zip(_DEEPSPEED_BATCH_KEYS, (ranks, 1, 1))
+    )
+    if not all(isinstance(value, int) and not isinstance(value, bool) for value in (batch, micro, accumulation)):
+        return []
+    if batch == micro * accumulation * ranks:
+        return []
+    return [
+        f"ds_config train_batch_size {batch} must equal train_micro_batch_size_per_gpu {micro} * "
+        f"gradient_accumulation_steps {accumulation} * {ranks} data-parallel ranks (n_gpus {n_gpus} / "
+        f"sp_size {sp_size}); set those ds_config fields to null to let the server derive them"
+    ]
+
+
 def _body_max_seq_len(body: Mapping[str, Any], job_type: str, config_key: str) -> int:
     config = _sub_job_config(body, job_type, config_key)
     value = config.get("max_seq_len")
@@ -2217,8 +2251,9 @@ def build_job(
 
     The layers are merged by :func:`make_config`, which then fills in router
     replay for an MoE RL job with the fixed default caps. A merged training
-    sub-job whose ``sp_size``/``ep_size`` no longer divide its ``n_gpus`` is
-    rejected (see :func:`parallelism_errors`). A
+    sub-job whose ``sp_size``/``ep_size`` no longer divide its ``n_gpus``, or
+    whose ``ds_config`` batch fields no longer fit that layout, is rejected (see
+    :func:`parallelism_errors` and :func:`_deepspeed_batch_errors`). A
     ``job_config`` file replaces the first two layers and is used as is: the
     command-line settings still apply, and nothing is planned. The source
     checkpoint (inference jobs) and the debug image tag are added last, and
@@ -2280,11 +2315,13 @@ def build_job(
         )
         # The catalog files are valid on their own, but an override can change
         # n_gpus without the model's sp_size/ep_size (DARE's 8 GPUs on a 16-GPU
-        # mesh, for example). Reject that here rather than submit a job no run can use.
+        # mesh, for example) or its explicit DeepSpeed batch fields. Reject that
+        # here rather than submit a job no run can use.
         for sub in body.get("sub_job_configs") or ():
             if sub.get("job_type") != "training":
                 continue
-            topology = parallelism_errors(sub.get("training_config") or {})
+            training_config = sub.get("training_config") or {}
+            topology = parallelism_errors(training_config) or _deepspeed_batch_errors(training_config)
             if topology:
                 files = ", ".join(str(layer) for layer in layers if isinstance(layer, (str, os.PathLike)))
                 raise ValueError(
