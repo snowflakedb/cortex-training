@@ -71,9 +71,8 @@ EXAMPLES = {
     ),
     "distillation": (
         "recipes.distillation.on_policy.train",
-        ["max_steps=2", "problems_per_batch=4", "group_size=2", "max_tokens=256",
-         "eval_max_tokens=256", "eval_every=1", "n_val=16", "n_test=32",
-         "n_kl_eval=8", "warmup_steps=0", "log_path={log_path}"],
+        ["max_steps=2", "questions_per_step=4", "group_size=2", "n_eval=10",
+         "eval_samples=1", "eval_every=1", "warmup_steps=0", "log_path={log_path}"],
     ),
     # Two steps, with valid_nll before and after. DARE trains on 8 data-parallel
     # GPUs, and the server rejects a batch smaller than that.
