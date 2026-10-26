@@ -594,6 +594,71 @@ def test_a_job_config_run_writes_no_record(tmp_path, monkeypatch):
     assert path.read_text() == "previous run\n"
 
 
+class _RolloutClient(_FakeJobClient):
+    """A job client whose generate returns two rollouts with different rewards."""
+
+    def generate(self, job_id: str, *, prompts, sampling_params) -> str:
+        return "request-1"
+
+    def poll_request(self, job_id: str, request_id: str) -> dict:
+        return {"results": [{"text": "right", "token_ids": [3]}, {"text": "wrong", "token_ids": [4]}]}
+
+
+class _OneProblemTask:
+    name = "one problem"
+    evaluation_name = "none"
+
+    def load(self, seed: int):
+        return type("Dataset", (), {"train": [("problem", "right")], "test": None})()
+
+    def build_prompt(self, problem, renderer) -> list[int]:
+        return [1, 2]
+
+    def score_response(self, response, answer, *, result, max_tokens):
+        return float(response == answer), {}
+
+
+@pytest.mark.parametrize(
+    ("lora", "weight_sync_format", "sent"),
+    [
+        (False, "hf", "hf"),
+        (False, None, None),
+        (True, "hf", "lora"),
+    ],
+)
+def test_rl_weight_sync_format_applies_to_full_parameter_runs(tmp_path, monkeypatch, lora, weight_sync_format, sent):
+    runner = _import_example("examples.rl.runner")
+    module = _import_example("examples.rl.math_grpo.train")
+    syncs: list[dict] = []
+    renderer = type("Renderer", (), {"get_stop_sequences": lambda self: ["<|im_end|>"]})()
+    tokenizer = type("Tokenizer", (), {"pad_token_id": 0, "eos_token_id": 0})()
+    ml_logger = type("Logger", (), {"log_metrics": lambda self, *args, **kwargs: None, "close": lambda self: None})()
+    monkeypatch.setattr(runner, "CONFIGS_DIR", tmp_path / "configs")
+    monkeypatch.setattr(runner, "build_renderer", lambda model_name: (tokenizer, renderer, "fake"))
+    monkeypatch.setattr(runner, "make_client", lambda config_path, connection=None, **kw: _RolloutClient([]))
+    monkeypatch.setattr(runner, "setup_logging", lambda *args, **kwargs: ml_logger)
+    monkeypatch.setattr(runner, "sequence_from_rollout", lambda prompt, sampled, *, advantage: (prompt, sampled))
+    monkeypatch.setattr(runner, "collate", lambda datums, **kwargs: ({}, {}))
+    monkeypatch.setattr(runner, "forward_backward_step", lambda *args, **kwargs: ({"avg_loss": 0.0}, {}))
+    monkeypatch.setattr(runner, "sync_weights", lambda client, job_id, **kwargs: syncs.append(kwargs))
+    monkeypatch.setattr(runner, "save_example_checkpoints", lambda client, job_id: {"weights-only": {"checkpoint_id": "cp_1"}})
+
+    config = module.Config(
+        config="unused",
+        lora=lora,
+        weight_sync_format=weight_sync_format,
+        problems_per_batch=1,
+        group_size=2,
+        max_steps=1,
+        eval_every=0,
+    )
+    runner.train(config, _OneProblemTask())
+
+    # A full-parameter run sends the chosen format (None keeps the server default);
+    # a LoRA run always syncs only the adapter.
+    assert syncs == [{"weight_format": sent, "bucket_size": None}]
+
+
 def test_only_an_explicit_debug_image_tag_authorizes_debug_options(tmp_path, monkeypatch):
     import types
 

@@ -42,6 +42,7 @@ python -m examples.rl.math_grpo.train config=/path/to/config.json \
 | `max_tokens=`, `temperature=` | 4096, 1.0 | Rollout sampling |
 | `max_steps=` | 10 | Training steps |
 | `eval_every=`, `n_test=` | 10, all | MATH-500 eval cadence (`0` skips it) and size |
+| `weight_sync_format=` | server default | `vllm` or `hf` for full-parameter weight sync. LoRA jobs always sync `lora` |
 | `weight_sync_bucket_size=` | server default | Weight-sync transfer bucket in bytes. Set it above the largest single tensor |
 | `job_config=` | none | Use this job file instead of the catalog and `overrides.json`; `lr=`, `train_batch_size=` and `max_seq_len=` still apply |
 | `wandb_project=`, `sf_tracking=` | off | [Experiment tracking](../../docs/guides/operations/wandb.md) |
