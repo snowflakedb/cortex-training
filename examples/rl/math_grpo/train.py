@@ -8,7 +8,10 @@ from examples.rl.runner import train
 
 @chz.chz
 class Config:
-    config: str
+    # Legacy JSON connection file. Omit it to use `connection` or the default profile.
+    config: str | None = None
+    # Snowflake connection profile name (connections.toml). Use config or connection, not both.
+    connection: str | None = None
     job_id: str | None = None
 
     # The job comes from model-catalog/models/; job_config= replaces it with a file.

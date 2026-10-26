@@ -471,7 +471,7 @@ def _run_rl_example(monkeypatch, tmp_path, events, *, fail=None, renderer_error=
     ml_logger = type("Logger", (), {"log_metrics": lambda self, *args, **kwargs: None, "close": lambda self: None})()
     monkeypatch.setattr(runner, "write_job_record", write_job_record)
     monkeypatch.setattr(runner, "build_renderer", build_renderer)
-    monkeypatch.setattr(runner, "make_client", lambda config_path: _FakeJobClient(events, fail))
+    monkeypatch.setattr(runner, "make_client", lambda config_path, connection=None, **kw: _FakeJobClient(events, fail))
     monkeypatch.setattr(runner, "setup_logging", lambda *args, **kwargs: ml_logger)
     monkeypatch.setattr(runner, "save_example_checkpoints", lambda client, job_id: {"weights-only": {"checkpoint_id": "cp_1"}})
     config = module.Config(config="unused", max_steps=0, eval_every=0, **settings)
@@ -897,7 +897,7 @@ def test_saved_checkpoints_print_a_command_that_serves_the_checkpoint(caplog):
     body = utils.build_job("training", model="Qwen/Qwen3.5-4B", context="standard", lora=True)
 
     utils.log_saved_checkpoints(
-        config_path="conn.json",
+        connection_args="config=conn.json",
         job_id="job-1",
         saved={"weights-only": {"checkpoint_id": "cp_1"}},
         sampling_command="evaluate",
@@ -929,7 +929,7 @@ def test_saved_checkpoints_print_an_explicit_job_config_when_no_catalog_file_fit
     body = utils.make_config("Qwen/Qwen3-8B", "standard", overrides=[_training_override(model_name="org/Custom-8B")])
 
     utils.log_saved_checkpoints(
-        config_path="conn.json",
+        connection_args="config=conn.json",
         job_id="job-1",
         saved={"weights-only": {"checkpoint_id": "cp_1"}},
         sampling_command="sample",
@@ -975,7 +975,7 @@ def _follow_up_body(module_name: str, args: dict[str, str]) -> dict:
 )
 def test_serve_prints_follow_up_commands_for_the_endpoint_it_built(caplog, monkeypatch, settings, printed):
     serve = _import_example("examples.inference.serve")
-    monkeypatch.setattr(serve, "make_client", lambda config_path: _FakeJobClient([]))
+    monkeypatch.setattr(serve, "make_client", lambda config_path, connection=None, **kw: _FakeJobClient([]))
     caplog.set_level("INFO", logger="examples.inference.endpoint")
 
     serve.main(serve.Config(config="conn.json", **settings))
@@ -990,7 +990,7 @@ def test_serve_prints_follow_up_commands_for_the_endpoint_it_built(caplog, monke
 def test_serve_follow_up_commands_repeat_its_job_config(caplog, monkeypatch, tmp_path):
     utils = _import_example("examples.utils")
     serve = _import_example("examples.inference.serve")
-    monkeypatch.setattr(serve, "make_client", lambda config_path: _FakeJobClient([]))
+    monkeypatch.setattr(serve, "make_client", lambda config_path, connection=None, **kw: _FakeJobClient([]))
     caplog.set_level("INFO", logger="examples.inference.endpoint")
     job_config = tmp_path / "glm 5.3.json"
     job_config.write_text(json.dumps(utils.make_config("zai-org/GLM-5.3", "long", inference=True)))
@@ -1080,7 +1080,7 @@ def test_dare_evaluate_builds_its_inference_job_from_the_catalog(tmp_path):
     # catalog selectors so the evaluator rebuilds this job, not its defaults.
     task = _import_example("examples.sft.dare.task").DareTask(variant="fv")
     command = task.eval_command(
-        config_path="conn.json",
+        connection_args="config=conn.json",
         job_id="job-0",
         checkpoint_id="cp_1",
         job_args=utils.inference_job_args(

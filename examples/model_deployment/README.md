@@ -28,9 +28,12 @@ uv pip install -e .
 uv pip install chz
 ```
 
-The `config=` file is the Snowflake connection file from
-`examples/config/connection.json.template`; the example needs its `host`,
-`pat`, `database`, and `schema`. The PAT also authenticates the chat call.
+This example needs a PAT, not only a profile: the chat call sends it as a
+Bearer token. Pass `config=` with a JSON file from
+`docs/getting-started/connection.json.template` (`host`, `pat`, `database`,
+`schema`). With `connection=` or the default profile, the example stops before
+it creates a deployment, because profile connections send a session token and
+the endpoint's documented authentication is the PAT.
 Inference is not yet available on all accounts: until it is enabled for yours,
 chat calls return HTTP 404.
 

@@ -33,8 +33,7 @@ import chz
 from examples.model_deployment.streaming import chat_messages
 from examples.model_deployment.streaming import complete_chat
 from examples.model_deployment.streaming import stream_chat
-from examples.utils import load_connection_mapping
-from examples.utils import make_client
+from examples.utils import resolve_example_connection
 
 logger = logging.getLogger(__name__)
 logging.getLogger("urllib3").setLevel(logging.WARN)
@@ -45,7 +44,10 @@ DEFAULT_SPEC = "configs/base-model.json"
 
 @chz.chz
 class Config:
-    config: str
+    # Legacy JSON connection file. Omit it to use `connection` or the default profile.
+    config: str | None = None
+    # Snowflake connection profile name (connections.toml). Use config or connection, not both.
+    connection: str | None = None
     # A deployment spec JSON file; relative paths are also looked up in this
     # example's directory.
     spec: str = DEFAULT_SPEC
@@ -79,9 +81,17 @@ def _write_delta(text: str) -> None:
 
 def main(config: Config) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    connection = load_connection_mapping(config.config)
     overrides = {"poll_timeout": config.timeout} if config.timeout is not None else {}
-    client = make_client(config.config, **overrides)
+    resolved = resolve_example_connection(config.config, config.connection, **overrides)
+    # Check before create_model_deployment: a run that cannot authenticate its
+    # chat call must not start a deployment that holds GPUs.
+    if not resolved.pat:
+        raise ValueError(
+            "model_deployment calls the inference endpoint with a PAT, and this example "
+            f"only takes one from a JSON config file (you used {resolved.source}). "
+            "Pass config=<JSON file with host and pat>."
+        )
+    client = resolved.client
 
     created = config.deployment is None
     if created:
@@ -101,12 +111,12 @@ def main(config: Config) -> None:
         kwargs: dict[str, Any] = {"on_delta": _write_delta} if config.stream else {}
         result = call(
             base_url,
-            connection["pat"],
+            resolved.pat,
             model=deployment_id,
             messages=chat_messages(config.prompt, config.system),
             max_completion_tokens=config.max_completion_tokens,
             temperature=config.temperature,
-            verify_ssl=bool(connection.get("verify_ssl", True)),
+            verify_ssl=resolved.verify_ssl,
             timeout=config.request_timeout,
             **kwargs,
         )

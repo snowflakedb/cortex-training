@@ -100,28 +100,25 @@ def generate_results(
     return results
 
 
-def log_endpoint_ready(config_path: str, job_id: str, job_args: Mapping[str, Any]) -> None:
+def log_endpoint_ready(connection_args: str, job_id: str, job_args: Mapping[str, Any]) -> None:
     """Log the endpoint's id and the generate and evaluate commands that use it.
 
-    ``job_args`` are the arguments that built the endpoint's job (``model=``,
-    ``context=``, ``hardware=``, ``lora=``, or ``job_config=``, and
-    ``max_seq_len=`` when set). The commands repeat them, so they pick the
-    endpoint's model, and with it its renderer, rather than their defaults.
+    ``connection_args`` is the connection argument to repeat (``config=``,
+    ``connection=``, or ``""`` for the default). ``job_args`` are the arguments
+    that built the endpoint's job (``model=``, ``context=``, ``hardware=``,
+    ``lora=``, or ``job_config=``, and ``max_seq_len=`` when set). The commands
+    repeat them, so they pick the endpoint's model, and with it its renderer,
+    rather than their defaults.
     """
     extra = "".join(
         f" {name}={str(value).lower() if isinstance(value, bool) else shlex.quote(str(value))}"
         for name, value in job_args.items()
     )
     logger.info("Inference endpoint is ready: job_id=%s", job_id)
-    logger.info(
-        "Examples against this endpoint:\n"
-        "  python -m examples.inference.generate config=%s job_id=%s%s\n"
-        "  python -m examples.inference.evaluate config=%s job_id=%s%s",
-        config_path,
-        job_id,
-        extra,
-        config_path,
-        job_id,
-        extra,
+    examples = "\n".join(
+        " ".join(part for part in (f"  python -m {module}", connection_args, f"job_id={job_id}") if part)
+        + extra
+        for module in ("examples.inference.generate", "examples.inference.evaluate")
     )
+    logger.info("Examples against this endpoint:\n%s", examples)
     logger.info("Tear down with: cortex-training cancel %s", job_id)

@@ -3673,7 +3673,11 @@ def test_the_poll_interval_is_the_flag_s_alone_and_the_sign_in_names_what_the_co
 
     reads = []
     load_config = cli._load_config
-    monkeypatch.setattr(cli, "_load_config", lambda path: reads.append(path) or load_config(path))
+    monkeypatch.setattr(
+        cli,
+        "_load_config",
+        lambda path, **kwargs: reads.append(path) or load_config(path, **kwargs),
+    )
     monkeypatch.delenv("CORTEX_TRAINING_CONNECTION", raising=False)
     monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", FakeApp)
     built = []  # the poll interval each client is built with

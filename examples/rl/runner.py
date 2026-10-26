@@ -25,6 +25,7 @@ from examples.utils import inference_job_args
 from examples.utils import log_saved_checkpoints
 from examples.utils import model_slug
 from examples.utils import make_client
+from examples.utils import example_connection_args
 from examples.utils import router_replay_stop_params
 from examples.utils import running_job
 from examples.utils import sampling_params_with_sample_ids
@@ -44,7 +45,10 @@ CONFIGS_DIR = _EXAMPLE_DIR / "configs"
 
 
 class Config(Protocol):
-    config: str
+    # Legacy JSON connection file. Omit it to use `connection` or the default profile.
+    config: str | None = None
+    # Snowflake connection profile name (connections.toml). Use config or connection, not both.
+    connection: str | None = None
     job_id: str | None
     model: str
     context: str
@@ -270,7 +274,7 @@ def train(config: Config, task: Task) -> None:
             task.evaluation_name,
         )
 
-    client = make_client(config.config)
+    client = make_client(config.config, config.connection)
 
     with running_job(client, body, job_id=config.job_id) as job_id:
         if config.job_id is not None:
@@ -468,7 +472,7 @@ def train(config: Config, task: Task) -> None:
 
         saved = save_example_checkpoints(client, job_id)
         log_saved_checkpoints(
-            config_path=config.config,
+            connection_args=example_connection_args(config.config, config.connection),
             job_id=job_id,
             saved=saved,
             sampling_command="evaluate",
