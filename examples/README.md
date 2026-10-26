@@ -9,7 +9,7 @@ type on the command line instead of writing a job file.
 | [Conversational SFT](sft/README.md) | LoRA or full-parameter SFT | Hugging Face chat datasets, GSM8K, identity |
 | [DARE-Bench agent SFT](sft/dare/README.md) | Full-parameter multi-turn tool SFT + agent eval | DARE-Bench |
 | [Math GRPO](rl/README.md) | Reinforcement learning | Hendrycks MATH, MATH-500 |
-| [On-policy distillation](distillation/README.md) | Distillation from a frozen teacher | GSM8K |
+| [On-policy distillation](distillation/README.md) | Multi-turn tool-use distillation from a frozen teacher | Wiki-search trivia |
 | [Inference endpoint](inference/README.md) | Serve, generate, evaluate open weights or a checkpoint | MATH-500, GSM8K, identity |
 | [Model deployment streaming](model_deployment/README.md) | OpenAI-compatible model deployment, streamed chat | Open weights, checkpoints |
 
@@ -35,6 +35,7 @@ From the repository root:
 ```bash
 uv pip install -e .
 uv pip install 'tinker-cookbook[math-rl] @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
+uv pip install chromadb  # distillation only: the wiki-search title index
 ```
 
 Set up a Snowflake connection profile (see
@@ -106,10 +107,10 @@ applies on top of it. Without `job_config=`, an RL job on an MoE model also gets
 [router replay](rl/README.md#router-replay) filled in after the merge. The
 final job is logged before it is submitted.
 
-Distillation builds a student and a teacher job instead; see
+Distillation builds a student, a teacher and a judge job instead; see
 [How the jobs are built](distillation/README.md#how-the-jobs-are-built). Its
-`job_config=` and `teacher_job_config=` files are used as is, without its
-sizing arguments.
+`job_config=`, `teacher_job_config=` and `judge_job_config=` files are used as
+is, without its sizing arguments.
 
 Merge rules:
 

@@ -48,6 +48,7 @@ EXPECTED_FILES = {
     "Qwen/Qwen3-1.7B": _TRAINABLE_STANDARD,
     "Qwen/Qwen3-4B-Instruct-2507": _FULL_STANDARD_LONG,
     "Qwen/Qwen3-8B": _TRAINABLE_STANDARD,
+    "Qwen/Qwen3.5-2B": _TRAINABLE_LONG + _TRAINABLE_STANDARD,
     "Qwen/Qwen3.5-4B": _TRAINABLE_LONG + _TRAINABLE_STANDARD,
     "Qwen/Qwen3.5-9B": _TRAINABLE_LONG,
     "Qwen/Qwen3.6-35B-A3B": _TRAINABLE_LONG + _TRAINABLE_STANDARD,
@@ -116,11 +117,11 @@ def _config(body: dict) -> dict:
 
 def test_checked_in_catalog_is_valid():
     assert validate_catalog() == {
-        "models": 24,
-        "files": 96,
-        "training": 45,
-        "inference": 51,
-        "rl": 44,
+        "models": 25,
+        "files": 104,
+        "training": 49,
+        "inference": 55,
+        "rl": 48,
         "distillation": 1,
     }
 
@@ -138,6 +139,7 @@ def test_catalog_models_include_license_links():
         "Qwen/Qwen3-0.6B": "Apache 2.0",
         "Qwen/Qwen3-1.7B": "Apache 2.0",
         "Qwen/Qwen3-8B": "Apache 2.0",
+        "Qwen/Qwen3.5-2B": "Apache 2.0",
         "Qwen/Qwen3.5-4B": "Apache 2.0",
         "Qwen/Qwen3.5-9B": "Apache 2.0",
         "Qwen/Qwen3.6-35B-A3B": "Apache 2.0",
@@ -222,6 +224,10 @@ def test_files_keep_their_source_sequence_lengths():
         ("Qwen/Qwen3-1.7B", "standard", "training"): 32768,
         ("Qwen/Qwen3-8B", "standard", "inference"): 32768,
         ("Qwen/Qwen3-8B", "standard", "training"): 32768,
+        ("Qwen/Qwen3.5-2B", "long", "inference"): 262144,
+        ("Qwen/Qwen3.5-2B", "long", "training"): 262144,
+        ("Qwen/Qwen3.5-2B", "standard", "inference"): 32768,
+        ("Qwen/Qwen3.5-2B", "standard", "training"): 32768,
         ("Qwen/Qwen3.5-4B", "long", "inference"): 262144,
         ("Qwen/Qwen3.5-4B", "long", "training"): 262144,
         ("Qwen/Qwen3.5-4B", "standard", "inference"): 32768,
@@ -383,6 +389,7 @@ def test_lora_inference_files_match_their_training_adapter():
         "Qwen/Qwen3-0.6B",
         "Qwen/Qwen3-1.7B",
         "Qwen/Qwen3-8B",
+        "Qwen/Qwen3.5-2B",
         "Qwen/Qwen3.5-4B",
         "Qwen/Qwen3.5-9B",
         "Qwen/Qwen3.6-35B-A3B",
@@ -564,7 +571,7 @@ def _invalid(catalog_dir: Path, match: str) -> str:
 
 
 def test_copied_catalog_is_valid(catalog):
-    assert validate_catalog(catalog)["models"] == 24
+    assert validate_catalog(catalog)["models"] == 25
 
 
 def test_distillation_jobs_build_with_make_distillation_config(catalog):
@@ -572,9 +579,9 @@ def test_distillation_jobs_build_with_make_distillation_config(catalog):
 
 
 def test_distillation_check_fails_when_a_default_model_is_absent(catalog):
-    shutil.rmtree(catalog / "qwen3-8b")
+    shutil.rmtree(catalog / "qwen3.8-27b")
 
-    _invalid(catalog, r"default distillation model\(s\) missing from the catalog: Qwen/Qwen3-8B")
+    _invalid(catalog, r"default distillation model\(s\) missing from the catalog: Qwen/Qwen3.8-27B")
 
 
 @pytest.mark.parametrize(

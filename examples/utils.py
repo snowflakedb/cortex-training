@@ -1969,16 +1969,21 @@ def make_config(
 
 # ─── make_distillation_config: student + teacher from the catalog ─────────────
 
-# The small, runnable on-policy distillation default: a dense student and a
-# larger teacher from the same tokenizer family, sized so the teacher's context
-# window strictly exceeds the student's, as the teacher-scoring step requires
-# (the teacher scores the prompt and completion together). The distillation
-# runner and the catalog's distillation check share these, so they never drift.
-DEFAULT_DISTILLATION_STUDENT = "Qwen/Qwen3-0.6B"
-DEFAULT_DISTILLATION_TEACHER = "Qwen/Qwen3-8B"
+# The validated on-policy distillation default: a dense student and a larger
+# teacher from the same tokenizer family, sized so the teacher's context window
+# strictly exceeds the student's, as the teacher-scoring step requires (the
+# teacher scores whole conversations). The judge grades final answers. The
+# distillation runner and the catalog's distillation check share these, so they
+# never drift.
+DEFAULT_DISTILLATION_STUDENT = "Qwen/Qwen3.5-4B"
+DEFAULT_DISTILLATION_TEACHER = "Qwen/Qwen3.8-27B"
 DEFAULT_DISTILLATION_CONTEXT = "standard"
-DEFAULT_DISTILLATION_STUDENT_MAX_SEQ_LEN = 2048
-DEFAULT_DISTILLATION_TEACHER_MAX_SEQ_LEN = 4096
+DEFAULT_DISTILLATION_STUDENT_MAX_SEQ_LEN = 16384
+DEFAULT_DISTILLATION_TEACHER_MAX_SEQ_LEN = 20480
+DEFAULT_DISTILLATION_TEACHER_GPUS = 2
+DEFAULT_DISTILLATION_JUDGE = "Qwen/Qwen3-30B-A3B"
+DEFAULT_DISTILLATION_JUDGE_MAX_SEQ_LEN = 20480
+DEFAULT_DISTILLATION_JUDGE_GPUS = 2
 
 
 def parallelism_errors(training_config: Mapping[str, Any]) -> list[str]:

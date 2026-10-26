@@ -130,11 +130,45 @@ def teacher_completion_logprobs(
     return values
 
 
+def generate_results(
+    client: Any,
+    job_id: str,
+    prompts: Sequence[Sequence[int]],
+    sampling_params: dict,
+    max_prompts_per_request: int | None = None,
+) -> list[dict]:
+    """Results for ``prompts`` in order, split across concurrent generate requests.
+
+    A response carrying per-token logprobs for many long sequences can exceed the
+    server's response size limit. Every chunk is submitted before any is polled,
+    so the server batches them together.
+    """
+    size = max_prompts_per_request or len(prompts) or 1
+    chunks = [
+        [[int(t) for t in prompt] for prompt in prompts[start : start + size]]
+        for start in range(0, len(prompts), size)
+    ]
+    request_ids = [
+        client.generate(job_id, prompts=chunk, sampling_params=dict(sampling_params))
+        for chunk in chunks
+    ]
+    results: list[dict] = []
+    for chunk, request_id in zip(chunks, request_ids):
+        chunk_results = client.poll_request(job_id, request_id)["results"]
+        if len(chunk_results) != len(chunk):
+            raise ValueError(
+                f"asked for {len(chunk)} results, got {len(chunk_results)}"
+            )
+        results.extend(chunk_results)
+    return results
+
+
 def score_with_teacher(
     client: Any,
     teacher_job_id: str,
     prompts: Sequence[Sequence[int]],
     completions: Sequence[Sequence[int]],
+    max_prompts_per_request: int | None = None,
 ) -> list[list[float]]:
     """Teacher logprobs for each completion token, in completion order."""
     if len(prompts) != len(completions):
@@ -143,14 +177,9 @@ def score_with_teacher(
         [int(t) for t in prompt] + [int(t) for t in completion]
         for prompt, completion in zip(prompts, completions)
     ]
-    request_id = client.generate(
-        teacher_job_id, prompts=full, sampling_params=dict(TEACHER_SCORING_PARAMS)
+    results = generate_results(
+        client, teacher_job_id, full, TEACHER_SCORING_PARAMS, max_prompts_per_request
     )
-    results = client.poll_request(teacher_job_id, request_id)["results"]
-    if len(results) != len(full):
-        raise ValueError(
-            f"teacher returned {len(results)} results for {len(full)} sequences"
-        )
     return [
         teacher_completion_logprobs(
             result, ids, len(prompt), where=f"teacher sequence {index}"

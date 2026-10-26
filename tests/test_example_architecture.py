@@ -351,7 +351,8 @@ def test_every_example_ships_an_overrides_file_with_a_comment():
     (student_training,) = [sub for sub in distillation["sub_job_configs"] if sub["job_type"] == "training"]
     student_config = student_training["training_config"]
     assert student_config["n_gpus"] == 1 and student_config["train_batch_size"] == 1
-    assert student_config["mb_spec"] == {"max_tokens_per_mb": 10240}
+    assert student_config["mb_spec"] == {"max_tokens_per_mb": 16384}
+    assert student_config["optimizer"] == {"lr": 1e-06}
     assert student_config["ds_config"]["zero_optimization"]["reduce_scatter"] is True
 
 

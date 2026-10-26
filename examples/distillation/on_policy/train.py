@@ -1,22 +1,23 @@
-"""GSM8K entrypoint for the shared on-policy distillation runner."""
+"""Wiki-search entrypoint for the shared on-policy distillation runner."""
 
 import chz
-from examples.utils import DEFAULT_DISTILLATION_CONTEXT
-from examples.utils import DEFAULT_DISTILLATION_STUDENT
-from examples.utils import DEFAULT_DISTILLATION_STUDENT_MAX_SEQ_LEN
-from examples.utils import DEFAULT_DISTILLATION_TEACHER
-from examples.utils import DEFAULT_DISTILLATION_TEACHER_MAX_SEQ_LEN
-from examples.distillation.tasks.gsm8k import BOXED_INSTRUCTION
-from examples.distillation.tasks.gsm8k import GSM8KProblems
-from examples.distillation.tasks.gsm8k import GSM8KTask
-from examples.distillation.tasks.gsm8k import extract_answer
-from examples.distillation.tasks.gsm8k import is_correct
-from examples.distillation.tasks.gsm8k import load_gsm8k
+from examples.distillation.tasks.wiki_search import DEFAULT_INDEX_DIR
+from examples.distillation.tasks.wiki_search import WikiIndex
+from examples.distillation.tasks.wiki_search import WikiSearchTask
 from examples.distillation.train import job_bodies
 from examples.distillation.train import lr_at
 from examples.distillation.train import processing_block
 from examples.distillation.train import train
 from examples.distillation.train import validate_config
+from examples.utils import DEFAULT_DISTILLATION_CONTEXT
+from examples.utils import DEFAULT_DISTILLATION_JUDGE
+from examples.utils import DEFAULT_DISTILLATION_JUDGE_GPUS
+from examples.utils import DEFAULT_DISTILLATION_JUDGE_MAX_SEQ_LEN
+from examples.utils import DEFAULT_DISTILLATION_STUDENT
+from examples.utils import DEFAULT_DISTILLATION_STUDENT_MAX_SEQ_LEN
+from examples.utils import DEFAULT_DISTILLATION_TEACHER
+from examples.utils import DEFAULT_DISTILLATION_TEACHER_GPUS
+from examples.utils import DEFAULT_DISTILLATION_TEACHER_MAX_SEQ_LEN
 
 
 @chz.chz
@@ -27,47 +28,61 @@ class Config:
     connection: str | None = None
     job_id: str | None = None
     teacher_job_id: str | None = None
+    judge_job_id: str | None = None
 
-    # The jobs come from model-catalog/models/; job_config=/teacher_job_config=
-    # replace a body with a file. The small default (student 2048, teacher 4096)
-    # keeps the teacher window above the student's and stays cheap to run.
+    # The jobs come from model-catalog/models/; job_config=/teacher_job_config=/
+    # judge_job_config= replace a body with a file. The defaults are the validated
+    # Qwen3.8-27B -> Qwen3.5-4B run: a 1 + 1 GPU student, a 2-GPU teacher, and a
+    # 2-GPU judge.
     student: str = DEFAULT_DISTILLATION_STUDENT
     teacher: str = DEFAULT_DISTILLATION_TEACHER
+    # The model that grades final answers; None lets the teacher job judge.
+    judge: str | None = DEFAULT_DISTILLATION_JUDGE
     context: str = DEFAULT_DISTILLATION_CONTEXT
     teacher_context: str | None = None
+    judge_context: str = DEFAULT_DISTILLATION_CONTEXT
     hardware: str = "h200"
     lora: bool = False
     student_max_seq_len: int | None = DEFAULT_DISTILLATION_STUDENT_MAX_SEQ_LEN
     teacher_max_seq_len: int | None = DEFAULT_DISTILLATION_TEACHER_MAX_SEQ_LEN
+    judge_max_seq_len: int | None = DEFAULT_DISTILLATION_JUDGE_MAX_SEQ_LEN
+    # GPUs (and tensor parallelism) for the teacher and judge; None keeps the catalog's.
+    teacher_gpus: int | None = DEFAULT_DISTILLATION_TEACHER_GPUS
+    judge_gpus: int | None = DEFAULT_DISTILLATION_JUDGE_GPUS
     job_config: str | None = None
     teacher_job_config: str | None = None
-    renderer_name: str | None = "qwen3_disable_thinking"
+    judge_job_config: str | None = None
+    index_dir: str = str(DEFAULT_INDEX_DIR)
 
-    problems_per_batch: int = 16
+    questions_per_step: int = 32
     group_size: int = 4
-    max_tokens: int = 1024
+    max_turns: int = 10
+    turn_max_tokens: int = 1024
     temperature: float = 1.0
     top_p: float = 1.0
+    eval_temperature: float = 0.7
+    eval_top_p: float = 0.8
+    eval_top_k: int = 20
 
-    max_steps: int | None = 100
-    warmup_steps: int = 5
+    max_steps: int = 40
+    warmup_steps: int = 2
     lr_schedule: str = "cosine"
     min_lr_ratio: float = 0.1
 
     teacher_tau: float = 1.0
     teacher_clip: float = 3.0
-    teacher_clip_negative: float | None = None
+    teacher_clip_negative: float | None = 1.0
     reward_coef: float = 0.0
     eps_clip: float = 0.2
     loss_agg_mode: str = "token-mean"
     entropy_coeff: float = 0.0
 
-    eval_every: int = 10
-    n_val: int = 200
-    n_test: int | None = None
-    eval_max_tokens: int | None = None
-    n_kl_eval: int = 64
+    eval_every: int = 5
+    n_eval: int = 100
+    eval_samples: int = 2
     evaluate_teacher: bool = True
+    max_prompts_per_request: int | None = 32
+    teacher_prompts_per_request: int | None = 8
     seed: int = 0
 
     weight_sync_bucket_size: int | None = None
@@ -79,18 +94,14 @@ class Config:
 
 
 def main(config: Config) -> None:
-    train(config, GSM8KTask())
+    train(config, WikiSearchTask(index_dir=config.index_dir))
 
 
 __all__ = [
-    "BOXED_INSTRUCTION",
     "Config",
-    "GSM8KProblems",
-    "GSM8KTask",
-    "extract_answer",
-    "is_correct",
+    "WikiIndex",
+    "WikiSearchTask",
     "job_bodies",
-    "load_gsm8k",
     "lr_at",
     "main",
     "processing_block",

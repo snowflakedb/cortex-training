@@ -13,6 +13,7 @@ for a specific workload.
 | `Qwen/Qwen3-1.7B` | dense | standard | standard | — |
 | `Qwen/Qwen3-4B-Instruct-2507` | dense | standard, long | standard, long | 262,144 |
 | `Qwen/Qwen3-8B` | dense | standard | standard | — |
+| `Qwen/Qwen3.5-2B` | dense | standard, long | standard, long | 262,144 |
 | `Qwen/Qwen3.5-4B` | dense | standard, long | standard, long | 262,144 |
 | `Qwen/Qwen3.5-9B` | dense | long | long | 65,536 |
 | `Qwen/Qwen3.8-27B` | dense | standard, long | standard, long | 65,536 |
