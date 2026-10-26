@@ -34,11 +34,13 @@ from cortex_training.client.core import ChunkGroupConflictError
 from cortex_training.client.core import ChunkGroupError
 from cortex_training.client.core import ChunkGroupRestartError
 from cortex_training.client.core import CortexTrainingClient
+from cortex_training.client.core import DatabaseAccessError
 from cortex_training.client.core import DownloadCancelled
 from cortex_training.client.core import Hardware
 from cortex_training.client.core import InferenceConfig
 from cortex_training.client.core import InvalidPageToken
 from cortex_training.client.core import JobType
+from cortex_training.client.core import ModelDeploymentSpec
 from cortex_training.client.core import NoChunksError
 from cortex_training.client.core import SubJobConfig
 from cortex_training.client.core import TrainingConfig
@@ -60,11 +62,13 @@ __all__ = [
     "ChunkGroupError",
     "ChunkGroupRestartError",
     "CortexTrainingClient",
+    "DatabaseAccessError",
     "DownloadCancelled",
     "Hardware",
     "InferenceConfig",
     "InvalidPageToken",
     "JobType",
+    "ModelDeploymentSpec",
     "NoChunksError",
     "SubJobConfig",
     "TrainingConfig",

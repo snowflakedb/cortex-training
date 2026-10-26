@@ -37,10 +37,13 @@ Tuning knobs on the constructor: `endpoint`, `poll_interval` (0.5s),
 and read timeout, or a `(connect, read)` pair. `from_connection_name` and
 `from_pat` also accept `telemetry_timeout` (3s) for best-effort client metrics.
 
-By default a request answered "database or schema not found" makes the client
-run `CREATE DATABASE` (and `CREATE SCHEMA`) and retry. Set
-`client.auto_create_database = False` for a client that only reads: the error
-is then raised as it is. A client from `for_job` starts with it off.
+The client never creates a database. A request that fails because the
+database or schema in its URL can't be found (HTTP 400, code `517602`) raises
+`DatabaseAccessError` (see [Exceptions](#exceptions)), which says how to create
+it, get access to it, or use another one. A client from `for_job` raises the
+plain `requests.HTTPError` instead. `client.auto_create_database` is deprecated:
+it is always False. Setting it to True emits a `FutureWarning`; setting it to False
+needs no change.
 
 ## Client metrics
 
@@ -354,6 +357,15 @@ carry a `.detail` dict for chunk-group failures. `AccountJobListUnavailable` (wi
 `.reason`) and `InvalidPageToken`, also `HTTPError` subclasses, come from
 `list_jobs_page`. Polling raises `RuntimeError`
 on a failed/cancelled request and `TimeoutError` at the deadline.
+
+`DatabaseAccessError` (a subclass of both `requests.exceptions.HTTPError` and
+`RuntimeError`) means the configured database or schema can't be found by the
+current role: it doesn't exist, or the role can't access it. It carries
+`.response` (the HTTP 400), `.kind` (`"database"` or `"schema"`), `.name`,
+`.role` (the session's role, or None when it can't be determined, as for PAT
+clients), and `.statement`, the SQL that would set it up: `CREATE DATABASE IF NOT
+EXISTS ...`, or for a schema other than `PUBLIC`, that statement and
+`CREATE SCHEMA IF NOT EXISTS ...`, separated by `; `.
 
 ## Details not covered here
 

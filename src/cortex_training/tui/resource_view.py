@@ -113,8 +113,10 @@ class ResourceTab:
     _RESOURCE_WHAT = {GPU: "GPU metrics", SYSTEM: "system metrics"}
     _RESOURCE_SAMPLES = {GPU: "GPU samples", SYSTEM: "system samples"}
     # While the screen has nothing of the shown sub-job (a first open, when its whole
-    # history can take minutes to download), its newest half hour, which covers the 10m
-    # and 30m windows, is fetched first and drawn while the rest comes.
+    # history can take minutes to download), its newest chunks are fetched first and drawn
+    # while the rest comes: the window on screen (see _resource_preview_seconds), at most
+    # this. A chunk holds about a minute, and a download fetches 16 at once: the 10m window,
+    # where every job opens, takes one round of them; the half hour, three times the chunks.
     _RESOURCE_PREVIEW_SECONDS = RANGES["30m"].total_seconds()
     # The header's bar for a metrics download: its cells, and how often it is redrawn.
     _RESOURCE_PROGRESS_CELLS = 12
@@ -127,6 +129,11 @@ class ResourceTab:
             return
         self._resource_range = name
         self._render_resource()
+        resource = self._resource_kind_data()
+        if resource is not None and not resource.fresh(name):
+            # A refresh builds only the window on screen: this one is as of its last showing.
+            self._resource_window_error = None  # this is another try
+            self._rebuild_resource_window()
 
     def action_cycle_window(self) -> None:
         names = list(RANGES)
@@ -166,6 +173,50 @@ class ResourceTab:
         if grown >= getattr(app, "CACHE_PASS_AFTER_BYTES", float("inf")):
             app.hold_cache_soon()
 
+    @work(thread=True, group="resource-window", exclusive=True)
+    def _rebuild_resource_window(self) -> None:
+        """Worker thread. The window just picked, built from the rows the loader holds, with
+        no download. Under the download lock, as every load is: while a download holds it, its
+        own loads build the window on screen, and this one then finds it built."""
+        worker = get_current_worker()
+        window = self._resource_range
+        lock = DownloadLock(self._metrics_root)
+        if not lock.acquire(lambda: self._screen_open and not worker.is_cancelled):
+            return
+        loader = resource_loader(self._metrics_root)
+        try:
+            if worker.is_cancelled or not self._screen_open:
+                return
+            data = loader.load(priority=self._resource_source(), window=RANGES.get(window), shown=window)
+        except Exception as exc:  # noqa: BLE001 - the window stays as it last was; r rebuilds it with a refresh
+            log_traceback(f"rebuilding the {window} window of {self._job_id} failed")
+            if not worker.is_cancelled:
+                self._post(self._fail_rebuilt_window, window, views.describe_error(exc))
+            return
+        finally:
+            lock.release()
+        if not worker.is_cancelled:
+            self._post(self._accept_rebuilt_window, data, loader)
+
+    def _accept_rebuilt_window(self, data: ResourceData, loader) -> None:
+        """UI thread. A window rebuilt for showing: the data, and nothing of a refresh's state.
+        Only while it is the loader's newest: a refresh that loaded after it may answer first."""
+        if not self._screen_open or data is not loader.last:
+            return
+        self._resource_data = data
+        self._resource_window_error = None
+        if self._resource_active():
+            self._render_resource()
+
+    def _fail_rebuilt_window(self, window: str, problem: str) -> None:
+        """UI thread. A window's rebuild failed: the header says so in place of refreshing…,
+        until the window is rebuilt (r, or the next refresh, builds the window on screen)."""
+        if not self._screen_open:
+            return
+        self._resource_window_error = (window, problem)
+        if self._resource_active() and window == self._resource_range:
+            self._render_resource()
+
     @work(thread=True, group="resource")
     def _refresh_resource(self) -> None:
         worker = get_current_worker()
@@ -191,7 +242,7 @@ class ResourceTab:
             # with its newest few minutes.
             source = self._resource_source()
             blank = source not in self._resource_data.kinds and source not in shown_here
-            return loader.load(priority=source, window=RANGES.get(self._resource_range),
+            return loader.load(priority=source, window=RANGES.get(self._resource_range), shown=self._resource_range,
                                on_partial=show_partial if blank else None)
 
         try:
@@ -258,7 +309,7 @@ class ResourceTab:
             source = self._resource_source()
             options: dict = {"on_chunk": progress}
             if source and source not in shown_here and source not in self._resource_data.kinds:
-                options.update(preview_seconds=self._RESOURCE_PREVIEW_SECONDS, on_preview=previewed)
+                options.update(preview_seconds=self._resource_preview_seconds(), on_preview=previewed)
             before = telemetry_bytes(self._metrics_root)
             results = self._client.download_metrics(
                 self._job_id,
@@ -285,7 +336,8 @@ class ResourceTab:
             if not worker.is_cancelled:
                 try:
                     # Only the lock holder may load; without it, show what the loader read last.
-                    partial = loader.load() if acquired else (loader.last or ResourceData({}))
+                    partial = (loader.load(shown=self._resource_range) if acquired
+                               else (loader.last or ResourceData({})))
                 except Exception:  # noqa: BLE001 - preserve the original refresh error
                     partial = ResourceData({})
                 self._post(
@@ -296,6 +348,23 @@ class ResourceTab:
         finally:
             if acquired:
                 lock.release()
+
+    def _rebuild_window_left_stale(self) -> None:
+        """UI thread. A refresh builds the window it was asked for when its load began. One picked
+        after that looked fresh on screen, so no rebuild started, and the refresh's rows now have it
+        as of its last showing: rebuild it, or the header would say refreshing… with nothing doing so."""
+        resource = self._resource_kind_data()
+        if resource is not None and not resource.fresh(self._resource_range):
+            self._resource_window_error = None  # another try, as picking the window again is
+            self._rebuild_resource_window()
+
+    def _resource_preview_seconds(self) -> float:
+        """How far back a first open's preview reaches: the window on screen, at most
+        _RESOURCE_PREVIEW_SECONDS (a larger window shows it marked loading older samples)."""
+        window = RANGES.get(self._resource_range)
+        if window is None:
+            return self._RESOURCE_PREVIEW_SECONDS
+        return min(window.total_seconds(), self._RESOURCE_PREVIEW_SECONDS)
 
     def _show_resource_progress(self, sub_job_id: str, done: int, total: int) -> None:
         """UI thread. A metrics download's chunk count: the shown sub-job's is the header's bar (see _resource_state)."""
@@ -330,12 +399,17 @@ class ResourceTab:
         self._resource_refresh_succeeded = error is None
         if error is None:
             self._resource_downloaded = True  # every sub-job's rows are in: one without a kind has none
+            self._resource_window_error = None  # the window on screen was built with the rest
+        elif self._resource_window_error is not None:
+            # The refresh failed too: a window whose rebuild failed names the newer failure.
+            self._resource_window_error = (self._resource_window_error[0], error)
         if data is not None:
             self._resource_data = data
             self._resource_loaded = True
             self._resource_error = error
             if self._resource_active():
                 self._render_resource()
+            self._rebuild_window_left_stale()
             return
         self._resource_error = error
         self._resource_loaded = _has_telemetry(self._resource_data)
@@ -547,6 +621,13 @@ class ResourceTab:
                 return self._with_progress(source, self._RESOURCE_REFRESHING)
             # A sub-job with nothing of its own after a whole download has none to load.
             return self._with_progress(source, ("refreshing…",) if self._resource_downloaded else (f"loading {what}…",))
+        if resource is not None and not resource.fresh(self._resource_range):
+            failed = self._resource_window_error
+            if failed is not None and failed[0] == self._resource_range:
+                # Its rebuild failed and nothing has built it since: nothing is refreshing it.
+                return ("cached · [$warning]refresh failed: $window_problem[/]",
+                        "[$warning]refresh failed: $window_problem[/]")
+            return ("refreshing…",)  # the window just picked, as of its last showing, until rebuilt
         if self._resource_error:
             return (("cached · [$warning]refresh failed: $problem[/]", "[$warning]refresh failed: $problem[/]")
                     if cached else (f"[$warning]{what} unavailable: $problem[/]",))
@@ -708,7 +789,8 @@ class ResourceTab:
         allocation = gpu_allocation(self._job, source)
         now = datetime.now(timezone.utc)
         stale = self._resource_stale(resource, now)
-        values: dict = {"problem": views.collapse(self._resource_error or "")}
+        values: dict = {"problem": views.collapse(self._resource_error or ""),
+                        "window_problem": views.collapse((self._resource_window_error or ("", ""))[1])}
         if ignored:
             values.update(note=skipped_rows_text(ignored), note_short=skipped_rows_text(ignored, short=True))
         note = [("$note", 0), ("$note_short", 0), ("", 0)] if ignored else [("", 0)]

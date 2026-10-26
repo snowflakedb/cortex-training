@@ -97,13 +97,18 @@ any of these methods:
 cortex-training capacity
 ```
 
-This should print your available GPU capacity. The client automatically creates
-the configured database if it does not exist. If automatic creation fails (for
-example, your role lacks `CREATE DATABASE`), create it manually in Snowsight:
+This should print your available GPU capacity.
+
+Cortex Training keeps your jobs and checkpoints in the profile's database, and
+it never creates that database for you. Create it once, in Snowsight:
 
 ```sql
 CREATE DATABASE IF NOT EXISTS CORTEX_TRAINING_DB;
 ```
+
+If a command can't find the database, it stops with an error that names your
+role and the database, and how to fix it: create it, ask an admin for
+`GRANT USAGE`, or use another database with `--database`.
 
 ### Option B: JSON config (legacy)
 

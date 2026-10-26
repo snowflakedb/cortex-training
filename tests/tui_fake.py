@@ -13,12 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Synthetic, offline client for trying and debugging the TUI (``cortex-training tui --debug``).
+"""An offline stand-in for the client, for the TUI's tests: never installed or shipped.
 
 Implements the read-only client methods the TUI calls, returning records in
-the shapes the service returns (job / sub-job metadata,
-``gpu.jsonl`` telemetry, tail-logs pages). Every value is generated from a
-fixed seed relative to "now"; nothing touches the network.
+the shapes the service returns (job / sub-job metadata, ``gpu.jsonl``
+telemetry, tail-logs pages), across several locations, so a test drives the
+TUI over a realistic account. Every value is generated from a fixed seed
+relative to "now"; nothing touches the network.
 """
 
 from __future__ import annotations
@@ -77,9 +78,9 @@ def _log_prob(model, *, seq=4096):
             "inference_config": {"n_gpus": 2.0, "max_seq_len": float(seq)}}
 
 
-# Where the demo's jobs live: the TUI's configured location, and two more that
+# Where the fake's jobs live: the TUI's configured location, and two more that
 # only the account-wide list shows (one a lowercase name, which SQL quotes).
-DEMO_LOCATION = ("CORTEX_TRAINING_DB", "PUBLIC")
+FAKE_LOCATION = ("CORTEX_TRAINING_DB", "PUBLIC")
 _TEAM = ("TEAM_DB", "EXPERIMENTS")
 _LOWERCASE = ("sandbox", "dev")
 
@@ -180,7 +181,7 @@ _NOT_FOUND = "Job status unavailable: job not found on Control Plane"
 _EXPERIMENT_GONE = "Linked experiment is not found for job {job}"
 _EXPERIMENT_SQL = ("002003 (02000): SQL compilation error: Experiment '{database}.{schema}.{name}' "
                    "does not exist or not authorized.")
-# The stuck job's oversized lines: the first this long after the demo starts, then one per period.
+# The stuck job's oversized lines: the first this long after the fake starts, then one per period.
 _STUCK_AFTER = timedelta(minutes=1)
 _STUCK_EVERY = timedelta(minutes=10)
 
@@ -223,7 +224,7 @@ def _http_error(status: int, message: str) -> requests.HTTPError:
     return requests.HTTPError(f"{status} {response.reason}", response=response)
 
 
-class DemoClient:
+class FakeClient:
     """Deterministic, read-only ``CortexTrainingClient`` stand-in.
 
     Jobs advance on wall time. ``account_list`` selects an unavailable-account
@@ -244,8 +245,8 @@ class DemoClient:
         self._run_steps: dict = {}  # job id -> the epoch of each step of its training run, computed once
         self._rng = random.Random(7)
         self._account_list = account_list
-        self._location = DEMO_LOCATION
-        self.database, self.schema = DEMO_LOCATION
+        self._location = FAKE_LOCATION
+        self.database, self.schema = FAKE_LOCATION
         self._jobs: list = []
         self._kinds: dict = {}
         self._extra: dict = {}  # job id -> its spec's overrides
@@ -320,7 +321,7 @@ class DemoClient:
 
     def _here(self, job_id: str) -> bool:
         """Whether the job is in the location this client is bound to."""
-        return self._extra[job_id].get("location", DEMO_LOCATION) == self._location
+        return self._extra[job_id].get("location", FAKE_LOCATION) == self._location
 
     def _record(self, job_id: str) -> dict:
         """A job in this client's location."""
@@ -360,7 +361,7 @@ class DemoClient:
         if how == "missing":
             raise _http_error(500, _EXPERIMENT_GONE.format(job=job["job_id"]))
         if how == "sql":
-            database, schema = self._extra[job["job_id"]].get("location", DEMO_LOCATION)
+            database, schema = self._extra[job["job_id"]].get("location", FAKE_LOCATION)
             raise RuntimeError(_EXPERIMENT_SQL.format(database=database, schema=schema, name="TRAINING_RUNS"))
 
     # ── client surface used by the TUI ──
@@ -380,7 +381,7 @@ class DemoClient:
         row = self._served(job)
         if views.is_unknown(row):
             row["created_at"] = job["created_at"]
-        database, schema = self._extra[job["job_id"]].get("location", DEMO_LOCATION)
+        database, schema = self._extra[job["job_id"]].get("location", FAKE_LOCATION)
         return {**row, "database_name": database, "schema_name": schema}
 
     def list_jobs_page(self, *, database: Optional[str] = None, schema: Optional[str] = None,
@@ -412,7 +413,7 @@ class DemoClient:
         end = start + len(page)
         return {"jobs": page, "next_page_token": str(end) if end < len(rows) else None}
 
-    def for_job(self, job: dict) -> "DemoClient":
+    def for_job(self, job: dict) -> "FakeClient":
         """A view of this client bound to ``job``'s database and schema, as ``CortexTrainingClient.for_job``."""
         view = copy.copy(self)  # shares the jobs, stores and caches
         view._location = (job["database_name"], job["schema_name"])
@@ -423,7 +424,7 @@ class DemoClient:
     # The sampler reads every GPU every 5 s, as the service's does. A long job's file
     # keeps every sample of its last hour (the windows a job opens on, and the
     # interval the tab reports, come from those) and every stride-th one before,
-    # so the demo's files stay small; each row still says 5 s, the sampler's interval.
+    # so the fake's files stay small; each row still says 5 s, the sampler's interval.
     _SAMPLE_SECONDS = 5.0
     _DENSE_SECONDS = 3600.0
     _OLDER_SAMPLES = 1680
@@ -509,7 +510,7 @@ class DemoClient:
                         "fb_used_bytes": float(used), "fb_free_bytes": float(fb_total - used),
                         "power_watts": round(180 + 5 * util, 1), "gpu_temp_c": round(38 + util / 3, 1),
                         "sm_active_pct": None, "sm_occupancy_pct": None, "tensor_active_pct": round(util * 0.6, 1),
-                        "dram_active_pct": round(util * 0.4, 1), "seq": seq, "seq_epoch": "demo",
+                        "dram_active_pct": round(util * 0.4, 1), "seq": seq, "seq_epoch": "fake",
                         "sample_interval_s": interval,
                     }))
             data = ("\n".join(lines) + "\n").encode("utf-8")
@@ -517,7 +518,7 @@ class DemoClient:
             # The resume manifest the real client writes; the Resources tab reads
             # only the bytes it commits.
             manifest = path.with_name("." + path.name + ".manifest.json")
-            manifest.write_text(json.dumps({"version": 1, "names": [f"_metrics/{sid}/gpu.demo.jsonl.gz"], "bytes": len(data)}),
+            manifest.write_text(json.dumps({"version": 1, "names": [f"_metrics/{sid}/gpu.fake.jsonl.gz"], "bytes": len(data)}),
                                 encoding="utf-8")
             written.append({"sub_job_id": sid, "path": str(path)})
             if on_commit is not None:
@@ -577,7 +578,7 @@ class DemoClient:
             manifest = path.with_name("." + path.name + ".manifest.json")
             manifest.write_text(json.dumps({
                 "version": 1,
-                "names": [f"_metrics/{sj['sub_job_id']}/training.demo.jsonl.gz"],
+                "names": [f"_metrics/{sj['sub_job_id']}/training.fake.jsonl.gz"],
                 "bytes": len(data),
             }), encoding="utf-8")
             written.append({"sub_job_id": sj["sub_job_id"], "path": str(path)})
@@ -594,8 +595,8 @@ class DemoClient:
         def row(op: str, step: int, call, metrics: dict, stamp: str) -> str:
             return json.dumps({
                 "kind": "training", "record_version": 2, "sub_job_id": sj["sub_job_id"], "sample_ts": stamp,
-                "seq": seq, "seq_epoch": "demo", "op": op, "step": step, "call": call,
-                "request_id": f"rr_demo.{seq}",
+                "seq": seq, "seq_epoch": "fake", "op": op, "step": step, "call": call,
+                "request_id": f"rr_fake.{seq}",
                 "metrics": {name: round(float(value), 6) for name, value in metrics.items()},
             })
 
@@ -630,7 +631,7 @@ class DemoClient:
                     + rng.gauss(0, 0.5) * _GIB)
         return {
             "kind": "system", "record_version": 3, "sub_job_id": sid, "sample_ts": stamp, "worker_num": node,
-            "seq": seq, "seq_epoch": "demo", "sample_interval_s": self._SAMPLE_SECONDS,
+            "seq": seq, "seq_epoch": "fake", "sample_interval_s": self._SAMPLE_SECONDS,
             "cpu_util_pct": round(max(0.1, min(100.0, cpu)), 1), "cpu_count": float(cpus),
             "mem_used_bytes": float(int(max(0.0, min(limit, used)))), "mem_total_bytes": float(limit),
         }
@@ -719,7 +720,7 @@ class DemoClient:
 
     def _stuck_lines(self, job: dict, sj: dict) -> list:
         """Indices of the lines of ``sj``'s log that are 300 KiB or more (see _SPECS):
-        one line every _STUCK_EVERY from _STUCK_AFTER after the demo started, on the clock."""
+        one line every _STUCK_EVERY from _STUCK_AFTER after the fake started, on the clock."""
         if not self._extra[job["job_id"]].get("stuck"):
             return []
         times, after, period = self._periodic(job, sj)
@@ -752,7 +753,7 @@ class DemoClient:
         if k % 37 == 20:
             return "WARNING", "train", "dataloader stalled 11.8s waiting for next batch (consider num_workers>4)"
         # The k-th line is the run's step k, and past its last step (the run stops when the
-        # demo starts) the steps go on; a job without a run logs every tenth step.
+        # fake starts) the steps go on; a job without a run logs every tenth step.
         step = k if self._step_times(job["job_id"]) else k * 10
         lr = float(sj["training_config"]["optimizer"]["lr"])
         if self._kinds.get(job["job_id"]) == "rl":
@@ -839,9 +840,9 @@ class DemoClient:
             else:
                 names = [("bf16_zero_pp_rank_0_mp_rank_00_optim_states.pt", 5161740657),
                          ("mp_rank_00_model_states.pt", 3441239525)]
-            files = [{"filename": f"{folder}/{name}", "size_bytes": str(size), "url": "https://demo.invalid/"}
+            files = [{"filename": f"{folder}/{name}", "size_bytes": str(size), "url": "https://fake.invalid/"}
                      for name, size in names]
-            files.append({"filename": "metadata.json", "size_bytes": "296", "url": "https://demo.invalid/"})
+            files.append({"filename": "metadata.json", "size_bytes": "296", "url": "https://fake.invalid/"})
             return {"checkpoint_id": checkpoint_id, "files": files,
                     "expires_at": _iso(self._clock() + timedelta(hours=1))}
         raise _http_error(404, f"checkpoint {checkpoint_id} not found")
@@ -926,7 +927,7 @@ class DemoClient:
                  "duration_s": 331.4, "error": "RuntimeError: loading the model failed: CUDA out of memory"},
             ]
             out.append({"sub_job_id": sid, "filename": "execution.jsonl",
-                        "artifact_uri": f"snow://experiment/DEMO/versions/RUN/_logs/{sid}/execution.jsonl",
+                        "artifact_uri": f"snow://experiment/FAKE/versions/RUN/_logs/{sid}/execution.jsonl",
                         "content": "".join(json.dumps(r) + "\n" for r in records)})
         return out
 

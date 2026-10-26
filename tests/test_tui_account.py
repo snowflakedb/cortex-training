@@ -911,3 +911,30 @@ def test_a_schema_whose_jobs_fall_past_the_cap_is_reachable_only_by_narrowing():
     narrowed = lister.load(NOW, location=("DB", "QUIET"))
     assert [job["job_id"] for job in narrowed.jobs] == [f"old-{i:05d}" for i in range(5)]
     assert narrowed.scope.stopped is None and narrowed.scope.narrowed == "DB.QUIET"
+
+
+def test_a_whole_schema_list_past_the_cap_is_held_as_a_walk_holds_one():
+    # list_jobs answers a schema whole: where the account-level list isn't there, tens of
+    # thousands of rows came whole too, and drawing them froze the job list for seconds.
+    now = datetime(2026, 10, 20, tzinfo=timezone.utc)
+    jobs = [{"job_id": f"j{i}", "status": "SUCCEEDED", "created_at": (now - timedelta(minutes=i)).isoformat()}
+            for i in range(ACCOUNT_LIST_CAP + 500)]
+    jobs[-1]["status"] = "RUNNING"  # the oldest of them, still running
+    jobs.append({"job_id": "no-time", "status": "FAILED"})  # no created_at: the oldest of all
+
+    cut = account.cut_whole_listing(account.Listing(jobs, account.ListScope(account.SCHEMA)))
+
+    ids = {job["job_id"] for job in cut.jobs}
+    assert len(cut.jobs) == ACCOUNT_LIST_CAP + 1
+    assert {f"j{i}" for i in range(ACCOUNT_LIST_CAP)} <= ids, "the newest were not the ones kept"
+    assert f"j{ACCOUNT_LIST_CAP + 499}" in ids, "an active job older than the newest went"
+    assert "no-time" not in ids
+    assert cut.everything is jobs
+    assert account.scope_text(cut.scope, location="DB.SCHEMA", only="") == (
+        "Current schema: DB.SCHEMA, newest 2,000 + every active job (more exist)")
+
+
+def test_a_whole_schema_list_within_the_cap_is_left_whole():
+    listing = account.Listing([{"job_id": f"j{i}", "status": "SUCCEEDED"} for i in range(10)],
+                              account.ListScope(account.SCHEMA))
+    assert account.cut_whole_listing(listing) is listing

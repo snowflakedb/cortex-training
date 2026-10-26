@@ -23,6 +23,7 @@ EXAMPLE_FOLDERS = (
     "sft/dare",
     "rl/math_grpo",
     "inference",
+    "model_deployment",
     "distillation",
     "frameworks/skyrl/gsm8k_grpo",
 )

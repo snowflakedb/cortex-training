@@ -24,3 +24,8 @@ independent, so the training job can be cancelled once the checkpoint is saved.
 `serve` waits until the endpoint is up and leaves it running; stop it with
 `cortex-training cancel JOB_ID`. For the equivalent raw client calls, see
 [Start sampling from saved weights](../../reference/rest-api.md#134-start-sampling-from-saved-weights).
+
+Readiness checks, scaling and teardown are not yet documented.
+
+To serve a checkpoint behind an OpenAI-compatible endpoint and stream replies
+instead, see [Deploy a Model for Streaming Inference](deploy-model.md).

@@ -13,6 +13,12 @@ from the model catalog instead; see
 | [`sampling.json`](sampling.json) | A sampling sub-job for `Qwen/Qwen3.6-35B-A3B` |
 | [`rl.json`](rl.json) | Colocated training and sampling sub-jobs |
 | [`external-weights-training.json`](external-weights-training.json) | A training sub-job from a Hugging Face model directory on a stage |
+| [`glm-sampling.json`](glm-sampling.json) | A 16-GPU `zai-org/GLM-5.2-FP8` sampling sub-job with a 1M-token context and an FP8 MLA KV cache |
+
+[`model-deployment-checkpoint.json`](model-deployment-checkpoint.json) is not a
+create-job body: it is a model-deployment spec for
+`cortex-training model-deployment create --spec` (see
+[Deploy a Model for Streaming Inference](../../docs/guides/inference/deploy-model.md)).
 
 ```bash
 ct submit --dry-run examples/api/training.json   # validate offline, print the body

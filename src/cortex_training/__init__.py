@@ -23,12 +23,14 @@ from .client import ChunkGroupConflictError
 from .client import ChunkGroupError
 from .client import ChunkGroupRestartError
 from .client import CortexTrainingClient
+from .client import DatabaseAccessError
 from .client import DownloadCancelled
 from .client import NoChunksError
 from .client import Hardware
 from .client import InferenceConfig
 from .client import InvalidPageToken
 from .client import JobType
+from .client import ModelDeploymentSpec
 from .client import SubJobConfig
 from .client import TrainingConfig
 from .client import build_forward_backward_kwargs
@@ -43,6 +45,7 @@ __all__ = [
     "ChunkGroupError",
     "ChunkGroupRestartError",
     "ChunkGroupConflictError",
+    "DatabaseAccessError",
     "DownloadCancelled",
     "NoChunksError",
     "InvalidPageToken",
@@ -51,6 +54,7 @@ __all__ = [
     "TrainingConfig",
     "InferenceConfig",
     "JobType",
+    "ModelDeploymentSpec",
     "Hardware",
     "wire",
     "__version__",

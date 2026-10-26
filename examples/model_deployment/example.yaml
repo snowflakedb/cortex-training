@@ -1,0 +1,11 @@
+id: model-deployment-streaming
+title: Deploy a model and stream chat completions
+status: runnable
+task: inference
+methods:
+  - model-deployment
+datasets: []
+precision:
+  - bfloat16
+provenance: null
+last_validated: 2026-10-23

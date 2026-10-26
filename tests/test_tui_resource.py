@@ -706,3 +706,110 @@ def test_a_preview_is_its_sub_job_s_newest_rows_marked_partial_and_leaves_the_lo
     # The loader's own state is untouched: the file it reads next is read whole.
     full = loader.load().kind(sub, "gpu")
     assert not full.partial and full.first_sample_ts == now - timedelta(minutes=120)
+
+
+# ─── a refresh builds only the window on screen (and the whole job's) ────────
+
+def _same(x, y) -> bool:
+    """Equal, with NaN equal to NaN: two builds of one view can't be compared with == alone."""
+    import math
+    if isinstance(x, float) and isinstance(y, float):
+        return x == y or (math.isnan(x) and math.isnan(y))
+    if isinstance(x, (tuple, list)) and isinstance(y, (tuple, list)):
+        return len(x) == len(y) and all(_same(a, b) for a, b in zip(x, y))
+    if isinstance(x, dict) and isinstance(y, dict):
+        return x.keys() == y.keys() and all(_same(x[key], y[key]) for key in x)
+    if hasattr(x, "__dataclass_fields__") and type(x) is type(y):
+        return all(_same(getattr(x, name), getattr(y, name)) for name in x.__dataclass_fields__)
+    return x == y
+
+
+SUB = "7:training:0"
+
+
+def _scrapes(start, first, count, gpus=4):
+    return [_row(start + timedelta(seconds=5 * k), gpu, float((k * 7 + gpu * 13) % 100))
+            for k in range(first, first + count) for gpu in range(gpus)]
+
+
+def _append(root, rows, chunks):
+    path = root / SUB / "gpu.jsonl"
+    with path.open("a", encoding="utf-8") as out:
+        for row in rows:
+            out.write(json.dumps({**row, "sub_job_id": SUB}) + "\n")
+    path.with_name(".gpu.jsonl.manifest.json").write_text(
+        json.dumps({"version": 1, "names": ["chunk.gz"] + [f"chunk{n}.gz" for n in range(1, chunks)],
+                    "bytes": path.stat().st_size}) + "\n", encoding="utf-8")
+
+
+def _two_hours(tmp_path):
+    start = datetime(2026, 10, 20, 10, 0, tzinfo=timezone.utc)
+    _write_metrics(tmp_path, SUB, _scrapes(start, 0, 1440))  # two hours at 5 s
+    return start
+
+
+def test_a_refresh_builds_only_the_window_on_screen_and_the_whole_job_s(tmp_path):
+    # Every window was rebuilt on every refresh: on a job with hundreds of GPUs the long ones
+    # took seconds, whichever was on screen.
+    start = _two_hours(tmp_path)
+    loader = resource_module.ResourceLoader(tmp_path)
+    assert loader.load(shown="10m").kinds[SUB]["gpu"].fresh(), "a first build leaves a window missing"
+
+    _append(tmp_path, _scrapes(start, 1440, 6), chunks=2)
+    gpu = loader.load(shown="10m").kinds[SUB]["gpu"]
+
+    assert gpu.fresh("10m") and not gpu.fresh()
+    assert gpu._stale == {"30m", "1h", "6h"}, "the window on screen or the whole job's was carried"
+    whole = resource_module.ResourceLoader(tmp_path).load().kinds[SUB]["gpu"]  # every window, from scratch
+    for window in ("10m", "all"):  # the chart, and the stats beside it
+        for unit in (None, *gpu.unit_ids):
+            assert _same(gpu.view(window, unit), whole.view(window, unit)), (window, unit)
+
+
+def test_a_window_carried_from_before_is_rebuilt_once_shown(tmp_path):
+    start = _two_hours(tmp_path)
+    loader = resource_module.ResourceLoader(tmp_path)
+    loader.load(shown="10m")
+    _append(tmp_path, _scrapes(start, 1440, 6), chunks=2)
+    loader.load(shown="10m")
+
+    gpu = loader.load(shown="6h").kinds[SUB]["gpu"]  # nothing new to read: the window was picked
+
+    assert gpu.fresh("6h")
+    whole = resource_module.ResourceLoader(tmp_path).load().kinds[SUB]["gpu"]
+    for unit in (None, *gpu.unit_ids):
+        assert _same(gpu.view("6h", unit), whole.view("6h", unit)), unit
+
+
+def test_without_a_window_named_every_window_is_built(tmp_path):
+    start = _two_hours(tmp_path)
+    loader = resource_module.ResourceLoader(tmp_path)
+    loader.load()
+    _append(tmp_path, _scrapes(start, 1440, 6), chunks=2)
+    assert loader.load().kinds[SUB]["gpu"].fresh()
+
+
+def test_picking_a_window_with_no_new_rows_builds_only_that_window(tmp_path, monkeypatch):
+    # The whole job's frame and the extremes were rebuilt too on every pick: seconds a press
+    # of w on a job with hundreds of GPUs, for frames already up to date.
+    start = _two_hours(tmp_path)
+    loader = resource_module.ResourceLoader(tmp_path)
+    loader.load(shown="10m")
+    _append(tmp_path, _scrapes(start, 1440, 6), chunks=2)
+    loader.load(shown="10m")
+    built, natives = [], []
+    real_raw, real_native = resource_module._raw_frame, resource_module._Native
+    monkeypatch.setattr(resource_module, "_raw_frame", lambda series, name, *a, **k: (
+        built.append((series.spec.name, name)), real_raw(series, name, *a, **k))[1])
+    monkeypatch.setattr(resource_module, "_Native", lambda *a, **k: (natives.append(1), real_native(*a, **k))[1])
+
+    gpu = loader.load(shown="1h").kinds[SUB]["gpu"]
+
+    assert built == [("gpu", "1h")] and not natives, "frames already up to date were built again"
+    assert gpu.fresh("1h") and gpu.fresh("10m") and gpu._stale == {"30m", "6h"}
+    monkeypatch.setattr(resource_module, "_raw_frame", real_raw)
+    monkeypatch.setattr(resource_module, "_Native", real_native)
+    whole = resource_module.ResourceLoader(tmp_path).load().kinds[SUB]["gpu"]
+    for window in ("1h", "10m", "all"):
+        for unit in (None, *gpu.unit_ids):
+            assert _same(gpu.view(window, unit), whole.view(window, unit)), (window, unit)

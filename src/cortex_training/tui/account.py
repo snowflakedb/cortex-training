@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import heapq
 import logging
 import threading
 import time
@@ -134,6 +135,33 @@ class Listing:
 
     jobs: list
     scope: ListScope
+    # A schema's whole list cut as a walk cuts one (see cut_whole_listing): every job it held.
+    everything: Optional[list] = None
+
+
+def _created_at(job: dict) -> float:
+    """``created_at`` as epoch seconds; a job without one counts as the oldest."""
+    stamp = views.parse_ts(job.get("created_at"))
+    return stamp.timestamp() if stamp is not None else float("-inf")
+
+
+def cut_whole_listing(listing: Listing) -> Listing:
+    """A whole list of more than ACCOUNT_LIST_CAP jobs, held as the account-level walk holds
+    one: its newest ACCOUNT_LIST_CAP jobs and every active job older than them, its scope
+    stopped at CAPPED, and every job in ``everything``.
+
+    ``list_jobs`` answers a schema whole, so where the account-level list is not there a
+    schema of tens of thousands came whole too, and drawing it froze the list for seconds.
+    The job list shows ``everything`` when asked (its ``f``).
+    """
+    if len(listing.jobs) <= ACCOUNT_LIST_CAP:
+        return listing
+    newest = heapq.nlargest(ACCOUNT_LIST_CAP, listing.jobs, key=_created_at)
+    held = {id(job) for job in newest}
+    active = [job for job in listing.jobs if id(job) not in held
+              and views.status_word(job.get("status")) in views.ACTIVE_STATUSES]
+    scope = replace(listing.scope, stopped=CAPPED, walked=ACCOUNT_LIST_CAP, active_read=True)
+    return Listing(newest + active, scope, everything=listing.jobs)
 
 
 def _more(scope: ListScope) -> str:
@@ -250,7 +278,7 @@ def _service_explained(exc: BaseException) -> bool:
 
 def _configured_location(client: Any) -> Optional[tuple]:
     """``(database, schema)`` the client is bound to, to scope a walk to its schema; None when the
-    client doesn't say which (a demo or test client's attributes may be anything).
+    client doesn't say which (a test client's attributes may be anything).
 
     Each name goes out as a SQL identifier, as ``CortexTrainingClient.for_job`` builds them, so a
     quoted or lowercase configured name resolves back to the same schema at the service.
@@ -409,7 +437,7 @@ class JobLister:
             jobs = self._client.list_jobs()
         except Exception as exc:
             raise JobListError(_failure_text(_SCHEMA_ROUTE, exc)) from exc
-        return Listing([job for job in (jobs or []) if isinstance(job, dict)], scope)
+        return cut_whole_listing(Listing([job for job in (jobs or []) if isinstance(job, dict)], scope))
 
     def _walk(self, now: datetime, is_cancelled: Callable[[], bool],
               on_partial: Optional[Callable[[Listing], None]] = None,

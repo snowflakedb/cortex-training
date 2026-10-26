@@ -49,7 +49,7 @@ from cortex_training.tui.checkpoints import fmt_bytes  # noqa: E402
 from cortex_training.tui.checkpoints import parse_checkpoints  # noqa: E402
 from cortex_training.tui.checkpoints import saves_no_checkpoints  # noqa: E402
 from cortex_training.tui.checkpoints import sort_checkpoints  # noqa: E402
-from cortex_training.tui.demo import DemoClient  # noqa: E402
+from tests.tui_fake import FakeClient  # noqa: E402
 from cortex_training.tui.logs import LogScreen  # noqa: E402
 from cortex_training.tui.screens import JobSummaryScreen  # noqa: E402
 
@@ -139,14 +139,14 @@ def test_compact_numbers():
         "n": 1, "lr": 1e-05, "xs": [2, 2.5], "s": "1.0"}
 
 
-def test_demo_checkpoints_have_types_from_the_list_or_the_files():
-    demo = DemoClient()
-    listed = {job["job_id"]: demo.list_checkpoints(job["job_id"]) for job in demo.list_jobs()}
+def test_listed_checkpoints_have_types_from_the_list_or_the_files():
+    fake = FakeClient()
+    listed = {job["job_id"]: fake.list_checkpoints(job["job_id"]) for job in fake.list_jobs()}
     job_id, entries = next((jid, cps) for jid, cps in listed.items() if len(cps) >= 3)
     rows = parse_checkpoints(entries)
     assert any(r.kind is None for r in rows) and any(r.kind for r in rows)
     for row in rows:
-        info = files_info(demo.export_checkpoint(job_id, row.checkpoint_id))
+        info = files_info(fake.export_checkpoint(job_id, row.checkpoint_id))
         assert info.kind in (RESUMABLE, WEIGHTS_ONLY) and info.step is not None
         assert row.kind in (None, info.kind)
 
@@ -658,7 +658,7 @@ def test_with_success_telemetry_off_only_failed_checkpoint_downloads_are_sent(tm
 def test_a_checkpoint_download_s_report_never_changes_the_download(tmp_path):
     failing = MagicMock()
     failing._emit_operation_outcome.side_effect = RuntimeError("telemetry is down")
-    for client in (failing, DemoClient()):  # the --debug client has no telemetry at all
+    for client in (failing, FakeClient()):  # the fake client has no telemetry at all
         root = tmp_path / type(client).__name__
         paths = download_checkpoint(client, "job-1", "cp-1", _checkpoint_export(), root, get=_get(b"ab"))
         assert [p.read_bytes() for p in paths] == [b"ab", b"ab"]

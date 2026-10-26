@@ -22,6 +22,7 @@ Search, sorting, and summary fields. Like ``format.py`` this never imports
 from __future__ import annotations
 
 import functools
+import json
 import math
 import re
 import shlex
@@ -411,13 +412,6 @@ def sub_job_gpu_text(sj: dict) -> str:
     return str(requested_gpus(sj) or ("0" if sub_job_kind(sj) == "log_prob" else "—"))
 
 
-def short_sub_job_id(sub_job_id: str) -> str:
-    """A ``JOB_ID:TYPE:INDEX`` id with its job id cut to 8 characters, such as
-    ``0a1b2c3d…:training:0``; any other id as it is."""
-    job_id, sep, rest = str(sub_job_id).partition(":")
-    return f"{job_id[:8]}…:{rest}" if sep and rest and len(job_id) > 9 else str(sub_job_id)
-
-
 def job_gpu_cell(job: dict, unit: str = "") -> str:
     """A job's GPU cell: what it requested (``8 H200``, ``8 requested``), else
     ``shared`` when it runs only on another job's GPUs, ``0`` when its only
@@ -487,33 +481,18 @@ def within_retention(job: dict, now: datetime, days: int = RETENTION_DAYS) -> bo
     return created is None or (now - created).total_seconds() <= days * 86400
 
 
-def subjob_config_summary(sj: dict) -> str:
-    """Compact human summary of one sub-job's create-time config."""
-    cfg = subjob_config(sj)
-    bits = []
-    opt = cfg.get("optimizer")
-    if isinstance(opt, dict):
-        o = str(opt.get("name") or "")
-        if opt.get("lr") is not None:
-            o = f"{o} lr={compact_number(opt['lr'])}".strip()
-        if o:
-            bits.append(o)
-    for key, label in (("train_batch_size", "bs"), ("max_seq_len", "seq")):
-        if cfg.get(key) is not None:
-            bits.append(f"{label}={compact_number(cfg[key])}")
-    peft = cfg.get("peft_config")
-    if isinstance(peft, dict):
-        lora = "LoRA"
-        if peft.get("r") is not None:
-            lora += f" r={compact_number(peft['r'])}"
-        if peft.get("lora_alpha") is not None:
-            lora += f" α={compact_number(peft['lora_alpha'])}"
-        bits.append(lora)
-    elif str(sj.get("job_type") or "").lower() == "training":
-        bits.append("full-param")
-    if cfg.get("gpu_memory_utilization") is not None:
-        bits.append(f"mem={compact_number(cfg['gpu_memory_utilization'])}")
-    return " · ".join(bits)
+# A sub-job entry's fields the service adds, not part of what was submitted (and
+# the label :func:`sub_jobs` adds to an entry without an id).
+_NOT_SUBMITTED = frozenset({"sub_job_id", "status", "label"})
+
+
+def subjob_config_json(sj: dict) -> list:
+    """One sub-job's submitted config as the lines ``cortex-training get`` prints
+    for it: its entry in the job record (type, model, dtype, seed and its
+    training or inference config) without the fields the service adds, as
+    indented JSON by key, values exactly as the service returned them."""
+    submitted = {key: value for key, value in sj.items() if key not in _NOT_SUBMITTED}
+    return json.dumps(submitted, indent=2, sort_keys=True, default=str).splitlines()
 
 
 def preview_facts(job: dict, now: datetime) -> list:
@@ -1172,7 +1151,7 @@ def narrowable_name(name: str) -> bool:
 
 
 def no_match_message(text: str, query: Query, searched: int, *, cut: str = "", older: Iterable[str] = (),
-                     location: str = "", widen: bool = False, narrow: bool = False) -> str:
+                     location: str = "", widen: bool = False, narrow: bool = False, everything: int = 0) -> str:
     """Explain an empty search, including truncated, old, or wider matches."""
     older = list(older)
     if cut:
@@ -1181,6 +1160,8 @@ def no_match_message(text: str, query: Query, searched: int, *, cut: str = "", o
     else:
         where = f" in {location}" if location else ""
         lines = [f"No jobs match “{text}” among {searched:,} job(s){where} in the last 6 months."]
+    if everything:
+        lines.append(f"  f searches all {everything:,} jobs of the schema.")
     if older:
         many = len(older) > 1
         lines.append(f"  {len(older):,} older job{'s' if many else ''} match{'' if many else 'es'} (the list hides "
@@ -1291,7 +1272,7 @@ def location_names(job: Any) -> Optional[tuple]:
 
 def client_location(client: Any) -> Optional[tuple]:
     """``(database_name, schema_name)`` a client is bound to, resolved from its identifiers;
-    None when it doesn't say (a demo or test client's attributes may be anything)."""
+    None when it doesn't say (a test client's attributes may be anything)."""
     db, sch = getattr(client, "database", None), getattr(client, "schema", None)
     if isinstance(db, str) and db.strip() and isinstance(sch, str) and sch.strip():
         return identifier_name(db), identifier_name(sch)

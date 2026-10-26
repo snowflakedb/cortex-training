@@ -11,6 +11,7 @@ type on the command line instead of writing a job file.
 | [Math GRPO](rl/README.md) | Reinforcement learning | Hendrycks MATH, MATH-500 |
 | [On-policy distillation](distillation/README.md) | Distillation from a frozen teacher | GSM8K |
 | [Inference endpoint](inference/README.md) | Serve, generate, evaluate open weights or a checkpoint | MATH-500, GSM8K, identity |
+| [Model deployment streaming](model_deployment/README.md) | OpenAI-compatible model deployment, streamed chat | Open weights, checkpoints |
 
 GRPO also runs from [SkyRL](frameworks/skyrl/gsm8k_grpo/README.md), with its own
 install and entry point.
@@ -48,6 +49,7 @@ python -m examples.sft.conversational.train config=/path/to/config.json
 python -m examples.rl.math_grpo.train config=/path/to/config.json
 python -m examples.distillation.on_policy.train config=/path/to/config.json
 python -m examples.inference.serve config=/path/to/config.json
+python -m examples.model_deployment.deploy config=/path/to/config.json
 ```
 
 `config=` is always the connection file, never a job body. The SFT, RL and

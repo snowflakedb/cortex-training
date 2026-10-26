@@ -25,6 +25,7 @@ import math
 import time
 from collections import Counter
 from dataclasses import dataclass
+from dataclasses import replace
 from datetime import datetime
 from datetime import timezone
 from rich.text import Text
@@ -302,6 +303,8 @@ class JobListScreen(FollowsPointer, Screen):
         Binding("enter", "submit_search", "Show matches", show=False, priority=True),
         Binding("a", "show_list('account')", "All schemas"),
         Binding("a", "show_list('schema')", "Current schema"),
+        Binding("f", "full_list('all')", "All jobs"),
+        Binding("f", "full_list('newest')", "Newest 2,000"),
         ("s", "cycle_sort", "Sort"),
         ("o", "toggle_order", "Order"),
         ("e", "expand_all", "Expand/collapse all"),
@@ -337,6 +340,10 @@ class JobListScreen(FollowsPointer, Screen):
         self._jobs_by_key: dict[tuple, dict] = {}
         self._sub_by_item: dict[str, tuple] = {}
         self._all_jobs: list = []
+        # A schema's whole list cut to its newest jobs (see cut_whole_listing), and whether f
+        # asked for every job of it: kept across refreshes, until another list is shown.
+        self._cut_listing: Listing | None = None
+        self._full_list = False
         self._filter = ""
         self._sort = "created"
         self._descending = True
@@ -629,6 +636,29 @@ class JobListScreen(FollowsPointer, Screen):
         """Whether the list to show is the account-wide one (a), not the configured schema's."""
         return self._lister.account_wide
 
+    def action_full_list(self, which: str) -> None:
+        """``f``: every job of a schema list that came whole (``which`` "all"), or again its
+        newest 2,000 and every active job ("newest"). Drawing tens of thousands of rows takes
+        seconds, so the header says so first."""
+        listing = self._cut_listing
+        if listing is None or (which == "all") == self._full_list:
+            return
+        self._full_list = which == "all"
+        self.refresh_bindings()  # the footer's f names the other way now
+        if self._full_list:
+            self._info = Content.from_markup(f"  [dim]drawing all {len(listing.everything):,} jobs…[/dim]")
+            self._paint_info()
+            self.call_after_refresh(self._draw_full_list, listing)
+        else:
+            self._show_listing(listing)
+
+    def _draw_full_list(self, listing: Listing) -> None:
+        """``f``'s draw, once its note is on screen: only while ``listing`` is still the list and every
+        job is still asked for. A refresh that landed meanwhile drew its own list whole, as f asks, and
+        this one's older jobs must not go back over it; a second f meanwhile drew the newest again."""
+        if self._cut_listing is listing and self._full_list:
+            self._show_listing(listing)
+
     def action_show_list(self, which: str) -> None:
         """``a``: show the account-wide list (``which`` "account") or the configured schema's ("schema")."""
         account = which == "account"
@@ -669,6 +699,10 @@ class JobListScreen(FollowsPointer, Screen):
         if action == "show_list":
             # One of a's two bindings, the one for the other list.
             return (parameters[:1] == ("account",)) != self._lister.account_wide
+        if action == "full_list":
+            # Only a list cut short with every job at hand has them to show; of f's two
+            # bindings, the one for the other way.
+            return self._cut_listing is not None and (parameters[:1] == ("all",)) != self._full_list
         return True
 
     def action_filter(self) -> None:
@@ -954,6 +988,13 @@ class JobListScreen(FollowsPointer, Screen):
     def _show_listing(self, listing: Listing, *, steady: bool = False) -> None:
         """Show ``listing`` as the list; ``steady``: it grows the list on screen, which stays where it is."""
         self._partial_stays = False
+        if listing.everything is None:
+            self._cut_listing, self._full_list = None, False
+        else:
+            self._cut_listing = listing
+            if self._full_list:  # f asked for every job: so does each refresh, until another list
+                listing = Listing(listing.everything, replace(listing.scope, stopped=None, walked=0))
+        self.refresh_bindings()
         self._scope = listing.scope
         # What these rows were read under, so the header and the next search compare against the
         # listing in hand rather than the live search text (the two differ while a load is in flight).
@@ -1034,7 +1075,9 @@ class JobListScreen(FollowsPointer, Screen):
         # The header keeps saying why, in short, after the notice has gone.
         self._declined = views.fit_cells(why, self._DECLINED_CELLS) or "all schemas unavailable"
         if error is None:
-            return Listing(listing.jobs, ListScope(SCHEMA))
+            # The configured schema's list as the fallback read it, as that list: one too long to
+            # draw whole stays cut, with its every job kept for f (see cut_whole_listing).
+            return replace(listing, scope=replace(listing.scope, kind=SCHEMA, reason=None))
         self._update_subtitle()
         if self._loaded_at is None:
             self._refresh_jobs()  # nothing listed yet (a came first): read the configured schema's list
@@ -1435,8 +1478,12 @@ class JobListScreen(FollowsPointer, Screen):
                 # database from the service instead of only the jobs loaded here.
                 narrow = (self._scope is not None and self._scope.kind == ACCOUNT
                           and self._scope.truncated and self._pushdown is None)
+                # A schema's whole list held to its newest jobs: f searches every one of them.
+                everything = (len(self._cut_listing.everything)
+                              if self._cut_listing is not None and not self._full_list else 0)
                 found = dict(cut=loaded_text(self._scope), older=self._older_matches(query) if hidden else (),
-                             location=self._schema_label() if one else "", widen=widen, narrow=narrow)
+                             location=self._schema_label() if one else "", widen=widen, narrow=narrow,
+                             everything=everything)
                 message = views.no_match_message(self._filter, query, len(recent), **found)
             elif self._scope is not None and self._scope.truncated:
                 message = empty_text(self._scope)

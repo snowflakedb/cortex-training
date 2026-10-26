@@ -49,10 +49,13 @@ import math
 import os
 import re
 import shutil
+import ssl
 import tempfile
 import threading
 import time
+import warnings
 import uuid
+from collections import OrderedDict
 from collections import deque
 from collections.abc import Callable
 from collections.abc import Iterable
@@ -62,6 +65,7 @@ from dataclasses import dataclass
 from dataclasses import field
 from concurrent.futures import Future
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import date
 from datetime import datetime
 from datetime import timezone
@@ -101,6 +105,76 @@ from cortex_training.client.optimizer import normalize_optimizer_config
 from cortex_training.client.peft import normalize_lora_peft_config
 from cortex_training.client.telemetry import CachedSessionTokenProvider
 from cortex_training.client.telemetry import OtlpMetricEmitter
+from cortex_training.model_deployment import DEPLOYMENT_CLASS
+from cortex_training.model_deployment import DEPLOYMENT_GPUS_PER_REPLICA
+from cortex_training.model_deployment import DEPLOYMENT_GPU_TYPE
+from cortex_training.model_deployment import DEPLOYMENT_MIN_REPLICAS
+from cortex_training.model_deployment import DEPLOYMENT_STATUSES
+from cortex_training.model_deployment import DEPLOYMENT_STATUSES_WITHOUT_ENDPOINT
+from cortex_training.model_deployment import DEPLOYMENT_STATUS_DROPPED
+from cortex_training.model_deployment import DEPLOYMENT_STATUS_DROPPING
+from cortex_training.model_deployment import DEPLOYMENT_STATUS_FAILED
+from cortex_training.model_deployment import DEPLOYMENT_STATUS_PENDING
+from cortex_training.model_deployment import DEPLOYMENT_STATUS_READY
+from cortex_training.model_deployment import DEPLOYMENT_STATUS_TERMINATED
+from cortex_training.model_deployment import DEPLOYMENT_STATUS_UNKNOWN
+from cortex_training.model_deployment import INFERENCE_MAX_SEQ_LEN
+from cortex_training.model_deployment import JOB_FIELD_CREATED_AT
+from cortex_training.model_deployment import JOB_FIELD_HARDWARE
+from cortex_training.model_deployment import JOB_FIELD_JOB_ID
+from cortex_training.model_deployment import JOB_FIELD_OWNER_ROLE
+from cortex_training.model_deployment import JOB_FIELD_REASON
+from cortex_training.model_deployment import JOB_FIELD_REASON_DETAILS
+from cortex_training.model_deployment import JOB_FIELD_STATUS
+from cortex_training.model_deployment import JOB_FIELD_SUBMITTED_BY
+from cortex_training.model_deployment import JOB_REASON_CANCELLED_BY_CLIENT
+from cortex_training.model_deployment import JOB_STATUS_TO_DEPLOYMENT_STATUS
+from cortex_training.model_deployment import MODEL_DEPLOYMENT_CLASS
+from cortex_training.model_deployment import MODEL_DEPLOYMENT_ID_PREFIX
+from cortex_training.model_deployment import ModelDeploymentSpec
+from cortex_training.model_deployment import OUT_BASE_URL
+from cortex_training.model_deployment import OUT_CREATED_AT
+from cortex_training.model_deployment import OUT_CREATOR
+from cortex_training.model_deployment import OUT_DATABASE
+from cortex_training.model_deployment import OUT_DEPLOYMENT
+from cortex_training.model_deployment import OUT_DEPLOYMENT_CLASS
+from cortex_training.model_deployment import OUT_DROPPED
+from cortex_training.model_deployment import OUT_FAILURE
+from cortex_training.model_deployment import OUT_FAILURE_CODE
+from cortex_training.model_deployment import OUT_FAILURE_MESSAGE
+from cortex_training.model_deployment import OUT_GPUS_PER_REPLICA
+from cortex_training.model_deployment import OUT_GPU_TYPE
+from cortex_training.model_deployment import OUT_LOGS
+from cortex_training.model_deployment import OUT_MAX_SEQ_LEN
+from cortex_training.model_deployment import OUT_METRICS
+from cortex_training.model_deployment import OUT_MODEL_SOURCE
+from cortex_training.model_deployment import OUT_OWNER_ROLE
+from cortex_training.model_deployment import OUT_REPLICAS
+from cortex_training.model_deployment import OUT_SCHEMA
+from cortex_training.model_deployment import OUT_SPEC
+from cortex_training.model_deployment import OUT_STATUS
+from cortex_training.model_deployment import OUT_STATUS_DETAILS
+from cortex_training.model_deployment import OUT_STATUS_REASON
+from cortex_training.model_deployment import SOURCE_CHECKPOINT_ID
+from cortex_training.model_deployment import SOURCE_JOB_ID
+from cortex_training.model_deployment import SOURCE_MODEL
+from cortex_training.model_deployment import SOURCE_TYPE
+from cortex_training.model_deployment import SOURCE_TYPE_BASE_MODEL
+from cortex_training.model_deployment import SOURCE_TYPE_CHECKPOINT
+from cortex_training.model_deployment import SPEC_DEPLOYMENT
+from cortex_training.model_deployment import SPEC_INFERENCE
+from cortex_training.model_deployment import SPEC_SOURCE
+from cortex_training.model_deployment import WIRE_CHECKPOINT_ID
+from cortex_training.model_deployment import WIRE_DEPLOYMENT_CLASS
+from cortex_training.model_deployment import WIRE_INFERENCE_CONFIG
+from cortex_training.model_deployment import WIRE_MAX_MODEL_LEN
+from cortex_training.model_deployment import WIRE_MAX_SEQ_LEN
+from cortex_training.model_deployment import WIRE_NUM_REPLICAS
+from cortex_training.model_deployment import WIRE_N_GPUS
+from cortex_training.model_deployment import WIRE_SOURCE_CHECKPOINT_INFO
+from cortex_training.model_deployment import WIRE_SOURCE_JOB_ID
+from cortex_training.model_deployment import WIRE_TENSOR_PARALLEL_SIZE
+from cortex_training.model_deployment import WIRE_VLLM_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +192,11 @@ _TRAINING_METRICS_CHUNK_RE = re.compile(
     r"^training\.(?P<timestamp>\d{8}-\d{6})\.(?P<suffix>[^./\\]+)\.gz$"
 )
 _STREAM_COPY_BUFFER_BYTES = 1024 * 1024
+# How long a chunked download whose first listing failed waits for its other listing, which
+# runs on the same session, before that session is closed (never kept) under it.
+_SIDE_LISTING_WAIT_SECONDS = 10.0
+# How many jobs' experiment runs a client, and the clients for_job makes from it, remember.
+_EXPERIMENT_RUNS_KEPT = 256
 
 # Env var that unlocks create-job debug options. These are an internal-only
 # capability and are deliberately not documented for external use: the client
@@ -230,6 +309,9 @@ _ENDED_JOB_STATES = frozenset(
 # out the service's read-after-create window.
 _RECENTLY_CREATED_SECONDS = 120.0
 _SESSION_EXPIRED_CODES = frozenset({"390111", "390112", "390114"})
+# The Cortex Training API's code, on an HTTP 400, for a database or schema in the
+# URL path that it cannot resolve. The client explains it; it never creates one.
+_DATABASE_NOT_RESOLVED_CODE = "517602"
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {
     _CHUNK_GROUP_RESTART_REQUIRED,
@@ -324,6 +406,33 @@ class ChunkGroupConflictError(ChunkGroupError):
     """The same chunk-group identity was reused inconsistently."""
 
 
+class DatabaseAccessError(requests.exceptions.HTTPError, RuntimeError):
+    """The configured database or schema can't be found by the current role.
+
+    Raised for the API's HTTP 400 with code 517602. The client never creates a
+    database; the message says how to create it, get access, or use another.
+    ``kind`` is ``"database"`` or ``"schema"``, ``name`` the object, ``role``
+    the session's role (None when it can't be determined, as for PAT clients),
+    and ``statement`` the CREATE statement that would set it up.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        response: requests.Response,
+        kind: str,
+        name: str,
+        role: str | None,
+        statement: str,
+    ):
+        super().__init__(message, response=response, request=getattr(response, "request", None))
+        self.kind = kind
+        self.name = name
+        self.role = role
+        self.statement = statement
+
+
 # Default per-request HTTP timeout, as a (connect, read) pair in seconds. The
 # read leg accommodates long-running data-plane calls; fast control-plane calls
 # such as GetCapacity apply a smaller bound explicitly.
@@ -379,13 +488,70 @@ class _DefaultTimeoutSession(requests.Session):
         )
 
 
+def _is_certificate_verification_error(exc: BaseException) -> bool:
+    """Return whether a certificate check failure is anywhere in ``exc``'s chain.
+
+    The ``ssl`` error rarely reaches the caller directly: ``requests`` and
+    ``urllib3`` nest it in exception arguments, in ``MaxRetryError.reason``, and
+    in ``__cause__``/``__context__``, so all of those are searched.
+    """
+    pending: list[Any] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if not isinstance(current, BaseException) or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return True
+        pending.extend(current.args)
+        pending.extend(
+            (getattr(current, "reason", None), current.__cause__, current.__context__)
+        )
+    return False
+
+
 def _is_transient(exc: BaseException) -> bool:
+    # SSLError is a ConnectionError. Retrying cannot fix a certificate the
+    # client rejects, but a handshake cut short by a reset or an EOF is
+    # usually a passing network fault.
+    if isinstance(exc, requests.exceptions.SSLError) and _is_certificate_verification_error(
+        exc
+    ):
+        return False
     if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
         return True
     if isinstance(exc, requests.exceptions.HTTPError):
         resp = exc.response
         return resp is not None and resp.status_code in _TRANSIENT_STATUSES
     return False
+
+
+def _is_job_not_found_response(response: requests.Response | None) -> bool:
+    """Return whether the server reported that the job definitely does not exist."""
+    if response is None or response.status_code != 404:
+        return False
+    try:
+        body = response.json()
+    except Exception:
+        return False
+    return any(
+        str(candidate.get("code") or candidate.get("error_code")) == _JOB_NOT_FOUND_CODE
+        for candidate in _iter_error_dicts(body)
+    )
+
+
+def _is_transient_unless_job_not_found(exc: BaseException) -> bool:
+    """Like ``_is_transient``, but the server's permanent job-not-found 404 is final.
+
+    404 stays retryable in general because routing can briefly return it for a
+    job that exists; only the explicit job-not-found error code stops retries.
+    """
+    if isinstance(exc, requests.exceptions.HTTPError) and _is_job_not_found_response(
+        exc.response
+    ):
+        return False
+    return _is_transient(exc)
 
 
 def _iter_error_dicts(value: Any, *, depth: int = 0) -> Iterator[dict]:
@@ -1378,6 +1544,416 @@ def _validate_raw_sub_job_configs(sub_job_configs: list) -> None:
         )
 
 
+# ─── Model deployments ───────────────────────────────────────────────────
+
+
+def _model_deployment_sub_job(job: Any) -> dict[str, Any] | None:
+    """Return a job's sub-job if the job is an ``EVALUATION`` deployment, else ``None``."""
+    if not isinstance(job, dict):
+        return None
+    sub_jobs = job.get("sub_jobs")
+    if not isinstance(sub_jobs, list) or len(sub_jobs) != 1:
+        return None
+    sub_job = sub_jobs[0]
+    if not isinstance(sub_job, dict):
+        return None
+    if _normalized_job_type(sub_job.get("job_type")) != JobType.SAMPLING.value:
+        return None
+    inference_config = sub_job.get(WIRE_INFERENCE_CONFIG)
+    if not isinstance(inference_config, dict):
+        return None
+    if inference_config.get(WIRE_DEPLOYMENT_CLASS) != MODEL_DEPLOYMENT_CLASS:
+        return None
+    return sub_job
+
+
+def _model_deployment_status(job: Mapping[str, Any]) -> str:
+    """Derive the customer-facing deployment status from one job response."""
+    status = CortexTrainingClient._normalize_job_status(job.get(JOB_FIELD_STATUS))
+    if status in JOB_STATUS_TO_DEPLOYMENT_STATUS:
+        return JOB_STATUS_TO_DEPLOYMENT_STATUS[status]
+    # A state this client doesn't know yet is shown as-is rather than guessed.
+    return status.upper() if status else DEPLOYMENT_STATUS_UNKNOWN
+
+
+def _deployment_int(value: Any, *, location: str) -> int:
+    """Read a positive whole number from a job response, which may arrive as a float."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or int(value) != value
+        or value <= 0
+    ):
+        raise ValueError(f"invalid marked deployment: {location} must be a positive integer")
+    return int(value)
+
+
+def _model_deployment_metadata(
+    job: Mapping[str, Any],
+    deployment_id: str,
+    *,
+    base_url: str | None = None,
+) -> dict[str, Any]:
+    """Render one marked job without exposing its backing job or sub-job IDs."""
+    sub_job = _model_deployment_sub_job(job)
+    if sub_job is None:
+        raise ValueError("the requested resource is not a model deployment")
+    inference_config = sub_job[WIRE_INFERENCE_CONFIG]
+    vllm_config = inference_config.get(WIRE_VLLM_CONFIG)
+    if not isinstance(vllm_config, dict):
+        raise ValueError(
+            f"invalid marked deployment: {WIRE_INFERENCE_CONFIG}.{WIRE_VLLM_CONFIG} is required"
+        )
+
+    # Every count the server stored for the deployment must be a positive whole
+    # number. The error location is built from the key so the two cannot drift
+    # apart.
+    vllm_location = f"{WIRE_INFERENCE_CONFIG}.{WIRE_VLLM_CONFIG}"
+    replicas, total_gpus, max_seq_len, gpus_per_replica, max_model_len = (
+        _deployment_int(container.get(key), location=f"{location}.{key}")
+        for container, location, key in (
+            (inference_config, WIRE_INFERENCE_CONFIG, WIRE_NUM_REPLICAS),
+            (inference_config, WIRE_INFERENCE_CONFIG, WIRE_N_GPUS),
+            (inference_config, WIRE_INFERENCE_CONFIG, WIRE_MAX_SEQ_LEN),
+            (vllm_config, vllm_location, WIRE_TENSOR_PARALLEL_SIZE),
+            (vllm_config, vllm_location, WIRE_MAX_MODEL_LEN),
+        )
+    )
+    if total_gpus != replicas * gpus_per_replica:
+        raise ValueError("invalid marked deployment: inconsistent replica GPU totals")
+    if max_model_len != max_seq_len:
+        raise ValueError("invalid marked deployment: inconsistent sequence lengths")
+
+    # The server already admitted this deployment, so admission rules (supported
+    # models, GPU minimums and shapes) are not re-checked here: a model or shape
+    # this client does not know about must still be listed, not fail the read.
+    model_name = sub_job.get("model_name")
+    if not isinstance(model_name, str) or not model_name.strip():
+        raise ValueError("marked deployment model_name must be a non-empty string")
+    checkpoint = sub_job.get(WIRE_SOURCE_CHECKPOINT_INFO)
+    if checkpoint is None:
+        model_source = {SOURCE_TYPE: SOURCE_TYPE_BASE_MODEL, SOURCE_MODEL: model_name}
+    elif isinstance(checkpoint, dict):
+        # A checkpoint source needs both IDs as non-empty strings.
+        for key in (WIRE_SOURCE_JOB_ID, WIRE_CHECKPOINT_ID):
+            value = checkpoint.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{WIRE_SOURCE_CHECKPOINT_INFO}.{key} must be a non-empty string")
+        model_source = {
+            SOURCE_TYPE: SOURCE_TYPE_CHECKPOINT,
+            SOURCE_JOB_ID: checkpoint[WIRE_SOURCE_JOB_ID],
+            SOURCE_CHECKPOINT_ID: checkpoint[WIRE_CHECKPOINT_ID],
+        }
+    else:
+        raise ValueError("invalid marked deployment: source_checkpoint_info must be an object")
+
+    # None means unknown. A job read while the server cannot reach its
+    # scheduler has no hardware, and defaulting to H200 would misreport a B300
+    # deployment.
+    hardware = job.get(JOB_FIELD_HARDWARE)
+    result: dict[str, Any] = {
+        OUT_DEPLOYMENT: deployment_id,
+        OUT_DEPLOYMENT_CLASS: inference_config[WIRE_DEPLOYMENT_CLASS],
+        OUT_STATUS: _model_deployment_status(job),
+        OUT_MODEL_SOURCE: model_source,
+        OUT_MAX_SEQ_LEN: max_seq_len,
+        OUT_GPUS_PER_REPLICA: gpus_per_replica,
+        OUT_REPLICAS: replicas,
+        OUT_GPU_TYPE: _hardware_wire(hardware) if hardware else None,
+    }
+    # Copy optional job fields to the output.
+    for source_key, output_key in (
+        (JOB_FIELD_CREATED_AT, OUT_CREATED_AT),
+        (JOB_FIELD_OWNER_ROLE, OUT_OWNER_ROLE),
+        (JOB_FIELD_SUBMITTED_BY, OUT_CREATOR),
+    ):
+        value = job.get(source_key)
+        if isinstance(value, str) and value:
+            result[output_key] = value
+    deployment_status = result[OUT_STATUS]
+    reason = job.get(JOB_FIELD_REASON)
+    reason = reason if isinstance(reason, str) and reason else None
+    reason_details = job.get(JOB_FIELD_REASON_DETAILS)
+    if isinstance(reason_details, str) and reason_details:
+        # The sentence may quote the backing job or sub-job ID. The sub-job ID
+        # and the deployment ID both contain the job ID, so match the longest
+        # ID first and rewrite each match to the deployment ID in a single
+        # pass; an existing deployment ID is left as it is.
+        ids = sorted(
+            {
+                value
+                for value in (
+                    deployment_id,
+                    sub_job.get("sub_job_id"),
+                    job.get(JOB_FIELD_JOB_ID),
+                )
+                if isinstance(value, str) and value
+            },
+            key=len,
+            reverse=True,
+        )
+        reason_details = re.sub(
+            "|".join(map(re.escape, ids)),
+            deployment_id,
+            reason_details,
+            flags=re.IGNORECASE,
+        )
+    else:
+        reason_details = None
+    if deployment_status in {DEPLOYMENT_STATUS_FAILED, DEPLOYMENT_STATUS_TERMINATED}:
+        failure: dict[str, str] = {}
+        if reason:
+            failure[OUT_FAILURE_CODE] = reason
+        if reason_details:
+            failure[OUT_FAILURE_MESSAGE] = reason_details
+        if failure:
+            result[OUT_FAILURE] = failure
+    elif not (
+        deployment_status in {DEPLOYMENT_STATUS_DROPPING, DEPLOYMENT_STATUS_DROPPED}
+        and reason == JOB_REASON_CANCELLED_BY_CLIENT
+    ):
+        if reason:
+            result[OUT_STATUS_REASON] = reason
+        if reason_details:
+            result[OUT_STATUS_DETAILS] = reason_details
+    # A deployment that has failed or is being dropped no longer serves.
+    if base_url is not None and deployment_status not in DEPLOYMENT_STATUSES_WITHOUT_ENDPOINT:
+        result[OUT_BASE_URL] = base_url
+    return result
+
+
+def _model_deployment_status_filter(
+    status: str | Iterable[str] | None,
+) -> frozenset[str] | None:
+    """Normalize a ``list`` status filter, rejecting unknown statuses."""
+    if status is None:
+        return None
+    values = [status] if isinstance(status, str) else list(status)
+    wanted = frozenset(str(value).strip().upper() for value in values)
+    unknown = sorted(wanted - set(DEPLOYMENT_STATUSES))
+    if unknown:
+        raise ValueError(
+            f"unknown deployment status {', '.join(unknown)}; choose from "
+            f"{', '.join(DEPLOYMENT_STATUSES)}"
+        )
+    return wanted
+
+
+def _deployment_id_from_job_id(job_id: Any) -> str:
+    """Turn a canonical job UUID into the public ``sf-ct-<UUID>`` deployment ID."""
+    if not isinstance(job_id, str):
+        raise ValueError("create response did not include a valid deployment identifier")
+    try:
+        parsed = uuid.UUID(job_id)
+    except (ValueError, AttributeError) as exc:
+        raise ValueError(
+            "create response did not include a valid deployment identifier"
+        ) from exc
+    canonical = str(parsed)
+    if job_id != canonical:
+        raise ValueError("create response deployment identifier was not canonical")
+    return MODEL_DEPLOYMENT_ID_PREFIX + canonical
+
+
+# Deployments are addressed by ID today; names may be accepted later.
+_DEPLOYMENT_FORMAT_ERROR = "deployment must currently be an sf-ct-<UUID> ID"
+
+
+def _job_id_from_deployment_id(deployment_id: Any) -> str:
+    """Turn a public ``sf-ct-<UUID>`` deployment ID back into its backing job UUID."""
+    if not isinstance(deployment_id, str) or not deployment_id.startswith(
+        MODEL_DEPLOYMENT_ID_PREFIX
+    ):
+        raise ValueError(_DEPLOYMENT_FORMAT_ERROR)
+    suffix = deployment_id[len(MODEL_DEPLOYMENT_ID_PREFIX) :]
+    try:
+        parsed = uuid.UUID(suffix)
+    except (ValueError, AttributeError) as exc:
+        raise ValueError(_DEPLOYMENT_FORMAT_ERROR) from exc
+    canonical = str(parsed)
+    if suffix != canonical:
+        raise ValueError(f"{_DEPLOYMENT_FORMAT_ERROR} with a canonical lowercase UUID")
+    return canonical
+
+
+def _pending_model_deployment_metadata(
+    spec: ModelDeploymentSpec,
+    deployment_id: str,
+    base_url: str,
+) -> dict[str, Any]:
+    """Build the metadata ``create`` returns before the deployment is placed."""
+    return {
+        OUT_DEPLOYMENT: deployment_id,
+        OUT_DEPLOYMENT_CLASS: spec.deployment_class,
+        OUT_STATUS: DEPLOYMENT_STATUS_PENDING,
+        OUT_MODEL_SOURCE: spec.source_to_wire(),
+        OUT_MAX_SEQ_LEN: spec.max_seq_len,
+        OUT_GPUS_PER_REPLICA: spec.gpus_per_replica,
+        OUT_REPLICAS: spec.min_replicas,
+        OUT_GPU_TYPE: spec.gpu_type,
+        OUT_BASE_URL: base_url,
+    }
+
+
+def _model_deployment_description(
+    metadata: Mapping[str, Any],
+    *,
+    database: str | None,
+    schema: str | None,
+) -> dict[str, Any]:
+    """Reshape deployment metadata into what ``describe`` prints.
+
+    The deployment's configuration is grouped under ``spec`` for readability.
+    It is a read view: it may gain read-only fields, and it is not guaranteed
+    to be accepted by ``create``. Status, endpoint, scope, and ownership stay
+    at the top level.
+    """
+    result: dict[str, Any] = {
+        key: metadata[key]
+        for key in (
+            OUT_DEPLOYMENT,
+            OUT_STATUS,
+            OUT_STATUS_REASON,
+            OUT_STATUS_DETAILS,
+            OUT_FAILURE,
+            OUT_BASE_URL,
+        )
+        if key in metadata
+    }
+    for key, value in ((OUT_DATABASE, database), (OUT_SCHEMA, schema)):
+        if value:
+            result[key] = value
+    for key in (OUT_CREATED_AT, OUT_CREATOR, OUT_OWNER_ROLE):
+        if key in metadata:
+            result[key] = metadata[key]
+    result[OUT_SPEC] = {
+        SPEC_DEPLOYMENT: {
+            DEPLOYMENT_CLASS: metadata[OUT_DEPLOYMENT_CLASS],
+            DEPLOYMENT_MIN_REPLICAS: metadata[OUT_REPLICAS],
+            DEPLOYMENT_GPUS_PER_REPLICA: metadata[OUT_GPUS_PER_REPLICA],
+            # None means the server did not report the hardware.
+            DEPLOYMENT_GPU_TYPE: metadata[OUT_GPU_TYPE],
+        },
+        SPEC_SOURCE: dict(metadata[OUT_MODEL_SOURCE]),
+        SPEC_INFERENCE: {INFERENCE_MAX_SEQ_LEN: metadata[OUT_MAX_SEQ_LEN]},
+    }
+    return result
+
+
+# Longest server error message kept in a model deployment error.
+_MAX_SERVER_ERROR_MESSAGE_CHARS = 1000
+
+
+def _server_error_code_and_message(
+    response: requests.Response | None,
+) -> tuple[str | None, str | None]:
+    """Return the ``code`` and ``message`` from a JSON error body, if any."""
+    if response is None:
+        return None, None
+    try:
+        body = response.json()
+    except Exception:
+        return None, None
+    for candidate in _iter_error_dicts(body):
+        code = candidate.get("code") or candidate.get("error_code")
+        message = candidate.get("message")
+        if code is not None or isinstance(message, str):
+            return (
+                str(code) if code is not None else None,
+                message if isinstance(message, str) and message.strip() else None,
+            )
+    return None, None
+
+
+def _sanitized_model_deployment_request_error(
+    exc: requests.exceptions.RequestException,
+    deployment_id: str | None,
+    *,
+    job_id: str | None = None,
+    scope: str | None = None,
+) -> RuntimeError:
+    """Return a public error that cannot expose backing job identifiers.
+
+    The request URL and raw body are dropped, but the server's error ``code``
+    and ``message`` are kept so "feature disabled", "not authorized" and "wrong
+    ID" stay distinguishable. ``job_id`` is replaced by ``deployment_id`` in the
+    message, since the server's own messages can name the backing job.
+    ``deployment_id`` is ``None`` for ``create``, which has no deployment yet.
+    """
+    response = exc.response
+    status_code = getattr(response, "status_code", None)
+    subject = f"model deployment {deployment_id}" if deployment_id else "model deployment"
+    code, detail = _server_error_code_and_message(response)
+    if code == _JOB_NOT_FOUND_CODE and deployment_id:
+        message = f"{subject} not found" + (f" in {scope}" if scope else "")
+    else:
+        message = f"{subject} request failed"
+        if status_code is not None:
+            message += f" with HTTP {status_code}"
+        if code:
+            message += f" ({code})"
+        if detail:
+            if job_id and deployment_id:
+                detail = detail.replace(job_id, deployment_id)
+            if len(detail) > _MAX_SERVER_ERROR_MESSAGE_CHARS:
+                detail = detail[:_MAX_SERVER_ERROR_MESSAGE_CHARS] + "..."
+            message += f": {detail}"
+    request_id = _response_snowflake_request_id(response)
+    if request_id:
+        message += f" (snowflake request id: {request_id})"
+    return RuntimeError(message)
+
+
+class ModelDeploymentWaitError(RuntimeError):
+    """A deployment reached a terminal status other than ``READY``.
+
+    ``deployment`` is the metadata from the last poll, or ``None``.
+    """
+
+    def __init__(self, message: str, deployment: dict[str, Any] | None):
+        super().__init__(message)
+        self.deployment = deployment
+
+
+class ModelDeploymentWaitTimeout(TimeoutError):
+    """A deployment did not become ``READY`` before the poll timeout.
+
+    The deployment is still running. ``deployment`` is the metadata from the
+    last poll, or ``None``.
+    """
+
+    def __init__(self, message: str, deployment: dict[str, Any] | None):
+        super().__init__(message)
+        self.deployment = deployment
+
+
+def _model_deployment_operation(method):
+    """Run a method whose first argument is a public ``sf-ct-`` deployment ID.
+
+    The ID is validated before any request. While the method runs, the backing
+    job ID is replaced by the deployment ID in request log lines, and any HTTP
+    error is turned into :func:`_sanitized_model_deployment_request_error`.
+    Errors that are not HTTP errors (e.g. local filesystem errors) pass through.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, deployment_id, *args, **kwargs):
+        job_id = _job_id_from_deployment_id(deployment_id)
+        with self._hiding_backing_job_id(job_id, deployment_id):
+            try:
+                return method(self, deployment_id, *args, **kwargs)
+            except requests.exceptions.RequestException as exc:
+                raise _sanitized_model_deployment_request_error(
+                    exc,
+                    deployment_id,
+                    job_id=job_id,
+                    scope=f"{self.database}.{self.schema}",
+                ) from exc
+
+    return wrapper
+
+
 # ─── Forward-backward payload helpers ────────────────────────────────────
 
 
@@ -1775,6 +2351,24 @@ def _sql_string_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _artifact_login_options() -> dict[str, Any]:
+    """Connector options for the client's own LIST/GET sessions.
+
+    At login the Connector probes cloud metadata endpoints to report the platform
+    it runs on, and waits for every probe to give up: on a laptop that adds from
+    a fraction of a second to over two seconds to each login. A timeout of zero
+    skips the probes (Connector 3.17.2 and later); the login itself is
+    unchanged. A Connector without the option is left as it is.
+    """
+    try:
+        from snowflake.connector.connection import DEFAULT_CONFIGURATION
+    except ImportError:
+        return {}
+    if "platform_detection_timeout_seconds" not in DEFAULT_CONFIGURATION:
+        return {}
+    return {"platform_detection_timeout_seconds": 0.0}
+
+
 _PLAIN_IDENTIFIER_RE = re.compile(r"[A-Z_][A-Z0-9_$]*")
 
 
@@ -1915,19 +2509,25 @@ class CortexTrainingClient:
         self._sampling_max_seq_len: dict[str, int | None] = {}
         self._artifact_connection_config: dict[str, str] | None = None
         self._artifact_connection_factory: Callable[[], Any] | None = None
+        # Download sessions kept open for the next download (see keep_artifact_sessions), and
+        # each job's experiment run, which never changes (the newest _EXPERIMENT_RUNS_KEPT
+        # jobs'); for_job() children share both.
+        self._kept_sessions: _artifact_download.KeptSessions | None = None
+        self._experiment_runs: OrderedDict[str, tuple[str, str]] = OrderedDict()
+        self._experiment_runs_lock = threading.Lock()
         self._auth_provider: SnowflakeProfileAuth | None = None
-        self._db_ensured = False
         # job_id -> monotonic time this client created it (see _definitive_not_found).
         self._recently_created_jobs: dict[str, float] = {}
         self._recently_created_lock = threading.Lock()
-        self._db_creating = False
         # Both are cleared on a for_job() child; see for_job().
         self._owns_session = True
-        self._auto_create_database = True
+        self._explain_database_errors = True
         self._metric_emitter: OtlpMetricEmitter | None = None
         # Sent with every metric as SURFACE_ATTRIBUTE; entry points set their own.
         self._telemetry_surface = SDK_SURFACE
         self._operation_metric_state = threading.local()
+        # Backing job IDs to replace in log lines; see _hiding_backing_job_id.
+        self._log_redaction_state = threading.local()
         self._session = _DefaultTimeoutSession(self.request_timeout)
         adapter = HTTPAdapter(pool_connections=pool_maxsize, pool_maxsize=pool_maxsize)
         self._session.mount("https://", adapter)
@@ -1935,16 +2535,51 @@ class CortexTrainingClient:
 
     @property
     def auto_create_database(self) -> bool:
-        """Whether a request answered "database or schema not found" creates them and retries.
+        """Deprecated, and always False: the client never creates a database.
 
-        True by default. Set it to False for a client that only reads: the error
-        is then raised as it is. A client from :meth:`for_job` starts with it off.
+        A request answered "database or schema not found" raises
+        :class:`DatabaseAccessError`, which says how to create it.
         """
-        return self._auto_create_database
+        return False
 
     @auto_create_database.setter
     def auto_create_database(self, value: bool) -> None:
-        self._auto_create_database = bool(value)
+        # False is already the only behavior, so only asking for creation warns.
+        if value:
+            warnings.warn(
+                "CortexTrainingClient.auto_create_database is deprecated and does nothing: the "
+                "client never creates a database. Create it once, for example with "
+                "CREATE DATABASE IF NOT EXISTS in Snowsight.",
+                FutureWarning,
+                stacklevel=2,
+            )
+
+    @property
+    def keep_artifact_sessions(self) -> bool:
+        """Whether a download keeps its Snowflake session open for the next one.
+
+        False by default: each artifact download logs in and closes its session
+        when it returns. True keeps the session of a download that succeeded, up
+        to two per database and schema (two downloads can run at once), so the
+        next download starts with its first ``LIST``; a session idle for 30
+        minutes is closed instead of reused. For a long-lived reader such as the
+        TUI. :meth:`close` closes the kept sessions, as does setting this back to
+        False on the client that owns them; a client from :meth:`for_job` shares
+        them.
+        """
+        return self._kept_sessions is not None
+
+    @keep_artifact_sessions.setter
+    def keep_artifact_sessions(self, value: bool) -> None:
+        # No lock: a download running across the swap gives its session back to the pool it
+        # started with, which closes any session given back after its close(). The race costs
+        # that download its pooling, never a leaked or doubly used session.
+        if value and self._kept_sessions is None:
+            self._kept_sessions = _artifact_download.KeptSessions()
+        elif not value and self._kept_sessions is not None:
+            kept, self._kept_sessions = self._kept_sessions, None
+            if self._owns_session:
+                kept.close()
 
     @classmethod
     def from_pat(
@@ -2050,6 +2685,11 @@ class CortexTrainingClient:
             f"/schemas/{quote(self.schema, safe='$')}/{self.endpoint}"
         )
 
+    @property
+    def model_deployment_base_url(self) -> str:
+        """OpenAI-compatible base URL for deployments in this database and schema."""
+        return f"{self._prefix}/inference/v1"
+
     def emit_metric(
         self,
         operation: str,
@@ -2087,6 +2727,9 @@ class CortexTrainingClient:
         """
         if not self._owns_session:
             return
+        kept, self._kept_sessions = self._kept_sessions, None
+        if kept is not None:
+            kept.close()  # never raises: a session it can't close expires by itself
         try:
             if self._metric_emitter is not None:
                 self._metric_emitter.close()
@@ -2220,75 +2863,70 @@ class CortexTrainingClient:
                 parts.append(f"{key}={value}")
         return " ".join(parts)
 
-    def _create_database(self) -> None:
-        """Attempt to create the configured database (and schema if non-PUBLIC).
+    def _current_role(self) -> str | None:
+        """The role this client signs in with, without running SQL.
 
-        Called only when an API request fails with a database-not-found error.
-        Routes through ``_send`` so auth works for both PAT and connection
-        profile users. Raises on failure with an actionable error message.
+        Profile clients read it from their Connector session, which Snowflake
+        fills at sign-in, even when the profile sets no role. PAT clients have
+        no session, so their role can't be determined.
         """
-        db_stmt = f"CREATE DATABASE IF NOT EXISTS {self.database}"
-        manual_hint = (
-            f"Create it manually in Snowsight: CREATE DATABASE IF NOT EXISTS {self.database}; "
-            "— or if the database already exists, check that your role has USAGE on it."
-        )
-        self._db_creating = True  # prevent recursion from inner _send call
+        if self._auth_provider is None:
+            return None
         try:
-            logger.info("Database '%s' not found. Attempting to create it...", self.database)
-            resp = self._send(
-                "POST",
-                f"{self.base_url}/api/v2/statements",
-                json={"statement": db_stmt, "timeout": 60},
-                max_retries=1,
-            )
-            if resp.status_code == 202:
-                raise RuntimeError(
-                    f"Database creation for '{self.database}' was accepted but has not "
-                    f"completed yet. {manual_hint}"
-                )
-            logger.info("Database '%s' created successfully.", self.database)
-
-            if self.schema.upper() != "PUBLIC":
-                schema_stmt = f"CREATE SCHEMA IF NOT EXISTS {self.database}.{self.schema}"
-                logger.info("Schema '%s' does not exist. Attempting to create it...", self.schema)
-                schema_resp = self._send(
-                    "POST",
-                    f"{self.base_url}/api/v2/statements",
-                    json={"statement": schema_stmt, "timeout": 60},
-                    max_retries=1,
-                )
-                if schema_resp.status_code == 202:
-                    raise RuntimeError(
-                        f"Schema creation for '{self.database}.{self.schema}' was accepted but has not "
-                        f"completed yet. Create it manually: CREATE SCHEMA IF NOT EXISTS {self.database}.{self.schema};"
-                    )
-                logger.info("Schema '%s' created successfully.", self.schema)
-
-            self._db_ensured = True
-        except RuntimeError:
-            raise
-        except Exception as exc:
-            raise RuntimeError(
-                f"Could not create database '{self.database}': {exc}. {manual_hint}"
-            ) from exc
-        finally:
-            self._db_creating = False
-
-    @staticmethod
-    def _is_database_not_found(resp: requests.Response) -> bool:
-        """Return True if the response indicates the configured database does not exist.
-
-        The Cortex Training API returns 400 with error code 517602 and a message
-        like ``Schema MY_DB.PUBLIC is not found or not authorized`` when the
-        database in the URL path does not exist.
-        """
-        if resp.status_code not in (400, 404, 422):
-            return False
-        try:
-            text = resp.text.lower()
+            return self._auth_provider.role
         except Exception:
-            return False
-        return "not found or not authorized" in text or "does not exist or not authorized" in text
+            logger.debug("Could not read the session's role.", exc_info=True)
+            return None
+
+    def _database_error(self, response: requests.Response) -> DatabaseAccessError:
+        """Explain an HTTP 400 with code 517602: the configured database or schema can't be found."""
+        role = self._current_role()
+        who = f"Role {role}" if role else "Role <ROLE> (couldn't determine your role)"
+        grantee = role or "<ROLE>"
+        source = ""
+        if self._auth_provider is not None:
+            profile = getattr(self._auth_provider, "connection_name", None)
+            source = f" (from profile {profile})" if profile else " (from your default Snowflake profile)"
+        database, schema = self.database, self.schema
+        if schema.upper() == "PUBLIC":
+            kind, name, statement = "database", database, f"CREATE DATABASE IF NOT EXISTS {database}"
+            lines = [
+                f"{who} can't find database {database}{source}.",
+                f"- If it doesn't exist: run `{statement}` (or ask an admin to).",
+                f"- If it exists: ask an admin to run `GRANT USAGE ON DATABASE {database} TO ROLE {grantee}`.",
+            ]
+        else:
+            kind, name = "schema", f"{database}.{schema}"
+            create_database = f"CREATE DATABASE IF NOT EXISTS {database}"
+            create_schema = f"CREATE SCHEMA IF NOT EXISTS {database}.{schema}"
+            statement = f"{create_database}; {create_schema}"
+            lines = [
+                f"{who} can't find database {database} or its schema {schema}{source}.",
+                f"- If they don't exist: run `{create_database}` and `{create_schema}` (or ask an admin to).",
+                f"- If they exist: ask an admin to run `GRANT USAGE ON DATABASE {database} TO ROLE {grantee}` "
+                f"and `GRANT USAGE ON SCHEMA {database}.{schema} TO ROLE {grantee}`.",
+            ]
+        lines.append("- Or use another database: --database NAME / CORTEX_TRAINING_DATABASE.")
+        return DatabaseAccessError(
+            "\n".join(lines), response=response, kind=kind, name=name, role=role, statement=statement
+        )
+
+    def _redact_for_log(self, text: str) -> str:
+        """Replace hidden backing job IDs in ``text`` (see _hiding_backing_job_id)."""
+        for job_id, replacement in getattr(self._log_redaction_state, "ids", {}).items():
+            text = text.replace(job_id, replacement)
+        return text
+
+    @contextlib.contextmanager
+    def _hiding_backing_job_id(self, job_id: str, deployment_id: str) -> Iterator[None]:
+        """Within the block, log ``deployment_id`` wherever ``job_id`` would appear."""
+        state = self._log_redaction_state
+        previous = getattr(state, "ids", {})
+        state.ids = {**previous, job_id: deployment_id}
+        try:
+            yield
+        finally:
+            state.ids = previous
 
     def _send(
         self,
@@ -2297,19 +2935,21 @@ class CortexTrainingClient:
         *,
         retry_on=_is_transient,
         max_retries: int | None = None,
-        ensure_database: bool = True,
+        explain_database: bool = True,
         **kwargs,
     ) -> requests.Response:
         """Send one request with retries.
 
-        ``ensure_database=False`` skips creating the configured database on a
-        not-found error, for routes whose path names no database. A client from
-        :meth:`for_job` never creates one, whatever the caller passes.
+        An HTTP 400 with code 517602 (the configured database or schema can't be
+        found) raises :class:`DatabaseAccessError`. ``explain_database=False``
+        leaves that answer as it is, for routes whose path names no database; a
+        client from :meth:`for_job` always leaves it.
         """
-        auto_create = ensure_database and self._auto_create_database
+        explain_database = explain_database and self._explain_database_errors
         fn = getattr(self._session, method.lower())
         debug_context = kwargs.pop("debug_context", None)
         debug_label = self._debug_context_label(debug_context) if debug_context is not None else None
+        log_url = self._redact_for_log(url)
         attempt_no = 0
         auth_retry_used = False
         retry_limit = self.max_retries if max_retries is None else max_retries
@@ -2341,7 +2981,7 @@ class CortexTrainingClient:
                         "%s sending %s %s attempt=%d/%d",
                         debug_label,
                         method.upper(),
-                        url,
+                        log_url,
                         attempt_no,
                         displayed_max_attempts,
                     )
@@ -2363,11 +3003,11 @@ class CortexTrainingClient:
                             "%s request exception %s %s attempt=%d/%d: %s: %s",
                             debug_label,
                             method.upper(),
-                            url,
+                            log_url,
                             attempt_no,
                             displayed_max_attempts,
                             type(exc).__name__,
-                            exc,
+                            self._redact_for_log(str(exc)),
                         )
                     raise
 
@@ -2379,7 +3019,7 @@ class CortexTrainingClient:
                         "snowflake request_id=%s  %s %s  status=%d",
                         sf_request_id,
                         getattr(req, "method", method.upper()),
-                        getattr(req, "path_url", url),
+                        self._redact_for_log(getattr(req, "path_url", None) or url),
                         status_code,
                     )
                     try:
@@ -2424,33 +3064,19 @@ class CortexTrainingClient:
                         debug_label,
                         outcome,
                         method.upper(),
-                        url,
+                        log_url,
                         attempt_no,
                         displayed_max_attempts,
                         status_code,
                         snowflake,
-                        self._debug_response_summary(resp),
+                        self._redact_for_log(self._debug_response_summary(resp)),
                     )
                 if (
-                    auto_create
-                    and not self._db_ensured
-                    and not self._db_creating
-                    and self._is_database_not_found(resp)
+                    explain_database
+                    and status_code == 400
+                    and _response_error_code(resp) == _DATABASE_NOT_RESOLVED_CODE
                 ):
-                    resp.close()
-                    self._create_database()
-                    # Retry the original request once after creating the DB.
-                    continue
-                if (
-                    auto_create
-                    and self._db_ensured
-                    and self._is_database_not_found(resp)
-                ):
-                    raise RuntimeError(
-                        f"Database '{self.database}' still not found after creation attempt. "
-                        f"The database may already exist but your role lacks USAGE on it. "
-                        f"Create it manually in Snowsight: CREATE DATABASE IF NOT EXISTS {self.database};"
-                    )
+                    raise self._database_error(resp)
                 try:
                     # requests.Response.raise_for_status() intentionally ignores 3xx.
                     if 300 <= resp.status_code < 400:
@@ -2634,6 +3260,51 @@ class CortexTrainingClient:
         self._note_created_job(job, body)
         return job
 
+    def create_model_deployment(
+        self, spec: ModelDeploymentSpec | Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Create an evaluation deployment and return only its public metadata.
+
+        See ``docs/reference/rest-api.md`` section 14.
+        """
+        raw_spec = (
+            spec.to_public_spec()
+            if isinstance(spec, ModelDeploymentSpec)
+            else spec
+        )
+        spec = ModelDeploymentSpec.from_dict(
+            dict(raw_spec) if isinstance(raw_spec, Mapping) else raw_spec
+        )
+        try:
+            if spec.source_type == SOURCE_TYPE_CHECKPOINT:
+                spec = replace(
+                    spec, model_name=self._checkpoint_source_model_name(spec.source_job_id)
+                )
+            response = self.create_job_from_body(spec._to_create_job_body())
+        except requests.exceptions.RequestException as exc:
+            raise _sanitized_model_deployment_request_error(exc, None) from exc
+        deployment_id = _deployment_id_from_job_id(response.get(JOB_FIELD_JOB_ID))
+        return _pending_model_deployment_metadata(
+            spec, deployment_id, self.model_deployment_base_url
+        )
+
+    def _checkpoint_source_model_name(self, job_id: str) -> str:
+        """Return the model a checkpoint's source job trained.
+
+        The server requires ``model_name`` on the deployment's sampling sub-job
+        and rejects one that differs from the source job's, so it is read from
+        the source job rather than asked of the user.
+        """
+        job = self.get_job(job_id, retry_on=_is_transient_unless_job_not_found)
+        for sub_job in job.get("sub_jobs") or ():
+            if _normalized_job_type(sub_job.get("job_type")) == JobType.TRAINING.value:
+                model_name = sub_job.get("model_name")
+                if isinstance(model_name, str) and model_name.strip():
+                    return model_name
+        raise ValueError(
+            f"{SPEC_SOURCE}.{SOURCE_JOB_ID} {job_id} has no training sub-job model_name"
+        )
+
     @staticmethod
     def _normalize_job_status(status) -> str:
         """Normalize full enum names (``JOB_STATE_RUNNING``) to short form (``running``).
@@ -2676,8 +3347,8 @@ class CortexTrainingClient:
         )
 
     @_track_operation("get_job")
-    def get_job(self, job_id: str) -> dict:
-        resp = self._send("GET", f"{self._prefix}/{job_id}")
+    def get_job(self, job_id: str, *, retry_on=_is_transient) -> dict:
+        resp = self._send("GET", f"{self._prefix}/{job_id}", retry_on=retry_on)
         return resp.json()
 
     @_track_operation("list_jobs")
@@ -2687,6 +3358,131 @@ class CortexTrainingClient:
             params["status"] = status
         resp = self._send("GET", self._prefix, params=params)
         return resp.json().get("jobs", [])
+
+    def _list_model_deployment_jobs(self) -> list[dict[str, Any]]:
+        """Return the jobs in this schema that are model deployments."""
+        return [job for job in self.list_jobs() if _model_deployment_sub_job(job) is not None]
+
+    def _get_model_deployment_job(self, job_id: str) -> dict[str, Any]:
+        """Fetch one job and raise ``ValueError`` if it is not a model deployment.
+
+        The server's job-not-found 404 is raised on the first attempt instead of
+        being retried like a transient routing 404, so a mistyped or dropped ID
+        fails fast.
+        """
+        job = self.get_job(job_id, retry_on=_is_transient_unless_job_not_found)
+        if _model_deployment_sub_job(job) is None:
+            raise ValueError("the requested resource is not a model deployment")
+        return job
+
+    def list_model_deployments(
+        self, status: str | Iterable[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """Return sanitized metadata for every marked deployment in scope.
+
+        ``status`` keeps only deployments in the given deployment status(es),
+        e.g. ``"READY"`` or ``["PENDING", "INITIALIZING"]`` (case-insensitive).
+        """
+        wanted = _model_deployment_status_filter(status)
+        deployments = []
+        for job in self._list_model_deployment_jobs():
+            deployment_id = _deployment_id_from_job_id(job.get(JOB_FIELD_JOB_ID))
+            metadata = _model_deployment_metadata(job, deployment_id)
+            if wanted is None or metadata[OUT_STATUS] in wanted:
+                deployments.append(metadata)
+        return deployments
+
+    @_model_deployment_operation
+    def get_model_deployment(self, deployment_id: str) -> dict[str, Any]:
+        """Return sanitized metadata for one opaque deployment ID."""
+        job = self._get_model_deployment_job(_job_id_from_deployment_id(deployment_id))
+        return _model_deployment_metadata(
+            job, deployment_id, base_url=self.model_deployment_base_url
+        )
+
+    def describe_model_deployment(self, deployment_id: str) -> dict[str, Any]:
+        """Return one deployment's status, endpoint, scope, and configuration."""
+        return _model_deployment_description(
+            self.get_model_deployment(deployment_id),
+            database=self.database,
+            schema=self.schema,
+        )
+
+    @_model_deployment_operation
+    def wait_for_model_deployment(self, deployment_id: str) -> dict[str, Any]:
+        """Poll until an opaque deployment ID is READY or terminal.
+
+        Raises :class:`ModelDeploymentWaitError` for a terminal status other
+        than READY and :class:`ModelDeploymentWaitTimeout` when the poll timeout
+        passes; both carry the last observed metadata as ``deployment``.
+        """
+        job_id = _job_id_from_deployment_id(deployment_id)
+        deadline = time.monotonic() + self.poll_timeout
+        delay = self.poll_interval
+        metadata: dict[str, Any] | None = None
+        while time.monotonic() < deadline:
+            job = self._get_model_deployment_job(job_id)
+            metadata = _model_deployment_metadata(
+                job, deployment_id, base_url=self.model_deployment_base_url
+            )
+            deployment_status = metadata[OUT_STATUS]
+            if deployment_status == DEPLOYMENT_STATUS_READY:
+                return metadata
+            if deployment_status == DEPLOYMENT_STATUS_DROPPED:
+                raise ModelDeploymentWaitError(
+                    f"model deployment {deployment_id} was dropped; create a new "
+                    "deployment to serve this model again",
+                    metadata,
+                )
+            if deployment_status in {DEPLOYMENT_STATUS_FAILED, DEPLOYMENT_STATUS_TERMINATED}:
+                failure = metadata.get(OUT_FAILURE, {})
+                message = f"model deployment {deployment_id} is {deployment_status}"
+                if failure.get(OUT_FAILURE_CODE):
+                    message += f" ({failure[OUT_FAILURE_CODE]})"
+                if failure.get(OUT_FAILURE_MESSAGE):
+                    message += f": {failure[OUT_FAILURE_MESSAGE]}"
+                message += (
+                    "; for details run `cortex-training model-deployment download-log "
+                    f"{deployment_id}`"
+                )
+                raise ModelDeploymentWaitError(message, metadata)
+            delay = self._sleep_with_backoff(delay, deadline)
+        last_status = metadata[OUT_STATUS] if metadata else DEPLOYMENT_STATUS_UNKNOWN
+        raise ModelDeploymentWaitTimeout(
+            f"model deployment {deployment_id} did not become READY within "
+            f"{self.poll_timeout:g}s (last status: {last_status}). It is still "
+            "running and holding GPUs: run `cortex-training model-deployment wait "
+            f"{deployment_id}` again, or `cortex-training model-deployment drop "
+            f"{deployment_id}` to release them",
+            metadata,
+        )
+
+    @_model_deployment_operation
+    def drop_model_deployment(self, deployment_id: str) -> dict[str, Any]:
+        """Idempotently drop one opaque deployment ID.
+
+        A ``DROPPING`` or ``DROPPED`` deployment is reported as dropped without
+        a second cancel. A ``FAILED`` or ``TERMINATED`` one holds no GPUs and can
+        never be dropped, since the server rejects cancelling it, so it is
+        returned as ``dropped: False`` with its ``status``; that is not an error.
+
+        A missing deployment is reported as dropped only when the lookup fails
+        with the job-not-found code. A bare 404 proves nothing about the
+        deployment, which could still be serving, so it propagates.
+        """
+        job_id = _job_id_from_deployment_id(deployment_id)
+        try:
+            job = self._get_model_deployment_job(job_id)
+        except requests.exceptions.HTTPError as exc:
+            if _is_job_not_found_response(exc.response):
+                return {OUT_DEPLOYMENT: deployment_id, OUT_DROPPED: True}
+            raise
+        status = _model_deployment_status(job)
+        if status in {DEPLOYMENT_STATUS_FAILED, DEPLOYMENT_STATUS_TERMINATED}:
+            return {OUT_DEPLOYMENT: deployment_id, OUT_DROPPED: False, OUT_STATUS: status}
+        if status not in {DEPLOYMENT_STATUS_DROPPING, DEPLOYMENT_STATUS_DROPPED}:
+            self.cancel_job(job_id)
+        return {OUT_DEPLOYMENT: deployment_id, OUT_DROPPED: True}
 
     def iter_jobs(
         self,
@@ -2828,7 +3624,7 @@ class CortexTrainingClient:
                 retry_on=_is_account_list_transient,
                 # The path names no database, so a not-found error here is not
                 # about the configured one.
-                ensure_database=False,
+                explain_database=False,
                 **bounds,
             )
         except requests.exceptions.HTTPError as exc:
@@ -2860,7 +3656,7 @@ class CortexTrainingClient:
                 retry_on=_is_account_list_transient,
                 # The path names no database, so a not-found error here is not
                 # about the configured one.
-                ensure_database=False,
+                explain_database=False,
             )
         except requests.exceptions.HTTPError as exc:
             if exc.response is None or exc.response.status_code != 404:
@@ -2898,12 +3694,15 @@ class CortexTrainingClient:
         client._session.close()
         client._session = self._session
         client._owns_session = False
-        client._auto_create_database = False
+        client._explain_database_errors = False
         client._auth_provider = self._auth_provider
         client._metric_emitter = self._metric_emitter
         client._telemetry_surface = self._telemetry_surface
         client._artifact_connection_config = self._artifact_connection_config
         client._artifact_connection_factory = self._artifact_connection_factory
+        client._kept_sessions = self._kept_sessions
+        client._experiment_runs = self._experiment_runs
+        client._experiment_runs_lock = self._experiment_runs_lock
         return client
 
     @_track_operation("cancel_job")
@@ -3027,7 +3826,18 @@ class CortexTrainingClient:
         return rows[0]
 
     def _experiment_run_uri(self, job_id: str) -> tuple[str, str]:
-        """Return the experiment run's ``snow://`` URI and run name."""
+        """Return the experiment run's ``snow://`` URI and run name.
+
+        A job's experiment run never changes, so it is read once for a client and every client
+        :meth:`for_job` makes from it, which share what they read. The newest
+        ``_EXPERIMENT_RUNS_KEPT`` jobs' are remembered; an older one is read again when asked for.
+        """
+        with self._experiment_runs_lock:
+            known = self._experiment_runs.get(job_id)
+            if known is not None:
+                self._experiment_runs.move_to_end(job_id)
+        if known is not None:
+            return known
         run = self.get_experiment_run(job_id)
         try:
             experiment_name = run["experiment_name"]
@@ -3038,10 +3848,13 @@ class CortexTrainingClient:
             raise ValueError("experiment-run response has invalid experiment_name")
         if not isinstance(run_name, str) or not run_name:
             raise ValueError("experiment-run response has invalid experiment_run_name")
-        return (
-            f"snow://experiment/{experiment_name}/versions/{run_name}/",
-            run_name,
-        )
+        found = (f"snow://experiment/{experiment_name}/versions/{run_name}/", run_name)
+        with self._experiment_runs_lock:
+            self._experiment_runs[job_id] = found
+            self._experiment_runs.move_to_end(job_id)
+            while len(self._experiment_runs) > _EXPERIMENT_RUNS_KEPT:
+                self._experiment_runs.popitem(last=False)
+        return found
 
     def _snowflake_connection_kwargs(self) -> dict[str, Any]:
         """Return connection kwargs derived from this client's PAT credentials."""
@@ -3078,7 +3891,29 @@ class CortexTrainingClient:
             )
         import snowflake.connector
 
-        return snowflake.connector.connect(**self._snowflake_connection_kwargs())
+        return snowflake.connector.connect(
+            **self._snowflake_connection_kwargs(), **_artifact_login_options()
+        )
+
+    def _artifact_session_key(self) -> tuple[str, str]:
+        """What a kept download session is kept under: it was opened for this schema."""
+        return (self.database, self.schema)
+
+    def warm_artifact_session(self, job_id: str) -> None:
+        """Get ready to download ``job_id``'s artifacts before asked to.
+
+        Reads the job's experiment run, which the client then keeps, and, while
+        :attr:`keep_artifact_sessions` is on and no session is kept for this
+        schema, logs one in and keeps it. The next download of the job then
+        starts with its first ``LIST``. Raises what reading the run or logging
+        in raises; nothing is kept then.
+        """
+        self._experiment_run_uri(job_id)
+        kept = self._kept_sessions
+        key = self._artifact_session_key()
+        if kept is None or kept.has(key):
+            return
+        kept.keep(key, self._open_experiment_artifact_connection())
 
     def create_snowpark_session(self) -> Any:
         """Create a Snowpark ``Session`` using this client's PAT credentials."""
@@ -3387,9 +4222,13 @@ class CortexTrainingClient:
         run_uri, run_name = self._experiment_run_uri(job_id)
         root = Path(output_dir).expanduser()
         shared = _artifact_download.SharedConnection(
-            self._open_experiment_artifact_connection, transfer_timeout_seconds
+            self._open_experiment_artifact_connection,
+            transfer_timeout_seconds,
+            kept=self._kept_sessions,
+            key=self._artifact_session_key(),
         )
         policy = self._artifact_retry_policy
+        succeeded = False
         try:
             started = time.monotonic()
             targets: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
@@ -3446,11 +4285,12 @@ class CortexTrainingClient:
                     results.append(saved)
             finally:
                 values["fetch_ms"] = round((time.monotonic() - started) * 1000, 3)
+            succeeded = True
             return results
         finally:
             values["artifact_retry_count"] = shared.retry_count
             values["transfer_timeout_count"] = shared.transfer_timeout_count
-            shared.close()
+            shared.close(keep=succeeded)
 
     def _save_execution_log(
         self,
@@ -4139,19 +4979,35 @@ class CortexTrainingClient:
         """
         policy = self._artifact_retry_policy
         artifact_roots = (f"_{artifact_name}", f"checkpoints/_{artifact_name}")
-        by_root: dict[str, dict[str, dict[str, str]]] = {}
-        for artifact_root in artifact_roots:
-            paths = _artifact_download.call_with_retry(
+
+        def listed(artifact_root: str) -> list[str]:
+            return _artifact_download.call_with_retry(
                 shared,
                 policy,
                 f"LIST {artifact_root}",
-                lambda connection, artifact_root=artifact_root: (
-                    self._list_experiment_artifacts(
-                        connection, run_uri, run_name, artifact_root
-                    )
+                lambda connection: self._list_experiment_artifacts(
+                    connection, run_uri, run_name, artifact_root
                 ),
                 cancel,
             )
+
+        # Both at once, each on its own cursor: a LIST is mostly round-trip latency.
+        later = _artifact_download.Beside(
+            functools.partial(listed, artifact_roots[1]), name="cortex-training-list"
+        )
+        try:
+            first = listed(artifact_roots[0])
+        except BaseException:
+            # The other listing runs on this download's session, which the caller closes or
+            # keeps next: not under it. One still running after a while is left to finish on a
+            # session that is then closed, never kept.
+            if not later.wait(_SIDE_LISTING_WAIT_SECONDS):
+                shared.abandon()
+            raise
+        listings = {artifact_roots[0]: first, artifact_roots[1]: later.result()}
+        by_root: dict[str, dict[str, dict[str, str]]] = {}
+        for artifact_root in artifact_roots:
+            paths = listings[artifact_root]
             prefix = artifact_root + "/"
             for relative_path in paths:
                 after_root = relative_path.removeprefix(prefix)
@@ -4562,12 +5418,16 @@ class CortexTrainingClient:
 
         run_uri, run_name = self._experiment_run_uri(job_id)
         shared = _artifact_download.SharedConnection(
-            self._open_experiment_artifact_connection, transfer_timeout_seconds
+            self._open_experiment_artifact_connection,
+            transfer_timeout_seconds,
+            kept=self._kept_sessions,
+            key=self._artifact_session_key(),
         )
         root = Path(output_dir).expanduser()
         stall_cancel = threading.Event()
         # True once output is on disk that a resumed download would keep.
         saved = False
+        succeeded = False
         try:
             started = time.monotonic()
             chunks_by_sub_job, warnings_by_sub_job = self._list_gzip_chunks(
@@ -4693,6 +5553,7 @@ class CortexTrainingClient:
                 }
                 for sub_job_id in unsaved
             )
+            succeeded = True
             return sorted(results, key=lambda result: result["sub_job_id"])
         except BaseException as exc:
             if isinstance(exc, (DownloadCancelled, KeyboardInterrupt)):
@@ -4708,7 +5569,7 @@ class CortexTrainingClient:
             values["artifact_retry_count"] = shared.retry_count
             values["transfer_timeout_count"] = shared.transfer_timeout_count
             try:
-                shared.close()
+                shared.close(keep=succeeded)
             except BaseException as exc:
                 # Closing the session can block; Ctrl-C there keeps the flag.
                 self._mark_progress_saved(exc, saved)
@@ -4918,6 +5779,103 @@ class CortexTrainingClient:
             priority=priority,
             on_commit=on_commit,
         )
+
+    @staticmethod
+    def _save_deployment_artifact(
+        source: Path | None, destination: Path, content: str | None = None
+    ) -> None:
+        """Move (or write) one downloaded artifact into place, readable only by the owner."""
+        if content is not None:
+            destination.write_text(content, encoding="utf-8")
+        else:
+            os.replace(source, destination)
+        # Downloads arrive with mixed modes (connector GET vs. local write);
+        # logs and metrics can carry prompts, so keep every file private.
+        os.chmod(destination, 0o600)
+
+    @_model_deployment_operation
+    def download_model_deployment_logs(
+        self,
+        deployment_id: str,
+        output_dir: str | os.PathLike[str],
+        *,
+        log_type: str = "execution",
+    ) -> dict[str, Any]:
+        """Download deployment logs without exposing backing sub-job identity."""
+        if log_type not in {"execution", "stdout"}:
+            raise ValueError("log_type must be either 'execution' or 'stdout'")
+        job_id = _job_id_from_deployment_id(deployment_id)
+        # Refuse IDs whose backing job is not a model deployment.
+        self._get_model_deployment_job(job_id)
+        root = Path(output_dir).expanduser()
+        root.mkdir(parents=True, exist_ok=True)
+        # Files are flattened into root by name alone. That is safe only because
+        # a deployment has exactly one sub-job (``_model_deployment_sub_job``);
+        # add name checks if that ever changes.
+        if log_type == "execution":
+            logs = self.fetch_execution_logs(job_id)
+            results: list[dict[str, Any]] = []
+            for log in logs:
+                filename = log["filename"]
+                destination = root / filename
+                self._save_deployment_artifact(
+                    None, destination, content=str(log.get("content", ""))
+                )
+                results.append({"filename": filename, "saved_path": str(destination)})
+            return {OUT_DEPLOYMENT: deployment_id, OUT_LOGS: results}
+
+        with tempfile.TemporaryDirectory(
+            prefix=".cortex-training-deployment-stdout-", dir=root
+        ) as temp:
+            logs = self.download_stdout_logs(job_id, temp)
+            results = []
+            for log in logs:
+                filename = log["filename"]
+                source = Path(str(log.get("saved_path", "")))
+                if not source.is_file():
+                    raise RuntimeError("model deployment stdout download is missing")
+                destination = root / filename
+                self._save_deployment_artifact(source, destination)
+                results.append(
+                    {
+                        "filename": filename,
+                        "saved_path": str(destination),
+                        "chunk_count": int(log.get("chunk_count", 0)),
+                    }
+                )
+            return {OUT_DEPLOYMENT: deployment_id, OUT_LOGS: results}
+
+    @_model_deployment_operation
+    def download_model_deployment_metrics(
+        self, deployment_id: str, output_dir: str | os.PathLike[str]
+    ) -> dict[str, Any]:
+        """Download deployment metrics without exposing backing sub-job identity."""
+        job_id = _job_id_from_deployment_id(deployment_id)
+        # Refuse IDs whose backing job is not a model deployment.
+        self._get_model_deployment_job(job_id)
+        root = Path(output_dir).expanduser()
+        root.mkdir(parents=True, exist_ok=True)
+        # Flattened by name alone; see download_model_deployment_logs.
+        with tempfile.TemporaryDirectory(
+            prefix=".cortex-training-deployment-metrics-", dir=root
+        ) as temp:
+            metrics = self.download_metrics(job_id, temp)
+            results: list[dict[str, Any]] = []
+            for metric in metrics:
+                filename = metric["filename"]
+                source = Path(str(metric.get("saved_path", "")))
+                if not source.is_file():
+                    raise RuntimeError("model deployment metrics download is missing")
+                destination = root / filename
+                self._save_deployment_artifact(source, destination)
+                results.append(
+                    {
+                        "filename": filename,
+                        "saved_path": str(destination),
+                        "chunk_count": int(metric.get("chunk_count", 0)),
+                    }
+                )
+            return {OUT_DEPLOYMENT: deployment_id, OUT_METRICS: results}
 
     # ─── Data-plane async operations ─────────────────────────────────────
 

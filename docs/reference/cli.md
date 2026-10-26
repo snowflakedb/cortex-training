@@ -150,6 +150,19 @@ See [execution logs](#download-execution-logs),
 [persisted stdout](#download-persisted-stdout), and [GPU metrics](#download-metrics)
 for download paths and output fields.
 
+### [Model Deployments](#model-deployments)
+
+```bash
+cortex-training model-deployment create --spec examples/api/model-deployment-checkpoint.json --wait
+cortex-training model-deployment create --spec deployment.json --dry-run   # Validate only
+cortex-training model-deployment list --status READY
+cortex-training model-deployment describe sf-ct-DEPLOYMENT_UUID
+cortex-training model-deployment wait sf-ct-DEPLOYMENT_UUID --timeout 1800
+cortex-training model-deployment download-log sf-ct-DEPLOYMENT_UUID --output-dir ./logs
+cortex-training model-deployment download-metrics sf-ct-DEPLOYMENT_UUID --output-dir ./metrics
+cortex-training model-deployment drop sf-ct-DEPLOYMENT_UUID
+```
+
 ### [Output And Help](#json-output-and-help)
 
 ```bash
@@ -170,6 +183,8 @@ cortex-training fwd-bwd --help
 | `load`, `weight-sync` | Poll the submitted request until completion | `--no-poll` returns without waiting for the result |
 | `capacity` | Query each GPU type the account supports | Select one with `--hardware` |
 | `download-log`, `download-metrics` | Write under the current directory | Set `--output-dir` |
+| `model-deployment create` | Return after creation with status `PENDING` | `--wait` waits until `READY`; `--dry-run` validates without creating |
+| `model-deployment wait` | Wait until `READY`, for up to `--poll-timeout` | Set `--timeout SECONDS` |
 
 ## Detailed Reference
 
@@ -721,6 +736,141 @@ command still offers `--resume`, and on an error it prints the GPU result with
 `training_metrics` `null` before exiting 1. Two downloads of the same directory
 at once are unsupported.
 
+### Model Deployments
+
+`cortex-training model-deployment` manages ephemeral OpenAI-compatible
+evaluation deployments while keeping their backing jobs and sub-jobs hidden.
+It uses the same connection settings as every other command. See
+[REST API reference section 14](rest-api.md#14-model-deployments) for the full
+spec format, statuses, drop and download behavior, and errors.
+
+`--database`, `--schema`, and `--compact` may be given either before
+`model-deployment` or after its subcommand.
+
+Create a deployment from a base model or a completed Cortex Training
+`weights-only` checkpoint:
+
+```bash
+cortex-training model-deployment create \
+  --database CORTEX_TRAINING_DB \
+  --schema PUBLIC \
+  --spec examples/api/model-deployment-checkpoint.json \
+  --wait
+```
+
+`--spec -` reads the spec from stdin; `--spec-file` is a deprecated alias for `--spec`. The checkpoint must come from a completed
+`save` whose checkpoint type is `weights-only`; resumable checkpoints and
+customer-supplied stage credentials are not accepted. A checkpoint source
+names only `job_id` and `checkpoint_id`; the model is read from the source
+job. Base-model sources use `{"type": "base_model", "model": "Qwen/Qwen3-1.7B"}`
+instead. The `deployment` object sets `class` (only `EVALUATION` is supported
+today), `min_replicas`, `gpus_per_replica` (1, 2, 4, or 8), and `gpu_type`
+(`H200`, `B200`, or `B300`, in any case); `min_replicas * gpus_per_replica`
+must be at most 8 or a multiple of 8. `create --help` shows a full example
+spec, and `create --dry-run` checks a spec and prints it without connecting.
+
+`create`, `create --wait`, and `wait` print the same summary (plus `failure`
+when the deployment failed):
+
+```json
+{
+  "base_url": "https://ACCOUNT.snowflakecomputing.com/api/v2/databases/CORTEX_TRAINING_DB/schemas/PUBLIC/cortex-training/inference/v1",
+  "deployment": "sf-ct-DEPLOYMENT_UUID",
+  "status": "READY"
+}
+```
+
+`--wait` (on `create`) and `wait` poll until the deployment reaches `READY` or
+a terminal failure state, for up to `--timeout SECONDS` (default
+`--poll-timeout`). If waiting fails, times out, or is interrupted with Ctrl+C
+(exit code 130), the deployment ID and its last observed status are still
+printed, and the deployment keeps running and holding GPUs until you `drop` it.
+
+`list` shows only each deployment's ID and status, oldest first. `--status`
+(repeatable, case-insensitive) keeps only `PENDING`, `INITIALIZING`, `READY`,
+`FAILED`, `DROPPING`, `DROPPED`, `TERMINATED`, or `UNKNOWN` deployments:
+
+```json
+{
+  "deployments": [
+    {"deployment": "sf-ct-DEPLOYMENT_UUID", "status": "READY"}
+  ]
+}
+```
+
+`describe` shows one deployment in full: its status (with `status_reason` and
+`status_details`, or `failure`, when present), `base_url` while it can serve,
+the `database` and `schema` it lives in, `created_at`, `creator`,
+`owner_role`, and its configuration grouped under `spec`. `spec` is a read view that may gain
+read-only fields, so don't rely on feeding it back to `create`. A `gpu_type`
+of `null` means the server did not report the hardware.
+
+```json
+{
+  "base_url": "https://ACCOUNT.snowflakecomputing.com/api/v2/databases/CORTEX_TRAINING_DB/schemas/PUBLIC/cortex-training/inference/v1",
+  "created_at": "2026-09-16T20:00:00Z",
+  "creator": "JDOE",
+  "database": "CORTEX_TRAINING_DB",
+  "deployment": "sf-ct-DEPLOYMENT_UUID",
+  "owner_role": "ML_ENGINEER",
+  "schema": "PUBLIC",
+  "spec": {
+    "deployment": {"class": "EVALUATION", "gpu_type": "H200", "gpus_per_replica": 1, "min_replicas": 1},
+    "inference": {"max_seq_len": 8192},
+    "source": {"model": "Qwen/Qwen3-1.7B", "type": "base_model"}
+  },
+  "status": "READY"
+}
+```
+
+`download-log` (execution logs by default, or `--log-type stdout`) and
+`download-metrics` write every file directly into `--output-dir` (default: the
+current directory) under its server filename, with mode `0600`, replacing a
+file of that name from an earlier download. `drop` is safe to retry: a
+deployment that no longer exists or is already dropping or dropped counts as
+dropped. A deployment that has already failed or terminated holds no GPUs and
+cannot be dropped, so `drop` prints `"dropped": false` with its `status` and
+still exits `0`.
+
+#### Calling A Deployment
+
+The `base_url` is an OpenAI-compatible endpoint. Authenticate with a Snowflake
+programmatic access token (PAT) and pass the deployment ID as `model`.
+Inference is not yet available on all accounts; until it is enabled for yours,
+requests return 404.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://ACCOUNT.snowflakecomputing.com/api/v2/databases/CORTEX_TRAINING_DB/schemas/PUBLIC/cortex-training/inference/v1",
+    api_key=PAT,  # sent as "Authorization: Bearer <PAT>"
+    default_headers={"X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN"},
+)
+response = client.chat.completions.create(
+    model="sf-ct-DEPLOYMENT_UUID",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+```
+
+```bash
+curl "$BASE_URL/chat/completions" \
+  -H "Authorization: Bearer $PAT" \
+  -H "X-Snowflake-Authorization-Token-Type: PROGRAMMATIC_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "sf-ct-DEPLOYMENT_UUID", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+Limit the reply length with `max_completion_tokens`; `max_tokens` is rejected
+with HTTP 400 (`unsupported_parameter`). `"stream": true` returns server-sent
+events; see [Deploy a Model for Streaming Inference](../guides/inference/deploy-model.md).
+
+Use `cortex-training model-deployment list` to find deployments: `GET
+$BASE_URL/models` can return an empty list while a deployment is `READY`
+([known limitation 6](rest-api.md#15-known-limitations)). The full request and
+response behavior is in
+[REST API reference section 14.8](rest-api.md#148-calling-a-deployment).
+
 ### Job TUI
 
 `cortex-training tui` is a read-only terminal dashboard for job logs and GPU
@@ -730,7 +880,6 @@ including named and configured-default Snowflake profiles:
 ```bash
 cortex-training tui                 # opens the job list of the configured database and schema
 cortex-training tui JOB_ID          # opens that job's dashboard directly
-cortex-training tui --debug         # synthetic jobs, no connection needed
 ```
 
 Without login state, pass connection details the same way as the CLI:
@@ -753,10 +902,9 @@ cortex-training tui \
   --database CORTEX_TRAINING_DB --schema PUBLIC
 ```
 
-Like `checkpoints` and `list --all`, the TUI never creates the configured
-database or schema, which the other commands do when the service answers that
-they are not found: it shows that error instead, as it does when this role
-can't use them. Every request the TUI sends is retried at most twice, with a
+No command, the TUI included, creates the configured database or schema; when
+the service answers that they are not found, the command stops with an error
+that says how to fix it. Every request the TUI sends is retried at most twice, with a
 10-second connect and a 45-second read timeout, where the other commands use
 the SDK's defaults (ten retries, 30 and 600 seconds; [REST API reference
 section 3.5](rest-api.md#35-retries)). So a job id that isn't found (404), or
@@ -794,16 +942,7 @@ Pass `--sub-job-id JOB_ID:training:0` to scope the job details to one matching
 sub-job. An unmatched id is shown as an error rather than falling back to a
 different sub-job.
 The error lists the job's sub-job ids; without `JOB_ID`, `--sub-job-id` opens
-that sub-job's job. `--debug` runs against generated jobs and telemetry, and
-keeps its caches in a temporary directory, removed when it ends; the title says
-`(debug)`. Its jobs are in three locations (the configured
-`CORTEX_TRAINING_DB.PUBLIC`, `TEAM_DB.EXPERIMENTS`, and a lowercase
-`"sandbox"."dev"`) and run on the wall clock: live jobs keep logging and
-reporting GPU and node samples (one reports its GPUs only), a placing job
-starts within two minutes, a
-running one is cancelled, a tail gets stuck behind a long line and restarts from
-the end, and others have ended, failed, are `UNKNOWN`, or sit on an Experiment
-this role can't read.
+that sub-job's job.
 
 #### Job list
 
@@ -850,7 +989,7 @@ list is whole, the header names it:
 | Header | The list holds |
 |---|---|
 | `Current schema: DB.SCHEMA` | the jobs of the configured database and schema, as the list opens |
-| `Current schema: DB.SCHEMA, newest 2,000 + every active job (more exist)` | the same, cut short as the all-schemas list can be (below, `first 40 pages: …` included): that one schema holds more jobs than one refresh reads |
+| `Current schema: DB.SCHEMA, newest 2,000 + every active job (more exist)` | the same, cut short as the all-schemas list can be (below, `first 40 pages: …` included): that one schema holds more jobs than one refresh reads; and where the account-level list is unavailable, so the schema's list comes whole, when it holds more than 2,000 jobs: `f` shows every one of them, and again the newest 2,000 |
 | `all schemas` | after `a`: the jobs in every database and schema the role can see, from the account-level list; `all schemas (all in DB.SCHEMA)` when every one of them is in the same location |
 | `all schemas, narrowed to DB.SCHEMA` | after a whole `db=` search (see below): the jobs of that one location, asked of the service rather than filtered out of the newest 2,000. A narrowed list cut short reads `narrowed to DB.SCHEMA: newest 2,000 + every active job (more exist)`, and `narrowing to DB.SCHEMA…` while it is read |
 | `newest 2,000 + every active job (more exist)` | the same, cut at the newest 2,000 because more exist, plus the active jobs created before those |
@@ -1035,6 +1174,7 @@ operators shows under it only while it has focus.
 | click `▸` / `▾` | Unfold or fold that job, as `→` / `←` do |
 | `e` | Expand or collapse every job's sub-jobs, also those of jobs that later pages of the list being read bring (jobs a later refresh adds start as usual) |
 | `a` | All schemas / current schema: switch to the account-level list of every database and schema the role can see (the footer's `a All schemas`), or back to the configured one (`a Current schema`) |
+| `f` | All jobs / newest 2,000: when the configured schema's list came whole (the account-level list is unavailable) and holds more than 2,000 jobs, the list shows the newest 2,000 and every active job, as the account-level list does, and search covers those (one that matches none of them says `f searches all N jobs of the schema.`); `f` shows every job of it (drawing tens of thousands takes a few seconds), and again the newest 2,000. Refreshes keep the choice until another list is shown |
 | `ctrl+c` | Copy what is highlighted, else every row in the list with a `Whole ID` column (see above for what each cell copies as); in the preview, the highlight, else the whole preview |
 | `r` | Refresh (the list also refreshes every 60 seconds while it is showing); while it shows the configured schema in place of the account-level list (`Current schema only: DB.SCHEMA (reason)`), `r` asks that list again once a minute has passed since the last ask |
 | `?` | Show or close the keys panel |
@@ -1077,10 +1217,17 @@ was cancelled, terminated or completed. It shows the service's `reason` and
 `reason_details` (a failure always has a reason, `not reported` when none is
 sent), or what the state means, and where to look next. A running job has no
 box unless the service sends a reason. The Sub-jobs card shows type, status
-(a badge such as `● RUNNING`), model, GPUs and key config; multiplexed rows
-name the source sub-job. Long cells use `…`, narrow screens omit Type, and
-wider tables scroll with `←` / `→` or `Home` / `End`; the card's bottom border
-says so (`e whole table`, `← → scroll`).
+(a badge such as `● RUNNING`), model and GPUs. Long cells use `…`, narrow
+screens omit Type, and wider tables scroll with `←` / `→` or `Home` / `End`;
+the card's bottom border says so (`e whole table`, `← → scroll`).
+
+The Config card under it follows the highlighted row: that sub-job's submitted
+config, exactly as `cortex-training get JOB_ID` prints that sub-job's entry
+(indented JSON by key, values as the service returns them, aliases as
+submitted), without the fields the service adds (`sub_job_id`, `status`). On
+the entire-job row, each sub-job's goes under its name, side by side when each
+has at least 40 cells. A line wider than its column is cut with `…` until `e`,
+which also puts the sub-jobs one under the other.
 
 Live previews refresh every 60 seconds, on return from details, or on `r`; a
 dim line at the end of the job card reports reads, slow reads and refresh
@@ -1170,8 +1317,12 @@ next tab, round to Logs after the last.
     `↑↓ node`) when the view has more than one; the footer shows the other
     keys.
   - Telemetry downloads when shown, refreshes every 30 seconds for a running
-    selected sub-job, and refreshes on `r`. While a download runs, the header
-    counts the selected sub-job's chunks:
+    selected sub-job, and refreshes on `r`. A refresh rebuilds the window on
+    screen and the whole job's (the stats beside every window); `w` to a window
+    not on screen since shows it as it last was, with `refreshing…` in the
+    header, for the moment it takes to rebuild. A rebuild that fails says
+    `cached · refresh failed: …` instead, until `r` or the next refresh builds the
+    window. While a download runs, the header counts the selected sub-job's chunks:
     `loading GPU metrics ━━━━━━━━━━━━ 340/1,440 chunks`. A view with nothing to chart shows
     a quiet card instead of the stats and charts: a title (`Waiting for the
     job to start`, `Waiting for the first samples`, `GPU metrics are on
@@ -1185,10 +1336,14 @@ next tab, round to Logs after the last.
     appear first, and later opens download only new chunks (unless the job
     left the cache to keep it within its limit, which makes the next open a
     first one: see [Local data](#local-data)). On a first open,
-    with nothing cached for the selected sub-job, its newest half hour (the 10m
-    and 30m windows) downloads before the rest of its history and is drawn at
-    once, marked `loading older samples…` until the rest is in; a job short
-    enough that this saves no time downloads whole.
+    with nothing cached for the selected sub-job, the window on screen (the
+    newest 10 minutes, where every job opens; at most the newest half hour)
+    downloads before the rest of its history and is drawn at once, marked
+    `loading older samples…` until the rest is in; a job short enough that this
+    saves no time downloads whole. The download starts on a Snowflake session
+    the job's screen logged in once its first log lines were drawn (see
+    [Download sessions](rest-api.md#127-download-sessions)): the TUI keeps
+    one open for its downloads while it runs, and closes it when it quits.
 - **Training metrics** charts what the training sub-job's `/step` and
   `/fwd-bwd` calls returned, read from its own `training.jsonl`
   ([Training metrics download](rest-api.md#125-training-metrics-download)),

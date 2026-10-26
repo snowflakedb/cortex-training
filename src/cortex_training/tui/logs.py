@@ -182,6 +182,9 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
     _CONSOLE_PREVIEW_SECONDS = 30 * 60
     _DATA_REFRESH_SECONDS = 30
     _STATUS_REFRESH_SECONDS = 60
+    # The warm-up (see _warm_artifact_session) waits for the Logs tab's first lines, which
+    # its import of the Snowflake Connector would slow, or this long after the screen opens.
+    _WARM_UP_AFTER_SECONDS = 1.5
     _LOG_ONLY = {"save_log", "cycle_level", "toggle_pause", "shrink_sources", "grow_sources", "filter", "jump"}
     # The tabs, in the order t cycles them, and their names.
     _TABS = ("logs", "resource", "training", "checkpoints")
@@ -241,6 +244,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         self._stdout_first: str | None = None  # the sub-job a download fetches before the others
         self._stdout_others = False  # ... and whether the job has others
         self._stdout_failed = False
+        self._warm_up_started = False
         self._held: tuple[list[str], bool] | None = None
         self._init_log_state()
         self._active_tab = initial_tab if initial_tab in self._TABS else "logs"
@@ -256,6 +260,8 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         self._resource_loading = False
         self._resource_refresh_succeeded = False
         self._resource_error: str | None = None
+        # The window whose rebuild failed (see _rebuild_resource_window) and why, until it is rebuilt.
+        self._resource_window_error: tuple[str, str] | None = None
         self._resource_range = DEFAULT_RANGE
         self._resource_downloaded = False
         self._resource_progress: dict[str, tuple[int, int]] = {}  # per sub-job, a download's (chunks done, of them)
@@ -333,6 +339,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         self._apply_sources_width()
         self._update_subtitle()
         self._load_sources()
+        self.set_timer(self._WARM_UP_AFTER_SECONDS, self._warm_up)
         after_refresh(self, self._focus_active_tab)
         self.set_interval(self._IDLE_CHECK_SECONDS, self._check_idle)
 
@@ -392,6 +399,29 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
     def _tab_job(self) -> dict:
         """The job as this screen knows it, with its newest status, for the Training metrics tab."""
         return {**self._job, "status": self._job_status or self._job.get("status")}
+
+    def _warm_up(self) -> None:
+        """UI thread. Start _warm_artifact_session, once."""
+        if not self._warm_up_started:
+            self._warm_up_started = True
+            self._warm_artifact_session()
+
+    @work(thread=True, exclusive=True, group="warm-up")
+    def _warm_artifact_session(self) -> None:
+        """Worker thread. Once the Logs tab has drawn its first lines (see _warm_up), the job's
+        experiment run and a Snowflake session are made ready, so the first download a tab asks
+        for (Resources, Training metrics, a saved console) starts with its listing, not a login
+        (see the client's warm_artifact_session). A client without it, or a failure, leaves
+        that to the download."""
+        warm = getattr(self._client, "warm_artifact_session", None)
+        if warm is None or not self._screen_open:
+            return
+        try:
+            warm(self._job_id)
+        except Exception:  # noqa: BLE001 - the download logs in itself, and says what failed
+            # Not on screen, where the download says what failed, but in the error log, once per
+            # job screen: the place to look when a job's first chart is slow.
+            log_traceback(f"getting {self._job_id}'s downloads ready failed")
 
     def _download_training_metrics(self, *, priority, on_commit, cancelled) -> bool:
         """Worker thread. The Training metrics tab's download: the zone's own training rows,
@@ -2704,7 +2734,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
 
     def _downloads_by_sub_job(self) -> bool:
         """Whether this client's download_stdout_logs takes sub_job_ids and on_chunk
-        (an older client, or the demo's, downloads the whole job at once)."""
+        (an older client, or a test's fake, downloads the whole job at once)."""
         try:
             parameters = inspect.signature(self._client.download_stdout_logs).parameters
         except (TypeError, ValueError):
@@ -2807,7 +2837,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         found = {"database": getattr(self._client, "database", None), "schema": getattr(self._client, "schema", None),
                  "connection": getattr(auth, "connection_name", None),
                  "endpoint": getattr(self._client, "endpoint", None)}
-        # Only real names: a demo or test client's attributes may be anything.
+        # Only real names: a test client's attributes may be anything.
         where = {key: value if isinstance(value, str) and value else None for key, value in found.items()}
         if where["endpoint"] == "cortex-training":
             where["endpoint"] = None
@@ -3087,6 +3117,8 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         self._shown_rows.extend(rows for _, _, rows in chunks)
         self._shown_kinds.extend(kinds)
         self._shown_logs += self._log_lines(line for line, _, _ in chunks)
+        if self._shown_logs and not self._warm_up_started:
+            after_refresh(self, self._warm_up)  # once these lines are drawn
         self._rows_total += added
         if cut and not self._pane_truncated:
             self._pane_truncated = True

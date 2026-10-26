@@ -19,8 +19,9 @@ The client downloads console and GPU metric chunks with one Snowflake ``GET``
 per chunk. Each ``GET`` is mostly round-trip latency, so chunks are fetched on a
 thread pool and appended to the output strictly in sorted name order. This
 module holds the pieces that do not depend on the client itself: retry
-classification and backoff, a reconnectable shared connection, and the
-checkpointing chunk writer that keeps a resume manifest in step with the file.
+classification and backoff, a reconnectable shared connection and the sessions
+kept between downloads, and the checkpointing chunk writer that keeps a resume
+manifest in step with the file.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ import threading
 import time
 import zlib
 from collections.abc import Callable
+from collections.abc import Hashable
 from collections.abc import Iterable
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -226,6 +228,111 @@ class SessionClosed(RuntimeError):
     """The download's session was closed; a late attempt must not reopen it."""
 
 
+def _reports_closed(connection: Any) -> bool:
+    """Whether the Connector says ``connection`` is closed; a connection that can't say is open,
+    and one whose answer raises is taken as closed."""
+    is_closed = getattr(connection, "is_closed", None)
+    if not callable(is_closed):
+        return False
+    try:
+        return bool(is_closed())
+    except Exception:  # noqa: BLE001 - it can't even say: no use reusing it
+        return True
+
+
+class KeptSessions:
+    """Connector sessions kept open between downloads, a few per key, so the next
+    download under that key starts without logging in.
+
+    Up to ``per_key`` are kept under one key: downloads that ran at once (a saved
+    console and the metrics, say) each give theirs back. The one kept last is taken
+    first. A session idle for longer than ``idle_seconds`` is closed instead of
+    reused: one kept that long is likelier to need its token renewed than to save a
+    download time.
+    """
+
+    IDLE_SECONDS = 30 * 60.0
+    PER_KEY = 2
+
+    def __init__(
+        self,
+        idle_seconds: float = IDLE_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+        per_key: int = PER_KEY,
+    ):
+        self._idle_seconds = idle_seconds
+        self._clock = clock
+        self._per_key = per_key
+        self._lock = threading.Lock()
+        self._kept: dict[Hashable, list[tuple[Any, float]]] = {}
+        self._closed = False
+
+    def take(self, key: Hashable) -> Any | None:
+        """A session kept under ``key``, which the caller then owns; None without one. One the
+        Connector reports closed is closed here and passed over: it can serve nothing."""
+        with self._lock:
+            stale = self._drop_stale(key)
+            kept = self._kept.get(key)
+            found = None
+            while kept and found is None:
+                connection = kept.pop()[0]
+                if _reports_closed(connection):
+                    stale.append(connection)
+                else:
+                    found = connection
+            if kept == []:
+                del self._kept[key]
+        for connection in stale:
+            self._close(connection)
+        return found
+
+    def has(self, key: Hashable) -> bool:
+        """Whether a session is kept under ``key`` that :meth:`take` would return."""
+        with self._lock:
+            return any(self._clock() - since <= self._idle_seconds and not _reports_closed(connection)
+                       for connection, since in self._kept.get(key, []))
+
+    def keep(self, key: Hashable, connection: Any) -> None:
+        """Keep ``connection`` under ``key``; close it when ``per_key`` are kept there
+        already, or after :meth:`close`."""
+        with self._lock:
+            stale = self._drop_stale(key)
+            kept = None if self._closed else self._kept.setdefault(key, [])
+            if kept is not None and len(kept) < self._per_key:
+                kept.append((connection, self._clock()))
+                connection = None
+        for idle in stale:
+            self._close(idle)
+        if connection is not None:
+            self._close(connection)
+
+    def _drop_stale(self, key: Hashable) -> list[Any]:
+        """Under the lock: forget the sessions under ``key`` idle too long; return them to close."""
+        kept = self._kept.get(key, [])
+        now = self._clock()
+        stale = [connection for connection, since in kept if now - since > self._idle_seconds]
+        if stale:
+            kept[:] = [(connection, since) for connection, since in kept if now - since <= self._idle_seconds]
+        if not kept:
+            self._kept.pop(key, None)
+        return stale
+
+    def close(self) -> None:
+        """Close every kept session; any given to :meth:`keep` later is closed at once."""
+        with self._lock:
+            self._closed = True
+            kept, self._kept = [entry for entries in self._kept.values() for entry in entries], {}
+        for connection, _since in kept:
+            self._close(connection)
+
+    @staticmethod
+    def _close(connection: Any) -> None:
+        try:
+            connection.close()
+        except Exception:  # its server-side session expires by itself
+            logger.debug("could not close a kept artifact session", exc_info=True)
+
+
 class SharedConnection:
     """One connector connection shared by worker threads, reopened on expiry.
 
@@ -233,10 +340,19 @@ class SharedConnection:
     ``threadsafety = 2``); each worker uses its own cursor. A replaced connection
     is closed only in :meth:`close`, because other threads may still hold
     cursors on it. ``transfer_timeout`` bounds each LIST or GET attempt made
-    for this download (see :func:`run_bounded`).
+    for this download (see :func:`run_bounded`). With ``kept``, the download
+    starts on a session kept under ``key`` when there is one, and a download
+    that succeeded gives its session back (see :meth:`close`).
     """
 
-    def __init__(self, opener: Callable[[], Any], transfer_timeout: float | None = None):
+    def __init__(
+        self,
+        opener: Callable[[], Any],
+        transfer_timeout: float | None = None,
+        *,
+        kept: KeptSessions | None = None,
+        key: Hashable = None,
+    ):
         self.transfer_timeout = transfer_timeout
         # Counted for client telemetry: retried attempts, and attempts that ran
         # past ``transfer_timeout``.
@@ -244,10 +360,18 @@ class SharedConnection:
         self.transfer_timeout_count = 0
         self._opener = opener
         self._lock = threading.Lock()
-        self._connection = opener()
+        # A session kept from an earlier download under ``key`` saves this one its login.
+        self._kept, self._key = kept, key
+        connection = kept.take(key) if kept is not None else None
+        self._connection = connection if connection is not None else opener()
         self._generation = 0
+        # The generation of a kept session this download started on, until an attempt on it
+        # succeeds (or the fresh login replacing it fails): see replace_stale_kept.
+        self._stale_suspect: int | None = 0 if connection is not None else None
         self._replaced: list[Any] = []
         self._closed = False
+        # Something still runs on the connection without an attempt to wait for (see abandon).
+        self._abandoned = False
 
     def note_attempt_failure(self, exc: BaseException, *, retried: bool) -> None:
         with self._lock:
@@ -255,6 +379,48 @@ class SharedConnection:
                 self.retry_count += 1
             if isinstance(exc, TransferTimeout):
                 self.transfer_timeout_count += 1
+
+    def note_attempt_success(self, generation: int) -> None:
+        """An attempt on ``generation`` succeeded: a kept session it was is live after all."""
+        with self._lock:
+            if generation == self._stale_suspect:
+                self._stale_suspect = None
+
+    def replace_stale_kept(self, generation: int) -> bool:
+        """For an attempt that failed on ``generation``: whether it should run again at once on a
+        fresh session, with no backoff and without counting against the retry policy.
+
+        It should when ``generation`` is the kept session this download started on and no
+        attempt on it has succeeded: it most likely went stale while it sat in the pool,
+        expired on the service or its socket dropped, and retrying on it would wait a backoff
+        or fail again. The first such failure logs in afresh; another thread's failure on the
+        same session then retries on that fresh login. A fresh login that fails leaves the
+        attempt to the retry policy.
+        """
+        with self._lock:
+            if self._closed:
+                raise SessionClosed("the artifact download session is closed")
+            if generation != self._stale_suspect:
+                return False
+            if generation != self._generation:
+                return True  # already replaced: the fresh session, at once
+            self._stale_suspect = None  # once only, whether or not the login works
+            try:
+                fresh = self._opener()
+            except Exception:  # noqa: BLE001 - the retry policy reopens it, with its backoff
+                logger.debug("logging in afresh after a stale kept session failed", exc_info=True)
+                return False
+            self._replaced.append(self._connection)
+            self._connection = fresh
+            self._generation += 1
+            self._stale_suspect = generation  # attempts that failed on it retry on the fresh one
+            return True
+
+    def abandon(self) -> None:
+        """Something left running on the connection cannot be waited for: the connection is
+        then closed at the end of the download, never kept, as after a timed-out attempt."""
+        with self._lock:
+            self._abandoned = True
 
     def current(self) -> tuple[Any, int]:
         with self._lock:
@@ -274,19 +440,26 @@ class SharedConnection:
             self._connection = fresh
             self._generation += 1
 
-    def close(self) -> None:
+    def close(self, *, keep: bool = False) -> None:
+        """Close the connections. With ``keep`` (a download that succeeded), the current one
+        goes to the kept sessions instead, for the next download, unless an attempt on it was
+        abandoned (see :func:`run_bounded` and :meth:`abandon`): it may still be running on it."""
         with self._lock:
             self._closed = True
             replaced, self._replaced = self._replaced, []
             current = self._connection
+            keep = (keep and self._kept is not None and self.transfer_timeout_count == 0
+                    and not self._abandoned)
         # A close error must not fail a finished download or hide its real error.
-        for connection in [*replaced, current]:
+        for connection in replaced if keep else [*replaced, current]:
             try:
                 connection.close()
             except Exception as exc:
                 # One line for the user; the traceback only at debug level.
                 logger.warning("could not close the artifact download session: %s", exc)
                 logger.debug("artifact download session close failure", exc_info=True)
+        if keep:
+            self._kept.keep(self._key, current)
 
 
 class TransferTimeout(TimeoutError):
@@ -369,12 +542,14 @@ def call_with_retry(
             raise DownloadCancelled(f"{description} cancelled")
         connection, generation = shared.current()
         try:
-            return run_bounded(
+            result = run_bounded(
                 lambda: operation(connection),
                 timeout=shared.transfer_timeout,
                 cancel=cancel,
                 description=description,
             )
+            shared.note_attempt_success(generation)
+            return result
         except DownloadCancelled:
             raise
         except Exception as exc:
@@ -383,6 +558,13 @@ def call_with_retry(
                 # being removed under an in-flight GET) are not worth reporting.
                 raise DownloadCancelled(f"{description} cancelled") from exc
             kind = classify_artifact_error(exc)
+            if kind is not None and shared.replace_stale_kept(generation):
+                # A kept session failed before any attempt on it worked: it went stale in the
+                # pool. Again at once on a fresh login, rather than a backoff on the old one.
+                shared.note_attempt_failure(exc, retried=True)
+                logger.info("%s failed on a kept session (%s); trying a fresh one", description,
+                            type(exc).__name__)
+                continue
             retried = kind is not None and attempt < policy.attempts
             shared.note_attempt_failure(exc, retried=retried)
             if not retried:
@@ -826,6 +1008,36 @@ class Background:
         if self._done.wait(timeout) and self._outcome:
             return self._outcome[0]
         return default
+
+
+class Beside:
+    """Run ``operation`` on a daemon thread while the caller does its own share;
+    :meth:`result` waits for it and returns its value or raises its error."""
+
+    def __init__(self, operation: Callable[[], _T], *, name: str):
+        self._outcome: list[Any] = []
+        self._error: list[BaseException] = []
+        self._done = threading.Event()
+
+        def run() -> None:
+            try:
+                self._outcome.append(operation())
+            except BaseException as exc:  # handed to the thread that waits
+                self._error.append(exc)
+            finally:
+                self._done.set()
+
+        threading.Thread(target=run, name=name, daemon=True).start()
+
+    def result(self) -> _T:
+        self._done.wait()
+        if self._error:
+            raise self._error[0]
+        return self._outcome[0]
+
+    def wait(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` seconds for ``operation`` to end; whether it did."""
+        return self._done.wait(timeout)
 
 
 class Spool:
