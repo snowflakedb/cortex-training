@@ -66,7 +66,10 @@ _LR_SCHEDULES = ("constant", "cosine")
 
 
 class Config(Protocol):
-    config: str
+    # Legacy JSON connection file. Omit it to use `connection` or the default profile.
+    config: str | None = None
+    # Snowflake connection profile name (connections.toml). Use config or connection, not both.
+    connection: str | None = None
     job_id: str | None
     teacher_job_id: str | None
     student: str
@@ -544,7 +547,7 @@ def _train(config: Config, task: Task) -> None:
         **stop_params,
     }
 
-    client = make_client(config.config)
+    client = make_client(config.config, config.connection)
     bodies = {"student": student_body}
     if teacher_body is not None:
         bodies["teacher"] = teacher_body

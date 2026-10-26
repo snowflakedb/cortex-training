@@ -65,6 +65,8 @@ from cortex_training import CortexTrainingClient
 from cortex_training import wire
 from cortex_training.client import DEBUG_OPTIONS_ENV
 from cortex_training.client.peft import normalize_lora_peft_config
+from cortex_training.connection import ResolvedConnection
+from cortex_training.connection import resolve_connection
 
 logger = logging.getLogger(__name__)
 
@@ -83,12 +85,46 @@ def load_connection_mapping(config_path: str) -> dict[str, Any]:
     return config
 
 
-def make_client(config_path: str, **overrides: Any) -> CortexTrainingClient:
+# Used only for a JSON config or PAT connection that does not name a database.
+# A named profile keeps its own database.
+LEGACY_DEFAULT_DATABASE = "CORTEX_TRAINING_DB"
+
+
+def resolve_example_connection(
+    config: str | None = None,
+    connection: str | None = None,
+    **overrides: Any,
+) -> ResolvedConnection:
+    """Open the client an example runs against, and log what it connected to.
+
+    ``config=`` is a legacy JSON file and behaves exactly as it always has: only the
+    file is read, and the environment, saved login and profiles are ignored.
+    ``connection=`` names a profile. With neither, the CLI's resolution order is
+    used (see ``cortex_training.connection``).
+    """
+    if config and connection:
+        raise ValueError("pass either config= or connection=, not both")
+    if config:
+        resolved = _legacy_json_connection(config, overrides)
+    else:
+        resolved = resolve_connection(
+            None,
+            connection,
+            default_database=LEGACY_DEFAULT_DATABASE,
+            strict_config=False,
+            overrides=overrides,
+        )
+    logger.info("%s", resolved.describe())
+    return resolved
+
+
+def _legacy_json_connection(config_path: str, overrides: Mapping[str, Any]) -> ResolvedConnection:
+    """The pre-profile ``make_client``, unchanged, wrapped in a ``ResolvedConnection``."""
     config = load_connection_mapping(config_path)
 
     pat = config.get("pat")
     kwargs: dict[str, Any] = dict(
-        database=config.get("database", "CORTEX_TRAINING_DB"),
+        database=config.get("database", LEGACY_DEFAULT_DATABASE),
         schema=config.get("schema", "PUBLIC"),
         endpoint=config.get("endpoint", "cortex-training"),
         poll_interval=float(config.get("poll_interval", 0.5)),
@@ -101,12 +137,34 @@ def make_client(config_path: str, **overrides: Any) -> CortexTrainingClient:
         raise ValueError("connection config needs `host` (Snowflake PAT auth)")
     if pat is None:
         raise ValueError("no PAT found: put `pat` in the connection config")
-    return CortexTrainingClient.from_pat(
+    verify_ssl = bool(config.get("verify_ssl", True))
+    client = CortexTrainingClient.from_pat(host=host, pat=pat, verify_ssl=verify_ssl, **kwargs)
+    return ResolvedConnection(
+        client=client,
+        source="config file",
         host=host,
+        database=kwargs["database"],
+        schema=kwargs["schema"],
+        verify_ssl=verify_ssl,
         pat=pat,
-        verify_ssl=bool(config.get("verify_ssl", True)),
-        **kwargs,
     )
+
+
+def make_client(
+    config: str | None = None,
+    connection: str | None = None,
+    **overrides: Any,
+) -> CortexTrainingClient:
+    return resolve_example_connection(config, connection, **overrides).client
+
+
+def example_connection_args(config: str | None, connection: str | None) -> str:
+    """Render the connection argument for a copy-paste command, or ``""`` for the default."""
+    if config:
+        return f"config={config}"
+    if connection:
+        return f"connection={connection}"
+    return ""
 
 
 # ─── Job configs ─────────────────────────────────────────────────────────────
@@ -199,11 +257,13 @@ def source_checkpoint_info(
 def _sampling_cli(
     *,
     module: str,
-    config_path: str,
+    connection_args: str,
     job_id: str,
     extra: str = "",
 ) -> str:
-    line = f"  python -m {module} config={config_path} source_job_id={job_id}"
+    line = " ".join(
+        part for part in (f"  python -m {module}", connection_args, f"source_job_id={job_id}") if part
+    )
     if extra:
         line += extra
     return line
@@ -211,7 +271,7 @@ def _sampling_cli(
 
 def log_saved_checkpoints(
     *,
-    config_path: str,
+    connection_args: str,
     job_id: str,
     saved: Mapping[str, Mapping[str, Any]],
     sampling_command: str | None = None,
@@ -269,7 +329,7 @@ def log_saved_checkpoints(
         lead,
         _sampling_cli(
             module=module,
-            config_path=config_path,
+            connection_args=connection_args,
             job_id=job_id,
             extra=extra,
         ),

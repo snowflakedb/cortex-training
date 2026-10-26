@@ -241,7 +241,10 @@ def _run_math500(
 
 @chz.chz
 class Config:
-    config: str
+    # Legacy JSON connection file. Omit it to use `connection` or the default profile.
+    config: str | None = None
+    # Snowflake connection profile name (connections.toml). Use config or connection, not both.
+    connection: str | None = None
     job_id: str | None = None  # attach to a running inference endpoint
 
     # The job comes from model-catalog/models/; job_config= replaces it with a file.
@@ -273,7 +276,8 @@ class Config:
 
 def run_evaluation(
     *,
-    config_path: str,
+    config: str | None = None,
+    connection: str | None = None,
     model: str = "Qwen/Qwen3-8B",
     context: str = "standard",
     hardware: str = "h200",
@@ -324,7 +328,7 @@ def run_evaluation(
     )
     logger.info("Using renderer: %s (enable_thinking=%s)", renderer_name, enable_thinking)
 
-    client = make_client(config_path)
+    client = make_client(config, connection)
     task_name = task.strip().lower()
     if task_name not in {"math500", "gsm8k", "identity"}:
         raise ValueError(f"unsupported eval task {task!r}; use math500, gsm8k, or identity")
@@ -371,7 +375,8 @@ def main(config: Config):
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
     run_evaluation(
-        config_path=config.config,
+        config=config.config,
+        connection=config.connection,
         model=config.model,
         context=config.context,
         hardware=config.hardware,

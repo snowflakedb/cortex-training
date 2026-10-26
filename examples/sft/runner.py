@@ -24,6 +24,7 @@ from examples.utils import forward_backward_step
 from examples.utils import inference_job_args
 from examples.utils import log_saved_checkpoints
 from examples.utils import make_client
+from examples.utils import example_connection_args
 from examples.utils import running_job
 from examples.utils import save_example_checkpoints
 
@@ -38,7 +39,10 @@ _EXAMPLE_DIR = Path(__file__).resolve().parent
 
 
 class Config(Protocol):
-    config: str
+    # Legacy JSON connection file. Omit it to use `connection` or the default profile.
+    config: str | None = None
+    # Snowflake connection profile name (connections.toml). Use config or connection, not both.
+    connection: str | None = None
     job_id: str | None
     model: str
     context: str
@@ -216,7 +220,8 @@ def train(config: Config, task: Task) -> dict[str, Any]:
         if eval_sequences:
             logger.info("valid_nll on %d held-out examples every %d steps", n_eval, eval_every)
 
-    client = make_client(config.config)
+    client = make_client(config.config, config.connection)
+    connection_args = example_connection_args(config.config, config.connection)
 
     def evaluate(job_id: str) -> dict[str, float]:
         eval_start = time.time()
@@ -294,7 +299,7 @@ def train(config: Config, task: Task) -> dict[str, Any]:
         if callable(eval_command):
             # A task with its own evaluation (e.g. DARE) prints that command.
             log_saved_checkpoints(
-                config_path=config.config,
+                connection_args=connection_args,
                 job_id=job_id,
                 saved=saved,
             )
@@ -303,7 +308,7 @@ def train(config: Config, task: Task) -> dict[str, Any]:
                 logger.info(
                     "Evaluate this weights-only checkpoint with:\n  %s",
                     eval_command(
-                        config_path=config.config,
+                        connection_args=connection_args,
                         job_id=job_id,
                         checkpoint_id=checkpoint_id,
                         job_args=inference_job_args(
@@ -315,7 +320,7 @@ def train(config: Config, task: Task) -> dict[str, Any]:
         else:
             sample_prompt = task.sample_prompt()
             log_saved_checkpoints(
-                config_path=config.config,
+                connection_args=connection_args,
                 job_id=job_id,
                 saved=saved,
                 sampling_command="sample",
