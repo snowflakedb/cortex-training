@@ -2150,6 +2150,41 @@ def _settings_override(
     return {"sub_job_configs": entries} if entries else {}
 
 
+def _with_sibling_sub_job(path: Path, body: dict[str, Any]) -> dict[str, Any]:
+    """Complete a one-sided RL ``job_config`` file from its sibling in the same folder.
+
+    A training-only file named ``*-training-*`` takes the sampling sub-jobs of
+    the matching ``*-inference-*`` file, and an inference-only file the training
+    sub-jobs of its ``-training-`` sibling, so ``job_config=`` can name either
+    catalog file of a pair. Sampling comes first, then training; the file's
+    ``hardware`` is kept, or the sibling's when the file has none. A body with
+    both kinds of sub-job, or a file without such a sibling, is returned as is.
+    """
+    jobs = list(body.get("sub_job_configs") or ())
+    kinds = {job.get("job_type") for job in jobs if isinstance(job, Mapping)}
+    if {"training", "sampling"} <= kinds:
+        return body
+    if "-training-" in path.name:
+        sibling, wanted = path.with_name(path.name.replace("-training-", "-inference-", 1)), "sampling"
+    elif "-inference-" in path.name:
+        sibling, wanted = path.with_name(path.name.replace("-inference-", "-training-", 1)), "training"
+    else:
+        return body
+    if not sibling.is_file():
+        return body
+    other = load_job_body(str(sibling))
+    extra = [job for job in other.get("sub_job_configs") or () if isinstance(job, Mapping) and job.get("job_type") == wanted]
+    if not extra:
+        return body
+    order = {"sampling": 0, "training": 1}
+    combined = sorted(jobs + extra, key=lambda job: order.get(job.get("job_type"), len(order)))
+    logger.info("Paired job_config %s with the %s sub-job of %s", path, wanted, sibling)
+    merged = {**body, "sub_job_configs": combined}
+    if not merged.get("hardware") and other.get("hardware"):
+        merged["hardware"] = other["hardware"]
+    return merged
+
+
 def build_job(
     kind: str,
     *,
@@ -2185,7 +2220,9 @@ def build_job(
     ``job_config`` file replaces the first two layers and is used as is: the
     command-line settings still apply, and nothing is planned. The source
     checkpoint (inference jobs) and the debug image tag are added last, and
-    the final job is logged.
+    the final job is logged. For ``rl``, a ``job_config`` file with only a
+    training or only a sampling sub-job is first completed from its sibling
+    file (see :func:`_with_sibling_sub_job`).
     """
     if kind not in _JOB_KIND_SUB_JOBS:
         raise ValueError(f"kind must be one of {sorted(_JOB_KIND_SUB_JOBS)}, got {kind!r}")
@@ -2193,7 +2230,10 @@ def build_job(
         raise TypeError("overrides must be a list of JSON files or dicts")
     needed = _JOB_KIND_SUB_JOBS[kind]
     if job_config is not None:
-        body = load_job_body(job_config, search_dirs=search_dirs)
+        path = resolve_cortex_training_config_path(job_config, search_dirs=search_dirs)
+        body = load_job_body(str(path))
+        if kind == "rl":
+            body = _with_sibling_sub_job(path, body)
         found = [sub.get("job_type") for sub in body.get("sub_job_configs") or () if isinstance(sub, Mapping)]
         # Require the exact composition for the mode -- one sub-job of each needed
         # type and nothing else -- so an RL body (training + sampling) is not

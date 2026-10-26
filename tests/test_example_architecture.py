@@ -312,6 +312,52 @@ def test_rl_job_config_is_used_as_is(tmp_path):
     assert _job_body("examples.rl.math_grpo.train", job_config=str(path)) == record
 
 
+def _by_job_type(body: dict) -> dict:
+    return {sub["job_type"]: sub for sub in body["sub_job_configs"]}
+
+
+@pytest.mark.parametrize(
+    ("model", "context", "lora"),
+    [("Qwen/Qwen3-8B", "standard", True), ("Qwen/Qwen3.6-35B-A3B", "long", False)],
+)
+@pytest.mark.parametrize("kind", ["training", "inference"])
+def test_an_rl_job_config_names_either_catalog_file_of_a_pair(model, context, lora, kind):
+    utils = _import_example("examples.utils")
+    folder = REPO_ROOT / "model-catalog" / "models" / utils.model_slug(model) / context
+    path = folder / utils.catalog_file_name("h200", kind, lora)
+
+    body = _job_body("examples.rl.math_grpo.train", job_config=str(path), model=model, context=context, lora=lora)
+
+    # The file plus its sibling's other sub-job, sampling first: the catalog's RL
+    # composition without rl/overrides.json or router replay.
+    composed = utils.make_config(model, context, lora=lora, rl=True)
+    for sub in composed["sub_job_configs"]:
+        (sub.get("training_config") or sub.get("inference_config")).pop("router_replay", None)
+    assert [sub["job_type"] for sub in body["sub_job_configs"]] == ["sampling", "training"]
+    assert body["hardware"] == composed["hardware"]
+    assert _by_job_type(body) == _by_job_type(composed)
+
+
+def test_an_rl_job_config_with_both_sub_jobs_is_not_paired(tmp_path):
+    utils = _import_example("examples.utils")
+    record = utils.make_config("Qwen/Qwen3-8B", "standard", lora=True, rl=True)
+    path = tmp_path / "h200-training-lora.json"
+    path.write_text(json.dumps(record))
+    sibling = REPO_ROOT / "model-catalog/models/qwen3-8b/standard/h200-inference-lora.json"
+    (tmp_path / "h200-inference-lora.json").write_text(sibling.read_text())
+
+    assert utils.build_job("rl", model="Qwen/Qwen3-8B", context="standard", job_config=str(path)) == record
+
+
+def test_an_rl_job_config_without_a_sibling_keeps_the_composition_error(tmp_path):
+    utils = _import_example("examples.utils")
+    path = tmp_path / "h200-training-lora.json"
+    path.write_text((REPO_ROOT / "model-catalog/models/qwen3-8b/standard/h200-training-lora.json").read_text())
+
+    with pytest.raises(ValueError, match=r"has sub-jobs \['training'\]; a rl job needs exactly \['sampling', 'training'\]"):
+        utils.build_job("rl", model="Qwen/Qwen3-8B", context="standard", job_config=str(path))
+
+
 def test_overrides_json_sits_between_the_catalog_and_the_command_line(tmp_path):
     utils = _import_example("examples.utils")
     (tmp_path / "overrides.json").write_text(

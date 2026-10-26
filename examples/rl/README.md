@@ -56,6 +56,12 @@ For RL, the model's training and inference files are combined into one job, and
 shares: optimizer betas `(0.9, 0.95)`, `mb_spec.max_tokens_per_mb` 10240, and
 ZeRO `reduce_scatter`. Edit that file to change these for every run.
 
+`job_config=` also takes either file of a catalog pair, such as a model's
+`<hw>-training-<lora|full>.json` under `model-catalog/models/`: a file with only
+a training or only a sampling sub-job takes the other sub-job from the file
+beside it whose name swaps `-training-` and `-inference-`. The pair is used as
+is, without `rl/overrides.json` or router replay.
+
 Each run that creates its job from the catalog (not with `job_config=` or
 `job_id=`) writes the job it built to
 `examples/rl/configs/<slug>-<context>-<hw>-<lora|full>.json`, which is
