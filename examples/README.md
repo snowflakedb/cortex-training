@@ -120,6 +120,8 @@ Merge rules:
 - Other lists are replaced whole.
 - A `_comment` key, at any level, is a free-text note. It is stripped before
   merging.
+- If a merged training sub-job's `sp_size` or `ep_size` no longer divides its
+  `n_gpus`, the build stops with an error instead of submitting the job.
 
 For example, this override changes only the training learning rate:
 

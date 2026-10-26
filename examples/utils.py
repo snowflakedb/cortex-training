@@ -2216,7 +2216,9 @@ def build_job(
        ``max_seq_len``; ``None`` keeps the value from the layers below.
 
     The layers are merged by :func:`make_config`, which then fills in router
-    replay for an MoE RL job with the fixed default caps. A
+    replay for an MoE RL job with the fixed default caps. A merged training
+    sub-job whose ``sp_size``/``ep_size`` no longer divide its ``n_gpus`` is
+    rejected (see :func:`parallelism_errors`). A
     ``job_config`` file replaces the first two layers and is used as is: the
     command-line settings still apply, and nothing is planned. The source
     checkpoint (inference jobs) and the debug image tag are added last, and
@@ -2276,6 +2278,20 @@ def build_job(
             rollout_batch_size=rollout_batch_size if kind == "rl" else None,
             catalog_dir=catalog_dir,
         )
+        # The catalog files are valid on their own, but an override can change
+        # n_gpus without the model's sp_size/ep_size (DARE's 8 GPUs on a 16-GPU
+        # mesh, for example). Reject that here rather than submit a job no run can use.
+        for sub in body.get("sub_job_configs") or ():
+            if sub.get("job_type") != "training":
+                continue
+            topology = parallelism_errors(sub.get("training_config") or {})
+            if topology:
+                files = ", ".join(str(layer) for layer in layers if isinstance(layer, (str, os.PathLike)))
+                raise ValueError(
+                    f"{model} ({context}) training parallelism does not fit its GPU count after "
+                    f"{files or 'the overrides'}: " + "; ".join(topology) + ". Edit the override, "
+                    "pick another model, or pass job_config= with a job file of your own."
+                )
     if source_checkpoint is not None:
         if kind != "inference":
             raise ValueError("a source checkpoint starts an inference job")

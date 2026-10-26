@@ -776,6 +776,32 @@ def _catalog_selections(kind: str) -> list[tuple[str, str, str, bool]]:
     return selections
 
 
+@pytest.mark.parametrize(("model", "context", "hardware", "lora"), _catalog_selections("training"))
+def test_dare_builds_a_runnable_mesh_or_stops_for_every_catalog_training_file(model, context, hardware, lora):
+    utils = _import_example("examples.utils")
+
+    try:
+        body = _job_body("examples.sft.dare.train", model=model, context=context, hardware=hardware, lora=lora)
+    except ValueError as error:
+        # Rejected before submission, naming the override that broke the mesh.
+        assert "training parallelism does not fit its GPU count after" in str(error)
+        assert str(DARE_OVERRIDES) in str(error)
+        return
+    training = _sub_job(body, "training")["training_config"]
+    assert training["n_gpus"] == 8
+    assert utils.parallelism_errors(training) == []
+
+
+def test_dare_keeps_a_fitting_mesh_and_rejects_one_that_needs_more_gpus():
+    # Qwen3-30B-A3B's 4-GPU EP4 mesh still divides 8 GPUs.
+    training = _sub_job(_job_body("examples.sft.dare.train", model="Qwen/Qwen3-30B-A3B"), "training")["training_config"]
+    assert (training["n_gpus"], training["ep_size"]) == (8, 4)
+
+    # GLM-5.3-Flash-BF16 trains on a 16-GPU SP16/EP16 mesh, which 8 GPUs cannot hold.
+    with pytest.raises(ValueError, match=r"sp_size 16 must be a positive divisor of n_gpus 8; ep_size 16"):
+        _job_body("examples.sft.dare.train", model="zai-org/GLM-5.3-Flash-BF16")
+
+
 def _assert_serves_checkpoint(utils, training_sub: dict, args: dict) -> None:
     inference = utils.make_config(
         args["model"], args["context"], hardware=args["hardware"], lora=args["lora"], inference=True
