@@ -40,6 +40,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import filelock
+
 CONNECTIONS_FILE = "connections.toml"
 CONFIG_FILE = "config.toml"
 DEFAULT_PROFILE_ENV = "SNOWFLAKE_DEFAULT_CONNECTION_NAME"
@@ -199,22 +201,13 @@ def _locked(path: Path) -> Iterator[None]:
     """Hold an exclusive lock while the file is read, changed, and written.
 
     Uses a ``.<name>.lock`` file next to the real file, so two writers (two
-    ``login`` runs, say) can't lose each other's profiles. Where file locks
-    aren't available (Windows), writes still replace the file atomically.
+    ``login`` runs, say) can't lose each other's profiles. ``filelock`` works on
+    macOS, Linux, and Windows.
     """
-    try:
-        import fcntl
-    except ImportError:
-        yield
-        return
     target = _real(path)
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd = os.open(target.with_name(f".{target.name}.lock"), os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    with filelock.FileLock(target.with_name(f".{target.name}.lock"), mode=0o600):
         yield
-    finally:
-        os.close(fd)  # closing the file releases the lock
 
 
 def _replace(path: Path, text: str) -> None:

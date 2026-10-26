@@ -10,6 +10,7 @@ import textwrap
 import threading
 from pathlib import Path
 
+import filelock
 import pytest
 
 from cortex_training import _profiles
@@ -294,6 +295,26 @@ def test_concurrent_writers_keep_every_profile(snowflake_home):
     assert errors == []
     assert len(_profiles.read_profiles()) == 22  # default, other, and 20 new
     assert not [p.name for p in snowflake_home.iterdir() if p.name.endswith(".tmp")]
+
+
+def test_the_lock_is_held_while_the_file_is_written(snowflake_home, monkeypatch):
+    (snowflake_home / "connections.toml").write_text(CONNECTIONS_TOML)
+    lock_file = snowflake_home / ".connections.toml.lock"
+    real_replace = _profiles._replace
+    held = []
+
+    def replace(path, text):
+        try:
+            filelock.FileLock(lock_file, timeout=0).acquire()
+        except filelock.Timeout:
+            held.append(True)
+        real_replace(path, text)
+
+    monkeypatch.setattr(_profiles, "_replace", replace)
+    _profiles.write_profile("training", {"account": "ACME"})
+
+    assert held == [True]
+    assert stat.S_IMODE(lock_file.stat().st_mode) == 0o600
 
 
 def test_the_file_is_flushed_to_disk_before_it_replaces_the_old_one(snowflake_home, monkeypatch):

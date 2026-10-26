@@ -17,6 +17,7 @@ dependencies = [
     "snowflake-connector-python>=3.17.0,<5",
     # Used directly to read and write Snowflake profile files (see _profiles.py);
     # the ranges stay within snowflake-connector-python's own requirements.
+    "filelock>=3.10.0,<4",
     "platformdirs>=2.6.0,<5.0.0",
     "tomlkit>=0.11.0",
     "torch",
