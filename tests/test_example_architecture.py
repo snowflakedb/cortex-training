@@ -968,8 +968,8 @@ def _follow_up_body(module_name: str, args: dict[str, str]) -> dict:
             {"model": "zai-org/GLM-5.3", "context": "long", "hardware": "h200", "lora": "false", "max_seq_len": "65536"},
         ),
         (
-            {"model": "Qwen/Qwen3.5-9B", "context": "long", "lora": True},
-            {"model": "Qwen/Qwen3.5-9B", "context": "long", "hardware": "h200", "lora": "true"},
+            {"model": "Qwen/Qwen3.5-9B", "context": "standard", "lora": True},
+            {"model": "Qwen/Qwen3.5-9B", "context": "standard", "hardware": "h200", "lora": "true"},
         ),
     ],
 )

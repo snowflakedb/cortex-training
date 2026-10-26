@@ -28,7 +28,7 @@ python -m examples.rl.math_grpo.train config=/path/to/config.json \
 
 # Qwen3.8-27B full-parameter
 python -m examples.rl.math_grpo.train config=/path/to/config.json \
-  model=Qwen/Qwen3.8-27B context=long lora=false \
+  model=Qwen/Qwen3.8-27B lora=false \
   max_tokens=2048 weight_sync_bucket_size=3221225472
 ```
 
