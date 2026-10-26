@@ -791,19 +791,25 @@ def _catalog_selections(kind: str) -> list[tuple[str, str, str, bool]]:
 @pytest.mark.parametrize(("model", "context", "hardware", "lora"), _catalog_selections("training"))
 def test_dare_builds_a_runnable_mesh_or_stops_for_every_catalog_training_file(model, context, hardware, lora):
     utils = _import_example("examples.utils")
+    catalog = utils.make_config(model, context, hardware=hardware, lora=lora)["sub_job_configs"][0]["training_config"]
+    # DARE's ds_config nulls let the server derive the batch, so only the catalog
+    # file's own sp_size/ep_size can fail to fit 8 GPUs.
+    reasons = utils.parallelism_errors(dict(catalog, n_gpus=8))
 
-    try:
-        body = _job_body("examples.sft.dare.train", model=model, context=context, hardware=hardware, lora=lora)
-    except ValueError as error:
-        # Rejected before submission, naming the override and why the mesh broke.
-        assert "training parallelism does not fit its GPU count after" in str(error)
-        assert str(DARE_OVERRIDES) in str(error)
-        assert "must be a positive divisor of n_gpus 8" in str(error) or "ds_config train_batch_size" in str(error)
+    if reasons:
+        # Rejected before submission, naming the override and each reason.
+        with pytest.raises(ValueError) as raised:
+            _job_body("examples.sft.dare.train", model=model, context=context, hardware=hardware, lora=lora)
+        message = str(raised.value)
+        assert "training parallelism does not fit its GPU count after" in message
+        assert str(DARE_OVERRIDES) in message
+        assert all(reason in message for reason in reasons), message
         return
+    body = _job_body("examples.sft.dare.train", model=model, context=context, hardware=hardware, lora=lora)
     training = _sub_job(body, "training")["training_config"]
     assert training["n_gpus"] == 8
     assert utils.parallelism_errors(training) == []
-    assert utils.deepspeed_batch_errors(training) == []
+    assert utils._deepspeed_batch_errors(training) == []
     # DeepSpeed's batch, as the server builds it, fits the 8-GPU layout.
     ds_batch, micro, accumulation, ranks = _server_deepspeed_batch(training)
     assert ds_batch == micro * accumulation * ranks
