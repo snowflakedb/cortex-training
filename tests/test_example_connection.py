@@ -335,13 +335,13 @@ def test_example_config_is_optional_and_takes_a_connection(module_name):
 
 def _capture_from_pat(env):
     calls = []
-    real = CortexTrainingClient.from_pat.__func__
+    real = CortexTrainingClient._from_pat.__func__
 
     def spy(cls, **kwargs):
         calls.append(kwargs)
         return real(cls, **kwargs)
 
-    env.setattr(CortexTrainingClient, "from_pat", classmethod(spy))
+    env.setattr(CortexTrainingClient, "_from_pat", classmethod(spy))
     return calls
 
 

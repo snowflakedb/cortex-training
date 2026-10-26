@@ -99,6 +99,7 @@ from cortex_training.client import _account_jobs
 from cortex_training.client._account_jobs import AccountJobListUnavailable  # noqa: F401 - exported
 from cortex_training.client._account_jobs import InvalidPageToken  # noqa: F401 - exported
 from cortex_training.client.auth import SnowflakeProfileAuth
+from cortex_training.client.auth import SnowflakeProfileError
 from cortex_training.client.auth import SnowflakeTelemetryTokenProvider
 from cortex_training.client.auth import rest_host
 from cortex_training.client.optimizer import normalize_optimizer_config
@@ -2604,7 +2605,6 @@ class CortexTrainingClient:
         ``verify_ssl``, ...) go to the constructor.
         """
         from cortex_training import _picker
-        from cortex_training.snowflake_auth import SnowflakeProfileError
 
         resolution = _picker.resolve(connection=connection, database=database, schema=schema)
         logger.info("Cortex Training target: %s", resolution.describe())

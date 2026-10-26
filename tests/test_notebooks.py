@@ -85,7 +85,7 @@ def test_the_first_cell_builds_the_client_from_the_whole_connection_file(name, m
         captured.update(kwargs)
         return object()
 
-    monkeypatch.setattr(cortex_training.CortexTrainingClient, "from_pat", staticmethod(fake_from_pat))
+    monkeypatch.setattr(cortex_training.CortexTrainingClient, "_from_pat", staticmethod(fake_from_pat))
     config_file = tmp_path / "conn.json"
     config_file.write_text(
         json.dumps(

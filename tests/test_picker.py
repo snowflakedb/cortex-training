@@ -8,7 +8,7 @@ import pytest
 
 from cortex_training import _picker
 from cortex_training.client import CortexTrainingClient
-from cortex_training.snowflake_auth import SnowflakeProfileError
+from cortex_training.client.auth import SnowflakeProfileError
 
 CONNECTIONS_TOML = """\
 [default]
