@@ -10,6 +10,7 @@ These JSON files demonstrate individual Cortex Training request bodies:
 | `external-weights-training.json` | Create a training sub-job initialized from a Hugging Face model directory uploaded to a stage |
 | `fwd-bwd.json` | Submit a readable forward/backward batch |
 | `generate.json` | Submit prompts for generation |
-| `glm-5.3-sampling.json` | Create a single-node GLM-5.3 sampling sub-job on 8 H200 GPUs with an FP8 MLA KV cache and a reasoning parser |
+| `glm-sampling.json` | Create a 16-GPU GLM-5.2-FP8 sampling sub-job with a 1M-token context and an FP8 MLA KV cache |
+| `model-deployment-checkpoint.json` | Create an evaluation model deployment from a weights-only checkpoint (`cortex-training model-deployment create --spec`; not a CreateJob body) |
 
 They are wire-format examples, not end-to-end training recipes.

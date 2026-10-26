@@ -25,6 +25,28 @@ import pytest
 from cortex_training.snowflake_auth import SnowflakeProfileAuth
 from cortex_training.snowflake_auth import SnowflakeProfileError
 from cortex_training.snowflake_auth import SnowflakeTelemetryTokenProvider
+from cortex_training.snowflake_auth import rest_host
+
+
+class FakeCursor:
+    def __init__(self, columns=(), rows=(), error: Exception | None = None) -> None:
+        self.description = [(name, None) for name in columns] if columns else None
+        self._rows = list(rows)
+        self._error = error
+        self.executed = []
+        self.closed = False
+
+    def execute(self, statement, **kwargs):
+        self.executed.append((statement, kwargs))
+        if self._error is not None:
+            raise self._error
+        return self
+
+    def fetchall(self):
+        return self._rows
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class FakeConnection:
@@ -34,11 +56,17 @@ class FakeConnection:
         server_url: str = "https://account.example:8443",
         database: str | None = "DB",
         schema: str | None = "SCHEMA",
+        cursor: FakeCursor | None = None,
     ) -> None:
         self.rest = SimpleNamespace(token=token, server_url=server_url)
         self.database = database
         self.schema = schema
+        self.role = "TRAINER"
         self.close_count = 0
+        self._cursor = cursor or FakeCursor()
+
+    def cursor(self) -> FakeCursor:
+        return self._cursor
 
     def close(self) -> None:
         self.close_count += 1
@@ -59,6 +87,31 @@ def test_named_profile_is_delegated_to_connector() -> None:
     assert auth.database == "DB"
     assert auth.schema == "SCHEMA"
     assert auth.get_token() == "session-token"
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        ("my_acct.us-west-2.aws.snowflakecomputing.com", "my-acct.us-west-2.aws.snowflakecomputing.com"),
+        ("ORG-MY_ACCT.snowflakecomputing.com:443", "ORG-MY-ACCT.snowflakecomputing.com:443"),
+        ("my_acct.region.snowflakecomputing.cn", "my-acct.region.snowflakecomputing.cn"),
+        ("acct.privatelink.snowflakecomputing.com", "acct.privatelink.snowflakecomputing.com"),
+        # Only the account label changes.
+        ("my_acct.my_region.snowflakecomputing.com", "my-acct.my_region.snowflakecomputing.com"),
+        # Hosts outside Snowflake's domains are left alone.
+        ("my_host.example.com", "my_host.example.com"),
+        ("test.local:8080", "test.local:8080"),
+    ],
+)
+def test_rest_host(host: str, expected: str) -> None:
+    assert rest_host(host) == expected
+
+
+def test_profile_base_url_uses_dashes_in_the_account_label() -> None:
+    connection = FakeConnection(server_url="https://my_acct.us-west-2.aws.snowflakecomputing.com:443")
+    auth = SnowflakeProfileAuth("training-profile", connect_factory=lambda **_: connection)
+
+    assert auth.base_url == "https://my-acct.us-west-2.aws.snowflakecomputing.com:443"
 
 
 def test_default_profile_calls_connector_without_arguments() -> None:
@@ -244,3 +297,12 @@ def test_rejected_pat_error_points_to_network_policy(exc) -> None:
     assert "Snowflake rejected your programmatic access token (PAT)." in message
     assert "Your user has no network policy." in message
     assert "authentication.md#network-policy-requirement" in message
+
+
+def test_role_comes_from_the_connection_without_sql() -> None:
+    connection = FakeConnection()
+    auth = SnowflakeProfileAuth("training-profile", connect_factory=lambda **_: connection)
+    assert auth.role == "TRAINER"
+    assert connection._cursor.executed == []
+    connection.role = None
+    assert auth.role is None

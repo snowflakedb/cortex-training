@@ -15,9 +15,11 @@
 
 """Unit tests for the TUI log cache (no ``textual`` dependency)."""
 
+import json
 from pathlib import Path
 
 import pytest
+import requests
 
 from cortex_training.tui.log_cache import LogCache
 from cortex_training.tui.log_cache import cache_root
@@ -166,6 +168,31 @@ def test_rotation_trims_oldest_keeps_cursor(tmp_path):
     assert c.get_cursor("s") == "CUR"  # cursor untouched by rotation
 
 
+def test_rotation_leaves_room_so_appends_at_the_cap_rarely_rewrite_the_file(tmp_path, monkeypatch):
+    import cortex_training.tui.log_cache as log_cache
+
+    c = _cache(tmp_path, max_bytes=10_000, max_lines=1_000)
+    rewrites = []
+    write = log_cache._atomic_write_text
+
+    def counted(path, text):
+        if path.suffix == ".jsonl":
+            rewrites.append(len(text.encode("utf-8")))
+        write(path, text)
+
+    monkeypatch.setattr(log_cache, "_atomic_write_text", counted)
+    for i in range(400):  # a line of about 100 bytes at a time: 40 KB through a 10 KB cache
+        c.append_entries("s", [{"i": i, "pad": "x" * 80}])
+    # A trim leaves 8 KB, so some twenty appends go in before the next one. Cut to just
+    # under the cap, every append after the first trim (about 300) rewrote the file.
+    assert 5 <= len(rewrites) <= 20, len(rewrites)
+    assert all(size <= 8_000 for size in rewrites)
+    loaded = c.load_entries("s")
+    assert loaded[-1]["i"] == 399 and [e["i"] for e in loaded] == list(range(loaded[0]["i"], 400))
+    assert c._jsonl_path("s").stat().st_size <= 10_000
+    assert c.head_missing("s")
+
+
 # ─── cached_pages: replay then resume ────────────────────────────────────
 
 
@@ -241,6 +268,46 @@ def test_cached_pages_follow_keeps_polling_past_eof(tmp_path):
     out = _drive(c, "s", client, follow=True, is_cancelled=cancelled)
     assert out == []
     assert client.calls >= 2  # kept polling despite eof (follow=True)
+
+
+# ─── cached_pages: a job that has yet to be placed ───────────────────────
+
+# The two answers tail-logs gives with a 409, which only the message tells apart.
+_PENDING = "Cortex training operation failed: session JOB_ID is pending placement: quota_filled"
+_CANCELLED = "Cortex training operation failed: session JOB_ID has been cancelled: cancelled_by_client"
+
+
+class _Failing:
+    """tail_logs raising the service's ``status`` and ``message`` ``times`` times, then answering ``page``."""
+
+    def __init__(self, status, message, times=1, page=None):
+        resp = requests.Response()
+        resp.status_code, resp.encoding = status, "utf-8"
+        resp._content = json.dumps({"message": message, "code": "510200"}).encode()
+        self.error = requests.exceptions.HTTPError(response=resp)
+        self.times, self.page, self.calls = times, page, 0
+
+    def tail_logs(self, job_id, source_id, *, cursor=None, sub_job_id=None):
+        self.calls += 1
+        if self.calls <= self.times:
+            raise self.error
+        return self.page
+
+
+@pytest.mark.parametrize(
+    ("status", "message", "follow"),
+    [
+        (409, _CANCELLED, True),  # the session is over: the TUI falls back to the saved log
+        (404, "session not found", True),
+        (409, _PENDING, False),  # draining the log once, there is nothing to wait for
+        (409, _PENDING, True),  # following too: the log screen, not the tail, waits for placement
+    ],
+)
+def test_cached_pages_raises_a_failed_fetch_to_the_caller(tmp_path, status, message, follow):
+    client = _Failing(status, message)
+    with pytest.raises(requests.exceptions.HTTPError):
+        _drive(_cache(tmp_path), "s", client, follow=follow)
+    assert client.calls == 1
 
 
 def test_cached_pages_cancel_during_replay(tmp_path):
@@ -333,3 +400,46 @@ def test_cached_pages_throttles_active_polling(tmp_path):
     # First two sleeps follow entries pages (active branch) — proves the floor
     # applies when busy, not just when idle.
     assert sleeps[0] == 2.0 and sleeps[1] == 2.0
+
+
+def test_poll_backoff_never_undercuts_a_slow_poll_interval(tmp_path):
+    sleeps = []
+    list(
+        cached_pages(
+            _cache(tmp_path),
+            "s",
+            lambda _cursor: {"entries": [], "next_cursor": ""},
+            entries_key="entries",
+            follow=True,
+            poll_interval=30.0,
+            sleep=sleeps.append,
+            is_cancelled=lambda: len(sleeps) == 3,
+        )
+    )
+    assert sleeps == [30.0, 30.0, 30.0]
+
+
+def test_cached_pages_hold_pauses_fetching_then_resumes_from_cursor(tmp_path):
+    c = _cache(tmp_path)
+    c.append_entries("src", [{"msg": "old"}])
+    c.set_cursor("src", "5")
+    held = [True]
+    sleeps = []
+    cursors = []
+
+    def fetch(cursor):
+        cursors.append(cursor)
+        return {"entries": [{"msg": "new"}], "next_cursor": "6"}
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 3:
+            held[0] = False  # the Logs tab is back on screen
+
+    pages = cached_pages(
+        c, "src", fetch, entries_key="entries", follow=True, poll_interval=1.0, sleep=sleep, hold=lambda: held[0]
+    )
+    assert next(pages) == ("cache", [{"msg": "old"}])
+    assert next(pages) == ("live", [{"msg": "new"}])
+    # Nothing was fetched while held; the tail resumed from the saved cursor.
+    assert len(sleeps) == 3 and cursors == ["5"]

@@ -36,6 +36,8 @@ import json
 import logging
 import os
 import sys
+import warnings
+import tempfile
 import threading
 import time
 from datetime import date
@@ -124,6 +126,8 @@ def _make_error_response(json_body, status_code: int = 409):
     resp.url = "http://test.local/error"
     resp.headers["Content-Type"] = "application/json"
     resp._content = json.dumps(json_body).encode("utf-8")
+    # As after requests reads a non-streamed body, so close() needs no connection.
+    resp._content_consumed = True
     return resp
 
 
@@ -171,6 +175,21 @@ class TestTrainingConfig:
     def test_validate_rejects_empty_optimizer(self):
         with pytest.raises(ValidationError, match="optimizer"):
             TrainingConfig(optimizer={}, max_seq_len=128, train_batch_size=1, n_gpus=2)
+
+    @pytest.mark.parametrize("stage", [3, "3"])
+    def test_validate_rejects_zero_stage_3(self, stage):
+        with pytest.raises(ValidationError, match=r"training\.extra\.ds_config\.zero_optimization\.stage=3 \(ZeRO-3\)"):
+            TrainingConfig(
+                optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+                ds_config={"zero_optimization": {"stage": stage}},
+            )
+
+    @pytest.mark.parametrize("stage", [0, 1, 2])
+    def test_validate_accepts_zero_stages_below_3(self, stage):
+        TrainingConfig(
+            optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+            ds_config={"zero_optimization": {"stage": stage}},
+        )
 
     def test_validate_accepts_nested_primerl_fused_ce_false(self):
         TrainingConfig(
@@ -804,6 +823,14 @@ class TestClientConstruction:
         assert c._metric_emitter is not None
         assert c._metric_emitter.timeout == 3.0
 
+    def test_from_pat_uses_dashes_in_the_rest_host(self):
+        c = CortexTrainingClient.from_pat(
+            host="org-my_acct.snowflakecomputing.com", pat="p", database="DB", schema="SCH"
+        )
+        assert c.base_url == "https://org-my-acct.snowflakecomputing.com"
+        # The Connector accepts either form, so artifact connections keep the host as given.
+        assert c._artifact_connection_config["host"] == "org-my_acct.snowflakecomputing.com"
+
     def test_from_pat_skips_telemetry_when_disabled(self, monkeypatch):
         monkeypatch.setenv(nc.DISABLE_TELEMETRY_ENV, "1")
         c = CortexTrainingClient.from_pat(
@@ -978,6 +1005,10 @@ class TestOperationMetrics:
         "get_capacity_breakdown",
         "get_experiment_run",
         "fetch_execution_logs",
+        "download_execution_logs",
+        "download_stdout_logs",
+        "download_metrics",
+        "download_training_metrics",
         "forward_backward",
         "generate",
         "generate_stream",
@@ -995,6 +1026,7 @@ class TestOperationMetrics:
         "list_checkpoints",
         "export_checkpoint",
         "delete_checkpoint",
+        "tail_logs",
     }
 
     def test_essential_operations_are_tracked(self):
@@ -1025,7 +1057,7 @@ class TestOperationMetrics:
         assert value["attempt_count"] == 1
         assert value["request_count"] == 1
         assert value["retry_count"] == 0
-        assert attributes == {"job_id": "job-1", "request_id": "r1"}
+        assert attributes == {"client.surface": "sdk", "job_id": "job-1", "request_id": "r1"}
 
     def test_client_validation_error_metric_preserves_original_error(self):
         c = _make_client()
@@ -1043,6 +1075,7 @@ class TestOperationMetrics:
         assert value["retry_count"] == 0
         assert "checkpoint_type" in value["error_message"]
         assert attributes == {
+            "client.surface": "sdk",
             "job_id": "job-1",
             "error.type": "ValueError",
         }
@@ -1069,6 +1102,7 @@ class TestOperationMetrics:
         assert value["retry_count"] == 0
         assert "snowflake request id: sf-request-1" in value["error_message"]
         assert attributes == {
+            "client.surface": "sdk",
             "job_id": "job-1",
             "error.type": "HTTPError",
             "error.http_status": 400,
@@ -1497,7 +1531,7 @@ class TestOperationMetrics:
         attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
         assert operation == "create_job"
         assert value["success"] is True
-        assert attributes == {"job_id": "server-job"}
+        assert attributes == {"client.surface": "sdk", "job_id": "server-job"}
 
     def test_sub_job_identity_is_included(self, monkeypatch):
         monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "1")
@@ -1512,6 +1546,7 @@ class TestOperationMetrics:
 
         attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
         assert attributes == {
+            "client.surface": "sdk",
             "job_id": "job-1",
             "source_sub_job_id": "job-1:training:0",
             "target_sub_job_ids": ["job-1:sampling:0"],
@@ -1528,7 +1563,7 @@ class TestOperationMetrics:
         c.forward_backward("job-1", b"customer-payload")
 
         attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
-        assert attributes == {"job_id": "job-1", "request_id": "r1"}
+        assert attributes == {"client.surface": "sdk", "job_id": "job-1", "request_id": "r1"}
         assert "customer-payload" not in repr(c._metric_emitter.emit.call_args)
 
     def test_error_message_redacts_obvious_secrets(self):
@@ -1602,6 +1637,125 @@ class TestOperationMetrics:
 
         c._metric_emitter.emit.assert_called_once()
         assert c._metric_emitter.emit.call_args.args[0] == "wait_for_job"
+
+
+class TestTelemetrySurface:
+    """Every metric says which program made the call: sdk, cli or tui."""
+
+    @pytest.fixture(autouse=True)
+    def _default_success_policy(self, monkeypatch):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+
+    def _client(self, surface=None, **responses):
+        c = _make_client(**responses)
+        c._metric_emitter = MagicMock()
+        if surface is not None:
+            c._telemetry_surface = surface
+        return c
+
+    def _attributes(self, c):
+        return [call.kwargs["attributes"] for call in c._metric_emitter.emit.call_args_list]
+
+    def test_a_client_is_sdk_until_an_entry_point_says_otherwise(self):
+        c = self._client()
+        c._session.get.return_value = _make_error_response({"message": "bad"}, 400)
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.get_job("job-1")
+
+        assert self._attributes(c)[0][nc.SURFACE_ATTRIBUTE] == nc.SDK_SURFACE == "sdk"
+
+    @pytest.mark.parametrize(
+        ("operation", "call"),
+        [
+            ("get_job", lambda c: c.get_job("job-1")),
+            ("list_jobs", lambda c: c.list_jobs()),
+            ("list_jobs_page", lambda c: c.list_jobs_page()),
+            ("list_checkpoints", lambda c: c.list_checkpoints("job-1")),
+        ],
+    )
+    def test_a_tui_client_reports_each_success_with_its_timing(self, operation, call):
+        c = self._client(nc.TUI_SURFACE, get_json={"job_id": "job-1", "jobs": [], "checkpoints": []})
+
+        call(c)
+
+        c._metric_emitter.emit.assert_called_once()
+        name, value = c._metric_emitter.emit.call_args.args
+        assert name == operation
+        assert value["success"] is True and value["duration_ms"] >= 0
+        assert self._attributes(c)[0][nc.SURFACE_ATTRIBUTE] == "tui"
+
+    @pytest.mark.parametrize("surface", [nc.SDK_SURFACE, nc.CLI_SURFACE])
+    def test_the_same_calls_from_sdk_or_cli_code_stay_failure_only(self, surface):
+        c = self._client(surface, get_json={"job_id": "job-1"})
+
+        c.get_job("job-1")
+
+        c._metric_emitter.emit.assert_not_called()
+
+    # The operations whose successes every program sends by default, as the Client
+    # metrics section of the Python SDK reference names them.
+    DEFAULT_SUCCESS_OPERATIONS = {
+        "download_stdout_logs",
+        "download_metrics",
+        "download_training_metrics",
+        "download_execution_logs",
+        "fetch_execution_logs",
+    }
+
+    @pytest.mark.parametrize("surface", [nc.SDK_SURFACE, nc.CLI_SURFACE, nc.TUI_SURFACE])
+    def test_by_default_only_the_downloads_and_the_tui_send_successes(self, surface):
+        # Every operation a metric can name: create_job_from_body reports as create_job, the
+        # job-list pages as iter_jobs and list_jobs_page, and the TUI's file download on its own.
+        operations = (TestOperationMetrics.TRACKED_METHODS - {"create_job_from_body"}) | {
+            "iter_jobs", "list_jobs_page", "download_checkpoint"}
+
+        sent = {operation for operation in operations if nc._success_telemetry_enabled(operation, surface)}
+
+        assert sent == (operations if surface == nc.TUI_SURFACE else self.DEFAULT_SUCCESS_OPERATIONS)
+
+    def test_an_explicit_setting_still_wins_on_the_tui(self, monkeypatch):
+        monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "0")
+        c = self._client(nc.TUI_SURFACE, get_json={"job_id": "job-1"})
+
+        c.get_job("job-1")
+        c._metric_emitter.emit.assert_not_called()
+
+        c._session.get.return_value = _make_error_response({"message": "bad"}, 400)
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.get_job("job-1")
+        # Failures are always sent, and still say where they came from.
+        assert [attributes[nc.SURFACE_ATTRIBUTE] for attributes in self._attributes(c)] == ["tui"]
+
+    def test_a_tui_client_s_per_job_clients_report_as_the_tui(self):
+        c = self._client(nc.TUI_SURFACE, get_json={"job_id": "j1"})
+
+        c.for_job({"job_id": "j1", "database_name": "ML", "schema_name": "EXP"}).get_job("j1")
+
+        assert self._attributes(c) == [{"client.surface": "tui", "job_id": "j1"}]
+
+    def test_custom_metrics_carry_the_surface_unless_they_name_one(self):
+        c = self._client(nc.CLI_SURFACE)
+
+        c.emit_metric("custom", {"n": 1}, attributes={"job_id": "job-1"})
+        c.emit_metric("custom", {"n": 2}, attributes={nc.SURFACE_ATTRIBUTE: "notebook"})
+        c.emit_metric("custom")
+
+        assert self._attributes(c) == [
+            {"client.surface": "cli", "job_id": "job-1"},
+            {"client.surface": "notebook"},
+            {"client.surface": "cli"},
+        ]
+
+    def test_with_telemetry_off_a_tui_client_has_nothing_to_send_with(self, monkeypatch):
+        monkeypatch.setenv(nc.DISABLE_TELEMETRY_ENV, "1")
+        monkeypatch.setattr(nc, "OtlpMetricEmitter", MagicMock(side_effect=AssertionError("built an emitter")))
+        c = CortexTrainingClient.from_pat(host="account.test", pat="pat", database="DB", schema="SCH")
+        c._telemetry_surface = nc.TUI_SURFACE
+
+        c.emit_metric("custom", {"n": 1})
+
+        assert c._metric_emitter is None
 
 
 # ─── CortexTrainingClient — create_job ────────────────────────────────────────
@@ -2007,6 +2161,25 @@ class TestCreateJob:
         with pytest.raises(
             ValueError,
             match=r"sub_job_configs\[0\]\.training_config\.peft_config\.peft_type",
+        ):
+            c.create_job_from_body(body)
+        c._session.post.assert_not_called()
+
+    def test_create_job_from_body_rejects_zero_stage_3_before_post(self):
+        c = _make_client()
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": "training",
+                    "model_name": "gpt2",
+                    "training_config": {"ds_config": {"zero_optimization": {"stage": 3}}},
+                },
+            ],
+        }
+
+        with pytest.raises(
+            ValueError,
+            match=r"sub_job_configs\[0\]\.training_config\.ds_config\.zero_optimization\.stage=3 \(ZeRO-3\)",
         ):
             c.create_job_from_body(body)
         c._session.post.assert_not_called()
@@ -2524,11 +2697,8 @@ class TestIterJobs:
         with pytest.raises(nc.requests.exceptions.HTTPError, match="400 Client Error"):
             list(c.iter_jobs(database="NOPE"))
 
-        # The same response on a schema route would run CREATE DATABASE DB.
-        assert c._is_database_not_found(c._session.get.return_value)
         c._session.get.assert_called_once()
         c._session.post.assert_not_called()
-        assert c._db_ensured is False
 
     def test_other_transient_errors_are_still_retried(self, monkeypatch):
         monkeypatch.setattr(
@@ -2573,8 +2743,8 @@ class TestIterJobs:
         assert [call.args[1]["success"] for call in calls] == [True, False]
         assert [call.args[1]["request_count"] for call in calls] == [1, 1]
         assert [call.kwargs["attributes"] for call in calls] == [
-            {},
-            {"error.type": "HTTPError", "error.http_status": 404},
+            {"client.surface": "sdk"},
+            {"client.surface": "sdk", "error.type": "HTTPError", "error.http_status": 404},
         ]
         assert "jdoe" not in repr(calls)
 
@@ -2625,6 +2795,7 @@ class TestForJob:
         c._auth_provider = MagicMock()
         c._auth_provider.get_token.return_value = "tok"
         c._metric_emitter = MagicMock()
+        c._telemetry_surface = nc.TUI_SURFACE
         c._artifact_connection_config = {"host": "x.test", "pat": "pat"}
         c._artifact_connection_factory = MagicMock()
 
@@ -2636,6 +2807,7 @@ class TestForJob:
         assert job_client._session is c._session
         assert job_client._auth_provider is c._auth_provider
         assert job_client._metric_emitter is c._metric_emitter
+        assert job_client._telemetry_surface == nc.TUI_SURFACE
         assert job_client._artifact_connection_config is c._artifact_connection_config
         assert job_client._artifact_connection_factory is c._artifact_connection_factory
         assert (
@@ -2702,9 +2874,7 @@ class TestForJob:
 
         # The listed database already exists and may belong to another role, so
         # the not-found answer surfaces instead of a CREATE DATABASE for it.
-        assert c._is_database_not_found(c._session.get.return_value)
         c._session.post.assert_not_called()
-        assert job_client._db_ensured is False
 
     def test_returns_a_client_of_the_same_class(self):
         class SubClient(CortexTrainingClient):
@@ -3185,7 +3355,7 @@ class TestCapacityBreakdown:
         assert value["request_count"] == 1
         assert value["attempt_count"] == 1
         # The result names the caller, so none of it becomes part of the metric.
-        assert attributes == {}
+        assert attributes == {"client.surface": "sdk"}
         assert "ALICE" not in repr(c._metric_emitter.emit.call_args)
 
     def test_bad_dimensions_record_a_failed_operation_without_a_request(self):
@@ -3202,7 +3372,7 @@ class TestCapacityBreakdown:
         assert operation == "get_capacity_breakdown"
         assert value["success"] is False
         assert value["request_count"] == 0
-        assert attributes == {"error.type": "ValueError"}
+        assert attributes == {"client.surface": "sdk", "error.type": "ValueError"}
 
     def test_get_capacity_still_returns_only_the_six_totals(self):
         c = _make_client(get_json=_CAPACITY_BREAKDOWN_BODY)
@@ -4807,8 +4977,9 @@ class TestExecutionLogDownload:
             self.commands = []
             self.closed = False
             self.close_count = 0
-            self.on_get = on_get
             self.raise_on_close = False
+            # Called with the source URI before a GET writes its file; may block or raise.
+            self.on_get = on_get
 
         class Cursor:
             def __init__(self, connection):
@@ -4829,11 +5000,11 @@ class TestExecutionLogDownload:
                     source_literal, target_literal = statement.removeprefix("GET ").split(" ", 1)
                     source = self._unquote(source_literal)
                     target_uri = self._unquote(target_literal)
+                    if self.connection.on_get is not None:
+                        self.connection.on_get(source)
                     target = Path(unquote(urlparse(target_uri).path))
                     target.mkdir(parents=True, exist_ok=True)
                     assert not list(target.iterdir())
-                    if self.connection.on_get is not None:
-                        self.connection.on_get(source)
                     (target / PurePosixPath(source).name).write_bytes(
                         self.connection.content_by_uri[source]
                     )
@@ -4915,7 +5086,11 @@ class TestExecutionLogDownload:
         connect = MagicMock(return_value=connected)
         monkeypatch.setattr(connector, "connect", connect)
         assert c._open_experiment_artifact_connection() is connected
-        connect.assert_called_once_with(**kwargs)
+        # Without the Connector's cloud-metadata probes, which add up to seconds to a login.
+        assert "platform_detection_timeout_seconds" in importlib.import_module(
+            "snowflake.connector.connection"
+        ).DEFAULT_CONFIGURATION
+        connect.assert_called_once_with(**kwargs, platform_detection_timeout_seconds=0.0)
 
     def test_get_experiment_run_calls_endpoint(self):
         c = _make_client(
@@ -5087,13 +5262,91 @@ class TestExecutionLogDownload:
         )
 
         with pytest.raises(gzip.BadGzipFile):
-            getattr(c, method_name)("job-1", tmp_path)
+            getattr(c, method_name)("job-1", tmp_path, strict=True)
 
         assert destination.read_bytes() == b"previous\n"
         assert not list(destination.parent.glob(".*.tmp"))
         assert connection.closed
 
-    def test_download_metrics_rejects_duplicate_roots_before_get(
+    def test_the_two_metric_streams_are_reconstructed_into_their_own_files(
+        self, tmp_path, monkeypatch
+    ):
+        """The GPU chunks and the zone's training chunks share ``_metrics/`` but are
+        separate streams: each download takes only its own chunks and writes its own
+        file, so training rows are never concatenated into ``gpu.jsonl``."""
+        c = _make_client()
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        sub_job_id = "job-1:training:0"
+        gpu = f"_metrics/{sub_job_id}/gpu.20260904-120001.a.gz"
+        training_first = f"_metrics/{sub_job_id}/training.20260904-120002.a.gz"
+        training_second = f"_metrics/{sub_job_id}/training.20260904-120003.b.gz"
+        connection = self.FakeArtifactConnection(
+            {
+                run_uri + "_metrics/": [
+                    (f"/versions/RUN_ABC/{gpu}",),
+                    (f"/versions/RUN_ABC/{training_first}",),
+                    (f"/versions/RUN_ABC/{training_second}",),
+                ],
+                run_uri + "checkpoints/_metrics/": [],
+            },
+            {
+                run_uri + gpu: gzip.compress(b'{"gpu_util_pct": 90}\n'),
+                run_uri + training_first: gzip.compress(b'{"kind": "training", "step": 1}\n'),
+                run_uri + training_second: gzip.compress(b'{"kind": "training", "step": 2}\n'),
+            },
+        )
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(
+            c, "_open_experiment_artifact_connection", lambda: connection
+        )
+
+        metrics = c.download_metrics("job-1", tmp_path)
+        training = c.download_training_metrics("job-1", tmp_path)
+
+        assert (tmp_path / sub_job_id / "gpu.jsonl").read_bytes() == b'{"gpu_util_pct": 90}\n'
+        assert (tmp_path / sub_job_id / "training.jsonl").read_bytes() == (
+            b'{"kind": "training", "step": 1}\n{"kind": "training", "step": 2}\n'
+        )
+        assert metrics[0]["chunk_count"] == 1
+        assert training[0]["chunk_count"] == 2
+        # Each stream keeps its own resume manifest beside its own file.
+        assert (tmp_path / sub_job_id / ".gpu.jsonl.manifest.json").exists()
+        assert (tmp_path / sub_job_id / ".training.jsonl.manifest.json").exists()
+
+    def test_a_sub_job_without_training_chunks_is_not_warned_about(
+        self, tmp_path, monkeypatch
+    ):
+        """Unlike the GPU stream, a sub-job with saved stdout and no training chunks
+        gets no warning: only training sub-jobs write them, and only where the
+        deployment saves them."""
+        c = _make_client()
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        sub_job_id = "job-1:training:0"
+        training = f"_metrics/{sub_job_id}/training.20260904-120001.a.gz"
+        connection = self.FakeArtifactConnection(
+            {
+                run_uri + "_metrics/": [(f"/versions/RUN_ABC/{training}",)],
+                run_uri + "checkpoints/_metrics/": [],
+                run_uri + "_stdout/": [
+                    (f"/versions/RUN_ABC/_stdout/job-1:sampling:0/console.20260904-120001.a.gz",),
+                ],
+            },
+            {run_uri + training: gzip.compress(b'{"kind": "training", "step": 1}\n')},
+        )
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(
+            c, "_open_experiment_artifact_connection", lambda: connection
+        )
+        monkeypatch.setattr(
+            c, "_job_for_upload_warnings", lambda _: ({"status": "SUCCEEDED"}, None)
+        )
+
+        result = c.download_training_metrics("job-1", tmp_path)
+
+        assert [entry["sub_job_id"] for entry in result] == [sub_job_id]
+        assert not result[0].get("warnings")
+
+    def test_download_metrics_merges_chunks_from_both_roots_in_time_order(
         self, tmp_path, monkeypatch
     ):
         c = _make_client()
@@ -5101,24 +5354,46 @@ class TestExecutionLogDownload:
         sub_job_id = "job-1:training:0"
         first = f"_metrics/{sub_job_id}/gpu.20260904-120001.first.gz"
         second = f"checkpoints/_metrics/{sub_job_id}/gpu.20260904-120002.second.gz"
+        third = f"_metrics/{sub_job_id}/gpu.20260904-120003.third.gz"
+        both = "gpu.20260904-120004.both.gz"
         connection = self.FakeArtifactConnection(
             {
-                run_uri + "_metrics/": [(f"/versions/RUN_ABC/{first}",)],
-                run_uri + "checkpoints/_metrics/": [
-                    (f"/versions/RUN_ABC/{second}",)
+                run_uri + "_metrics/": [
+                    (f"/versions/RUN_ABC/{first}",),
+                    (f"/versions/RUN_ABC/{third}",),
+                    (f"/versions/RUN_ABC/_metrics/{sub_job_id}/{both}",),
                 ],
-            }
+                run_uri + "checkpoints/_metrics/": [
+                    (f"/versions/RUN_ABC/{second}",),
+                    (f"/versions/RUN_ABC/checkpoints/_metrics/{sub_job_id}/{both}",),
+                ],
+            },
+            {
+                run_uri + first: gzip.compress(b"1\n"),
+                run_uri + second: gzip.compress(b"2\n"),
+                run_uri + third: gzip.compress(b"3\n"),
+                run_uri + f"_metrics/{sub_job_id}/{both}": gzip.compress(b"4\n"),
+                run_uri + f"checkpoints/_metrics/{sub_job_id}/{both}": gzip.compress(b"dup\n"),
+            },
         )
         monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
         monkeypatch.setattr(
             c, "_open_experiment_artifact_connection", lambda: connection
         )
 
-        with pytest.raises(ValueError, match="multiple artifact roots"):
-            c.download_metrics("job-1", tmp_path)
+        result = c.download_metrics("job-1", tmp_path)
 
-        assert not any(command.startswith("GET ") for command in connection.commands)
+        assert (tmp_path / sub_job_id / "gpu.jsonl").read_bytes() == b"1\n2\n3\n4\n"
+        assert result[0]["chunk_count"] == 4
+        assert result[0]["last_artifact_uri"] == run_uri + f"_metrics/{sub_job_id}/{both}"
+        assert "merged in chunk time order" in result[0]["warnings"][0]
         assert connection.closed
+
+        # The merged order is stable, so a resume finds nothing new.
+        gets = [cmd for cmd in connection.commands if cmd.startswith("GET ")]
+        again = c.download_metrics("job-1", tmp_path, resume=True)
+        assert [cmd for cmd in connection.commands if cmd.startswith("GET ")] == gets
+        assert again[0]["chunk_count"] == 4
 
     def _gzip_download(self, monkeypatch, tmp_path, artifact_name, listed, bodies):
         c = _make_client()
@@ -5280,7 +5555,7 @@ class TestExecutionLogDownload:
         connection.list_rows[run_uri + root + "/"].append((f"/versions/RUN_ABC/{bad}",))
         connection.content_by_uri[run_uri + bad] = b"not gzip"
         with pytest.raises(gzip.BadGzipFile):
-            c.download_stdout_logs("job-1", tmp_path, resume=True)
+            c.download_stdout_logs("job-1", tmp_path, resume=True, strict=True)
         assert destination.read_bytes() == b"first\n"
         manifest = json.loads(destination.with_name(".stdout.log.manifest.json").read_text())
         assert manifest["names"] == [first]
@@ -5307,7 +5582,7 @@ class TestExecutionLogDownload:
         monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
         monkeypatch.setattr(c, "_open_experiment_artifact_connection", lambda: connection)
         with pytest.raises(gzip.BadGzipFile):
-            c.download_stdout_logs("job-1", tmp_path)
+            c.download_stdout_logs("job-1", tmp_path, strict=True)
         committed = tmp_path / first_sub / "stdout.log"
         assert committed.read_bytes() == b"ok\n"
         connection.content_by_uri[run_uri + bad] = gzip.compress(b"later\n")
@@ -5318,6 +5593,7 @@ class TestExecutionLogDownload:
         assert (tmp_path / second_sub / "stdout.log").read_bytes() == b"later\n"
 
     def _parallel_stdout(self, monkeypatch, count, *, bodies=None, on_get=None):
+        """One sub-job of ``count`` stdout chunks; every connection opened is recorded."""
         c = _make_client()
         run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
         sub = "job-1:training:0"
@@ -5343,38 +5619,100 @@ class TestExecutionLogDownload:
 
         monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
         monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
-        monkeypatch.setattr(nc, "_ARTIFACT_GET_MIN_CHUNKS", 2)
         return c, opened, run_uri, paths
 
-    def test_parallel_download_overlaps_and_keeps_sorted_order(
+    def test_parallel_download_overlaps_on_one_session_and_keeps_sorted_order(
         self, tmp_path, monkeypatch
     ):
-        started = {"n": 0}
+        workers = 8
+        barrier = threading.Barrier(workers, timeout=5)
+        started = []
         lock = threading.Lock()
-        released = {}
-        workers = nc._ARTIFACT_GET_WORKERS
-
-        def note_release():
-            released["n"] = started["n"]
-
-        barrier = threading.Barrier(workers, action=note_release, timeout=5)
 
         def on_get(_source):
             with lock:
-                started["n"] += 1
-                current = started["n"]
+                started.append(1)
+                current = len(started)
             if current <= workers:
-                barrier.wait()
+                barrier.wait()  # only passes if `workers` GETs run at once
 
-        c, opened, _run_uri, _paths = self._parallel_stdout(
-            monkeypatch, 20, on_get=on_get
-        )
-        c.download_stdout_logs("job-1", tmp_path)
-        assert released["n"] == workers
+        c, opened, _run_uri, _paths = self._parallel_stdout(monkeypatch, 20, on_get=on_get)
+        c.download_stdout_logs("job-1", tmp_path, max_workers=workers)
         expected = b"".join(f"{index}\n".encode() for index in range(20))
         assert (tmp_path / "job-1:training:0" / "stdout.log").read_bytes() == expected
-        assert len(opened) == workers
-        assert [conn.close_count for conn in opened] == [1] * workers
+        # The GETs share one session (one cursor each); nothing else is opened.
+        assert len(opened) == 1
+        assert opened[0].close_count == 1
+
+    def test_parallel_get_failure_keeps_previous_file(self, tmp_path, monkeypatch):
+        def on_get(source):
+            if source.endswith("000001.part.gz"):
+                raise RuntimeError("get failed")
+
+        c, opened, _run_uri, _paths = self._parallel_stdout(monkeypatch, 4, on_get=on_get)
+        destination = tmp_path / "job-1:training:0" / "stdout.log"
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"previous\n")
+        with pytest.raises(RuntimeError, match="get failed"):
+            c.download_stdout_logs("job-1", tmp_path)
+        assert destination.read_bytes() == b"previous\n"
+        assert [conn.close_count for conn in opened] == [1]
+
+    def test_parallel_bad_gzip_on_resume_keeps_committed_chunks(self, tmp_path, monkeypatch):
+        c, opened, run_uri, paths = self._parallel_stdout(monkeypatch, 1)
+        c.download_stdout_logs("job-1", tmp_path)
+        destination = tmp_path / "job-1:training:0" / "stdout.log"
+        committed = destination.read_bytes()
+        manifest = destination.with_name(".stdout.log.manifest.json")
+        names = json.loads(manifest.read_text())["names"]
+        later = [
+            f"_stdout/job-1:training:0/console.20260904-{index:06d}.part.gz" for index in (1, 2)
+        ]
+        opened[0].content_by_uri[run_uri + later[0]] = gzip.compress(b"new\n")
+        opened[0].content_by_uri[run_uri + later[1]] = b"not gzip"
+        opened[0].list_rows[run_uri + "_stdout/"].extend(
+            (f"/versions/RUN_ABC/{path}",) for path in later
+        )
+        with pytest.raises(gzip.BadGzipFile):
+            c.download_stdout_logs("job-1", tmp_path, resume=True, strict=True)
+        # The chunk appended before the damaged one is kept and recorded.
+        assert destination.read_bytes() == committed + b"new\n"
+        assert json.loads(manifest.read_text())["names"] == names + later[:1]
+        assert [conn.close_count for conn in opened] == [1, 1]
+
+    def test_close_failure_does_not_fail_the_download(self, tmp_path, monkeypatch, caplog):
+        c, opened, _run_uri, _paths = self._parallel_stdout(monkeypatch, 3)
+        real_opener = c._open_experiment_artifact_connection
+
+        def opener():
+            conn = real_opener()
+            conn.raise_on_close = True
+            return conn
+
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
+        with caplog.at_level(logging.WARNING):
+            c.download_stdout_logs("job-1", tmp_path)
+        assert (tmp_path / "job-1:training:0" / "stdout.log").read_bytes() == b"0\n1\n2\n"
+        assert [conn.close_count for conn in opened] == [1]
+        assert "could not close the artifact download session" in caplog.text
+
+    def test_get_error_survives_a_close_error(self, tmp_path, monkeypatch):
+        def on_get(source):
+            if source.endswith("000001.part.gz"):
+                raise RuntimeError("get failed")
+
+        c, opened, _run_uri, _paths = self._parallel_stdout(monkeypatch, 3, on_get=on_get)
+        real_opener = c._open_experiment_artifact_connection
+
+        def opener():
+            conn = real_opener()
+            conn.raise_on_close = True
+            return conn
+
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
+        with pytest.raises(RuntimeError, match="get failed"):
+            c.download_stdout_logs("job-1", tmp_path)
+        assert [conn.close_count for conn in opened] == [1]
 
     def test_parallel_progress_reports_on_caller_after_each_copy(
         self, tmp_path, monkeypatch
@@ -5383,13 +5721,13 @@ class TestExecutionLogDownload:
         sub = "job-1:training:0"
         caller = threading.get_ident()
         copied = []
-        real_copy = c._copy_gzip_member
+        real_copy = nc._artifact_download.copy_gzip_member
 
-        def copy(downloaded, output):
-            real_copy(downloaded, output)
+        def copy(downloaded, output, buffer_bytes):
+            real_copy(downloaded, output, buffer_bytes)
             copied.append(output.tell())
 
-        c._copy_gzip_member = copy
+        monkeypatch.setattr(nc._artifact_download, "copy_gzip_member", copy)
         calls = []
 
         def progress(message):
@@ -5401,7 +5739,7 @@ class TestExecutionLogDownload:
             assert len(copied) == done
 
         c.download_stdout_logs("job-1", tmp_path, progress=progress)
-        assert len(opened) > 1
+        assert len(opened) == 1  # one session shared by the concurrent GETs
         status = c._artifact_progress_status
         assert calls == [status("stdout", index, 20, sub) for index in range(21)] + ["\n"]
         expected = b"".join(f"{index}\n".encode() for index in range(20))
@@ -5444,250 +5782,15 @@ class TestExecutionLogDownload:
             c.download_stdout_logs("job-1", tmp_path, resume=True, progress=stop)
         assert calls[0] == c._artifact_progress_status("stdout", 0, 4, sub)
         assert calls[-1] == "\n"
-        assert destination.read_bytes() == committed
-        assert manifest.read_text(encoding="utf-8") == manifest_before
+        # Stopping at "2/4" keeps the two chunks already appended for a resume.
+        assert destination.read_bytes() == committed + b"4\n5\n"
+        names = json.loads(manifest_before)["names"]
+        assert json.loads(manifest.read_text(encoding="utf-8"))["names"] == names + [
+            f"_stdout/{sub}/console.20260904-{index:06d}.part.gz" for index in (4, 5)
+        ]
         resume_connections = opened[before:]
         assert resume_connections
         assert [conn.close_count for conn in resume_connections] == [1] * len(resume_connections)
-
-    def test_parallel_download_stays_serial_when_opener_returns_one_connection(
-        self, tmp_path, monkeypatch
-    ):
-        inflight = {"n": 0, "max": 0}
-        lock = threading.Lock()
-
-        def on_get(source):
-            with lock:
-                inflight["n"] += 1
-                inflight["max"] = max(inflight["max"], inflight["n"])
-            try:
-                if source.endswith("000000.part.gz"):
-                    time.sleep(0.2)
-            finally:
-                with lock:
-                    inflight["n"] -= 1
-
-        c, _opened, _run_uri, paths = self._parallel_stdout(
-            monkeypatch, 4, on_get=on_get
-        )
-        primary = self.FakeArtifactConnection(
-            {
-                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/_stdout/": [
-                    (f"/versions/RUN_ABC/{path}",) for path in paths
-                ],
-                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_stdout/": [],
-            },
-            {
-                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/" + path: gzip.compress(
-                    f"{index}\n".encode()
-                )
-                for index, path in enumerate(paths)
-            },
-            on_get=on_get,
-        )
-        monkeypatch.setattr(
-            c, "_open_experiment_artifact_connection", lambda: primary
-        )
-        c.download_stdout_logs("job-1", tmp_path)
-        assert inflight["max"] == 1
-        assert primary.close_count == 1
-        assert primary.closed
-        assert (tmp_path / "job-1:training:0" / "stdout.log").read_bytes() == b"0\n1\n2\n3\n"
-
-    def test_parallel_get_failure_keeps_previous_file(self, tmp_path, monkeypatch):
-        def on_get(source):
-            if source.endswith("000001.part.gz"):
-                raise RuntimeError("get failed")
-
-        c, opened, _run_uri, _paths = self._parallel_stdout(
-            monkeypatch, 4, on_get=on_get
-        )
-        destination = tmp_path / "job-1:training:0" / "stdout.log"
-        destination.parent.mkdir(parents=True)
-        destination.write_bytes(b"previous\n")
-        with pytest.raises(RuntimeError, match="get failed"):
-            c.download_stdout_logs("job-1", tmp_path)
-        assert destination.read_bytes() == b"previous\n"
-        assert opened
-        assert [conn.close_count for conn in opened] == [1] * len(opened)
-
-    def test_parallel_bad_gzip_on_resume_keeps_committed_prefix(
-        self, tmp_path, monkeypatch
-    ):
-        c, opened, run_uri, paths = self._parallel_stdout(monkeypatch, 1)
-        c.download_stdout_logs("job-1", tmp_path)
-        destination = tmp_path / "job-1:training:0" / "stdout.log"
-        committed = destination.read_bytes()
-        manifest = destination.with_name(".stdout.log.manifest.json")
-        names = json.loads(manifest.read_text())["names"]
-        later = [
-            f"_stdout/job-1:training:0/console.20260904-{index:06d}.part.gz"
-            for index in (1, 2)
-        ]
-        bodies = opened[0].content_by_uri
-        bodies[run_uri + later[0]] = gzip.compress(b"new\n")
-        bodies[run_uri + later[1]] = b"not gzip"
-        listed = opened[0].list_rows[run_uri + "_stdout/"]
-        listed.extend((f"/versions/RUN_ABC/{path}",) for path in later)
-        resume_opened = []
-
-        def opener():
-            conn = self.FakeArtifactConnection(
-                opened[0].list_rows, bodies
-            )
-            resume_opened.append(conn)
-            return conn
-
-        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
-        with pytest.raises(gzip.BadGzipFile):
-            c.download_stdout_logs("job-1", tmp_path, resume=True)
-        assert destination.read_bytes() == committed
-        assert json.loads(manifest.read_text())["names"] == names
-        assert len(resume_opened) > 1
-        assert [conn.close_count for conn in resume_opened] == [1] * len(resume_opened)
-
-    def test_parallel_download_continues_when_a_later_session_open_fails(
-        self, tmp_path, monkeypatch, caplog
-    ):
-        c, _opened, _run_uri, paths = self._parallel_stdout(monkeypatch, 3)
-        created = []
-
-        def opener():
-            if len(created) >= 2:
-                raise RuntimeError("open failed")
-            conn = self.FakeArtifactConnection(
-                {
-                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/_stdout/": [
-                        (f"/versions/RUN_ABC/{path}",) for path in paths
-                    ],
-                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_stdout/": [],
-                },
-                {
-                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/" + path: gzip.compress(
-                        f"{index}\n".encode()
-                    )
-                    for index, path in enumerate(paths)
-                },
-            )
-            created.append(conn)
-            return conn
-
-        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
-        with caplog.at_level(logging.WARNING, logger=nc.__name__):
-            c.download_stdout_logs("job-1", tmp_path)
-        assert (tmp_path / "job-1:training:0" / "stdout.log").read_bytes() == b"0\n1\n2\n"
-        assert len(created) == 2
-        assert [conn.close_count for conn in created] == [1, 1]
-
-    def test_parallel_download_warns_when_the_first_extra_session_fails(
-        self, tmp_path, monkeypatch, caplog
-    ):
-        c, _opened, _run_uri, paths = self._parallel_stdout(monkeypatch, 3)
-        primary = self.FakeArtifactConnection(
-            {
-                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/_stdout/": [
-                    (f"/versions/RUN_ABC/{path}",) for path in paths
-                ],
-                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_stdout/": [],
-            },
-            {
-                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/" + path: gzip.compress(
-                    f"{index}\n".encode()
-                )
-                for index, path in enumerate(paths)
-            },
-        )
-        calls = {"n": 0}
-
-        def opener():
-            calls["n"] += 1
-            if calls["n"] > 1:
-                raise RuntimeError("open failed")
-            return primary
-
-        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
-        with caplog.at_level(logging.WARNING, logger=nc.__name__):
-            c.download_stdout_logs("job-1", tmp_path)
-        assert any(
-            "could not open an extra session" in record.message
-            for record in caplog.records
-        )
-        assert primary.close_count == 1
-        assert (tmp_path / "job-1:training:0" / "stdout.log").read_bytes() == b"0\n1\n2\n"
-
-    def test_parallel_close_failure_does_not_fail_the_download(
-        self, tmp_path, monkeypatch, caplog
-    ):
-        c, _opened, _run_uri, paths = self._parallel_stdout(monkeypatch, 3)
-        created = []
-
-        def opener():
-            conn = self.FakeArtifactConnection(
-                {
-                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/_stdout/": [
-                        (f"/versions/RUN_ABC/{path}",) for path in paths
-                    ],
-                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_stdout/": [],
-                },
-                {
-                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/" + path: gzip.compress(
-                        f"{index}\n".encode()
-                    )
-                    for index, path in enumerate(paths)
-                },
-            )
-            if len(created) == 1:
-                conn.raise_on_close = True
-            created.append(conn)
-            return conn
-
-        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
-        with caplog.at_level(logging.WARNING, logger=nc.__name__):
-            c.download_stdout_logs("job-1", tmp_path)
-        assert (tmp_path / "job-1:training:0" / "stdout.log").read_bytes() == b"0\n1\n2\n"
-        assert [conn.close_count for conn in created] == [1, 1, 1]
-        assert any("failed to close" in record.message for record in caplog.records)
-
-    def test_parallel_get_error_survives_a_close_error(self, tmp_path, monkeypatch):
-        def on_get(source):
-            if source.endswith("000001.part.gz"):
-                raise RuntimeError("get failed")
-
-        c, _opened, _run_uri, paths = self._parallel_stdout(
-            monkeypatch, 3, on_get=on_get
-        )
-        created = []
-
-        def opener():
-            conn = self.FakeArtifactConnection(
-                {
-                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/_stdout/": [
-                        (f"/versions/RUN_ABC/{path}",) for path in paths
-                    ],
-                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_stdout/": [],
-                },
-                {
-                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/" + path: gzip.compress(
-                        f"{index}\n".encode()
-                    )
-                    for index, path in enumerate(paths)
-                },
-                on_get=on_get,
-            )
-            if created:
-                conn.raise_on_close = True
-            created.append(conn)
-            return conn
-
-        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
-        with pytest.raises(RuntimeError, match="get failed"):
-            c.download_stdout_logs("job-1", tmp_path)
-        assert [conn.close_count for conn in created] == [1] * len(created)
-
-    def test_fetch_execution_logs_errors_when_experiment_run_missing_fields(self):
-        c = _make_client(get_json={"experiment_name": "DB.SCH.EXP"})
-        with pytest.raises(ValueError, match="experiment_run_name"):
-            c.fetch_execution_logs("job-1")
 
     @pytest.mark.parametrize(
         ("artifact_name", "chunk_name", "destination_name", "method_name"),
@@ -5876,11 +5979,14 @@ class TestExecutionLogDownload:
         connection.content_by_uri[run_uri + names[2]] = b"not gzip"
         calls = []
         with pytest.raises(gzip.BadGzipFile):
-            c.download_metrics("job-1", tmp_path, resume=True, progress=calls.append)
+            c.download_metrics(
+                "job-1", tmp_path, resume=True, progress=calls.append, strict=True
+            )
         assert c._artifact_progress_status("metrics", 1, 2, sub) in calls
         assert c._artifact_progress_status("metrics", 2, 2, sub) not in calls
         assert calls[-1] == "\n"
-        assert destination.read_bytes() == committed
+        # The chunk appended before the damaged one is kept for a resume.
+        assert destination.read_bytes() == committed + b"b\n"
 
         connection.content_by_uri[run_uri + names[2]] = gzip.compress(b"c\n")
 
@@ -5889,11 +5995,21 @@ class TestExecutionLogDownload:
             if " 2/" in message:
                 raise RuntimeError("stop")
 
+        def stop_on_first(message):
+            calls.append(message)
+            if " 1/" in message:
+                raise RuntimeError("stop")
+
         calls.clear()
         with pytest.raises(RuntimeError, match="stop"):
-            c.download_metrics("job-1", tmp_path, resume=True, progress=stop_on_second)
+            c.download_metrics("job-1", tmp_path, resume=True, progress=stop_on_first)
         assert calls[-1] == "\n"
-        assert destination.read_bytes() == committed
+        # The callback stops the download after the chunk it reports; that chunk
+        # stays committed and a resume has nothing left to fetch.
+        assert destination.read_bytes() == committed + b"b\nc\n"
+        calls.clear()
+        c.download_metrics("job-1", tmp_path, resume=True, progress=calls.append)
+        assert calls == [f"metrics: no new chunks for {sub}\n"]
 
         fresh = tmp_path / "fresh"
         calls.clear()
@@ -6002,13 +6118,16 @@ class TestExecutionLogDownload:
         connection.content_by_uri[run_uri + later] = gzip.compress(b"later\n")
         connection.content_by_uri[run_uri + bad] = b"not gzip"
         with pytest.raises(gzip.BadGzipFile):
-            c.download_stdout_logs("job-1", tmp_path, resume=True, progress=fail_on_newline)
-        assert seen == [(b"good\n", [])]
-        assert destination.read_bytes() == b"good\n"
+            c.download_stdout_logs(
+                "job-1", tmp_path, resume=True, progress=fail_on_newline, strict=True
+            )
+        # The line closes after the chunks before the damaged one are saved.
+        assert seen == [(b"good\nlater\n", [])]
+        assert destination.read_bytes() == b"good\nlater\n"
 
         seen.clear()
         with pytest.raises(gzip.BadGzipFile):
-            c.download_stdout_logs("job-1", fresh, progress=fail_on_newline)
+            c.download_stdout_logs("job-1", fresh, progress=fail_on_newline, strict=True)
         assert [fresh_temps for _bytes, fresh_temps in seen] == [[]]
         assert not list((fresh / sub).glob(".*.tmp"))
         assert not (fresh / sub / "stdout.log").exists()
@@ -6023,12 +6142,52 @@ class TestExecutionLogDownload:
         def interrupt(*_args):
             raise KeyboardInterrupt
 
-        monkeypatch.setattr(c, "_download_gzip_member", interrupt)
+        monkeypatch.setattr(c, "_fetch_artifact_chunk", interrupt)
         calls = []
         with pytest.raises(KeyboardInterrupt):
             c.download_stdout_logs("job-1", tmp_path, progress=calls.append)
         assert calls == [c._artifact_progress_status("stdout", 0, 1, sub), "\n"]
         assert not list((tmp_path / sub).glob(".*.tmp"))
+
+    def test_an_empty_training_stream_is_named_as_training_metrics(self, tmp_path, monkeypatch):
+        """The training stream shares ``_metrics/`` with the GPU one, so its empty line
+        must not read as if the GPU download found nothing."""
+        c, _connection, _run_uri = self._gzip_download(monkeypatch, tmp_path, "metrics", [], {})
+        monkeypatch.setattr(c, "_job_for_upload_warnings", lambda _: ({"status": "SUCCEEDED"}, None))
+        calls = []
+        assert c.download_training_metrics("job-1", tmp_path, progress=calls.append) == []
+        assert calls == ["training metrics: found 0 chunks\n"]
+
+    def test_a_named_sub_job_without_training_rows_is_left_out_not_an_error(self, tmp_path, monkeypatch):
+        """Only training sub-jobs write training rows, so naming a sampling sub-job beside a
+        training one returns the training one's rows instead of raising NoChunksError."""
+        sub = "job-1:training:0"
+        chunk = f"_metrics/{sub}/training.20260904-120001.a.gz"
+        c, _connection, _run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "metrics", [chunk], {chunk: b'{"kind": "training"}\n'}
+        )
+        monkeypatch.setattr(c, "_job_for_upload_warnings", lambda _: ({"status": "SUCCEEDED"}, None))
+
+        result = c.download_training_metrics("job-1", tmp_path, sub_job_ids=[sub, "job-1:sampling:0"])
+        assert [entry["sub_job_id"] for entry in result] == [sub]
+        assert (tmp_path / sub / "training.jsonl").read_bytes() == b'{"kind": "training"}\n'
+
+        # Naming only sub-jobs without rows is an empty result, not an error.
+        assert c.download_training_metrics("job-1", tmp_path / "none", sub_job_ids=["job-1:sampling:0"]) == []
+
+    def test_a_named_sub_job_without_gpu_metrics_still_raises(self, tmp_path, monkeypatch):
+        """The GPU stream keeps raising: every sub-job with GPUs uploads it."""
+        sub = "job-1:training:0"
+        chunk = f"_metrics/{sub}/gpu.20260904-120001.a.gz"
+        c, _connection, _run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "metrics", [chunk], {chunk: b'{"gpu_util_pct": 1}\n'}
+        )
+        monkeypatch.setattr(c, "_job_for_upload_warnings", lambda _: ({"status": "SUCCEEDED"}, None))
+        with pytest.raises(nc.NoChunksError) as excinfo:
+            c.download_metrics("job-1", tmp_path, sub_job_ids=["job-1:sampling:0"])
+        assert str(excinfo.value) == (
+            "no metrics chunks for sub-job(s) job-1:sampling:0; sub-jobs with metrics: job-1:training:0"
+        )
 
     def test_download_progress_empty_and_directory_destination(self, tmp_path, monkeypatch):
         c, _connection, _run_uri = self._gzip_download(monkeypatch, tmp_path, "stdout", [], {})
@@ -6099,7 +6258,7 @@ class TestExecutionLogDownload:
         destination.write_bytes(b"previous\n")
         calls = []
         with pytest.raises(gzip.BadGzipFile):
-            c.download_stdout_logs("job-1", tmp_path, progress=calls.append)
+            c.download_stdout_logs("job-1", tmp_path, progress=calls.append, strict=True)
         assert c._artifact_progress_status("stdout", 1, 2, sub) in calls
         assert c._artifact_progress_status("stdout", 2, 2, sub) not in calls
         assert calls[-1] == "\n"
@@ -6127,123 +6286,3108 @@ class TestExecutionLogDownload:
         assert calls.count(calls[0]) == 1
         assert destination.read_bytes() == b"a\nb\n"
 
+    def test_fetch_execution_logs_errors_when_experiment_run_missing_fields(self):
+        c = _make_client(get_json={"experiment_name": "DB.SCH.EXP"})
+        with pytest.raises(ValueError, match="experiment_run_name"):
+            c.fetch_execution_logs("job-1")
 
-# ─── _ensure_database ──────────────────────────────────────────────────
 
+class TestChunkedArtifactDownload:
+    """Parallel fetch, ordered commit, retries, and durable progress."""
 
-class TestEnsureDatabase:
-    def test_skipped_for_http_base_url(self):
-        """Mock/test mode: no DB check at all."""
-        c = CortexTrainingClient(base_url="http://test.local", database="DB", schema="SCH")
-        c._session = MagicMock()
-        c._session.get.return_value = _make_response({"jobs": []})
-        c._send("GET", f"{c.base_url}/test")
-        c._session.post.assert_not_called()
+    @pytest.fixture(autouse=True)
+    def _default_telemetry_env(self, monkeypatch):
+        # Telemetry defaults are part of what these tests check.
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        monkeypatch.delenv(nc.DISABLE_TELEMETRY_ENV, raising=False)
 
-    def test_no_extra_call_when_db_exists(self):
-        """Happy path: DB exists, no CREATE DATABASE call made."""
-        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
-        c._session = MagicMock()
-        api_resp = _make_response({"jobs": []})
-        c._session.get.return_value = api_resp
-        c._send("GET", f"{c.base_url}/api/v2/databases/MY_DB/schemas/SCH/cortex-training/jobs")
-        # Only the GET was made, no POST to /statements
-        c._session.post.assert_not_called()
+    RUN_URI = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+    SUB = "job-1:training:0"
 
-    def test_creates_db_on_not_found_then_retries(self):
-        """DB missing: first request fails, CREATE DATABASE, retry succeeds."""
-        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
-        c._session = MagicMock()
-        not_found_resp = _make_error_response(
-            {"code": "517602", "message": "Schema MY_DB.SCH is not found or not authorized"}, status_code=400
+    def _setup(self, monkeypatch, *, subs=None, count=6, artifact_name="stdout", chunk_name=None):
+        subs = subs or [self.SUB]
+        root = f"_{artifact_name}"
+        chunk_name = chunk_name or ("console" if artifact_name == "stdout" else "gpu")
+        paths = {
+            sub: [
+                f"{root}/{sub}/{chunk_name}.20260904-"
+                f"{12 + index // 3600:02d}{index // 60 % 60:02d}{index % 60:02d}.c{index:04d}.gz"
+                for index in range(count)
+            ]
+            for sub in subs
+        }
+        connection = TestExecutionLogDownload.FakeArtifactConnection(
+            {
+                self.RUN_URI + root + "/": [
+                    (f"/versions/RUN_ABC/{path}",) for sub in subs for path in reversed(paths[sub])
+                ],
+                self.RUN_URI + "checkpoints/" + root + "/": [],
+            },
+            {
+                self.RUN_URI + path: gzip.compress(f"{sub} line {index}\n".encode())
+                for sub in subs
+                for index, path in enumerate(paths[sub])
+            },
         )
-        create_resp = _make_response({"data": [["Database MY_DB successfully created."]]})
-        ok_resp = _make_response({"jobs": []})
-        c._session.get.side_effect = [not_found_resp, ok_resp]
-        c._session.post.return_value = create_resp
-        c._send("GET", f"{c.base_url}/test")
-        assert c._db_ensured is True
-        create_call = c._session.post.call_args_list[0]
-        assert "/api/v2/statements" in create_call.args[0]
-        assert "CREATE DATABASE IF NOT EXISTS MY_DB" in create_call.kwargs["json"]["statement"]
+        c = _make_client()
+        sleeps = []
+        c._artifact_retry_policy = nc._artifact_download.RetryPolicy(sleep=sleeps.append)
+        opened = []
+
+        def open_connection():
+            opened.append(connection)
+            return connection
+
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (self.RUN_URI, "RUN_ABC"))
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", open_connection)
+        return c, connection, paths, sleeps, opened
+
+    @staticmethod
+    def _expected(sub, indexes):
+        return "".join(f"{sub} line {index}\n" for index in indexes).encode()
+
+    @staticmethod
+    def _settle(timeout=5.0):
+        """Wait for workers a cancelled download abandoned (it does not join them)."""
+        deadline = time.monotonic() + timeout
+        while any(t.name.startswith("cortex-training-download") for t in threading.enumerate()):
+            assert time.monotonic() < deadline, "download workers kept running"
+            time.sleep(0.01)
+
+    @staticmethod
+    def _gets(connection, needle=""):
+        return [cmd for cmd in connection.commands if cmd.startswith("GET ") and needle in cmd]
+
+    def test_out_of_order_completion_commits_in_sorted_order(self, tmp_path, monkeypatch):
+        subs = [self.SUB, "job-1:training:1"]
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, subs=subs, count=3)
+        first = self.RUN_URI + paths[self.SUB][0]
+        last = self.RUN_URI + paths[subs[1]][-1]
+        last_done = threading.Event()
+        finished = []
+        lock = threading.Lock()
+
+        def on_get(source):
+            if source == first:
+                # The first chunk completes only after the very last one has.
+                assert last_done.wait(5)
+            with lock:
+                finished.append(source)
+            if source == last:
+                last_done.set()
+
+        connection.on_get = on_get
+        result = c.download_stdout_logs("job-1", tmp_path, max_workers=6)
+
+        assert finished.index(last) < finished.index(first)
+        for sub in subs:
+            assert (tmp_path / sub / "stdout.log").read_bytes() == self._expected(sub, range(3))
+            manifest = json.loads((tmp_path / sub / ".stdout.log.manifest.json").read_text())
+            assert manifest["names"] == paths[sub]
+            assert manifest["bytes"] == (tmp_path / sub / "stdout.log").stat().st_size
+        assert [entry["sub_job_id"] for entry in result] == subs
+        assert not list((tmp_path / self.SUB).glob(".*.partial*"))
+        assert connection.closed
+
+    def test_get_targets_are_raw_paths_without_percent_encoding(self, tmp_path, monkeypatch):
+        c, connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=2)
+        c.download_stdout_logs("job-1", tmp_path, max_workers=2)
+        for command in self._gets(connection):
+            target = command.rsplit(" ", 1)[1]
+            assert target.startswith("'file:///") and "%" not in target and ":" not in target[8:]
+
+    def test_fetch_window_bounds_chunks_held_ahead_of_the_writer(self, tmp_path, monkeypatch):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=8)
+        monkeypatch.setattr(c, "_DOWNLOAD_WINDOW_PER_WORKER", 1)
+        first = self.RUN_URI + paths[self.SUB][0]
+        started_while_first_blocked = []
+
+        def on_get(source):
+            if source == first:
+                time.sleep(0.3)
+                started_while_first_blocked.append(len(self._gets(connection)))
+
+        connection.on_get = on_get
+        c.download_stdout_logs("job-1", tmp_path, max_workers=2)
+
+        # Two workers with a window of two: only the blocked chunk and one more.
+        assert started_while_first_blocked == [2]
+        assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(self.SUB, range(8))
+
+    def test_transient_get_failure_is_retried(self, tmp_path, monkeypatch):
+        errors = importlib.import_module("snowflake.connector.errors")
+        c, connection, paths, sleeps, _opened = self._setup(monkeypatch, count=4)
+        flaky = self.RUN_URI + paths[self.SUB][2]
+        failures = [errors.OperationalError(msg="connection reset"), ConnectionResetError("reset")]
+
+        def on_get(source):
+            if source == flaky and failures:
+                raise failures.pop(0)
+
+        connection.on_get = on_get
+        c.download_stdout_logs("job-1", tmp_path)
+
+        assert len(sleeps) == 2
+        assert len(self._gets(connection, flaky)) == 3
+        assert len(self._gets(connection)) == 6
+        assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(self.SUB, range(4))
+
+    def test_transient_list_failure_is_retried(self, tmp_path, monkeypatch):
+        errors = importlib.import_module("snowflake.connector.errors")
+        c, connection, _paths, sleeps, _opened = self._setup(monkeypatch, count=2)
+        cursor_cls = connection.Cursor
+        failures = [errors.ServiceUnavailableError(msg="503")]
+
+        class FlakyCursor(cursor_cls):
+            def execute(self, statement):
+                if statement.startswith("LIST ") and failures:
+                    raise failures.pop(0)
+                return super().execute(statement)
+
+        monkeypatch.setattr(connection, "cursor", lambda: FlakyCursor(connection))
+        c.download_stdout_logs("job-1", tmp_path)
+
+        assert len(sleeps) == 1
+        assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(self.SUB, range(2))
+
+    def test_expired_session_reopens_the_connection(self, tmp_path, monkeypatch):
+        errors = importlib.import_module("snowflake.connector.errors")
+        c, connection, paths, sleeps, opened = self._setup(monkeypatch, count=3)
+        target = self.RUN_URI + paths[self.SUB][1]
+        failures = [errors.ProgrammingError(msg="token expired", errno=390114)]
+
+        def on_get(source):
+            if source == target and failures:
+                raise failures.pop(0)
+
+        connection.on_get = on_get
+        c.download_stdout_logs("job-1", tmp_path)
+
+        assert len(opened) == 2
+        assert len(sleeps) == 1
+        assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(self.SUB, range(3))
+
+    def test_permanent_error_fails_fast_and_keeps_committed_chunks(self, tmp_path, monkeypatch):
+        errors = importlib.import_module("snowflake.connector.errors")
+        c, connection, paths, sleeps, _opened = self._setup(monkeypatch, count=5)
+        denied = self.RUN_URI + paths[self.SUB][3]
+
+        def on_get(source):
+            if source == denied:
+                raise errors.ProgrammingError(msg="not authorized", errno=2003)
+
+        connection.on_get = on_get
+        with pytest.raises(errors.ProgrammingError, match="not authorized"):
+            c.download_stdout_logs("job-1", tmp_path, max_workers=1)
+        self._settle()
+
+        assert sleeps == []
+        assert len(self._gets(connection, denied)) == 1
+        destination = tmp_path / self.SUB / "stdout.log"
+        assert not destination.exists()
+        partial = tmp_path / self.SUB / ".stdout.log.partial"
+        assert partial.read_bytes() == self._expected(self.SUB, range(3))
+        manifest = json.loads((tmp_path / self.SUB / ".stdout.log.partial.manifest.json").read_text())
+        assert manifest == {"bytes": partial.stat().st_size, "names": paths[self.SUB][:3], "version": 1}
+
+    def test_retries_are_bounded(self, tmp_path, monkeypatch):
+        errors = importlib.import_module("snowflake.connector.errors")
+        c, connection, paths, sleeps, _opened = self._setup(monkeypatch, count=2)
+        broken = self.RUN_URI + paths[self.SUB][0]
+
+        def on_get(source):
+            if source == broken:
+                raise errors.OperationalError(msg="network down")
+
+        connection.on_get = on_get
+        with pytest.raises(errors.OperationalError):
+            c.download_stdout_logs("job-1", tmp_path)
+        self._settle()
+
+        attempts = c._artifact_retry_policy.attempts
+        assert len(self._gets(connection, broken)) == attempts
+        assert len(sleeps) == attempts - 1
+
+    @pytest.mark.parametrize(
+        ("artifact_name", "method_name", "destination_name"),
+        [("stdout", "download_stdout_logs", "stdout.log"), ("metrics", "download_metrics", "gpu.jsonl")],
+    )
+    def test_interrupted_first_download_resumes_from_saved_chunks(
+        self, artifact_name, method_name, destination_name, tmp_path, monkeypatch
+    ):
+        c, connection, paths, _sleeps, _opened = self._setup(
+            monkeypatch, count=8, artifact_name=artifact_name
+        )
+        chunks = paths[self.SUB]
+        interrupt_at = self.RUN_URI + chunks[5]
+        interrupt = [True]
+
+        def on_get(source):
+            if source == interrupt_at and interrupt:
+                interrupt.clear()
+                raise KeyboardInterrupt
+
+        connection.on_get = on_get
+        download = getattr(c, method_name)
+        with pytest.raises(KeyboardInterrupt):
+            download("job-1", tmp_path, max_workers=3)
+        self._settle()
+
+        destination = tmp_path / self.SUB / destination_name
+        assert not destination.exists()
+        partial_manifest = json.loads(
+            (tmp_path / self.SUB / f".{destination_name}.partial.manifest.json").read_text()
+        )
+        assert partial_manifest["names"] == chunks[:5]
+
+        gets_before = len(self._gets(connection))
+        download("job-1", tmp_path, resume=True, max_workers=3)
+        resumed = self._gets(connection)[gets_before:]
+
+        assert sorted(cmd.split(" ")[1].strip("'") for cmd in resumed) == [
+            self.RUN_URI + path for path in chunks[5:]
+        ]
+        assert destination.read_bytes() == self._expected(self.SUB, range(8))
+        manifest = json.loads((tmp_path / self.SUB / f".{destination_name}.manifest.json").read_text())
+        assert manifest == {"bytes": destination.stat().st_size, "names": chunks, "version": 1}
+        assert not list((tmp_path / self.SUB).glob(f".{destination_name}.partial*"))
+
+    def test_periodic_checkpoint_survives_a_hard_kill(self, tmp_path, monkeypatch):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=7)
+        chunks = paths[self.SUB]
+        monkeypatch.setattr(c, "_DOWNLOAD_CHECKPOINT_CHUNKS", 2)
+        monkeypatch.setattr(c, "_DOWNLOAD_CHECKPOINT_SECONDS", 3600.0)
+        monkeypatch.setattr(c, "_DOWNLOAD_WINDOW_PER_WORKER", 1)
+        partial = tmp_path / self.SUB / ".stdout.log.partial"
+        partial_manifest = tmp_path / self.SUB / ".stdout.log.partial.manifest.json"
+        seen = {}
+        killed = [True]
+
+        def on_get(source):
+            if source == self.RUN_URI + chunks[4]:
+                seen["manifest"] = json.loads(partial_manifest.read_text())
+                seen["size"] = partial.stat().st_size
+            if source == self.RUN_URI + chunks[5] and killed:
+                killed.clear()
+                raise SystemExit("killed")
+
+        # A hard kill runs no cleanup: the file keeps whatever was written and
+        # the manifest stays at the last checkpoint.
+        def no_cleanup(writer):
+            writer._output.close()
+
+        monkeypatch.setattr(nc._artifact_download.ChunkWriter, "abort", no_cleanup)
+        connection.on_get = on_get
+        with pytest.raises(SystemExit):
+            c.download_stdout_logs("job-1", tmp_path, max_workers=1)
+        self._settle()
+
+        assert seen["manifest"]["names"] == chunks[:4]
+        assert seen["manifest"]["bytes"] <= seen["size"]
+        assert json.loads(partial_manifest.read_text())["names"] == chunks[:4]
+        assert partial.stat().st_size > seen["manifest"]["bytes"]
+
+        gets_before = len(self._gets(connection))
+        c.download_stdout_logs("job-1", tmp_path, resume=True, max_workers=1)
+        assert len(self._gets(connection)) - gets_before == 3
+        destination = tmp_path / self.SUB / "stdout.log"
+        assert destination.read_bytes() == self._expected(self.SUB, range(7))
+
+    def test_non_resume_run_restarts_an_interrupted_download(self, tmp_path, monkeypatch):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=4)
+        target = self.RUN_URI + paths[self.SUB][2]
+        interrupt = [True]
+
+        def on_get(source):
+            if source == target and interrupt:
+                interrupt.clear()
+                raise KeyboardInterrupt
+
+        connection.on_get = on_get
+        with pytest.raises(KeyboardInterrupt):
+            c.download_stdout_logs("job-1", tmp_path, max_workers=1)
+        self._settle()
+        gets_before = len(self._gets(connection))
+        c.download_stdout_logs("job-1", tmp_path, max_workers=1)
+        assert len(self._gets(connection)) - gets_before == 4
+        assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(self.SUB, range(4))
+
+    def test_resume_appends_to_completed_file_and_drops_stale_partial(self, tmp_path, monkeypatch):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=5)
+        chunks = paths[self.SUB]
+        listing = connection.list_rows[self.RUN_URI + "_stdout/"]
+        connection.list_rows[self.RUN_URI + "_stdout/"] = [
+            row for row in listing if row[0].removeprefix("/versions/RUN_ABC/") in chunks[:3]
+        ]
+        c.download_stdout_logs("job-1", tmp_path)
+        directory = tmp_path / self.SUB
+        (directory / ".stdout.log.partial").write_bytes(b"stale")
+        (directory / ".stdout.log.partial.manifest.json").write_text(
+            json.dumps({"bytes": 5, "names": chunks[:1], "version": 1})
+        )
+        connection.list_rows[self.RUN_URI + "_stdout/"] = listing
+        gets_before = len(self._gets(connection))
+
+        c.download_stdout_logs("job-1", tmp_path, resume=True)
+
+        assert len(self._gets(connection)) - gets_before == 2
+        assert (directory / "stdout.log").read_bytes() == self._expected(self.SUB, range(5))
+        assert not list(directory.glob(".stdout.log.partial*"))
+
+    def test_leftover_temp_files_are_removed(self, tmp_path, monkeypatch, caplog):
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=2)
+        directory = tmp_path / self.SUB
+        directory.mkdir(parents=True)
+        removed = [
+            directory / ".stdout-abc123.tmp",
+            directory / ".stdout.log.manifest-xyz.tmp",
+            directory / ".stdout.log.partial.manifest-xyz.tmp",
+            directory / ".manifest-old.tmp",
+        ]
+        kept = [
+            # Recently written: may belong to a download still running here.
+            directory / ".manifest-recent.tmp",
+            directory / ".stdout-recent.tmp",
+            directory / ".stdout.log.manifest-recent.tmp",
+            # Not ours to remove.
+            directory / ".gpu-metrics-abc.tmp",
+            directory / ".gpu.jsonl.manifest-abc.tmp",
+            directory / "notes.tmp",
+        ]
+        for path in removed + kept:
+            path.write_bytes(b"x")
+        old = time.time() - 2 * c._TEMP_ORPHAN_MIN_AGE_SECONDS
+        for path in removed + kept[3:]:
+            os.utime(path, (old, old))
+
+        with caplog.at_level(logging.DEBUG):
+            c.download_stdout_logs("job-1", tmp_path)
+
+        assert [path for path in removed if path.exists()] == []
+        assert caplog.text.count("removed leftover temporary file") == len(removed)
+        assert "could not remove leftover temporary file" not in caplog.text
+        assert all(path.exists() for path in kept)
+        assert (directory / "stdout.log").read_bytes() == self._expected(self.SUB, range(2))
+
+    def test_on_chunk_reports_each_committed_chunk(self, tmp_path, monkeypatch):
+        subs = [self.SUB, "job-1:training:1"]
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, subs=subs, count=3)
+        calls = []
+        c.download_stdout_logs(
+            "job-1", tmp_path, on_chunk=lambda *args: calls.append(args), max_workers=4
+        )
+        for sub in subs:
+            mine = [call for call in calls if call[0] == sub]
+            assert [call[1] for call in mine] == [0, 1, 2, 3]
+            assert {call[2] for call in mine} == {3}
+            assert mine[0][3] == 0
+            assert mine[-1][3] == (tmp_path / sub / "stdout.log").stat().st_size
+        assert calls[0][0] == self.SUB and calls[-1][0] == subs[1]
+
+    def test_sub_job_filter_downloads_only_selected(self, tmp_path, monkeypatch):
+        subs = [self.SUB, "job-1:training:1"]
+        c, connection, _paths, _sleeps, _opened = self._setup(monkeypatch, subs=subs, count=2)
+        result = c.download_stdout_logs("job-1", tmp_path, sub_job_ids=[subs[1]])
+        assert [entry["sub_job_id"] for entry in result] == [subs[1]]
+        assert not (tmp_path / self.SUB).exists()
+        assert all(subs[1] in cmd for cmd in self._gets(connection))
+
+    def test_sub_job_filter_rejects_unknown_sub_job_before_get(self, tmp_path, monkeypatch):
+        c, connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=2)
+        with pytest.raises(ValueError, match="job-1:sampling:0.*job-1:training:0"):
+            c.download_stdout_logs("job-1", tmp_path, sub_job_ids=["job-1:sampling:0"])
+        self._settle()
+        assert self._gets(connection) == []
+        assert connection.closed
+
+    @pytest.mark.parametrize("workers", [0, -1, True, 1.5])
+    def test_max_workers_must_be_positive_int(self, tmp_path, monkeypatch, workers):
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=1)
+        with pytest.raises(ValueError, match="max_workers"):
+            c.download_stdout_logs("job-1", tmp_path, max_workers=workers)
+        self._settle()
+
+    def test_damaged_chunk_is_fetched_again_then_kept(self, tmp_path, monkeypatch):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=4)
+        chunks = paths[self.SUB]
+        target = self.RUN_URI + chunks[1]
+        good = connection.content_by_uri[target]
+        # A truncated member writes part of its output before failing.
+        connection.content_by_uri[target] = good[:-6]
+
+        def on_get(source):
+            if source == target and len(self._gets(connection, target)) > 1:
+                connection.content_by_uri[target] = good
+
+        connection.on_get = on_get
+        result = c.download_stdout_logs("job-1", tmp_path, max_workers=2)
+
+        assert len(self._gets(connection, target)) == 2
+        assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(self.SUB, range(4))
+        assert "skipped_chunks" not in result[0] and "warnings" not in result[0]
+
+    @pytest.mark.parametrize("damage", [b"not gzip", "truncated"])
+    def test_damaged_chunk_is_skipped_and_recorded(self, tmp_path, monkeypatch, damage):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=4)
+        chunks = paths[self.SUB]
+        target = self.RUN_URI + chunks[2]
+        good = connection.content_by_uri[target]
+        connection.content_by_uri[target] = good[:-6] if damage == "truncated" else damage
+
+        result = c.download_stdout_logs("job-1", tmp_path)
+
+        destination = tmp_path / self.SUB / "stdout.log"
+        assert destination.read_bytes() == self._expected(self.SUB, [0, 1, 3])
+        assert len(self._gets(connection, target)) == 2
+        assert result[0]["chunk_count"] == 3
+        assert result[0]["skipped_chunks"] == [target]
+        [warning] = result[0]["warnings"]
+        assert warning.startswith(f"skipped chunk {target}: it is damaged")
+        assert warning.endswith("the saved file is missing that chunk's output")
+        manifest = json.loads((tmp_path / self.SUB / ".stdout.log.manifest.json").read_text())
+        assert manifest == {
+            "bytes": destination.stat().st_size,
+            "names": chunks,
+            "skipped": [chunks[2]],
+            "version": 1,
+        }
+
+        # Resume keeps the gap without fetching the damaged chunk again.
+        gets_before = len(self._gets(connection))
+        resumed = c.download_stdout_logs("job-1", tmp_path, resume=True)
+        assert len(self._gets(connection)) == gets_before
+        assert resumed[0]["skipped_chunks"] == [target]
+        assert "earlier download" in resumed[0]["warnings"][0]
+
+        # A full download retries it.
+        connection.content_by_uri[target] = good
+        full = c.download_stdout_logs("job-1", tmp_path)
+        assert destination.read_bytes() == self._expected(self.SUB, range(4))
+        assert "skipped_chunks" not in full[0]
+        assert "skipped" not in json.loads(
+            (tmp_path / self.SUB / ".stdout.log.manifest.json").read_text()
+        )
+
+    def test_strict_keeps_fail_fast_on_damaged_chunk(self, tmp_path, monkeypatch):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=3)
+        target = self.RUN_URI + paths[self.SUB][1]
+        connection.content_by_uri[target] = b"not gzip"
+        with pytest.raises(gzip.BadGzipFile):
+            c.download_stdout_logs("job-1", tmp_path, strict=True, max_workers=1)
+        self._settle()
+        assert len(self._gets(connection, target)) == 1
+        partial = tmp_path / self.SUB / ".stdout.log.partial"
+        assert partial.read_bytes() == self._expected(self.SUB, [0])
+
+    def test_strict_damaged_chunk_keeps_prefix_and_resume_refetches_rest(
+        self, tmp_path, monkeypatch
+    ):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=5)
+        chunks = paths[self.SUB]
+        target = self.RUN_URI + chunks[2]
+        good = connection.content_by_uri[target]
+        connection.content_by_uri[target] = good[:-6]  # truncated: writes, then fails
+        with pytest.raises(EOFError):
+            c.download_stdout_logs("job-1", tmp_path, strict=True, max_workers=3)
+        self._settle()
+        partial = tmp_path / self.SUB / ".stdout.log.partial"
+        assert partial.read_bytes() == self._expected(self.SUB, [0, 1])
+        connection.content_by_uri[target] = good
+        gets_before = len(self._gets(connection))
+        c.download_stdout_logs("job-1", tmp_path, resume=True, strict=True, max_workers=3)
+        resumed = self._gets(connection)[gets_before:]
+        assert sorted(cmd.split(" ")[1].strip("'") for cmd in resumed) == [
+            self.RUN_URI + path for path in chunks[2:]
+        ]
+        assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(
+            self.SUB, range(5)
+        )
+
+    def test_chunk_removed_after_listing_is_skipped_without_retries(
+        self, tmp_path, monkeypatch
+    ):
+        errors = importlib.import_module("snowflake.connector.errors")
+        c, connection, paths, sleeps, _opened = self._setup(monkeypatch, count=4)
+        gone = self.RUN_URI + paths[self.SUB][1]
+
+        def on_get(source):
+            if source == gone:
+                raise errors.OperationalError(msg="the file does not exist.", errno=253006)
+
+        connection.on_get = on_get
+        result = c.download_stdout_logs("job-1", tmp_path)
+
+        assert sleeps == []
+        assert len(self._gets(connection, gone)) == 1
+        assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(
+            self.SUB, [0, 2, 3]
+        )
+        assert result[0]["skipped_chunks"] == [gone]
+        assert "no longer exists" in result[0]["warnings"][0]
+
+        with pytest.raises(errors.OperationalError):
+            c.download_stdout_logs("job-1", tmp_path / "strict", strict=True)
+        self._settle()
+
+    def test_cancel_during_retry_backoff_returns_promptly_and_saves(
+        self, tmp_path, monkeypatch
+    ):
+        errors = importlib.import_module("snowflake.connector.errors")
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=6)
+        # Real, long backoff waits: only the cancel event can end them early.
+        c._artifact_retry_policy = nc._artifact_download.RetryPolicy(initial_delay=30.0)
+        chunks = paths[self.SUB]
+        failing = self.RUN_URI + chunks[3]
+        in_backoff = threading.Event()
+
+        def on_get(source):
+            if source == self.RUN_URI + chunks[1]:
+                assert in_backoff.wait(5)
+            if source == failing:
+                in_backoff.set()
+                raise errors.OperationalError(msg="network down")
+
+        def progress(sub_job_id, done, total, nbytes):
+            if done == 3:
+                raise nc.DownloadCancelled("leaving")
+
+        connection.on_get = on_get
+        started = time.monotonic()
+        with pytest.raises(nc.DownloadCancelled):
+            c.download_stdout_logs("job-1", tmp_path, max_workers=4, on_chunk=progress)
+        self._settle()
+        assert time.monotonic() - started < 5
+
+        deadline = time.monotonic() + 5
+        while any(t.name.startswith("cortex-training-download") for t in threading.enumerate()):
+            assert time.monotonic() < deadline, "download workers kept running"
+            time.sleep(0.05)
+        assert len(self._gets(connection, failing)) == 1
+        manifest = json.loads((tmp_path / self.SUB / ".stdout.log.partial.manifest.json").read_text())
+        assert manifest["names"] == chunks[:3]
+
+    def test_cancellation_is_not_reported_as_a_failure(self, tmp_path, monkeypatch):
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=3)
+        c._metric_emitter = MagicMock()
+
+        def progress(*_args):
+            raise nc.DownloadCancelled("stop")
+
+        # Explicitly turning success telemetry off also silences cancellations.
+        monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "0")
+        with pytest.raises(nc.DownloadCancelled):
+            c.download_stdout_logs("job-1", tmp_path, on_chunk=progress)
+        self._settle()
+        c._metric_emitter.emit.assert_not_called()
+
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        with pytest.raises(nc.DownloadCancelled):
+            c.download_stdout_logs("job-1", tmp_path, on_chunk=progress)
+        self._settle()
+        operation, value = c._metric_emitter.emit.call_args.args
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert operation == "download_stdout_logs"
+        assert value["cancelled"] is True and value["success"] is False
+        assert "error_message" not in value and "error.type" not in attributes
+
+    def _emitted(self, c, operation="download_stdout_logs"):
+        calls = [call for call in c._metric_emitter.emit.call_args_list if call.args[0] == operation]
+        assert len(calls) == 1, calls
+        return calls[0].args[1], calls[0].kwargs["attributes"]
+
+    def test_training_metrics_download_successes_are_on_by_default_too(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c, _connection, _paths, _sleeps, _opened = self._setup(
+            monkeypatch, count=3, artifact_name="metrics", chunk_name="training"
+        )
+        c._metric_emitter = MagicMock()
+
+        c.download_training_metrics("job-1", tmp_path)
+
+        value, attributes = self._emitted(c, "download_training_metrics")
+        assert (value["success"], value["chunk_count"], value["cancelled"]) == (True, 3, False)
+        assert attributes == {"client.surface": "sdk", "job_id": "job-1"}
+
+    def test_download_success_telemetry_is_on_by_default(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=3)
+        c._metric_emitter = MagicMock()
+        c.download_stdout_logs("job-1", tmp_path)
+        value, attributes = self._emitted(c)
+        size = (tmp_path / self.SUB / "stdout.log").stat().st_size
+        varying = ("duration_ms", "list_ms", "fetch_ms", "first_commit_ms", "attempt_count", "request_count")
+        assert {key: value[key] for key in value if key not in varying} == {
+            "artifact": "stdout",
+            "max_workers": 16,
+            "resume": False,
+            "resume_mode": "fresh",
+            "sub_job_count": 1,
+            "chunk_count": 3,
+            "chunks_skipped": 0,
+            "bytes_written": size,
+            "artifact_retry_count": 0,
+            "transfer_timeout_count": 0,
+            "cancelled": False,
+            "retry_count": 0,
+            "success": True,
+        }
+        assert value["list_ms"] >= 0 and value["fetch_ms"] >= 0
+        assert value["duration_ms"] >= value["fetch_ms"]
+        # Its one file was whole before the call ended; with no on_preview there is no preview_ms.
+        assert 0 <= value["first_commit_ms"] <= value["duration_ms"] and "preview_ms" not in value
+        # Surface and identity only: per-download detail stays in the value.
+        assert attributes == {"client.surface": "sdk", "job_id": "job-1"}
+
+        # Other operations keep successes opt-in.
+        c._metric_emitter.reset_mock()
+        c._session.post.return_value = _make_response({"request_id": "r1"})
+        c.step("job-1")
+        c._metric_emitter.emit.assert_not_called()
+
+        monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "0")
+        c.download_stdout_logs("job-1", tmp_path / "quiet")
+        c._metric_emitter.emit.assert_not_called()
+
+    def test_download_telemetry_for_resume_append_and_skipped_chunks(self, tmp_path, monkeypatch):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=4)
+        chunks = paths[self.SUB]
+        listing = connection.list_rows[self.RUN_URI + "_stdout/"]
+        connection.list_rows[self.RUN_URI + "_stdout/"] = [
+            row for row in listing if row[0].removeprefix("/versions/RUN_ABC/") in chunks[:2]
+        ]
+        c.download_stdout_logs("job-1", tmp_path)
+        connection.list_rows[self.RUN_URI + "_stdout/"] = listing
+        connection.content_by_uri[self.RUN_URI + chunks[3]] = b"not gzip"
+        c._metric_emitter = MagicMock()
+        before = (tmp_path / self.SUB / "stdout.log").stat().st_size
+        result = c.download_stdout_logs("job-1", tmp_path, resume=True, max_workers=2)
+        value, _attributes = self._emitted(c)
+        after = (tmp_path / self.SUB / "stdout.log").stat().st_size
+        assert result[0]["skipped_chunks"] == [self.RUN_URI + chunks[3]]
+        assert value["resume"] is True and value["resume_mode"] == "append"
+        assert value["chunk_count"] == 2 and value["chunks_skipped"] == 1
+        assert value["bytes_written"] == after - before > 0
+        assert value["max_workers"] == 2 and value["success"] is True
+
+    def test_download_failure_telemetry_counts_retries_and_progress(self, tmp_path, monkeypatch):
+        errors = importlib.import_module("snowflake.connector.errors")
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=4)
+        chunks = paths[self.SUB]
+        flaky = [errors.OperationalError(msg="reset")]
+
+        def on_get(source):
+            if source == self.RUN_URI + chunks[1] and flaky:
+                raise flaky.pop()
+            if source == self.RUN_URI + chunks[2]:
+                raise errors.ProgrammingError(msg="denied", errno=2003)
+
+        connection.on_get = on_get
+        c._metric_emitter = MagicMock()
+        with pytest.raises(errors.ProgrammingError):
+            c.download_stdout_logs("job-1", tmp_path, max_workers=1)
+        self._settle()
+        value, attributes = self._emitted(c)
+        assert value["success"] is False and value["cancelled"] is False
+        assert "denied" in value["error_message"]
+        assert value["chunk_count"] == 2  # committed before the failure
+        assert value["artifact_retry_count"] == 1
+        assert value["transfer_timeout_count"] == 0
+        assert attributes["error.type"] == "ProgrammingError"
+
+    def test_download_telemetry_counts_transfer_timeouts(self, tmp_path, monkeypatch):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=2)
+        hung = self.RUN_URI + paths[self.SUB][0]
+        release = threading.Event()
+        first = [True]
+
+        def on_get(source):
+            if source == hung and first:
+                first.clear()
+                release.wait(10)
+
+        connection.on_get = on_get
+        c._metric_emitter = MagicMock()
+        try:
+            c.download_stdout_logs("job-1", tmp_path, transfer_timeout_seconds=0.3)
+        finally:
+            release.set()
+        value, _attributes = self._emitted(c)
+        assert value["transfer_timeout_count"] == 1
+        assert value["artifact_retry_count"] == 1
+        assert value["success"] is True
+
+    def test_interrupted_download_reports_cancelled(self, tmp_path, monkeypatch):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=4)
+        target = self.RUN_URI + paths[self.SUB][2]
+
+        def on_get(source):
+            if source == target:
+                raise KeyboardInterrupt
+
+        connection.on_get = on_get
+        c._metric_emitter = MagicMock()
+        with pytest.raises(KeyboardInterrupt):
+            c.download_stdout_logs("job-1", tmp_path, max_workers=1)
+        self._settle()
+        value, _attributes = self._emitted(c)
+        assert value["cancelled"] is True and value["success"] is False
+        assert value["chunk_count"] == 2
+        assert "error_message" not in value
+
+    def test_fetch_execution_logs_success_telemetry(self, monkeypatch):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c = _make_client()
+        run_uri = self.RUN_URI
+        path = "_logs/job-1:training:0/execution.jsonl"
+        connection = TestExecutionLogDownload.FakeArtifactConnection(
+            {run_uri + "_logs/": [(f"/versions/RUN_ABC/{path}",)], run_uri + "checkpoints/_logs/": []},
+            {run_uri + path: b'{"a":1}\n'},
+        )
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", lambda: connection)
+        c._metric_emitter = MagicMock()
+        c.fetch_execution_logs("job-1")
+        value, _attributes = self._emitted(c, "fetch_execution_logs")
+        assert value["artifact"] == "execution_logs"
+        assert value["file_count"] == 1 and value["bytes_read"] == 8
+        assert value["list_ms"] >= 0 and value["fetch_ms"] >= 0
+        assert value["success"] is True and value["cancelled"] is False
+
+        # A file that does not decode is not counted as read.
+        connection.content_by_uri[run_uri + path] = b"\xff\xfe not utf-8"
+        c._metric_emitter.reset_mock()
+        with pytest.raises(UnicodeDecodeError):
+            c.fetch_execution_logs("job-1")
+        value, _attributes = self._emitted(c, "fetch_execution_logs")
+        assert value["success"] is False
+        assert value["file_count"] == 0 and value["bytes_read"] == 0
+        assert value["cancelled"] is False
+
+    def test_download_telemetry_sends_resume_as_a_bool(self, tmp_path, monkeypatch):
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=1)
+        c._metric_emitter = MagicMock()
+        c.download_stdout_logs("job-1", tmp_path, resume=1)
+        value, _attributes = self._emitted(c)
+        assert value["resume"] is True
+
+    @pytest.mark.parametrize("setting", ["no", "off", "false", "2"])
+    def test_any_explicit_non_truthy_setting_turns_download_successes_off(
+        self, tmp_path, monkeypatch, setting
+    ):
+        monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, setting)
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=1)
+        c._metric_emitter = MagicMock()
+        c.download_stdout_logs("job-1", tmp_path)
+        c._metric_emitter.emit.assert_not_called()
+
+    def test_download_failures_are_still_sent_with_success_telemetry_off(
+        self, tmp_path, monkeypatch
+    ):
+        errors = importlib.import_module("snowflake.connector.errors")
+        monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "0")
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=2)
+
+        def on_get(source):
+            raise errors.ProgrammingError(msg="denied", errno=2003)
+
+        connection.on_get = on_get
+        c._metric_emitter = MagicMock()
+        with pytest.raises(errors.ProgrammingError):
+            c.download_stdout_logs("job-1", tmp_path)
+        self._settle()
+        value, _attributes = self._emitted(c)
+        assert value["success"] is False and value["artifact"] == "stdout"
+
+    def test_interrupting_another_operation_sends_nothing_by_default(self):
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        c._session.post.side_effect = KeyboardInterrupt
+        with pytest.raises(KeyboardInterrupt):
+            c.step("job-1")
+        c._metric_emitter.emit.assert_not_called()
+
+    def test_rebuilding_an_existing_file_reports_rebuild(self, tmp_path, monkeypatch):
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=1)
+        c.download_stdout_logs("job-1", tmp_path)
+        c._metric_emitter = MagicMock()
+        c.download_stdout_logs("job-1", tmp_path)
+        value, _attributes = self._emitted(c)
+        assert value["resume_mode"] == "rebuild"
+
+    def test_download_cancelled_is_public(self):
+        import cortex_training
+
+        assert cortex_training.DownloadCancelled is nc.DownloadCancelled
+        assert issubclass(nc.DownloadCancelled, Exception)
+
+    def test_failure_marks_whether_progress_was_saved(self, tmp_path, monkeypatch):
+        errors = importlib.import_module("snowflake.connector.errors")
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=3)
+        denied = {self.RUN_URI + paths[self.SUB][0]}
+
+        def on_get(source):
+            if source in denied:
+                raise errors.ProgrammingError(msg="denied", errno=2003)
+
+        connection.on_get = on_get
+        with pytest.raises(errors.ProgrammingError) as first:
+            c.download_stdout_logs("job-1", tmp_path, max_workers=1)
+        assert first.value.download_progress_saved is False
+
+        denied.clear()
+        denied.add(self.RUN_URI + paths[self.SUB][2])
+        with pytest.raises(errors.ProgrammingError) as second:
+            c.download_stdout_logs("job-1", tmp_path, max_workers=1)
+        assert second.value.download_progress_saved is True
+
+    def test_on_chunk_done_equals_total_only_after_commit(self, tmp_path, monkeypatch):
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=3)
+        destination = tmp_path / self.SUB / "stdout.log"
+        seen = []
+
+        def progress(sub_job_id, done, total, nbytes):
+            seen.append((done, destination.exists()))
+            if done == total:
+                assert destination.read_bytes() == self._expected(self.SUB, range(3))
+                assert destination.stat().st_size == nbytes
+
+        c.download_stdout_logs("job-1", tmp_path, on_chunk=progress)
+        assert seen == [(0, False), (1, False), (2, False), (3, True)]
+        seen.clear()
+        c.download_stdout_logs("job-1", tmp_path, on_chunk=progress, resume=True)
+        assert seen == [(3, True)]
+
+    @pytest.mark.parametrize("crash", ["before_data_replace", "between_replaces"])
+    def test_promote_crash_windows(self, tmp_path, monkeypatch, crash):
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=3)
+        directory = tmp_path / self.SUB
+        destination = directory / "stdout.log"
+        manifest = directory / ".stdout.log.manifest.json"
+        real_replace = os.replace
+        crashed = []
+
+        def replace(src, dst):
+            target = destination if crash == "before_data_replace" else manifest
+            if Path(dst) == target and not crashed:
+                crashed.append(dst)
+                raise SystemExit("crash")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(nc.os, "replace", replace)
+        with pytest.raises(SystemExit):
+            c.download_stdout_logs("job-1", tmp_path)
+        self._settle()
+        monkeypatch.setattr(nc.os, "replace", real_replace)
+
+        gets_before = len(self._gets(connection))
+        c.download_stdout_logs("job-1", tmp_path, resume=True)
+        refetched = len(self._gets(connection)) - gets_before
+        assert destination.read_bytes() == self._expected(self.SUB, range(3))
+        assert json.loads(manifest.read_text())["names"] == paths[self.SUB]
+        assert not list(directory.glob(".stdout.log.partial*"))
+        if crash == "before_data_replace":
+            # The complete partial file is promoted without any GET.
+            assert refetched == 0
+        else:
+            # The new file has no manifest yet, so it is rebuilt (wasteful, safe).
+            assert refetched == 3
+
+    def test_reconnect_while_another_get_runs_on_the_old_connection(
+        self, tmp_path, monkeypatch
+    ):
+        errors = importlib.import_module("snowflake.connector.errors")
+        c, first, paths, _sleeps, _opened = self._setup(monkeypatch, count=4)
+        second = TestExecutionLogDownload.FakeArtifactConnection(
+            first.list_rows, first.content_by_uri
+        )
+        connections = iter([first, second])
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", lambda: next(connections))
+        chunks = paths[self.SUB]
+        slow = self.RUN_URI + chunks[0]
+        expiring = self.RUN_URI + chunks[1]
+        reopened = threading.Event()
+        old_still_open = []
+
+        def on_first_get(source):
+            if source == slow:
+                assert reopened.wait(5)
+                old_still_open.append(not first.closed)
+            if source == expiring:
+                raise errors.ProgrammingError(msg="session expired", errno=390112)
+
+        def on_second_get(source):
+            if source == expiring:
+                reopened.set()
+
+        first.on_get = on_first_get
+        second.on_get = on_second_get
+        c.download_stdout_logs("job-1", tmp_path, max_workers=2)
+
+        assert old_still_open == [True]
+        assert any(expiring in cmd for cmd in self._gets(second))
+        assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(
+            self.SUB, range(4)
+        )
+        assert first.closed and second.closed
+
+    def test_stress_many_chunks_with_random_latency(self, tmp_path, monkeypatch):
+        import random as random_module
+
+        subs = [self.SUB, "job-1:training:1", "job-1:sampling:0"]
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, subs=subs, count=170)
+        rng = random_module.Random(1234)
+        delays = {
+            self.RUN_URI + path: rng.random() * 0.004 for sub in subs for path in paths[sub]
+        }
+        connection.on_get = lambda source: time.sleep(delays[source])
+
+        result = c.download_stdout_logs("job-1", tmp_path, max_workers=32)
+
+        assert len(self._gets(connection)) == 510
+        for sub in subs:
+            assert (tmp_path / sub / "stdout.log").read_bytes() == self._expected(sub, range(170))
+        assert [entry["chunk_count"] for entry in result] == [170, 170, 170]
+
+    @pytest.mark.parametrize(
+        "skipped", [["not-listed.gz"], [{"x": 1}], "names"]
+    )
+    def test_manifest_with_invalid_skipped_list_is_rejected(self, tmp_path, skipped):
+        path = tmp_path / ".x.manifest.json"
+        path.write_text(json.dumps({"bytes": 1, "names": ["a.gz"], "skipped": skipped, "version": 1}))
+        assert nc._artifact_download.read_manifest(path) is None
+
+    # Newest chunk time in _setup(count=3): 2026-09-04 12:00:02 UTC.
+    NEWEST = datetime(2026, 9, 4, 12, 0, 2, tzinfo=timezone.utc).timestamp()
+
+    def _stale_setup(
+        self,
+        monkeypatch,
+        *,
+        status="RUNNING",
+        age_minutes=11,
+        server_age_minutes=None,
+        job_fields=None,
+        **kwargs,
+    ):
+        """``server_age_minutes`` sets the server's clock; None means no Date header."""
+        c, connection, paths, sleeps, opened = self._setup(monkeypatch, **kwargs)
+        status_calls = []
+
+        def job_for_upload_warnings(job_id):
+            status_calls.append(job_id)
+            if isinstance(status, Exception):
+                raise status
+            server_now = (
+                None if server_age_minutes is None else self.NEWEST + server_age_minutes * 60
+            )
+            return {"job_id": job_id, "status": status, **(job_fields or {})}, server_now
+
+        monkeypatch.setattr(c, "_job_for_upload_warnings", job_for_upload_warnings)
+        c._wall_clock = lambda: self.NEWEST + age_minutes * 60
+        return c, connection, paths, status_calls
+
+    def test_stale_stdout_warns_while_running(self, tmp_path, monkeypatch, caplog):
+        c, _connection, _paths, status_calls = self._stale_setup(monkeypatch, count=3)
+        with caplog.at_level(logging.WARNING):
+            result = c.download_stdout_logs("job-1", tmp_path)
+        [warning] = result[0]["warnings"]
+        assert warning.startswith(
+            f"newest saved stdout output for {self.SUB} is from 2026-09-04 12:00:02 UTC "
+            "(11 min ago) while the job is still running; uploads may be stalled. "
+            "Contact support if this persists."
+        )
+        assert warning in caplog.text
+        assert status_calls == ["job-1"]
+        assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(self.SUB, range(3))
+
+    def test_old_training_metrics_of_a_running_job_are_not_called_stalled(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Training rows are written only on /fwd-bwd and /step, so a running job whose
+        newest training chunk is old is idle, not stalled: no warning, unlike GPU metrics."""
+        c, _connection, _paths, _status_calls = self._stale_setup(
+            monkeypatch, count=3, artifact_name="metrics", chunk_name="training"
+        )
+        with caplog.at_level(logging.WARNING):
+            result = c.download_training_metrics("job-1", tmp_path)
+        assert [entry["sub_job_id"] for entry in result] == [self.SUB]
+        assert not result[0].get("warnings")
+        assert "stalled" not in caplog.text
+        assert (tmp_path / self.SUB / "training.jsonl").read_bytes() == self._expected(self.SUB, range(3))
+
+    def test_old_gpu_metrics_of_a_running_job_are_still_called_stalled(self, tmp_path, monkeypatch):
+        c, _connection, _paths, _status_calls = self._stale_setup(
+            monkeypatch, count=3, artifact_name="metrics"
+        )
+        result = c.download_metrics("job-1", tmp_path)
+        [warning] = result[0]["warnings"]
+        assert "uploads may be stalled" in warning
+
+    @pytest.mark.parametrize(
+        ("status", "age_minutes", "stale_after"),
+        [
+            ("DONE", 60, 600),
+            ("failed", 60, 600),
+            ("JOB_STATE_CANCELLED", 60, 600),
+            ("RUNNING", 9, 600),
+            ("RUNNING", 60, None),
+            ("RUNNING", 60, 7200),
+            (RuntimeError("status unavailable"), 60, 600),
+        ],
+    )
+    def test_no_stale_warning(self, tmp_path, monkeypatch, status, age_minutes, stale_after):
+        c, _connection, _paths, _calls = self._stale_setup(
+            monkeypatch, status=status, age_minutes=age_minutes, count=3
+        )
+        result = c.download_stdout_logs("job-1", tmp_path, stale_after_seconds=stale_after)
+        assert "warnings" not in result[0]
+        assert result[0]["chunk_count"] == 3
+
+    def test_fresh_stdout_of_a_running_job_looks_up_status_once_and_stays_quiet(self, tmp_path, monkeypatch):
+        # Recent chunks mean the job may have only just ended, so its status is
+        # read once (in the background); a running job gets no warning.
+        c, _connection, _paths, status_calls = self._stale_setup(
+            monkeypatch, age_minutes=1, count=3
+        )
+        assert "warnings" not in c.download_stdout_logs("job-1", tmp_path)[0]
+        assert status_calls == ["job-1"]
+
+    @pytest.mark.parametrize("age_minutes", [1, 30])
+    def test_turning_the_checks_off_skips_the_status_lookup(self, tmp_path, monkeypatch, age_minutes):
+        c, _connection, _paths, status_calls = self._stale_setup(monkeypatch, age_minutes=age_minutes, count=3)
+        c.download_stdout_logs("job-1", tmp_path, stale_after_seconds=None)
+        assert status_calls == []
+
+    @pytest.mark.parametrize("artifact_name, label", [("stdout", "stdout output"), ("metrics", "GPU metrics")])
+    def test_a_just_ended_job_warns_that_its_last_chunks_may_still_be_uploading(
+        self, tmp_path, monkeypatch, artifact_name, label
+    ):
+        ended = datetime.fromtimestamp(self.NEWEST + 30, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        c, _connection, _paths, status_calls = self._stale_setup(
+            monkeypatch,
+            status="CANCELLED",
+            age_minutes=1,
+            count=3,
+            artifact_name=artifact_name,
+            job_fields={"state_changed_at": ended},
+        )
+        method = c.download_stdout_logs if artifact_name == "stdout" else c.download_metrics
+        [warning] = method("job-1", tmp_path)[0]["warnings"]
+        assert warning == (
+            f"the job ended 30s ago, so the last {label} for {self.SUB} may still be uploading; "
+            "download again with resume in a minute or two to pick it up."
+        )
+        assert status_calls == ["job-1"]
+
+    def test_a_job_that_ended_a_while_ago_has_no_upload_warning(self, tmp_path, monkeypatch):
+        ended = datetime.fromtimestamp(self.NEWEST - 3600, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        c, _connection, _paths, _calls = self._stale_setup(
+            monkeypatch, status="DONE", age_minutes=1, count=3, job_fields={"state_changed_at": ended}
+        )
+        assert "warnings" not in c.download_stdout_logs("job-1", tmp_path)[0]
+
+    def test_stale_metrics_warning_has_no_stdout_hint(self, tmp_path, monkeypatch):
+        c, _connection, _paths, _calls = self._stale_setup(
+            monkeypatch, count=3, artifact_name="metrics"
+        )
+        [warning] = c.download_metrics("job-1", tmp_path)[0]["warnings"]
+        assert warning.startswith(f"newest saved GPU metrics for {self.SUB} is from")
+        assert "prints nothing" not in warning
+
+    def _metrics_missing_setup(self, monkeypatch, status="RUNNING", **kwargs):
+        kwargs.setdefault("age_minutes", 3)
+        c, connection, paths, status_calls = self._stale_setup(
+            monkeypatch,
+            status=status,
+            count=3,
+            artifact_name="metrics",
+            **kwargs,
+        )
+        # A second sub-job has saved stdout but no metrics.
+        stdout_only = "job-1:sampling:0"
+        connection.list_rows[self.RUN_URI + "_stdout/"] = [
+            (f"/versions/RUN_ABC/_stdout/{stdout_only}/console.20260904-120001.a.gz",)
+        ]
+        connection.list_rows[self.RUN_URI + "checkpoints/_stdout/"] = []
+        return c, connection, stdout_only
+
+    def test_running_job_with_stdout_but_no_metrics_warns(self, tmp_path, monkeypatch):
+        c, connection, stdout_only = self._metrics_missing_setup(monkeypatch)
+        result = c.download_metrics("job-1", tmp_path)
+        assert [entry["sub_job_id"] for entry in result] == [stdout_only, self.SUB]
+        assert result[0] == {
+            "sub_job_id": stdout_only,
+            "filename": "gpu.jsonl",
+            "saved_path": None,
+            "chunk_count": 0,
+            "first_artifact_uri": None,
+            "last_artifact_uri": None,
+            "warnings": [
+                f"no GPU metrics have been saved for {stdout_only} while the job is still "
+                "running, although its stdout output has been; metric uploads may be "
+                "stalled. Contact support if this persists."
+            ],
+        }
+        assert "warnings" not in result[1]
+        assert not (tmp_path / stdout_only).exists()
+        assert not any(stdout_only in cmd for cmd in self._gets(connection))
+
+        # Selecting that sub-job is not an error while the warning applies.
+        only = c.download_metrics("job-1", tmp_path, sub_job_ids=[stdout_only])
+        assert [entry["sub_job_id"] for entry in only] == [stdout_only]
+
+    @pytest.mark.parametrize("status", ["DONE", "TERMINATED", "CANCELLED", "FAILED"])
+    def test_ended_job_with_stdout_but_no_metrics_explains_why(self, tmp_path, monkeypatch, status):
+        c, connection, stdout_only = self._metrics_missing_setup(monkeypatch, status=status)
+        result = c.download_metrics("job-1", tmp_path)
+        assert [entry["sub_job_id"] for entry in result] == [stdout_only, self.SUB]
+        assert result[0]["chunk_count"] == 0 and result[0]["saved_path"] is None
+        (message,) = result[0]["warnings"]
+        assert message.startswith(f"no GPU metrics were saved for {stdout_only}, although its stdout")
+        assert "images from before GPU metrics were uploaded" in message
+        assert "warnings" not in result[1]
+        assert any(cmd == f"LIST '{self.RUN_URI}_stdout/'" for cmd in connection.commands)
+        # Naming that sub-job returns the explanation instead of NoChunksError.
+        (only,) = c.download_metrics("job-1", tmp_path, sub_job_ids=[stdout_only])
+        assert only["sub_job_id"] == stdout_only and only["warnings"] == [message]
+        self._settle()
+
+    def test_ended_job_without_stdout_either_stays_an_unknown_sub_job(self, tmp_path, monkeypatch):
+        c, _connection, _stdout_only = self._metrics_missing_setup(monkeypatch, status="DONE")
+        with pytest.raises(nc.NoChunksError):
+            c.download_metrics("job-1", tmp_path, sub_job_ids=["job-1:other:0"])
+        self._settle()
+
+    def test_pending_job_with_stdout_but_no_metrics_is_quiet(self, tmp_path, monkeypatch):
+        c, _connection, _stdout_only = self._metrics_missing_setup(monkeypatch, status="PENDING")
+        result = c.download_metrics("job-1", tmp_path)
+        assert [entry["sub_job_id"] for entry in result] == [self.SUB]
+        self._settle()
+
+    def _iso(self, minutes_after_newest):
+        stamp = datetime.fromtimestamp(self.NEWEST + minutes_after_newest * 60, tz=timezone.utc)
+        return stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @pytest.mark.parametrize("sub_status", ["DONE", "failed", "JOB_STATE_PENDING"])
+    def test_no_stall_warning_for_a_sub_job_that_is_not_running(
+        self, tmp_path, monkeypatch, sub_status
+    ):
+        fields = {"sub_jobs": [{"sub_job_id": self.SUB, "status": sub_status}]}
+        c, _connection, _paths, _calls = self._stale_setup(
+            monkeypatch, count=3, job_fields=fields
+        )
+        assert "warnings" not in c.download_stdout_logs("job-1", tmp_path)[0]
+
+    def test_stall_warning_for_a_running_sub_job(self, tmp_path, monkeypatch):
+        fields = {
+            "state_changed_at": self._iso(-60),
+            "sub_jobs": [
+                {"sub_job_id": self.SUB, "status": "RUNNING"},
+                {"sub_job_id": "job-1:sampling:0", "status": "DONE"},
+            ],
+        }
+        c, _connection, _paths, _calls = self._stale_setup(
+            monkeypatch, count=3, job_fields=fields
+        )
+        assert "11 min ago" in c.download_stdout_logs("job-1", tmp_path)[0]["warnings"][0]
+
+    def test_no_stall_warning_soon_after_the_job_started_running(self, tmp_path, monkeypatch):
+        # The newest chunk predates a restart five minutes ago.
+        c, _connection, _paths, _calls = self._stale_setup(
+            monkeypatch, count=3, job_fields={"state_changed_at": self._iso(6)}
+        )
+        assert "warnings" not in c.download_stdout_logs("job-1", tmp_path)[0]
+
+    @pytest.mark.parametrize(
+        ("local", "server", "warned"),
+        [(11, 2, None), (6, 12, "12 min ago"), (30, 11, "11 min ago"), (11, None, "11 min ago")],
+    )
+    def test_stall_age_uses_the_server_clock(
+        self, tmp_path, monkeypatch, local, server, warned
+    ):
+        c, _connection, _paths, _calls = self._stale_setup(
+            monkeypatch, count=3, age_minutes=local, server_age_minutes=server
+        )
+        warnings = c.download_stdout_logs("job-1", tmp_path)[0].get("warnings")
+        if warned is None:
+            assert warnings is None
+        else:
+            assert warned in warnings[0]
+
+    def test_no_missing_metrics_warning_right_after_the_sub_job_starts(
+        self, tmp_path, monkeypatch
+    ):
+        # Its first stdout chunk is from 12:00:01; one minute later is too soon.
+        c, _connection, stdout_only = self._metrics_missing_setup(
+            monkeypatch, age_minutes=1
+        )
+        result = c.download_metrics("job-1", tmp_path)
+        assert [entry["sub_job_id"] for entry in result] == [self.SUB]
+
+    def test_no_missing_metrics_warning_for_a_finished_sub_job(self, tmp_path, monkeypatch):
+        c, _connection, stdout_only = self._metrics_missing_setup(
+            monkeypatch,
+            job_fields={"sub_jobs": [{"sub_job_id": "job-1:sampling:0", "status": "DONE"}]},
+        )
+        result = c.download_metrics("job-1", tmp_path)
+        assert [entry["sub_job_id"] for entry in result] == [self.SUB]
+
+    def test_job_for_upload_warnings_reads_server_date(self):
+        c = _make_client()
+        response = _make_response({"status": "RUNNING"})
+        response.headers = {"Date": "Thu, 15 Oct 2026 01:52:53 GMT"}
+        c._session.get.return_value = response
+        job, server_now = c._job_for_upload_warnings("job-1")
+        assert job == {"status": "RUNNING"}
+        assert server_now == datetime(2026, 10, 15, 1, 52, 53, tzinfo=timezone.utc).timestamp()
+        response.headers = {}
+        assert c._job_for_upload_warnings("job-1")[1] is None
+
+    def test_status_lookup_failure_skips_warnings_but_finishes(self, tmp_path, monkeypatch):
+        c, _connection, _paths, calls = self._stale_setup(
+            monkeypatch, status=RuntimeError("boom"), count=3, artifact_name="metrics"
+        )
+        result = c.download_metrics("job-1", tmp_path)
+        assert calls == ["job-1"]
+        assert "warnings" not in result[0]
+        assert result[0]["chunk_count"] == 3
+
+    def test_named_sub_job_without_chunks_raises_no_chunks_error(self, tmp_path, monkeypatch):
+        import cortex_training
+
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=1)
+        with pytest.raises(cortex_training.NoChunksError) as raised:
+            c.download_stdout_logs("job-1", tmp_path, sub_job_ids=["job-1:sampling:0", self.SUB])
+        assert isinstance(raised.value, ValueError)
+        assert raised.value.sub_job_ids == ["job-1:sampling:0"]
+        assert raised.value.available == [self.SUB]
+
+    def test_spool_is_removed_after_cancel_once_abandoned_gets_finish(
+        self, tmp_path, monkeypatch
+    ):
+        spool_parent = tmp_path / "tmp"
+        spool_parent.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(spool_parent))
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=6)
+        chunks = paths[self.SUB]
+        release = threading.Event()
+        cancel_at = self.RUN_URI + chunks[1]
+
+        def on_get(source):
+            if source == cancel_at:
+                raise KeyboardInterrupt
+            if source == self.RUN_URI + chunks[3]:
+                # Still on the wire when the download gives up on it.
+                assert release.wait(5)
+
+        connection.on_get = on_get
+        with pytest.raises(KeyboardInterrupt):
+            c.download_stdout_logs("job-1", tmp_path / "out", max_workers=4)
+        assert list(spool_parent.iterdir()), "spool removed while a GET was still running"
+        release.set()
+        self._settle()
+        deadline = time.monotonic() + 5
+        while list(spool_parent.iterdir()):
+            assert time.monotonic() < deadline, list(spool_parent.rglob("*"))
+            time.sleep(0.01)
+
+    def test_spool_waits_for_the_fetch_the_writer_was_blocked_on(self, tmp_path, monkeypatch):
+        import signal
+
+        # A process started in the background by a non-interactive shell
+        # inherits SIGINT as ignored, and Python then never raises
+        # KeyboardInterrupt for it. Install the default handler for this test.
+        previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+        try:
+            self._spool_waits_for_the_blocked_fetch(tmp_path, monkeypatch, signal)
+        finally:
+            signal.signal(signal.SIGINT, previous)
+
+    def _spool_waits_for_the_blocked_fetch(self, tmp_path, monkeypatch, signal):
+        spool_parent = tmp_path / "tmp"
+        spool_parent.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(spool_parent))
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=4)
+        head = self.RUN_URI + paths[self.SUB][0]
+        release = threading.Event()
+        get_finished = threading.Event()
+        timed_out = []
+
+        def on_get(source):
+            if source == head:
+                try:
+                    # Ctrl-C arrives while the writer waits on this very fetch.
+                    signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
+                    # Bounded generously: under load the main thread can take a
+                    # while to unwind the interrupt before it releases us.
+                    if not release.wait(30):
+                        timed_out.append(source)
+                finally:
+                    get_finished.set()
+
+        connection.on_get = on_get
+        with pytest.raises(KeyboardInterrupt):
+            c.download_stdout_logs("job-1", tmp_path / "out", max_workers=1)
+        # The interrupted download has returned, but the head GET is still
+        # inside on_get: give a premature cleanup time to happen, then check.
+        assert not get_finished.wait(0.3)
+        assert list(spool_parent.iterdir()), "spool removed while the head GET was running"
+        release.set()
+        assert get_finished.wait(30)
+        self._settle()
+        deadline = time.monotonic() + 30
+        while list(spool_parent.iterdir()):
+            assert time.monotonic() < deadline, list(spool_parent.rglob("*"))
+            time.sleep(0.01)
+        assert timed_out == []
+
+    def test_sweep_reports_only_directories_it_removed(self, tmp_path, monkeypatch, caplog):
+        spool_parent = tmp_path / "tmp"
+        spool_parent.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(spool_parent))
+        stuck = spool_parent / "cortex-training-stdout-artifacts-stuck"
+        stuck.mkdir()
+        stamp = time.time() - 7200
+        os.utime(stuck, (stamp, stamp))
+        monkeypatch.setattr(nc._artifact_download.shutil, "rmtree", lambda *a, **k: None)
+        with caplog.at_level(logging.DEBUG):
+            nc._artifact_download.Spool.sweep("cortex-training-stdout-artifacts-", 3600)
+        assert "could not remove leftover download directory" in caplog.text
+        assert "removed leftover download directory" not in caplog.text
+
+    def test_old_spool_directories_are_swept(self, tmp_path, monkeypatch):
+        spool_parent = tmp_path / "tmp"
+        spool_parent.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(spool_parent))
+        old = spool_parent / "cortex-training-stdout-artifacts-old"
+        recent = spool_parent / "cortex-training-stdout-artifacts-recent"
+        other = spool_parent / "cortex-training-metrics-artifacts-old"
+        for directory in (old, recent, other):
+            (directory / "chunk-x").mkdir(parents=True)
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=1)
+        stamp = time.time() - 2 * c._TEMP_ORPHAN_MIN_AGE_SECONDS
+        for directory in (old, other):
+            os.utime(directory, (stamp, stamp))
+        c.download_stdout_logs("job-1", tmp_path / "out")
+        assert sorted(path.name for path in spool_parent.iterdir()) == [other.name, recent.name]
+
+    def test_hung_get_is_abandoned_and_retried(self, tmp_path, monkeypatch):
+        c, connection, paths, sleeps, _opened = self._setup(monkeypatch, count=4)
+        hung = self.RUN_URI + paths[self.SUB][1]
+        release = threading.Event()
+        first = [True]
+
+        def on_get(source):
+            if source == hung and first:
+                first.clear()
+                assert release.wait(10)
+
+        connection.on_get = on_get
+        started = time.monotonic()
+        result = c.download_stdout_logs("job-1", tmp_path, transfer_timeout_seconds=0.5)
+        assert time.monotonic() - started < 5
+        destination = tmp_path / self.SUB / "stdout.log"
+        expected = self._expected(self.SUB, range(4))
+        assert destination.read_bytes() == expected
+        assert len(self._gets(connection, hung)) == 2
+        assert len(sleeps) == 1
+        assert result[0]["chunk_count"] == 4
+
+        # The abandoned attempt finishing later cannot touch the output.
+        release.set()
+        deadline = time.monotonic() + 5
+        while any(t.name == "cortex-training-transfer" for t in threading.enumerate()):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert destination.read_bytes() == expected
+        assert sorted(p.name for p in (tmp_path / self.SUB).iterdir()) == [
+            ".stdout.log.manifest.json",
+            "stdout.log",
+        ]
+
+    def test_hung_list_is_abandoned_and_retried(self, tmp_path, monkeypatch):
+        c, connection, _paths, sleeps, _opened = self._setup(monkeypatch, count=2)
+        cursor_cls = connection.Cursor
+        release = threading.Event()
+        first = [True]
+
+        class HangingCursor(cursor_cls):
+            def execute(self, statement):
+                if statement.startswith("LIST ") and first:
+                    first.clear()
+                    release.wait(10)
+                return super().execute(statement)
+
+        monkeypatch.setattr(connection, "cursor", lambda: HangingCursor(connection))
+        try:
+            c.download_stdout_logs("job-1", tmp_path, transfer_timeout_seconds=0.5)
+        finally:
+            release.set()
+        assert len(sleeps) == 1
+        assert (tmp_path / self.SUB / "stdout.log").read_bytes() == self._expected(
+            self.SUB, range(2)
+        )
+
+    def test_run_bounded_gives_a_cancelled_attempt_a_short_grace(self, monkeypatch):
+        monkeypatch.setattr(nc._artifact_download, "CANCEL_GRACE_SECONDS", 0.3)
+        cancel = threading.Event()
+        cancel.set()
+        release = threading.Event()
+        started = time.monotonic()
+        with pytest.raises(nc.DownloadCancelled):
+            nc._artifact_download.run_bounded(
+                lambda: release.wait(10), timeout=None, cancel=cancel, description="GET x"
+            )
+        assert 0.2 < time.monotonic() - started < 3
+        release.set()
+        # A quick attempt still completes normally after cancel.
+        assert nc._artifact_download.run_bounded(
+            lambda: 7, timeout=1.0, cancel=cancel, description="GET y"
+        ) == 7
+
+    def test_run_bounded_reraises_the_attempt_error(self):
+        def fail():
+            raise KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            nc._artifact_download.run_bounded(fail, timeout=1.0, cancel=None, description="x")
+        assert nc._artifact_download.classify_artifact_error(
+            nc._artifact_download.TransferTimeout("slow")
+        ) == "retry"
+
+    def test_transfer_timeout_message_suggests_the_knobs(self):
+        with pytest.raises(nc._artifact_download.TransferTimeout) as raised:
+            nc._artifact_download.run_bounded(
+                lambda: time.sleep(1), timeout=0.05, cancel=None, description="GET x"
+            )
+        message = str(raised.value)
+        assert message.startswith("GET x did not finish within 0.05s.")
+        assert "--transfer-timeout" in message and "--parallel" in message
+
+    @pytest.mark.parametrize("value", [0, -1, True, "300"])
+    def test_transfer_timeout_must_be_positive(self, tmp_path, monkeypatch, value):
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=1)
+        with pytest.raises(ValueError, match="transfer_timeout_seconds"):
+            c.download_stdout_logs("job-1", tmp_path, transfer_timeout_seconds=value)
+
+    def test_resume_with_nothing_new_leaves_a_read_only_file_alone(self, tmp_path, monkeypatch):
+        if os.geteuid() == 0:
+            pytest.skip("root ignores the read-only destination")
+        c, connection, paths, _sleeps, _opened = self._setup(monkeypatch, count=3)
+        c.download_stdout_logs("job-1", tmp_path)
+        destination = tmp_path / self.SUB / "stdout.log"
+        destination.chmod(0o444)
+        gets_before = len(self._gets(connection))
+        calls, counts = [], []
+        try:
+            result = c.download_stdout_logs(
+                "job-1",
+                tmp_path,
+                resume=True,
+                progress=calls.append,
+                on_chunk=lambda *args: counts.append(args),
+            )
+        finally:
+            destination.chmod(0o644)
+        assert len(self._gets(connection)) == gets_before
+        assert destination.read_bytes() == self._expected(self.SUB, range(3))
+        assert result[0]["chunk_count"] == 3
+        assert result[0]["last_artifact_uri"] == self.RUN_URI + paths[self.SUB][-1]
+        assert calls == [f"stdout: no new chunks for {self.SUB}\n"]
+        assert counts == [(self.SUB, 3, 3, destination.stat().st_size)]
+
+    @pytest.mark.parametrize("value", ["job-1:training:0", b"job-1:training:0"])
+    def test_sub_job_ids_rejects_a_bare_string(self, tmp_path, monkeypatch, value):
+        c, connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=1)
+        with pytest.raises(TypeError, match="not a single string"):
+            c.download_stdout_logs("job-1", tmp_path, sub_job_ids=value)
+        assert connection.commands == []
+
+    def test_stall_check_runs_while_chunks_are_fetched(self, tmp_path, monkeypatch):
+        c, connection, paths, _calls = self._stale_setup(monkeypatch, count=3)
+        fetching = threading.Event()
+        threads = []
+        real_lookup = c._job_for_upload_warnings
+
+        def lookup(job_id):
+            threads.append(threading.current_thread().name)
+            # Only returns quickly if the GETs run at the same time.
+            assert fetching.wait(5)
+            return real_lookup(job_id)
+
+        monkeypatch.setattr(c, "_job_for_upload_warnings", lookup)
+        connection.on_get = lambda _source: fetching.set()
+        result = c.download_stdout_logs("job-1", tmp_path)
+        assert threads == ["cortex-training-stall-check"]
+        assert "11 min ago" in result[0]["warnings"][0]
+
+    def test_slow_stall_check_does_not_hold_the_download(self, tmp_path, monkeypatch):
+        c, _connection, _paths, _calls = self._stale_setup(monkeypatch, count=2)
+        monkeypatch.setattr(c, "_STALL_CHECK_WAIT_SECONDS", 0.2)
+        release = threading.Event()
+        monkeypatch.setattr(c, "_job_for_upload_warnings", lambda _job: release.wait(10))
+        started = time.monotonic()
+        try:
+            result = c.download_stdout_logs("job-1", tmp_path)
+        finally:
+            release.set()
+        assert time.monotonic() - started < 3
+        assert "warnings" not in result[0]
+        assert result[0]["chunk_count"] == 2
+
+    def test_interrupt_while_waiting_on_stall_check_keeps_saved_progress(
+        self, tmp_path, monkeypatch
+    ):
+        c, _connection, _paths, _calls = self._stale_setup(monkeypatch, count=2)
+        release = threading.Event()
+        monkeypatch.setattr(c, "_job_for_upload_warnings", lambda _job: release.wait(10))
+        destination = tmp_path / self.SUB / "stdout.log"
+        committed = []
+
+        def interrupted_wait(_self, _timeout, _default):
+            # Ctrl-C lands while the stall check is still running, after the
+            # files were written.
+            committed.append(destination.read_bytes())
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(nc._artifact_download.Background, "result", interrupted_wait)
+        try:
+            with pytest.raises(KeyboardInterrupt) as excinfo:
+                c.download_stdout_logs("job-1", tmp_path)
+        finally:
+            release.set()
+        assert excinfo.value.download_progress_saved is True
+        assert committed == [self._expected(self.SUB, range(2))]
+        assert destination.read_bytes() == self._expected(self.SUB, range(2))
+
+    @pytest.mark.parametrize("interrupt_wait_too", [False, True])
+    def test_interrupt_while_closing_the_session_keeps_saved_progress(
+        self, tmp_path, monkeypatch, interrupt_wait_too
+    ):
+        c, _connection, _paths, _calls = self._stale_setup(monkeypatch, count=2)
+        if interrupt_wait_too:
+            # A second Ctrl-C in the close replaces the first one's exception.
+            def interrupted_wait(_self, _timeout, _default):
+                raise KeyboardInterrupt
+
+            monkeypatch.setattr(nc._artifact_download.Background, "result", interrupted_wait)
+        real_close = nc._artifact_download.SharedConnection.close
+        escaped = []
+
+        def interrupted_close(shared, **options):
+            real_close(shared, **options)
+            escaped.append(KeyboardInterrupt())
+            raise escaped[-1]
+
+        monkeypatch.setattr(nc._artifact_download.SharedConnection, "close", interrupted_close)
+        with pytest.raises(KeyboardInterrupt) as excinfo:
+            c.download_stdout_logs("job-1", tmp_path)
+        assert excinfo.value is escaped[0]
+        assert excinfo.value.download_progress_saved is True
+        destination = tmp_path / self.SUB / "stdout.log"
+        assert destination.read_bytes() == self._expected(self.SUB, range(2))
+
+    def test_interrupt_in_pool_shutdown_after_the_last_commit_keeps_saved_progress(
+        self, tmp_path, monkeypatch
+    ):
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=2)
+        real_shutdown = nc.ThreadPoolExecutor.shutdown
+        spools = []
+
+        def live_spools():
+            return set(Path(tempfile.gettempdir()).glob("*-stdout-artifacts-*"))
+
+        earlier = live_spools()
+
+        def interrupted_shutdown(pool, wait=True, **kwargs):
+            real_shutdown(pool, wait=wait, **kwargs)
+            if wait:
+                spools.extend(live_spools() - earlier)
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr(nc.ThreadPoolExecutor, "shutdown", interrupted_shutdown)
+        with pytest.raises(KeyboardInterrupt) as excinfo:
+            c.download_stdout_logs("job-1", tmp_path)
+        assert excinfo.value.download_progress_saved is True
+        destination = tmp_path / self.SUB / "stdout.log"
+        assert destination.read_bytes() == self._expected(self.SUB, range(2))
+        assert spools and not any(path.exists() for path in spools)
+
+    def test_interrupt_while_closing_after_nothing_was_saved_is_not_marked(
+        self, tmp_path, monkeypatch
+    ):
+        c, _connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=0)
+        real_close = nc._artifact_download.SharedConnection.close
+
+        def interrupted_close(shared, **options):
+            real_close(shared, **options)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(nc._artifact_download.SharedConnection, "close", interrupted_close)
+        with pytest.raises(KeyboardInterrupt) as excinfo:
+            c.download_stdout_logs("job-1", tmp_path)
+        assert not getattr(excinfo.value, "download_progress_saved", False)
+
+    @pytest.mark.parametrize("new_chunk", [False, True])
+    def test_resume_interrupted_before_writing_keeps_saved_progress(
+        self, tmp_path, monkeypatch, new_chunk
+    ):
+        c, connection, _paths, _sleeps, _opened = self._setup(monkeypatch, count=3)
+        listing = self.RUN_URI + "_stdout/"
+        rows = connection.list_rows[listing]
+        if new_chunk:
+            # The newest chunk is uploaded after the first download.
+            connection.list_rows[listing] = rows[1:]
+        c.download_stdout_logs("job-1", tmp_path)
+        connection.list_rows[listing] = rows
+        destination = tmp_path / self.SUB / "stdout.log"
+        saved = destination.read_bytes()
+
+        def interrupted_progress(_line):
+            # Ctrl-C at the first status line, before any new chunk is written.
+            raise KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt) as excinfo:
+            c.download_stdout_logs("job-1", tmp_path, resume=True, progress=interrupted_progress)
+        assert excinfo.value.download_progress_saved is True
+        assert destination.read_bytes() == saved
+        assert saved == self._expected(self.SUB, range(2 if new_chunk else 3))
+
+    @pytest.mark.parametrize("download_fails", [True, False])
+    def test_late_stall_check_never_reopens_the_session(
+        self, tmp_path, monkeypatch, caplog, download_fails
+    ):
+        errors = importlib.import_module("snowflake.connector.errors")
+        base = TestExecutionLogDownload.FakeArtifactConnection
+
+        class ClosingConnection(base):
+            class Cursor(base.Cursor):
+                def execute(self, statement):
+                    if self.connection.closed:
+                        raise errors.DatabaseError(msg="Connection is closed", errno=250002)
+                    if statement.startswith("GET ") and download_fails:
+                        raise errors.ProgrammingError(msg="invalid stage location", errno=253004)
+                    return super().execute(statement)
+
+            def cursor(self):
+                return self.Cursor(self)
+
+        c, connection, _paths, _calls = self._stale_setup(
+            monkeypatch, count=1, artifact_name="metrics"
+        )
+        opened = []
+
+        def opener():
+            conn = ClosingConnection(connection.list_rows, connection.content_by_uri)
+            opened.append(conn)
+            return conn
+
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
+        monkeypatch.setattr(c, "_STALL_CHECK_WAIT_SECONDS", 0.1)
+        real_lookup = c._job_for_upload_warnings
+        finished = threading.Event()
+
+        def slow_lookup(job_id):
+            # Outlives both a failed download and the wait cap.
+            time.sleep(0.4)
+            try:
+                return real_lookup(job_id)
+            finally:
+                finished.set()
+
+        monkeypatch.setattr(c, "_job_for_upload_warnings", slow_lookup)
+        with caplog.at_level(logging.DEBUG):
+            if download_fails:
+                with pytest.raises(errors.ProgrammingError):
+                    c.download_metrics("job-1", tmp_path)
+            else:
+                c.download_metrics("job-1", tmp_path)
+            returned = len(caplog.records)
+            assert finished.wait(5)
+            deadline = time.monotonic() + 5
+            while any(t.name == "cortex-training-stall-check" for t in threading.enumerate()):
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+        assert len(opened) == 1
+        assert all(conn.closed for conn in opened)
+        late = [r for r in caplog.records[returned:] if r.levelno >= logging.WARNING]
+        assert late == []
+
+    def test_closed_shared_connection_refuses_to_reopen(self):
+        opened = []
+
+        def opener():
+            opened.append(MagicMock())
+            return opened[-1]
+
+        shared = nc._artifact_download.SharedConnection(opener)
+        _connection, generation = shared.current()
+        shared.close()
+        with pytest.raises(nc._artifact_download.SessionClosed):
+            shared.current()
+        with pytest.raises(nc._artifact_download.SessionClosed):
+            shared.reopen(generation)
+        assert len(opened) == 1
+        assert nc._artifact_download.classify_artifact_error(
+            nc._artifact_download.SessionClosed("closed")
+        ) is None
+
+    @pytest.mark.parametrize("value", [0, -5, True, "600"])
+    def test_stale_after_must_be_positive(self, tmp_path, monkeypatch, value):
+        c, _connection, _paths, _calls = self._stale_setup(monkeypatch, count=1)
+        with pytest.raises(ValueError, match="stale_after_seconds"):
+            c.download_stdout_logs("job-1", tmp_path, stale_after_seconds=value)
+        self._settle()
+
+    @pytest.mark.parametrize("missing", ["NonRetryableTlsError", "RevocationCheckError", "TooManyRequests"])
+    def test_classification_tolerates_connector_classes_missing_in_older_releases(
+        self, monkeypatch, missing
+    ):
+        errors = importlib.import_module("snowflake.connector.errors")
+        operational = errors.OperationalError(msg="network down")
+        permission = errors.ProgrammingError(msg="denied", errno=2003)
+        monkeypatch.delattr(errors, missing, raising=False)
+        classify = nc._artifact_download.classify_artifact_error
+        assert classify(operational) == "retry"
+        assert classify(permission) is None
+        assert classify(errors.ProgrammingError(msg="expired", errno=390112)) == "reconnect"
+
+    def test_classification_never_raises(self, monkeypatch):
+        class Weird(Exception):
+            errno = 253002
+
+            def __str__(self):
+                raise RuntimeError("unprintable")
+
+        assert nc._artifact_download.classify_artifact_error(Weird()) is None
+        errors = importlib.import_module("snowflake.connector.errors")
+        monkeypatch.setattr(errors, "OperationalError", "not a class")
+        assert nc._artifact_download.classify_artifact_error(ConnectionResetError()) == "retry"
+
+    @staticmethod
+    def _checkpoint_positions(tmp_path, monkeypatch, n, *, seconds_per_chunk=0.0):
+        """Chunk counts at which ChunkWriter wrote its manifest while appending n chunks."""
+        chunk = tmp_path / "chunk.gz"
+        chunk.write_bytes(gzip.compress(b"x\n"))
+        now = [0.0]
+        writes = []
+        real_write = nc._artifact_download.write_manifest
+
+        def record(path, names, nbytes, skipped=None):
+            writes.append(len(names))
+            real_write(path, names, nbytes, skipped)
+
+        monkeypatch.setattr(nc._artifact_download, "write_manifest", record)
+        writer = nc._artifact_download.ChunkWriter(
+            tmp_path / "out",
+            tmp_path / "out.manifest.json",
+            [],
+            0,
+            buffer_bytes=1024,
+            checkpoint_chunks=64,
+            checkpoint_seconds=5.0,
+            clock=lambda: now[0],
+        )
+        for index in range(n):
+            now[0] += seconds_per_chunk
+            writer.append(f"c{index:05d}.gz", chunk)
+        positions = list(writes)
+        writer.finish()
+        assert writes[-1] == n  # finish always records everything
+        assert (tmp_path / "out").read_bytes() == b"x\n" * n
+        return positions
+
+    @pytest.mark.parametrize(
+        ("n", "expected"),
+        [
+            (100, [64]),
+            (1000, [64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 711, 789, 876, 973]),
+            (
+                5000,
+                [64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 711, 789, 876, 973, 1081,
+                 1201, 1334, 1482, 1646, 1828, 2031, 2256, 2506, 2784, 3093, 3436, 3817,
+                 4241, 4712],
+            ),
+        ],
+    )
+    def test_checkpoint_cadence_by_chunk_count(self, tmp_path, monkeypatch, n, expected):
+        # Rule: checkpoint once pending >= max(64, n // 10) chunks, or after 5 s
+        # once pending >= n // 50. With a frozen clock only the first applies.
+        assert self._checkpoint_positions(tmp_path, monkeypatch, n) == expected
+
+    def test_checkpoint_cadence_by_time(self, tmp_path, monkeypatch):
+        positions = self._checkpoint_positions(
+            tmp_path, monkeypatch, 5000, seconds_per_chunk=1.0
+        )
+        # One chunk per second: every 5 s while n // 50 <= 5, then spacing
+        # follows n // 50 (for example 4787 -> 4884 -> 4983).
+        assert positions[:4] == [5, 10, 15, 20]
+        assert positions[-3:] == [4787, 4884, 4983]
+        assert len(positions) == 203
+        assert all(b - a >= max(5, b // 50) for a, b in zip(positions, positions[1:]))
+
+    def test_storage_refusal_logs_the_matched_text(self, caplog):
+        errors = importlib.import_module("snowflake.connector.errors")
+        exc = errors.OperationalError(msg="error: '403 Forbidden' from storage", errno=253002)
+        with caplog.at_level(logging.DEBUG):
+            assert nc._artifact_download.classify_artifact_error(exc) is None
+        assert "message matched '403'" in caplog.text
+
+    def test_error_classification(self):
+        errors = importlib.import_module("snowflake.connector.errors")
+        classify = nc._artifact_download.classify_artifact_error
+        assert classify(errors.OperationalError(msg="x")) == "retry"
+        assert classify(errors.ServiceUnavailableError(msg="x")) == "retry"
+        assert classify(errors.TooManyRequests(msg="x")) == "retry"
+        assert classify(errors.DatabaseError(msg="x", errno=603)) == "retry"
+        assert classify(ConnectionResetError()) == "retry"
+        assert classify(nc.requests.exceptions.ConnectionError()) == "retry"
+        assert classify(errors.ProgrammingError(msg="x", errno=390112)) == "reconnect"
+        assert classify(errors.OperationalError(msg="x", errno=390114)) == "reconnect"
+        assert classify(errors.ProgrammingError(msg="x", errno=2003)) is None
+        if hasattr(errors, "NonRetryableTlsError"):  # newer connector releases only
+            assert classify(errors.NonRetryableTlsError(msg="x")) is None
+        assert classify(RuntimeError("x")) is None
+        assert classify(gzip.BadGzipFile("x")) is None
+        assert classify(PermissionError("x")) is None
+        # File transfer errors that another attempt cannot fix.
+        assert classify(errors.OperationalError(msg="does not exist", errno=253006)) is None
+        assert classify(errors.ProgrammingError(msg="not a dir", errno=253005)) is None
+        assert classify(errors.OperationalError(msg="bad stage", errno=253004)) is None
+        denied = "While getting file(s) there was an error: '{}', this might be caused by your access"
+        for detail in ("403 Forbidden", "AccessDenied: Access Denied", "AuthorizationFailure"):
+            exc = errors.OperationalError(msg=denied.format(detail), errno=253002)
+            assert classify(exc) is None, detail
+        network = errors.OperationalError(msg=denied.format("ConnectionResetError(54)"), errno=253002)
+        assert classify(network) == "retry"
+
+
+# ─── A database or schema the API can't find ──────────────────────────────
+
+# What the API returns, with HTTP 400, when the database or schema in the URL can't be resolved.
+_FAILED_REQUEST = {"code": "517602", "message": "Schema MY_DB.SCH is not found or not authorized"}
+
+
+class TestMissingDatabase:
+    @staticmethod
+    def _client(database="MY_DB", schema="PUBLIC", *, profile=None, role=None):
+        c = CortexTrainingClient(
+            base_url="https://test.snowflakecomputing.com", database=database, schema=schema
+        )
+        c._session = MagicMock()
+        if profile is not False and (profile or role):
+            c._auth_provider = MagicMock()
+            c._auth_provider.get_token.return_value = "session-token"
+            c._auth_provider.connection_name = profile
+            c._auth_provider.role = role
+        return c
+
+    def test_a_pat_client_gets_a_clear_error_and_nothing_runs(self):
+        c = self._client()
+        c.max_retries = 5
+        c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
+        with pytest.raises(nc.DatabaseAccessError) as exc:
+            c._send("GET", f"{c.base_url}/test")
+        assert str(exc.value) == (
+            "Role <ROLE> (couldn't determine your role) can't find database MY_DB.\n"
+            "- If it doesn't exist: run `CREATE DATABASE IF NOT EXISTS MY_DB` (or ask an admin to).\n"
+            "- If it exists: ask an admin to run `GRANT USAGE ON DATABASE MY_DB TO ROLE <ROLE>`.\n"
+            "- Or use another database: --database NAME / CORTEX_TRAINING_DATABASE."
+        )
+        c._session.post.assert_not_called()  # no SQL, nothing created
+        c._session.get.assert_called_once()  # not retried
+        error = exc.value
+        assert (error.kind, error.name, error.role, error.statement) == (
+            "database", "MY_DB", None, "CREATE DATABASE IF NOT EXISTS MY_DB"
+        )
+        assert "cortex-training login" not in str(error)  # not on main until the new login ships
+        assert error.response.status_code == 400
+        assert isinstance(error, nc.requests.exceptions.HTTPError) and isinstance(error, RuntimeError)
+
+    def test_a_profile_client_names_its_role_and_profile(self):
+        c = self._client(profile="prod", role="TRAINER")
+        c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
+        with pytest.raises(nc.DatabaseAccessError) as exc:
+            c._send("GET", f"{c.base_url}/test")
+        message = str(exc.value)
+        assert message.startswith("Role TRAINER can't find database MY_DB (from profile prod).\n")
+        assert "GRANT USAGE ON DATABASE MY_DB TO ROLE TRAINER" in message
+        assert exc.value.role == "TRAINER"
+        c._session.post.assert_not_called()
+
+    def test_the_default_profile_is_named_as_such(self):
+        c = self._client(profile=None, role="TRAINER")
+        c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
+        with pytest.raises(nc.DatabaseAccessError, match=r"\(from your default Snowflake profile\)"):
+            c._send("GET", f"{c.base_url}/test")
+
+    def test_a_non_public_schema_covers_both_database_and_schema(self):
+        c = self._client(schema="CUSTOM", profile="prod", role="TRAINER")
+        c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
+        with pytest.raises(nc.DatabaseAccessError) as exc:
+            c._send("GET", f"{c.base_url}/test")
+        assert str(exc.value).splitlines()[:3] == [
+            "Role TRAINER can't find database MY_DB or its schema CUSTOM (from profile prod).",
+            "- If they don't exist: run `CREATE DATABASE IF NOT EXISTS MY_DB` and "
+            "`CREATE SCHEMA IF NOT EXISTS MY_DB.CUSTOM` (or ask an admin to).",
+            "- If they exist: ask an admin to run `GRANT USAGE ON DATABASE MY_DB TO ROLE TRAINER` and "
+            "`GRANT USAGE ON SCHEMA MY_DB.CUSTOM TO ROLE TRAINER`.",
+        ]
+        assert (exc.value.kind, exc.value.name, exc.value.statement) == (
+            "schema", "MY_DB.CUSTOM", "CREATE DATABASE IF NOT EXISTS MY_DB; CREATE SCHEMA IF NOT EXISTS MY_DB.CUSTOM"
+        )
+
+    @pytest.mark.parametrize(
+        ("body", "status"),
+        [
+            pytest.param({"code": "517604", "message": 'invalid hardware "NOT_A_GPU"'}, 400, id="other-code"),
+            pytest.param({"message": "Schema MY_DB.SCH is not found or not authorized"}, 400, id="no-code"),
+            pytest.param({"code": "517602", "message": "Schema MY_DB.SCH is not found or not authorized"}, 422, id="not-400"),
+            pytest.param({}, 404, id="missing-job"),
+            pytest.param({"message": "boom"}, 500, id="server-error"),
+        ],
+    )
+    def test_other_errors_are_left_as_they_are(self, body, status):
+        c = self._client()
+        c.max_retries = 0
+        c._session.get.return_value = _make_error_response(body, status)
+        with pytest.raises(nc.requests.exceptions.HTTPError, match=str(status)) as exc:
+            c._send("GET", f"{c.base_url}/test")
+        assert not isinstance(exc.value, nc.DatabaseAccessError)
+
+    def test_routes_without_a_database_leave_the_error_as_it_is(self):
+        c = self._client()
+        c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
+        with pytest.raises(nc.requests.exceptions.HTTPError) as exc:
+            c._send("GET", f"{c.base_url}/test", explain_database=False)
+        assert not isinstance(exc.value, nc.DatabaseAccessError)
+
+    def test_a_job_client_leaves_the_error_as_it_is(self):
+        c = self._client()
+        job_client = c.for_job({"database_name": "OTHER_DB", "schema_name": "PUBLIC"})
+        c._session.get.return_value = _make_error_response(_FAILED_REQUEST, 400)
+        with pytest.raises(nc.requests.exceptions.HTTPError) as exc:
+            job_client._send("GET", f"{c.base_url}/test")
+        assert not isinstance(exc.value, nc.DatabaseAccessError)
+
+    def test_auto_create_database_is_deprecated_and_does_nothing(self):
+        c = self._client()
+        assert c.auto_create_database is False
+        with pytest.warns(FutureWarning, match="auto_create_database is deprecated and does nothing"):
+            c.auto_create_database = True
+        assert c.auto_create_database is False
+
+    def test_setting_auto_create_database_to_false_is_silent(self):
+        c = self._client()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            c.auto_create_database = False
+        assert c.auto_create_database is False
+
+
+# ─── Not-found handling and log-tail stopping ────────────────────────────────
+
+
+_SAMPLING_BODY = {
+    "sub_job_configs": [{"job_type": "sampling", "model_name": "gpt2", "inference_config": {"n_gpus": 1}}]
+}
+
+
+def _not_found(code, message, *, url="http://test.local/api/v2/x/jobs/missing", status=404):
+    response = _make_error_response({"code": code, "message": message, "error_code": code}, status)
+    response.url = url
+    return response
+
+
+class TestNotFoundFailsFast:
+    @pytest.fixture(autouse=True)
+    def _no_backoff(self, monkeypatch):
+        monkeypatch.setattr(nc, "wait_exponential_jitter", lambda **kwargs: lambda retry_state: 0)
+
+    def test_unknown_job_is_not_retried(self):
+        c = _make_client()
+        c.max_retries = 5
+        c._session.get.return_value = _not_found("517601", "Training job missing not found in PUBLIC")
+        with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+            c.get_job("missing")
+        assert excinfo.value.response.status_code == 404
+        assert c._session.get.call_count == 1
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            # A gateway or proxy 404 has no service error code.
+            pytest.param(lambda: _make_error_response({"message": "no route"}, 404), id="no-code"),
+            pytest.param(lambda: _make_response(status_code=404), id="no-json"),
+            pytest.param(lambda: _not_found("517604", "session s not found"), id="other-code"),
+        ],
+    )
+    def test_other_404s_are_still_retried(self, response):
+        c = _make_client()
+        c.max_retries = 2
+        first = response()
+        if isinstance(first, MagicMock):
+            first.raise_for_status.side_effect = nc.requests.exceptions.HTTPError(response=first)
+        c._session.get.side_effect = [first, _make_response({"job_id": "j1", "status": "RUNNING"})]
+        assert c.get_job("j1")["status"] == "RUNNING"
         assert c._session.get.call_count == 2
 
-    def test_only_retries_once(self):
-        """If DB is still missing after CREATE, don't loop — raise the error."""
-        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
-        c._session = MagicMock()
-        not_found_resp = _make_error_response(
-            {"code": "517602", "message": "Schema MY_DB.SCH is not found or not authorized"}, status_code=400
-        )
-        create_resp = _make_response({"data": [["OK"]]})
-        c._session.get.return_value = not_found_resp
-        c._session.post.return_value = create_resp
-        with pytest.raises(RuntimeError, match="CREATE DATABASE IF NOT EXISTS"):
-            c._send("GET", f"{c.base_url}/test")
-        assert c._db_ensured is True
+    def test_a_job_this_client_just_created_is_retried_while_not_yet_visible(self):
+        c = _make_client(post_json={"job_id": "new-job"})
+        c.max_retries = 3
+        c.create_job_from_body(_SAMPLING_BODY)
+        c._session.get.side_effect = [
+            _not_found("517601", "Training job new-job not found", url=f"{c._prefix}/new-job"),
+            _not_found("517601", "Training job new-job not found", url=f"{c._prefix}/new-job"),
+            _make_response({"job_id": "new-job", "status": "PENDING"}),
+        ]
+        assert c.get_job("new-job")["status"] == "PENDING"
+        assert c._session.get.call_count == 3
 
-    def test_raises_when_create_fails_permission(self):
-        """CREATE DATABASE fails with 403: raise with actionable message."""
-        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
-        c._session = MagicMock()
-        not_found_resp = _make_error_response(
-            {"code": "517602", "message": "Schema MY_DB.SCH is not found or not authorized"}, status_code=400
-        )
-        perm_resp = _make_error_response({"message": "Insufficient privileges"}, status_code=403)
-        c._session.get.return_value = not_found_resp
-        c._session.post.return_value = perm_resp
-        with pytest.raises(RuntimeError, match="CREATE DATABASE IF NOT EXISTS"):
-            c._send("GET", f"{c.base_url}/test")
+    def test_the_create_grace_period_expires(self, monkeypatch):
+        c = _make_client(post_json={"job_id": "new-job"})
+        c.max_retries = 3
+        c.create_job_from_body(_SAMPLING_BODY)
+        created_at = c._recently_created_jobs["new-job"]
+        monkeypatch.setattr(nc.time, "monotonic", lambda: created_at + nc._RECENTLY_CREATED_SECONDS + 1)
+        c._session.get.return_value = _not_found("517601", "not found", url=f"{c._prefix}/new-job")
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.get_job("new-job")
+        assert c._session.get.call_count == 1
 
-    def test_lowercase_database_name_not_quoted(self):
-        """Lowercase DB names are NOT quoted — SQL resolves the same as the URL path."""
-        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="my_db", schema="SCH")
-        c._session = MagicMock()
-        not_found_resp = _make_error_response(
-            {"code": "517602", "message": "Schema MY_DB.SCH is not found or not authorized"}, status_code=400
-        )
-        create_resp = _make_response({"data": [["OK"]]})
-        ok_resp = _make_response({"jobs": []})
-        c._session.get.side_effect = [not_found_resp, ok_resp]
-        c._session.post.return_value = create_resp
-        c._send("GET", f"{c.base_url}/test")
-        create_call = c._session.post.call_args_list[0]
-        stmt = create_call.kwargs["json"]["statement"]
-        assert stmt == "CREATE DATABASE IF NOT EXISTS my_db"
-        assert '"' not in stmt
 
-    def test_creates_schema_when_not_public(self):
-        """Non-PUBLIC schema triggers CREATE SCHEMA after CREATE DATABASE."""
-        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="CUSTOM")
-        c._session = MagicMock()
-        not_found_resp = _make_error_response(
-            {"code": "517602", "message": "Schema MY_DB.CUSTOM is not found or not authorized"}, status_code=400
-        )
-        create_db_resp = _make_response({"data": [["Database MY_DB successfully created."]]})
-        create_schema_resp = _make_response({"data": [["Schema CUSTOM successfully created."]]})
-        ok_resp = _make_response({"jobs": []})
-        c._session.get.side_effect = [not_found_resp, ok_resp]
-        c._session.post.side_effect = [create_db_resp, create_schema_resp]
-        c._send("GET", f"{c.base_url}/test")
-        assert c._db_ensured is True
-        assert c._session.post.call_count == 2
-        db_call = c._session.post.call_args_list[0]
-        assert "CREATE DATABASE IF NOT EXISTS MY_DB" in db_call.kwargs["json"]["statement"]
-        schema_call = c._session.post.call_args_list[1]
-        assert "CREATE SCHEMA IF NOT EXISTS MY_DB.CUSTOM" in schema_call.kwargs["json"]["statement"]
+class TestTailOnEndedJobs:
+    @pytest.fixture(autouse=True)
+    def _no_backoff(self, monkeypatch):
+        monkeypatch.setattr(nc, "wait_exponential_jitter", lambda **kwargs: lambda retry_state: 0)
 
-    def test_skips_schema_creation_for_public(self):
-        """PUBLIC schema does not trigger CREATE SCHEMA."""
-        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="PUBLIC")
-        c._session = MagicMock()
-        not_found_resp = _make_error_response(
-            {"code": "517602", "message": "Schema MY_DB.PUBLIC is not found or not authorized"}, status_code=400
+    def _job(self, status):
+        return _make_response(
+            {"job_id": "j1", "status": status, "sub_jobs": [{"sub_job_id": "j1:sampling:0", "job_type": "SAMPLING"}]}
         )
-        create_db_resp = _make_response({"data": [["Database MY_DB successfully created."]]})
-        ok_resp = _make_response({"jobs": []})
-        c._session.get.side_effect = [not_found_resp, ok_resp]
-        c._session.post.return_value = create_db_resp
-        c._send("GET", f"{c.base_url}/test")
-        assert c._db_ensured is True
-        # Only one POST for CREATE DATABASE, no schema creation
+
+    @pytest.mark.parametrize("status", ["TERMINATED", "CANCELLED", "JOB_STATE_FAILED"])
+    def test_finished_job_fails_at_once_and_points_at_download_log(self, status):
+        c = _make_client()
+        c.max_retries = 10
+        c._session.post.return_value = _not_found("517604", "Cortex training operation failed: session s not found")
+        c._session.get.return_value = self._job(status)
+        with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+        message = str(excinfo.value)
+        assert "cortex-training download-log j1 --log-type stdout" in message
+        assert "download_stdout_logs" in message
+        assert excinfo.value.response.status_code == 404
         assert c._session.post.call_count == 1
+        assert c._session.get.call_count == 1  # one job lookup per call
+
+    def test_failed_session_410_gets_the_same_hint(self):
+        c = _make_client()
+        c._session.post.return_value = _not_found("517604", "session s has failed: runtime_sub_job_failed", status=410)
+        c._session.get.return_value = self._job("FAILED")
+        with pytest.raises(nc.requests.exceptions.HTTPError, match="download-log j1 --log-type stdout"):
+            c.tail_logs("j1", sub_job_type="sampling")
+        assert c._session.post.call_count == 1
+
+    def test_unknown_sub_job_of_a_running_job_fails_at_once(self):
+        c = _make_client()
+        c.max_retries = 10
+        c._session.post.return_value = _not_found("517604", "session s not found")
+        c._session.get.return_value = self._job("RUNNING")
+        match = "Sub-job j1:training:0 is not part of job j1.*j1:sampling:0"
+        with pytest.raises(nc.requests.exceptions.HTTPError, match=match):
+            c.tail_logs("j1", sub_job_id="j1:training:0")
+        assert c._session.post.call_count == 1
+
+    def test_a_starting_job_is_still_retried(self):
+        c = _make_client()
+        c.max_retries = 3
+        c._session.post.side_effect = [
+            _not_found("517604", "session s not found"),
+            _make_response({"entries": [{"_raw": "x"}], "next_cursor": "1", "eof": False}),
+        ]
+        c._session.get.return_value = self._job("PLACING")
+        assert c.tail_logs("j1", sub_job_id="j1:sampling:0")["entries"] == [{"_raw": "x"}]
+        assert c._session.post.call_count == 2
+        assert c._session.get.call_count == 1
+
+    def test_lookup_failure_keeps_the_old_retry_behavior(self):
+        c = _make_client()
+        c.max_retries = 2
+        c._session.post.return_value = _not_found("517604", "session s not found")
+        c._session.get.side_effect = RuntimeError("lookup down")
+        with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+        assert "download-log" not in str(excinfo.value)
+        assert c._session.post.call_count == 3
+
+    def test_the_job_lookup_is_tried_once(self):
+        c = _make_client()
+        c.max_retries = 2
+        c._session.post.return_value = _not_found("517604", "session s not found")
+        c._session.get.return_value = _make_error_response({"message": "unavailable"}, 503)
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+        assert c._session.get.call_count == 1
+        assert c._session.post.call_count == 3
+
+    def test_each_tui_tail_page_is_one_metric_without_its_cursor(self, monkeypatch):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c = _make_client(post_json={"entries": [{"_raw": "x"}], "next_cursor": "c-secret", "eof": False})
+        c._metric_emitter = MagicMock()
+        c._telemetry_surface = nc.TUI_SURFACE
+
+        c.tail_logs("j1", sub_job_id="j1:sampling:0")
+        c.tail_logs("j1", cursor="c-secret", max_lines=50, sub_job_id="j1:sampling:0")
+
+        calls = c._metric_emitter.emit.call_args_list
+        assert [call.args[0] for call in calls] == ["tail_logs", "tail_logs"]
+        assert [call.args[1]["success"] for call in calls] == [True, True]
+        assert [call.kwargs["attributes"] for call in calls] == [
+            {"client.surface": "tui", "job_id": "j1", "sub_job_id": "j1:sampling:0"}
+        ] * 2
+        assert "c-secret" not in repr(calls)
+
+    @pytest.mark.parametrize(
+        ("status_code", "message", "status", "job_status"),
+        [
+            (404, "session s not found", "TERMINATED", "terminated"),
+            (409, "session s not found", "TERMINATED", "terminated"),
+            # Not retried, so the job is looked up only once the call has failed.
+            (410, "session s has failed: runtime_sub_job_failed", "JOB_STATE_FAILED", "failed"),
+        ],
+        ids=["404", "409", "410"],
+    )
+    def test_an_ended_job_s_tail_is_one_failure_marked_job_ended(
+        self, monkeypatch, status_code, message, status, job_status
+    ):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        c._session.post.return_value = _not_found("517604", message, status=status_code)
+        c._session.get.return_value = self._job(status)
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        assert (c._session.post.call_count, c._session.get.call_count) == (1, 1)
+        c._metric_emitter.emit.assert_called_once()
+        operation, value = c._metric_emitter.emit.call_args.args
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert operation == "tail_logs"
+        assert value["success"] is False and value["job_ended"] is True
+        assert value["job_status"] == job_status
+        assert value["request_count"] == 2  # the tail, and the job lookup that explains it
+        assert (attributes["job_id"], attributes["sub_job_id"]) == ("j1", "j1:sampling:0")
+        assert (attributes["error.type"], attributes["error.http_status"]) == ("HTTPError", status_code)
+
+    def test_other_tail_failures_are_not_marked_job_ended(self):
+        c = _make_client()
+        c.max_retries = 0
+        c._metric_emitter = MagicMock()
+        c._session.post.return_value = _make_error_response({"message": "bad"}, 400)
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        value = c._metric_emitter.emit.call_args.args[1]
+        assert value["success"] is False and "job_ended" not in value and "job_status" not in value
+
+    def test_a_tail_failing_while_the_job_is_placed_says_so(self):
+        # The service answers 409 until the job's session exists: expected while placing.
+        c = _make_client()
+        c.max_retries = 0
+        c._metric_emitter = MagicMock()
+        c._session.post.return_value = _not_found("517604", "job j1 is pending placement", status=409)
+        c._session.get.return_value = self._job("JOB_STATE_PLACING")
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        value = c._metric_emitter.emit.call_args.args[1]
+        assert (value["success"], value["job_status"]) == (False, "placing")
+        assert "job_ended" not in value
+
+    def test_a_status_the_server_makes_up_is_cut_short_in_the_metric(self):
+        c = _make_client()
+        c.max_retries = 0
+        c._metric_emitter = MagicMock()
+        c._session.post.return_value = _not_found("517604", "session s not found", status=409)
+        c._session.get.return_value = _make_response(
+            {"job_id": "j1", "status": "JOB_STATE_" + "X" * 100, "sub_jobs": [{"sub_job_id": "j1:sampling:0"}]}
+        )
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        assert c._metric_emitter.emit.call_args.args[1]["job_status"] == "x" * 32
+
+    def test_a_tail_of_a_sub_job_the_job_lacks_is_not_marked_job_ended(self):
+        # The job runs; the sub-job id is what is wrong, so the failure is a real one.
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        c._session.post.return_value = _not_found("517604", "session s not found")
+        c._session.get.return_value = self._job("RUNNING")
+
+        with pytest.raises(nc.requests.exceptions.HTTPError, match="is not part of job j1") as raised:
+            c.tail_logs("j1", sub_job_id="j1:training:0")
+
+        assert raised.value.job_ended is False
+        c._metric_emitter.emit.assert_called_once()
+        value = c._metric_emitter.emit.call_args.args[1]
+        assert (value["success"], value["job_status"]) == (False, "running")
+        assert "job_ended" not in value
+
+    def test_a_410_while_the_job_still_runs_has_its_status_but_is_not_marked_job_ended(self):
+        # A 410 is not retried, so only the failure's own lookup reads the status.
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        c._session.post.return_value = _not_found(
+            "517604", "session s has failed: runtime_sub_job_failed", status=410)
+        c._session.get.return_value = self._job("RUNNING")
+
+        with pytest.raises(nc.requests.exceptions.HTTPError) as raised:
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        assert raised.value.response.status_code == 410
+        assert (c._session.post.call_count, c._session.get.call_count) == (1, 1)
+        c._metric_emitter.emit.assert_called_once()
+        value = c._metric_emitter.emit.call_args.args[1]
+        assert (value["success"], value["job_status"]) == (False, "running")
+        assert "job_ended" not in value
+
+    @pytest.mark.parametrize("status", [{}, {"status": None}, {"status": ""}], ids=["missing", "null", "empty"])
+    def test_a_job_lookup_without_a_status_sends_no_job_status(self, status):
+        c = _make_client()
+        c.max_retries = 0
+        c._metric_emitter = MagicMock()
+        c._session.post.return_value = _not_found("517604", "session s not found", status=409)
+        c._session.get.return_value = _make_response(
+            {"job_id": "j1", **status, "sub_jobs": [{"sub_job_id": "j1:sampling:0"}]}
+        )
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        assert c._session.get.call_count == 1  # the lookup was made, and read no status
+        value = c._metric_emitter.emit.call_args.args[1]
+        assert value["success"] is False
+        assert "job_status" not in value and "job_ended" not in value
+
+    @pytest.mark.parametrize(
+        ("first", "status"),
+        [
+            (lambda: _not_found("517604", "session s not found"), "PLACING"),
+            (lambda: _not_found("517604", "job j1 is pending placement", status=409), "JOB_STATE_PLACING"),
+            (lambda: _make_error_response({"message": "the target zone is restarting"}, 409), "RUNNING"),
+        ],
+        ids=["404-placing", "409-placing", "409-running"],
+    )
+    def test_a_tail_a_retry_gets_through_sends_no_job_status(self, monkeypatch, first, status):
+        # The lookup explained an attempt the retry got past, not the page that came back.
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c = _make_client()
+        c.max_retries = 2  # as the TUI reads
+        c._metric_emitter = MagicMock()
+        c._telemetry_surface = nc.TUI_SURFACE
+        c._session.post.side_effect = [
+            first(),
+            _make_response({"entries": [{"_raw": "x"}], "next_cursor": "1", "eof": False}),
+        ]
+        c._session.get.return_value = self._job(status)
+
+        assert c.tail_logs("j1", sub_job_id="j1:sampling:0")["entries"] == [{"_raw": "x"}]
+
+        assert c._session.get.call_count == 1  # the job was looked up
+        c._metric_emitter.emit.assert_called_once()
+        value = c._metric_emitter.emit.call_args.args[1]
+        assert (value["success"], value["retry_count"]) == (True, 1)
+        assert "job_status" not in value and "job_ended" not in value
+
+    def test_a_retried_tail_that_still_fails_has_the_job_status_its_lookup_read(self):
+        c = _make_client()
+        c.max_retries = 2
+        c._metric_emitter = MagicMock()
+        c._session.post.return_value = _not_found("517604", "job j1 is pending placement", status=409)
+        c._session.get.return_value = self._job("JOB_STATE_PLACING")
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        assert (c._session.post.call_count, c._session.get.call_count) == (3, 1)
+        c._metric_emitter.emit.assert_called_once()
+        value = c._metric_emitter.emit.call_args.args[1]
+        assert (value["success"], value["retry_count"], value["job_status"]) == (False, 2, "placing")
+
+    @pytest.mark.parametrize(
+        ("job", "job_status"),
+        [
+            ({"status": "JOB_STATE_PLACING"}, "placing"),
+            ({"status": "JOB_STATE_" + "X" * 100}, "x" * 32),  # made up by the server: cut short
+            ({}, None),
+            ({"status": None}, None),
+            ({"status": ""}, None),
+        ],
+        ids=["placing", "made-up", "missing", "null", "empty"],
+    )
+    @pytest.mark.parametrize(
+        "error",
+        [
+            nc.requests.exceptions.ConnectionError("connection reset by peer"),
+            nc.requests.exceptions.ReadTimeout("read timed out"),
+        ],
+        ids=["reset", "timeout"],
+    )
+    def test_a_tail_whose_retries_then_fail_off_the_wire_has_the_job_status_too(self, error, job, job_status):
+        # The first attempt's 409 had the job looked up; the retries got no answer at all.
+        # Its status is sent as for a tail whose own answer failed it: cut short, and only when read.
+        c = _make_client()
+        c.max_retries = 2  # as the TUI reads
+        c._metric_emitter = MagicMock()
+        c._session.post.side_effect = [
+            _not_found("517604", "job j1 is pending placement", status=409), error, error]
+        c._session.get.return_value = _make_response(
+            {"job_id": "j1", **job, "sub_jobs": [{"sub_job_id": "j1:sampling:0"}]}
+        )
+
+        with pytest.raises(type(error)):
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        assert (c._session.post.call_count, c._session.get.call_count) == (3, 1)
+        c._metric_emitter.emit.assert_called_once()
+        value = c._metric_emitter.emit.call_args.args[1]
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert (value["success"], value.get("job_status")) == (False, job_status)
+        assert attributes["error.type"] == type(error).__name__
+        assert "job_ended" not in value
+
+    def test_a_tail_whose_retry_cannot_get_a_token_has_the_job_status_too(self):
+        # Not every later attempt fails off the wire: one that gets no token fails the call too.
+        from cortex_training.snowflake_auth import SnowflakeProfileError
+
+        c = _make_client()
+        c.max_retries = 2  # as the TUI reads
+        c._metric_emitter = MagicMock()
+        auth = MagicMock()
+        # The first attempt and its job lookup get a token; the retry's request for one fails.
+        no_token = SnowflakeProfileError("Snowflake Connector did not expose a session token")
+        auth.get_token.side_effect = ["session-token", "session-token", no_token]
+        c._auth_provider = auth
+        c._session.post.return_value = _not_found("517604", "job j1 is pending placement", status=409)
+        c._session.get.return_value = self._job("JOB_STATE_PLACING")
+
+        with pytest.raises(SnowflakeProfileError):
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        assert (c._session.post.call_count, c._session.get.call_count, auth.get_token.call_count) == (1, 1, 3)
+        c._metric_emitter.emit.assert_called_once()
+        value = c._metric_emitter.emit.call_args.args[1]
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert (value["success"], value["job_status"]) == (False, "placing")
+        assert attributes["error.type"] == "SnowflakeProfileError"
+        assert "job_ended" not in value
+
+    def test_a_tail_that_never_got_an_answer_sends_no_job_status(self):
+        c = _make_client()
+        c.max_retries = 2
+        c._metric_emitter = MagicMock()
+        c._session.post.side_effect = nc.requests.exceptions.ConnectionError("connection reset by peer")
+
+        with pytest.raises(nc.requests.exceptions.ConnectionError):
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        assert (c._session.post.call_count, c._session.get.call_count) == (3, 0)  # nothing to look up for
+        value = c._metric_emitter.emit.call_args.args[1]
+        assert value["success"] is False and "job_status" not in value
+
+    def test_a_tail_stopped_after_a_lookup_is_cancelled_without_a_job_status(self, monkeypatch):
+        # Only a failed call's event has the status; Ctrl-C is a stop, not a failure.
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c = _make_client()
+        c.max_retries = 2
+        c._metric_emitter = MagicMock()
+        c._telemetry_surface = nc.TUI_SURFACE
+        c._session.post.side_effect = [
+            _not_found("517604", "job j1 is pending placement", status=409), KeyboardInterrupt()]
+        c._session.get.return_value = self._job("JOB_STATE_PLACING")
+
+        with pytest.raises(KeyboardInterrupt):
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        assert c._session.get.call_count == 1  # the job was looked up
+        c._metric_emitter.emit.assert_called_once()
+        value = c._metric_emitter.emit.call_args.args[1]
+        assert (value["success"], value["cancelled"]) == (False, True)
+        assert "job_status" not in value
+
+
+class TestStreamStopsWithoutEof:
+    def test_follow_false_stops_at_the_first_empty_page_without_eof(self, monkeypatch):
+        sleeps = []
+        monkeypatch.setattr(nc.time, "sleep", sleeps.append)
+        c = _make_client()
+        c._session.post.side_effect = [
+            _make_response({"entries": [{"msg": "a"}], "next_cursor": "c1", "eof": False}),
+            _make_response({"entries": [{"msg": "b"}], "next_cursor": "c2", "eof": False}),
+            _make_response({"entries": [], "next_cursor": "c2", "eof": False}),
+            AssertionError("polled past the tail"),
+        ]
+        assert [e["msg"] for e in c.stream_logs("j1", sub_job_id="sj-0", follow=False)] == ["a", "b"]
+        assert c._session.post.call_count == 3
+        assert sleeps == []
+
+    def test_follow_false_on_an_empty_log_stops_after_one_page(self):
+        c = _make_client(post_json={"entries": [], "next_cursor": "", "eof": False})
+        assert list(c.stream_logs("j1", sub_job_id="sj-0", follow=False)) == []
+        assert c._session.post.call_count == 1
+
+    def test_follow_true_keeps_polling_through_empty_pages(self, monkeypatch):
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        c = _make_client()
+        c._session.post.side_effect = [
+            _make_response({"entries": [], "next_cursor": "c0", "eof": False}),
+            _make_response({"entries": [{"msg": "late"}], "next_cursor": "c1", "eof": False}),
+        ]
+        stream = c.stream_logs("j1", sub_job_id="sj-0", follow=True)
+        assert next(stream)["msg"] == "late"
+
+    def test_follow_true_ends_at_an_empty_eof_page(self, monkeypatch):
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        c = _make_client()
+        c._session.post.side_effect = [
+            _make_response({"entries": [{"msg": "a"}], "next_cursor": "c1", "eof": True}),
+            _make_response({"entries": [], "next_cursor": "c1", "eof": True}),
+            AssertionError("polled past eof"),
+        ]
+        assert [e["msg"] for e in c.stream_logs("j1", sub_job_id="sj-0", follow=True)] == ["a"]
+
+class TestStreamEndsWhenTheJobEnds:
+    @pytest.fixture(autouse=True)
+    def _no_waits(self, monkeypatch):
+        monkeypatch.setattr(nc, "wait_exponential_jitter", lambda **kwargs: lambda retry_state: 0)
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+
+    def _job(self, status):
+        return _make_response({"job_id": "j1", "status": status, "sub_jobs": [{"sub_job_id": "j1:s:0"}]})
+
+    @pytest.mark.parametrize("status_code", [404, 409, 410])
+    def test_a_following_stream_ends_cleanly_when_the_job_ends(self, status_code):
+        c = _make_client()
+        c.max_retries = 10
+        c._session.post.side_effect = [
+            _make_response({"entries": [{"msg": "a"}], "next_cursor": "c1", "eof": False}),
+            _make_response({"entries": [], "next_cursor": "c1", "eof": False}),
+            _not_found("517604", "session s not found", status=status_code),
+            AssertionError("polled after the job ended"),
+        ]
+        c._session.get.return_value = self._job("CANCELLED")
+        assert [e["msg"] for e in c.stream_logs("j1", sub_job_id="j1:s:0", follow=True)] == ["a"]
+        assert c._session.get.call_count == 1
+
+    def test_by_default_a_follow_sends_only_the_end_of_the_job(self, monkeypatch):
+        # A CLI or SDK follow polls for as long as the job runs, so its pages stay
+        # failure-only; the one event is the tail the job's end stopped.
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        c._telemetry_surface = nc.CLI_SURFACE
+        c._session.post.side_effect = [
+            _make_response({"entries": [{"msg": "a"}], "next_cursor": "c1", "eof": False}),
+            _make_response({"entries": [], "next_cursor": "c1", "eof": False}),
+            _not_found("517604", "session s not found", status=409),
+        ]
+        c._session.get.return_value = self._job("CANCELLED")
+
+        assert [e["msg"] for e in c.stream_logs("j1", sub_job_id="j1:s:0", follow=True)] == ["a"]
+
+        c._metric_emitter.emit.assert_called_once()
+        operation, value = c._metric_emitter.emit.call_args.args
+        assert (operation, value["success"], value["job_ended"]) == ("tail_logs", False, True)
+        assert c._metric_emitter.emit.call_args.kwargs["attributes"][nc.SURFACE_ATTRIBUTE] == "cli"
+
+    def test_a_job_that_ended_before_the_first_read_still_raises(self):
+        c = _make_client()
+        c._session.post.return_value = _not_found("517604", "session s not found")
+        c._session.get.return_value = self._job("TERMINATED")
+        with pytest.raises(nc.requests.exceptions.HTTPError, match="download-log j1 --log-type stdout"):
+            list(c.stream_logs("j1", sub_job_id="j1:s:0", follow=True))
+
+    def test_other_errors_mid_stream_still_raise(self):
+        c = _make_client()
+        c.max_retries = 0
+        c._session.post.side_effect = [
+            _make_response({"entries": [{"msg": "a"}], "next_cursor": "c1", "eof": False}),
+            _make_error_response({"message": "bad"}, 400),
+        ]
+        stream = c.stream_logs("j1", sub_job_id="j1:s:0", follow=True)
+        assert next(stream)["msg"] == "a"
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            next(stream)
+
+    def test_tail_logs_marks_an_ended_job_error(self):
+        c = _make_client()
+        c._session.post.return_value = _not_found("517604", "session s not found", status=409)
+        c._session.get.return_value = self._job("FAILED")
+        with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+            c.tail_logs("j1", sub_job_id="j1:s:0")
+        assert excinfo.value.job_ended is True
+        assert excinfo.value.response.status_code == 409
+        assert c._session.post.call_count == 1  # a 409 on an ended job is not retried
+
+
+# ─── Streamed execution-log download ─────────────────────────────────────────
+
+
+class TestDownloadExecutionLogs:
+    RUN_URI = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+
+    def _setup(self, monkeypatch, files, *, checkpoint_files=None):
+        """``files`` maps a ``_logs/``-relative path to ``(bytes, md5)``."""
+        c = _make_client(get_json={"experiment_name": "DB.SCH.EXP", "experiment_run_name": "RUN_ABC"})
+        c._artifact_retry_policy = nc._artifact_download.RetryPolicy(sleep=lambda _delay: None)
+
+        def rows(root, entries):
+            return [
+                (f"/versions/RUN_ABC/{root}{path}", len(body), md5, "Thu, 15 Oct 2026 00:00:00 GMT")
+                for path, (body, md5) in entries.items()
+            ]
+
+        checkpoint_files = checkpoint_files or {}
+        connection = TestExecutionLogDownload.FakeArtifactConnection(
+            {
+                self.RUN_URI + "_logs/": rows("_logs/", files),
+                self.RUN_URI + "checkpoints/_logs/": rows("checkpoints/_logs/", checkpoint_files),
+            },
+            {
+                **{self.RUN_URI + "_logs/" + path: body for path, (body, _md5) in files.items()},
+                **{self.RUN_URI + "checkpoints/_logs/" + path: body for path, (body, _md5) in checkpoint_files.items()},
+            },
+        )
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", lambda: connection)
+        return c, connection
+
+    @staticmethod
+    def _gets(connection):
+        return [cmd for cmd in connection.commands if cmd.startswith("GET ")]
+
+    def test_saves_each_file_privately_without_returning_its_body(self, tmp_path, monkeypatch):
+        files = {
+            "job-1:sampling:0/execution.jsonl": (b'{"a": 1}\n' * 1000, "m1"),
+            "job-1:sampling:0/server.log": (b"server line\n", "m2"),
+            "other-job:sampling:0/execution.jsonl": (b"not ours\n", "m3"),
+        }
+        c, connection = self._setup(monkeypatch, files)
+        messages = []
+        result = c.download_execution_logs("job-1", tmp_path, progress=messages.append)
+        assert [(r["sub_job_id"], r["filename"]) for r in result] == [
+            ("job-1:sampling:0", "execution.jsonl"),
+            ("job-1:sampling:0", "server.log"),
+        ]
+        for entry, (path, (body, _md5)) in zip(result, list(files.items())[:2]):
+            saved = Path(entry["saved_path"])
+            assert saved == tmp_path / path
+            assert saved.read_bytes() == body
+            assert entry["bytes"] == len(body) and entry["unchanged"] is False
+            assert entry["artifact_uri"] == self.RUN_URI + "_logs/" + path
+            assert "content" not in entry
+            assert saved.stat().st_mode & 0o777 == 0o600
+        assert not (tmp_path / "other-job:sampling:0").exists()
+        # No download directories are left behind.
+        assert not list((tmp_path / "job-1:sampling:0").glob(".execution-log-*"))
+        assert "".join(messages).count("\n") == 2
+        assert "execution logs: job-1:sampling:0/execution.jsonl: saved 8.8 KiB" in "".join(messages)
+        assert connection.closed
+
+    def test_execution_log_download_successes_are_on_by_default(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c, _connection = self._setup(monkeypatch, {"job-1:sampling:0/execution.jsonl": (b"one\n", "m1")})
+        c._metric_emitter = MagicMock()
+
+        c.download_execution_logs("job-1", tmp_path)
+        c.download_execution_logs("job-1", tmp_path, resume=True)  # unchanged: kept, not fetched
+
+        calls = [call for call in c._metric_emitter.emit.call_args_list
+                 if call.args[0] == "download_execution_logs"]
+        fields = ("success", "artifact", "file_count", "files_skipped", "bytes_written", "cancelled")
+        assert [{key: call.args[1][key] for key in fields} for call in calls] == [
+            {"success": True, "artifact": "execution_logs", "file_count": 1, "files_skipped": 0,
+             "bytes_written": 4, "cancelled": False},
+            {"success": True, "artifact": "execution_logs", "file_count": 1, "files_skipped": 1,
+             "bytes_written": 0, "cancelled": False},
+        ]
+        assert calls[0].kwargs["attributes"] == {"client.surface": "sdk", "job_id": "job-1"}
+
+    @staticmethod
+    def _events(c):
+        return [call.args[1] for call in c._metric_emitter.emit.call_args_list
+                if call.args[0] == "download_execution_logs"]
+
+    def test_an_execution_log_download_times_its_list_and_fetch_and_counts_retried_gets(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c, connection = self._setup(monkeypatch, {"job-1:sampling:0/execution.jsonl": (b"one\n", "m1")})
+        c._metric_emitter = MagicMock()
+        now = [1000.0]
+        monkeypatch.setattr(nc.time, "monotonic", lambda: now[0])
+        run = c._session.get.return_value
+
+        def slow_run_lookup(*args, **kwargs):  # the experiment-run lookup takes 3 s
+            now[0] += 3.0
+            return run
+
+        def slow_open():  # and opening the artifact connection 1.5 s
+            now[0] += 1.5
+            return connection
+
+        listing = c._list_experiment_artifact_files
+
+        def slow_list(*args, **kwargs):  # each of its two LISTs takes 0.5 s
+            now[0] += 0.5
+            return listing(*args, **kwargs)
+
+        gets = []
+
+        def slow_get(source):  # each GET attempt takes 2 s; the first runs past its time limit
+            gets.append(source)
+            now[0] += 2.0
+            if len(gets) == 1:
+                raise nc._artifact_download.TransferTimeout(f"GET {source} did not finish in time")
+
+        c._session.get.side_effect = slow_run_lookup
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", slow_open)
+        monkeypatch.setattr(c, "_list_experiment_artifact_files", slow_list)
+        connection.on_get = slow_get
+        c.download_execution_logs("job-1", tmp_path)
+
+        assert len(gets) == 2
+        (value,) = self._events(c)
+        assert (value["success"], value["artifact_retry_count"], value["transfer_timeout_count"]) == (True, 1, 1)
+        assert value["retry_count"] == 0  # REST retries only: the GET's retry is counted above
+        # The run lookup and the connection come before the listing: only the whole call's time has them.
+        assert (value["list_ms"], value["fetch_ms"], value["duration_ms"]) == (1000.0, 4000.0, 9500.0)
+
+    def test_an_execution_log_download_that_keeps_timing_out_counts_its_retries_in_the_failure(
+        self, tmp_path, monkeypatch
+    ):
+        c, connection = self._setup(monkeypatch, {"job-1:sampling:0/execution.jsonl": (b"one\n", "m1")})
+        c._metric_emitter = MagicMock()
+
+        def get(source):  # every attempt runs past its time limit
+            raise nc._artifact_download.TransferTimeout(f"GET {source} did not finish in time")
+
+        connection.on_get = get
+        with pytest.raises(nc._artifact_download.TransferTimeout):
+            c.download_execution_logs("job-1", tmp_path)
+
+        attempts = c._artifact_retry_policy.attempts
+        assert len(self._gets(connection)) == attempts
+        (value,) = self._events(c)
+        # Every attempt timed out; all but the last were retried.
+        assert (value["success"], value["artifact_retry_count"], value["transfer_timeout_count"]) == (
+            False, attempts - 1, attempts)
+
+    def test_an_execution_log_download_tells_retried_gets_from_timed_out_ones(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c, connection = self._setup(monkeypatch, {"job-1:sampling:0/execution.jsonl": (b"one\n", "m1")})
+        c._metric_emitter = MagicMock()
+        # The first GET's connection is reset, the second runs past its time limit, the third works.
+        failures = [ConnectionResetError("connection reset by peer"),
+                    nc._artifact_download.TransferTimeout("GET did not finish in time")]
+
+        def get(source):
+            if failures:
+                raise failures.pop(0)
+
+        connection.on_get = get
+        c.download_execution_logs("job-1", tmp_path)
+
+        assert len(self._gets(connection)) == 3
+        (value,) = self._events(c)
+        assert (value["success"], value["artifact_retry_count"], value["transfer_timeout_count"]) == (True, 2, 1)
+
+    def test_an_execution_log_download_counts_every_file_its_sub_job_filter_keeps(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        files = {
+            "job-1:sampling:0/execution.jsonl": (b"one\n", "m1"),  # 4 bytes
+            "job-1:sampling:0/server.log": (b"server\n", "s1"),  # 7 bytes
+            "job-1:training:0/execution.jsonl": (b"training\n", "t1"),  # not asked for
+        }
+        c, _connection = self._setup(monkeypatch, files)
+        c._metric_emitter = MagicMock()
+
+        c.download_execution_logs("job-1", tmp_path, sub_job_ids=["job-1:sampling:0"])
+        c.download_execution_logs("job-1", tmp_path, sub_job_ids=["job-1:sampling:0"], resume=True)  # both kept
+
+        fields = ("success", "file_count", "files_skipped", "bytes_written")
+        assert [tuple(value[key] for key in fields) for value in self._events(c)] == [
+            (True, 2, 0, 11), (True, 2, 2, 0)]
+
+    @pytest.mark.parametrize(
+        ("error", "cancelled"),
+        [(nc._artifact_download.DownloadCancelled("stopped"), True), (RuntimeError("GET refused"), False)],
+        ids=["stopped", "failed"],
+    )
+    def test_a_stopped_or_failed_execution_log_download_reports_the_work_before_it(
+        self, tmp_path, monkeypatch, error, cancelled
+    ):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        files = {
+            "job-1:sampling:0/execution.jsonl": (b"one\n", "m1"),
+            "job-1:sampling:0/server.log": (b"server\n", "s1"),
+        }
+        c, connection = self._setup(monkeypatch, files)
+        c._metric_emitter = MagicMock()
+        now = [1000.0]
+        monkeypatch.setattr(nc.time, "monotonic", lambda: now[0])
+
+        def get(source):  # each GET takes 2 s; server.log's, the second, ends the download
+            now[0] += 2.0
+            if source.endswith("/server.log"):
+                raise error
+
+        connection.on_get = get
+        with pytest.raises(type(error)):
+            c.download_execution_logs("job-1", tmp_path)
+
+        (value,) = self._events(c)
+        fields = ("success", "artifact", "file_count", "files_skipped", "bytes_written", "cancelled", "fetch_ms")
+        assert {key: value[key] for key in fields} == {
+            "success": False, "artifact": "execution_logs", "file_count": 2, "files_skipped": 0,
+            "bytes_written": 4, "cancelled": cancelled, "fetch_ms": 4000.0}
+
+    # Every field a download_execution_logs event has, for a failure before any work.
+    _NOTHING_DONE = {
+        "success": False, "artifact": "execution_logs", "file_count": 0, "files_skipped": 0,
+        "bytes_written": 0, "list_ms": 0.0, "fetch_ms": 0.0, "artifact_retry_count": 0,
+        "transfer_timeout_count": 0, "cancelled": False}
+
+    def test_a_failed_run_lookup_is_still_an_execution_log_download_event(self, tmp_path, monkeypatch):
+        c, connection = self._setup(monkeypatch, {"job-1:sampling:0/execution.jsonl": (b"one\n", "m1")})
+        c.max_retries = 0
+        c._metric_emitter = MagicMock()
+        c._session.get.return_value = _make_error_response({"message": "experiment run unavailable"}, 404)
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.download_execution_logs("job-1", tmp_path)
+
+        assert connection.commands == []  # it failed before listing anything
+        (value,) = self._events(c)
+        assert {key: value[key] for key in self._NOTHING_DONE} == self._NOTHING_DONE
+
+    @pytest.mark.parametrize(
+        ("arguments", "error"),
+        [
+            ({"sub_job_ids": "job-1:sampling:0"}, TypeError),
+            ({"sub_job_ids": []}, ValueError),
+            ({"transfer_timeout_seconds": 0}, ValueError),
+        ],
+        ids=["one-string", "no-sub-jobs", "no-time"],
+    )
+    def test_a_download_refused_for_its_arguments_is_still_an_execution_log_download_event(
+        self, tmp_path, monkeypatch, arguments, error
+    ):
+        c, connection = self._setup(monkeypatch, {"job-1:sampling:0/execution.jsonl": (b"one\n", "m1")})
+        c._metric_emitter = MagicMock()
+
+        with pytest.raises(error):
+            c.download_execution_logs("job-1", tmp_path, **arguments)
+
+        assert (c._session.get.call_count, connection.commands) == (0, [])  # refused before any work
+        (value,) = self._events(c)
+        assert {key: value[key] for key in self._NOTHING_DONE} == self._NOTHING_DONE
+        assert c._metric_emitter.emit.call_args.kwargs["attributes"]["error.type"] == error.__name__
+
+    def test_a_download_for_a_sub_job_without_execution_logs_still_times_its_listing(self, tmp_path, monkeypatch):
+        # The listing finds which sub-jobs have logs, so a missing one fails after it.
+        c, connection = self._setup(monkeypatch, {"job-1:sampling:0/execution.jsonl": (b"one\n", "m1")})
+        c._metric_emitter = MagicMock()
+        now = [1000.0]
+        monkeypatch.setattr(nc.time, "monotonic", lambda: now[0])
+        listing = c._list_experiment_artifact_files
+
+        def slow_list(*args, **kwargs):  # each of its two LISTs takes 0.5 s
+            now[0] += 0.5
+            return listing(*args, **kwargs)
+
+        monkeypatch.setattr(c, "_list_experiment_artifact_files", slow_list)
+        with pytest.raises(nc.NoChunksError, match="job-1:training:0"):
+            c.download_execution_logs("job-1", tmp_path, sub_job_ids=["job-1:training:0"])
+
+        assert self._gets(connection) == []  # nothing fetched
+        (value,) = self._events(c)
+        assert (value["success"], value["list_ms"], value["fetch_ms"], value["file_count"]) == (
+            False, 1000.0, 0.0, 0)
+        assert c._metric_emitter.emit.call_args.kwargs["attributes"]["error.type"] == "NoChunksError"
+
+    def test_resume_skips_unchanged_files_and_refetches_changed_ones(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        files = {
+            "job-1:sampling:0/execution.jsonl": (b"one\n", "m1"),  # 4 bytes
+            "job-1:sampling:0/server.log": (b"server\n", "s1"),  # 7 bytes
+        }
+        c, connection = self._setup(monkeypatch, files)
+        c._metric_emitter = MagicMock()
+        c.download_execution_logs("job-1", tmp_path)
+        assert len(self._gets(connection)) == 2
+
+        connection.commands.clear()
+        again = c.download_execution_logs("job-1", tmp_path, resume=True)
+        assert self._gets(connection) == []
+        assert [r["unchanged"] for r in again] == [True, True]
+
+        # The running job rewrote its execution log.
+        grown = b"one\ntwo\n"
+        uri = self.RUN_URI + "_logs/job-1:sampling:0/execution.jsonl"
+        connection.content_by_uri[uri] = grown
+        connection.list_rows[self.RUN_URI + "_logs/"][0] = (
+            "/versions/RUN_ABC/_logs/job-1:sampling:0/execution.jsonl", len(grown), "m2", "later"
+        )
+        connection.commands.clear()
+        third = c.download_execution_logs("job-1", tmp_path, resume=True)
+        (get,) = self._gets(connection)
+        assert get.startswith(f"GET '{uri}' ")
+        assert (tmp_path / "job-1:sampling:0" / "execution.jsonl").read_bytes() == grown
+        assert [r["unchanged"] for r in third] == [False, True]
+        # Each call's event says the same: the third kept server.log and wrote the 8 new bytes.
+        fields = ("success", "file_count", "files_skipped", "bytes_written")
+        assert [tuple(value[key] for key in fields) for value in self._events(c)] == [
+            (True, 2, 0, 11), (True, 2, 2, 0), (True, 2, 1, 8)]
+
+    def test_without_resume_every_file_is_fetched_again(self, tmp_path, monkeypatch):
+        c, connection = self._setup(monkeypatch, {"job-1:sampling:0/execution.jsonl": (b"x\n", "m1")})
+        c.download_execution_logs("job-1", tmp_path)
+        c.download_execution_logs("job-1", tmp_path)
+        assert len(self._gets(connection)) == 2
+
+    def test_resume_refetches_a_locally_edited_file(self, tmp_path, monkeypatch):
+        c, connection = self._setup(monkeypatch, {"job-1:sampling:0/execution.jsonl": (b"abc\n", "m1")})
+        c.download_execution_logs("job-1", tmp_path)
+        (tmp_path / "job-1:sampling:0" / "execution.jsonl").write_bytes(b"truncated")
+        c.download_execution_logs("job-1", tmp_path, resume=True)
+        assert len(self._gets(connection)) == 2
+        assert (tmp_path / "job-1:sampling:0" / "execution.jsonl").read_bytes() == b"abc\n"
+
+    def test_a_failed_download_keeps_the_previous_copy(self, tmp_path, monkeypatch):
+        c, connection = self._setup(monkeypatch, {"job-1:sampling:0/execution.jsonl": (b"old\n", "m1")})
+        c.download_execution_logs("job-1", tmp_path)
+        saved = tmp_path / "job-1:sampling:0" / "execution.jsonl"
+
+        def fail(_source):
+            raise nc._artifact_download.DownloadCancelled("stopped")
+
+        connection.on_get = fail
+        with pytest.raises(nc.DownloadCancelled):
+            c.download_execution_logs("job-1", tmp_path)
+        assert saved.read_bytes() == b"old\n"
+        assert not list(saved.parent.glob(".execution-log-*"))
+
+    def test_logs_copy_wins_over_the_checkpoints_copy(self, tmp_path, monkeypatch):
+        c, _connection = self._setup(
+            monkeypatch,
+            {"job-1:training:0/execution.jsonl": (b"logs copy\n", "a")},
+            checkpoint_files={
+                "job-1:training:0/execution.jsonl": (b"checkpoints copy\n", "b"),
+                "job-1:training:0/only-here.log": (b"only\n", "c"),
+            },
+        )
+        result = c.download_execution_logs("job-1", tmp_path)
+        assert {r["filename"]: r["artifact_uri"] for r in result} == {
+            "execution.jsonl": self.RUN_URI + "_logs/job-1:training:0/execution.jsonl",
+            "only-here.log": self.RUN_URI + "checkpoints/_logs/job-1:training:0/only-here.log",
+        }
+        assert (tmp_path / "job-1:training:0" / "execution.jsonl").read_bytes() == b"logs copy\n"
+
+    def test_sub_job_filter(self, tmp_path, monkeypatch):
+        files = {
+            "job-1:sampling:0/execution.jsonl": (b"s\n", "a"),
+            "job-1:training:0/execution.jsonl": (b"t\n", "b"),
+        }
+        c, _connection = self._setup(monkeypatch, files)
+        (only,) = c.download_execution_logs("job-1", tmp_path, sub_job_ids=["job-1:training:0"])
+        assert only["sub_job_id"] == "job-1:training:0"
+        assert not (tmp_path / "job-1:sampling:0").exists()
+        with pytest.raises(nc.NoChunksError, match="job-1:eval:0.*job-1:sampling:0, job-1:training:0") as raised:
+            c.download_execution_logs("job-1", tmp_path, sub_job_ids=["job-1:eval:0"])
+        assert raised.value.sub_job_ids == ["job-1:eval:0"]
+        with pytest.raises(TypeError):
+            c.download_execution_logs("job-1", tmp_path, sub_job_ids="job-1:training:0")
+
+    def test_no_files_reports_it(self, tmp_path, monkeypatch):
+        c, _connection = self._setup(monkeypatch, {})
+        messages = []
+        assert c.download_execution_logs("job-1", tmp_path, progress=messages.append) == []
+        assert messages == ["execution logs: found 0 files\n"]
+
+    def test_a_listing_without_size_columns_still_downloads_but_never_skips(self, tmp_path, monkeypatch):
+        c, connection = self._setup(monkeypatch, {"job-1:sampling:0/execution.jsonl": (b"x\n", "a")})
+        connection.list_rows[self.RUN_URI + "_logs/"] = [("/versions/RUN_ABC/_logs/job-1:sampling:0/execution.jsonl",)]
+        c.download_execution_logs("job-1", tmp_path, resume=True)
+        c.download_execution_logs("job-1", tmp_path, resume=True)
+        assert len(self._gets(connection)) == 2
+
+    def test_old_leftover_download_directories_are_removed(self, tmp_path, monkeypatch):
+        c, _connection = self._setup(monkeypatch, {"job-1:sampling:0/execution.jsonl": (b"x\n", "a")})
+        sub = tmp_path / "job-1:sampling:0"
+        sub.mkdir()
+        old = sub / ".execution-log-old.tmp"
+        old.mkdir()
+        (old / "partial").write_bytes(b"junk")
+        fresh = sub / ".execution-log-fresh.tmp"
+        fresh.mkdir()
+        hour_ago = time.time() - 2 * nc.CortexTrainingClient._TEMP_ORPHAN_MIN_AGE_SECONDS
+        os.utime(old, (hour_ago, hour_ago))
+        c.download_execution_logs("job-1", tmp_path)
+        assert not old.exists()
+        assert fresh.exists()  # possibly another download's, still in use
+
+    def test_the_body_is_never_read_into_memory(self, tmp_path, monkeypatch):
+        c, _connection = self._setup(monkeypatch, {"job-1:sampling:0/execution.jsonl": (b"x" * 4096, "a")})
+
+        def refuse(*_args, **_kwargs):
+            raise AssertionError("an execution log body was read into memory")
+
+        monkeypatch.setattr(Path, "read_text", refuse)
+        monkeypatch.setattr(Path, "read_bytes", refuse)
+        (entry,) = c.download_execution_logs("job-1", tmp_path)
+        assert entry["bytes"] == 4096
+
+
+def test_execution_log_get_time_limit_scales_with_file_size(tmp_path, monkeypatch):
+    setup = TestDownloadExecutionLogs()
+    big = 10 * nc.CortexTrainingClient._EXECUTION_LOG_MIN_BYTES_PER_SECOND
+    c, connection = setup._setup(monkeypatch, {"job-1:sampling:0/execution.jsonl": (b"x" * big, "m")})
+    seen = []
+    real = nc._artifact_download.run_bounded
+
+    def spy(operation, *, timeout, cancel, description):
+        seen.append((description.split(" ")[0], timeout))
+        return real(operation, timeout=timeout, cancel=cancel, description=description)
+
+    monkeypatch.setattr(nc._artifact_download, "run_bounded", spy)
+    c.download_execution_logs("job-1", tmp_path, transfer_timeout_seconds=2)
+    assert ("GET", 10.0) in seen
+    assert all(timeout == 2 for kind, timeout in seen if kind == "LIST")
+
+
+
+def test_stall_check_job_lookup_is_tried_once_and_stays_quiet_after_the_download(tmp_path, monkeypatch, caplog):
+    c, _connection, _paths, _sleeps, _opened = TestChunkedArtifactDownload()._setup(
+        monkeypatch, count=2, artifact_name="metrics"
+    )
+    calls = []
+
+    def unavailable(*_args, **_kwargs):
+        calls.append(time.monotonic())
+        return _make_error_response({"message": "control plane unavailable"}, 503)
+
+    c._session.get.side_effect = unavailable
+    with caplog.at_level(logging.WARNING):
+        result = c.download_metrics("job-1", tmp_path)
+        returned = time.time()
+        time.sleep(1.0)  # long enough for a retrying lookup to have logged again
+    assert [entry["sub_job_id"] for entry in result] == [TestChunkedArtifactDownload.SUB]
+    assert len(calls) == 1
+    assert [r.getMessage() for r in caplog.records if r.created > returned] == []
+    assert not any("retrying" in r.getMessage() for r in caplog.records)
+
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["TERMINATED", "JOB_STATE_TERMINATED", "terminated", "CANCELLED", "canceled", "FAILED", "DONE", "succeeded"],
+)
+def test_wait_for_job_stops_at_every_ended_state(monkeypatch, status):
+    c = _make_client(get_json={"status": status, "reason": "r"})
+    monkeypatch.setattr(nc.time, "sleep", lambda *_: (_ for _ in ()).throw(AssertionError("kept polling")))
+    with pytest.raises(RuntimeError, match="reached terminal state"):
+        c.wait_for_job("job-1")
+    assert c._session.get.call_count == 1
+
+
+def test_wait_for_job_keeps_polling_through_starting_states(monkeypatch):
+    monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+    c = _make_client()
+    c._session.get.side_effect = [
+        _make_response({"status": status}) for status in ("PENDING", "PLACING", "INITIALIZING", "RUNNING")
+    ]
+    assert c.wait_for_job("job-1")["status"] == "RUNNING"
+    assert c._session.get.call_count == 4
+
+
+class TestCreatedJobBookkeeping:
+    def test_concurrent_creates_on_one_client_never_raise(self, monkeypatch):
+        import sys
+        import threading
+
+        c = _make_client()
+        counter = iter(range(10**9))
+        lock = threading.Lock()
+
+        def post(*_args, **_kwargs):
+            with lock:
+                n = next(counter)
+            return _make_response({"job_id": f"job-{n}"})
+
+        c._session.post.side_effect = post
+        # A large map makes each pruning pass long enough to be interrupted.
+        c._recently_created_jobs.update({f"old-{i}": time.monotonic() for i in range(20000)})
+        errors, created = [], []
+        old_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        try:
+            def worker():
+                try:
+                    for _ in range(200):
+                        created.append(c.create_job_from_body(_SAMPLING_BODY)["job_id"])
+                except BaseException as exc:  # noqa: BLE001 - recorded for the assertion
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=worker) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(60)
+        finally:
+            sys.setswitchinterval(old_interval)
+        assert errors == []
+        assert len(set(created)) == 800
+        assert all(job_id in c._recently_created_jobs for job_id in created)
+
+    def test_recording_a_create_never_hides_its_result(self):
+        c = _make_client(post_json={"job_id": "srv-1"})
+
+        class Broken(dict):
+            def items(self):
+                raise RuntimeError("boom")
+
+        c._recently_created_jobs = Broken()
+        assert c.create_job_from_body(_SAMPLING_BODY) == {"job_id": "srv-1"}
+
+    def test_a_response_without_job_id_falls_back_to_the_requested_one(self):
+        c = _make_client(post_json={"status": "PENDING"})
+        c.create_job_from_body({**_SAMPLING_BODY, "job_id": "client-chosen"})
+        assert "client-chosen" in c._recently_created_jobs
+
+
+
+def test_execution_log_filenames_keep_their_subdirectories(tmp_path, monkeypatch):
+    setup = TestDownloadExecutionLogs()
+    files = {
+        "job-1:sampling:0/ray/worker.log": (b"worker\n", "a"),
+        "job-1:sampling:0/execution.jsonl": (b"e\n", "b"),
+    }
+    c, _connection = setup._setup(monkeypatch, files)
+    messages = []
+    result = c.download_execution_logs("job-1", tmp_path, progress=messages.append)
+    assert [(r["filename"], r["saved_path"]) for r in result] == [
+        ("execution.jsonl", str(tmp_path / "job-1:sampling:0" / "execution.jsonl")),
+        ("ray/worker.log", str(tmp_path / "job-1:sampling:0" / "ray" / "worker.log")),
+    ]
+    assert (tmp_path / "job-1:sampling:0" / "ray" / "worker.log").read_bytes() == b"worker\n"
+    # The same names fetch_execution_logs reports.
+    assert [r["filename"] for r in result] == sorted(
+        f["filename"] for f in c.fetch_execution_logs("job-1")
+    )
+    assert any("execution logs: job-1:sampling:0/ray/worker.log: saved" in m for m in messages)
+    # Resume finds the nested file's record.
+    again = c.download_execution_logs("job-1", tmp_path, resume=True)
+    assert [r["unchanged"] for r in again] == [True, True]

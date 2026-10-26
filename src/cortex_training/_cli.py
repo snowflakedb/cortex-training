@@ -18,11 +18,14 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import itertools
 import json
+import logging
 import os
 import re
 import sys
+import threading
 from datetime import date
 from datetime import datetime
 from datetime import timedelta
@@ -30,7 +33,14 @@ from datetime import timezone
 from pathlib import Path
 from typing import Any
 from typing import Callable
+from typing import Iterator
 from typing import TextIO
+
+from .model_deployment import OUT_BASE_URL
+from .model_deployment import OUT_DEPLOYMENT
+from .model_deployment import OUT_FAILURE
+from .model_deployment import OUT_STATUS
+from .model_deployment import ModelDeploymentSpec
 
 _CONFIG_KEYS = {
     "base_url",
@@ -285,6 +295,71 @@ def _positive_int(value: str) -> int:
     return number
 
 
+def _add_model_deployment_common_args(parser: argparse.ArgumentParser) -> None:
+    """Add ``--database``, ``--schema``, and ``--compact`` to a subcommand.
+
+    They are also accepted before ``model-deployment``; SUPPRESS keeps a value
+    given there unless the subcommand repeats the flag.
+    """
+    parser.add_argument(
+        "--database",
+        default=argparse.SUPPRESS,
+        help="Database containing the model deployment.",
+    )
+    parser.add_argument(
+        "--schema",
+        default=argparse.SUPPRESS,
+        help="Schema containing the model deployment.",
+    )
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Print compact JSON instead of pretty JSON.",
+    )
+
+
+def _add_model_deployment_positional_arg(parser: argparse.ArgumentParser) -> None:
+    """Add the ``DEPLOYMENT`` positional argument naming one model deployment."""
+    parser.add_argument(
+        "deployment",
+        metavar="DEPLOYMENT",
+        help="The deployment (currently an sf-ct-<UUID> ID).",
+    )
+
+
+def _add_model_deployment_timeout_arg(parser: argparse.ArgumentParser) -> None:
+    """Add ``--timeout``, a per-command alias for the global ``--poll-timeout``."""
+    parser.add_argument(
+        "--timeout",
+        dest="poll_timeout",
+        type=float,
+        default=argparse.SUPPRESS,
+        metavar="SECONDS",
+        help="Seconds to wait for READY before giving up (default: --poll-timeout).",
+    )
+
+
+# Printed by ``model-deployment create --help``.
+_MODEL_DEPLOYMENT_SPEC_EXAMPLE = """\
+example spec (base model):
+  {
+    "deployment": {"class": "EVALUATION", "min_replicas": 1,
+                   "gpus_per_replica": 1, "gpu_type": "H200"},
+    "source": {"type": "base_model", "model": "Qwen/Qwen3-1.7B"},
+    "inference": {"max_seq_len": 8192}
+  }
+
+For a checkpoint, use:
+  "source": {"type": "checkpoint", "job_id": "TRAINING_JOB_UUID",
+             "checkpoint_id": "CHECKPOINT_ID"}
+
+Only EVALUATION is supported today. gpu_type is H200, B200, or B300; gpus_per_replica is 1, 2, 4, or 8; and
+min_replicas * gpus_per_replica must be at most 8 or a multiple of 8. Use
+--dry-run to check a spec without creating anything.
+"""
+
+
 def build_parser(
     *,
     prog: str = "cortex-training",
@@ -337,8 +412,16 @@ def build_parser(
         action="store_true",
         help="Disable SSL certificate verification for authenticated requests.",
     )
-    parser.add_argument("--poll-interval", type=float)
-    parser.add_argument("--poll-timeout", type=float)
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        help="Initial seconds between status polls while waiting.",
+    )
+    parser.add_argument(
+        "--poll-timeout",
+        type=float,
+        help="Seconds to wait for a job or model deployment before giving up.",
+    )
     parser.add_argument(
         "--compact",
         action="store_true",
@@ -583,23 +666,27 @@ def build_parser(
         "--resume",
         action="store_true",
         help=(
-            "Continue an earlier stdout download in the output directory and "
-            "fetch only output that is not already saved. Two downloads of the "
-            "same directory at once are unsupported."
+            "Continue an earlier download in the output directory and fetch "
+            "only what is not already saved. For stdout that includes output an "
+            "interrupted download already saved; for execution logs, files "
+            "unchanged since the last download are skipped. Two downloads of "
+            "the same directory at once are unsupported."
         ),
     )
+    _add_chunk_download_arguments(download_log, "--log-type stdout")
 
     download_metrics = subparsers.add_parser(
         "download-metrics",
-        help="Download and reconstruct GPU metrics for a Cortex Training job.",
+        help="Download and reconstruct GPU and training metrics for a Cortex Training job.",
     )
     download_metrics.add_argument("job_id")
     download_metrics.add_argument(
         "--output-dir",
         dest="output_dir",
         help=(
-            "Directory to write <sub_job_id>/gpu.jsonl files. Created if "
-            "missing. Defaults to the current working directory."
+            "Directory to write <sub_job_id>/gpu.jsonl and "
+            "<sub_job_id>/training.jsonl files. Created if missing. Defaults "
+            "to the current working directory."
         ),
     )
     download_metrics.add_argument(
@@ -607,10 +694,124 @@ def build_parser(
         action="store_true",
         help=(
             "Continue an earlier metrics download in the output directory and "
-            "fetch only metrics that are not already saved. Two downloads of "
-            "the same directory at once are unsupported."
+            "fetch only metrics that are not already saved, including metrics "
+            "an interrupted download already saved. Two downloads of the same "
+            "directory at once are unsupported."
         ),
     )
+    _add_chunk_download_arguments(download_metrics, None)
+
+    model_deployment = subparsers.add_parser(
+        "model-deployment",
+        help="Create and manage OpenAI-compatible evaluation deployments.",
+    )
+    deployment_commands = model_deployment.add_subparsers(
+        dest="model_deployment_command", required=True
+    )
+
+    deployment_create = deployment_commands.add_parser(
+        "create",
+        help="Create an evaluation deployment from a base model or checkpoint.",
+        description=(
+            "Create an evaluation deployment. Checkpoint sources must name a "
+            "completed Cortex Training weights-only checkpoint."
+        ),
+        epilog=_MODEL_DEPLOYMENT_SPEC_EXAMPLE,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_model_deployment_common_args(deployment_create)
+    deployment_create.add_argument(
+        "--spec",
+        "--spec-file",
+        dest="spec_file",
+        required=True,
+        help=(
+            "Deployment JSON file. --spec-file is a deprecated alias. "
+            "Checkpoint sources require a completed weights-only save."
+        ),
+    )
+    create_mode = deployment_create.add_mutually_exclusive_group()
+    create_mode.add_argument(
+        "--wait",
+        action="store_true",
+        help=(
+            "Wait until the deployment reaches READY or a terminal failure "
+            "state, then print its metadata."
+        ),
+    )
+    create_mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate the spec and print it as it would be sent; create nothing.",
+    )
+    _add_model_deployment_timeout_arg(deployment_create)
+
+    deployment_list = deployment_commands.add_parser(
+        "list",
+        help=(
+            "List the ID and status of each model deployment in the database and "
+            "schema. Use describe for details."
+        ),
+    )
+    _add_model_deployment_common_args(deployment_list)
+    deployment_list.add_argument(
+        "--status",
+        action="append",
+        metavar="STATUS",
+        help=(
+            "Only list deployments in this status (e.g. READY, PENDING, DROPPED). "
+            "Repeat to allow several."
+        ),
+    )
+
+    deployment_describe = deployment_commands.add_parser(
+        "describe",
+        help="Show one model deployment's status, endpoint, and configuration.",
+        description=(
+            "Show one model deployment: status, base URL, database and schema, "
+            "creator, owner role, and its configuration grouped under spec."
+        ),
+    )
+    _add_model_deployment_common_args(deployment_describe)
+    _add_model_deployment_positional_arg(deployment_describe)
+
+    deployment_wait = deployment_commands.add_parser(
+        "wait", help="Wait until one model deployment is READY or terminal."
+    )
+    _add_model_deployment_common_args(deployment_wait)
+    _add_model_deployment_timeout_arg(deployment_wait)
+    _add_model_deployment_positional_arg(deployment_wait)
+
+    deployment_download_log = deployment_commands.add_parser(
+        "download-log", help="Download logs for one model deployment."
+    )
+    _add_model_deployment_common_args(deployment_download_log)
+    _add_model_deployment_positional_arg(deployment_download_log)
+    deployment_download_log.add_argument(
+        "--log-type",
+        choices=("execution", "stdout"),
+        default="execution",
+    )
+    deployment_download_log.add_argument(
+        "--output-dir",
+        help="Directory to write deployment logs. Defaults to the current directory.",
+    )
+
+    deployment_download_metrics = deployment_commands.add_parser(
+        "download-metrics", help="Download metrics for one model deployment."
+    )
+    _add_model_deployment_common_args(deployment_download_metrics)
+    _add_model_deployment_positional_arg(deployment_download_metrics)
+    deployment_download_metrics.add_argument(
+        "--output-dir",
+        help="Directory to write deployment metrics. Defaults to the current directory.",
+    )
+
+    deployment_drop = deployment_commands.add_parser(
+        "drop", help="Drop one model deployment. Safe to retry."
+    )
+    _add_model_deployment_common_args(deployment_drop)
+    _add_model_deployment_positional_arg(deployment_drop)
 
     login = subparsers.add_parser(
         "login",
@@ -906,6 +1107,12 @@ def build_client(args: argparse.Namespace, cortex_training_client_cls):
         "poll_interval": args.poll_interval,
         "poll_timeout": args.poll_timeout,
     }
+    # The TUI bounds every read (`cortex-training tui` sets these); the CLI
+    # commands keep the client's defaults.
+    for option in ("max_retries", "request_timeout"):
+        value = getattr(args, option, None)
+        if value is not None:
+            kwargs[option] = value
     if args.base_url:
         return cortex_training_client_cls(base_url=args.base_url, **kwargs)
     if args.use_connection_profile:
@@ -1274,34 +1481,208 @@ def _cmd_weight_sync(args: argparse.Namespace, client, stdout: TextIO) -> int:
     return 0
 
 
-def _artifact_progress_writer(stderr: TextIO) -> Callable[[str], None]:
-    """Draw one updating terminal line. A redirected stderr gets the final line."""
-    try:
-        tty = stderr.isatty()
-    except (OSError, ValueError):
-        tty = False
-    latest: str | None = None
+_CHUNK_DOWNLOAD_COMMANDS = ("download-log", "download-metrics")
 
-    def write(message: str) -> None:
-        nonlocal latest
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return parsed
+
+
+# More concurrent fetches than this only add load; the default is 16.
+_MAX_PARALLEL = 128
+
+
+def _parallel_count(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > _MAX_PARALLEL:
+        raise argparse.ArgumentTypeError(f"must be at most {_MAX_PARALLEL}, got {parsed}")
+    return parsed
+
+
+def _non_negative_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a non-negative number, got {value!r}")
+    if not parsed >= 0 or parsed == float("inf"):
+        raise argparse.ArgumentTypeError(f"expected a non-negative number, got {value!r}")
+    return parsed
+
+
+def _add_chunk_download_arguments(parser: argparse.ArgumentParser, applies_to: str | None) -> None:
+    suffix = f" Applies to {applies_to}." if applies_to else ""
+    parser.add_argument(
+        "--parallel",
+        type=_parallel_count,
+        default=None,
+        metavar="N",
+        help=f"Number of chunks to fetch at once, 1 to {_MAX_PARALLEL} (default: 16).{suffix}",
+    )
+    parser.add_argument(
+        "--sub-job",
+        dest="sub_job_ids",
+        action="append",
+        default=None,
+        metavar="SUB_JOB_ID",
+        help="Download only this sub-job. Repeat for more than one.",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "Stop on a chunk that cannot be decompressed instead of skipping it "
+            f"and reporting it in skipped_chunks.{suffix}"
+        ),
+    )
+    parser.add_argument(
+        "--stale-after-minutes",
+        type=_non_negative_float,
+        default=10.0,
+        metavar="MINUTES",
+        help=(
+            "Warn when a running job's newest saved chunk is older than this "
+            "(default: 10). 0 turns off this and the other job-status notices "
+            f"(a just-ended job, missing GPU metrics).{suffix}"
+        ),
+    )
+    parser.add_argument(
+        "--transfer-timeout",
+        type=_non_negative_float,
+        default=300.0,
+        metavar="SECONDS",
+        help=(
+            "Give up on and retry a single file or chunk fetch, or listing, that "
+            "takes longer than this (default: 300; 0 means no limit)."
+        ),
+    )
+
+
+class _ArtifactProgressWriter:
+    """Draw one updating terminal line. A redirected stderr gets the final line.
+
+    Messages follow the download ``progress`` contract: a status without a
+    newline replaces the current line, ``"\\n"`` ends it, and a message that
+    already ends in a newline is printed as is. :meth:`warn` prints a full
+    line without breaking the status line. Warnings come from download worker
+    threads, so each update is written in one call under a lock.
+    """
+
+    def __init__(self, stderr: TextIO):
+        self._lock = threading.Lock()
+        self._stderr = stderr
         try:
+            self._tty = stderr.isatty()
+        except (OSError, ValueError):
+            self._tty = False
+        self._latest: str | None = None
+
+    def __call__(self, message: str) -> None:
+        with self._lock:
             if message == "\n":
-                status, latest = latest, None
+                status, self._latest = self._latest, None
                 if status is None:
                     return
-                stderr.write("\n" if tty else status + "\n")
+                self._write("\n" if self._tty else status + "\n")
             elif message.endswith("\n"):
-                stderr.write(message)
+                self._write(message)
             else:
-                latest = message
-                if not tty:
-                    return
-                stderr.write("\r" + message)
-            stderr.flush()
+                self._latest = message
+                if self._tty:
+                    self._write("\r" + message)
+
+    def warn(self, line: str) -> None:
+        with self._lock:
+            if self._tty and self._latest is not None:
+                # Move off the status line, then redraw it below the warning.
+                self._write("\n" + line + "\n\r" + self._latest)
+            else:
+                self._write(line + "\n")
+
+    def _write(self, text: str) -> None:
+        try:
+            self._stderr.write(text)
+            self._stderr.flush()
         except OSError:
             return
 
-    return write
+
+def _artifact_progress_writer(stderr: TextIO) -> _ArtifactProgressWriter:
+    return _ArtifactProgressWriter(stderr)
+
+
+def _chunk_download_options(
+    args: argparse.Namespace, progress: Callable[[str], None]
+) -> dict[str, Any]:
+    return {
+        "resume": args.resume,
+        "max_workers": args.parallel,
+        "progress": progress,
+        "sub_job_ids": args.sub_job_ids,
+        "strict": args.strict,
+        "stale_after_seconds": (
+            args.stale_after_minutes * 60 if args.stale_after_minutes else None
+        ),
+        "transfer_timeout_seconds": args.transfer_timeout or None,
+    }
+
+
+class _WarningLines(logging.Handler):
+    def __init__(self, writer: _ArtifactProgressWriter):
+        super().__init__(logging.WARNING)
+        self._writer = writer
+        self.setFormatter(logging.Formatter("warning: %(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._writer.warn(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+
+@contextlib.contextmanager
+def _library_warnings_to(writer: _ArtifactProgressWriter) -> Iterator[None]:
+    """Show the client's warnings (retries, skipped chunks) as ``warning:`` lines.
+
+    Records still propagate, so a caller's own logging handlers see them too.
+    """
+    library = logging.getLogger("cortex_training")
+    handler = _WarningLines(writer)
+    library.addHandler(handler)
+    try:
+        yield
+    finally:
+        library.removeHandler(handler)
+
+
+@contextlib.contextmanager
+def _output_dir_lock(out_dir: Path) -> Iterator[None]:
+    """Refuse to share a directory with a running TUI download of it.
+
+    The TUI marks each cache directory it downloads into with a sibling lock
+    file. Only an existing lock file is honored, so a plain CLI download never
+    creates files outside its output directory.
+    """
+    from cortex_training._download_lock import DownloadLock
+
+    lock = DownloadLock(out_dir)
+    if lock.lock_path is None or not lock.lock_path.exists():
+        yield
+        return
+    if not lock.try_acquire():
+        raise RuntimeError(
+            f"another download is using {out_dir}; close that job's view in the "
+            "TUI or wait for its download to finish, then retry"
+        )
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def _cmd_download_log(
@@ -1309,12 +1690,13 @@ def _cmd_download_log(
 ) -> int:
     out_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.cwd()
     if args.log_type == "stdout":
-        logs = client.download_stdout_logs(
-            args.job_id,
-            out_dir,
-            resume=args.resume,
-            progress=_artifact_progress_writer(stderr),
-        )
+        progress = _artifact_progress_writer(stderr)
+        with _output_dir_lock(out_dir), _library_warnings_to(progress):
+            logs = client.download_stdout_logs(
+                args.job_id,
+                out_dir,
+                **_chunk_download_options(args, progress),
+            )
         _print_json(
             {"job_id": args.job_id, "logs": logs},
             stdout,
@@ -1322,19 +1704,15 @@ def _cmd_download_log(
         )
         return 0
 
-    logs = client.fetch_execution_logs(args.job_id)
-    saved = []
-    for log in logs:
-        file_path = out_dir / (log["sub_job_id"] or "unknown") / log["filename"]
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(log["content"], encoding="utf-8")
-        saved.append(
-            {
-                "sub_job_id": log["sub_job_id"],
-                "filename": log["filename"],
-                "artifact_uri": log["artifact_uri"],
-                "saved_path": str(file_path),
-            }
+    progress = _artifact_progress_writer(stderr)
+    with _library_warnings_to(progress):
+        saved = client.download_execution_logs(
+            args.job_id,
+            out_dir,
+            resume=args.resume,
+            sub_job_ids=args.sub_job_ids,
+            progress=progress,
+            transfer_timeout_seconds=args.transfer_timeout or None,
         )
     _print_json({"job_id": args.job_id, "logs": saved}, stdout, compact=args.compact)
     return 0
@@ -1344,18 +1722,186 @@ def _cmd_download_metrics(
     args: argparse.Namespace, client, stdout: TextIO, stderr: TextIO
 ) -> int:
     out_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.cwd()
-    metrics = client.download_metrics(
-        args.job_id,
-        out_dir,
-        resume=args.resume,
-        progress=_artifact_progress_writer(stderr),
-    )
+    progress = _artifact_progress_writer(stderr)
+    with _output_dir_lock(out_dir), _library_warnings_to(progress):
+        options = _chunk_download_options(args, progress)
+        metrics = client.download_metrics(args.job_id, out_dir, **options)
+        # The zone's own training-metric file: its own stream, under the same
+        # stage root, written beside the GPU file (see download_training_metrics).
+        try:
+            training = client.download_training_metrics(args.job_id, out_dir, **options)
+        except BaseException as exc:
+            # The GPU stream has already committed its files: an interrupt or error
+            # here must not report that nothing was saved (main() then offers
+            # --resume), and the GPU result is still printed for whatever reads stdout.
+            if metrics and not getattr(exc, "download_progress_saved", False):
+                try:
+                    exc.download_progress_saved = True  # type: ignore[attr-defined]
+                except AttributeError:
+                    pass
+            if not isinstance(exc, KeyboardInterrupt):
+                _print_json(
+                    {"job_id": args.job_id, "metrics": metrics, "training_metrics": None},
+                    stdout,
+                    compact=args.compact,
+                )
+            raise
     _print_json(
-        {"job_id": args.job_id, "metrics": metrics},
+        {"job_id": args.job_id, "metrics": metrics, "training_metrics": training},
         stdout,
         compact=args.compact,
     )
     return 0
+
+
+class _InterruptedCommand(Exception):
+    """Ctrl+C stopped a command; the message says what is still running."""
+
+
+def _still_running_message(deployment_id: str) -> str:
+    return (
+        f"{deployment_id} is still running; run `cortex-training model-deployment "
+        f"wait {deployment_id}` to keep waiting, or `cortex-training "
+        f"model-deployment drop {deployment_id}` to release its GPUs"
+    )
+
+
+def _model_deployment_summary(metadata: dict) -> dict:
+    """What ``create`` and ``wait`` print: ID, status, base URL, and failure."""
+    summary = {
+        key: metadata[key]
+        for key in (OUT_DEPLOYMENT, OUT_STATUS, OUT_BASE_URL)
+        if key in metadata
+    }
+    if OUT_FAILURE in metadata:
+        summary[OUT_FAILURE] = metadata[OUT_FAILURE]
+    return summary
+
+
+def _cmd_model_deployment_create(
+    args: argparse.Namespace,
+    client,
+    stdout: TextIO,
+    stdin: TextIO,
+) -> int:
+    """Run ``model-deployment create``, optionally waiting for ``READY``."""
+    raw_spec = _read_json_object(args.spec_file, stdin)
+    if args.dry_run:
+        spec = ModelDeploymentSpec.from_dict(raw_spec)
+        _print_json(spec.to_public_spec(), stdout, compact=args.compact)
+        return 0
+    output = client.create_model_deployment(raw_spec)
+    if args.wait:
+        deployment_id = output[OUT_DEPLOYMENT]
+        try:
+            output = client.wait_for_model_deployment(deployment_id)
+        except KeyboardInterrupt:
+            # Keep the deployment ID visible; the deployment keeps running and
+            # is not dropped automatically.
+            _print_json(_model_deployment_summary(output), stdout, compact=args.compact)
+            stdout.flush()
+            raise _InterruptedCommand(_still_running_message(deployment_id)) from None
+        except Exception as exc:
+            # Keep the deployment ID visible so a failed wait can be retried or
+            # dropped, with the last status the wait saw rather than PENDING.
+            output = getattr(exc, "deployment", None) or output
+            _print_json(_model_deployment_summary(output), stdout, compact=args.compact)
+            stdout.flush()
+            raise
+    _print_json(_model_deployment_summary(output), stdout, compact=args.compact)
+    return 0
+
+
+def _cmd_model_deployment_list(args: argparse.Namespace, client, stdout: TextIO) -> int:
+    """Run ``model-deployment list``: each deployment's ID and status only.
+
+    ``describe`` shows the rest. Rows are ordered by creation time first.
+    """
+    deployments = _jobs_latest_last(client.list_model_deployments(status=args.status))
+    rows = [
+        {"deployment": item["deployment"], "status": item["status"]}
+        for item in deployments
+    ]
+    _print_json({"deployments": rows}, stdout, compact=args.compact)
+    return 0
+
+
+def _cmd_model_deployment_wait(args: argparse.Namespace, client, stdout: TextIO) -> int:
+    """Run ``model-deployment wait``; prints the same summary as ``create``."""
+    try:
+        metadata = client.wait_for_model_deployment(args.deployment)
+    except KeyboardInterrupt:
+        raise _InterruptedCommand(_still_running_message(args.deployment)) from None
+    _print_json(_model_deployment_summary(metadata), stdout, compact=args.compact)
+    return 0
+
+
+def _cmd_model_deployment_describe(
+    args: argparse.Namespace, client, stdout: TextIO
+) -> int:
+    """Run ``model-deployment describe``."""
+    _print_json(
+        client.describe_model_deployment(args.deployment),
+        stdout,
+        compact=args.compact,
+    )
+    return 0
+
+
+def _cmd_model_deployment_download_log(
+    args: argparse.Namespace, client, stdout: TextIO
+) -> int:
+    """Run ``model-deployment download-log``."""
+    output_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.cwd()
+    result = client.download_model_deployment_logs(
+        args.deployment, output_dir, log_type=args.log_type
+    )
+    _print_json(result, stdout, compact=args.compact)
+    return 0
+
+
+def _cmd_model_deployment_download_metrics(
+    args: argparse.Namespace, client, stdout: TextIO
+) -> int:
+    """Run ``model-deployment download-metrics``."""
+    output_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.cwd()
+    result = client.download_model_deployment_metrics(
+        args.deployment, output_dir
+    )
+    _print_json(result, stdout, compact=args.compact)
+    return 0
+
+
+def _cmd_model_deployment_drop(args: argparse.Namespace, client, stdout: TextIO) -> int:
+    """Run ``model-deployment drop``."""
+    result = client.drop_model_deployment(args.deployment)
+    _print_json(result, stdout, compact=args.compact)
+    return 0
+
+
+def _cmd_model_deployment(
+    args: argparse.Namespace,
+    client,
+    stdout: TextIO,
+    stdin: TextIO,
+) -> int:
+    """Dispatch a ``model-deployment`` subcommand to its handler."""
+    command = args.model_deployment_command
+    if command == "create":
+        return _cmd_model_deployment_create(args, client, stdout, stdin)
+    if command == "list":
+        return _cmd_model_deployment_list(args, client, stdout)
+    if command == "describe":
+        return _cmd_model_deployment_describe(args, client, stdout)
+    if command == "wait":
+        return _cmd_model_deployment_wait(args, client, stdout)
+    if command == "download-log":
+        return _cmd_model_deployment_download_log(args, client, stdout)
+    if command == "download-metrics":
+        return _cmd_model_deployment_download_metrics(args, client, stdout)
+    if command == "drop":
+        return _cmd_model_deployment_drop(args, client, stdout)
+    raise ValueError(f"unknown model-deployment command: {command}")
 
 
 def _is_unsupported_hardware(exc: BaseException) -> bool:
@@ -1397,16 +1943,24 @@ def _run(
     client_factory: Callable[[argparse.Namespace], Any],
     stdout: TextIO,
     stdin: TextIO,
-    stderr: TextIO,
+    stderr: TextIO | None = None,
 ) -> int:
+    stderr = stderr or sys.stderr
     if args.command == "login":
         return _cmd_login(args, stdout)
 
     if args.command == "submit" and args.dry_run:
         return _cmd_submit(args, None, stdout, stdin)
 
-    if args.command == "download-log" and args.resume and args.log_type != "stdout":
-        raise ValueError("--resume applies to --log-type stdout, not execution logs")
+    if args.command == "download-log" and args.log_type != "stdout":
+        # Execution logs are whole files, not chunks.
+        for flag, value in (
+            ("--parallel", args.parallel),
+            ("--strict", args.strict),
+            ("--stale-after-minutes", args.stale_after_minutes != 10.0),
+        ):
+            if value:
+                raise ValueError(f"{flag} applies to --log-type stdout, not execution logs")
 
     client = client_factory(args)
     if args.command == "submit":
@@ -1457,6 +2011,8 @@ def _run(
         return _cmd_download_log(args, client, stdout, stderr)
     if args.command == "download-metrics":
         return _cmd_download_metrics(args, client, stdout, stderr)
+    if args.command == "model-deployment":
+        return _cmd_model_deployment(args, client, stdout, stdin)
     raise ValueError(f"unknown command: {args.command}")
 
 
@@ -1474,15 +2030,25 @@ def main(
     stderr = stderr or sys.stderr
     stdin = stdin or sys.stdin
 
+    args = None
     try:
         args = parse_args(argv, prog=prog, include_tui=include_tui)
-        dry_run = args.command == "submit" and args.dry_run
+        dry_run = (args.command == "submit" and args.dry_run) or (
+            args.command == "model-deployment"
+            and args.model_deployment_command == "create"
+            and args.dry_run
+        )
         no_client = dry_run or args.command == "login"
         if client_factory is None and not no_client:
             cortex_training_client_cls = _load_cortex_training_client_class()
 
             def default_client_factory(parsed_args: argparse.Namespace) -> Any:
-                return build_client(parsed_args, cortex_training_client_cls)
+                from .client import CLI_SURFACE
+
+                client = build_client(parsed_args, cortex_training_client_cls)
+                # Its metrics say a command made the call (client.surface).
+                client._telemetry_surface = CLI_SURFACE
+                return client
 
             client_factory = default_client_factory
         elif client_factory is None:
@@ -1492,8 +2058,23 @@ def main(
 
             client_factory = empty_client_factory
         return _run(args, client_factory, stdout, stdin, stderr)
+    except _InterruptedCommand as exc:
+        print(f"interrupted; {exc}", file=stderr)
+        return 130
+    except KeyboardInterrupt as exc:
+        command = getattr(args, "command", None)
+        if command not in _CHUNK_DOWNLOAD_COMMANDS:
+            raise
+        if not _resumable_download(args):
+            print("interrupted", file=stderr)
+        elif getattr(exc, "download_progress_saved", False):
+            print(f"interrupted; {_RESUME_HINT}", file=stderr)
+        else:
+            print("interrupted before any output was saved", file=stderr)
+        return 130
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"error: {_format_error(exc)}", file=stderr)
+        _print_resume_hint(args, exc, stderr)
         return 1
     except ModuleNotFoundError as exc:
         missing = exc.name or "a required package"
@@ -1504,6 +2085,48 @@ def main(
             file=stderr,
         )
         return 1
+    except Exception as exc:
+        if not _is_connector_error(exc):
+            raise
+        print(f"error: {_format_connector_error(exc)}", file=stderr)
+        _print_resume_hint(args, exc, stderr)
+        return 1
+
+
+_RESUME_HINT = (
+    "downloaded chunks were saved. Run the same command with --resume to continue."
+)
+_FAILED_RESUME_HINT = (
+    "Downloaded chunks were saved. Run the same command with --resume to continue."
+)
+
+
+def _resumable_download(args: argparse.Namespace | None) -> bool:
+    command = getattr(args, "command", None)
+    if command == "download-metrics":
+        return True
+    return command == "download-log" and getattr(args, "log_type", None) == "stdout"
+
+
+def _print_resume_hint(args: argparse.Namespace | None, exc: BaseException, stderr: TextIO) -> None:
+    if _resumable_download(args) and getattr(exc, "download_progress_saved", False):
+        print(_FAILED_RESUME_HINT, file=stderr)
+
+
+def _is_connector_error(exc: BaseException) -> bool:
+    try:
+        from snowflake.connector import errors as sf
+    except ImportError:  # pragma: no cover - the connector is a dependency
+        return False
+    return isinstance(exc, sf.Error)
+
+
+def _format_connector_error(exc: BaseException) -> str:
+    message = str(exc).strip() or type(exc).__name__
+    query_id = getattr(exc, "sfqid", None)
+    if query_id and str(query_id) not in message:
+        message += f"\nsnowflake query id: {query_id}"
+    return message
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ weights-only checkpoint produced by a training run:
 ```bash
 python -m recipes.inference.serve \
   config=/path/to/config.json \
+  job_config=JOB_CONFIG \
   source_job_id=TRAINING_JOB_ID \
   checkpoint_id=CHECKPOINT_ID
 ```
@@ -15,8 +16,11 @@ Sampling requires a `weights-only` checkpoint; resumable checkpoints carry
 optimizer state and are not loadable by the sampling runtime. The sampling job is
 independent, so the training job can be cancelled once the checkpoint is saved.
 
-GPU count and vLLM settings live in the job-config JSON under
-`recipes/inference/configs/`. For the equivalent raw client calls, see
+GPU count and vLLM settings live in the inference files under
+`model-catalog/models/`. For the equivalent raw client calls, see
 [Start sampling from saved weights](../../reference/rest-api.md#134-start-sampling-from-saved-weights).
 
 Readiness checks, scaling and teardown are not yet documented.
+
+To serve a checkpoint behind an OpenAI-compatible endpoint and stream replies
+instead, see [Deploy a Model for Streaming Inference](deploy-model.md).

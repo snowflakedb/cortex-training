@@ -41,6 +41,7 @@ class Config:
     n_test: int | None = None
     eval_temperature: float | None = None
     eval_max_tokens: int | None = None
+    weight_sync_format: str | None = None
     weight_sync_bucket_size: int | None = None
 
     log_path: str = "/tmp/cortex-training-examples/rl-loop"
@@ -48,7 +49,7 @@ class Config:
     wandb_name: str | None = None
     sf_tracking: bool = False
 
-    job_config: str = "configs/qwen3_8b_lora.json"
+    job_config: str = "model-catalog/models/qwen3-8b/standard/h200-training-lora.json"
 
 
 def main(config: Config) -> None:

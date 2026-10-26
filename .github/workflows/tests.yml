@@ -1,0 +1,49 @@
+name: Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # The SDK supports 3.10, but tinker-cookbook (needed by the recipe
+        # tests) requires 3.11+.
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package and test dependencies
+        # The recipe tests import tinker-cookbook and wandb; install them the
+        # way recipes/README.md does. CPU-only torch keeps the job small.
+        # `python -m uv pip` installs into the setup-python interpreter, which
+        # is the one the next step runs.
+        run: |
+          python -m pip install uv
+          python -m uv pip install --index-strategy unsafe-best-match \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
+            -e ".[dev]" \
+            'tinker-cookbook[math-rl] @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly' \
+            wandb
+
+      - name: Run tests
+        run: python -m pytest tests/ -q

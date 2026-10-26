@@ -1,0 +1,13 @@
+{
+  "modelId": "zai-org/GLM-5.3",
+  "license": {
+    "name": "GLM-5.3 License",
+    "url": "https://huggingface.co/zai-org/GLM-5.3/blob/main/LICENSE"
+  },
+  "architecture": "moe",
+  "moe": {
+    "num_moe_layers": 75,
+    "topk": 8,
+    "num_experts": 256
+  }
+}

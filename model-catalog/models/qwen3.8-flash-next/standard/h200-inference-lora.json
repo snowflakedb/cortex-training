@@ -1,0 +1,54 @@
+{
+  "hardware": "H200",
+  "sub_job_configs": [
+    {
+      "job_type": "sampling",
+      "model_name": "Qwen/Qwen3.8-Flash-Next",
+      "dtype": "bfloat16",
+      "seed": 42,
+      "weight_format": "vllm",
+      "inference_config": {
+        "n_gpus": 4,
+        "max_seq_len": 65536,
+        "vllm_config": {
+          "tensor_parallel_size": 4,
+          "gpu_memory_utilization": 0.9,
+          "max_num_seqs": 16,
+          "distributed_executor_backend": "mp",
+          "enable_chunked_prefill": true,
+          "max_num_batched_tokens": 8192,
+          "enforce_eager": false,
+          "enable_return_routed_experts": true,
+          "enable_prefix_caching": true,
+          "gdn_prefill_backend": "triton",
+          "reasoning_parser": "qwen3",
+          "extra_engine_kwargs": {
+            "disable_custom_all_reduce": true
+          }
+        },
+        "router_replay": {
+          "enabled": true,
+          "max_cache_bytes": 17179869184
+        },
+        "peft_config": {
+          "peft_type": "Lora",
+          "r": 32,
+          "lora_alpha": 32,
+          "lora_dropout": 0.0,
+          "bias": "none",
+          "target_modules": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "in_proj_qkv",
+            "in_proj_z",
+            "in_proj_a",
+            "in_proj_b",
+            "out_proj"
+          ]
+        }
+      }
+    }
+  ]
+}

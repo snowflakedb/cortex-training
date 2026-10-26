@@ -13,6 +13,9 @@ the Cortex Training client.
   [reinforcement learning](guides/training/reinforcement-learning.md) and
   [starting from your own weights](guides/training/external-weights.md), plus the
   [runnable recipes](../recipes/README.md).
+- Inference users: [deploy a model for streaming inference](guides/inference/deploy-model.md)
+  behind an OpenAI-compatible endpoint, or
+  [serve a training checkpoint](guides/inference/serve-checkpoint.md).
 - Framework users: see the [integrations index](integrations/README.md) for
   RL frameworks integrated with Cortex.
 - Operators: see [job management](guides/operations/manage-jobs.md) and
