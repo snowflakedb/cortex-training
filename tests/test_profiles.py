@@ -7,6 +7,9 @@ import subprocess
 import sys
 import textwrap
 
+import threading
+from pathlib import Path
+
 import pytest
 
 from cortex_training import _profiles
@@ -152,7 +155,7 @@ def test_a_failed_write_leaves_the_file_and_no_temp_file(snowflake_home, monkeyp
     with pytest.raises(OSError, match="disk full"):
         _profiles.write_profile("training", {"account": "ACME-TRAIN"})
     assert path.read_text() == CONNECTIONS_TOML
-    assert sorted(p.name for p in snowflake_home.iterdir()) == ["connections.toml"]
+    assert not [p.name for p in snowflake_home.iterdir() if p.name.endswith(".tmp")]
 
 
 @pytest.mark.parametrize("name", ["", "my profile", "a.b", "x]", "émile"])
@@ -250,3 +253,87 @@ def test_profile_tables_are_found_by_file_name(tmp_path):
     assert _profiles._profile_tables(tmp_path / "config.toml", config) is config["connections"]
     with pytest.raises(_profiles.ProfileFileError, match="not a Snowflake profile file"):
         _profiles._profile_tables(tmp_path / "other.toml", connections)
+
+
+# ─── Review follow-ups: symlinks, concurrency, durability, names, values ────
+
+
+def test_a_symlinked_connections_toml_stays_linked(snowflake_home, tmp_path):
+    dotfiles = tmp_path / "dotfiles"
+    dotfiles.mkdir()
+    real = dotfiles / "connections.toml"
+    real.write_text(CONNECTIONS_TOML)
+    link = snowflake_home / "connections.toml"
+    link.symlink_to(real)
+
+    _profiles.write_profile("training", {"account": "ACME-TRAIN"})
+
+    assert link.is_symlink()
+    assert '[training]\naccount = "ACME-TRAIN"\n' in real.read_text()
+    assert sorted(_profiles.read_profiles()) == ["default", "other", "training"]
+    assert _profiles.remove_profile("training") is True
+    assert link.is_symlink() and "[training]" not in real.read_text()
+
+
+def test_concurrent_writers_keep_every_profile(snowflake_home):
+    (snowflake_home / "connections.toml").write_text(CONNECTIONS_TOML)
+    errors = []
+
+    def write(index):
+        try:
+            _profiles.write_profile(f"p{index}", {"account": f"ACME-{index}"})
+        except Exception as exc:  # pragma: no cover - reported below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=write, args=(i,)) for i in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert len(_profiles.read_profiles()) == 22  # default, other, and 20 new
+    assert not [p.name for p in snowflake_home.iterdir() if p.name.endswith(".tmp")]
+
+
+def test_the_file_is_flushed_to_disk_before_it_replaces_the_old_one(snowflake_home, monkeypatch):
+    events = []
+    real_fsync, real_replace = _profiles.os.fsync, _profiles.os.replace
+    monkeypatch.setattr(_profiles.os, "fsync", lambda fd: events.append("fsync") or real_fsync(fd))
+    monkeypatch.setattr(_profiles.os, "replace", lambda a, b: events.append("replace") or real_replace(a, b))
+
+    _profiles.write_profile("training", {"account": "ACME-TRAIN"})
+
+    assert events.index("fsync") < events.index("replace")
+
+
+def test_existing_profiles_with_any_name_can_be_replaced_and_removed(snowflake_home):
+    (snowflake_home / "connections.toml").write_text('["prod.us"]\naccount = "ACME-US"\n')
+    assert sorted(_profiles.read_profiles()) == ["prod.us"]
+
+    _profiles.write_profile("prod.us", {"account": "ACME-US2"})
+    assert _profiles.read_profiles()["prod.us"] == {"account": "ACME-US2"}
+    assert _profiles.remove_profile("prod.us") is True
+    assert _profiles.read_profiles() == {}
+
+
+def test_new_profiles_still_need_a_simple_name(snowflake_home):
+    with pytest.raises(_profiles.ProfileFileError, match="invalid profile name"):
+        _profiles.write_profile("prod.eu", {"account": "ACME-EU"})
+
+
+def test_path_values_are_written_as_strings(snowflake_home):
+    _profiles.write_profile("keys", {"account": "ACME", "private_key_file": Path("/keys/me.p8")})
+    assert _profiles.read_profiles()["keys"]["private_key_file"] == "/keys/me.p8"
+
+
+def test_values_toml_can_not_hold_fail_clearly(snowflake_home):
+    with pytest.raises(_profiles.ProfileFileError, match="can't write when"):
+        _profiles.write_profile("odd", {"account": "ACME", "when": object()})
+    assert not (snowflake_home / "connections.toml").exists()
+
+
+def test_replacing_a_profile_drops_keys_not_given(snowflake_home):
+    _profiles.write_profile("keys", {"account": "ACME", "private_key_file": "/k.p8"})
+    _profiles.write_profile("keys", {"account": "ACME"})
+    assert _profiles.read_profiles()["keys"] == {"account": "ACME"}

@@ -31,8 +31,11 @@ profile is never changed.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
+import tempfile
+from collections.abc import Iterator
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -41,6 +44,8 @@ CONNECTIONS_FILE = "connections.toml"
 CONFIG_FILE = "config.toml"
 DEFAULT_PROFILE_ENV = "SNOWFLAKE_DEFAULT_CONNECTION_NAME"
 
+# Names this module creates. Existing profiles may use any name the Connector
+# accepts (for example ["prod.us"]); those can still be replaced or removed.
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
@@ -119,38 +124,51 @@ def default_profile_name() -> str:
 def write_profile(name: str, values: Mapping[str, Any]) -> Path:
     """Add or replace the profile ``name`` and return the file written.
 
-    Every other profile, setting, and comment in the file is kept.
+    An existing profile is replaced as a whole: keys not in ``values``, and
+    comments inside that profile's table, are dropped. Every other profile,
+    setting, and comment in the file is kept. ``None`` values are left out, and
+    path values are written as strings. A new profile's name must use letters,
+    digits, ``_`` or ``-``; an existing profile can have any name.
     """
-    _check_name(name)
     if not values:
         raise ProfileFileError(f"profile {name!r} needs at least one setting")
     import tomlkit
 
     path = profile_file()
-    document = _parse(path, keep_format=True) if path.is_file() else tomlkit.document()
-    table = tomlkit.table()
-    for key, value in values.items():
-        if value is not None:
-            table[key] = value
-    _profile_tables(path, document)[name] = table
-    _replace(path, tomlkit.dumps(document))
+    with _locked(path):
+        document = _parse(path, keep_format=True) if path.is_file() else tomlkit.document()
+        tables = _profile_tables(path, document)
+        if name not in tables:
+            _check_name(name)
+        table = tomlkit.table()
+        for key, value in values.items():
+            if value is None:
+                continue
+            if isinstance(value, os.PathLike):
+                value = os.fspath(value)
+            try:
+                table[key] = value
+            except Exception as exc:
+                raise ProfileFileError(f"profile {name!r}: can't write {key} = {value!r}: {exc}") from exc
+        tables[name] = table
+        _replace(path, tomlkit.dumps(document))
     return path
 
 
 def remove_profile(name: str) -> bool:
-    """Remove the profile ``name``; return whether it existed."""
-    _check_name(name)
+    """Remove the profile ``name``, whatever its name; return whether it existed."""
     import tomlkit
 
     path = profile_file()
     if not path.is_file():
         return False
-    document = _parse(path, keep_format=True)
-    tables = _profile_tables(path, document)
-    if name not in tables or not isinstance(tables[name], Mapping):
-        return False
-    del tables[name]
-    _replace(path, tomlkit.dumps(document))
+    with _locked(path):
+        document = _parse(path, keep_format=True)
+        tables = _profile_tables(path, document)
+        if name not in tables or not isinstance(tables[name], Mapping):
+            return False
+        del tables[name]
+        _replace(path, tomlkit.dumps(document))
     return True
 
 
@@ -171,16 +189,68 @@ def _parse(path: Path, *, keep_format: bool = False) -> Any:
     return document if keep_format else document.unwrap()
 
 
+def _real(path: Path) -> Path:
+    """The file ``path`` names, following symlinks, so a linked dotfile stays linked."""
+    return Path(os.path.realpath(path))
+
+
+@contextlib.contextmanager
+def _locked(path: Path) -> Iterator[None]:
+    """Hold an exclusive lock while the file is read, changed, and written.
+
+    Uses a ``.<name>.lock`` file next to the real file, so two writers (two
+    ``login`` runs, say) can't lose each other's profiles. Where file locks
+    aren't available (Windows), writes still replace the file atomically.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    target = _real(path)
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(target.with_name(f".{target.name}.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing the file releases the lock
+
+
 def _replace(path: Path, text: str) -> None:
-    """Write ``text`` to ``path`` atomically, readable only by the user."""
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    """Write ``text`` to ``path`` atomically and durably, readable only by the user.
+
+    A symlinked ``path`` keeps its link: the file it points to is replaced. The
+    temporary file has a unique name, so concurrent writers never share one.
+    """
+    target = _real(path)
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+    tmp_path = Path(name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
-        os.replace(tmp_path, path)
+            handle.flush()
+            # The file holds every Snowflake credential: make sure it's on disk
+            # before it replaces the old one.
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, target)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
-    os.chmod(path, 0o600)
+    os.chmod(target, 0o600)
+    _fsync_folder(target.parent)
+
+
+def _fsync_folder(folder: Path) -> None:
+    """Flush the folder entry, so the replace itself survives a crash (POSIX only)."""
+    try:
+        fd = os.open(folder, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
