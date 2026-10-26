@@ -15,6 +15,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = REPO_ROOT / "examples"
 RL_OVERRIDES = EXAMPLES / "rl" / "overrides.json"
+SFT_OVERRIDES = EXAMPLES / "sft" / "overrides.json"
+DARE_OVERRIDES = EXAMPLES / "sft" / "dare" / "overrides.json"
 
 # Each runnable example and the folder that holds its entry point, task,
 # metadata and data.
@@ -326,19 +328,28 @@ def test_overrides_json_sits_between_the_catalog_and_the_command_line(tmp_path):
 
 def test_every_example_ships_an_overrides_file_with_a_comment():
     # Every example ships an overrides.json carrying a human "_comment"; SFT and
-    # inference are comment-only (no real overrides), RL and distillation also
-    # carry their real settings.
-    sft = EXAMPLES / "sft" / "overrides.json"
+    # inference are comment-only (no real overrides), RL, distillation and DARE
+    # also carry their real settings.
+    sft = SFT_OVERRIDES
     inference = EXAMPLES / "inference" / "overrides.json"
     distillation_overrides = EXAMPLES / "distillation" / "overrides.json"
-    assert set(EXAMPLES.glob("*/overrides.json")) == {sft, RL_OVERRIDES, inference, distillation_overrides}
+    assert set(EXAMPLES.rglob("overrides.json")) == {
+        sft,
+        RL_OVERRIDES,
+        inference,
+        distillation_overrides,
+        DARE_OVERRIDES,
+    }
 
     for path in (sft, inference):
         data = json.loads(path.read_text())
         assert set(data) == {"_comment"} and isinstance(data["_comment"], str) and data["_comment"]
 
-    for path in (RL_OVERRIDES, distillation_overrides):
+    for path in (RL_OVERRIDES, distillation_overrides, DARE_OVERRIDES):
         assert isinstance(json.loads(path.read_text()).get("_comment"), str)
+
+    dare = json.loads(DARE_OVERRIDES.read_text())
+    assert dare["sub_job_configs"] == [{"job_type": "training", "training_config": {"n_gpus": 8}}]
 
     override = json.loads(RL_OVERRIDES.read_text())
     (training,) = [sub for sub in override["sub_job_configs"] if sub["job_type"] == "training"]
@@ -353,6 +364,27 @@ def test_every_example_ships_an_overrides_file_with_a_comment():
     assert student_config["n_gpus"] == 1 and student_config["train_batch_size"] == 1
     assert student_config["mb_spec"] == {"max_tokens_per_mb": 10240}
     assert student_config["ds_config"]["zero_optimization"]["reduce_scatter"] is True
+
+
+def test_dare_applies_its_own_overrides_after_the_sft_file():
+    utils = _import_example("examples.utils")
+    dare = _import_example("examples.sft.dare.train")
+
+    body = _job_body("examples.sft.dare.train")
+
+    # The catalog file, sft/overrides.json, dare/overrides.json, then DARE's lr and batch defaults.
+    assert body == utils.build_job(
+        "training",
+        model="Qwen/Qwen3-8B",
+        context="standard",
+        example_dir=EXAMPLES / "sft",
+        overrides=[DARE_OVERRIDES],
+        lr=dare.Config().lr,
+        train_batch_size=dare.Config().train_batch_size,
+    )
+    assert _sub_job(body, "training")["training_config"]["n_gpus"] == 8
+    # Only DARE has the file: conversational SFT keeps the catalog's GPU count.
+    assert _sub_job(_job_body("examples.sft.conversational.train"), "training")["training_config"]["n_gpus"] == 4
 
 
 def test_the_sft_and_inference_overrides_files_are_no_ops(monkeypatch):

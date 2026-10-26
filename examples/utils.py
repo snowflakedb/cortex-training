@@ -2159,6 +2159,7 @@ def build_job(
     lora: bool = False,
     job_config: str | None = None,
     example_dir: str | os.PathLike | None = None,
+    overrides: Sequence[str | os.PathLike | Mapping[str, Any]] = (),
     search_dirs: Sequence[Path] = (),
     lr: float | None = None,
     train_batch_size: int | None = None,
@@ -2174,7 +2175,8 @@ def build_job(
 
     1. The model catalog file for ``model``, ``context``, ``hardware`` and
        ``lora`` (for ``rl``, the training and inference files combined).
-    2. ``overrides.json`` in ``example_dir``, when that file exists.
+    2. ``overrides.json`` in ``example_dir``, when that file exists, then
+       ``overrides`` (JSON files or dicts) in order.
     3. The command-line settings ``lr``, ``train_batch_size`` and
        ``max_seq_len``; ``None`` keeps the value from the layers below.
 
@@ -2187,6 +2189,8 @@ def build_job(
     """
     if kind not in _JOB_KIND_SUB_JOBS:
         raise ValueError(f"kind must be one of {sorted(_JOB_KIND_SUB_JOBS)}, got {kind!r}")
+    if isinstance(overrides, (str, os.PathLike, Mapping)):
+        raise TypeError("overrides must be a list of JSON files or dicts")
     needed = _JOB_KIND_SUB_JOBS[kind]
     if job_config is not None:
         body = load_job_body(job_config, search_dirs=search_dirs)
@@ -2214,12 +2218,13 @@ def build_job(
             _check_rl_windows(body)
         logger.info("Using job_config %s as is; the model catalog and overrides.json are skipped", job_config)
     else:
-        overrides: list[Any] = []
+        layers: list[Any] = []
         if example_dir is not None and (Path(example_dir) / "overrides.json").is_file():
-            overrides.append(Path(example_dir) / "overrides.json")
+            layers.append(Path(example_dir) / "overrides.json")
+        layers.extend(overrides)
         settings = _settings_override(needed, lr=lr, train_batch_size=train_batch_size, max_seq_len=max_seq_len)
         if settings:
-            overrides.append(settings)
+            layers.append(settings)
         body = make_config(
             model,
             context,
@@ -2227,7 +2232,7 @@ def build_job(
             lora=lora,
             inference=kind == "inference",
             rl=kind == "rl",
-            overrides=overrides,
+            overrides=layers,
             rollout_batch_size=rollout_batch_size if kind == "rl" else None,
             catalog_dir=catalog_dir,
         )
