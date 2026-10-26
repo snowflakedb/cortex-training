@@ -909,10 +909,10 @@ Typical polled result:
 }
 ```
 
-The exact metrics are backend/loss dependent. The current ArcticTraining
-forward/backward response assembler intentionally returns
-`post_process_outputs` as an empty object; callers must not assume that
-`compute_logprobs` appears there.
+The exact metrics are backend/loss dependent. When `processing.post` lists
+`compute_logprobs`, `post_process_outputs.logprobs` holds the pass's `[B, S]`
+float32 log-probabilities in the batch's row order; otherwise
+`post_process_outputs` is empty or absent.
 
 When the training sub-job sets `router_replay.mode = "best_effort"` (see
 [section 8.2](#82-trainingconfig)), `metrics` of a forward/backward request that
@@ -1388,7 +1388,10 @@ The ceiling is `CORTEX_TRAINING_FORWARD_OPERATION_MAX_JSON_BYTES` (integer
 bytes, default 16 MiB, minimum 16 KiB). Dict payloads stay a single plain
 `/operation` POST.
 
-Do not treat this route as a portable log-probability API.
+The frame that returns per-token log-probabilities of token sequences, which
+`forward_backward_custom()` sends for its forward pass, is in
+[section 10.5](#105-custom-losses); other payload shapes are
+backend-specific.
 
 ### 7.2 Weight sync
 
@@ -2664,6 +2667,71 @@ tensor[:, i] is the log probability of input_ids[:, i + 1]
 
 This is an ArcticTraining processing convention, not a REST-level field
 requirement.
+
+### 10.5 Custom losses
+
+`forward_backward_custom()` (see
+[Custom losses](python-sdk.md#custom-losses)) trains on a custom loss `L`
+computed in the client over the per-token log-probabilities `logprobs`. It uses
+the existing routes; a client in another language can send the same frames.
+
+The forward pass is a `forward` operation with `sub_job_type: "training"` and
+this frame. Rows are right-padded, and `labels[i, j]` is `input_ids[i, j + 1]`,
+or `-100` from each row's last token on:
+
+```python
+{
+    "args": (),
+    "kwargs": {
+        "input_ids": input_ids,            # [B, S] int64, valid tokens first
+        "attention_mask": attention_mask,  # [B, S] int64
+        "position_ids": position_ids,      # [B, S] int64, arange(S) per row
+        "use_cache": False,
+        "labels": labels,                  # [B, S] int64
+    },
+}
+```
+
+The result's `logprobs` is a `[B, S]` float32 tensor: `logprobs[i, j]` is the
+log-probability of `labels[i, j]`, and `0` where the label is `-100`.
+
+The backward pass is a forward/backward request with the loss
+`weighted_cross_entropy`:
+
+```python
+{
+    "args": (),
+    "kwargs": {"input_ids": ..., "attention_mask": ..., "position_ids": ..., "use_cache": False},
+    "context": {
+        "input_ids": input_ids,
+        "loss_mask": loss_mask,                  # [B, S] float32, 1 where a position predicts a real token
+        "logprob_weights_shifted": w,            # [B, S] float32, w = -g, zero outside loss_mask
+    },
+    "processing": {"loss_fn": "weighted_cross_entropy", "post": ["compute_logprobs"]},
+}
+```
+
+`w[i, j]` weights the log-probability of token `j + 1` of row `i`, and the loss
+trains `L_surrogate = -sum(w * logprobs)` over the whole request, without
+normalizing, however the server splits it across ranks and micro-batches. Its
+gradient with respect to `logprobs[i, j]` is `-w[i, j]`, so sending `w = -g`,
+where `g[i, j]` is `dL/dlogprobs[i, j]`, makes the model gradient
+`sum(g * dlogprobs/dtheta)`, which is that of `L`. With `w = loss_mask` it is
+the summed causal cross-entropy, which makes the loss usable directly for
+per-token weighted SFT, negative weights included.
+
+The server rejects the request before the model runs when `w` is missing, not
+float32, shaped differently from `loss_mask`, not finite, or nonzero where
+`loss_mask` is 0; when `temperature` is not 1; and when
+`processing.config` carries a key the loss does not know (it has no options).
+Do not send `batch_num_tokens` or `dp_size`; the server derives both. A server
+without this loss fails the request with an error containing
+`is not a registered`.
+
+The result's `metrics["weighted_cross_entropy_objective_sum"]` is
+`L_surrogate`, not `L`; read it rather than `avg_loss`, whose scale depends on
+how the server combines its ranks' losses. `post_process_outputs.logprobs`
+holds the backward pass's own `[B, S]` log-probabilities.
 
 ---
 
