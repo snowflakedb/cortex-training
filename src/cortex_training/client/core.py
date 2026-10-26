@@ -96,8 +96,6 @@ from cortex_training import wire
 from cortex_training._artifact_download import DownloadCancelled
 from cortex_training._artifact_download import NoChunksError
 from cortex_training.client import _account_jobs
-from cortex_training.client._account_jobs import AccountJobListUnavailable  # noqa: F401 - exported
-from cortex_training.client._account_jobs import InvalidPageToken  # noqa: F401 - exported
 from cortex_training.client.auth import SnowflakeProfileAuth
 from cortex_training.client.auth import SnowflakeProfileError
 from cortex_training.client.auth import SnowflakeTelemetryTokenProvider
