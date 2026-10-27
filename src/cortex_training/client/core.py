@@ -413,8 +413,7 @@ class DatabaseAccessError(requests.exceptions.HTTPError, RuntimeError):
 
     Raised for the API's HTTP 400 with code 517602 and message "Schema ... is
     not found or not authorized". The client never creates a database; the
-    message starts with the server's message, then says how to create it, get
-    access, or use another.
+    message says how to create it, get access, or use another.
     ``kind`` is ``"schema"``, ``name`` the ``DATABASE.SCHEMA``, ``role`` the
     session's role (None when it can't be determined, as for PAT clients), and
     ``statement`` the CREATE DATABASE and CREATE SCHEMA statements that would
@@ -652,20 +651,20 @@ def _response_error_code(response: requests.Response | None) -> str | None:
     return None
 
 
-def _schema_not_found_message(response: requests.Response | None) -> str | None:
-    """The server's message when ``response`` says the URL's schema can't be found."""
+def _is_schema_not_found(response: requests.Response | None) -> bool:
+    """Whether ``response`` says the URL's schema can't be found."""
     if response is None:
-        return None
+        return False
     try:
         body = response.json()
     except Exception:
-        return None
+        return False
     for candidate in _iter_error_dicts(body):
         code = candidate.get("code") or candidate.get("error_code")
         message = str(candidate.get("message") or "").strip()
         if str(code) == _INVALID_REQUEST_CODE and _SCHEMA_NOT_FOUND_MESSAGE.match(message):
-            return message
-    return None
+            return True
+    return False
 
 
 def _chunk_group_error_detail(response: requests.Response | None) -> dict | None:
@@ -2958,7 +2957,7 @@ class CortexTrainingClient:
             logger.debug("Could not read the session's role.", exc_info=True)
             return None
 
-    def _schema_not_found_error(self, response: requests.Response, server_message: str) -> DatabaseAccessError:
+    def _schema_not_found_error(self, response: requests.Response) -> DatabaseAccessError:
         """Explain an HTTP 400 saying the configured schema can't be found."""
         role = self._current_role()
         sent_headers = getattr(getattr(response, "request", None), "headers", None) or self._session.headers
@@ -2980,7 +2979,6 @@ class CortexTrainingClient:
         # The server's message is the same whether the database or the schema is missing, or
         # the role can't use either, so the explanation covers all three.
         lines = [
-            f"HTTP 400 ({_INVALID_REQUEST_CODE}): {server_message}",
             f"{who} can't find database {database} or its schema {schema}{source}.",
             f"- If they don't exist: run `{create_database}` and `{create_schema}` (or ask an admin to).",
             f"- If they exist: ask an admin to run `GRANT USAGE ON DATABASE {database} TO ROLE {grantee}` "
@@ -2988,7 +2986,7 @@ class CortexTrainingClient:
         ]
         if not role and sent_pat:
             lines.insert(
-                2,
+                1,
                 "- If that's the wrong role: restrict the PAT to a role that has access, or run "
                 "`ALTER USER <USER> SET DEFAULT_ROLE = <ROLE>`. Snowsight shows the token's role under "
                 "Settings > Authentication.",
@@ -3167,9 +3165,9 @@ class CortexTrainingClient:
                 if (
                     explain_database
                     and status_code == 400
-                    and (server_message := _schema_not_found_message(resp)) is not None
+                    and _is_schema_not_found(resp)
                 ):
-                    raise self._schema_not_found_error(resp, server_message)
+                    raise self._schema_not_found_error(resp)
                 try:
                     # requests.Response.raise_for_status() intentionally ignores 3xx.
                     if 300 <= resp.status_code < 400:

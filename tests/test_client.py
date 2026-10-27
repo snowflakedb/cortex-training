@@ -8210,7 +8210,6 @@ class TestMissingDatabase:
         with pytest.raises(nc.DatabaseAccessError) as exc:
             c._send("GET", f"{c.base_url}/test")
         assert str(exc.value) == (
-            "HTTP 400 (517602): Schema MY_DB.PUBLIC is not found or not authorized\n"
             "Your PAT's role (its role restriction, or your user's DEFAULT_ROLE if it has none) "
             "can't find database MY_DB or its schema PUBLIC.\n"
             "- If that's the wrong role: restrict the PAT to a role that has access, or run "
@@ -8240,7 +8239,6 @@ class TestMissingDatabase:
             c._send("GET", f"{c.base_url}/test")
         message = str(exc.value)
         assert message.startswith(
-            "HTTP 400 (517602): Schema MY_DB.PUBLIC is not found or not authorized\n"
             "Role TRAINER can't find database MY_DB or its schema PUBLIC (from profile prod).\n"
         )
         assert "GRANT USAGE ON SCHEMA MY_DB.PUBLIC TO ROLE TRAINER" in message
@@ -8254,7 +8252,7 @@ class TestMissingDatabase:
         with pytest.raises(nc.DatabaseAccessError) as exc:
             c._send("GET", f"{c.base_url}/test")
         message = str(exc.value)
-        assert message.splitlines()[1] == (
+        assert message.splitlines()[0] == (
             "Role <ROLE> (couldn't determine your role) can't find database MY_DB or its schema PUBLIC."
         )
         assert "PAT" not in message
@@ -8265,7 +8263,7 @@ class TestMissingDatabase:
         c._session.get.return_value = _make_error_response(body, 400)
         with pytest.raises(nc.DatabaseAccessError) as exc:
             c._send("GET", f"{c.base_url}/test")
-        assert str(exc.value).startswith('HTTP 400 (517602): Schema "my db".PUBLIC is not found or not authorized\n')
+        assert exc.value.name == "MY_DB.PUBLIC"
 
     def test_the_default_profile_is_named_as_such(self):
         c = self._client(profile=None, role="TRAINER")
@@ -8278,8 +8276,7 @@ class TestMissingDatabase:
         c._session.get.return_value = _make_error_response(_failed_request(c), 400)
         with pytest.raises(nc.DatabaseAccessError) as exc:
             c._send("GET", f"{c.base_url}/test")
-        assert str(exc.value).splitlines()[:4] == [
-            "HTTP 400 (517602): Schema MY_DB.CUSTOM is not found or not authorized",
+        assert str(exc.value).splitlines()[:3] == [
             "Role TRAINER can't find database MY_DB or its schema CUSTOM (from profile prod).",
             "- If they don't exist: run `CREATE DATABASE IF NOT EXISTS MY_DB` and "
             "`CREATE SCHEMA IF NOT EXISTS MY_DB.CUSTOM` (or ask an admin to).",

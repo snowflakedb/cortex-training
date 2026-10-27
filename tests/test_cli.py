@@ -3029,6 +3029,33 @@ def test_http_errors_include_response_details():
     assert 'response body: {"message":"backend detail"}' in err
 
 
+def test_a_schema_not_found_error_shows_the_server_message_once():
+    import requests
+
+    from cortex_training import CortexTrainingClient
+
+    client = CortexTrainingClient(
+        base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="PUBLIC", max_retries=0
+    )
+    message = "Schema MY_DB.PUBLIC is not found or not authorized"
+    response = requests.Response()
+    response.status_code = 400
+    response.url = "https://test.snowflakecomputing.com/error"
+    response.headers["Content-Type"] = "application/json"
+    response._content = json.dumps({"code": "517602", "message": message}).encode()
+    response._content_consumed = True
+    client._session = MagicMock()
+    client._session.get.return_value = response
+    stderr = io.StringIO()
+
+    rc = cli.main(["get", "job-1"], client_factory=lambda _args: client, stderr=stderr)
+
+    err = stderr.getvalue()
+    assert rc == 1
+    assert err.startswith("error: Role <ROLE> (couldn't determine your role) can't find database MY_DB")
+    assert err.count(message) == 1
+
+
 def test_invalid_job_json_returns_error(tmp_path):
     path = tmp_path / "job.json"
     path.write_text("[]", encoding="utf-8")

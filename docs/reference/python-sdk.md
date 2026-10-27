@@ -74,9 +74,9 @@ and read timeout, or a `(connect, read)` pair. `from_configs` also accepts
 The client never creates a database. A request that fails because the
 database or schema in its URL can't be found (HTTP 400, code `517602`, message
 `Schema DB.SCHEMA is not found or not authorized`) raises `DatabaseAccessError`
-(see [Exceptions](#exceptions)), which starts with the server's message, then
-says how to create it, get access to it, or use another one. A client from `for_job`
-raises the plain `requests.HTTPError` instead. `client.auto_create_database` is deprecated:
+(see [Exceptions](#exceptions)), which says how to create it, get access to it,
+or use another one. A client from `for_job` raises the plain
+`requests.HTTPError` instead. `client.auto_create_database` is deprecated:
 it is always False. Setting it to True emits a `FutureWarning`; setting it to False
 needs no change.
 
