@@ -10,5 +10,11 @@ dist/
 # filenames the docs tell you to create -- a blanket `*.json` also silently
 # ignored this repo's own examples/api/*.json payloads.
 connection.json
+conn.json
 *-config.json
 config.json
+
+# The RL and distillation examples write the jobs each run built here; these are
+# local records regenerated per run.
+examples/rl/configs/
+examples/distillation/configs/

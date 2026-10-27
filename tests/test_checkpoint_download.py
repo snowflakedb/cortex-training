@@ -10,7 +10,7 @@ import pytest
 import requests
 
 from cortex_training import _checkpoint_download as download
-from cortex_training import _cli as cli
+from cortex_training.cli import commands as cli
 from cortex_training.cli import build_parser
 
 

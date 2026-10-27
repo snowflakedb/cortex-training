@@ -1,0 +1,17 @@
+{
+  "$schema": "../../schema.json",
+  "model_id": "openai/gpt-oss-120b",
+  "license": {
+    "name": "Apache 2.0",
+    "url": "https://huggingface.co/openai/gpt-oss-120b/blob/main/LICENSE"
+  },
+  "architecture": "moe",
+  "moe": {
+    "num_moe_layers": 36,
+    "topk": 4,
+    "num_experts": 128
+  },
+  "last_validated": {
+    "long/h200-inference-full": null
+  }
+}

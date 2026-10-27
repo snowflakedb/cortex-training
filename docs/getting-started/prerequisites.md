@@ -1,13 +1,13 @@
 # Prerequisites
 
-Before running a training recipe, you need:
+Before running a training example, you need:
 
-- Python 3.10 or later
+- Python 3.10 or later (3.11 or later to run the examples)
 - [uv](https://docs.astral.sh/uv/) (or `pip`) to install the client
 - Access to a Snowflake account with the Cortex Training endpoint enabled
 - A programmatic access token
 - A database and schema containing the endpoint
-- Sufficient reserved GPU capacity for the selected recipe
+- Sufficient reserved GPU capacity for the selected example
 
 Check current capacity after installing and authenticating:
 
@@ -20,5 +20,5 @@ Omitting `--hardware` reports every GPU type. Pass the same `--hardware` value
 you will set on the job; capacity is per hardware type. See
 [GPU hardware](../concepts/hardware.md).
 
-Model-specific GPU requirements are not yet fully validated. Treat recipe
+Model-specific GPU requirements are not yet fully validated. Treat example
 defaults as starting configurations, not guaranteed minimums.

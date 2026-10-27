@@ -12,11 +12,11 @@ the Cortex Training client.
   [full fine-tuning](guides/training/full-finetuning.md),
   [reinforcement learning](guides/training/reinforcement-learning.md) and
   [starting from your own weights](guides/training/external-weights.md), plus the
-  [runnable recipes](../recipes/README.md).
+  [runnable examples](../examples/README.md).
 - Inference users: [deploy a model for streaming inference](guides/inference/deploy-model.md)
   behind an OpenAI-compatible endpoint, or
   [serve a training checkpoint](guides/inference/serve-checkpoint.md).
-- Framework users: see the [integrations index](integrations/README.md) for
+- Framework users: see the [framework examples](../examples/frameworks/README.md) for
   RL frameworks integrated with Cortex.
 - Operators: see [job management](guides/operations/manage-jobs.md) and
   [logs and metrics](guides/operations/logs-and-metrics.md).
@@ -26,6 +26,6 @@ the Cortex Training client.
 
 ## Scope
 
-Every page here documents behavior that exists in this branch. Where a workflow
-is only partially implemented, the page says so inline and names what is
-missing -- there are no placeholder pages for unimplemented features.
+These pages document the client, CLI and examples in this repository, and the
+service behavior they rely on; the service itself is not part of this
+repository.

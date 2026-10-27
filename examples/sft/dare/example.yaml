@@ -1,0 +1,13 @@
+id: dare-bench-sft
+title: DARE-Bench agent SFT
+status: runnable
+task: sft
+methods:
+  - full-parameter
+datasets:
+  - Snowflake/dare-bench
+precision:
+  - bfloat16
+provenance:
+  project: Snowflake-Labs/dare-bench
+last_validated: null

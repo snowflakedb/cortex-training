@@ -1,5 +1,6 @@
 {
-  "modelId": "zai-org/GLM-5.3-Flash",
+  "$schema": "../../schema.json",
+  "model_id": "zai-org/GLM-5.3-Flash",
   "license": {
     "name": "MIT",
     "url": "https://huggingface.co/zai-org/GLM-5.3-Flash/blob/main/LICENSE"
@@ -10,8 +11,12 @@
     "topk": 8,
     "num_experts": 288
   },
-  "lastValidated": {
-    "h200-training-lora": "2026-10-20",
-    "h200-inference-lora": "2026-10-20"
+  "last_validated": {
+    "long/h200-inference-full": null,
+    "long/h200-inference-lora": "2026-10-20",
+    "long/h200-training-lora": "2026-10-20",
+    "standard/h200-inference-full": null,
+    "standard/h200-inference-lora": null,
+    "standard/h200-training-lora": null
   }
 }

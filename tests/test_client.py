@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for ``cortex_training.client``.
+"""Unit tests for ``cortex_training.client.core``.
 
 Two suites:
 
@@ -64,7 +64,8 @@ spec = importlib.util.spec_from_file_location(
         __import__("pathlib").Path(__file__).resolve().parent.parent
         / "src"
         / "cortex_training"
-        / "client.py"
+        / "client"
+        / "core.py"
     ),
 )
 nc = importlib.util.module_from_spec(spec)
@@ -809,7 +810,7 @@ class TestClientConstruction:
         assert c._prefix == "http://x.test/api/v2/databases/MY$DB/schemas/S$1/cortex-training"
 
     def test_from_pat_sets_headers_and_verify(self):
-        c = CortexTrainingClient.from_pat(
+        c = CortexTrainingClient._from_pat(
             host="x.test",
             pat="tok-xyz",
             database="DB",
@@ -824,7 +825,7 @@ class TestClientConstruction:
         assert c._metric_emitter.timeout == 3.0
 
     def test_from_pat_uses_dashes_in_the_rest_host(self):
-        c = CortexTrainingClient.from_pat(
+        c = CortexTrainingClient._from_pat(
             host="org-my_acct.snowflakecomputing.com", pat="p", database="DB", schema="SCH"
         )
         assert c.base_url == "https://org-my-acct.snowflakecomputing.com"
@@ -833,7 +834,7 @@ class TestClientConstruction:
 
     def test_from_pat_skips_telemetry_when_disabled(self, monkeypatch):
         monkeypatch.setenv(nc.DISABLE_TELEMETRY_ENV, "1")
-        c = CortexTrainingClient.from_pat(
+        c = CortexTrainingClient._from_pat(
             host="x.test",
             pat="tok-xyz",
             database="DB",
@@ -843,7 +844,7 @@ class TestClientConstruction:
         assert c.emit_metric("event") is None
 
     def test_from_pat_propagates_telemetry_timeout(self):
-        c = CortexTrainingClient.from_pat(
+        c = CortexTrainingClient._from_pat(
             host="x.test",
             pat="tok-xyz",
             database="DB",
@@ -862,7 +863,7 @@ class TestClientConstruction:
         auth_type = MagicMock(return_value=auth)
         monkeypatch.setattr(nc, "SnowflakeProfileAuth", auth_type)
 
-        c = CortexTrainingClient.from_connection_name("training-profile")
+        c = CortexTrainingClient._from_profile("training-profile")
 
         auth_type.assert_called_once_with("training-profile")
         assert c.base_url == "https://profile.example:8443"
@@ -886,7 +887,7 @@ class TestClientConstruction:
         auth.schema = "PROFILE_SCHEMA"
         monkeypatch.setattr(nc, "SnowflakeProfileAuth", MagicMock(return_value=auth))
 
-        c = CortexTrainingClient.from_connection_name(
+        c = CortexTrainingClient._from_profile(
             "training-profile", database="OVERRIDE_DB", schema="OVERRIDE_SCHEMA"
         )
 
@@ -901,7 +902,7 @@ class TestClientConstruction:
         monkeypatch.setattr(nc, "SnowflakeProfileAuth", MagicMock(return_value=auth))
 
         with pytest.raises(ValueError, match="must set database"):
-            CortexTrainingClient.from_connection_name("training-profile")
+            CortexTrainingClient._from_profile("training-profile")
 
         auth.close.assert_called_once()
 
@@ -1749,7 +1750,7 @@ class TestTelemetrySurface:
     def test_with_telemetry_off_a_tui_client_has_nothing_to_send_with(self, monkeypatch):
         monkeypatch.setenv(nc.DISABLE_TELEMETRY_ENV, "1")
         monkeypatch.setattr(nc, "OtlpMetricEmitter", MagicMock(side_effect=AssertionError("built an emitter")))
-        c = CortexTrainingClient.from_pat(host="account.test", pat="pat", database="DB", schema="SCH")
+        c = CortexTrainingClient._from_pat(host="account.test", pat="pat", database="DB", schema="SCH")
         c._telemetry_surface = nc.TUI_SURFACE
 
         c.emit_metric("custom", {"n": 1})
@@ -2144,6 +2145,36 @@ class TestCreateJob:
         assert isinstance(training_config["peft_config"]["lora_dropout"], float)
         # The raw path forwards the optimizer untouched.
         assert training_config["optimizer"] == {"type": "adamw"}
+
+    def test_the_api_readme_says_create_job_from_body_rewrites_peft_config_in_place(self):
+        readme = (Path(__file__).resolve().parents[1] / "examples" / "api" / "README.md").read_text()
+        text = " ".join(readme.split())
+        claim = text[text.index("`create_job_from_body` checks the body") :]
+        claim = claim[: claim.index(" See ")]
+        assert "rewrites each `peft_config` in place into its canonical form" in claim
+        assert "unchanged" not in claim
+
+        c = _make_client(post_json={"job_id": "srv-raw"})
+        peft = {"peft_type": "Lora", "r": 32, "lora_alpha": 32, "target_modules": ["q_proj", "v_proj"]}
+        body = {
+            "hardware": "H200",
+            "sub_job_configs": [
+                {
+                    "job_type": "training",
+                    "model_name": "Qwen/Qwen3-8B",
+                    "training_config": {"n_gpus": 4, "optimizer": {"lr": 2e-5}, "peft_config": dict(peft)},
+                }
+            ],
+        }
+        unchanged = json.loads(json.dumps(body))
+        del unchanged["sub_job_configs"][0]["training_config"]["peft_config"]
+
+        c.create_job_from_body(body)
+
+        assert c._session.post.call_args.kwargs["json"] is body
+        canonical = dict(peft, task_type="CAUSAL_LM", lora_dropout=0.0, bias="none", target_parameters=[])
+        assert body["sub_job_configs"][0]["training_config"].pop("peft_config") == canonical
+        assert body == unchanged
 
     def test_create_job_from_body_rejects_invalid_peft_config_before_post(self):
         c = _make_client()
@@ -5045,7 +5076,7 @@ class TestExecutionLogDownload:
     )
     def test_connection_kwargs_use_pat_host_as_account(self, monkeypatch, host, account):
         monkeypatch.setenv(nc.DISABLE_TELEMETRY_ENV, "1")
-        c = CortexTrainingClient.from_pat(
+        c = CortexTrainingClient._from_pat(
             host=host,
             pat="tok-xyz",
             database="DB",
@@ -8650,7 +8681,7 @@ class TestTailOnEndedJobs:
 
     def test_a_tail_whose_retry_cannot_get_a_token_has_the_job_status_too(self):
         # Not every later attempt fails off the wire: one that gets no token fails the call too.
-        from cortex_training.snowflake_auth import SnowflakeProfileError
+        from cortex_training.client.auth import SnowflakeProfileError
 
         c = _make_client()
         c.max_retries = 2  # as the TUI reads

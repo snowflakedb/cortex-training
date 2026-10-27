@@ -11,7 +11,7 @@
         "max_seq_len": 40960,
         "train_batch_size": 4,
         "gradient_clipping": 1.0,
-        "model_provider": "prime_rl",
+        "model_provider": "arctic",
         "attn_implementation": "flash_attention_3",
         "ac_config": {
           "mode": "full",

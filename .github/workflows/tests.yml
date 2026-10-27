@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The SDK supports 3.10, but tinker-cookbook (needed by the recipe
+        # The SDK supports 3.10, but tinker-cookbook (needed by the example
         # tests) requires 3.11+.
         python-version: ["3.11", "3.12"]
     steps:
@@ -33,8 +33,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install package and test dependencies
-        # The recipe tests import tinker-cookbook and wandb; install them the
-        # way recipes/README.md does. CPU-only torch keeps the job small.
+        # The example tests import tinker-cookbook and wandb; install them the
+        # way examples/README.md does. CPU-only torch keeps the job small.
         # `python -m uv pip` installs into the setup-python interpreter, which
         # is the one the next step runs.
         run: |

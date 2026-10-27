@@ -3,9 +3,9 @@
 For authentication, URL, and server error messages, see the
 [CLI troubleshooting section](cli.md#troubleshooting).
 
-For recipe failures, first capture:
+When an example fails, first capture:
 
-- The recipe command with secrets removed
+- The example command with secrets removed
 - Job and sub-job IDs
 - The installed client version, from `python -c "import cortex_training; print(cortex_training.__version__)"`
 - Model, precision, GPU count, and sequence length
@@ -20,5 +20,5 @@ For recipe failures, first capture:
   `cancelled`, log nothing.
 - Downloaded execution logs, from `cortex-training download-log JOB_ID`
 
-Recipe-specific failure modes are documented beside the recipe rather than
+Example-specific failure modes are documented beside the example rather than
 accumulated on this page.

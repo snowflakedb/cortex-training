@@ -1,49 +1,29 @@
 # Compatibility data for documentation renderers that consume docs/_data.
-# model-catalog/models.json is the source of truth; keep model IDs and support
-# flags synchronized with it.
+# Derived from model-catalog/models/; keep it in sync with that tree:
+# - training and inference: the model has a training or an inference file.
+# - examples: the runnable examples the catalog supports for the model AND whose
+#   renderer resolves. A workflow is listed only when its catalog files exist
+#   (conversational-sft needs a training file, inference-endpoint an inference
+#   file, math-grpo a training and an inference file of the same context,
+#   hardware and mode) and recommended_renderer_name(model, enable_thinking=False)
+#   resolves with the pinned tinker_cookbook. A model whose renderer does not
+#   resolve gets no example entries.
+# - last_validated: the latest date in the model's model.json, or null.
 models:
-  - id: Qwen/Qwen3-0.6B
-    training: true
-    inference: true
-    last_validated: null
-  - id: Qwen/Qwen3-1.7B
-    training: true
-    inference: true
-    last_validated: null
-  - id: Qwen/Qwen3-8B
-    training: true
-    inference: true
-    recipes:
-      - conversational-sft
-      - math-grpo
-    last_validated: null
-  - id: Qwen/Qwen3.5-4B
-    training: true
-    inference: true
-    recipes:
-      - conversational-sft
-      - math-grpo
-    last_validated: null
-  - id: Qwen/Qwen3.6-35B-A3B
-    training: true
-    inference: true
-    recipes:
-      - conversational-sft
-      - math-grpo
-    last_validated: null
-  - id: Qwen/Qwen3.8-27B
-    training: true
-    inference: true
-    recipes:
-      - conversational-sft
-      - math-grpo
-    last_validated: null
   - id: deepseek-ai/DeepSeek-V4-Flash-0731
     training: false
     inference: true
     last_validated: 2026-09-01
-  - id: openai/gpt-oss-120b
-    training: false
+  - id: google/gemma-3-4b-it
+    training: true
+    inference: true
+    last_validated: null
+  - id: google/gemma-4-31B-it
+    training: true
+    inference: true
+    last_validated: 2026-10-15
+  - id: zai-org/GLM-4.5-Air
+    training: true
     inference: true
     last_validated: null
   - id: zai-org/GLM-5.2
@@ -54,3 +34,107 @@ models:
     training: false
     inference: true
     last_validated: 2026-09-01
+  - id: zai-org/GLM-5.3
+    training: false
+    inference: true
+    last_validated: null
+  - id: zai-org/GLM-5.3-Flash
+    training: true
+    inference: true
+    last_validated: 2026-10-20
+  - id: zai-org/GLM-5.3-Flash-BF16
+    training: true
+    inference: true
+    last_validated: 2026-10-20
+  - id: openai/gpt-oss-120b
+    training: false
+    inference: true
+    last_validated: null
+  - id: google/medgemma-1.5-4b-it
+    training: true
+    inference: true
+    last_validated: 2026-10-15
+  - id: google/medgemma-4b-it
+    training: true
+    inference: true
+    last_validated: 2026-10-15
+  - id: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    training: true
+    inference: true
+    examples:
+      - conversational-sft
+      - inference-endpoint
+      - math-grpo
+    last_validated: 2026-10-14
+  - id: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
+    training: true
+    inference: true
+    examples:
+      - conversational-sft
+      - inference-endpoint
+      - math-grpo
+    last_validated: 2026-10-14
+  - id: Qwen/Qwen3-0.6B
+    training: true
+    inference: true
+    last_validated: null
+  - id: Qwen/Qwen3-1.7B
+    training: true
+    inference: true
+    last_validated: null
+  - id: Qwen/Qwen3-30B-A3B
+    training: true
+    inference: true
+    examples:
+      - conversational-sft
+      - inference-endpoint
+      - math-grpo
+    last_validated: null
+  - id: Qwen/Qwen3-4B-Instruct-2507
+    training: true
+    inference: true
+    last_validated: 2026-10-14
+  - id: Qwen/Qwen3-8B
+    training: true
+    inference: true
+    examples:
+      - conversational-sft
+      - inference-endpoint
+      - math-grpo
+    last_validated: null
+  - id: Qwen/Qwen3.5-4B
+    training: true
+    inference: true
+    examples:
+      - conversational-sft
+      - inference-endpoint
+      - math-grpo
+    last_validated: 2026-09-02
+  - id: Qwen/Qwen3.5-9B
+    training: true
+    inference: true
+    examples:
+      - conversational-sft
+      - inference-endpoint
+      - math-grpo
+    last_validated: 2026-10-14
+  - id: Qwen/Qwen3.6-35B-A3B
+    training: true
+    inference: true
+    examples:
+      - conversational-sft
+      - inference-endpoint
+      - math-grpo
+    last_validated: 2026-09-02
+  - id: Qwen/Qwen3.8-27B
+    training: true
+    inference: true
+    examples:
+      - conversational-sft
+      - inference-endpoint
+      - math-grpo
+    last_validated: 2026-09-02
+  - id: Qwen/Qwen3.8-Flash-Next
+    training: true
+    inference: true
+    last_validated: null

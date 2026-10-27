@@ -6,7 +6,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-import cortex_training._cli as cli
+import cortex_training.cli.commands as cli
 
 JOB_ID = "12345678-1234-4234-8234-123456789abc"
 DEPLOYMENT_ID = f"sf-ct-{JOB_ID}"

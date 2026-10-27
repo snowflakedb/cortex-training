@@ -13,7 +13,7 @@ cortex-training wait JOB_ID
 cortex-training cancel JOB_ID
 ```
 
-Use `cortex-training capacity` before starting a recipe, and
+Use `cortex-training capacity` before starting an example, and
 `cortex-training capacity --hardware B200` (or `B300`) when you want a single
 type. See [GPU hardware](../../concepts/hardware.md). Resume and retry guidance
 is tracked separately because support depends on checkpoint type and failure
@@ -23,7 +23,7 @@ state.
 
 From a repository checkout, use `cluster-status.py` for a summary of running
 jobs and GPU usage. It shells out to `cortex-training list`, so configure
-[CLI login](../../reference/cli.md#login) first.
+[CLI login](../../reference/cli.md#legacy-login) first.
 
 ```bash
 python cluster-status.py            # Live view, refreshed every 5 seconds

@@ -6,7 +6,6 @@
       "model_name": "Qwen/Qwen3.8-Flash-Next",
       "dtype": "bfloat16",
       "seed": 42,
-      "weight_format": "vllm",
       "inference_config": {
         "n_gpus": 4,
         "max_seq_len": 65536,

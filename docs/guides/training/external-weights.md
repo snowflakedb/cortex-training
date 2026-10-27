@@ -180,14 +180,7 @@ The Python SDK uses the same request field:
 ```python
 from cortex_training.client import CortexTrainingClient, SubJobConfig
 
-client = CortexTrainingClient.from_connection_name("training")
-# With a JSON config file instead of a profile:
-# client = CortexTrainingClient.from_pat(
-#     host="ACCOUNT.snowflakecomputing.com",
-#     pat=PAT,
-#     database="CORTEX_TRAINING_DB",
-#     schema="PUBLIC",
-# )
+client = CortexTrainingClient.from_configs(connection="training")
 
 training = SubJobConfig.training_job(
     model_name="Qwen/Qwen3-0.6B",

@@ -1,0 +1,14 @@
+id: inference-endpoint
+title: Inference endpoint
+status: runnable
+task: inference
+methods:
+  - lora
+  - full-parameter
+datasets:
+  - HuggingFaceH4/MATH-500
+  - openai/gsm8k
+  - identity
+precision:
+  - bfloat16
+last_validated: null

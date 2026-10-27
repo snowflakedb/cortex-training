@@ -53,7 +53,7 @@ try:  # POSIX only; elsewhere the cursors are written unlocked.
 except ImportError:  # pragma: no cover - exercised on Windows
     fcntl = None  # type: ignore[assignment]
 
-# Cache dir resolution mirrors cortex_training._cli._login_state_path: an explicit
+# Cache dir resolution mirrors cortex_training.cli.commands._login_state_path: an explicit
 # override wins, else XDG_CACHE_HOME, else ~/.cache, namespaced under the app.
 _OVERRIDE_ENV = "CORTEX_TRAINING_TUI_CACHE_DIR"
 _XDG_CACHE_ENV = "XDG_CACHE_HOME"

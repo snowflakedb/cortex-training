@@ -13,14 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for ``cortex_training.optimizer``."""
+"""Unit tests for ``cortex_training.client.optimizer``."""
 
 from __future__ import annotations
 
 import pytest
 
-from cortex_training.optimizer import SUPPORTED_OPTIMIZER_KEYS
-from cortex_training.optimizer import normalize_optimizer_config
+from cortex_training.client.optimizer import SUPPORTED_OPTIMIZER_KEYS
+from cortex_training.client.optimizer import normalize_optimizer_config
 
 
 class TestReportedRegression:

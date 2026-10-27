@@ -17,7 +17,6 @@
 
 __version__ = "0.0.2"
 
-from . import router_replay_planner
 from . import wire
 from .client import AccountJobListUnavailable
 from .client import ChunkGroupConflictError
@@ -57,7 +56,6 @@ __all__ = [
     "JobType",
     "ModelDeploymentSpec",
     "Hardware",
-    "router_replay_planner",
     "wire",
     "__version__",
 ]

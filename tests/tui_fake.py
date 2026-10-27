@@ -61,7 +61,7 @@ def _training(model, gpus, *, lr=2e-5, bs=8, seq=4096, lora=None, opt="AdamW"):
     if lora:
         cfg["peft_config"] = {"peft_type": "Lora", "r": float(lora), "lora_alpha": float(lora * 2),
                               "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"]}
-    if model.endswith("-A3B"):  # MoE: trained expert-parallel, as the recipes' configs do
+    if model.endswith("-A3B"):  # MoE: trained expert-parallel, as the shipped MoE configs do
         cfg["ep_size"] = 4.0
     return {"job_type": "TRAINING", "model_name": model, "dtype": "bfloat16", "seed": 42, "training_config": cfg}
 

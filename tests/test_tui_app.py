@@ -3451,7 +3451,7 @@ def test_quit_without_job_id_derives_it_from_sub_job_id_and_reports_crashes(monk
             pass
 
     monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", FakeApp)
-    monkeypatch.setattr("cortex_training._cli.build_client", lambda args, cls: MagicMock())
+    monkeypatch.setattr("cortex_training.cli.commands.build_client", lambda args, cls: MagicMock())
     rc = tui_main.run(["--sub-job-id", "job-x:sampling:0", "--base-url", "http://localhost:1", "--database", "DB"])
     assert seen == {"job_id": "job-x", "sub_job_id": "job-x:sampling:0"}
     assert rc == 1  # the app's return code, not a blanket 0
@@ -3493,7 +3493,7 @@ def test_the_tui_tags_its_client_and_the_job_clients_it_opens(monkeypatch):
 def _screenshot_script():
     import importlib.util
 
-    path = Path(__file__).resolve().parents[1] / "scripts" / "tui_screenshot.py"
+    path = Path(__file__).resolve().parents[1] / "tools" / "tui_screenshot.py"
     spec = importlib.util.spec_from_file_location("tui_screenshot", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -3506,7 +3506,7 @@ class _ScreenshotClient:
 
 def test_the_tui_and_the_screenshot_script_build_the_same_bounded_client(monkeypatch):
     # One helper builds both, so a screenshot's reads are the TUI's: bounded, and tagged as the TUI's.
-    import cortex_training._cli as cli
+    import cortex_training.cli.commands as cli
 
     built = []
 
@@ -3533,7 +3533,7 @@ def test_the_tui_and_the_screenshot_script_build_the_same_bounded_client(monkeyp
 
 
 def test_the_screenshot_script_reads_only_the_account_it_is_named(tmp_path, monkeypatch, capsys):
-    import cortex_training._cli as cli
+    import cortex_training.cli.commands as cli
 
     script = _screenshot_script()
     built = []
@@ -3556,8 +3556,8 @@ def test_the_screenshot_script_reads_only_the_account_it_is_named(tmp_path, monk
 
 def test_the_screenshot_script_s_connection_errors_are_the_tui_s(tmp_path, monkeypatch, capsys):
     # On a machine with no account to read: the TUI's error and how to connect, not a traceback.
-    import cortex_training._cli as cli
-    from cortex_training.snowflake_auth import SnowflakeProfileError
+    import cortex_training.cli.commands as cli
+    from cortex_training.client.auth import SnowflakeProfileError
 
     script = _screenshot_script()
 
@@ -3584,7 +3584,7 @@ def test_the_screenshot_script_s_connection_errors_are_the_tui_s(tmp_path, monke
 
 
 def test_the_screenshot_script_says_what_it_reads_and_leaves_no_cache_behind(tmp_path, monkeypatch, capsys):
-    import cortex_training._cli as cli
+    import cortex_training.cli.commands as cli
 
     script = _screenshot_script()
     monkeypatch.setattr(cli, "build_client", lambda args, cls: _ScreenshotClient())
@@ -3657,7 +3657,7 @@ def test_the_log_poll_interval_must_be_positive_and_finite(value, capsys):
 
 
 def test_the_poll_interval_is_the_flag_s_alone_and_the_sign_in_names_what_the_config_gives(tmp_path, monkeypatch):
-    import cortex_training._cli as cli
+    import cortex_training.cli.commands as cli
 
     seen = []
 
@@ -3673,11 +3673,15 @@ def test_the_poll_interval_is_the_flag_s_alone_and_the_sign_in_names_what_the_co
 
     reads = []
     load_config = cli._load_config
-    monkeypatch.setattr(cli, "_load_config", lambda path: reads.append(path) or load_config(path))
+    monkeypatch.setattr(
+        cli,
+        "_load_config",
+        lambda path, **kwargs: reads.append(path) or load_config(path, **kwargs),
+    )
     monkeypatch.delenv("CORTEX_TRAINING_CONNECTION", raising=False)
     monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", FakeApp)
     built = []  # the poll interval each client is built with
-    monkeypatch.setattr("cortex_training._cli.build_client", lambda args, cls: built.append(args.poll_interval) or MagicMock())
+    monkeypatch.setattr("cortex_training.cli.commands.build_client", lambda args, cls: built.append(args.poll_interval) or MagicMock())
     path = tmp_path / "config.json"
     # The config's poll_interval is the CLI's result polling: neither the TUI's log polls nor a reason not to start.
     path.write_text(json.dumps({"base_url": "http://localhost:1", "database": "DB", "poll_interval": 10}),
@@ -5403,7 +5407,7 @@ def _run_tui_main(monkeypatch, client, during_run):
 
     monkeypatch.delenv("CORTEX_TRAINING_CONNECTION", raising=False)
     monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", FakeApp)
-    monkeypatch.setattr("cortex_training._cli.build_client", lambda args, cls: client)
+    monkeypatch.setattr("cortex_training.cli.commands.build_client", lambda args, cls: client)
     return tui_main.run(["--base-url", "http://localhost:1", "--database", "DB"])
 
 

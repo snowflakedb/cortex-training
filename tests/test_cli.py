@@ -28,7 +28,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import cortex_training._cli as cli
+import cortex_training.cli.commands as cli
 
 
 class FakeClient:
@@ -282,7 +282,7 @@ class FakeClient:
             "transfer_timeout_seconds": transfer_timeout_seconds,
         }
         if self.download_warning:
-            logging.getLogger("cortex_training.client").warning(self.download_warning)
+            logging.getLogger("cortex_training.client.core").warning(self.download_warning)
         if self.download_interrupt:
             raise self.download_interrupt
         if progress is not None:
@@ -326,7 +326,7 @@ class FakeClient:
             "transfer_timeout_seconds": transfer_timeout_seconds,
         }
         if self.download_warning:
-            logging.getLogger("cortex_training.client").warning(self.download_warning)
+            logging.getLogger("cortex_training.client.core").warning(self.download_warning)
         if self.download_interrupt:
             raise self.download_interrupt
         if progress is not None:
@@ -678,7 +678,7 @@ def test_submit_rejects_log_probability_sub_jobs(tmp_path):
 # The CLI duplicates these so `submit --dry-run` never imports the client; keep
 # the two copies from drifting apart.
 def test_cli_log_probability_rejection_matches_client():
-    from cortex_training import client
+    from cortex_training.client import core as client
 
     assert (
         cli._LOG_PROBABILITY_JOB_TYPE_ALIASES
@@ -1432,7 +1432,7 @@ def test_capacity_breakdown_rejects_unknown_choice(choice):
 
 # The CLI spells each dimension with a hyphen; it must send the client's name.
 def test_cli_breakdown_choices_match_client_dimensions():
-    from cortex_training import client
+    from cortex_training.client import core as client
 
     assert (
         tuple(cli._CAPACITY_BREAKDOWN_CHOICES.values())
@@ -1524,7 +1524,7 @@ def test_capacity_breakdown_fails_on_the_first_lookup_error(hardware):
 
 
 def test_capacity_breakdown_prints_the_real_client_result_with_sorted_keys():
-    from cortex_training import client as client_module
+    from cortex_training.client import core as client_module
 
     client = client_module.CortexTrainingClient(
         base_url="http://test.local", database="DB", schema="SCH"
@@ -1604,7 +1604,7 @@ def test_capacity_breakdown_prints_the_real_client_result_with_sorted_keys():
 
 
 def test_capacity_breakdown_prints_visible_user_rows_in_server_order():
-    from cortex_training import client as client_module
+    from cortex_training.client import core as client_module
 
     client = client_module.CortexTrainingClient(
         base_url="http://test.local", database="DB", schema="SCH"
@@ -2544,7 +2544,7 @@ def test_download_interrupted_after_the_files_are_written_prints_the_resume_hint
     tmp_path, monkeypatch, where
 ):
     from cortex_training import _artifact_download
-    from cortex_training import client as client_module
+    from cortex_training.client import core as client_module
 
     client = client_module.CortexTrainingClient(
         base_url="http://test.local", database="DB", schema="SCH"
@@ -3457,10 +3457,10 @@ def test_build_client_uses_named_snowflake_connection(tmp_path, monkeypatch):
     args = cli.parse_args(["--connection", "training-profile", "list"])
     client_cls = MagicMock()
     connected = object()
-    client_cls.from_connection_name.return_value = connected
+    client_cls._from_profile.return_value = connected
 
     assert cli.build_client(args, client_cls) is connected
-    client_cls.from_connection_name.assert_called_once_with(
+    client_cls._from_profile.assert_called_once_with(
         connection_name="training-profile",
         database=None,
         schema=None,
@@ -3482,7 +3482,7 @@ def test_build_client_forwards_read_bounds_only_when_set(tmp_path, monkeypatch):
     client_cls = MagicMock()
 
     cli.build_client(args, client_cls)
-    kwargs = client_cls.from_connection_name.call_args.kwargs
+    kwargs = client_cls._from_profile.call_args.kwargs
     assert (kwargs["max_retries"], kwargs["request_timeout"]) == (2, (10.0, 45.0))
 
 

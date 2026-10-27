@@ -1,0 +1,21 @@
+id: conversational-sft
+title: Conversational supervised fine-tuning
+status: runnable
+task: sft
+methods:
+  - lora
+  - full-parameter
+planned_methods:
+  - qlora
+datasets:
+  - who_trained_you
+  - identity
+  - openai/gsm8k
+  - HuggingFaceH4/no_robots
+  - HuggingFaceH4/ultrachat_200k
+precision:
+  - bfloat16
+provenance:
+  project: tinker-cookbook
+  recipe: recipes/sl_loop.py
+last_validated: null

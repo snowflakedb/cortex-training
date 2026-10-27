@@ -52,7 +52,7 @@ between its sub-jobs.
 
 The CLI and `CortexTrainingClient` operate on the same jobs; they are not
 alternative execution models. Use the CLI for setup, inspection, and individual
-operations. Use a Python loop or a [recipe](../../recipes/README.md) for dataset
+operations. Use a Python loop or an [example](../../examples/README.md) for dataset
 iteration, batching, rewards, evaluation, and repeated calls. The client loop
 creates a job or uses an existing job ID, submits operations, and polls their
 results. `submit --wait` waits for workers to be running; it does not upload or
@@ -78,7 +78,7 @@ require the global `--job JOB_ID` option. Their `--help` usage lines show its
 placement. Management commands such as `get` and `checkpoints` instead take a
 positional `JOB_ID` after the subcommand.
 
-### [Connection](#connection-config)
+### [Connection](#legacy-connection-config)
 
 ```bash
 cortex-training --connection training list    # Use a Snowflake profile
@@ -189,7 +189,7 @@ cortex-training fwd-bwd --help
 
 ## Detailed Reference
 
-- [Connection config](#connection-config), [login](#login), and [environment variables](#environment-variables)
+- [Connection config](#legacy-connection-config), [login](#legacy-login), and [environment variables](#environment-variables)
 - [Submit](#submit-a-job), [manage jobs](#manage-existing-jobs), and [GPU capacity](#show-current-gpu-capacity)
 - [Forward-backward and optimizer steps](#run-a-forward-backward-smoke-test)
 - [Load checkpoints](#load-a-checkpoint-into-a-running-job) and [initialize sampling](#start-sampling-from-a-training-checkpoint)
@@ -458,7 +458,7 @@ cortex-training submit examples/api/sampling.json
 ```
 
 That file creates a training sub-job for `Qwen/Qwen3.6-35B-A3B` with
-`training_config.model_provider` set to `prime_rl`.
+`training_config.model_provider` set to `arctic`.
 
 ### Run A Forward-Backward Smoke Test
 
@@ -600,7 +600,7 @@ jobs, not sampling jobs. Resumable checkpoints are not directly loadable by the
 sampling runtime.
 
 See [Serve a Training Checkpoint](../guides/inference/serve-checkpoint.md)
-for the recipe workflow, or
+for the example workflow, or
 [Start sampling from saved weights](rest-api.md#134-start-sampling-from-saved-weights)
 for the Python save-and-create example.
 

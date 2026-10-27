@@ -51,7 +51,8 @@ below that, per `/fwd-bwd` call (`avg_loss`, …); `a` also shows the bookkeepin
 numbers it hides, such as `rank` and `global_steps`. Run `cortex-training tui` without a job id
 to browse and search your jobs first. See [Job TUI](../../reference/cli.md#job-tui).
 
-Recipe-level metrics are also written under each recipe's `log_path`.
+Example-level metrics are also written under each example's `log_path`; see
+[Experiment tracking](wandb.md) to mirror them elsewhere.
 
 Snowflake profile and PAT clients also emit best-effort client-side operation
 metrics over Snowflake's OTLP endpoint. Failures of essential SDK methods, the

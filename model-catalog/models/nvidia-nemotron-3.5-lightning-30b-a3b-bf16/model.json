@@ -1,0 +1,20 @@
+{
+  "$schema": "../../schema.json",
+  "model_id": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+  "license": {
+    "name": "OpenMDW-1.1",
+    "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16/blob/main/LICENSE"
+  },
+  "architecture": "moe",
+  "moe": {
+    "num_moe_layers": 23,
+    "topk": 6,
+    "num_experts": 128
+  },
+  "last_validated": {
+    "long/h200-inference-full": null,
+    "long/h200-training-full": "2026-10-14",
+    "standard/h200-inference-full": null,
+    "standard/h200-training-full": null
+  }
+}

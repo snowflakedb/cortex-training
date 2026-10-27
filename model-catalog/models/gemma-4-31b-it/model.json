@@ -1,0 +1,15 @@
+{
+  "$schema": "../../schema.json",
+  "model_id": "google/gemma-4-31B-it",
+  "license": {
+    "name": "Gemma",
+    "url": "https://ai.google.dev/gemma/terms"
+  },
+  "architecture": "dense",
+  "last_validated": {
+    "long/h200-inference-full": "2026-10-15",
+    "long/h200-training-full": "2026-10-15",
+    "standard/h200-inference-full": null,
+    "standard/h200-training-full": null
+  }
+}

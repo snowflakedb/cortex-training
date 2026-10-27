@@ -22,10 +22,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from cortex_training.snowflake_auth import SnowflakeProfileAuth
-from cortex_training.snowflake_auth import SnowflakeProfileError
-from cortex_training.snowflake_auth import SnowflakeTelemetryTokenProvider
-from cortex_training.snowflake_auth import rest_host
+from cortex_training.client.auth import SnowflakeProfileAuth
+from cortex_training.client.auth import SnowflakeProfileError
+from cortex_training.client.auth import SnowflakeTelemetryTokenProvider
+from cortex_training.client.auth import rest_host
 
 
 class FakeCursor:
