@@ -960,7 +960,10 @@ Press `a`, or click `a All schemas` in the footer, to list the jobs in every
 database and schema the role can see instead, from the same list unscoped;
 the footer then offers `a Current schema`, which goes back. The
 header line starts with when the list was last refreshed (`refreshing…` while
-a refresh reads), then which list is shown. Until the list `a` asked for
+a refresh reads), then which list is shown. The words naming the list stand out
+as a chip, bold and filled: `Current schema: DB.SCHEMA` in white, `all schemas`
+in blue. Where the header doesn't otherwise name the list (the all-schemas list
+cut short, below), its chip comes first. Until the list `a` asked for
 answers, the header reads `loading all schemas…` (or `loading the current
 schema, DB.SCHEMA…`) and the previous list stays on screen. Either list shows
 its first page (the newest 100 jobs) as soon as it answers, and adds each later
@@ -1097,8 +1100,23 @@ counts time spent waiting to be placed; in its status's color), or how long a
 finished one ran until its last state change (`40s`, `12m`, `3h 05m`,
 `2d 4h`). The times are as of the last refresh, which redraws them. On a narrow
 screen the Job ID column narrows (its id ends in `…`) and stays in view while
-the other columns scroll. `shared` marks multiplexed GPU use and `log_prob`
+the other columns scroll. The Schema column, shown when the list spans more than
+one location, is as wide as its longest `DB.SCHEMA` where the screen has room,
+and up to 32 cells where it doesn't; a name it cuts loses the end of its
+database name first (`TEAM_D….EXPERIMENTS`), so the schema stays whole, and a
+copy has the name whole. `shared` marks multiplexed GPU use and `log_prob`
 requests zero GPUs.
+
+A bar (`┃`) after each column's name marks the column's right edge. Drag a bar
+sideways to make its column wider or narrower; the bar follows the pointer. A
+press on a blank cell either side of a bar takes the bar too, and the bar under
+the pointer brightens, so it is easy to catch; held, it is drawn in blue. A
+column is at least 3 cells wide. The widths stay
+through refreshes, `a`, searches and terminal resizes until the TUI exits; a
+double-click on a bar gives its column back the width the list picks. A drag on
+the names themselves highlights them as text, and a copy leaves the bars out.
+Where the terminal draws pointer shapes, the pointer on a bar is a sideways
+arrow.
 
 A sub-job row is fainter than its job's and shows what it doesn't share with
 it: its label (`training #0`), its status as the glyph alone while it is its
@@ -1175,6 +1193,7 @@ operators shows under it only while it has focus.
 | `Home` / `End` | First / last job |
 | `→` / `←` | Unfold the highlighted job's sub-jobs / fold them; on a sub-job row, `←` folds its job and moves to it. The job's row stays where it is on screen, and the list scrolls only as far as an unfolded job's sub-jobs need to show. Where there is nothing to unfold or fold, they scroll the columns sideways |
 | click `▸` / `▾` | Unfold or fold that job, as `→` / `←` do |
+| drag a `┃` bar | Make the column before it wider or narrower (the bars sit between the column names, and after the last; a blank cell beside a bar takes it too); a double-click on a bar gives its column back its own width |
 | `e` | Expand or collapse every job's sub-jobs, also those of jobs that later pages of the list being read bring (jobs a later refresh adds start as usual) |
 | `a` | All schemas / current schema: switch to the account-level list of every database and schema the role can see (the footer's `a All schemas`), or back to the configured one (`a Current schema`) |
 | `f` | All jobs / newest 2,000: when the configured schema's list came whole (the account-level list is unavailable) and holds more than 2,000 jobs, the list shows the newest 2,000 and every active job, as the account-level list does, and search covers those (one that matches none of them says `f searches all N jobs of the schema.`); `f` shows every job of it (drawing tens of thousands takes a few seconds), and again the newest 2,000. Refreshes keep the choice until another list is shown |
@@ -1594,7 +1613,8 @@ sub-job's saved console, else the lines its tail cached, else the execution log
 the pane shows; with nothing to save it says so and writes no file.
 
 Copying works everywhere: drag to highlight, then press `ctrl+c` (or Cmd-C
-where the terminal passes it through). Drags stay in their log, list, pane, or
+where the terminal passes it through). A drag on a `┃` bar between the job
+list's column names resizes a column instead (see above). Drags stay in their log, list, pane, or
 table region and scroll it at an edge; table selection follows characters
 across rows and hidden horizontal columns. Small row movements remain clicks,
 while a drag never activates the row. Changing the shown tab, source, unit,
