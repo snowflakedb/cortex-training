@@ -35,6 +35,10 @@ cortex-training = "cortex_training.cli:main"
 ct = "cortex_training.cli:main"
 
 [project.optional-dependencies]
+# cortex_training.client_v2 runs on the Arctic Platform client, which needs Python >= 3.12.
+client-v2 = [
+    "arctic_platform[cortex] @ git+https://github.com/Snowflake-AI-Research/Arctic-Platform.git@v0.1.5rc25",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
