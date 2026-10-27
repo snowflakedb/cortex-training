@@ -37,6 +37,7 @@ from cortex_training.client.core import ChunkGroupRestartError
 from cortex_training.client.core import CortexTrainingClient
 from cortex_training.client.core import DatabaseAccessError
 from cortex_training.client.core import DownloadCancelled
+from cortex_training.client.core import GenerateHandle
 from cortex_training.client.core import Hardware
 from cortex_training.client.core import InferenceConfig
 from cortex_training.client.core import JobType
@@ -64,6 +65,7 @@ __all__ = [
     "CortexTrainingClient",
     "DatabaseAccessError",
     "DownloadCancelled",
+    "GenerateHandle",
     "Hardware",
     "InferenceConfig",
     "InvalidPageToken",

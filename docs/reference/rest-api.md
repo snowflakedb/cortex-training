@@ -193,6 +193,12 @@ GET /{job_id}/requests/{request_id}
 `CortexTrainingClient.poll_request(job_id, request_id)` handles status normalization,
 backoff, DSSST1 result decoding, and cursor-addressed result chunks.
 
+A generate can also ask the server to hold the call until its result is ready,
+so a short generation needs no poll. Only a server with waiting enabled holds
+the call; any other answers right away with the plain handle, and the call
+keeps the narrower retries of a waiting generate all the same. See
+[Waiting for the result](#waiting-for-the-result-wait_seconds).
+
 ### 3.2 Job states
 
 Customer-facing job states are:
@@ -231,7 +237,7 @@ as `JOB_STATE_RUNNING`. `wait_for_job()` lowercases and removes the
 | `failed` | Failure |
 | `cancelled`, `canceled` | Cancelled |
 
-Raw enum names such as `REQUEST_STATE_DONE` can also appear.
+The REST API sends raw enum names such as `REQUEST_STATE_DONE`.
 `poll_request()` normalizes them internally.
 
 ### 3.4 Poll timing
@@ -282,6 +288,19 @@ The default is ten retries after the first attempt, with exponential jitter.
 
 Create-job uses the narrower connection-establishment retry predicate so an
 ambiguous response does not accidentally create a second server-assigned job.
+
+A generate sent with `wait_seconds` above `0` is retried only on failures that
+come before any generation starts: a connection that could not be opened
+(refused, or the connect timed out, the same test create-job uses), or HTTP
+429, 404, 409, 307 or 308. A TLS handshake failure is not retried. The
+job-not-found 404 exception above still applies, and a chunk-group 409
+([section 9.3](#93-request-chunking)) is not retried. A 5xx, a read timeout, or
+a reset after the request was sent is raised instead, because the server may already be
+generating and a resend would run the generation twice. That includes 503 and
+504: a gateway can return them after the backend already accepted the call. A
+generate whose `wait_seconds` is `None` or `0` sends no wait and keeps the
+retries above. See
+[Waiting for the result](#waiting-for-the-result-wait_seconds).
 
 ### 3.6 Errors
 
@@ -1197,6 +1216,73 @@ The backend can add fields such as log probabilities or action masks. For a
 request submitted by the same `CortexTrainingClient` instance, `poll_request()`
 converts tensor values under `results` back to Python lists.
 
+#### Waiting for the result (`wait_seconds`)
+
+On server versions that support it, the generate call can wait for the result
+instead of returning at once. The wait happens only where the server has it
+enabled; otherwise the reply is the plain handle, sent at once, and the
+client still applies the waiting retry rule to the call.
+
+```text
+POST /{job_id}/generate?wait_seconds=40
+```
+
+- `wait_seconds` is a whole number of seconds, 0 or more. The server holds the
+  call for at most 40 seconds, and may not wait at all. HTTP 400 comes back only
+  when the value is empty or has a character other than `0`-`9` (such as a sign
+  or a decimal point); a value of digits alone is accepted, however large, and
+  cut down to 40 seconds. The Python client raises `ValueError` for a negative
+  or non-integer value before sending. On a request-chunked generate, only the
+  final chunk's POST carries it.
+- When the call did not wait (`wait_seconds` omitted or `0`, waiting not
+  available, or a server that ignores the parameter), the reply is the plain
+  handle `{"request_id", "job_id"}`. A server that waited but then could not
+  read the request's status also replies with the plain handle; the caller
+  polls `request_id` as usual.
+- When the call waited, the reply is the body that
+  `GET /{job_id}/requests/{request_id}` returns
+  ([section 6.8](#68-poll-request---get-job_idrequestsrequest_id)), plus
+  `job_id`. As on a poll, `status` is the raw enum name. The generation has
+  finished only if it is terminal: `REQUEST_STATE_DONE`,
+  `REQUEST_STATE_FAILED` or `REQUEST_STATE_CANCELLED`. If the wait ran out
+  first, it is `REQUEST_STATE_PENDING` or `REQUEST_STATE_RUNNING`, there is no
+  result yet, and the caller polls `request_id` as usual.
+- A chunked result arrives as it does on a poll: the reply carries the first
+  `result_chunk` events and a `next_cursor`, and the rest are read with
+  `GET /{job_id}/requests/{request_id}?cursor=...`.
+
+Python call:
+
+```python
+handle = client.generate(job_id, prompts=["Hello"], wait_seconds=40)
+result = handle.result
+if result is None:
+    result = client.poll_request(job_id, handle.request_id)
+```
+
+When `wait_seconds` is not `None` (`0` included), `generate()` returns a
+`GenerateHandle`; with the default `None` it returns the bare `request_id`
+string. Its `result` is the same value `poll_request()` would return, and
+is set only when the reply says the generation succeeded and carries the whole
+result (no `next_cursor`). Otherwise it is `None`: the generation was still
+running, the server did not wait, the result was chunked, or the reply could
+not be decoded, and the caller polls `request_id` as usual. For a chunked
+result the chunks that came with the reply are not kept: `poll_request()`
+reads the whole result again, from the first chunk. A generation that
+failed or was cancelled within the wait makes `generate()` raise the same error
+`poll_request()` raises. `wait_seconds=0` sends no wait and returns a handle
+with no result. The client keeps no copy of the reply: the handle the caller
+holds is the only one. The server keeps a delivered result for about 60
+seconds after it last sent it, so a poll made right away (after a `None`
+result) still gets it, but a GET much later may not. When `result` is set,
+use it instead of polling again: as with a second poll of any generate, a
+re-poll returns the values under `results` as tensors, not lists.
+
+For a waiting call, the read timeout is the client's read timeout plus
+`wait_seconds`, so the usual read timeout starts when the wait ends. The
+call is retried only on failures that come before the generation starts; see
+[section 3.5](#35-retries).
+
 #### Per-token log probabilities
 
 On server versions that pass vLLM's `logprobs` and `prompt_logprobs` sampling
@@ -1289,7 +1375,7 @@ Example:
 ```json
 {
   "request_id": "request-id",
-  "status": "done",
+  "status": "REQUEST_STATE_DONE",
   "created_at": "2026-07-20T18:00:00Z",
   "updated_at": "2026-07-20T18:00:01Z",
   "result": {},

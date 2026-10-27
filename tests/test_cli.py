@@ -29,6 +29,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import cortex_training.cli.commands as cli
+from cortex_training import GenerateHandle
 
 
 class FakeClient:
@@ -55,6 +56,8 @@ class FakeClient:
         self.generate_sampling_params = None
         self.generate_routing_key = None
         self.generate_strict = None
+        self.generate_wait_seconds = None
+        self.generate_waited_result = None
         self.weight_sync_job_id = None
         self.weight_sync_source_sub_job_id = None
         self.weight_sync_target_sub_job_ids = None
@@ -173,13 +176,17 @@ class FakeClient:
         sampling_params=None,
         routing_key=None,
         strict=None,
+        wait_seconds=None,
     ):
         self.generated_job_id = job_id
         self.generate_prompts = prompts
         self.generate_sampling_params = sampling_params
         self.generate_routing_key = routing_key
         self.generate_strict = strict
-        return "req-generate-1"
+        self.generate_wait_seconds = wait_seconds
+        if wait_seconds is None:
+            return "req-generate-1"
+        return GenerateHandle("req-generate-1", self.generate_waited_result)
 
     def weight_sync(
         self,
@@ -1968,6 +1975,8 @@ def test_generate_reads_json_and_polls(tmp_path):
     }
     assert client.generate_routing_key == "sample-route"
     assert client.generate_strict is False
+    # Waiting is opt-in, so a default generate keeps all of its retries.
+    assert client.generate_wait_seconds is None
     assert client.polled_request == ("job-1", "req-generate-1")
     assert json.loads(stdout.getvalue()) == {
         "job_id": "job-1",
@@ -2031,11 +2040,112 @@ def test_generate_can_skip_poll(tmp_path):
 
     assert rc == 0
     assert instances[0].polled_request is None
+    assert instances[0].generate_wait_seconds is None
     assert json.loads(stdout.getvalue()) == {
         "job_id": "job-1",
         "prompt_count": 1,
         "request_id": "req-generate-1",
     }
+
+
+@pytest.mark.parametrize("wait_seconds", [0, 5])
+def test_generate_passes_wait_seconds_through(tmp_path, wait_seconds):
+    instances = []
+    path = tmp_path / "generate.json"
+    path.write_text(
+        json.dumps({"wait_seconds": wait_seconds, "payload": {"prompts": ["hello"]}}),
+        encoding="utf-8",
+    )
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory(instances),
+        stdout=io.StringIO(),
+    )
+
+    assert rc == 0
+    assert instances[0].generate_wait_seconds == wait_seconds
+    # The handle has no result, so the CLI polls as without a wait.
+    assert instances[0].polled_request == ("job-1", "req-generate-1")
+
+
+def test_generate_prints_a_waited_result_without_polling(tmp_path):
+    instances = []
+    stdout = io.StringIO()
+    path = tmp_path / "generate.json"
+    path.write_text(
+        json.dumps({"wait_seconds": 40, "payload": {"prompts": ["hello"]}}),
+        encoding="utf-8",
+    )
+
+    def factory(_args):
+        client = FakeClient()
+        client.generate_waited_result = {"responses": [{"text": "hi"}]}
+        instances.append(client)
+        return client
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=factory,
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert instances[0].polled_request is None
+    assert json.loads(stdout.getvalue()) == {
+        "job_id": "job-1",
+        "prompt_count": 1,
+        "request_id": "req-generate-1",
+        "result": {"responses": [{"text": "hi"}]},
+    }
+
+
+@pytest.mark.parametrize("wait_seconds", [0, None])
+def test_generate_accepts_no_wait_without_poll(tmp_path, wait_seconds):
+    instances = []
+    stdout = io.StringIO()
+    path = tmp_path / "generate.json"
+    path.write_text(
+        json.dumps({"poll": False, "wait_seconds": wait_seconds, "payload": {"prompts": ["hello"]}}),
+        encoding="utf-8",
+    )
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory(instances),
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert instances[0].polled_request is None
+    assert json.loads(stdout.getvalue()) == {
+        "job_id": "job-1",
+        "prompt_count": 1,
+        "request_id": "req-generate-1",
+    }
+
+
+@pytest.mark.parametrize("wait_seconds", [5, -1, True, False, 0.0, "0"])
+def test_generate_rejects_wait_seconds_without_poll(tmp_path, wait_seconds):
+    instances = []
+    path = tmp_path / "generate.json"
+    path.write_text(
+        json.dumps({"poll": False, "wait_seconds": wait_seconds, "payload": {"prompts": ["hello"]}}),
+        encoding="utf-8",
+    )
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory(instances),
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert rc != 0
+    assert "only helps when the CLI polls" in stderr.getvalue()
+    assert f"got {wait_seconds!r}" in stderr.getvalue()
+    assert not instances or instances[0].generated_job_id is None
 
 
 def test_generate_counts_flat_token_list_as_one_prompt(tmp_path):

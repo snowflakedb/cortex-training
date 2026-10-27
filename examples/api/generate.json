@@ -9,5 +9,6 @@
     "temperature": 0.2,
     "top_p": 0.9
   },
-  "strict": false
+  "strict": false,
+  "wait_seconds": 0
 }

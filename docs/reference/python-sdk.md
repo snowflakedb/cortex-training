@@ -145,6 +145,11 @@ When the client looked the job up to explain a `tail_logs` failure, the event
 also has the `job_status` it read, such as `placing` for a job whose logs are
 not there yet; a call that succeeded on a retry has none.
 
+A `generate` with a positive `wait_seconds` stays open while the server
+waits, so its `duration_ms` includes that wait (up to 40 seconds). If the
+generation fails or is cancelled during the wait, `generate` raises and the
+failure is reported on the `generate` event, not on a `poll_request` one.
+
 Download events add these body fields:
 
 | Field | Meaning |
@@ -262,7 +267,7 @@ supported`. The short alias `log_prob` is rejected the same way.
 |---|---|---|
 | `forward_backward(job_id, data)` | `request_id` | `data` is a DSSST1 frame; always chunk-wrapped |
 | `step(job_id, learning_rate=None)` | `request_id` | Omitting the rate uses the job's optimizer setting |
-| `generate(job_id, prompts, sampling_params=None, routing_key=None, strict=None)` | `request_id` | Pre-tokenized prompts are length-checked client-side |
+| `generate(job_id, prompts, sampling_params=None, routing_key=None, strict=None, wait_seconds=None)` | `request_id` when `wait_seconds` is `None`, otherwise `GenerateHandle` | Pre-tokenized prompts are length-checked client-side. `wait_seconds` asks the server to hold the call until the result is ready (capped at 40 seconds); the handle's `result` is then what `poll_request` would return, or `None` when the caller must poll `request_id`; see [REST API section 6.6](rest-api.md#waiting-for-the-result-wait_seconds) |
 | `generate_stream(...)` | response dict | Same DSSST1 body encoding as `generate`, sent in one POST; read progress with `get_request_status` |
 | `weight_sync(job_id, source_sub_job_id, target_sub_job_ids, weight_format=None)` | `request_id` | `weight_format="lora"` syncs adapters only |
 | `forward(job_id, payload, ...)` | response dict | Byte frames that exceed the `/operation` JSON ceiling are request-chunked; see [rest-api.md section 7.1](rest-api.md#71-forward) |
