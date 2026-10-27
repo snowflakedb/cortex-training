@@ -24,12 +24,14 @@ from cortex_training.client.core import JobType
 from cortex_training.client.core import SubJobConfig
 from cortex_training.client.core import TrainingConfig
 from cortex_training.client_v2.core import CortexTrainingClient
+from cortex_training.model_deployment import ModelDeploymentSpec
 
 __all__ = [
     "CortexTrainingClient",
     "Hardware",
     "InferenceConfig",
     "JobType",
+    "ModelDeploymentSpec",
     "SubJobConfig",
     "TrainingConfig",
 ]

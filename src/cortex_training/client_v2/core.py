@@ -33,15 +33,20 @@ Not carried over from v1, because Arctic Platform has no equivalent:
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import logging
 import threading
 import time
 import warnings
 from collections.abc import Callable
+from collections.abc import Iterable
 from collections.abc import Iterator
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 
+import aiohttp
 from arctic_platform import wire
 from arctic_platform.client.base import _next_log_wait
 from arctic_platform.client.config import CortexConfig
@@ -72,20 +77,48 @@ from arctic_platform.client.transports.cortex import CortexTransport
 from arctic_platform.client.transports.cortex import _SendPolicy
 from arctic_platform.client.transports.cortex import _decode_result
 from arctic_platform.client.transports.cortex import _identity
+from arctic_platform.client.transports.cortex import _is_job_not_found
 from arctic_platform.client.transports.cortex import _parent_id
 from arctic_platform.client.transports.cortex import _route
 from arctic_platform.client.transports.cortex import _to_python
 from arctic_platform.client.transports.cortex import job_create_payload
 
 from cortex_training.client.auth import rest_host
+from cortex_training.client.core import _SNOWFLAKE_REQUEST_ID_HEADER
 from cortex_training.client.core import Hardware
 from cortex_training.client.core import SubJobConfig
+from cortex_training.model_deployment import DEPLOYMENT_STATUS_DROPPED
+from cortex_training.model_deployment import DEPLOYMENT_STATUS_DROPPING
+from cortex_training.model_deployment import DEPLOYMENT_STATUS_FAILED
+from cortex_training.model_deployment import DEPLOYMENT_STATUS_TERMINATED
+from cortex_training.model_deployment import JOB_FIELD_JOB_ID
+from cortex_training.model_deployment import OUT_DEPLOYMENT
+from cortex_training.model_deployment import OUT_DROPPED
+from cortex_training.model_deployment import OUT_STATUS
+from cortex_training.model_deployment import SOURCE_TYPE_CHECKPOINT
+from cortex_training.model_deployment import ModelDeploymentSpec
+from cortex_training.model_deployment import _deployment_id_from_job_id
+from cortex_training.model_deployment import _job_id_from_deployment_id
+from cortex_training.model_deployment import _model_deployment_description
+from cortex_training.model_deployment import _model_deployment_metadata
+from cortex_training.model_deployment import _model_deployment_ready
+from cortex_training.model_deployment import _model_deployment_request_error
+from cortex_training.model_deployment import _model_deployment_status
+from cortex_training.model_deployment import _model_deployment_status_filter
+from cortex_training.model_deployment import _model_deployment_sub_job
+from cortex_training.model_deployment import _model_deployment_wait_timeout
+from cortex_training.model_deployment import _pending_model_deployment_metadata
+from cortex_training.model_deployment import _trained_model_name
 
 logger = logging.getLogger(__name__)
 
 # CortexConfig takes one total timeout per request, so v1's (connect, read)
 # default becomes its read bound.
 _DEFAULT_REQUEST_TIMEOUT = 600.0
+# CortexTransport's fixed job-wait backoff; deployment waits use it too.
+_POLL_BACKOFF_MULTIPLIER = 1.25
+_POLL_MAX_INTERVAL = 6.0
+_REQUEST_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError)
 
 
 def _unsupported(feature: str) -> Callable[..., Any]:
@@ -98,6 +131,41 @@ def _unsupported(feature: str) -> Callable[..., Any]:
 def _unsupported_unless(condition: bool, feature: str) -> None:
     if not condition:
         raise NotImplementedError(f"{feature}: not supported by the Arctic Platform client")
+
+
+def _deployment_request_error(exc: Exception, deployment_id: str | None, **kwargs: Any) -> RuntimeError:
+    """:func:`_model_deployment_request_error` for a failed ``CortexTransport`` call."""
+    # Only HTTP errors carry a response; error_code and error_message come from the
+    # body, when CortexTransport could read one.
+    headers = getattr(exc, "headers", None) or {}
+    return _model_deployment_request_error(
+        deployment_id,
+        status_code=getattr(exc, "status", None),
+        code=getattr(exc, "error_code", None),
+        detail=getattr(exc, "error_message", None),
+        request_id=headers.get(_SNOWFLAKE_REQUEST_ID_HEADER),
+        **kwargs,
+    )
+
+
+def _deployment_operation(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Run a method whose first argument is a public ``sf-ct-`` deployment ID.
+
+    The ID is validated before any request, and any HTTP error is turned into
+    :func:`_model_deployment_request_error`.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self: Any, deployment_id: str, *args: Any, **kwargs: Any) -> Any:
+        job_id = _job_id_from_deployment_id(deployment_id)
+        try:
+            return method(self, deployment_id, *args, **kwargs)
+        except _REQUEST_ERRORS as exc:
+            raise _deployment_request_error(
+                exc, deployment_id, job_id=job_id, scope=f"{self.database}.{self.schema}"
+            ) from exc
+
+    return wrapper
 
 
 class CortexTrainingClient:
@@ -126,7 +194,8 @@ class CortexTrainingClient:
         # Needs: CortexConfig fields for the poll backoff and its cap (CortexTransport
         # hard-codes 1.25x up to 6s) and for the connection pool size.
         _unsupported_unless(
-            (poll_backoff_multiplier, poll_max_interval, pool_maxsize) == (1.25, 6.0, 1024),
+            (poll_backoff_multiplier, poll_max_interval, pool_maxsize)
+            == (_POLL_BACKOFF_MULTIPLIER, _POLL_MAX_INTERVAL, 1024),
             "poll_backoff_multiplier, poll_max_interval and pool_maxsize",
         )
         # Needs: a (connect, read) timeout pair on CortexConfig.request_timeout.
@@ -600,6 +669,108 @@ class CortexTrainingClient:
     def delete_checkpoint(self, job_id: str, checkpoint_id: str) -> None:
         self._call(delete_checkpoint_request(job_id, checkpoint_id))
 
+    # ─── Model deployments ───────────────────────────────────────────────
+
+    @property
+    def model_deployment_base_url(self) -> str:
+        """OpenAI-compatible base URL for deployments in this database and schema."""
+        return f"{self._transport()._prefix}/inference/v1"
+
+    def create_model_deployment(self, spec: ModelDeploymentSpec | Mapping[str, Any]) -> dict[str, Any]:
+        """Create an evaluation deployment and return only its public metadata.
+
+        See ``docs/reference/rest-api.md`` section 14.
+        """
+        raw_spec = spec.to_public_spec() if isinstance(spec, ModelDeploymentSpec) else spec
+        spec = ModelDeploymentSpec.from_dict(dict(raw_spec) if isinstance(raw_spec, Mapping) else raw_spec)
+        try:
+            if spec.source_type == SOURCE_TYPE_CHECKPOINT:
+                source_job = self.get_job(spec.source_job_id)
+                spec = replace(spec, model_name=_trained_model_name(source_job, spec.source_job_id))
+            response = self.create_job_from_body(spec._to_create_job_body())
+        except _REQUEST_ERRORS as exc:
+            raise _deployment_request_error(exc, None) from exc
+        deployment_id = _deployment_id_from_job_id(response.get(JOB_FIELD_JOB_ID))
+        return _pending_model_deployment_metadata(spec, deployment_id, self.model_deployment_base_url)
+
+    def _model_deployment_job(self, job_id: str) -> dict[str, Any]:
+        """Fetch one job and raise ``ValueError`` if it is not a model deployment."""
+        job = self.get_job(job_id)
+        if _model_deployment_sub_job(job) is None:
+            raise ValueError("the requested resource is not a model deployment")
+        return job
+
+    def list_model_deployments(self, status: str | Iterable[str] | None = None) -> list[dict[str, Any]]:
+        """Return sanitized metadata for every marked deployment in scope.
+
+        ``status`` keeps only deployments in the given deployment status(es),
+        e.g. ``"READY"`` or ``["PENDING", "INITIALIZING"]`` (case-insensitive).
+        """
+        wanted = _model_deployment_status_filter(status)
+        deployments = [
+            _model_deployment_metadata(job, _deployment_id_from_job_id(job.get(JOB_FIELD_JOB_ID)))
+            for job in self.list_jobs()
+            if _model_deployment_sub_job(job) is not None
+        ]
+        return [d for d in deployments if wanted is None or d[OUT_STATUS] in wanted]
+
+    @_deployment_operation
+    def get_model_deployment(self, deployment_id: str) -> dict[str, Any]:
+        """Return sanitized metadata for one opaque deployment ID."""
+        job = self._model_deployment_job(_job_id_from_deployment_id(deployment_id))
+        return _model_deployment_metadata(job, deployment_id, base_url=self.model_deployment_base_url)
+
+    def describe_model_deployment(self, deployment_id: str) -> dict[str, Any]:
+        """Return one deployment's status, endpoint, scope, and configuration."""
+        return _model_deployment_description(
+            self.get_model_deployment(deployment_id), database=self.database, schema=self.schema
+        )
+
+    def wait_for_model_deployment(self, deployment_id: str) -> dict[str, Any]:
+        """Poll until an opaque deployment ID is READY or terminal.
+
+        Raises :class:`ModelDeploymentWaitError` for a terminal status other
+        than READY and :class:`ModelDeploymentWaitTimeout` when the poll timeout
+        passes; both carry the last observed metadata as ``deployment``.
+        """
+        # Not a _deployment_operation: ModelDeploymentWaitTimeout is a TimeoutError,
+        # which that would report as a failed request.
+        _job_id_from_deployment_id(deployment_id)
+        deadline = time.monotonic() + self.poll_timeout
+        delay = self.poll_interval
+        metadata: dict[str, Any] | None = None
+        while time.monotonic() < deadline:
+            metadata = self.get_model_deployment(deployment_id)
+            if _model_deployment_ready(metadata):
+                return metadata
+            time.sleep(max(0.0, min(delay, deadline - time.monotonic())))
+            delay = min(delay * _POLL_BACKOFF_MULTIPLIER, _POLL_MAX_INTERVAL)
+        raise _model_deployment_wait_timeout(deployment_id, self.poll_timeout, metadata)
+
+    @_deployment_operation
+    def drop_model_deployment(self, deployment_id: str) -> dict[str, Any]:
+        """Idempotently drop one opaque deployment ID.
+
+        A ``DROPPING`` or ``DROPPED`` deployment is reported as dropped without
+        a second cancel. A ``FAILED`` or ``TERMINATED`` one can never be dropped,
+        so it is returned as ``dropped: False`` with its ``status``. A missing
+        deployment is reported as dropped only when the lookup fails with the
+        job-not-found code; any other error propagates.
+        """
+        job_id = _job_id_from_deployment_id(deployment_id)
+        try:
+            job = self._model_deployment_job(job_id)
+        except aiohttp.ClientResponseError as exc:
+            if _is_job_not_found(exc):
+                return {OUT_DEPLOYMENT: deployment_id, OUT_DROPPED: True}
+            raise
+        status = _model_deployment_status(job)
+        if status in {DEPLOYMENT_STATUS_FAILED, DEPLOYMENT_STATUS_TERMINATED}:
+            return {OUT_DEPLOYMENT: deployment_id, OUT_DROPPED: False, OUT_STATUS: status}
+        if status not in {DEPLOYMENT_STATUS_DROPPING, DEPLOYMENT_STATUS_DROPPED}:
+            self.cancel_job(job_id)
+        return {OUT_DEPLOYMENT: deployment_id, OUT_DROPPED: True}
+
     # ─── Not supported by the Arctic Platform client ─────────────────────
 
     # Needs: a client-side breakdown normalizer and dimension check; the capacity
@@ -616,19 +787,10 @@ class CortexTrainingClient:
     iter_jobs = _unsupported("Account-level job listing")
     list_jobs_page = _unsupported("Account-level job listing")
     for_job = _unsupported("for_job")
-    # Needs: model deployment ops (create, list, get, wait, drop, logs, metrics) and the
-    # deployment metadata they return.
-    model_deployment_base_url = property(_unsupported("Model deployments"))
-    create_model_deployment = _unsupported("Model deployments")
-    list_model_deployments = _unsupported("Model deployments")
-    get_model_deployment = _unsupported("Model deployments")
-    describe_model_deployment = _unsupported("Model deployments")
-    wait_for_model_deployment = _unsupported("Model deployments")
-    drop_model_deployment = _unsupported("Model deployments")
-    download_model_deployment_logs = _unsupported("Model deployments")
-    download_model_deployment_metrics = _unsupported("Model deployments")
     # Needs: Snowflake connector sessions for experiment artifacts (LIST/GET of logs
     # and metrics), Snowpark sessions, and keeping sessions between downloads.
+    download_model_deployment_logs = _unsupported("Model deployment log downloads")
+    download_model_deployment_metrics = _unsupported("Model deployment metric downloads")
     keep_artifact_sessions = property(_unsupported("Experiment artifact downloads"))
     warm_artifact_session = _unsupported("Experiment artifact downloads")
     create_snowpark_session = _unsupported("Snowpark sessions")
