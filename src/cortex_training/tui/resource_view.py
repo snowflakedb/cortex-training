@@ -35,6 +35,7 @@ from textual.widgets import ListView
 from textual.widgets import Static
 from textual.worker import get_current_worker
 from cortex_training._download_lock import DownloadLock
+from cortex_training.client import NoChunksError
 from cortex_training.tui.cache_cleanup import telemetry_bytes
 from cortex_training.tui import views
 from cortex_training.tui.format import safe_text
@@ -140,22 +141,76 @@ class ResourceTab:
         index = names.index(self._resource_range) if self._resource_range in names else -1
         self.action_resource_range(names[(index + 1) % len(names)])
 
-    def _start_resource_refresh(self, *, force: bool) -> None:
+    def _start_resource_refresh(self, *, force: bool, whole: bool = False) -> None:
+        """UI thread. Download the telemetry: the whole job's when ``whole``, else the shown
+        sub-job's alone when it can be (see _resource_scope). Unless ``force``, only when the last
+        refresh did not succeed or the shown sub-job's copy is due (see _resource_due).
+        ``whole`` while a download of one sub-job alone runs is done once that one ends."""
+        source = self._resource_source()
+        if self._resource_loading and whole and self._resource_loading_scope is not None:
+            self._resource_whole_pending = True
         if (
             not self._screen_open
             or not self._sources_ready
-            or not self._resource_source()
+            or not source
             or self._sub_job_missing
             or self._resource_loading
-            or (self._resource_refresh_succeeded and not force)
+            or (self._resource_refresh_succeeded and not force and not self._resource_due(source))
         ):
             return
         self._resource_loading = True
+        self._resource_loading_scope = None if whole else self._resource_scope()
         if not self._resource_data.kinds:
             self.query_one("#resource-status", Static).update(f"loading {self._RESOURCE_WHAT[self._resource_kind]}…")
         elif self._resource_active():
             self._render_resource()  # "cached · refreshing…" while it runs
-        self._refresh_resource()
+        self._refresh_resource(self._resource_loading_scope)
+
+    def _resource_scope(self) -> str | None:
+        """UI thread. The sub-job a refresh downloads alone, or None for the whole job.
+
+        The shown sub-job of a live job, once a whole-job download found its chunks, when the
+        client can download one sub-job: its LIST then returns that sub-job's chunks rather
+        than the whole run's. The first download is of the whole job, as an ended job's are,
+        so the other sub-jobs are on disk for a switch, which refreshes one left behind.
+        """
+        source = self._resource_source()
+        if (
+            not source
+            or self._resource_full_at is None
+            or not self._live()
+            or source not in self._resource_with_chunks
+            or not _download_options(self._client.download_metrics, {"sub_job_ids": [source]})
+        ):
+            return None
+        return source
+
+    def _resource_polled_at(self, sub_job_id: str) -> float | None:
+        """When the newest successful download that covered ``sub_job_id`` started (monotonic), if any."""
+        times = [at for at in (self._resource_full_at, self._resource_alone_at.get(sub_job_id)) if at is not None]
+        return max(times) if times else None
+
+    def _resource_newest_success(self) -> float:
+        """When the newest successful download, of the whole job or of one sub-job alone, started
+        (monotonic); 0.0 before any."""
+        return max([self._resource_full_at or 0.0, *self._resource_alone_at.values()])
+
+    def _resource_behind(self, sub_job_id: str) -> bool:
+        """Whether ``sub_job_id``'s copy was left behind: never downloaded, or a download of another
+        sub-job alone has succeeded since the newest one that covered it. Without such downloads
+        (an ended job's, a client that downloads only whole jobs) no copy is."""
+        polled = self._resource_polled_at(sub_job_id)
+        if polled is None:
+            return True
+        return any(at > polled for at in self._resource_alone_at.values())
+
+    def _resource_due(self, sub_job_id: str) -> bool:
+        """Whether showing ``sub_job_id`` should refresh it: left behind and, while the job is
+        live, a refresh interval old (the next refresh downloads a newer one shown)."""
+        if not self._resource_behind(sub_job_id):
+            return False
+        polled = self._resource_polled_at(sub_job_id)
+        return polled is None or not self._live() or time.monotonic() - polled >= self._DATA_REFRESH_SECONDS
 
     def _after_telemetry_download(self, before: int) -> None:
         """Worker thread. A download that grew the job's telemetry from ``before`` bytes by
@@ -218,7 +273,9 @@ class ResourceTab:
             self._render_resource()
 
     @work(thread=True, group="resource")
-    def _refresh_resource(self) -> None:
+    def _refresh_resource(self, scope: str | None = None) -> None:
+        """Worker thread. Download the telemetry, of the ``scope`` sub-job alone when one is given
+        (see _resource_scope), and show it."""
         worker = get_current_worker()
         lock = DownloadLock(self._metrics_root)
         acquired = False
@@ -263,7 +320,7 @@ class ResourceTab:
                 accept(cached)
 
             def committed(_result: dict) -> None:
-                # Each sub-job is painted as it lands, the one on screen first.
+                # Each sub-job downloaded is painted as it lands, the one on screen first.
                 if worker.is_cancelled or not self._screen_open:
                     return
                 data = load()
@@ -308,28 +365,39 @@ class ResourceTab:
 
             source = self._resource_source()
             options: dict = {"on_chunk": progress}
+            if scope is not None:
+                options["sub_job_ids"] = [scope]
             if source and source not in shown_here and source not in self._resource_data.kinds:
                 options.update(preview_seconds=self._resource_preview_seconds(), on_preview=previewed)
             before = telemetry_bytes(self._metrics_root)
-            results = self._client.download_metrics(
-                self._job_id,
-                self._metrics_root,
-                resume=True,
-                priority=[source] if source else [],
-                on_commit=committed,
-                **_quiet_download(self._client.download_metrics),
-                **_download_options(self._client.download_metrics, options),
-            )
+            started = time.monotonic()
+            try:
+                results = self._client.download_metrics(
+                    self._job_id,
+                    self._metrics_root,
+                    resume=True,
+                    priority=[source] if source else [],
+                    on_commit=committed,
+                    **_quiet_download(self._client.download_metrics),
+                    **_download_options(self._client.download_metrics, options),
+                )
+            except NoChunksError:
+                if scope is None:
+                    raise
+                results = []  # none for it after all: the next refresh downloads the whole job
             self._after_telemetry_download(before)
             # Chunks the download gave up on: say so, with the command that retries them.
             self._post(self._accept_download_warnings, "metrics",
                        _result_warnings(results, kind="metrics", job_id=self._job_id,
-                                        output_dir=self._metrics_root))
+                                        output_dir=self._metrics_root),
+                       None if scope is None else [scope])
             if worker.is_cancelled or not self._screen_open:
                 return  # the screen closed during the download; the next one to open reads it
             fresh = load()  # reads only what the download appended
+            found = {entry.get("sub_job_id") for entry in (results if isinstance(results, list) else [])
+                     if isinstance(entry, dict) and entry.get("saved_path")}
             if not worker.is_cancelled:
-                self._post(self._finish_resource_refresh, fresh, None)
+                self._post(self._finish_resource_refresh, fresh, None, scope, started, found)
         except Exception as exc:  # noqa: BLE001 - surfaced in the Resource tab
             # The tab's header has room for the start of the error; the log keeps it whole.
             log_traceback(f"GPU metrics refresh for {self._job_id} failed")
@@ -391,15 +459,31 @@ class ResourceTab:
         self,
         data: ResourceData | None,
         error: str | None,
+        scope: str | None = None,
+        started: float | None = None,
+        found: set[str] | None = None,
     ) -> None:
+        """UI thread. A refresh ended: ``scope`` is the sub-job it downloaded alone (None: the
+        whole job), from ``started`` (monotonic), and ``found`` those it found chunks for."""
         if not self._screen_open:
             return
         self._resource_loading = False
+        self._resource_loading_scope = None
         self._resource_progress.clear()
         self._resource_refresh_succeeded = error is None
         if error is None:
-            self._resource_downloaded = True  # every sub-job's rows are in: one without a kind has none
+            # Every sub-job's rows are in, one without a kind has none: a download of one sub-job
+            # alone follows a whole-job one (see _resource_scope).
+            self._resource_downloaded = True
             self._resource_window_error = None  # the window on screen was built with the rest
+            if started is not None:
+                if scope is None:
+                    self._resource_full_at = started
+                    self._resource_with_chunks = set(found or ())
+                else:
+                    self._resource_alone_at[scope] = started
+                    if scope not in (found or ()):
+                        self._resource_with_chunks.discard(scope)
         elif self._resource_window_error is not None:
             # The refresh failed too: a window whose rebuild failed names the newer failure.
             self._resource_window_error = (self._resource_window_error[0], error)
@@ -410,11 +494,25 @@ class ResourceTab:
             if self._resource_active():
                 self._render_resource()
             self._rebuild_window_left_stale()
-            return
-        self._resource_error = error
-        self._resource_loaded = _has_telemetry(self._resource_data)
-        if self._resource_active():
-            self._render_resource()
+        else:
+            self._resource_error = error
+            self._resource_loaded = _has_telemetry(self._resource_data)
+            if self._resource_active():
+                self._render_resource()
+        if self._resource_whole_pending:
+            # r while a download of one sub-job alone ran: every sub-job, now.
+            self._resource_whole_pending = False
+            self._start_resource_refresh(force=True, whole=True)
+        elif error is None and scope is not None:
+            self._refresh_switched_resource(scope)
+
+    def _refresh_switched_resource(self, scope: str) -> None:
+        """UI thread. After a download of ``scope`` alone, refresh the sub-job shown now if another
+        was shown meanwhile and its copy is due: it would otherwise wait for the next refresh."""
+        source = self._resource_source()
+        if (source and source != scope and self._resource_active() and self._resource_waiting() is None
+                and self._resource_due(source)):
+            self._start_resource_refresh(force=True)
 
     def _resource_sub_job_ids(self) -> list[str]:
         """The sub-jobs < and > switch between, in the order the Logs tab lists them."""
@@ -439,8 +537,9 @@ class ResourceTab:
         self._resource_pick = ids[(index + step) % len(ids)]
         self.refresh_bindings()
         self._render_resource()
-        if self._resource_pick not in self._resource_data.kinds:
-            # Not downloaded yet (a cold cache downloads the shown sub-job first): fetch it now.
+        if self._resource_pick not in self._resource_data.kinds or self._resource_due(self._resource_pick):
+            # Not downloaded yet (a cold cache downloads the shown sub-job first), or due (a live
+            # job's refreshes download only the sub-job shown; see _resource_due): fetch it now.
             self._start_resource_refresh(force=True)
 
     def _follow_resource_source(self, source: str | None) -> None:
@@ -616,7 +715,7 @@ class ResourceTab:
                 return ("[$warning]older samples failed to load: $problem[/]",
                         "[$warning]older samples failed: $problem[/]")
             return (f"[$warning]{OLDER_NOT_LOADED}[/]",)
-        if self._resource_loading:
+        if self._resource_loading and self._resource_loading_scope in (None, source):
             if cached:
                 return self._with_progress(source, self._RESOURCE_REFRESHING)
             # A sub-job with nothing of its own after a whole download has none to load.
@@ -675,6 +774,12 @@ class ResourceTab:
             return False
         interval = resource.sample_interval_s or resource.reported_interval_s or 0
         age = (now - resource.latest_sample_ts).total_seconds()
+        # A copy left behind by downloads of another sub-job alone is judged as if they had kept it
+        # current, as a download of the whole job would have: as of the newest download that
+        # succeeded. While refreshes fail, it ages from there, as a copy refreshed every tick does.
+        polled = self._resource_polled_at(source)
+        if polled is not None:
+            age -= max(0.0, self._resource_newest_success() - polled)
         return age > max(self._RESOURCE_STALE_SECONDS, 6 * interval)
 
     def _resource_empty_text(self, allocation, ignored: int) -> str:

@@ -28,7 +28,7 @@ python -m examples.rl.math_grpo.train config=/path/to/config.json \
 
 # Qwen3.8-27B full-parameter
 python -m examples.rl.math_grpo.train config=/path/to/config.json \
-  model=Qwen/Qwen3.8-27B context=long lora=false \
+  model=Qwen/Qwen3.8-27B lora=false \
   max_tokens=2048 weight_sync_bucket_size=3221225472
 ```
 
@@ -42,6 +42,7 @@ python -m examples.rl.math_grpo.train config=/path/to/config.json \
 | `max_tokens=`, `temperature=` | 4096, 1.0 | Rollout sampling |
 | `max_steps=` | 10 | Training steps |
 | `eval_every=`, `n_test=` | 10, all | MATH-500 eval cadence (`0` skips it) and size |
+| `weight_sync_format=` | server default | `vllm` or `hf` for full-parameter weight sync. LoRA jobs always sync `lora` |
 | `weight_sync_bucket_size=` | server default | Weight-sync transfer bucket in bytes. Set it above the largest single tensor |
 | `job_config=` | none | Use this job file instead of the catalog and `overrides.json`; `lr=`, `train_batch_size=` and `max_seq_len=` still apply |
 | `wandb_project=`, `sf_tracking=` | off | [Experiment tracking](../../docs/guides/operations/wandb.md) |
@@ -54,6 +55,12 @@ For RL, the model's training and inference files are combined into one job, and
 [`rl/overrides.json`](overrides.json) adds the RL tuning that every model
 shares: optimizer betas `(0.9, 0.95)`, `mb_spec.max_tokens_per_mb` 10240, and
 ZeRO `reduce_scatter`. Edit that file to change these for every run.
+
+`job_config=` also takes either file of a catalog pair, such as a model's
+`<hw>-training-<lora|full>.json` under `model-catalog/models/`: a file with only
+a training or only a sampling sub-job takes the other sub-job from the file
+beside it whose name swaps `-training-` and `-inference-`. The pair is used as
+is, without `rl/overrides.json` or router replay.
 
 Each run that creates its job from the catalog (not with `job_config=` or
 `job_id=`) writes the job it built to

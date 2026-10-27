@@ -2564,7 +2564,7 @@ def test_download_interrupted_after_the_files_are_written_prints_the_resume_hint
     monkeypatch.setattr(client, "_experiment_run_uri", lambda _job: ("snow://run/", "RUN"))
     monkeypatch.setattr(client, "_open_experiment_artifact_connection", MagicMock)
     monkeypatch.setattr(
-        client, "_list_gzip_chunks", lambda *_args: ({sub: ["_metrics/c0.gz"]}, {})
+        client, "_list_gzip_chunks", lambda *_args, **_kwargs: ({sub: ["_metrics/c0.gz"]}, {})
     )
     # The stall check outlives the wait, as when the job lookup is slow.
     monkeypatch.setattr(client, "_STALL_CHECK_WAIT_SECONDS", 0.05)

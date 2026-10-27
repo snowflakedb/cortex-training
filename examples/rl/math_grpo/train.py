@@ -43,6 +43,9 @@ class Config:
     n_test: int | None = None
     eval_temperature: float | None = None
     eval_max_tokens: int | None = None
+    # Full-parameter weight sync format, vllm or hf; None uses the server default.
+    # LoRA jobs always sync lora.
+    weight_sync_format: str | None = None
     weight_sync_bucket_size: int | None = None
 
     log_path: str = "/tmp/cortex-training-examples/rl-loop"

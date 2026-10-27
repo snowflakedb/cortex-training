@@ -657,8 +657,11 @@ command with `--resume` to fetch only the remaining chunks. A run without
 
 Chunks are fetched concurrently; `--parallel N` sets how many at once (1 to
 128, default 16) and output is still written in chunk order. `--sub-job SUB_JOB_ID`
-(repeatable) limits the download to those sub-jobs; naming a sub-job with no
-stdout chunks is an error. Transient connection and service errors are retried
+(repeatable) limits the download to those sub-jobs; with a single `--sub-job`
+whose id has only letters, digits, `_`, `.`, `:` and `-`, only that sub-job's
+chunks are listed. Naming a sub-job with no stdout chunks is an error (after
+which a single one has every sub-job's listed, to name those that have some).
+Transient connection and service errors are retried
 with backoff, and an expired session is reopened. A single fetch or listing
 that takes longer than `--transfer-timeout SECONDS` (default 300; `0` means no
 limit) is abandoned and retried. Errors a retry cannot fix,
@@ -1317,7 +1320,12 @@ next tab, round to Logs after the last.
     `↑↓ node`) when the view has more than one; the footer shows the other
     keys.
   - Telemetry downloads when shown, refreshes every 30 seconds for a running
-    selected sub-job, and refreshes on `r`. A refresh rebuilds the window on
+    selected sub-job, and refreshes on `r`. The first download and `r` fetch
+    every sub-job; once the selected sub-job has telemetry, the 30-second
+    refreshes fetch only it, and `Space` to a sub-job they have left behind for
+    30 seconds or more refreshes it at once. A copy left behind is judged stale
+    as of the newest refresh that succeeded, as if that refresh had fetched it
+    too. A refresh rebuilds the window on
     screen and the whole job's (the stats beside every window); `w` to a window
     not on screen since shows it as it last was, with `refreshing…` in the
     header, for the moment it takes to rebuild. A rebuild that fails says
@@ -1396,7 +1404,10 @@ next tab, round to Logs after the last.
     machine, still shows every step the stage has.
   - It downloads when shown, refreshes on `r`, and re-reads every 30 seconds
     while a live job's tab is showing, reading only the rows added since (a
-    job that left the cache downloads whole again: see [Local data](#local-data)). The
+    job that left the cache downloads whole again: see [Local data](#local-data)).
+    After the first download, a tab with one sub-job to show fetches only that
+    one's chunks on those refreshes; `r`, even while one runs, fetches every
+    sub-job's, and so finds a sub-job whose training rows start later. The
     file sits in the same per-location cache as the Resources tab's and is
     downloaded under the same lock, but the two are separate streams: each
     fetches its own chunks. A job with no training sub-job says so without

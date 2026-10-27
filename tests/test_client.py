@@ -1217,7 +1217,7 @@ class TestOperationMetrics:
             post_json={"request_id": "g1"},
             get_json={
                 "sub_jobs": [
-                    {"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}
+                    {"job_type": "sampling", "inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}
                 ]
             },
         )
@@ -3789,7 +3789,7 @@ class TestDataPlane:
         # Sampling sub-job exposes max_seq_len=4 (proto numbers arrive as floats).
         c = _make_client(
             post_json={"request_id": "g5"},
-            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
+            get_json={"sub_jobs": [{"job_type": "sampling", "inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
         )
         # 4 tokens == max_seq_len leaves no room for output -> rejected.
         with pytest.raises(ValueError, match="does not fit the sampling job's max_seq_len of 4"):
@@ -3799,7 +3799,7 @@ class TestDataPlane:
     def test_generate_allows_tokenized_prompt_under_limit(self):
         c = _make_client(
             post_json={"request_id": "g6"},
-            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
+            get_json={"sub_jobs": [{"job_type": "sampling", "inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
         )
         # 3 tokens < max_seq_len=4 -> accepted.
         assert c.generate("j1", prompts=[[1, 2, 3]]) == "g6"
@@ -3808,12 +3808,142 @@ class TestDataPlane:
     def test_generate_caches_max_seq_len_across_calls(self):
         c = _make_client(
             post_json={"request_id": "g7"},
-            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 8.0, "n_gpus": 1.0}}]},
+            get_json={"sub_jobs": [{"job_type": "sampling", "inference_config": {"max_seq_len": 8.0, "n_gpus": 1.0}}]},
         )
         c.generate("j1", prompts=[[1, 2]])
         c.generate("j1", prompts=[[3, 4]])
         # Only the first call should have hit get_job; the value is cached.
         assert c._session.get.call_count == 1
+
+    # ─── sub_job_id addressing ───────────────────────────────────────────
+    #
+    # The id travels as a query param because the body is an opaque DSSST1 frame.
+    # generate chunks that frame; generate_stream sends it in one POST — two
+    # transports, so both need covering.
+
+    def test_generate_sends_sub_job_id_query_param(self):
+        c = _make_client(post_json={"request_id": "sj1"})
+        assert c.generate("j1", prompts=["hi"], sub_job_id="j1:sampling:1") == "sj1"
+        _, kwargs = c._session.post.call_args
+        assert kwargs["params"] == {"sub_job_id": "j1:sampling:1"}
+
+    def test_generate_omits_params_when_no_sub_job_id(self):
+        # No param key at all, so the request stays byte-identical for old callers.
+        c = _make_client(post_json={"request_id": "sj2"})
+        c.generate("j1", prompts=["hi"])
+        _, kwargs = c._session.post.call_args
+        assert "params" not in kwargs
+
+    def test_generate_sends_sub_job_id_on_every_chunk(self):
+        # The chunk loop reuses one URL, so the param has to be attached per send —
+        # a server that only saw it on the final chunk could route the rest wrongly.
+        c = _make_client()
+        c._MAX_GENERATE_BYTES = 64 * 1024
+        c._session.post.side_effect = [
+            _make_response({"chunk_cached": True}),
+            _make_response({"request_id": "sj3"}),
+        ]
+        oversized_prompt = "x" * (70 * 1024)
+
+        assert c.generate("j1", prompts=[oversized_prompt], sub_job_id="j1:sampling:0") == "sj3"
+        assert c._session.post.call_count == 2
+        for call in c._session.post.call_args_list:
+            assert call.kwargs["params"] == {"sub_job_id": "j1:sampling:0"}
+
+    def test_generate_stream_sends_sub_job_id_query_param(self):
+        c = _make_client(post_json={"request_id": "sj4", "count": 1})
+        c.generate_stream("j1", prompts=["hi"], sub_job_id="j1:sampling:1")
+        url, kwargs = c._session.post.call_args
+        assert url[0] == f"{c._prefix}/j1/generate-stream"
+        assert kwargs["params"] == {"sub_job_id": "j1:sampling:1"}
+
+    def test_generate_stream_omits_params_when_no_sub_job_id(self):
+        c = _make_client(post_json={"request_id": "sj5", "count": 1})
+        c.generate_stream("j1", prompts=["hi"])
+        _, kwargs = c._session.post.call_args
+        assert "params" not in kwargs
+
+    # ─── per-sub-job max_seq_len ─────────────────────────────────────────
+
+    def test_max_seq_len_ignores_log_prob_sub_job(self):
+        # A log_prob sub-job also carries an inference_config, but its window says
+        # nothing about where a generate runs. With only log_prob present there is
+        # no sampling window to check, so validation is skipped rather than applied
+        # to the wrong sub-job — an 8-token prompt must not be rejected against 4.
+        c = _make_client(
+            post_json={"request_id": "m1"},
+            get_json={
+                "sub_jobs": [
+                    {"job_type": "log_probability", "inference_config": {"max_seq_len": 4.0}},
+                ]
+            },
+        )
+        assert c.generate("j1", prompts=[[1, 2, 3, 4, 5, 6, 7, 8]]) == "m1"
+
+    def test_max_seq_len_ignores_log_prob_even_when_named(self):
+        # Naming a log_prob sub-job must not resolve its window either.
+        c = _make_client(
+            post_json={"request_id": "m1b"},
+            get_json={
+                "sub_jobs": [
+                    {"sub_job_id": "j1:log_prob:0", "job_type": "log_probability",
+                     "inference_config": {"max_seq_len": 4.0}},
+                ]
+            },
+        )
+        assert c.generate(
+            "j1", prompts=[[1, 2, 3, 4, 5, 6, 7, 8]], sub_job_id="j1:log_prob:0"
+        ) == "m1b"
+
+    def test_max_seq_len_uses_the_named_sub_job(self):
+        c = _make_client(
+            post_json={"request_id": "m2"},
+            get_json={
+                "sub_jobs": [
+                    {"sub_job_id": "j1:sampling:0", "job_type": "sampling",
+                     "inference_config": {"max_seq_len": 4.0}},
+                    {"sub_job_id": "j1:sampling:1", "job_type": "sampling",
+                     "inference_config": {"max_seq_len": 64.0}},
+                ]
+            },
+        )
+        # Same prompt: rejected against :0, accepted against :1.
+        with pytest.raises(ValueError, match="max_seq_len of 4"):
+            c.generate("j1", prompts=[[1, 2, 3, 4, 5]], sub_job_id="j1:sampling:0")
+        assert c.generate("j1", prompts=[[1, 2, 3, 4, 5]], sub_job_id="j1:sampling:1") == "m2"
+
+    def test_max_seq_len_skips_when_ambiguous(self):
+        # Two sampling sub-jobs and no sub_job_id: guessing risks a wrong
+        # client-side rejection, so validation is skipped and the server decides.
+        c = _make_client(
+            post_json={"request_id": "m3"},
+            get_json={
+                "sub_jobs": [
+                    {"sub_job_id": "j1:sampling:0", "job_type": "sampling",
+                     "inference_config": {"max_seq_len": 4.0}},
+                    {"sub_job_id": "j1:sampling:1", "job_type": "sampling",
+                     "inference_config": {"max_seq_len": 64.0}},
+                ]
+            },
+        )
+        assert c.generate("j1", prompts=[[1, 2, 3, 4, 5]]) == "m3"
+
+    def test_max_seq_len_cache_is_keyed_per_sub_job(self):
+        c = _make_client(
+            post_json={"request_id": "m4"},
+            get_json={
+                "sub_jobs": [
+                    {"sub_job_id": "j1:sampling:0", "job_type": "sampling",
+                     "inference_config": {"max_seq_len": 4.0}},
+                    {"sub_job_id": "j1:sampling:1", "job_type": "sampling",
+                     "inference_config": {"max_seq_len": 64.0}},
+                ]
+            },
+        )
+        c.generate("j1", prompts=[[1, 2]], sub_job_id="j1:sampling:1")
+        # A different sub-job must not read :1's cached value.
+        with pytest.raises(ValueError, match="max_seq_len of 4"):
+            c.generate("j1", prompts=[[1, 2, 3, 4, 5]], sub_job_id="j1:sampling:0")
 
     def test_generate_skips_validation_for_string_prompts(self):
         # String prompts are not validated client-side, so get_job is not called.
@@ -3842,7 +3972,7 @@ class TestDataPlane:
     def test_generate_stream_rejects_overlong_tokenized_prompt(self):
         c = _make_client(
             post_json={"request_id": "s3", "count": 1},
-            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
+            get_json={"sub_jobs": [{"job_type": "sampling", "inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
         )
         with pytest.raises(ValueError, match="does not fit the sampling job's max_seq_len of 4"):
             c.generate_stream("j1", prompts=[[1, 2, 3, 4, 5]])
@@ -3853,7 +3983,7 @@ class TestDataPlane:
         # though the list has four elements.
         c = _make_client(
             post_json={"request_id": "g-flat"},
-            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
+            get_json={"sub_jobs": [{"job_type": "sampling", "inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
         )
         with pytest.raises(ValueError, match="prompt at index 0 has 4 tokens"):
             c.generate("j1", prompts=[1, 2, 3, 4])
@@ -3862,7 +3992,7 @@ class TestDataPlane:
     def test_generate_rejects_mixed_flat_token_list(self):
         c = _make_client(
             post_json={"request_id": "g-mixed"},
-            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 8.0, "n_gpus": 1.0}}]},
+            get_json={"sub_jobs": [{"job_type": "sampling", "inference_config": {"max_seq_len": 8.0, "n_gpus": 1.0}}]},
         )
         with pytest.raises(ValueError, match=r"prompts\[1\] must be an integer token id"):
             c.generate("j1", prompts=[1, 2.5])
@@ -3871,7 +4001,7 @@ class TestDataPlane:
     def test_generate_allows_bare_tensor_prompt_under_limit(self):
         c = _make_client(
             post_json={"request_id": "g-tensor"},
-            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
+            get_json={"sub_jobs": [{"job_type": "sampling", "inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
         )
         assert c.generate("j1", prompts=torch.tensor([1, 2, 3], dtype=torch.int32)) == "g-tensor"
         c._session.post.assert_called_once()
@@ -3879,7 +4009,7 @@ class TestDataPlane:
     def test_generate_rejects_overlong_bare_tensor_prompt(self):
         c = _make_client(
             post_json={"request_id": "g-tensor-long"},
-            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
+            get_json={"sub_jobs": [{"job_type": "sampling", "inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
         )
         with pytest.raises(ValueError, match="prompt at index 0 has 4 tokens"):
             c.generate("j1", prompts=torch.tensor([1, 2, 3, 4], dtype=torch.int32))
@@ -3888,7 +4018,7 @@ class TestDataPlane:
     def test_generate_stream_allows_bare_tensor_prompt_under_limit(self):
         c = _make_client(
             post_json={"request_id": "s-tensor", "count": 1},
-            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
+            get_json={"sub_jobs": [{"job_type": "sampling", "inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
         )
         assert c.generate_stream("j1", prompts=torch.tensor([1, 2, 3], dtype=torch.int32)) == {
             "request_id": "s-tensor",
@@ -5013,7 +5143,7 @@ class TestExecutionLogDownload:
                 self.connection.commands.append(statement)
                 if statement.startswith("LIST "):
                     uri = self._unquote(statement.removeprefix("LIST "))
-                    self.rows = self.connection.list_rows.get(uri, [])
+                    self.rows = self.connection.listed(uri)
                 elif statement.startswith("GET "):
                     source_literal, target_literal = statement.removeprefix("GET ").split(" ", 1)
                     source = self._unquote(source_literal)
@@ -5036,6 +5166,19 @@ class TestExecutionLogDownload:
 
             def close(self):
                 pass
+
+        def listed(self, uri):
+            """What LIST ``uri`` returns. A stage LIST matches by path prefix: the rows
+            seeded for ``uri`` itself, else those of a seeded location above it that
+            lie under ``uri`` (a row's name is its path from ``/versions/``)."""
+            if uri in self.list_rows:
+                return self.list_rows[uri]
+            above = [location for location in self.list_rows if uri.startswith(location) and "/versions/" in location]
+            if not above:
+                return []
+            location = max(above, key=len)
+            stage = location[: location.index("/versions/")]
+            return [row for row in self.list_rows[location] if (stage + row[0]).startswith(uri)]
 
         def cursor(self):
             return self.Cursor(self)
