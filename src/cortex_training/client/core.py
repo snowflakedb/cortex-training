@@ -313,7 +313,7 @@ _SESSION_EXPIRED_CODES = frozenset({"390111", "390112", "390114"})
 # The Cortex Training API's invalid-request code, and its message for a URL
 # path DATABASE.SCHEMA it can't resolve (missing database or schema alike).
 _INVALID_REQUEST_CODE = "517602"
-_SCHEMA_NOT_FOUND_MESSAGE = re.compile(r"^Schema .+ is not found or not authorized$")
+_SCHEMA_NOT_FOUND_MESSAGE = re.compile(r"^Schema .+ is not found or not authorized")
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {
     _CHUNK_GROUP_RESTART_REQUIRED,

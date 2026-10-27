@@ -8257,9 +8257,17 @@ class TestMissingDatabase:
         )
         assert "PAT" not in message
 
-    def test_a_quoted_schema_name_is_explained_too(self):
+    @pytest.mark.parametrize(
+        "message",
+        [
+            pytest.param('Schema "my db".PUBLIC is not found or not authorized', id="quoted-name"),
+            pytest.param("Schema MY_DB.PUBLIC is not found or not authorized.", id="trailing-period"),
+            pytest.param("Schema MY_DB.PUBLIC is not found or not authorized for role R", id="appended-detail"),
+        ],
+    )
+    def test_the_message_is_explained_with_small_wording_changes(self, message):
         c = self._client(profile="prod", role="TRAINER")
-        body = {"code": "517602", "message": 'Schema "my db".PUBLIC is not found or not authorized'}
+        body = {"code": "517602", "message": message}
         c._session.get.return_value = _make_error_response(body, 400)
         with pytest.raises(nc.DatabaseAccessError) as exc:
             c._send("GET", f"{c.base_url}/test")
