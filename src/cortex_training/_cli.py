@@ -1733,6 +1733,37 @@ def _cmd_download_log(
     return 0
 
 
+def _cmd_download_checkpoint(
+    args: argparse.Namespace, client, stdout: TextIO, stderr: TextIO
+) -> int:
+    from ._checkpoint_download import download_checkpoint
+
+    progress = _artifact_progress_writer(stderr)
+
+    def on_progress(done: int, total: int, files_done: int, file_count: int) -> None:
+        fraction = done / total if total else files_done / file_count
+        filled = int(fraction * 20)
+        bar = "#" * filled + "-" * (20 - filled)
+        progress(
+            f"Checkpoint [{bar}] {fraction:4.0%} "
+            f"{done:,}/{total:,} bytes ({files_done}/{file_count} files)"
+        )
+
+    try:
+        result = download_checkpoint(
+            client,
+            args.job_id,
+            args.checkpoint_id,
+            args.output_dir,
+            args.include,
+            on_progress=on_progress,
+        )
+    finally:
+        progress("\n")
+    _print_json(result, stdout, compact=args.compact)
+    return 0
+
+
 def _cmd_download_metrics(
     args: argparse.Namespace, client, stdout: TextIO, stderr: TextIO
 ) -> int:
@@ -2018,13 +2049,7 @@ def _run(
     if args.command == "download-log":
         return _cmd_download_log(args, client, stdout, stderr)
     if args.command == "download-checkpoint":
-        from ._checkpoint_download import download_checkpoint
-
-        result = download_checkpoint(
-            client, args.job_id, args.checkpoint_id, args.output_dir, args.include
-        )
-        _print_json(result, stdout, compact=args.compact)
-        return 0
+        return _cmd_download_checkpoint(args, client, stdout, stderr)
     if args.command == "download-metrics":
         return _cmd_download_metrics(args, client, stdout, stderr)
     if args.command == "model-deployment":

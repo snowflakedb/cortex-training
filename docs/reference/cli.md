@@ -568,6 +568,12 @@ structure. `--include` is a repeatable, case-sensitive shell-style glob matched
 against the full relative filename; quote patterns to prevent shell expansion.
 Omit it to download every exported file. No matches produce an error.
 
+Downloads always show a byte-based progress bar on stderr, leaving stdout as
+machine-readable JSON. A terminal displays live updates; redirected stderr gets
+only the final progress line (or the last progress line before an error).
+The totals cover only files selected by `--include`, count completed files and
+resumed bytes as they are encountered, and show the number of completed files.
+
 Downloads resume automatically from sibling `.partial` files using HTTP Range
 requests. Rerun the same command after an interruption; no `--resume` flag is
 needed. Completed files whose byte size matches the export are skipped, and a

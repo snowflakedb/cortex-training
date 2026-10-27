@@ -32,9 +32,9 @@ def client():
     return client
 
 
-def _invoke(client, root, *options):
+def _invoke(client, root, *options, stderr=None):
     stdout = io.StringIO()
-    stderr = io.StringIO()
+    stderr = io.StringIO() if stderr is None else stderr
     status = cli.main(
         [
             "--base-url",
@@ -71,9 +71,21 @@ def test_command_is_available_from_public_parser_and_requires_output_dir():
         ["download-checkpoint", "JOB_ID", "CHECKPOINT_ID", "--output-dir", "out"]
     )
     assert args.include == []
+    assert not hasattr(args, "progress")
     assert args.output_dir == "out"
     with pytest.raises(SystemExit):
         parser.parse_args(["download-checkpoint", "JOB_ID", "CHECKPOINT_ID"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "download-checkpoint",
+                "JOB_ID",
+                "CHECKPOINT_ID",
+                "--output-dir",
+                "out",
+                "--progress",
+            ]
+        )
 
 
 def test_downloads_nested_file_and_prints_summary(client, tmp_path, monkeypatch):
@@ -82,7 +94,7 @@ def test_downloads_nested_file_and_prints_summary(client, tmp_path, monkeypatch)
     status, stdout, stderr = _invoke(client, tmp_path)
     target = tmp_path / "weights/model.safetensors"
     assert status == 0
-    assert stderr == ""
+    assert stderr == "Checkpoint [####################] 100% 4/4 bytes (1/1 files)\n"
     assert target.read_bytes() == b"abcd"
     assert not target.with_name(target.name + ".partial").exists()
     client.list_checkpoints.assert_called_once_with("JOB_ID")
@@ -287,7 +299,7 @@ def test_partial_transfer_resumes_on_next_invocation(client, tmp_path, monkeypat
     get.return_value = _response((b"cd",), status=206, content_range="bytes 2-3/4")
     status, stdout, stderr = _invoke(client, tmp_path)
     assert status == 0
-    assert stderr == ""
+    assert stderr == "Checkpoint [####################] 100% 4/4 bytes (1/1 files)\n"
     assert get.call_args.kwargs["headers"] == {"Range": "bytes=2-"}
     assert (tmp_path / "weights/model.safetensors").read_bytes() == b"abcd"
     assert not partial.exists()
@@ -408,4 +420,124 @@ def test_keyboard_interrupt_keeps_partial_and_reports_resume(
     assert status == 130
     assert stdout == ""
     assert "rerun the same command to resume" in stderr
+    assert (tmp_path / "weights/model.safetensors.partial").read_bytes() == b"ab"
+
+
+class _TtyStderr(io.StringIO):
+    def isatty(self):
+        return True
+
+
+def test_progress_updates_terminal_without_changing_json(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        download.requests, "get", MagicMock(return_value=_response((b"ab", b"cd")))
+    )
+    status, stdout, stderr = _invoke(client, tmp_path, stderr=_TtyStderr())
+    assert status == 0
+    assert "\rCheckpoint [##########----------]" in stderr
+    assert "50% 2/4 bytes (0/1 files)" in stderr
+    assert stderr.endswith("100% 4/4 bytes (1/1 files)\n")
+    assert "Checkpoint [" not in stdout
+    assert json.loads(stdout)["files"][0]["status"] == "downloaded"
+    assert "SECRET" not in stderr
+
+
+def test_redirected_progress_prints_only_final_bar(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        download.requests, "get", MagicMock(return_value=_response((b"ab", b"cd")))
+    )
+    status, stdout, stderr = _invoke(client, tmp_path)
+    assert status == 0
+    assert stderr == "Checkpoint [####################] 100% 4/4 bytes (1/1 files)\n"
+    assert json.loads(stdout)["files"][0]["status"] == "downloaded"
+
+
+def test_progress_counts_resumed_bytes(client, tmp_path, monkeypatch):
+    partial = tmp_path / "weights/model.safetensors.partial"
+    partial.parent.mkdir()
+    partial.write_bytes(b"ab")
+    monkeypatch.setattr(
+        download.requests,
+        "get",
+        MagicMock(return_value=_response((b"cd",), 206, "bytes 2-3/4")),
+    )
+    status, stdout, stderr = _invoke(client, tmp_path, stderr=_TtyStderr())
+    assert status == 0
+    assert "50% 2/4 bytes (0/1 files)" in stderr
+    assert stderr.endswith("100% 4/4 bytes (1/1 files)\n")
+    assert json.loads(stdout)["files"][0]["status"] == "resumed"
+
+
+def test_progress_counts_existing_files_and_selected_files_only(
+    client, tmp_path, monkeypatch
+):
+    target = tmp_path / "weights/model.safetensors"
+    target.parent.mkdir()
+    target.write_bytes(b"abcd")
+    client.export_checkpoint.return_value["files"].extend(
+        [
+            {
+                "filename": "config.json",
+                "url": "https://download.example/config",
+                "size_bytes": 4,
+            },
+            {
+                "filename": "optimizer.bin",
+                "url": "https://download.example/optimizer",
+                "size_bytes": 100,
+            },
+        ]
+    )
+    get = MagicMock(return_value=_response((b"ab", b"cd")))
+    monkeypatch.setattr(download.requests, "get", get)
+    status, stdout, stderr = _invoke(
+        client,
+        tmp_path,
+        "--include",
+        "*.safetensors",
+        "--include",
+        "*.json",
+        stderr=_TtyStderr(),
+    )
+    assert status == 0
+    assert "50% 4/8 bytes (1/2 files)" in stderr
+    assert stderr.endswith("100% 8/8 bytes (2/2 files)\n")
+    assert [entry["status"] for entry in json.loads(stdout)["files"]] == [
+        "existing",
+        "downloaded",
+    ]
+    get.assert_called_once()
+
+
+def test_progress_handles_zero_byte_files(client, tmp_path, monkeypatch):
+    client.export_checkpoint.return_value["files"][0]["size_bytes"] = 0
+    get = MagicMock()
+    monkeypatch.setattr(download.requests, "get", get)
+    status, _, stderr = _invoke(client, tmp_path)
+    assert status == 0
+    assert stderr.endswith("100% 0/0 bytes (1/1 files)\n")
+    get.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "failure,expected_status",
+    [(requests.ConnectionError("SECRET"), 1), (KeyboardInterrupt(), 130)],
+)
+def test_progress_ends_before_failure_message(
+    client, tmp_path, monkeypatch, failure, expected_status
+):
+    response = _response()
+
+    def interrupted():
+        yield b"ab"
+        raise failure
+
+    response.iter_content.return_value = interrupted()
+    monkeypatch.setattr(download.requests, "get", MagicMock(return_value=response))
+    status, stdout, stderr = _invoke(client, tmp_path)
+    assert status == expected_status
+    assert stdout == ""
+    assert "50% 2/4 bytes (0/1 files)\n" in stderr
+    assert "100%" not in stderr
+    assert "SECRET" not in stderr
     assert (tmp_path / "weights/model.safetensors.partial").read_bytes() == b"ab"

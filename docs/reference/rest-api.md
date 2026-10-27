@@ -844,6 +844,8 @@ The CLI command `cortex-training download-checkpoint JOB_ID CHECKPOINT_ID` with
 `--output-dir DIRECTORY` lists checkpoints, calls this export endpoint, and
 downloads the returned HTTPS links. It accepts repeated `--include` filename
 globs and automatically resumes `.partial` files using HTTP Range requests.
+The CLI always displays byte and file progress on stderr without
+changing the JSON summary on stdout.
 The server-provided `size_bytes` must be a non-negative integer or decimal
 string; the CLI verifies the downloaded size before promoting a file. See
 [Download a checkpoint](cli.md#download-a-checkpoint) for flags and output.

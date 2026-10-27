@@ -6,7 +6,7 @@ import fnmatch
 import re
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 import requests
@@ -88,13 +88,20 @@ def _destination(root: Path, filename: str) -> Path:
     return target
 
 
-def _download_file(export_file: _ExportFile, target: Path) -> str:
+def _download_file(
+    export_file: _ExportFile,
+    target: Path,
+    *,
+    on_progress: Callable[[int], None] | None = None,
+) -> str:
     size = export_file.size_bytes
     if target.exists():
         if not target.is_file() or target.stat().st_size != size:
             raise ValueError(
                 f"existing checkpoint file {target} does not match its expected size ({size} bytes); move it aside before retrying"
             )
+        if on_progress is not None:
+            on_progress(size)
         return "existing"
     partial = target.with_name(target.name + ".partial")
     resumed = partial.exists()
@@ -105,6 +112,8 @@ def _download_file(export_file: _ExportFile, target: Path) -> str:
         raise ValueError(
             f"partial checkpoint file {partial} is larger than expected ({size} bytes); move it aside before retrying"
         )
+    if on_progress is not None:
+        on_progress(offset)
     target.parent.mkdir(parents=True, exist_ok=True)
     if size == 0 and not resumed:
         partial.touch(exist_ok=False)
@@ -145,6 +154,8 @@ def _download_file(export_file: _ExportFile, target: Path) -> str:
                             )
                         output.write(chunk)
                         offset += len(chunk)
+                        if on_progress is not None:
+                            on_progress(offset)
         except requests.RequestException as exc:
             response = exc.response
             status = f" (HTTP {response.status_code})" if response is not None else ""
@@ -160,7 +171,13 @@ def _download_file(export_file: _ExportFile, target: Path) -> str:
 
 
 def download_checkpoint(
-    client: Any, job_id: str, checkpoint_id: str, output_dir: str, include: list[str]
+    client: Any,
+    job_id: str,
+    checkpoint_id: str,
+    output_dir: str,
+    include: list[str],
+    *,
+    on_progress: Callable[[int, int, int, int], None] | None = None,
 ) -> dict:
     """Export a listed checkpoint and download matching files without exposing links."""
     checkpoints = client.list_checkpoints(job_id)
@@ -193,9 +210,21 @@ def download_checkpoint(
         )
     root = Path(output_dir).expanduser()
     plan = [(entry, _destination(root, entry.filename)) for entry in selected]
+    total_bytes = sum(entry.size_bytes for entry in selected)
+    done_bytes = 0
     saved = []
+
+    def report_file(file_bytes: int) -> None:
+        if on_progress is not None:
+            on_progress(done_bytes + file_bytes, total_bytes, len(saved), len(plan))
+
+    if on_progress is not None:
+        on_progress(0, total_bytes, 0, len(plan))
     for entry, target in plan:
-        status = _download_file(entry, target)
+        status = _download_file(
+            entry, target, on_progress=report_file if on_progress is not None else None
+        )
+        done_bytes += entry.size_bytes
         saved.append(
             {
                 "filename": entry.filename,
@@ -204,6 +233,8 @@ def download_checkpoint(
                 "status": status,
             }
         )
+        if on_progress is not None:
+            on_progress(done_bytes, total_bytes, len(saved), len(plan))
     return {
         "job_id": job_id,
         "checkpoint_id": checkpoint_id,
