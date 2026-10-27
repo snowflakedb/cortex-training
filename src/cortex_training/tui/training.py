@@ -610,11 +610,11 @@ def format_step(step: int | None) -> str:
 
 def _columns(xs: tuple[int, ...], values: tuple[float, ...], first: int, last: int,
              width: int) -> list[float | None]:
-    """The chart's columns from x ``first`` to ``last``: the mean of the xs each covers, None
-    where none has a value. With fewer xs than columns, each x is as many columns wide."""
+    """The chart's ``width`` columns from x ``first`` to ``last``: the mean of the xs each covers, None
+    where none has a value. With fewer xs than columns, each x is as many columns wide, give or take
+    one where they don't divide evenly, so a short window still spans the chart."""
     span = last - first + 1
     count = min(width, span)
-    per_x = max(1, width // span) if span <= width else 1
     sums = [0.0] * count
     hits = [0] * count
     for x, value in zip(xs, values):
@@ -623,7 +623,7 @@ def _columns(xs: tuple[int, ...], values: tuple[float, ...], first: int, last: i
             sums[column] += value
             hits[column] += 1
     columns = [sums[i] / hits[i] if hits[i] else None for i in range(count)]
-    return [value for value in columns for _ in range(per_x)]
+    return [columns[column * count // width] for column in range(width)]
 
 
 def _x_labels(first: int, last: int, chart_width: int) -> str:

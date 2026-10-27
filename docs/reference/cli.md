@@ -1307,7 +1307,13 @@ next tab, round to Logs after the last.
     50% gridline running through the fill, and `◂` right of the newest column
     on the row its value reaches. A bucket without a sample stays blank over a
     broken baseline (`╌`), so a gap never reads as 0, and the marker is left
-    out when the newest bucket is a gap. Percentage
+    out when the newest bucket is a gap. A chart's time axis spans its window
+    (the whole job's spans the job): with more buckets than columns, a column is
+    the mean of those it covers, and with fewer, the buckets widen to fill it. A
+    job shorter than the window starts at the left edge and fills only its
+    share, `◂` marking its newest sample part of the way across, the rest of the
+    window blank; a window whose older samples are still loading ends at the
+    right edge, the older samples to come at the left. Percentage
     axes are 0–100%; other axes use a stable rounded ceiling. `ALL` aggregates
     reporting units by sample interval; one missed node scrape is bridged,
     longer gaps remain gaps. History older than seven hours is folded into
@@ -1386,7 +1392,8 @@ next tab, round to Logs after the last.
     a chart per metric, two per row at 90 cells or wider. The y axis spans the
     window's own lowest and highest value, since a loss rarely starts at 0 and
     a policy loss can be negative; with more steps or calls than columns, a
-    column is the mean of the ones it covers.
+    column is the mean of the ones it covers, and with fewer, they widen to
+    fill the chart.
   - `w` cycles all steps (the default), the last 100 and the last 1,000,
     counted back from the newest step, for both sections. Per call, the window holds those steps'
     calls, and the calls of a step still running.
