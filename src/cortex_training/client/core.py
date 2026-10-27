@@ -104,76 +104,32 @@ from cortex_training.client.optimizer import normalize_optimizer_config
 from cortex_training.client.peft import normalize_lora_peft_config
 from cortex_training.client.telemetry import CachedSessionTokenProvider
 from cortex_training.client.telemetry import OtlpMetricEmitter
-from cortex_training.model_deployment import DEPLOYMENT_CLASS
-from cortex_training.model_deployment import DEPLOYMENT_GPUS_PER_REPLICA
-from cortex_training.model_deployment import DEPLOYMENT_GPU_TYPE
-from cortex_training.model_deployment import DEPLOYMENT_MIN_REPLICAS
-from cortex_training.model_deployment import DEPLOYMENT_STATUSES
-from cortex_training.model_deployment import DEPLOYMENT_STATUSES_WITHOUT_ENDPOINT
 from cortex_training.model_deployment import DEPLOYMENT_STATUS_DROPPED
 from cortex_training.model_deployment import DEPLOYMENT_STATUS_DROPPING
 from cortex_training.model_deployment import DEPLOYMENT_STATUS_FAILED
-from cortex_training.model_deployment import DEPLOYMENT_STATUS_PENDING
-from cortex_training.model_deployment import DEPLOYMENT_STATUS_READY
 from cortex_training.model_deployment import DEPLOYMENT_STATUS_TERMINATED
-from cortex_training.model_deployment import DEPLOYMENT_STATUS_UNKNOWN
-from cortex_training.model_deployment import INFERENCE_MAX_SEQ_LEN
-from cortex_training.model_deployment import JOB_FIELD_CREATED_AT
-from cortex_training.model_deployment import JOB_FIELD_HARDWARE
 from cortex_training.model_deployment import JOB_FIELD_JOB_ID
-from cortex_training.model_deployment import JOB_FIELD_OWNER_ROLE
-from cortex_training.model_deployment import JOB_FIELD_REASON
-from cortex_training.model_deployment import JOB_FIELD_REASON_DETAILS
-from cortex_training.model_deployment import JOB_FIELD_STATUS
-from cortex_training.model_deployment import JOB_FIELD_SUBMITTED_BY
-from cortex_training.model_deployment import JOB_REASON_CANCELLED_BY_CLIENT
-from cortex_training.model_deployment import JOB_STATUS_TO_DEPLOYMENT_STATUS
-from cortex_training.model_deployment import MODEL_DEPLOYMENT_CLASS
-from cortex_training.model_deployment import MODEL_DEPLOYMENT_ID_PREFIX
 from cortex_training.model_deployment import ModelDeploymentSpec
-from cortex_training.model_deployment import OUT_BASE_URL
-from cortex_training.model_deployment import OUT_CREATED_AT
-from cortex_training.model_deployment import OUT_CREATOR
-from cortex_training.model_deployment import OUT_DATABASE
+from cortex_training.model_deployment import ModelDeploymentWaitError
+from cortex_training.model_deployment import ModelDeploymentWaitTimeout
 from cortex_training.model_deployment import OUT_DEPLOYMENT
-from cortex_training.model_deployment import OUT_DEPLOYMENT_CLASS
 from cortex_training.model_deployment import OUT_DROPPED
-from cortex_training.model_deployment import OUT_FAILURE
-from cortex_training.model_deployment import OUT_FAILURE_CODE
-from cortex_training.model_deployment import OUT_FAILURE_MESSAGE
-from cortex_training.model_deployment import OUT_GPUS_PER_REPLICA
-from cortex_training.model_deployment import OUT_GPU_TYPE
 from cortex_training.model_deployment import OUT_LOGS
-from cortex_training.model_deployment import OUT_MAX_SEQ_LEN
 from cortex_training.model_deployment import OUT_METRICS
-from cortex_training.model_deployment import OUT_MODEL_SOURCE
-from cortex_training.model_deployment import OUT_OWNER_ROLE
-from cortex_training.model_deployment import OUT_REPLICAS
-from cortex_training.model_deployment import OUT_SCHEMA
-from cortex_training.model_deployment import OUT_SPEC
 from cortex_training.model_deployment import OUT_STATUS
-from cortex_training.model_deployment import OUT_STATUS_DETAILS
-from cortex_training.model_deployment import OUT_STATUS_REASON
-from cortex_training.model_deployment import SOURCE_CHECKPOINT_ID
-from cortex_training.model_deployment import SOURCE_JOB_ID
-from cortex_training.model_deployment import SOURCE_MODEL
-from cortex_training.model_deployment import SOURCE_TYPE
-from cortex_training.model_deployment import SOURCE_TYPE_BASE_MODEL
 from cortex_training.model_deployment import SOURCE_TYPE_CHECKPOINT
-from cortex_training.model_deployment import SPEC_DEPLOYMENT
-from cortex_training.model_deployment import SPEC_INFERENCE
-from cortex_training.model_deployment import SPEC_SOURCE
-from cortex_training.model_deployment import WIRE_CHECKPOINT_ID
-from cortex_training.model_deployment import WIRE_DEPLOYMENT_CLASS
-from cortex_training.model_deployment import WIRE_INFERENCE_CONFIG
-from cortex_training.model_deployment import WIRE_MAX_MODEL_LEN
-from cortex_training.model_deployment import WIRE_MAX_SEQ_LEN
-from cortex_training.model_deployment import WIRE_NUM_REPLICAS
-from cortex_training.model_deployment import WIRE_N_GPUS
-from cortex_training.model_deployment import WIRE_SOURCE_CHECKPOINT_INFO
-from cortex_training.model_deployment import WIRE_SOURCE_JOB_ID
-from cortex_training.model_deployment import WIRE_TENSOR_PARALLEL_SIZE
-from cortex_training.model_deployment import WIRE_VLLM_CONFIG
+from cortex_training.model_deployment import _deployment_id_from_job_id
+from cortex_training.model_deployment import _job_id_from_deployment_id
+from cortex_training.model_deployment import _model_deployment_description
+from cortex_training.model_deployment import _model_deployment_metadata
+from cortex_training.model_deployment import _model_deployment_ready
+from cortex_training.model_deployment import _model_deployment_request_error
+from cortex_training.model_deployment import _model_deployment_status
+from cortex_training.model_deployment import _model_deployment_status_filter
+from cortex_training.model_deployment import _model_deployment_sub_job
+from cortex_training.model_deployment import _model_deployment_wait_timeout
+from cortex_training.model_deployment import _pending_model_deployment_metadata
+from cortex_training.model_deployment import _trained_model_name
 
 logger = logging.getLogger(__name__)
 
@@ -1546,304 +1502,6 @@ def _validate_raw_sub_job_configs(sub_job_configs: list) -> None:
 # ─── Model deployments ───────────────────────────────────────────────────
 
 
-def _model_deployment_sub_job(job: Any) -> dict[str, Any] | None:
-    """Return a job's sub-job if the job is an ``EVALUATION`` deployment, else ``None``."""
-    if not isinstance(job, dict):
-        return None
-    sub_jobs = job.get("sub_jobs")
-    if not isinstance(sub_jobs, list) or len(sub_jobs) != 1:
-        return None
-    sub_job = sub_jobs[0]
-    if not isinstance(sub_job, dict):
-        return None
-    if _normalized_job_type(sub_job.get("job_type")) != JobType.SAMPLING.value:
-        return None
-    inference_config = sub_job.get(WIRE_INFERENCE_CONFIG)
-    if not isinstance(inference_config, dict):
-        return None
-    if inference_config.get(WIRE_DEPLOYMENT_CLASS) != MODEL_DEPLOYMENT_CLASS:
-        return None
-    return sub_job
-
-
-def _model_deployment_status(job: Mapping[str, Any]) -> str:
-    """Derive the customer-facing deployment status from one job response."""
-    status = CortexTrainingClient._normalize_job_status(job.get(JOB_FIELD_STATUS))
-    if status in JOB_STATUS_TO_DEPLOYMENT_STATUS:
-        return JOB_STATUS_TO_DEPLOYMENT_STATUS[status]
-    # A state this client doesn't know yet is shown as-is rather than guessed.
-    return status.upper() if status else DEPLOYMENT_STATUS_UNKNOWN
-
-
-def _deployment_int(value: Any, *, location: str) -> int:
-    """Read a positive whole number from a job response, which may arrive as a float."""
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        or int(value) != value
-        or value <= 0
-    ):
-        raise ValueError(f"invalid marked deployment: {location} must be a positive integer")
-    return int(value)
-
-
-def _model_deployment_metadata(
-    job: Mapping[str, Any],
-    deployment_id: str,
-    *,
-    base_url: str | None = None,
-) -> dict[str, Any]:
-    """Render one marked job without exposing its backing job or sub-job IDs."""
-    sub_job = _model_deployment_sub_job(job)
-    if sub_job is None:
-        raise ValueError("the requested resource is not a model deployment")
-    inference_config = sub_job[WIRE_INFERENCE_CONFIG]
-    vllm_config = inference_config.get(WIRE_VLLM_CONFIG)
-    if not isinstance(vllm_config, dict):
-        raise ValueError(
-            f"invalid marked deployment: {WIRE_INFERENCE_CONFIG}.{WIRE_VLLM_CONFIG} is required"
-        )
-
-    # Every count the server stored for the deployment must be a positive whole
-    # number. The error location is built from the key so the two cannot drift
-    # apart.
-    vllm_location = f"{WIRE_INFERENCE_CONFIG}.{WIRE_VLLM_CONFIG}"
-    replicas, total_gpus, max_seq_len, gpus_per_replica, max_model_len = (
-        _deployment_int(container.get(key), location=f"{location}.{key}")
-        for container, location, key in (
-            (inference_config, WIRE_INFERENCE_CONFIG, WIRE_NUM_REPLICAS),
-            (inference_config, WIRE_INFERENCE_CONFIG, WIRE_N_GPUS),
-            (inference_config, WIRE_INFERENCE_CONFIG, WIRE_MAX_SEQ_LEN),
-            (vllm_config, vllm_location, WIRE_TENSOR_PARALLEL_SIZE),
-            (vllm_config, vllm_location, WIRE_MAX_MODEL_LEN),
-        )
-    )
-    if total_gpus != replicas * gpus_per_replica:
-        raise ValueError("invalid marked deployment: inconsistent replica GPU totals")
-    if max_model_len != max_seq_len:
-        raise ValueError("invalid marked deployment: inconsistent sequence lengths")
-
-    # The server already admitted this deployment, so admission rules (supported
-    # models, GPU minimums and shapes) are not re-checked here: a model or shape
-    # this client does not know about must still be listed, not fail the read.
-    model_name = sub_job.get("model_name")
-    if not isinstance(model_name, str) or not model_name.strip():
-        raise ValueError("marked deployment model_name must be a non-empty string")
-    checkpoint = sub_job.get(WIRE_SOURCE_CHECKPOINT_INFO)
-    if checkpoint is None:
-        model_source = {SOURCE_TYPE: SOURCE_TYPE_BASE_MODEL, SOURCE_MODEL: model_name}
-    elif isinstance(checkpoint, dict):
-        # A checkpoint source needs both IDs as non-empty strings.
-        for key in (WIRE_SOURCE_JOB_ID, WIRE_CHECKPOINT_ID):
-            value = checkpoint.get(key)
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"{WIRE_SOURCE_CHECKPOINT_INFO}.{key} must be a non-empty string")
-        model_source = {
-            SOURCE_TYPE: SOURCE_TYPE_CHECKPOINT,
-            SOURCE_JOB_ID: checkpoint[WIRE_SOURCE_JOB_ID],
-            SOURCE_CHECKPOINT_ID: checkpoint[WIRE_CHECKPOINT_ID],
-        }
-    else:
-        raise ValueError("invalid marked deployment: source_checkpoint_info must be an object")
-
-    # None means unknown. A job read while the server cannot reach its
-    # scheduler has no hardware, and defaulting to H200 would misreport a B300
-    # deployment.
-    hardware = job.get(JOB_FIELD_HARDWARE)
-    result: dict[str, Any] = {
-        OUT_DEPLOYMENT: deployment_id,
-        OUT_DEPLOYMENT_CLASS: inference_config[WIRE_DEPLOYMENT_CLASS],
-        OUT_STATUS: _model_deployment_status(job),
-        OUT_MODEL_SOURCE: model_source,
-        OUT_MAX_SEQ_LEN: max_seq_len,
-        OUT_GPUS_PER_REPLICA: gpus_per_replica,
-        OUT_REPLICAS: replicas,
-        OUT_GPU_TYPE: _hardware_wire(hardware) if hardware else None,
-    }
-    # Copy optional job fields to the output.
-    for source_key, output_key in (
-        (JOB_FIELD_CREATED_AT, OUT_CREATED_AT),
-        (JOB_FIELD_OWNER_ROLE, OUT_OWNER_ROLE),
-        (JOB_FIELD_SUBMITTED_BY, OUT_CREATOR),
-    ):
-        value = job.get(source_key)
-        if isinstance(value, str) and value:
-            result[output_key] = value
-    deployment_status = result[OUT_STATUS]
-    reason = job.get(JOB_FIELD_REASON)
-    reason = reason if isinstance(reason, str) and reason else None
-    reason_details = job.get(JOB_FIELD_REASON_DETAILS)
-    if isinstance(reason_details, str) and reason_details:
-        # The sentence may quote the backing job or sub-job ID. The sub-job ID
-        # and the deployment ID both contain the job ID, so match the longest
-        # ID first and rewrite each match to the deployment ID in a single
-        # pass; an existing deployment ID is left as it is.
-        ids = sorted(
-            {
-                value
-                for value in (
-                    deployment_id,
-                    sub_job.get("sub_job_id"),
-                    job.get(JOB_FIELD_JOB_ID),
-                )
-                if isinstance(value, str) and value
-            },
-            key=len,
-            reverse=True,
-        )
-        reason_details = re.sub(
-            "|".join(map(re.escape, ids)),
-            deployment_id,
-            reason_details,
-            flags=re.IGNORECASE,
-        )
-    else:
-        reason_details = None
-    if deployment_status in {DEPLOYMENT_STATUS_FAILED, DEPLOYMENT_STATUS_TERMINATED}:
-        failure: dict[str, str] = {}
-        if reason:
-            failure[OUT_FAILURE_CODE] = reason
-        if reason_details:
-            failure[OUT_FAILURE_MESSAGE] = reason_details
-        if failure:
-            result[OUT_FAILURE] = failure
-    elif not (
-        deployment_status in {DEPLOYMENT_STATUS_DROPPING, DEPLOYMENT_STATUS_DROPPED}
-        and reason == JOB_REASON_CANCELLED_BY_CLIENT
-    ):
-        if reason:
-            result[OUT_STATUS_REASON] = reason
-        if reason_details:
-            result[OUT_STATUS_DETAILS] = reason_details
-    # A deployment that has failed or is being dropped no longer serves.
-    if base_url is not None and deployment_status not in DEPLOYMENT_STATUSES_WITHOUT_ENDPOINT:
-        result[OUT_BASE_URL] = base_url
-    return result
-
-
-def _model_deployment_status_filter(
-    status: str | Iterable[str] | None,
-) -> frozenset[str] | None:
-    """Normalize a ``list`` status filter, rejecting unknown statuses."""
-    if status is None:
-        return None
-    values = [status] if isinstance(status, str) else list(status)
-    wanted = frozenset(str(value).strip().upper() for value in values)
-    unknown = sorted(wanted - set(DEPLOYMENT_STATUSES))
-    if unknown:
-        raise ValueError(
-            f"unknown deployment status {', '.join(unknown)}; choose from "
-            f"{', '.join(DEPLOYMENT_STATUSES)}"
-        )
-    return wanted
-
-
-def _deployment_id_from_job_id(job_id: Any) -> str:
-    """Turn a canonical job UUID into the public ``sf-ct-<UUID>`` deployment ID."""
-    if not isinstance(job_id, str):
-        raise ValueError("create response did not include a valid deployment identifier")
-    try:
-        parsed = uuid.UUID(job_id)
-    except (ValueError, AttributeError) as exc:
-        raise ValueError(
-            "create response did not include a valid deployment identifier"
-        ) from exc
-    canonical = str(parsed)
-    if job_id != canonical:
-        raise ValueError("create response deployment identifier was not canonical")
-    return MODEL_DEPLOYMENT_ID_PREFIX + canonical
-
-
-# Deployments are addressed by ID today; names may be accepted later.
-_DEPLOYMENT_FORMAT_ERROR = "deployment must currently be an sf-ct-<UUID> ID"
-
-
-def _job_id_from_deployment_id(deployment_id: Any) -> str:
-    """Turn a public ``sf-ct-<UUID>`` deployment ID back into its backing job UUID."""
-    if not isinstance(deployment_id, str) or not deployment_id.startswith(
-        MODEL_DEPLOYMENT_ID_PREFIX
-    ):
-        raise ValueError(_DEPLOYMENT_FORMAT_ERROR)
-    suffix = deployment_id[len(MODEL_DEPLOYMENT_ID_PREFIX) :]
-    try:
-        parsed = uuid.UUID(suffix)
-    except (ValueError, AttributeError) as exc:
-        raise ValueError(_DEPLOYMENT_FORMAT_ERROR) from exc
-    canonical = str(parsed)
-    if suffix != canonical:
-        raise ValueError(f"{_DEPLOYMENT_FORMAT_ERROR} with a canonical lowercase UUID")
-    return canonical
-
-
-def _pending_model_deployment_metadata(
-    spec: ModelDeploymentSpec,
-    deployment_id: str,
-    base_url: str,
-) -> dict[str, Any]:
-    """Build the metadata ``create`` returns before the deployment is placed."""
-    return {
-        OUT_DEPLOYMENT: deployment_id,
-        OUT_DEPLOYMENT_CLASS: spec.deployment_class,
-        OUT_STATUS: DEPLOYMENT_STATUS_PENDING,
-        OUT_MODEL_SOURCE: spec.source_to_wire(),
-        OUT_MAX_SEQ_LEN: spec.max_seq_len,
-        OUT_GPUS_PER_REPLICA: spec.gpus_per_replica,
-        OUT_REPLICAS: spec.min_replicas,
-        OUT_GPU_TYPE: spec.gpu_type,
-        OUT_BASE_URL: base_url,
-    }
-
-
-def _model_deployment_description(
-    metadata: Mapping[str, Any],
-    *,
-    database: str | None,
-    schema: str | None,
-) -> dict[str, Any]:
-    """Reshape deployment metadata into what ``describe`` prints.
-
-    The deployment's configuration is grouped under ``spec`` for readability.
-    It is a read view: it may gain read-only fields, and it is not guaranteed
-    to be accepted by ``create``. Status, endpoint, scope, and ownership stay
-    at the top level.
-    """
-    result: dict[str, Any] = {
-        key: metadata[key]
-        for key in (
-            OUT_DEPLOYMENT,
-            OUT_STATUS,
-            OUT_STATUS_REASON,
-            OUT_STATUS_DETAILS,
-            OUT_FAILURE,
-            OUT_BASE_URL,
-        )
-        if key in metadata
-    }
-    for key, value in ((OUT_DATABASE, database), (OUT_SCHEMA, schema)):
-        if value:
-            result[key] = value
-    for key in (OUT_CREATED_AT, OUT_CREATOR, OUT_OWNER_ROLE):
-        if key in metadata:
-            result[key] = metadata[key]
-    result[OUT_SPEC] = {
-        SPEC_DEPLOYMENT: {
-            DEPLOYMENT_CLASS: metadata[OUT_DEPLOYMENT_CLASS],
-            DEPLOYMENT_MIN_REPLICAS: metadata[OUT_REPLICAS],
-            DEPLOYMENT_GPUS_PER_REPLICA: metadata[OUT_GPUS_PER_REPLICA],
-            # None means the server did not report the hardware.
-            DEPLOYMENT_GPU_TYPE: metadata[OUT_GPU_TYPE],
-        },
-        SPEC_SOURCE: dict(metadata[OUT_MODEL_SOURCE]),
-        SPEC_INFERENCE: {INFERENCE_MAX_SEQ_LEN: metadata[OUT_MAX_SEQ_LEN]},
-    }
-    return result
-
-
-# Longest server error message kept in a model deployment error.
-_MAX_SERVER_ERROR_MESSAGE_CHARS = 1000
-
-
 def _server_error_code_and_message(
     response: requests.Response | None,
 ) -> tuple[str | None, str | None]:
@@ -1872,59 +1530,18 @@ def _sanitized_model_deployment_request_error(
     job_id: str | None = None,
     scope: str | None = None,
 ) -> RuntimeError:
-    """Return a public error that cannot expose backing job identifiers.
-
-    The request URL and raw body are dropped, but the server's error ``code``
-    and ``message`` are kept so "feature disabled", "not authorized" and "wrong
-    ID" stay distinguishable. ``job_id`` is replaced by ``deployment_id`` in the
-    message, since the server's own messages can name the backing job.
-    ``deployment_id`` is ``None`` for ``create``, which has no deployment yet.
-    """
+    """:func:`_model_deployment_request_error` for a failed ``requests`` call."""
     response = exc.response
-    status_code = getattr(response, "status_code", None)
-    subject = f"model deployment {deployment_id}" if deployment_id else "model deployment"
     code, detail = _server_error_code_and_message(response)
-    if code == _JOB_NOT_FOUND_CODE and deployment_id:
-        message = f"{subject} not found" + (f" in {scope}" if scope else "")
-    else:
-        message = f"{subject} request failed"
-        if status_code is not None:
-            message += f" with HTTP {status_code}"
-        if code:
-            message += f" ({code})"
-        if detail:
-            if job_id and deployment_id:
-                detail = detail.replace(job_id, deployment_id)
-            if len(detail) > _MAX_SERVER_ERROR_MESSAGE_CHARS:
-                detail = detail[:_MAX_SERVER_ERROR_MESSAGE_CHARS] + "..."
-            message += f": {detail}"
-    request_id = _response_snowflake_request_id(response)
-    if request_id:
-        message += f" (snowflake request id: {request_id})"
-    return RuntimeError(message)
-
-
-class ModelDeploymentWaitError(RuntimeError):
-    """A deployment reached a terminal status other than ``READY``.
-
-    ``deployment`` is the metadata from the last poll, or ``None``.
-    """
-
-    def __init__(self, message: str, deployment: dict[str, Any] | None):
-        super().__init__(message)
-        self.deployment = deployment
-
-
-class ModelDeploymentWaitTimeout(TimeoutError):
-    """A deployment did not become ``READY`` before the poll timeout.
-
-    The deployment is still running. ``deployment`` is the metadata from the
-    last poll, or ``None``.
-    """
-
-    def __init__(self, message: str, deployment: dict[str, Any] | None):
-        super().__init__(message)
-        self.deployment = deployment
+    return _model_deployment_request_error(
+        deployment_id,
+        status_code=getattr(response, "status_code", None),
+        code=code,
+        detail=detail,
+        request_id=_response_snowflake_request_id(response),
+        job_id=job_id,
+        scope=scope,
+    )
 
 
 def _model_deployment_operation(method):
@@ -3347,21 +2964,8 @@ class CortexTrainingClient:
         )
 
     def _checkpoint_source_model_name(self, job_id: str) -> str:
-        """Return the model a checkpoint's source job trained.
-
-        The server requires ``model_name`` on the deployment's sampling sub-job
-        and rejects one that differs from the source job's, so it is read from
-        the source job rather than asked of the user.
-        """
         job = self.get_job(job_id, retry_on=_is_transient_unless_job_not_found)
-        for sub_job in job.get("sub_jobs") or ():
-            if _normalized_job_type(sub_job.get("job_type")) == JobType.TRAINING.value:
-                model_name = sub_job.get("model_name")
-                if isinstance(model_name, str) and model_name.strip():
-                    return model_name
-        raise ValueError(
-            f"{SPEC_SOURCE}.{SOURCE_JOB_ID} {job_id} has no training sub-job model_name"
-        )
+        return _trained_model_name(job, job_id)
 
     @staticmethod
     def _normalize_job_status(status) -> str:
@@ -3483,37 +3087,10 @@ class CortexTrainingClient:
             metadata = _model_deployment_metadata(
                 job, deployment_id, base_url=self.model_deployment_base_url
             )
-            deployment_status = metadata[OUT_STATUS]
-            if deployment_status == DEPLOYMENT_STATUS_READY:
+            if _model_deployment_ready(metadata):
                 return metadata
-            if deployment_status == DEPLOYMENT_STATUS_DROPPED:
-                raise ModelDeploymentWaitError(
-                    f"model deployment {deployment_id} was dropped; create a new "
-                    "deployment to serve this model again",
-                    metadata,
-                )
-            if deployment_status in {DEPLOYMENT_STATUS_FAILED, DEPLOYMENT_STATUS_TERMINATED}:
-                failure = metadata.get(OUT_FAILURE, {})
-                message = f"model deployment {deployment_id} is {deployment_status}"
-                if failure.get(OUT_FAILURE_CODE):
-                    message += f" ({failure[OUT_FAILURE_CODE]})"
-                if failure.get(OUT_FAILURE_MESSAGE):
-                    message += f": {failure[OUT_FAILURE_MESSAGE]}"
-                message += (
-                    "; for details run `cortex-training model-deployment download-log "
-                    f"{deployment_id}`"
-                )
-                raise ModelDeploymentWaitError(message, metadata)
             delay = self._sleep_with_backoff(delay, deadline)
-        last_status = metadata[OUT_STATUS] if metadata else DEPLOYMENT_STATUS_UNKNOWN
-        raise ModelDeploymentWaitTimeout(
-            f"model deployment {deployment_id} did not become READY within "
-            f"{self.poll_timeout:g}s (last status: {last_status}). It is still "
-            "running and holding GPUs: run `cortex-training model-deployment wait "
-            f"{deployment_id}` again, or `cortex-training model-deployment drop "
-            f"{deployment_id}` to release them",
-            metadata,
-        )
+        raise _model_deployment_wait_timeout(deployment_id, self.poll_timeout, metadata)
 
     @_model_deployment_operation
     def drop_model_deployment(self, deployment_id: str) -> dict[str, Any]:
