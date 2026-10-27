@@ -491,6 +491,10 @@ class _Login:
         self.p.say(self.s.dim(_DATABASE_HELP))
         return self.p.ask("Database", default=DEFAULT_DATABASE)
 
+    def _ask_schema(self) -> str:
+        # Enter keeps PUBLIC; a team that uses its own schema types it here.
+        return self.p.ask("Schema", default=DEFAULT_SCHEMA)
+
     def _write(self, name: str, values: Mapping[str, Any]) -> None:
         path = _profiles.write_profile(name, values)
         self.created_profiles.append(name)
@@ -506,6 +510,7 @@ class _Login:
         token = self.p.secret("Programmatic access token (hidden as you type)")
         name = name or self._ask_new_name(DEFAULT_PROFILE)
         database = self._ask_database()
+        schema = self._ask_schema()
         self._write(
             name,
             {
@@ -516,18 +521,21 @@ class _Login:
                 "authenticator": "PROGRAMMATIC_ACCESS_TOKEN",
                 "token": token,
                 "database": database,
-                "schema": DEFAULT_SCHEMA,
+                "schema": schema,
             },
         )
         return name
 
     def copy_profile(self, base: str) -> str:
         """Create a profile with ``base``'s sign-in and its own database."""
-        self.p.say(f"The new profile signs in exactly like {self.s.bold(base)}; only the database is different.")
+        self.p.say(
+            f"The new profile signs in exactly like {self.s.bold(base)}; only the database and schema are different."
+        )
         name = self._ask_new_name(f"{base}-ct")
         database = self._ask_database()
+        schema = self._ask_schema()
         values = {key: value for key, value in self.profiles()[base].items() if key not in ("database", "schema")}
-        self._write(name, {**values, "database": database, "schema": DEFAULT_SCHEMA})
+        self._write(name, {**values, "database": database, "schema": schema})
         return name
 
     # ── Checking ────────────────────────────────────────────────────────
