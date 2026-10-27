@@ -155,7 +155,7 @@ def test_a_new_user_creates_a_pat_profile(isolated):
     world = World(databases={"CORTEX_TRAINING_DB"})
     code, summary, err = login(
         world,
-        ["acme-main.snowflakecomputing.com", "ME", "", "my-secret-token", "", "", ""],
+        ["acme-main.snowflakecomputing.com", "ME", "", "my-secret-token", "", "", "", ""],
     )
     assert code == 0
     assert _profiles.read_profiles() == {
@@ -180,7 +180,7 @@ def test_a_new_user_can_choose_the_profile_and_database_names(isolated):
     world = World()
     code, summary, err = login(
         world,
-        ["https://app.snowflake.com/acme/main", "ME", "TRAINER", "tok", "mine", "MY_DB", "", "y"],
+        ["https://app.snowflake.com/acme/main", "ME", "TRAINER", "tok", "mine", "MY_DB", "", "", "y"],
     )
     assert code == 0
     profile = _profiles.read_profiles()["mine"]
@@ -195,7 +195,7 @@ def test_a_create_that_fails_explains_why_without_a_traceback(isolated):
     world.create_error = "Role TRAINER can't find database MY_DB and can't create it."
     code, _, err = login(
         world,
-        ["https://app.snowflake.com/acme/main", "ME", "TRAINER", "tok", "mine", "MY_DB", "", "y"],
+        ["https://app.snowflake.com/acme/main", "ME", "TRAINER", "tok", "mine", "MY_DB", "", "", "y"],
     )
     assert code == 1
     assert "Role TRAINER can't find database MY_DB and can't create it." in err
@@ -304,8 +304,8 @@ def test_a_separate_database_copies_the_sign_in_into_a_new_profile(isolated):
     write_profiles(isolated, PROFILES)
     before = dict(_profiles.read_profiles()["prod"])
     world = World(databases={"ANALYTICS_DB"})
-    # prod -> separate database -> name [prod-ct] -> database [CORTEX_TRAINING_DB] -> check [Y] -> run CREATE
-    code, summary, err = login(world, ["n", "2", "2", "", "", "", "y"])
+    # prod -> separate database -> name [prod-ct] -> database [CORTEX_TRAINING_DB] -> schema [PUBLIC] -> check [Y] -> run CREATE
+    code, summary, err = login(world, ["n", "2", "2", "", "", "", "", "y"])
     assert code == 0
     profiles = _profiles.read_profiles()
     assert profiles["prod"] == before
@@ -331,16 +331,37 @@ def test_login_name_uses_an_existing_profile(isolated):
     assert summary["profile"] == "train"
 
 
+def test_a_new_profile_can_use_its_own_schema(isolated):
+    world = World(databases={"TEAM_DB"})
+    # host, user, role, PAT, database, schema, then check [Y]
+    code, summary, err = login(world, ["acme-new.snowflakecomputing.com", "ME", "", "tok", "TEAM_DB", "TEAM_SCHEMA", ""], name="fresh")
+    assert code == 0, err
+    assert "Schema [PUBLIC]:" in err
+    profile = _profiles.read_profiles()["fresh"]
+    assert (profile["database"], profile["schema"]) == ("TEAM_DB", "TEAM_SCHEMA")
+    assert summary["schema"] == "TEAM_SCHEMA"
+
+
+def test_a_separate_database_can_use_its_own_schema(isolated):
+    write_profiles(isolated, PROFILES)
+    world = World(databases={"ANALYTICS_DB", "TEAM_DB"})
+    # prod -> separate database -> name [prod-ct] -> database TEAM_DB -> schema TEAM_SCHEMA -> check [Y]
+    code, _, err = login(world, ["n", "2", "2", "", "TEAM_DB", "TEAM_SCHEMA", ""])
+    assert code == 0, err
+    assert "only the database and schema are different" in err
+    assert _profiles.read_profiles()["prod-ct"]["schema"] == "TEAM_SCHEMA"
+
+
 def test_login_name_creates_that_profile_when_it_does_not_exist(isolated):
     write_profiles(isolated, PROFILES)
-    code, summary, _ = login(World(databases={"CORTEX_TRAINING_DB"}), ["acme-new.snowflakecomputing.com", "ME", "", "tok", "", ""], name="fresh")
+    code, summary, _ = login(World(databases={"CORTEX_TRAINING_DB"}), ["acme-new.snowflakecomputing.com", "ME", "", "tok", "", "", ""], name="fresh")
     assert code == 0
     assert _profiles.read_profiles()["fresh"]["host"] == "acme-new.snowflakecomputing.com"
     assert summary["profile"] == "fresh"
 
 
-# Answers for `login fresh`: host, user, role, PAT, database.
-NEW_PROFILE = ["acme-new.snowflakecomputing.com", "ME", "", "tok", ""]
+# Answers for `login fresh`: host, user, role, PAT, database, schema.
+NEW_PROFILE = ["acme-new.snowflakecomputing.com", "ME", "", "tok", "", ""]
 
 
 def test_a_new_profile_is_checked_only_after_asking(isolated):
@@ -398,7 +419,7 @@ def test_a_profile_that_just_failed_is_not_used_to_check_its_account(isolated):
     world = World(databases={"CORTEX_TRAINING_DB"})
     world.sign_in_error["cortex-training"] = "Programmatic access token is invalid."
     # No profiles -> create one -> check [Y] -> it fails -> keep it (n) -> back to the list.
-    code, _, err = login(world, ["acme-new.snowflakecomputing.com", "ME", "", "tok", "", "", "", "n"])
+    code, _, err = login(world, ["acme-new.snowflakecomputing.com", "ME", "", "tok", "", "", "", "", "n"])
     assert code != 0
     assert "Profile cortex-training can't be used." in err
     assert "Which of your accounts have Cortex Training?" not in err
@@ -434,7 +455,7 @@ def test_login_rejects_an_invalid_profile_name(isolated):
 def test_a_new_profile_name_must_be_unused(isolated):
     write_profiles(isolated, PROFILES)
     world = World(databases={"CORTEX_TRAINING_DB"})
-    code, summary, err = login(world, ["n", "2", "2", "train", "prod-ct", "", ""])
+    code, summary, err = login(world, ["n", "2", "2", "train", "prod-ct", "", "", ""])
     assert code == 0
     assert "Profile train already exists; choose another name." in err
     assert summary["profile"] == "prod-ct"
@@ -458,7 +479,7 @@ def test_without_a_matching_profile_a_new_profile_is_offered(isolated):
     write_profiles(isolated, PROFILES)
     world = World(databases=set())
     # other -> use OTHER_DB -> missing; no same-identity profile -> create new? yes -> names -> CREATE? yes
-    code, summary, err = login(world, ["n", "1", "1", "y", "", "", "", "y"])
+    code, summary, err = login(world, ["n", "1", "1", "y", "", "", "", "", "y"])
     assert code == 0
     assert "Profile train signs in" not in err
     assert summary["profile"] == "other-ct"
@@ -477,7 +498,7 @@ def test_declining_a_new_profile_changes_nothing(isolated):
 
 def test_declining_create_database_keeps_the_new_profile_and_says_so(isolated):
     write_profiles(isolated, PROFILES)
-    code, _, err = login(World(databases=set()), ["n", "1", "1", "y", "", "", "", "n"])
+    code, _, err = login(World(databases=set()), ["n", "1", "1", "y", "", "", "", "", "n"])
     assert code == 1
     assert "To create it yourself, run in Snowsight: CREATE DATABASE IF NOT EXISTS CORTEX_TRAINING_DB;" in err
     assert "Saved profile(s) other-ct; run cortex-training login again to finish." in err
@@ -756,7 +777,7 @@ def test_an_account_without_cortex_training_returns_to_the_list_before_anything_
 def test_a_missing_database_still_means_cortex_training_answered(isolated):
     write_profiles(isolated, PROFILES)
     world = World(databases=set())
-    code, summary, err = login(world, ["n", "1", "1", "y", "", "", "", "y"])
+    code, summary, err = login(world, ["n", "1", "1", "y", "", "", "", "", "y"])
     assert code == 0
     assert "isn't enabled" not in err
     assert world.created == [("database", "CORTEX_TRAINING_DB")]

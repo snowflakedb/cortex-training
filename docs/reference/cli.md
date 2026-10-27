@@ -290,9 +290,9 @@ cortex-training login training   # use or create the profile "training"
    it signs in (a token or key pair signs in without prompts; browser and MFA
    sign-ins stop to ask), its database, and its role. A profile without an
    account or user can't be picked. You can also create one from an account
-   host (a Snowsight URL also works), a user, an optional role, and a
-   programmatic access token (typed hidden); new profiles default to the name
-   `cortex-training`. Pick a profile on an account where Cortex Training is
+   host (a Snowsight URL also works), a user, an optional role, a
+   programmatic access token (typed hidden), a database, and a schema (Enter
+   keeps `PUBLIC`); new profiles default to the name `cortex-training`. Pick a profile on an account where Cortex Training is
    enabled. Before listing, login offers to check which accounts have it by
    signing in once to each account (read-only), using only profiles that sign
    in without prompts; it lists the accounts it would contact and asks first.
