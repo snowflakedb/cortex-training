@@ -96,10 +96,6 @@ EXAMPLES = {
     ),
 }
 
-# TEMPORARY, drop this commit before merging: run only the new case, so a CI run
-# validating it takes one job instead of the whole suite.
-EXAMPLES = {"sft_lora_qwen35": EXAMPLES["sft_lora_qwen35"]}
-
 
 @pytest.fixture
 def dare_bench(tmp_path_factory):
