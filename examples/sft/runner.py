@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 import os
@@ -76,7 +77,9 @@ class Task(Protocol):
 
 
 def job_body(config: Config) -> dict:
-    """The training job: the catalog file, sft/overrides.json, then ``config``."""
+    """The training job: the catalog file, sft/overrides.json, the example's own
+    overrides.json (see :func:`_example_overrides`), then ``config``.
+    """
     return build_job(
         "training",
         model=config.model,
@@ -85,12 +88,23 @@ def job_body(config: Config) -> dict:
         lora=config.lora,
         job_config=config.job_config,
         example_dir=_EXAMPLE_DIR,
+        overrides=_example_overrides(config),
         search_dirs=(_EXAMPLE_DIR,),
         lr=config.lr,
         train_batch_size=config.train_batch_size,
         max_seq_len=config.max_seq_len,
         debug_image_tag=config.debug_image_tag,
     )
+
+
+def _example_overrides(config: Config) -> list[Path]:
+    """The ``overrides.json`` next to the entry point that defines ``config``'s class.
+
+    It applies after ``sft/overrides.json`` to that example only, for example
+    ``sft/dare/overrides.json`` for DARE. An example without one gets none.
+    """
+    path = Path(inspect.getfile(type(config))).resolve().parent / "overrides.json"
+    return [path] if path.is_file() else []
 
 
 def causal_cross_entropy_processing() -> dict[str, Any]:

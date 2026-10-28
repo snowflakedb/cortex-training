@@ -48,7 +48,8 @@ python -m examples.sft.conversational.train config=/path/to/config.json \
 
 The job is built as described in
 [How an example builds its job](../README.md#how-an-example-builds-its-job).
-`sft/overrides.json` ships empty, and also applies to DARE. For model-specific
+`sft/overrides.json` ships empty, and also applies to DARE. DARE then applies
+[`dare/overrides.json`](dare/overrides.json), which sets 8 training GPUs. For model-specific
 job fields (MoE LoRA targets, `model_options`, `numerics.fp32_parity`), see
 [LoRA and QLoRA](../../docs/guides/training/lora-and-qlora.md) and
 [REST API `model_options`](../../docs/reference/rest-api.md#model_options).

@@ -96,8 +96,6 @@ from cortex_training import wire
 from cortex_training._artifact_download import DownloadCancelled
 from cortex_training._artifact_download import NoChunksError
 from cortex_training.client import _account_jobs
-from cortex_training.client._account_jobs import AccountJobListUnavailable  # noqa: F401 - exported
-from cortex_training.client._account_jobs import InvalidPageToken  # noqa: F401 - exported
 from cortex_training.client.auth import SnowflakeProfileAuth
 from cortex_training.client.auth import SnowflakeProfileError
 from cortex_training.client.auth import SnowflakeTelemetryTokenProvider
@@ -192,6 +190,10 @@ _GPU_METRICS_CHUNK_RE = re.compile(
 _TRAINING_METRICS_CHUNK_RE = re.compile(
     r"^training\.(?P<timestamp>\d{8}-\d{6})\.(?P<suffix>[^./\\]+)\.gz$"
 )
+# A sub-job id that can be listed under its own prefix (see _scoped_sub_jobs): a
+# LIST path is taken literally (``%3A`` does not mean ``:``), and an id with other
+# characters is listed with the rest of its root instead.
+_SCOPED_LIST_SUB_JOB_RE = re.compile(r"[A-Za-z0-9_.:-]+")
 _STREAM_COPY_BUFFER_BYTES = 1024 * 1024
 # How long a chunked download whose first listing failed waits for its other listing, which
 # runs on the same session, before that session is closed (never kept) under it.
@@ -310,9 +312,10 @@ _ENDED_JOB_STATES = frozenset(
 # out the service's read-after-create window.
 _RECENTLY_CREATED_SECONDS = 120.0
 _SESSION_EXPIRED_CODES = frozenset({"390111", "390112", "390114"})
-# The Cortex Training API's code, on an HTTP 400, for a database or schema in the
-# URL path that it cannot resolve. The client explains it; it never creates one.
-_DATABASE_NOT_RESOLVED_CODE = "517602"
+# The Cortex Training API's invalid-request code, and its message for a URL
+# path DATABASE.SCHEMA it can't resolve (missing database or schema alike).
+_INVALID_REQUEST_CODE = "517602"
+_SCHEMA_NOT_FOUND_MESSAGE = re.compile(r"^Schema .+ is not found or not authorized")
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {
     _CHUNK_GROUP_RESTART_REQUIRED,
@@ -410,11 +413,13 @@ class ChunkGroupConflictError(ChunkGroupError):
 class DatabaseAccessError(requests.exceptions.HTTPError, RuntimeError):
     """The configured database or schema can't be found by the current role.
 
-    Raised for the API's HTTP 400 with code 517602. The client never creates a
-    database; the message says how to create it, get access, or use another.
-    ``kind`` is ``"database"`` or ``"schema"``, ``name`` the object, ``role``
-    the session's role (None when it can't be determined, as for PAT clients),
-    and ``statement`` the CREATE statement that would set it up.
+    Raised for the API's HTTP 400 with code 517602 and message "Schema ... is
+    not found or not authorized". The client never creates a database; the
+    message says how to create it, get access, or use another.
+    ``kind`` is ``"schema"``, ``name`` the ``DATABASE.SCHEMA``, ``role`` the
+    session's role (None when it can't be determined, as for PAT clients), and
+    ``statement`` the CREATE DATABASE and CREATE SCHEMA statements that would
+    set it up, separated by ``; ``.
     """
 
     def __init__(
@@ -646,6 +651,22 @@ def _response_error_code(response: requests.Response | None) -> str | None:
         if code is not None:
             return str(code)
     return None
+
+
+def _is_schema_not_found(response: requests.Response | None) -> bool:
+    """Whether ``response`` says the URL's schema can't be found."""
+    if response is None:
+        return False
+    try:
+        body = response.json()
+    except Exception:
+        return False
+    for candidate in _iter_error_dicts(body):
+        code = candidate.get("code") or candidate.get("error_code")
+        message = str(candidate.get("message") or "").strip()
+        if str(code) == _INVALID_REQUEST_CODE and _SCHEMA_NOT_FOUND_MESSAGE.match(message):
+            return True
+    return False
 
 
 def _chunk_group_error_detail(response: requests.Response | None) -> dict | None:
@@ -2425,6 +2446,15 @@ def _deprecated_constructor(name: str) -> str:
 # ─── HTTP client ─────────────────────────────────────────────────────────
 
 
+def _sub_job_id_params(sub_job_id: str | None) -> dict[str, dict[str, str]]:
+    """``params=`` kwargs for a sub-job-addressed request, or nothing when unset.
+
+    The key is omitted rather than sent empty so a request without a sub_job_id is
+    byte-identical to one from a client that predates the parameter.
+    """
+    return {"params": {"sub_job_id": sub_job_id}} if sub_job_id else {}
+
+
 class CortexTrainingClient:
     """HTTP client for the Cortex Training REST API (``cortex-training``).
 
@@ -2508,7 +2538,8 @@ class CortexTrainingClient:
         # means the job was fetched but exposes no sampling max_seq_len (skip
         # validation); a missing key means it has not been resolved yet (e.g. a
         # transient get_job failure), so a later call will retry.
-        self._sampling_max_seq_len: dict[str, int | None] = {}
+        # Keyed on (job_id, sub_job_id); sub_job_id is None for the unaddressed case.
+        self._sampling_max_seq_len: dict[tuple[str, str | None], int | None] = {}
         self._artifact_connection_config: dict[str, str] | None = None
         self._artifact_connection_factory: Callable[[], Any] | None = None
         # Download sessions kept open for the next download (see keep_artifact_sessions), and
@@ -2517,6 +2548,11 @@ class CortexTrainingClient:
         self._kept_sessions: _artifact_download.KeptSessions | None = None
         self._experiment_runs: OrderedDict[str, tuple[str, str]] = OrderedDict()
         self._experiment_runs_lock = threading.Lock()
+        # (run URI, job id, stream's chunk pattern, sub-job id) -> the one root a listing of both
+        # found the sub-job's chunks of that stream under, and when (monotonic); see
+        # _list_gzip_chunks. for_job() children share it too.
+        self._artifact_roots_seen: OrderedDict[tuple[str, str, str, str], tuple[str, float]] = OrderedDict()
+        self._artifact_roots_lock = threading.Lock()
         self._auth_provider: SnowflakeProfileAuth | None = None
         # job_id -> monotonic time this client created it (see _definitive_not_found).
         self._recently_created_jobs: dict[str, float] = {}
@@ -2938,37 +2974,48 @@ class CortexTrainingClient:
             logger.debug("Could not read the session's role.", exc_info=True)
             return None
 
-    def _database_error(self, response: requests.Response) -> DatabaseAccessError:
-        """Explain an HTTP 400 with code 517602: the configured database or schema can't be found."""
+    def _schema_not_found_error(self, response: requests.Response) -> DatabaseAccessError:
+        """Explain an HTTP 400 saying the configured schema can't be found."""
         role = self._current_role()
-        who = f"Role {role}" if role else "Role <ROLE> (couldn't determine your role)"
+        sent_headers = getattr(getattr(response, "request", None), "headers", None) or self._session.headers
+        sent_pat = sent_headers.get("X-Snowflake-Authorization-Token-Type") == "PROGRAMMATIC_ACCESS_TOKEN"
+        if role:
+            who = f"Role {role}"
+        elif sent_pat:
+            who = "Your PAT's role (its role restriction, or your user's DEFAULT_ROLE if it has none)"
+        else:
+            who = "Role <ROLE> (couldn't determine your role)"
         grantee = role or "<ROLE>"
         source = ""
         if self._auth_provider is not None:
             profile = getattr(self._auth_provider, "connection_name", None)
             source = f" (from profile {profile})" if profile else " (from your default Snowflake profile)"
         database, schema = self.database, self.schema
-        if schema.upper() == "PUBLIC":
-            kind, name, statement = "database", database, f"CREATE DATABASE IF NOT EXISTS {database}"
-            lines = [
-                f"{who} can't find database {database}{source}.",
-                f"- If it doesn't exist: run `{statement}` (or ask an admin to).",
-                f"- If it exists: ask an admin to run `GRANT USAGE ON DATABASE {database} TO ROLE {grantee}`.",
-            ]
-        else:
-            kind, name = "schema", f"{database}.{schema}"
-            create_database = f"CREATE DATABASE IF NOT EXISTS {database}"
-            create_schema = f"CREATE SCHEMA IF NOT EXISTS {database}.{schema}"
-            statement = f"{create_database}; {create_schema}"
-            lines = [
-                f"{who} can't find database {database} or its schema {schema}{source}.",
-                f"- If they don't exist: run `{create_database}` and `{create_schema}` (or ask an admin to).",
-                f"- If they exist: ask an admin to run `GRANT USAGE ON DATABASE {database} TO ROLE {grantee}` "
-                f"and `GRANT USAGE ON SCHEMA {database}.{schema} TO ROLE {grantee}`.",
-            ]
+        create_database = f"CREATE DATABASE IF NOT EXISTS {database}"
+        create_schema = f"CREATE SCHEMA IF NOT EXISTS {database}.{schema}"
+        # The server's message is the same whether the database or the schema is missing, or
+        # the role can't use either, so the explanation covers all three.
+        lines = [
+            f"{who} can't find database {database} or its schema {schema}{source}.",
+            f"- If they don't exist: run `{create_database}` and `{create_schema}` (or ask an admin to).",
+            f"- If they exist: ask an admin to run `GRANT USAGE ON DATABASE {database} TO ROLE {grantee}` "
+            f"and `GRANT USAGE ON SCHEMA {database}.{schema} TO ROLE {grantee}`.",
+        ]
+        if not role and sent_pat:
+            lines.insert(
+                1,
+                "- If that's the wrong role: restrict the PAT to a role that has access, or run "
+                "`ALTER USER <USER> SET DEFAULT_ROLE = <ROLE>`. Snowsight shows the token's role under "
+                "Settings > Authentication.",
+            )
         lines.append("- Or use another database: --database NAME / CORTEX_TRAINING_DATABASE.")
         return DatabaseAccessError(
-            "\n".join(lines), response=response, kind=kind, name=name, role=role, statement=statement
+            "\n".join(lines),
+            response=response,
+            kind="schema",
+            name=f"{database}.{schema}",
+            role=role,
+            statement=f"{create_database}; {create_schema}",
         )
 
     def _redact_for_log(self, text: str) -> str:
@@ -3000,9 +3047,10 @@ class CortexTrainingClient:
     ) -> requests.Response:
         """Send one request with retries.
 
-        An HTTP 400 with code 517602 (the configured database or schema can't be
-        found) raises :class:`DatabaseAccessError`. ``explain_database=False``
-        leaves that answer as it is, for routes whose path names no database; a
+        An HTTP 400 saying the configured schema can't be found (code 517602,
+        "Schema ... is not found or not authorized") raises
+        :class:`DatabaseAccessError`. ``explain_database=False`` leaves that
+        answer as it is, for routes whose path names no database; a
         client from :meth:`for_job` always leaves it.
         """
         explain_database = explain_database and self._explain_database_errors
@@ -3134,9 +3182,9 @@ class CortexTrainingClient:
                 if (
                     explain_database
                     and status_code == 400
-                    and _response_error_code(resp) == _DATABASE_NOT_RESOLVED_CODE
+                    and _is_schema_not_found(resp)
                 ):
-                    raise self._database_error(resp)
+                    raise self._schema_not_found_error(resp)
                 try:
                     # requests.Response.raise_for_status() intentionally ignores 3xx.
                     if 300 <= resp.status_code < 400:
@@ -3763,6 +3811,8 @@ class CortexTrainingClient:
         client._kept_sessions = self._kept_sessions
         client._experiment_runs = self._experiment_runs
         client._experiment_runs_lock = self._experiment_runs_lock
+        client._artifact_roots_seen = self._artifact_roots_seen
+        client._artifact_roots_lock = self._artifact_roots_lock
         return client
 
     @_track_operation("cancel_job")
@@ -3987,11 +4037,13 @@ class CortexTrainingClient:
         run_uri: str,
         run_name: str,
         artifact_root: str,
+        *,
+        within: str | None = None,
     ) -> list[str]:
         """List safe run-relative file paths below ``artifact_root``."""
         return sorted(
             CortexTrainingClient._list_experiment_artifact_files(
-                connection, run_uri, run_name, artifact_root
+                connection, run_uri, run_name, artifact_root, within=within
             )
         )
 
@@ -4001,12 +4053,20 @@ class CortexTrainingClient:
         run_uri: str,
         run_name: str,
         artifact_root: str,
+        *,
+        within: str | None = None,
     ) -> dict[str, dict[str, Any]]:
         """Map each safe run-relative path below ``artifact_root`` to what LIST
         reported about it: ``size``, ``md5`` and ``last_modified`` (``None``
-        when a column is missing)."""
+        when a column is missing).
+
+        A file outside ``artifact_root`` is an error, unless ``within`` (an
+        ancestor of ``artifact_root``) is given and holds it: such a file is left
+        out, as from a LIST that matched ``artifact_root`` without its final ``/``.
+        """
         root = artifact_root.strip("/") + "/"
         _validate_artifact_relative_path(root.removesuffix("/"))
+        allowed = root if within is None else within.strip("/") + "/"
         cursor = connection.cursor()
         try:
             rows = cursor.execute(
@@ -4026,11 +4086,13 @@ class CortexTrainingClient:
             relative_path = _validate_artifact_relative_path(
                 name.removeprefix(run_prefix)
             )
-            if not relative_path.startswith(root):
+            if not relative_path.startswith(allowed):
                 raise ValueError(
                     "experiment artifact LIST returned a file outside the "
-                    f"requested root {root!r}: {relative_path!r}"
+                    f"requested root {allowed!r}: {relative_path!r}"
                 )
+            if not relative_path.startswith(root):
+                continue
             # LIST columns: name, size, md5, last_modified.
             size = row[1] if len(row) > 1 and isinstance(row[1], int) and not isinstance(row[1], bool) else None
             files[relative_path] = {
@@ -5017,6 +5079,65 @@ class CortexTrainingClient:
                 raise
         return results
 
+    @staticmethod
+    def _scoped_sub_jobs(job_id: str, sub_job_ids: Iterable[str] | None) -> list[str] | None:
+        """The sub-job to list under its own prefix (a list of at most one), or None to list each root whole.
+
+        A named id that is not one of the job's sub-jobs has no chunks, so it is not
+        listed: an empty list means there is nothing to list. A LIST costs the service
+        a listing of the whole run whatever its prefix, so several named sub-jobs are
+        listed with the rest of their root, in one LIST, rather than one apiece;
+        so is one with characters _SCOPED_LIST_SUB_JOB_RE leaves out. The id is
+        returned as a plain ``str``: a subclass's (such as a ``str`` Enum member's)
+        own formatting would name another directory.
+        """
+        if sub_job_ids is None:
+            return None
+        scoped = sorted(
+            {
+                str.__str__(sub_job_id)
+                for sub_job_id in sub_job_ids
+                if isinstance(sub_job_id, str)
+                and sub_job_id not in {"", ".", ".."}
+                and (sub_job_id == job_id or sub_job_id.startswith(f"{job_id}:"))
+                and "/" not in sub_job_id
+                and "\\" not in sub_job_id
+            }
+        )
+        if len(scoped) > 1 or (scoped and _SCOPED_LIST_SUB_JOB_RE.fullmatch(scoped[0]) is None):
+            return None
+        return scoped
+
+    # A sub-job's root is looked up again, by listing both, once it is this old: this bounds
+    # how long chunks it starts saving under the other root go unseen.
+    _ARTIFACT_ROOT_RECHECK_SECONDS = 600.0
+    # Sub-jobs whose root is kept; the one noted longest ago is forgotten first.
+    _ARTIFACT_ROOTS_KEPT = 1024
+
+    def _known_artifact_root(self, key: tuple[str, str, str, str]) -> str | None:
+        """The one root a recent listing of both found the sub-job's chunks of the stream under."""
+        with self._artifact_roots_lock:
+            seen = self._artifact_roots_seen.get(key)
+        if seen is None or time.monotonic() - seen[1] >= self._ARTIFACT_ROOT_RECHECK_SECONDS:
+            return None
+        return seen[0]
+
+    def _note_artifact_roots(
+        self, run_uri: str, job_id: str, stream: str, by_root: Mapping[str, Mapping[str, Any]]
+    ) -> None:
+        """Remember each sub-job's root from a listing of both: the one holding its chunks of the
+        stream, if just one does. One with chunks under both is listed under both from then on."""
+        now = time.monotonic()
+        with self._artifact_roots_lock:
+            seen = self._artifact_roots_seen
+            for sub_job_id, roots in by_root.items():
+                key = (run_uri, job_id, stream, sub_job_id)
+                seen.pop(key, None)
+                if len(roots) == 1:
+                    seen[key] = (next(iter(roots)), now)
+            while len(seen) > self._ARTIFACT_ROOTS_KEPT:
+                seen.popitem(last=False)
+
     def _list_gzip_chunks(
         self,
         shared: _artifact_download.SharedConnection,
@@ -5026,6 +5147,7 @@ class CortexTrainingClient:
         artifact_name: str,
         chunk_pattern: re.Pattern[str],
         *,
+        sub_job_ids: Iterable[str] | None = None,
         report_merges: bool = True,
         cancel: threading.Event | None = None,
     ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
@@ -5036,38 +5158,61 @@ class CortexTrainingClient:
         chunks under both, they are merged by chunk name (which starts with the
         chunk's time), and a chunk name present in both keeps the
         ``_<name>/`` copy, so no output is dropped or repeated.
+
+        With ``sub_job_ids`` naming one of the job's sub-jobs, only it is listed,
+        under ``<root>/<sub_job_id>/`` (see :meth:`_scoped_sub_jobs`), so a LIST
+        returns its files rather than the whole run's, and only it is returned;
+        naming none of them lists nothing. While a recent listing of both found all
+        of that sub-job's chunks of this stream (those ``chunk_pattern`` matches)
+        under one root, only that root is listed, and the other too when that one
+        now holds none of them.
         """
         policy = self._artifact_retry_policy
         artifact_roots = (f"_{artifact_name}", f"checkpoints/_{artifact_name}")
+        scoped = self._scoped_sub_jobs(job_id, sub_job_ids)
+        if scoped == []:
+            return {}, {}
+        # The GPU and training streams share each root's directories, so each stream's root is
+        # remembered apart.
+        stream = chunk_pattern.pattern
+        known = (
+            None
+            if scoped is None
+            else self._known_artifact_root((run_uri, job_id, stream, scoped[0]))
+        )
 
         def listed(artifact_root: str) -> list[str]:
+            location = artifact_root if scoped is None else f"{artifact_root}/{scoped[0]}"
             return _artifact_download.call_with_retry(
                 shared,
                 policy,
-                f"LIST {artifact_root}",
+                f"LIST {location}",
                 lambda connection: self._list_experiment_artifacts(
-                    connection, run_uri, run_name, artifact_root
+                    connection, run_uri, run_name, location, within=artifact_root
                 ),
                 cancel,
             )
 
-        # Both at once, each on its own cursor: a LIST is mostly round-trip latency.
-        later = _artifact_download.Beside(
-            functools.partial(listed, artifact_roots[1]), name="cortex-training-list"
-        )
-        try:
-            first = listed(artifact_roots[0])
-        except BaseException:
-            # The other listing runs on this download's session, which the caller closes or
-            # keeps next: not under it. One still running after a while is left to finish on a
-            # session that is then closed, never kept.
-            if not later.wait(_SIDE_LISTING_WAIT_SECONDS):
-                shared.abandon()
-            raise
-        listings = {artifact_roots[0]: first, artifact_roots[1]: later.result()}
+        if known is None:
+            # Both at once, each on its own cursor: a LIST is mostly round-trip latency.
+            later = _artifact_download.Beside(
+                functools.partial(listed, artifact_roots[1]), name="cortex-training-list"
+            )
+            try:
+                first = listed(artifact_roots[0])
+            except BaseException:
+                # The other listing runs on this download's session, which the caller closes or
+                # keeps next: not under it. One still running after a while is left to finish on a
+                # session that is then closed, never kept.
+                if not later.wait(_SIDE_LISTING_WAIT_SECONDS):
+                    shared.abandon()
+                raise
+            listings = {artifact_roots[0]: first, artifact_roots[1]: later.result()}
+        else:
+            listings = {known: listed(known)}
         by_root: dict[str, dict[str, dict[str, str]]] = {}
-        for artifact_root in artifact_roots:
-            paths = listings[artifact_root]
+
+        def sort_in(artifact_root: str, paths: list[str]) -> None:
             prefix = artifact_root + "/"
             for relative_path in paths:
                 after_root = relative_path.removeprefix(prefix)
@@ -5087,6 +5232,20 @@ class CortexTrainingClient:
                 by_root.setdefault(sub_job_id, {}).setdefault(artifact_root, {})[
                     filename
                 ] = relative_path
+
+        for artifact_root, paths in listings.items():
+            sort_in(artifact_root, paths)
+        if known is not None and scoped[0] not in by_root:
+            # None of its chunks where they were: look under the other root before calling
+            # it empty.
+            other = next(root for root in artifact_roots if root != known)
+            sort_in(other, listed(other))
+            known = None
+        if known is None:
+            # A sub-job listed alone and found under neither root is forgotten: its next listing
+            # lists both at once.
+            noted = by_root if scoped is None else {scoped[0]: by_root.get(scoped[0], {})}
+            self._note_artifact_roots(run_uri, job_id, stream, noted)
 
         chunks: dict[str, list[str]] = {}
         warnings: dict[str, list[str]] = {}
@@ -5270,6 +5429,7 @@ class CortexTrainingClient:
                     job_id,
                     "stdout",
                     _STDOUT_CHUNK_RE,
+                    sub_job_ids=wanted,
                     report_merges=False,
                     cancel=cancel,
                 )
@@ -5334,7 +5494,8 @@ class CortexTrainingClient:
         """Explain each sub-job of an ended job that saved stdout but no metrics."""
         try:
             stdout_chunks, _ = self._list_gzip_chunks(
-                shared, run_uri, run_name, job_id, "stdout", _STDOUT_CHUNK_RE, report_merges=False
+                shared, run_uri, run_name, job_id, "stdout", _STDOUT_CHUNK_RE,
+                sub_job_ids=wanted, report_merges=False,
             )
         except Exception:
             logger.debug("stdout listing for missing-metrics warnings failed", exc_info=True)
@@ -5491,12 +5652,12 @@ class CortexTrainingClient:
         try:
             started = time.monotonic()
             chunks_by_sub_job, warnings_by_sub_job = self._list_gzip_chunks(
-                shared, run_uri, run_name, job_id, artifact_name, chunk_pattern
+                shared, run_uri, run_name, job_id, artifact_name, chunk_pattern, sub_job_ids=wanted
             )
             values["list_ms"] = round((time.monotonic() - started) * 1000, 3)
             # The stall check reads the job status (one REST call, plus a
-            # stdout listing for metrics); it runs while chunks are fetched so
-            # it adds no time to the download.
+            # stdout listing of the same sub-jobs for metrics); it runs while
+            # chunks are fetched so it adds no time to the download.
             stall_check = None
             if stale_after_seconds is not None:
                 stall_check = _artifact_download.Background(
@@ -5530,6 +5691,15 @@ class CortexTrainingClient:
                 missing = sorted(wanted - set(chunks_by_sub_job) - unsaved)
                 if missing:
                     available = sorted(chunks_by_sub_job)
+                    if self._scoped_sub_jobs(job_id, wanted) is not None:
+                        # The listing of one sub-job alone found only its chunks: the error names
+                        # every sub-job with some, from a listing of the whole job.
+                        relisted = time.monotonic()
+                        everyone, _ = self._list_gzip_chunks(
+                            shared, run_uri, run_name, job_id, artifact_name, chunk_pattern, report_merges=False
+                        )
+                        values["list_ms"] = round(values["list_ms"] + (time.monotonic() - relisted) * 1000, 3)
+                        available = sorted(set(everyone) - set(missing))
                     raise NoChunksError(
                         f"no {progress_label} chunks for sub-job(s) "
                         f"{', '.join(missing)}; sub-jobs with {progress_label}: "
@@ -5670,9 +5840,10 @@ class CortexTrainingClient:
         download, keeps the chunks already written for ``resume=True``, and is
         re-raised; raise :class:`DownloadCancelled` to cancel without the call
         being counted as a failure. The return value is unchanged.
-        ``sub_job_ids`` limits the download to those sub-jobs. A chunk that will
-        not decompress is downloaded once more and then skipped; it is listed in
-        that sub-job's ``skipped_chunks`` and ``warnings``. ``strict=True``
+        ``sub_job_ids`` limits the download to those sub-jobs; naming one also
+        limits the listing to its chunks rather than the whole run's. A chunk that
+        will not decompress is downloaded once more and then skipped; it is listed
+        in that sub-job's ``skipped_chunks`` and ``warnings``. ``strict=True``
         raises instead. While the job is running, a sub-job whose newest chunk is
         older than ``stale_after_seconds`` (default 600; ``None`` disables) gets
         a warning that uploads may be stalled; the download still completes.
@@ -5957,6 +6128,7 @@ class CortexTrainingClient:
         sampling_params,
         routing_key,
         strict,
+        sub_job_id: str | None = None,
     ) -> bytes:
         """Encode a generate request body, for both the unary and stream calls.
 
@@ -5969,7 +6141,7 @@ class CortexTrainingClient:
 
         ``op`` only names the caller in the length-check error message.
         """
-        self._check_prompt_lengths(op, job_id, prompts)
+        self._check_prompt_lengths(op, job_id, prompts, sub_job_id)
         # Packed after validation so the check above still reads plain lists,
         # and so a rejected prompt is never converted for nothing.
         payload: dict = {"prompts": _pack_token_prompts(prompts)}
@@ -5995,39 +6167,69 @@ class CortexTrainingClient:
                 "bring the serialized request under the limit."
             )
 
-    def _resolve_sampling_max_seq_len(self, job_id: str) -> int | None:
-        """Return the sampling sub-job's ``max_seq_len``, or ``None`` if unknown.
+    def _resolve_sampling_max_seq_len(self, job_id: str, sub_job_id: str | None = None) -> int | None:
+        """Return a sampling sub-job's ``max_seq_len``, or ``None`` if unknown.
 
-        The value is read from the job's sampling ``inference_config`` (the same
-        number the backend launches vLLM with as ``max_model_len``) and cached
-        per ``job_id``. A successful lookup — including a definitive "no sampling
-        sub-job" miss — is cached; a transient ``get_job`` failure is not, so a
-        later call retries rather than disabling validation permanently.
+        The value is read from the sub-job's ``inference_config`` (the same number
+        the backend launches vLLM with as ``max_model_len``) and cached per
+        ``(job_id, sub_job_id)``. A successful lookup — including a definitive
+        "no sampling sub-job" miss — is cached; a transient ``get_job`` failure is
+        not, so a later call retries rather than disabling validation permanently.
+
+        ``sub_job_id`` selects one sub-job. Without it, the value is only resolved
+        when the job has exactly one sampling sub-job: guessing between several
+        risks rejecting a prompt the chosen zone would have accepted, so ``None``
+        (validation skipped) is returned instead and the server decides.
+
+        Only ``job_type == "sampling"`` sub-jobs are considered. ``log_prob``
+        sub-jobs also carry an ``inference_config``, and its window has no bearing
+        on where a generate request runs.
         """
-        if job_id in self._sampling_max_seq_len:
-            return self._sampling_max_seq_len[job_id]
+        cache_key = (job_id, sub_job_id)
+        if cache_key in self._sampling_max_seq_len:
+            return self._sampling_max_seq_len[cache_key]
         try:
             job = self.get_job(job_id)
         except Exception:
             # Don't let a transient lookup failure break generate, and don't
             # cache the miss — the real request will surface any hard error.
             return None
-        max_seq_len: int | None = None
-        for sub in job.get("sub_jobs", []) or []:
-            if not isinstance(sub, dict):
-                continue
+
+        def _window(sub: dict) -> int | None:
             cfg = sub.get("inference_config")
             if not isinstance(cfg, dict):
-                continue
+                return None
             raw = cfg.get("max_seq_len")
             # Proto numbers can arrive as floats (e.g. 2048.0); coerce to int.
             if isinstance(raw, (int, float)) and raw > 0:
-                max_seq_len = int(raw)
-                break
-        self._sampling_max_seq_len[job_id] = max_seq_len
+                return int(raw)
+            return None
+
+        # A sub-job record flattens its config into the record, so job_type sits at
+        # the top level. The REST schema accepts it case-insensitively, so normalise.
+        sampling = [
+            sub
+            for sub in (job.get("sub_jobs", []) or [])
+            if isinstance(sub, dict) and str(sub.get("job_type", "")).lower() == JobType.SAMPLING.value
+        ]
+        max_seq_len: int | None = None
+        if sub_job_id is not None:
+            for sub in sampling:
+                if sub.get("sub_job_id") == sub_job_id:
+                    max_seq_len = _window(sub)
+                    break
+        elif len(sampling) == 1:
+            max_seq_len = _window(sampling[0])
+        self._sampling_max_seq_len[cache_key] = max_seq_len
         return max_seq_len
 
-    def _check_prompt_lengths(self, op: str, job_id: str, prompts: list[str | list[int]]) -> None:
+    def _check_prompt_lengths(
+        self,
+        op: str,
+        job_id: str,
+        prompts: list[str | list[int]],
+        sub_job_id: str | None = None,
+    ) -> None:
         """Fail fast when a pre-tokenized prompt cannot fit the sampling window.
 
         Mirrors vLLM's decoder-prompt check (``vllm/v1/engine/input_processor``):
@@ -6063,7 +6265,7 @@ class CortexTrainingClient:
 
         if not any(_pretokenized(p) for p in prompts):
             return
-        max_seq_len = self._resolve_sampling_max_seq_len(job_id)
+        max_seq_len = self._resolve_sampling_max_seq_len(job_id, sub_job_id)
         if max_seq_len is None:
             return
         for i, prompt in enumerate(prompts):
@@ -6092,6 +6294,7 @@ class CortexTrainingClient:
         force_chunk: bool = False,
         allow_group_restart: bool = False,
         debug_context: dict[str, Any] | None = None,
+        sub_job_id: str | None = None,
     ) -> dict:
         chunks = wire.encode_byte_chunks(
             frame,
@@ -6117,6 +6320,7 @@ class CortexTrainingClient:
                     f"{self._prefix}/{job_id}/{path_suffix}",
                     data=chunk,
                     headers={"Content-Type": "application/octet-stream"},
+                    **_sub_job_id_params(sub_job_id),
                     retry_on=(_is_chunk_post_transient if allow_group_restart else _is_transient),
                     debug_context=debug_context,
                 )
@@ -6204,6 +6408,7 @@ class CortexTrainingClient:
         sampling_params: dict | list[dict | None] | None = None,
         routing_key: str | list[str | None] | None = None,
         strict: bool | None = None,
+        sub_job_id: str | None = None,
     ) -> str:
         """Submit a generate request to a sampling sub-job. Returns request_id.
 
@@ -6223,14 +6428,26 @@ class CortexTrainingClient:
           would require replicating the server tokenizer (including special
           tokens), so an over-long string instead fails server-side in vLLM
           with a ``maximum model length`` error rather than client-side.
+
+        Args:
+            sub_job_id: Optional. Which sampling sub-job runs the request, e.g.
+                ``"{job_id}:sampling:1"``; discover the ids from
+                :meth:`get_job`'s ``sub_jobs``. Sent as a query parameter, since
+                the body is an opaque frame. If omitted, no ``sub_job_id`` is
+                sent and the server chooses the sub-job; currently that is the
+                job's only sampling sub-job, and a job with several rejects the
+                request and lists the valid ids.
         """
-        body = self._build_generate_frame("generate", job_id, prompts, sampling_params, routing_key, strict)
+        body = self._build_generate_frame(
+            "generate", job_id, prompts, sampling_params, routing_key, strict, sub_job_id
+        )
         response = self._post_octet_request_chunks(
             job_id=job_id,
             path_suffix="generate",
             operation="generate",
             frame=body,
             max_bytes=self._MAX_GENERATE_BYTES,
+            sub_job_id=sub_job_id,
         )
         request_id = response["request_id"]
         self._generate_request_ids.add(request_id)
@@ -6244,6 +6461,7 @@ class CortexTrainingClient:
         sampling_params: dict | list[dict | None] | None = None,
         routing_key: str | list[str | None] | None = None,
         strict: bool | None = None,
+        sub_job_id: str | None = None,
     ) -> dict:
         """Start a streaming generate request. Returns the response body.
 
@@ -6259,14 +6477,21 @@ class CortexTrainingClient:
         prompts are checked client-side against the sampling sub-job's
         ``max_seq_len`` and fail fast, while over-long string prompts are left
         to fail server-side in vLLM (see :meth:`generate`).
+
+        Args:
+            sub_job_id: Optional. Which sampling sub-job runs the request; see
+                :meth:`generate` for the format and when it may be omitted.
         """
-        body = self._build_generate_frame("generate_stream", job_id, prompts, sampling_params, routing_key, strict)
+        body = self._build_generate_frame(
+            "generate_stream", job_id, prompts, sampling_params, routing_key, strict, sub_job_id
+        )
         self._check_generate_payload("generate_stream", body)
         resp = self._send(
             "POST",
             f"{self._prefix}/{job_id}/generate-stream",
             data=body,
             headers={"Content-Type": "application/octet-stream"},
+            **_sub_job_id_params(sub_job_id),
         )
         return resp.json()
 

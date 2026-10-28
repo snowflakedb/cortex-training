@@ -1134,6 +1134,7 @@ request_id = client.generate(
     sampling_params={"max_tokens": 64, "temperature": 0.7},
     routing_key="conversation-1",
     strict=False,
+    sub_job_id=f"{job_id}:sampling:1",   # optional
 )
 ```
 
@@ -1150,6 +1151,13 @@ Logical request object inside the DSSST1 frame:
 
 Rules:
 
+- `sub_job_id` is optional and names which sampling sub-job runs the request;
+  discover the ids from `get_job()`'s `sub_jobs`. It is sent as a **query
+  parameter** (`?sub_job_id=...`), not inside the frame, because the server routes
+  the request before it reads the DSSST1 body. If you omit it, the client sends no
+  `sub_job_id` and the server chooses the sub-job. Currently it uses the job's only
+  sampling sub-job, and rejects the request (listing the valid ids) when there are
+  several. Applies to `generate-stream` identically.
 - `prompts` is a list of string prompts and/or token-id lists. A flat list of
   integers such as `[1, 2, 3]`, and a bare 1-D tensor, are each read as one
   pre-tokenized prompt rather than as a batch. For a batch of several prompts,
@@ -2773,11 +2781,24 @@ in both keeps the `_stdout/` copy; the sub-job's result gets a warning.
 [section 12.4](#124-gpu-metrics-download)); that sub-job is written first, and
 without `sub_job_ids` there is no preview.
 
+The chunks are found with an experiment artifact `LIST` of each of the two
+roots. When `sub_job_ids` names one of the job's sub-jobs, the download lists
+only that sub-job's folder in each, `_stdout/{sub_job_id}/` and
+`checkpoints/_stdout/{sub_job_id}/`, so the listing returns that sub-job's
+chunks rather than the whole run's; naming several, or one whose id has
+characters other than letters, digits, `_`, `.`, `:` and `-`, lists the roots
+whole. Once
+a listing of both roots finds a sub-job's chunks under just one, the client,
+and every client `for_job()` makes from it, lists only that one for the
+sub-job's later downloads of the same kind of chunk that name it alone, until
+that finding is 10 minutes old; it lists the other root too when that one
+holds none of them. A sub-job with chunks under both roots has both listed.
+
 Each chunk is one experiment artifact `GET` into a private temporary directory.
 Up to `max_workers` (default 16) run at once on one Connector session, each on
 its own cursor; fetches may finish in any order, but chunks are appended
-strictly in sorted name order. The session, and the two listings that come
-first, are described in [section 12.7](#127-download-sessions). At most four fetched chunks per worker wait to
+strictly in sorted name order. The session, and the listings that come first,
+are described in [section 12.7](#127-download-sessions). At most four fetched chunks per worker wait to
 be appended, which bounds temporary disk use. `LIST` and `GET` are retried with
 bounded exponential backoff on transient Connector, network, and service
 errors; a session or token expiry reopens the session. Each `LIST` or `GET`
@@ -2868,7 +2889,9 @@ after saving any output, the exception carries
 `download_progress_saved = True`. `sub_job_ids` limits the download
 to those sub-jobs and raises `cortex_training.NoChunksError` (a `ValueError`
 with `sub_job_ids` and `available` attributes) before any `GET` if one has no
-chunks. Two downloads of the same output directory at once are unsupported.
+chunks. `available` names every other sub-job of the job that has chunks: a
+download that listed one sub-job alone then lists both roots whole to find them.
+Two downloads of the same output directory at once are unsupported.
 
 ### 12.4 GPU metrics download
 
@@ -2878,9 +2901,10 @@ stale_after_seconds=600, transfer_timeout_seconds=300, priority=(),
 on_commit=None, preview_seconds=None, on_preview=None)`
 applies the same reconstruction to
 `gpu.YYYYMMDD-HHMMSS.UUID.gz` chunks under `_metrics/{sub_job_id}/` and writes
-`<output_dir>/<sub_job_id>/gpu.jsonl`, including the options, retries, and the
-manifests beside that file. Unless `stale_after_seconds` is `None`, it also reads
-the job status. While the job is running it lists `_stdout/` too, and a running
+`<output_dir>/<sub_job_id>/gpu.jsonl`, including the options, listing, retries,
+and the manifests beside that file. Unless `stale_after_seconds` is `None`, it
+also reads the job status. While the job is running it also lists stdout
+chunks, limited by `sub_job_ids` as its metrics listing is, and a running
 sub-job that has had stdout chunks for at least two minutes (judged from its
 first stdout chunk and `state_changed_at`) but no metrics chunks is returned
 with `chunk_count` 0,
@@ -3036,10 +3060,13 @@ job's experiment run once and reuses it, since a job's run never changes: they
 share what they read, and remember the newest 256 jobs' runs. A failed read is
 not kept, so the next call tries again. A chunked download (stdout, GPU
 metrics, training metrics) lists its two roots, `_{name}/` and
-`checkpoints/_{name}/`, at the same time, each on its own cursor. If the first
-listing fails, the download waits up to 10 seconds for the second, which runs
-on the same session, before it closes that session; one still running then
-finishes on a session that is closed, never kept.
+`checkpoints/_{name}/` (for one sub-job, its folder in each: see
+[section 12.3](#123-persisted-stdout-download)), at the same time, each on its
+own cursor; one that lists only the root it knows for the sub-job makes one
+listing, then one of the other root if that one holds none of the sub-job's
+chunks. If the first listing fails, the download waits up to 10 seconds for
+the second, which runs on the same session, before it closes that session; one
+still running then finishes on a session that is closed, never kept.
 
 A PAT client opens its sessions with `platform_detection_timeout_seconds=0`
 (Connector 3.17.2 and later), which skips the Connector's cloud-metadata

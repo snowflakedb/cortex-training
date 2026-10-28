@@ -21,6 +21,8 @@ package. This module re-exports the public client surface, so
 ``from cortex_training.client import CortexTrainingClient`` keeps working.
 """
 
+from cortex_training.client._account_jobs import AccountJobListUnavailable
+from cortex_training.client._account_jobs import InvalidPageToken
 from cortex_training.client.core import DEBUG_OPTIONS_ENV
 from cortex_training.client.core import DISABLE_TELEMETRY_ENV
 from cortex_training.client.core import DISABLE_TENSOR_PROMPTS_ENV
@@ -29,7 +31,6 @@ from cortex_training.client.core import CLI_SURFACE
 from cortex_training.client.core import SDK_SURFACE
 from cortex_training.client.core import SURFACE_ATTRIBUTE
 from cortex_training.client.core import TUI_SURFACE
-from cortex_training.client.core import AccountJobListUnavailable
 from cortex_training.client.core import ChunkGroupConflictError
 from cortex_training.client.core import ChunkGroupError
 from cortex_training.client.core import ChunkGroupRestartError
@@ -38,7 +39,6 @@ from cortex_training.client.core import DatabaseAccessError
 from cortex_training.client.core import DownloadCancelled
 from cortex_training.client.core import Hardware
 from cortex_training.client.core import InferenceConfig
-from cortex_training.client.core import InvalidPageToken
 from cortex_training.client.core import JobType
 from cortex_training.client.core import ModelDeploymentSpec
 from cortex_training.client.core import NoChunksError
