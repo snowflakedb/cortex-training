@@ -778,7 +778,9 @@ def _runtime_error_from_logs(client: CortexTrainingClient, job_id: str) -> str |
             if match not in unique:
                 unique.append(match)
         return "\n".join(unique[-5:])
-    return errors[-1][:2000]
+    # Whole record: these are tracebacks from the worker, and the innermost frames
+    # that name the failure are at the end.
+    return errors[-1]
 
 
 @contextlib.contextmanager

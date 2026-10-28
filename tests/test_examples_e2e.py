@@ -10,9 +10,6 @@ needs network access. These submit real jobs on real GPUs:
     CORTEX_TRAINING_E2E_CONFIG=~/conn.json python -m pytest tests/test_examples_e2e.py -v -s
 
 If DEBUG_IMAGE_TAG is set, every example also gets debug_image_tag=<tag>.
-
-Each case's output is printed in full once the example exits, rather than left
-on the inherited descriptors -- see :func:`_run` for why.
 """
 
 from __future__ import annotations
@@ -108,22 +105,18 @@ def dare_bench(tmp_path_factory):
     # Ignore the user's git config, so a URL rewrite or credential helper cannot redirect the clone.
     # Timeouts are several times the measured setup, so a hang fails this case instead of the whole run.
     git_env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
-    _run(
+    subprocess.run(
         ["git", "clone", "--quiet", "--filter=blob:none", DARE_BENCH_URL, str(checkout)],
-        label="dare_bench clone", timeout=600, env=git_env,
+        env=git_env, check=True, timeout=600,
     )
-    _run(
-        ["git", "-C", str(checkout), "checkout", "--quiet", DARE_BENCH_COMMIT],
-        label="dare_bench checkout", timeout=600, env=git_env,
+    subprocess.run(
+        ["git", "-C", str(checkout), "checkout", "--quiet", DARE_BENCH_COMMIT], env=git_env, check=True, timeout=600
     )
 
     sandbox = root / "sandbox"
-    _run([sys.executable, "-m", "venv", str(sandbox)], label="dare_bench venv", timeout=300)
+    subprocess.run([sys.executable, "-m", "venv", str(sandbox)], check=True, timeout=300)
     python = sandbox / "bin" / "python"
-    _run(
-        [str(python), "-m", "pip", "install", "--quiet", *DARE_SANDBOX_PACKAGES],
-        label="dare_bench pip install", timeout=1200,
-    )
+    subprocess.run([str(python), "-m", "pip", "install", "--quiet", *DARE_SANDBOX_PACKAGES], check=True, timeout=1200)
 
     # The script writes each task's verify/simulated_pred_local.csv, which the evaluator reads.
     bench_dir = checkout / "data" / "eval"
@@ -131,49 +124,18 @@ def dare_bench(tmp_path_factory):
     question_list = root / "question_list.json"
     tasks = [q for q in questions if q["task"] == DARE_TASK_TYPE]
     question_list.write_text(json.dumps(tasks), encoding="utf-8")
-    _run(
+    subprocess.run(
         [str(python), str(checkout / "scripts" / "reference_solution.py"),
          "--databases_dir", str(bench_dir / "databases"), "--question_list", str(question_list),
          "--output_dir", str(root / "reference"), "--execute"],
-        label="dare_bench reference solution", timeout=1800,
+        check=True,
+        timeout=1800,
     )
     # The script counts a failed task and still exits 0, so check its outputs here.
     missing = [q["file_path"] for q in tasks
                if not (bench_dir / "databases" / q["file_path"] / "verify" / "simulated_pred_local.csv").is_file()]
     assert not missing, f"reference_solution.py wrote no reference for {missing}"
     return {"bench_dir": bench_dir, "sandbox_python": python}
-
-
-def _run(command: list[str], *, label: str, timeout: float, env: dict[str, str] | None = None) -> None:
-    """Run ``command``, print everything it wrote, and fail if it did not succeed.
-
-    The output is captured and printed here, once, after the process is reaped,
-    rather than left on the descriptors it inherits. The test runner writes each
-    case's result to those same descriptors, and two writers on one pipe clipped
-    the large block a failing example writes as it exits -- which is exactly
-    where a server error carries the remote traceback.
-    """
-    try:
-        completed = subprocess.run(
-            command,
-            cwd=REPO_ROOT,
-            timeout=timeout,
-            stdout=subprocess.PIPE,
-            # Merged, so a traceback spanning both streams cannot interleave, and
-            # unbuffered, because a pipe would otherwise leave stdout block-buffered
-            # to flush at exit -- after the traceback that stderr already wrote.
-            stderr=subprocess.STDOUT,
-            env={**(env if env is not None else os.environ), "PYTHONUNBUFFERED": "1"},
-        )
-    except subprocess.TimeoutExpired as expired:
-        # The example has usually submitted a job already, which may still be running.
-        print((expired.output or b"").decode("utf-8", "replace"))
-        pytest.fail(f"{label} did not finish within {timeout:.0f}s: {' '.join(command)}")
-
-    print(completed.stdout.decode("utf-8", "replace"))
-    assert completed.returncode == 0, (
-        f"{label} exited with status {completed.returncode}: {' '.join(command)}"
-    )
 
 
 @pytest.mark.skipif(CONFIG is None, reason="set CORTEX_TRAINING_E2E_CONFIG to a connection file to run the examples")
@@ -197,4 +159,10 @@ def test_example_runs(name, tmp_path, request):
     if DEBUG_IMAGE_TAG:
         command.append(f"debug_image_tag={DEBUG_IMAGE_TAG}")
 
-    _run(command, label=name, timeout=TIMEOUT_SECONDS)
+    try:
+        result = subprocess.run(command, cwd=REPO_ROOT, timeout=TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        # The example has usually submitted a job already, which may still be running.
+        pytest.fail(f"{name} did not finish within {TIMEOUT_SECONDS}s: {' '.join(command)}")
+
+    assert result.returncode == 0, f"{name} exited with status {result.returncode}"
