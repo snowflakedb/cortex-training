@@ -494,6 +494,7 @@ def test_deepseek_v4_training_meshes_match_the_completed_h200_runs():
         assert training["max_seq_len"] == seq_len
         assert training["train_batch_size"] == 1
         assert training["attn_implementation"] == "eager"
+        assert training["model_provider"] == "arctic"
         assert training["ac_config"]["offload_config"]["enabled"] is True
         assert training["prime_rl"]["ep_comm_backend"] == "uccl"
         assert ds_config["bf16"]["bf16_optimizer_states"] is True
@@ -534,6 +535,7 @@ def test_deepseek_v41_training_meshes_match_the_completed_h200_runs():
         assert training["max_seq_len"] == seq_len
         assert training["train_batch_size"] == batch
         assert training["attn_implementation"] == "eager"
+        assert training["model_provider"] == "arctic"
         assert "offload_config" not in training["ac_config"]
         assert training["prime_rl"] == {"fused_cross_entropy": False, "ep_comm_backend": "uccl"}
         assert ds_config["bf16"]["bf16_optimizer_states"] is True
