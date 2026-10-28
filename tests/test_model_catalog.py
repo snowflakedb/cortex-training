@@ -936,8 +936,14 @@ def test_qwen38_sft_uses_chunked_logprob_loss(job, context):
     request = build_catalog_request(CATALOG_DIR, "Qwen/Qwen3.8-27B", job, context=context)
     training = request["sub_job_configs"][0]["training_config"]
 
-    # The 262,144-token long tier splits each sequence across eight GPUs.
-    assert training.get("sp_size", 1) == (8 if context == "long" else 1)
+    # Each sequence is split across eight GPUs. 256K full fine-tuning needs
+    # four of those groups; a larger sequence-parallel degree does not divide
+    # the attention heads.
+    assert training["sp_size"] == 8
+    if context == "long" and job == "training-full":
+        assert (training["n_gpus"], training["train_batch_size"]) == (32, 4)
+    else:
+        assert (training["n_gpus"], training["train_batch_size"]) == (8, 1)
     assert training["fused_lm_head_token_chunk_size"] == 8192
 
     spec = build_forward_backward_probe_spec(
