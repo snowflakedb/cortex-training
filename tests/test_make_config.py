@@ -91,15 +91,15 @@ def test_the_default_rl_job_is_four_training_and_two_sampling_gpus_with_sft_beta
 
 
 def test_a_missing_combination_names_the_files_that_exist():
-    # Qwen3.5-9B ships only long-context files, so a standard RL build cannot find
-    # the standard training file and names the files that do exist.
+    # Qwen3.5-9B's long tier has no LoRA files, so a long LoRA RL build cannot find
+    # the long training file and names the files that do exist.
     with pytest.raises(FileNotFoundError) as raised:
-        make_config("Qwen/Qwen3.5-9B", "standard", lora=True, rl=True)
+        make_config("Qwen/Qwen3.5-9B", "long", lora=True, rl=True)
 
     assert str(raised.value) == (
-        "Qwen/Qwen3.5-9B has no standard/h200-training-lora.json in the model catalog; its files "
-        "are: long/h200-inference-full.json, long/h200-inference-lora.json, long/h200-training-full.json, "
-        "long/h200-training-lora.json"
+        "Qwen/Qwen3.5-9B has no long/h200-training-lora.json in the model catalog; its files "
+        "are: long/h200-inference-full.json, long/h200-training-full.json, standard/h200-inference-full.json, "
+        "standard/h200-inference-lora.json, standard/h200-training-full.json, standard/h200-training-lora.json"
     )
 
 
@@ -727,11 +727,13 @@ def test_the_command_line_writes_stdout_for_a_dash(capsys):
 
 
 def test_the_command_line_reports_a_missing_combination(tmp_path, capsys):
-    # Qwen3.5-9B is long-context only, so a standard RL build has no standard file.
-    status = utils.main(["--model", "Qwen/Qwen3.5-9B", "--context", "standard", "--rl", "-o", str(tmp_path / "x.json")])
+    # Qwen3.5-9B's long tier has no LoRA files, so a long LoRA RL build has no file.
+    status = utils.main(
+        ["--model", "Qwen/Qwen3.5-9B", "--context", "long", "--lora", "--rl", "-o", str(tmp_path / "x.json")]
+    )
 
     assert status == 1
-    assert "error: Qwen/Qwen3.5-9B has no standard/h200-training-full.json" in capsys.readouterr().err
+    assert "error: Qwen/Qwen3.5-9B has no long/h200-training-lora.json" in capsys.readouterr().err
     assert not (tmp_path / "x.json").exists()
 
 

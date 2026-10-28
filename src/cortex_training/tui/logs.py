@@ -264,6 +264,15 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
         self._resource_window_error: tuple[str, str] | None = None
         self._resource_range = DEFAULT_RANGE
         self._resource_downloaded = False
+        # When (monotonic) the newest successful whole-job download started and, per sub-job, the
+        # newest successful download of it alone; the sub-jobs that whole-job download found chunks
+        # for, less any a download alone has found none for since (see _resource_scope); the
+        # sub-job the download running now is of, alone; and an r to do once it ends.
+        self._resource_full_at: float | None = None
+        self._resource_alone_at: dict[str, float] = {}
+        self._resource_with_chunks: set[str] = set()
+        self._resource_loading_scope: str | None = None
+        self._resource_whole_pending = False
         self._resource_progress: dict[str, tuple[int, int]] = {}  # per sub-job, a download's (chunks done, of them)
         self._resource_ticker = None
         self._resource_pick: str | None = None
@@ -423,16 +432,18 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
             # job screen: the place to look when a job's first chart is slow.
             log_traceback(f"getting {self._job_id}'s downloads ready failed")
 
-    def _download_training_metrics(self, *, priority, on_commit, cancelled) -> bool:
+    def _download_training_metrics(self, *, priority, on_commit, cancelled, sub_job_ids=None) -> bool:
         """Worker thread. The Training metrics tab's download: the zone's own training rows,
         into the same cache directory as the Resources tab's GPU file and under the same
         :class:`DownloadLock`, so the two tabs (and the CLI) don't write that directory at
-        once. The streams are separate, so this fetches its own chunks. False when the
+        once. The streams are separate, so this fetches its own chunks, only those of
+        ``sub_job_ids`` when given (and the client takes them). False when the
         screen closed (or ``cancelled()``) before the lock was taken."""
         lock = DownloadLock(self._metrics_root)
         if not lock.acquire(lambda: self._screen_open and not cancelled()):
             return False
         before = telemetry_bytes(self._metrics_root)
+        alone = {"sub_job_ids": sub_job_ids} if sub_job_ids else {}
         try:
             self._client.download_training_metrics(
                 self._job_id,
@@ -441,6 +452,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
                 priority=priority,
                 on_commit=on_commit,
                 **_quiet_download(self._client.download_training_metrics),
+                **_download_options(self._client.download_training_metrics, alone),
             )
         finally:
             lock.release()
@@ -558,7 +570,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
             pane.action_refresh()
             return
         if self._resource_active():
-            self._start_resource_refresh(force=True)
+            self._start_resource_refresh(force=True, whole=True)  # every sub-job, as a first download
             return
         if self._checkpoints_active():
             self._start_checkpoint_refresh(force=True)
@@ -618,14 +630,19 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
             merged.update(dict.fromkeys(table.get(source, [])))
         return list(merged)
 
-    def _accept_download_warnings(self, kind: str, warnings: dict) -> None:
-        """UI thread. Keep one download's warnings and show them on the lines that carry them."""
+    def _accept_download_warnings(self, kind: str, warnings: dict, covered: list | None = None) -> None:
+        """UI thread. Keep one download's warnings and show them on the lines that carry them.
+        A metrics download of the ``covered`` sub-jobs alone leaves the others' as they were."""
         if not self._screen_open:
             return
         if kind == "stdout":
             self._stdout_warnings.update(warnings)
-        else:
+        elif covered is None:
             self._metrics_warnings = warnings
+        else:
+            kept = {sub_job_id: messages for sub_job_id, messages in self._metrics_warnings.items()
+                    if sub_job_id not in covered}
+            self._metrics_warnings = {**kept, **warnings}
         self._update_subtitle()
         if self._resource_active():
             self._render_resource()

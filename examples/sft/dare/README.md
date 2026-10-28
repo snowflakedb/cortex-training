@@ -70,11 +70,19 @@ The evaluator refuses to start if a reference file is missing.
 
 ## Run
 
-Training defaults to full-parameter Qwen3-8B at standard context on four H200
+Training defaults to full-parameter Qwen3-8B at standard context on eight H200
 GPUs, with `lr=1e-5`, `train_batch_size=32`, a cosine schedule, thinking on,
 and 120 steps, logging `valid_nll` every 10 steps (`eval_every=`). It takes the
 same job arguments as the [conversational SFT example](../README.md#options);
 run it with `--help` for the full list. Evaluation serves the model on two GPUs.
+
+The GPU count comes from [`overrides.json`](overrides.json), which sets
+`n_gpus` to 8 for every catalog-built DARE run, whatever `model=` you pick. It
+also drops the `ds_config` batch fields some catalog files spell out for their
+own GPU count, so the server derives them for 8 GPUs.
+A model whose catalog `sp_size` or `ep_size` does not divide 8 (GLM-5.3-Flash-BF16
+uses 16) stops with an error before anything is submitted; edit that file or
+pass `job_config=` for it.
 
 ```bash
 # 1. Baseline

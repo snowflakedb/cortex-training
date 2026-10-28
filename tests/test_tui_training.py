@@ -289,9 +289,11 @@ def test_chart_runs_from_the_lowest_value_and_labels_steps():
     lines = _text(training.chart_spans(series, None, 40, height=4))
     assert lines[0].startswith(" 0.5 ┤") and lines[-2].startswith("-0.5 └")
     assert all(len(line) <= 40 for line in lines)
-    # Few steps: each is as many columns wide, and the lowest still draws.
+    # Few steps: each is as many columns wide (give or take one) across the whole chart, and the lowest
+    # still draws.
     bars = lines[-3][len("-0.5 │"):]
-    assert bars.count(bars[0]) == len(bars) // 3 and bars[0] != " "
+    assert len(bars) == 40 - len("-0.5 │")
+    assert bars.count(bars[0]) in (len(bars) // 3, len(bars) // 3 + 1) and bars[0] != " "
     assert lines[-1].split() == ["1", "2", "3"]
 
 
@@ -313,6 +315,15 @@ def test_a_window_longer_than_the_history_starts_at_the_first_step():
     gappy = _parse([_step(step, x=1.0) for step in (1, 2, 9, 10)])
     lines = _text(training.chart_spans(gappy.metrics(STEP)[0], 5, 40, height=4))
     assert lines[-1].split()[0] == "5"
+
+
+def test_a_window_of_fewer_steps_than_columns_spans_the_chart():
+    # 20 steps across 34 columns: a whole number of columns each would leave 14 blank after the newest.
+    series = _parse([_step(step, x=float(step)) for step in range(1, 21)]).metrics(STEP)[0]
+    *rows, baseline, steps = _text(training.chart_spans(series, None, 40, height=4))
+    assert all(len(row) == 40 for row in rows) and rows[0][-1] == "█"  # the newest step is the highest
+    assert baseline == "   1 └" + "─" * 34
+    assert steps.endswith("20") and len(steps) == 40
 
 
 def test_chart_of_a_flat_series_and_of_an_empty_window():
