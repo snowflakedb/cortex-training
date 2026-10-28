@@ -316,6 +316,7 @@ Paths are relative to the prefix in [section 2.1](#21-base-url).
 |---|---|---|---|
 | `/` | `POST` | `create_job`, `create_job_from_body` | Create a job |
 | `/` | `GET` | `list_jobs` | List jobs, optionally filtered by status |
+| `/api/v2/cortex-training/models` | `GET` | `list_models` | Account-level active models; not under the schema prefix |
 | `/capacity` | `GET` | `get_capacity`, `get_capacity_breakdown` | Account reservation and GPU usage, optionally broken down |
 | `/{job_id}` | `GET` | `get_job`, `wait_for_job` | Job and sub-job status |
 | `/{job_id}:cancel` | `POST` | `cancel_job` | Cancel a job |
@@ -586,7 +587,22 @@ whole one, so that location's jobs are read whole rather than filtered out of
 the newest jobs the walk reads; see the job list in `docs/reference/cli.md`. A
 page token is only sent back with the filters it was made under, as above.
 
-### 5.4 Capacity - `GET /capacity`
+### 5.4 List models - `GET /api/v2/cortex-training/models`
+
+This account-scoped endpoint returns active models configured for new jobs.
+It is not under the database and schema prefix. The server resolves the
+account from the authenticated session:
+
+```json
+{"models": [{"name": "Qwen/Qwen3-8B"}]}
+```
+
+`CortexTrainingClient.list_models()` returns only the `models` list. The CLI
+`models` command restores the server-shaped envelope. This response is policy
+discovery, not a cache or capacity guarantee; a listed model can still wait for
+weight synchronization or enough GPUs for a particular job shape.
+
+### 5.5 Capacity - `GET /capacity`
 
 This account-scoped endpoint takes no account id from the caller. The server
 resolves the account from the authenticated session. Besides `hardware`
@@ -760,7 +776,7 @@ It fills missing counts with `0` and always lists the three known job types
 when there are groups. The CLI exposes it as
 [`capacity --breakdown`](cli.md#capacity-breakdown).
 
-### 5.5 Cancel job - `POST /{job_id}:cancel`
+### 5.6 Cancel job - `POST /{job_id}:cancel`
 
 No body. Pending, placing, and running jobs enter cancellation. Repeating a
 cancel while a job is cancelling or already cancelled is an idempotent success.
@@ -768,7 +784,7 @@ Terminated or failed jobs return a precondition/conflict-style error.
 
 `cancel_job()` returns `None`.
 
-### 5.6 Experiment run - `GET /{job_id}/experiment-run`
+### 5.7 Experiment run - `GET /{job_id}/experiment-run`
 
 ```json
 {
@@ -779,7 +795,7 @@ Terminated or failed jobs return a precondition/conflict-style error.
 
 `fetch_execution_logs()` uses these values to locate the run's stage.
 
-### 5.7 List checkpoints - `GET /{job_id}/checkpoints`
+### 5.8 List checkpoints - `GET /{job_id}/checkpoints`
 
 ```json
 {
@@ -809,7 +825,7 @@ output is selected with the global option:
 cortex-training --compact checkpoints JOB_ID
 ```
 
-### 5.8 Export checkpoint
+### 5.9 Export checkpoint
 
 ```text
 POST /{job_id}/checkpoints/{checkpoint_id}:export
@@ -833,7 +849,7 @@ No body.
 
 The URLs are short-lived.
 
-### 5.9 Delete checkpoint
+### 5.10 Delete checkpoint
 
 ```text
 DELETE /{job_id}/checkpoints/{checkpoint_id}
@@ -1134,6 +1150,7 @@ request_id = client.generate(
     sampling_params={"max_tokens": 64, "temperature": 0.7},
     routing_key="conversation-1",
     strict=False,
+    sub_job_id=f"{job_id}:sampling:1",   # optional
 )
 ```
 
@@ -1150,6 +1167,13 @@ Logical request object inside the DSSST1 frame:
 
 Rules:
 
+- `sub_job_id` is optional and names which sampling sub-job runs the request;
+  discover the ids from `get_job()`'s `sub_jobs`. It is sent as a **query
+  parameter** (`?sub_job_id=...`), not inside the frame, because the server routes
+  the request before it reads the DSSST1 body. If you omit it, the client sends no
+  `sub_job_id` and the server chooses the sub-job. Currently it uses the job's only
+  sampling sub-job, and rejects the request (listing the valid ids) when there are
+  several. Applies to `generate-stream` identically.
 - `prompts` is a list of string prompts and/or token-id lists. A flat list of
   integers such as `[1, 2, 3]`, and a bare 1-D tensor, are each read as one
   pre-tokenized prompt rather than as a batch. For a batch of several prompts,

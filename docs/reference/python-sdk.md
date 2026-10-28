@@ -72,10 +72,11 @@ and read timeout, or a `(connect, read)` pair. `from_configs` also accepts
 `telemetry_timeout` (3s) for best-effort client metrics.
 
 The client never creates a database. A request that fails because the
-database or schema in its URL can't be found (HTTP 400, code `517602`) raises
-`DatabaseAccessError` (see [Exceptions](#exceptions)), which says how to create
-it, get access to it, or use another one. A client from `for_job` raises the
-plain `requests.HTTPError` instead. `client.auto_create_database` is deprecated:
+database or schema in its URL can't be found (HTTP 400, code `517602`, message
+`Schema DB.SCHEMA is not found or not authorized`) raises `DatabaseAccessError`
+(see [Exceptions](#exceptions)), which says how to create it, get access to it,
+or use another one. A client from `for_job` raises the plain
+`requests.HTTPError` instead. `client.auto_create_database` is deprecated:
 it is always False. Setting it to True emits a `FutureWarning`; setting it to False
 needs no change.
 
@@ -117,8 +118,8 @@ program that made the call:
 Tracked operations:
 
 - Job lifecycle: `create_job`, `wait_for_job`, `get_job`, `list_jobs`,
-  `iter_jobs` (one event per page), `list_jobs_page`, `cancel_job`, `get_capacity`,
-  `get_capacity_breakdown`, `get_experiment_run`
+  `list_models`, `iter_jobs` (one event per page), `list_jobs_page`,
+  `cancel_job`, `get_capacity`, `get_capacity_breakdown`, `get_experiment_run`
 - Compute: `forward_backward`, `forward`, `generate`, `generate_stream`, `step`
 - Checkpoints and logs: `save`, `load`, `list_checkpoints`,
   `export_checkpoint`, `delete_checkpoint`, `tail_logs` (one event per page,
@@ -238,6 +239,7 @@ client, including notebooks, CI and containers that never open the TUI.
 | `create_job_from_body(body)` | response dict | For callers that already hold the REST JSON. Enforces the same one-training-sub-job and no-`log_probability` rules before sending |
 | `get_job(job_id)` | job dict | Includes `sub_jobs` with their configs |
 | `list_jobs(status=None)` | list of jobs | Returns the inner list, not the envelope |
+| `list_models()` | list of models | Active models for the account, from `GET /api/v2/cortex-training/models`; returns the inner list. The configured database and schema are not part of the request |
 | `iter_jobs(*, database=None, schema=None, status=None, submitted_by=None, created_after=None, created_before=None, page_size=100)` | iterator of jobs | Jobs across the account that the caller can see, newest first, following page tokens; each also carries `database_name` and `schema_name`. The server applies every filter. Arguments are checked on the call: `page_size` is 1 to 1000, and `schema` needs `database` with it. A 404 means account-level listing is not enabled for the account. See [REST API section 5.3](rest-api.md#across-the-account---get-apiv2endpoint) |
 | `list_jobs_page(*, database=None, schema=None, status=None, submitted_by=None, created_after=None, created_before=None, page_size=100, page_token=None, max_retries=None, request_timeout=None)` | `{"jobs": [...], "next_page_token": str \| None}` | One page of what `iter_jobs` walks, with the same filters read the same way. Pass `next_page_token` back as `page_token`, with the same filters, for the next page; `None` means no more. A page can be short or empty and still have a token. `max_retries` (retries after the first attempt) and `request_timeout` (seconds, or `(connect, read)`) bound this page; omitted, the client's own apply. Raises `AccountJobListUnavailable` (`reason`: `not_deployed`, `disabled`, `forbidden`, `rest_disabled`) for 404, 403 and 405 without retrying, and `InvalidPageToken` for 400 `Invalid page_token` (start again from the first page); both subclass `requests.HTTPError`. Bad arguments, or a page body that is not a job list, raise `ValueError`. See [REST API section 5.3](rest-api.md#across-the-account---get-apiv2endpoint) |
 | `for_job(job)` | `CortexTrainingClient` | Bound to a job from `iter_jobs` or `list_jobs_page` for per-job calls. Borrows this client's session, auth, and telemetry, its `client.surface` included, so keep this one open; closing the returned client is a no-op. Never creates the job's database |
@@ -262,7 +264,7 @@ supported`. The short alias `log_prob` is rejected the same way.
 |---|---|---|
 | `forward_backward(job_id, data)` | `request_id` | `data` is a DSSST1 frame; always chunk-wrapped |
 | `step(job_id, learning_rate=None)` | `request_id` | Omitting the rate uses the job's optimizer setting |
-| `generate(job_id, prompts, sampling_params=None, routing_key=None, strict=None)` | `request_id` | Pre-tokenized prompts are length-checked client-side |
+| `generate(job_id, prompts, sampling_params=None, routing_key=None, strict=None, sub_job_id=None)` | `request_id` | Pre-tokenized prompts are length-checked client-side; `sub_job_id` picks the sampling sub-job when a job has several |
 | `generate_stream(...)` | response dict | Same DSSST1 body encoding as `generate`, sent in one POST; read progress with `get_request_status` |
 | `weight_sync(job_id, source_sub_job_id, target_sub_job_ids, weight_format=None)` | `request_id` | `weight_format="lora"` syncs adapters only |
 | `forward(job_id, payload, ...)` | response dict | Byte frames that exceed the `/operation` JSON ceiling are request-chunked; see [rest-api.md section 7.1](rest-api.md#71-forward) |
@@ -398,11 +400,10 @@ on a failed/cancelled request and `TimeoutError` at the deadline.
 `DatabaseAccessError` (a subclass of both `requests.exceptions.HTTPError` and
 `RuntimeError`) means the configured database or schema can't be found by the
 current role: it doesn't exist, or the role can't access it. It carries
-`.response` (the HTTP 400), `.kind` (`"database"` or `"schema"`), `.name`,
+`.response` (the HTTP 400), `.kind` (`"schema"`), `.name` (`DATABASE.SCHEMA`),
 `.role` (the session's role, or None when it can't be determined, as for PAT
 clients), and `.statement`, the SQL that would set it up: `CREATE DATABASE IF NOT
-EXISTS ...`, or for a schema other than `PUBLIC`, that statement and
-`CREATE SCHEMA IF NOT EXISTS ...`, separated by `; `.
+EXISTS ...` and `CREATE SCHEMA IF NOT EXISTS ...`, separated by `; `.
 
 ## Details not covered here
 

@@ -109,6 +109,7 @@ cortex-training get JOB_ID
 cortex-training wait JOB_ID                   # Wait until running, not finished
 cortex-training cancel JOB_ID
 cortex-training checkpoints JOB_ID
+cortex-training models                        # Active configured models
 cortex-training capacity                      # Every GPU type your account supports
 cortex-training capacity --hardware H200
 ```
@@ -189,7 +190,7 @@ cortex-training fwd-bwd --help
 ## Detailed Reference
 
 - [Connection config](#legacy-connection-config), [login](#legacy-login), and [environment variables](#environment-variables)
-- [Submit](#submit-a-job), [manage jobs](#manage-existing-jobs), and [GPU capacity](#show-current-gpu-capacity)
+- [Submit](#submit-a-job), [manage jobs](#manage-existing-jobs), [available models](#list-available-models), and [GPU capacity](#show-current-gpu-capacity)
 - [Forward-backward and optimizer steps](#run-a-forward-backward-smoke-test)
 - [Load checkpoints](#load-a-checkpoint-into-a-running-job) and [initialize sampling](#start-sampling-from-a-training-checkpoint)
 - [Generate](#run-a-generate-smoke-test) and [sync weights](#sync-training-weights)
@@ -336,6 +337,19 @@ with status 2 before connecting.
 `wait` waits for the job to reach **running**, not for training to finish.
 See [Manage Jobs](../guides/operations/manage-jobs.md) for the operational workflow.
 
+### List Available Models
+
+List active models configured for new jobs:
+
+```bash
+cortex-training models
+```
+
+The command prints `{"models": [{"name": "..."}]}`. It calls the account-level
+route and does not use the configured database or schema. This is a policy
+catalog, not a cache-readiness guarantee; a submitted job may wait while model
+sync completes.
+
 ### Show Current GPU Capacity
 
 Print the caller account's reserved GPU capacity and current usage, separated
@@ -379,7 +393,7 @@ names the supported types.
 `max_total_gpus` is the canonical ceiling and supersedes the deprecated
 `reserved_gpus`. `in_use_gpus` counts only GPUs the account holds; queued work
 is reported separately in `pending_gpus`. See
-[REST API reference section 5.4](rest-api.md#54-capacity---get-capacity) and
+[REST API reference section 5.5](rest-api.md#55-capacity---get-capacity) and
 [GPU hardware](../concepts/hardware.md).
 
 #### Capacity Breakdown
@@ -960,7 +974,10 @@ Press `a`, or click `a All schemas` in the footer, to list the jobs in every
 database and schema the role can see instead, from the same list unscoped;
 the footer then offers `a Current schema`, which goes back. The
 header line starts with when the list was last refreshed (`refreshing…` while
-a refresh reads), then which list is shown. Until the list `a` asked for
+a refresh reads), then which list is shown. The words naming the list stand out
+as a chip, bold and filled: `Current schema: DB.SCHEMA` in white, `all schemas`
+in blue. Where the header doesn't otherwise name the list (the all-schemas list
+cut short, below), its chip comes first. Until the list `a` asked for
 answers, the header reads `loading all schemas…` (or `loading the current
 schema, DB.SCHEMA…`) and the previous list stays on screen. Either list shows
 its first page (the newest 100 jobs) as soon as it answers, and adds each later
@@ -1097,8 +1114,23 @@ counts time spent waiting to be placed; in its status's color), or how long a
 finished one ran until its last state change (`40s`, `12m`, `3h 05m`,
 `2d 4h`). The times are as of the last refresh, which redraws them. On a narrow
 screen the Job ID column narrows (its id ends in `…`) and stays in view while
-the other columns scroll. `shared` marks multiplexed GPU use and `log_prob`
+the other columns scroll. The Schema column, shown when the list spans more than
+one location, is as wide as its longest `DB.SCHEMA` where the screen has room,
+and up to 32 cells where it doesn't; a name it cuts loses the end of its
+database name first (`TEAM_D….EXPERIMENTS`), so the schema stays whole, and a
+copy has the name whole. `shared` marks multiplexed GPU use and `log_prob`
 requests zero GPUs.
+
+A bar (`┃`) after each column's name marks the column's right edge. Drag a bar
+sideways to make its column wider or narrower; the bar follows the pointer. A
+press on a blank cell either side of a bar takes the bar too, and the bar under
+the pointer brightens, so it is easy to catch; held, it is drawn in blue. A
+column is at least 3 cells wide. The widths stay
+through refreshes, `a`, searches and terminal resizes until the TUI exits; a
+double-click on a bar gives its column back the width the list picks. A drag on
+the names themselves highlights them as text, and a copy leaves the bars out.
+Where the terminal draws pointer shapes, the pointer on a bar is a sideways
+arrow.
 
 A sub-job row is fainter than its job's and shows what it doesn't share with
 it: its label (`training #0`), its status as the glyph alone while it is its
@@ -1175,6 +1207,7 @@ operators shows under it only while it has focus.
 | `Home` / `End` | First / last job |
 | `→` / `←` | Unfold the highlighted job's sub-jobs / fold them; on a sub-job row, `←` folds its job and moves to it. The job's row stays where it is on screen, and the list scrolls only as far as an unfolded job's sub-jobs need to show. Where there is nothing to unfold or fold, they scroll the columns sideways |
 | click `▸` / `▾` | Unfold or fold that job, as `→` / `←` do |
+| drag a `┃` bar | Make the column before it wider or narrower (the bars sit between the column names, and after the last; a blank cell beside a bar takes it too); a double-click on a bar gives its column back its own width |
 | `e` | Expand or collapse every job's sub-jobs, also those of jobs that later pages of the list being read bring (jobs a later refresh adds start as usual) |
 | `a` | All schemas / current schema: switch to the account-level list of every database and schema the role can see (the footer's `a All schemas`), or back to the configured one (`a Current schema`) |
 | `f` | All jobs / newest 2,000: when the configured schema's list came whole (the account-level list is unavailable) and holds more than 2,000 jobs, the list shows the newest 2,000 and every active job, as the account-level list does, and search covers those (one that matches none of them says `f searches all N jobs of the schema.`); `f` shows every job of it (drawing tens of thousands takes a few seconds), and again the newest 2,000. Refreshes keep the choice until another list is shown |
@@ -1308,7 +1341,13 @@ next tab, round to Logs after the last.
     50% gridline running through the fill, and `◂` right of the newest column
     on the row its value reaches. A bucket without a sample stays blank over a
     broken baseline (`╌`), so a gap never reads as 0, and the marker is left
-    out when the newest bucket is a gap. Percentage
+    out when the newest bucket is a gap. A chart's time axis spans its window
+    (the whole job's spans the job): with more buckets than columns, a column is
+    the mean of those it covers, and with fewer, the buckets widen to fill it. A
+    job shorter than the window starts at the left edge and fills only its
+    share, `◂` marking its newest sample part of the way across, the rest of the
+    window blank; a window whose older samples are still loading ends at the
+    right edge, the older samples to come at the left. Percentage
     axes are 0–100%; other axes use a stable rounded ceiling. `ALL` aggregates
     reporting units by sample interval; one missed node scrape is bridged,
     longer gaps remain gaps. History older than seven hours is folded into
@@ -1387,7 +1426,8 @@ next tab, round to Logs after the last.
     a chart per metric, two per row at 90 cells or wider. The y axis spans the
     window's own lowest and highest value, since a loss rarely starts at 0 and
     a policy loss can be negative; with more steps or calls than columns, a
-    column is the mean of the ones it covers.
+    column is the mean of the ones it covers, and with fewer, they widen to
+    fill the chart.
   - `w` cycles all steps (the default), the last 100 and the last 1,000,
     counted back from the newest step, for both sections. Per call, the window holds those steps'
     calls, and the calls of a step still running.
@@ -1595,7 +1635,8 @@ sub-job's saved console, else the lines its tail cached, else the execution log
 the pane shows; with nothing to save it says so and writes no file.
 
 Copying works everywhere: drag to highlight, then press `ctrl+c` (or Cmd-C
-where the terminal passes it through). Drags stay in their log, list, pane, or
+where the terminal passes it through). A drag on a `┃` bar between the job
+list's column names resizes a column instead (see above). Drags stay in their log, list, pane, or
 table region and scroll it at an edge; table selection follows characters
 across rows and hidden horizontal columns. Small row movements remain clicks,
 while a drag never activates the row. Changing the shown tab, source, unit,

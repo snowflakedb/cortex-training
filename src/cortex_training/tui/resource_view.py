@@ -1038,7 +1038,7 @@ class ResourceTab:
                 head.append(Content.styled(note, CHART_MUTED))
             if has_metric_samples(view, metric.key):
                 body = [spans_content(line) for line in metric_chart_spans(view, metric, column, height=bars,
-                                                                              hue=hue)]
+                                                                              hue=hue, complete=complete)]
             else:
                 body = [Content.styled(views.fit_cells(f"no {metric.name} samples in this range", column),
                                        CHART_MUTED)]

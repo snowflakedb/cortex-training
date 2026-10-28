@@ -504,6 +504,12 @@ def build_parser(
         help="Print at most this many of the newest matching jobs.",
     )
 
+    subparsers.add_parser(
+        "models",
+        help="List active models configured for new jobs.",
+        description="List active models configured for new jobs.",
+    )
+
     capacity = subparsers.add_parser(
         "capacity",
         help="Show reserved GPU capacity and current usage for the caller account.",
@@ -1976,6 +1982,13 @@ def _run(
         return 0
     if args.command == "list":
         return _cmd_list(args, client, stdout)
+    if args.command == "models":
+        _print_json(
+            {"models": client.list_models()},
+            stdout,
+            compact=args.compact,
+        )
+        return 0
     if args.command == "capacity":
         return _cmd_capacity(args, client, stdout)
     if args.command == "cancel":

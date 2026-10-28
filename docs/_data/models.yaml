@@ -11,9 +11,17 @@
 # - last_validated: the latest date in the model's model.json, or null.
 models:
   - id: deepseek-ai/DeepSeek-V4-Flash-0731
-    training: false
+    training: true
     inference: true
-    last_validated: 2026-09-01
+    last_validated: 2026-10-23
+  - id: deepseek-ai/DeepSeek-V4.1-Flash-1017
+    training: true
+    inference: true
+    examples:
+      - conversational-sft
+      - inference-endpoint
+      - math-grpo
+    last_validated: 2026-10-26
   - id: google/gemma-3-4b-it
     training: true
     inference: true
