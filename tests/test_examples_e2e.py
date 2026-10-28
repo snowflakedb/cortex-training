@@ -10,14 +10,19 @@ needs network access. These submit real jobs on real GPUs:
     CORTEX_TRAINING_E2E_CONFIG=~/conn.json python -m pytest tests/test_examples_e2e.py -v -s
 
 If DEBUG_IMAGE_TAG is set, every example also gets debug_image_tag=<tag>.
+
+Each case's output streams live, is written beside its log_path, and is repeated
+in the failure if it fails -- see :func:`_run_example` for why all three.
 """
 
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -27,6 +32,9 @@ CONFIG = os.environ.get("CORTEX_TRAINING_E2E_CONFIG")
 DEBUG_IMAGE_TAG = os.environ.get("DEBUG_IMAGE_TAG")
 # Per example. CI runs all of them within a fixed total budget.
 TIMEOUT_SECONDS = 3600
+# Repeated from the end of a failing example's output. A server-side traceback arrives
+# innermost-last, so the tail is the part worth reading; 400 lines covers a nested one.
+FAILURE_TAIL_LINES = 400
 
 # The eval tasks, sandbox packages, and reference predictions examples/sft/dare/README.md sets up.
 DARE_BENCH_URL = "https://github.com/Snowflake-Labs/dare-bench"
@@ -107,18 +115,22 @@ def dare_bench(tmp_path_factory):
     # Ignore the user's git config, so a URL rewrite or credential helper cannot redirect the clone.
     # Timeouts are several times the measured setup, so a hang fails this case instead of the whole run.
     git_env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
-    subprocess.run(
+    _run_setup(
         ["git", "clone", "--quiet", "--filter=blob:none", DARE_BENCH_URL, str(checkout)],
-        env=git_env, check=True, timeout=600,
+        step="clone", root=root, timeout=600, env=git_env,
     )
-    subprocess.run(
-        ["git", "-C", str(checkout), "checkout", "--quiet", DARE_BENCH_COMMIT], env=git_env, check=True, timeout=600
+    _run_setup(
+        ["git", "-C", str(checkout), "checkout", "--quiet", DARE_BENCH_COMMIT],
+        step="checkout", root=root, timeout=600, env=git_env,
     )
 
     sandbox = root / "sandbox"
-    subprocess.run([sys.executable, "-m", "venv", str(sandbox)], check=True, timeout=300)
+    _run_setup([sys.executable, "-m", "venv", str(sandbox)], step="venv", root=root, timeout=300)
     python = sandbox / "bin" / "python"
-    subprocess.run([str(python), "-m", "pip", "install", "--quiet", *DARE_SANDBOX_PACKAGES], check=True, timeout=1200)
+    _run_setup(
+        [str(python), "-m", "pip", "install", "--quiet", *DARE_SANDBOX_PACKAGES],
+        step="pip-install", root=root, timeout=1200,
+    )
 
     # The script writes each task's verify/simulated_pred_local.csv, which the evaluator reads.
     bench_dir = checkout / "data" / "eval"
@@ -126,18 +138,102 @@ def dare_bench(tmp_path_factory):
     question_list = root / "question_list.json"
     tasks = [q for q in questions if q["task"] == DARE_TASK_TYPE]
     question_list.write_text(json.dumps(tasks), encoding="utf-8")
-    subprocess.run(
+    _run_setup(
         [str(python), str(checkout / "scripts" / "reference_solution.py"),
          "--databases_dir", str(bench_dir / "databases"), "--question_list", str(question_list),
          "--output_dir", str(root / "reference"), "--execute"],
-        check=True,
-        timeout=1800,
+        step="reference-solution", root=root, timeout=1800,
     )
     # The script counts a failed task and still exits 0, so check its outputs here.
     missing = [q["file_path"] for q in tasks
                if not (bench_dir / "databases" / q["file_path"] / "verify" / "simulated_pred_local.csv").is_file()]
     assert not missing, f"reference_solution.py wrote no reference for {missing}"
     return {"bench_dir": bench_dir, "sandbox_python": python}
+
+
+def _run_example(
+    command: list[str], *, log_file: Path, timeout: float, env: dict[str, str] | None = None
+) -> tuple[int | None, str]:
+    """Run ``command`` to completion, keeping every byte it writes.
+
+    Returns its exit status and output, or ``(None, output)`` if ``timeout``
+    expired and it was killed. stderr is merged into stdout, so the two cannot
+    interleave and lose part of a traceback that spans both.
+
+    The output is read here rather than left on the inherited descriptors. An
+    example that fails writes its last and largest block as it exits -- a server
+    error carries the remote traceback inside the message -- while the test
+    runner writes that case's result to the same descriptor. Two writers on one
+    pipe clip a block that large, which cost us the innermost frames of a worker
+    failure. Holding the bytes here means the copy quoted in the failure is
+    written once, by the runner, after this process is reaped. The live echo is
+    still best-effort and may be clipped; the quoted copy is the record.
+    """
+    captured: list[bytes] = []
+    timed_out = False
+    with subprocess.Popen(
+        command,
+        cwd=REPO_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        # Unbuffered, because merging the streams only orders them if the example
+        # does not hold stdout back: a pipe makes it block-buffered, so it would
+        # flush at exit and land after the traceback that stderr already wrote.
+        # That ordering decides whether the tail quoted on failure holds the
+        # traceback or the last few hundred lines of training progress.
+        env={**(env if env is not None else os.environ), "PYTHONUNBUFFERED": "1"},
+    ) as process:
+        assert process.stdout is not None
+
+        def pump() -> None:
+            # read1 returns what has arrived instead of waiting for a full buffer,
+            # so an hour-long case still reports progress as it goes.
+            decoder = codecs.getincrementaldecoder("utf-8")("replace")
+            for chunk in iter(lambda: process.stdout.read1(65536), b""):
+                captured.append(chunk)
+                sys.stdout.write(decoder.decode(chunk))
+                sys.stdout.flush()
+
+        reader = threading.Thread(target=pump, daemon=True)
+        reader.start()
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            process.kill()
+            process.wait()
+        # Drain what is left before the context manager closes the pipe.
+        reader.join(timeout=60)
+
+    output = b"".join(captured)
+    # Written whole, so a case that fails on a developer's machine leaves the
+    # untrimmed output behind even though the failure quotes only the tail.
+    log_file.write_bytes(output)
+    return (None if timed_out else process.returncode), output.decode("utf-8", errors="replace")
+
+
+def _tail(output: str, log_file: Path) -> str:
+    lines = output.splitlines()
+    if len(lines) <= FAILURE_TAIL_LINES:
+        return f"--- output ({len(lines)} lines), also in {log_file} ---\n{output}"
+    head = f"--- last {FAILURE_TAIL_LINES} of {len(lines)} lines; all of them are in {log_file} ---"
+    return "\n".join([head, *lines[-FAILURE_TAIL_LINES:]])
+
+
+def _run_setup(command: list[str], *, step: str, root: Path, timeout: float, env=None) -> None:
+    """Run one DARE setup step, failing with its output rather than only a status.
+
+    ``check=True`` would raise with the exit status alone, leaving whatever the
+    step printed about why only in the live stream, which is the copy that gets
+    clipped. These steps clone, build a venv, and install from the network, so
+    that output is usually the whole explanation.
+    """
+    log_file = root / f"{step}.console.log"
+    returncode, output = _run_example(command, log_file=log_file, timeout=timeout, env=env)
+    if returncode == 0:
+        return
+    status = "timed out" if returncode is None else f"exited with status {returncode}"
+    pytest.fail(f"dare_bench setup step {step!r} {status}: {' '.join(command)}\n{_tail(output, log_file)}")
 
 
 @pytest.mark.skipif(CONFIG is None, reason="set CORTEX_TRAINING_E2E_CONFIG to a connection file to run the examples")
@@ -161,10 +257,15 @@ def test_example_runs(name, tmp_path, request):
     if DEBUG_IMAGE_TAG:
         command.append(f"debug_image_tag={DEBUG_IMAGE_TAG}")
 
-    try:
-        result = subprocess.run(command, cwd=REPO_ROOT, timeout=TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
+    log_file = tmp_path / f"{name}.console.log"
+    returncode, output = _run_example(command, log_file=log_file, timeout=TIMEOUT_SECONDS)
+    if returncode is None:
         # The example has usually submitted a job already, which may still be running.
-        pytest.fail(f"{name} did not finish within {TIMEOUT_SECONDS}s: {' '.join(command)}")
+        pytest.fail(
+            f"{name} did not finish within {TIMEOUT_SECONDS}s: {' '.join(command)}\n"
+            f"{_tail(output, log_file)}"
+        )
 
-    assert result.returncode == 0, f"{name} exited with status {result.returncode}"
+    assert returncode == 0, (
+        f"{name} exited with status {returncode}: {' '.join(command)}\n{_tail(output, log_file)}"
+    )
