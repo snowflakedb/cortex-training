@@ -17,7 +17,6 @@ in the failure if it fails -- see :func:`_run_example` for why all three.
 
 from __future__ import annotations
 
-import codecs
 import json
 import os
 import subprocess
@@ -32,9 +31,10 @@ CONFIG = os.environ.get("CORTEX_TRAINING_E2E_CONFIG")
 DEBUG_IMAGE_TAG = os.environ.get("DEBUG_IMAGE_TAG")
 # Per example. CI runs all of them within a fixed total budget.
 TIMEOUT_SECONDS = 3600
-# Repeated from the end of a failing example's output. A server-side traceback arrives
-# innermost-last, so the tail is the part worth reading; 400 lines covers a nested one.
-FAILURE_TAIL_LINES = 400
+# How much of a failing example's output to quote in the assertion. A budget for what
+# is readable in a report, not a measurement: the deepest failure seen so far is a
+# chained server traceback of about a hundred lines, and the log file keeps all of it.
+FAILURE_TAIL_LINES = 200
 
 # The eval tasks, sandbox packages, and reference predictions examples/sft/dare/README.md sets up.
 DARE_BENCH_URL = "https://github.com/Snowflake-Labs/dare-bench"
@@ -154,20 +154,17 @@ def dare_bench(tmp_path_factory):
 def _run_example(
     command: list[str], *, log_file: Path, timeout: float, env: dict[str, str] | None = None
 ) -> tuple[int | None, str]:
-    """Run ``command`` to completion, keeping every byte it writes.
+    """Run ``command`` to completion, echoing its output and returning a copy.
 
     Returns its exit status and output, or ``(None, output)`` if ``timeout``
-    expired and it was killed. stderr is merged into stdout, so the two cannot
-    interleave and lose part of a traceback that spans both.
+    expired and it was killed.
 
-    The output is read here rather than left on the inherited descriptors. An
-    example that fails writes its last and largest block as it exits -- a server
-    error carries the remote traceback inside the message -- while the test
-    runner writes that case's result to the same descriptor. Two writers on one
-    pipe clip a block that large, which cost us the innermost frames of a worker
-    failure. Holding the bytes here means the copy quoted in the failure is
-    written once, by the runner, after this process is reaped. The live echo is
-    still best-effort and may be clipped; the quoted copy is the record.
+    Reading the output here rather than leaving the example on the descriptors
+    it inherits is what keeps it whole. An example that fails writes its last
+    and largest block as it exits -- a server error carries the remote traceback
+    inside the message -- while the test runner writes that case's result to the
+    same descriptor, and two writers on one pipe clipped that block. The copy
+    quoted in the failure is written once, after this process is reaped.
     """
     captured: list[bytes] = []
     timed_out = False
@@ -175,23 +172,22 @@ def _run_example(
         command,
         cwd=REPO_ROOT,
         stdout=subprocess.PIPE,
+        # Merged, so a traceback spanning both streams cannot interleave, and
+        # unbuffered, because a pipe would otherwise leave stdout block-buffered
+        # to flush at exit -- after the traceback that stderr already wrote.
         stderr=subprocess.STDOUT,
-        # Unbuffered, because merging the streams only orders them if the example
-        # does not hold stdout back: a pipe makes it block-buffered, so it would
-        # flush at exit and land after the traceback that stderr already wrote.
-        # That ordering decides whether the tail quoted on failure holds the
-        # traceback or the last few hundred lines of training progress.
         env={**(env if env is not None else os.environ), "PYTHONUNBUFFERED": "1"},
     ) as process:
         assert process.stdout is not None
 
+        # On a thread, so the timeout below still applies: iterating the pipe on
+        # this one would block until the example closed it.
         def pump() -> None:
-            # read1 returns what has arrived instead of waiting for a full buffer,
-            # so an hour-long case still reports progress as it goes.
-            decoder = codecs.getincrementaldecoder("utf-8")("replace")
-            for chunk in iter(lambda: process.stdout.read1(65536), b""):
-                captured.append(chunk)
-                sys.stdout.write(decoder.decode(chunk))
+            # Bytes split on newlines only, so a progress bar's carriage returns
+            # stay on one line and no decode lands mid-character.
+            for line in process.stdout:
+                captured.append(line)
+                sys.stdout.write(line.decode("utf-8", "replace"))
                 sys.stdout.flush()
 
         reader = threading.Thread(target=pump, daemon=True)
@@ -202,18 +198,19 @@ def _run_example(
             timed_out = True
             process.kill()
             process.wait()
-        # Drain what is left before the context manager closes the pipe.
-        reader.join(timeout=60)
+        reader.join(timeout=60)  # Drain before the context manager closes the pipe.
 
     output = b"".join(captured)
-    # Written whole, so a case that fails on a developer's machine leaves the
-    # untrimmed output behind even though the failure quotes only the tail.
+    # Written whole, so the untrimmed output outlives a failure quoting only the tail.
     log_file.write_bytes(output)
-    return (None if timed_out else process.returncode), output.decode("utf-8", errors="replace")
+    return (None if timed_out else process.returncode), output.decode("utf-8", "replace")
 
 
 def _tail(output: str, log_file: Path) -> str:
-    lines = output.splitlines()
+    # split, not splitlines: a carriage return is progress output rewriting one
+    # line, and counting each repaint would push the traceback out of the tail.
+    # The trailing newline is dropped first, so it does not cost a line of tail.
+    lines = output.rstrip("\n").split("\n")
     if len(lines) <= FAILURE_TAIL_LINES:
         return f"--- output ({len(lines)} lines), also in {log_file} ---\n{output}"
     head = f"--- last {FAILURE_TAIL_LINES} of {len(lines)} lines; all of them are in {log_file} ---"
