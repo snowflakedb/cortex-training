@@ -1,38 +1,33 @@
 # Run a Quick SFT Job
 
-The conversational SFT recipe is the current shortest end-to-end training path.
-It creates a training job, loads a chat dataset, submits forward/backward
-batches, applies optimizer steps, and cancels the job when complete.
+The conversational SFT example is the shortest end-to-end training path. It
+creates a training job, loads a chat dataset, submits forward/backward batches,
+applies optimizer steps, saves a checkpoint, and cancels the job.
 
-Install the recipe dependency:
+Install the example dependency:
 
 ```bash
 uv pip install 'tinker-cookbook @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
 ```
 
-Start with a short run:
+Start with a short run. It uses your default connection profile; pass
+`connection=<name>` for another profile, or `config=<file>` for a
+[JSON connection file](setup.md#json-connection-file):
 
 ```bash
-python -m recipes.sft.conversational.train \
-  config=/path/to/config.json \
+python -m examples.sft.conversational.train \
   max_steps=2
 ```
 
-The default job config, `model-catalog/models/qwen3-8b/standard/h200-training-full.json`, requests four GPUs and
-runs full-parameter training, so check capacity first. It omits `hardware`, so
-the job lands on H200. Add `"hardware": "B200"` (or `B300`) at the top level of
-that JSON to use another pool; check
-`cortex-training capacity --hardware B200` first. GPU count, batch shape,
-sequence length and LoRA all live in that JSON rather than on the command line --
-pass a different one with `job_config=`, for example
-`job_config=model-catalog/models/qwen3-8b/standard/h200-training-lora.json` for the lighter LoRA path. See
-[sizing and batching](../concepts/sizing-and-batching.md) and
-[GPU hardware](../concepts/hardware.md).
+The default job is full-parameter `Qwen/Qwen3-8B` at standard context on four
+H200 GPUs, so check capacity first with `cortex-training capacity`. Add
+`lora=true` for the lighter LoRA path, or `model=` for another model; see
+[the SFT example](../../examples/sft/README.md) for every option and
+[sizing and batching](../concepts/sizing-and-batching.md) for how the batch
+fields interact.
 
-For a longer run, dataset changes, dense training, and MoE configuration, see
-the [conversational SFT recipe](../../recipes/sft/README.md).
-
-There is no packaged before/after evaluation workflow yet. To confirm the run
-worked, check that `train_mean_nll` and `test/nll` fall over a longer run, then
-run the sampling command the recipe prints after it saves its checkpoint -- on
-the default memorize task the answer should be `Snowflake AI Research`.
+To confirm the run worked, check that `train_nll` falls over a longer run, then
+run the generate command the example prints after it saves its checkpoint. On
+the default dataset the answer should be `Snowflake AI Research`. To score the
+checkpoint instead, use the
+[inference example's evaluate command](../../examples/inference/README.md#evaluate).

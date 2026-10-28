@@ -1,0 +1,15 @@
+{
+  "$schema": "../../schema.json",
+  "model_id": "google/medgemma-4b-it",
+  "license": {
+    "name": "Health AI Developer Foundations",
+    "url": "https://developers.google.com/health-ai-developer-foundations/terms"
+  },
+  "architecture": "dense",
+  "last_validated": {
+    "long/h200-inference-full": "2026-10-15",
+    "long/h200-training-full": "2026-10-15",
+    "standard/h200-inference-full": null,
+    "standard/h200-training-full": null
+  }
+}

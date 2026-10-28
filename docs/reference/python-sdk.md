@@ -8,40 +8,75 @@ from cortex_training import CortexTrainingClient, SubJobConfig, JobType
 client: every data-plane call returns a `request_id` that you poll, and results
 are whatever the backend returns.
 
-Construct it with a named Snowflake connection profile:
+Construct it with `from_configs()`, which uses your Snowflake connection
+profile:
 
 ```python
-client = CortexTrainingClient.from_connection_name("training")
+client = CortexTrainingClient.from_configs()                # pick the profile as below
+client = CortexTrainingClient.from_configs(connection="training")
 ```
 
-Pass no name to use the Connector-configured default profile. The profile's
-database and schema are used unless explicitly overridden. The client shares
-the profile's live Snowflake session token with REST and telemetry calls,
-reconnecting once when the API reports token expiry.
+`from_configs(connection=None, *, database=None, schema=None, **kwargs)`
+picks, first match wins:
 
-Direct Programmatic Access Token construction remains supported:
+- **Profile:** `connection`; then `"profile"` in `config.json`; then the
+  Snowflake default profile. `CORTEX_TRAINING_HOST` and `CORTEX_TRAINING_PAT`
+  are used only when no Snowflake profile exists, for CI; when a profile is used
+  they are ignored and a warning says so.
+- **Database:** `database`; then `CORTEX_TRAINING_DATABASE` (logged when used);
+  then the profile's database; then `CORTEX_TRAINING_DB`.
+- **Schema:** `schema`; then `CORTEX_TRAINING_SCHEMA`; then the profile's
+  schema; then `PUBLIC`.
 
-```python
-client = CortexTrainingClient.from_pat(
-    host="ACCOUNT.snowflakecomputing.com",
-    pat=PAT,
-    database="CORTEX_TRAINING_DB",
-    schema="PUBLIC",
-)
+It logs one line naming the target and where each part came from, for example
+`profile training (saved in ~/.snowflake/cortex-training/config.json), db TRAIN_DB (from profile training), schema PUBLIC (default)`.
+The client shares the profile's live Snowflake session token with REST and
+telemetry calls, reconnecting once when the API reports token expiry.
+
+`config.json` holds one key, the name of the Snowflake connection profile to
+use:
+
+```json
+{"profile": "training"}
 ```
+
+It lives in the Snowflake folder the profiles come from,
+`<Snowflake folder>/cortex-training/config.json`: `$SNOWFLAKE_HOME` if that
+folder exists, else `~/.snowflake`, else the platform's config folder. So
+`SNOWFLAKE_HOME` moves the profiles and `config.json` together. A missing file
+is fine: the Snowflake default profile is used. Any other key is rejected:
+credentials and the database belong in the Snowflake profile, and settings such
+as `poll_interval` or `verify_ssl` are keyword arguments to `from_configs()`,
+which go to the constructor.
+
+These fail with an error that says what's wrong:
+
+- A profile name that doesn't exist (passed in, saved in `config.json`, or the
+  Snowflake default from `SNOWFLAKE_DEFAULT_CONNECTION_NAME` or
+  `default_connection_name`) names where the name came from and lists the
+  profiles that exist.
+- A profile that can't sign in names the profile and where it came from.
+- `CORTEX_TRAINING_HOST` may include `https://` and a trailing `/`. Anything
+  else that isn't an account host, such as `ACCOUNT.snowflakecomputing.com`
+  (with an optional `:port`), is rejected.
+
+`from_connection_name()` and `from_pat()` still work but are deprecated: each
+emits a `FutureWarning` and will be removed in a future release. Use
+`from_configs()` instead.
 
 Tuning knobs on the constructor: `endpoint`, `poll_interval` (0.5s),
 `poll_timeout` (1800s), `poll_backoff_multiplier` (1.25), `poll_max_interval`
 (6s), `pool_maxsize` (1024), `max_retries` (10), and `request_timeout`
 (`(30s connect, 600s read)`). Pass a positive scalar to use the same connect
-and read timeout, or a `(connect, read)` pair. `from_connection_name` and
-`from_pat` also accept `telemetry_timeout` (3s) for best-effort client metrics.
+and read timeout, or a `(connect, read)` pair. `from_configs` also accepts
+`telemetry_timeout` (3s) for best-effort client metrics.
 
 The client never creates a database. A request that fails because the
-database or schema in its URL can't be found (HTTP 400, code `517602`) raises
-`DatabaseAccessError` (see [Exceptions](#exceptions)), which says how to create
-it, get access to it, or use another one. A client from `for_job` raises the
-plain `requests.HTTPError` instead. `client.auto_create_database` is deprecated:
+database or schema in its URL can't be found (HTTP 400, code `517602`, message
+`Schema DB.SCHEMA is not found or not authorized`) raises `DatabaseAccessError`
+(see [Exceptions](#exceptions)), which says how to create it, get access to it,
+or use another one. A client from `for_job` raises the plain
+`requests.HTTPError` instead. `client.auto_create_database` is deprecated:
 it is always False. Setting it to True emits a `FutureWarning`; setting it to False
 needs no change.
 
@@ -59,8 +94,10 @@ moves, one every 6 seconds once it is quiet, and a few a second while it catches
 up. The job list sends one per page of 100 jobs each time it refreshes (every 60
 seconds while it is shown), and a live job's preview or details screen one
 `get_job` every 60 seconds. A live job's Resources or Training metrics tab
-downloads every 30 seconds while shown, and so does its Checkpoints tab's list,
-with one export per checkpoint whose files it reads (once per opening of the
+downloads every 30 seconds while shown (after its first download, only the
+sub-job it shows; a Training metrics tab with more than one sub-job, all of
+them), and so does its Checkpoints tab's list, with one export per
+checkpoint whose files it reads (once per opening of the
 job, up to 50 at a time) and one more per download. Set
 `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY=1` to emit successful outcomes for
 every operation, or `=0` to emit only failures for every operation, the TUI's
@@ -227,7 +264,7 @@ supported`. The short alias `log_prob` is rejected the same way.
 |---|---|---|
 | `forward_backward(job_id, data)` | `request_id` | `data` is a DSSST1 frame; always chunk-wrapped |
 | `step(job_id, learning_rate=None)` | `request_id` | Omitting the rate uses the job's optimizer setting |
-| `generate(job_id, prompts, sampling_params=None, routing_key=None, strict=None)` | `request_id` | Pre-tokenized prompts are length-checked client-side |
+| `generate(job_id, prompts, sampling_params=None, routing_key=None, strict=None, sub_job_id=None)` | `request_id` | Pre-tokenized prompts are length-checked client-side; `sub_job_id` picks the sampling sub-job when a job has several |
 | `generate_stream(...)` | response dict | Same DSSST1 body encoding as `generate`, sent in one POST; read progress with `get_request_status` |
 | `weight_sync(job_id, source_sub_job_id, target_sub_job_ids, weight_format=None)` | `request_id` | `weight_format="lora"` syncs adapters only |
 | `forward(job_id, payload, ...)` | response dict | Byte frames that exceed the `/operation` JSON ceiling are request-chunked; see [rest-api.md section 7.1](rest-api.md#71-forward) |
@@ -251,94 +288,12 @@ other than `"strict"` on a sampling sub-job. See
 [rest-api.md section 8.2](rest-api.md#82-trainingconfig) and
 [section 6.1](rest-api.md#61-forwardbackward---post-job_idforward-backward).
 
-## Router-replay capacity planning
-
-`cortex_training.router_replay_planner` derives the per-worker
-`router_replay.max_cache_bytes` caps before you create a job. It only
-calculates. It does not call the service, edit a job config, or reserve GPU
-memory. Put `CachePlan.max_cache_bytes` on the sampling and training
-`router_replay` objects yourself. When bootstrapping with an explicit cap, pass
-the training result to `bootstrap_router_replay(..., max_cache_bytes=...)`.
-
-One full-sequence capture occupies:
-
-```text
-entry_bytes = seq_len * num_moe_layers * topk * dtype_bytes
-```
-
-`moe_geometry_from_config` reads `num_hidden_layers` and `num_experts_per_tok`
-from the config root or `text_config`, and rejects conflicting values. Every
-recognized expert-count field (`num_local_experts`, `n_routed_experts`,
-`num_experts`, `moe_num_experts`) must agree, be positive, and be at least
-`topk`. A count of 256 or fewer selects `dtype_bytes=1` because those expert
-ids fit in `uint8`. A count from 257 through 65536 selects `dtype_bytes=2`
-(`uint16`). A larger count is rejected. `plan_sampling_cache_bytes` and
-`plan_training_cache_bytes` use that width unless you pass `dtype_bytes`.
-
-The sampling cap is per sampling replica, and the training cap is per
-data-parallel shard:
-
-```text
-backlog = max_inflight_rollouts
-        + ceil(batch_size * over_generation_multiplier)
-        + batch_size * max(async_depth, 1)
-per_replica_rollouts = ceil(backlog / replicas * routing_skew)
-sampling_cap = ceil(per_replica_rollouts * entry_bytes * safety_factor)
-
-resident_rows = ceil(batch_size / dp_size)
-training_cap = ceil(resident_rows * entry_bytes * safety_factor)
-```
-
-`max_inflight_rollouts` defaults to `batch_size`. `routing_skew` defaults to
-`2.0` and `safety_factor` defaults to `1.2`. Replica and data-parallel counts
-come from `derive_num_sampling_workers` and `derive_dp_size`; known GPU counts
-must divide exactly by the parallel widths. The skew estimate is not an
-overflow-proof bound. Raise it, or set a manual cap, when a worker retains
-more replay entries than the average backlog times the skew.
-
-`plan_vllm_gpu_memory_utilization` lowers vLLM's `gpu_memory_utilization` by
-the sampling cap divided by the GPU's byte capacity. It raises when that
-reservation exceeds half the GPU or would push utilization below `0.05`.
-
-```python
-from cortex_training import router_replay_planner as rrp
-
-geometry = rrp.resolve_model_moe_geometry(
-    "org/moe-model",
-    num_moe_layers_override=40,
-    topk_override=8,
-    num_experts_override=512,
-)
-assert geometry.dtype_bytes == 2
-
-backlog = rrp.derive_backlog_rollouts(batch_size=16, async_depth=2)
-sampling_workers = rrp.derive_num_sampling_workers(
-    sampling_gpus=8,
-    sampling_tensor_parallel_size=2,
-)
-sampling_plan = rrp.plan_sampling_cache_bytes(
-    seq_len=8192,
-    geometry=geometry,
-    backlog_rollouts=backlog,
-    num_sampling_workers=sampling_workers,
-)
-training_plan = rrp.plan_training_cache_bytes(
-    seq_len=8192,
-    geometry=geometry,
-    resident_rows=rrp.derive_resident_rows(
-        batch_size=16,
-        dp_size=rrp.derive_dp_size(training_gpus=8, sp_size=2),
-    ),
-)
-sampling_cap = sampling_plan.max_cache_bytes
-training_cap = training_plan.max_cache_bytes
-```
-
-The same sequence length, layer count, and top-k with 512 experts stores each
-expert id in two bytes, so each capture is twice as large as one from a model
-with 256 or fewer experts. See
-[rest-api.md section 8.2](rest-api.md#82-trainingconfig) for the
-`max_cache_bytes` field.
+The SDK does not size `router_replay.max_cache_bytes`: set it on each sub-job's
+`router_replay` object in `extra_training` or `extra_sampling`. The
+repository's RL example fills in 5 GiB (training) and 20 GiB (sampling) for MoE
+models, and describes an optional planner that sizes a cap from the model's
+geometry; see
+[Router-replay capacity planning](../../examples/rl/README.md#router-replay-capacity-planning).
 
 ## Checkpoints
 
@@ -392,9 +347,10 @@ can open one file while the others download, and sub-jobs named in `priority`
 are downloaded first, in that order (the returned list stays in id order).
 These callbacks run on the calling thread; an error raised by any of them stops
 the download and keeps the chunks already written. Raise `cortex_training.DownloadCancelled` to stop
-without the call counting as a failure. `sub_job_ids` limits the download; an
-entry with no chunks raises `cortex_training.NoChunksError`, a `ValueError`. A
-damaged chunk is fetched once more and then skipped and listed in the entry's
+without the call counting as a failure. `sub_job_ids` limits the download (and,
+naming one sub-job, its listing too); an entry with no chunks raises
+`cortex_training.NoChunksError`, a `ValueError`. A damaged chunk is fetched
+once more and then skipped and listed in the entry's
 `skipped_chunks` and `warnings`; `strict=True` raises instead. While the job is
 running, a sub-job whose newest chunk is older than `stale_after_seconds` (or,
 for metrics, one with stdout but no metrics) gets a warning that uploads may be
@@ -418,12 +374,12 @@ backend keys such as `context` or `processing`.
 `build_forward_backward_payload(spec)` builds a frame from readable JSON and is
 what the CLI's `fwd-bwd` command uses.
 
-`cortex_training.peft.normalize_lora_peft_config(cfg)` validates and normalizes
+`cortex_training.client.peft.normalize_lora_peft_config(cfg)` validates and normalizes
 the LoRA subset supported by weight sync. It requires `peft_type` to be exactly
 `"Lora"`, so a config copied from a Hugging Face `adapter_config.json` (which
 writes `"LORA"`) must be adjusted.
 
-`cortex_training.optimizer.normalize_optimizer_config(cfg)` does the same for
+`cortex_training.client.optimizer.normalize_optimizer_config(cfg)` does the same for
 the training optimizer block, returning `(canonical_optimizer,
 gradient_clipping)`. It resolves the `type`/`name` and `beta1`/`beta2` aliases,
 flattens a DeepSpeed `params` sub-object, hoists a nested `gradient_clipping`
@@ -444,11 +400,10 @@ on a failed/cancelled request and `TimeoutError` at the deadline.
 `DatabaseAccessError` (a subclass of both `requests.exceptions.HTTPError` and
 `RuntimeError`) means the configured database or schema can't be found by the
 current role: it doesn't exist, or the role can't access it. It carries
-`.response` (the HTTP 400), `.kind` (`"database"` or `"schema"`), `.name`,
+`.response` (the HTTP 400), `.kind` (`"schema"`), `.name` (`DATABASE.SCHEMA`),
 `.role` (the session's role, or None when it can't be determined, as for PAT
 clients), and `.statement`, the SQL that would set it up: `CREATE DATABASE IF NOT
-EXISTS ...`, or for a schema other than `PUBLIC`, that statement and
-`CREATE SCHEMA IF NOT EXISTS ...`, separated by `; `.
+EXISTS ...` and `CREATE SCHEMA IF NOT EXISTS ...`, separated by `; `.
 
 ## Details not covered here
 

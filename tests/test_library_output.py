@@ -7,7 +7,7 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "src" / "cortex_training"
 
 # Entry points that own the terminal. Library code logs through ``logger`` so the
 # CLI's JSON on stdout stays parseable.
-_ALLOWED = {Path("_cli.py"), Path("tui/__main__.py")}
+_ALLOWED = {Path("cli/commands.py"), Path("tui/__main__.py")}
 
 
 def _stdout_writes(tree: ast.AST) -> list[int]:

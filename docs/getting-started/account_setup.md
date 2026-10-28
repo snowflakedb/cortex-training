@@ -47,8 +47,32 @@ continue to the next step.
 
 Generate a Programmatic Access Token (PAT) and configure your client connection.
 Follow the [authentication guide](authentication.md) to complete this step.
+You verify the connection after installing the client in the next step.
 
-Once done, verify your connection and GPU capacity:
+## Step 4: Install the Client and Example Dependencies
+
+Requires [uv](https://docs.astral.sh/uv/) (or `pip`) and Python 3.10 or later
+for the client, or 3.11 or later for the examples (tinker-cookbook needs it).
+
+Clone the repository and install:
+
+```bash
+git clone https://github.com/snowflakedb/cortex-training.git
+cd cortex-training
+uv venv
+source .venv/bin/activate
+uv pip install -e .
+```
+
+Install the example dependency. The training examples and the inference
+`generate` and `evaluate` commands need it for tokenization; `serve` and the
+raw API examples do not:
+
+```bash
+uv pip install 'tinker-cookbook[math-rl] @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
+```
+
+Verify your connection and GPU capacity:
 
 ```bash
 cortex-training capacity
@@ -58,37 +82,21 @@ You should see your reserved GPU capacity listed. If you see zero capacity or
 an error, confirm with the Snowflake team that enablement and GPU reservation
 are complete.
 
-## Step 4: Install the Client and Recipe Dependencies
-
-Requires Python 3.10 or later and [uv](https://docs.astral.sh/uv/) (or `pip`).
-
-Clone the repository and install:
-
-```bash
-git clone https://github.com/snowflakedb/cortex-training.git
-cd cortex-training
-uv pip install -e .
-```
-
-Install the recipe dependency — this is required to run any recipe:
-
-```bash
-uv pip install 'tinker-cookbook @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
-```
-
 ## Step 5: Run Your First Training Job
 
-The conversational SFT recipe fine-tunes Qwen3-8B on a one-example chat dataset
+The conversational SFT example fine-tunes Qwen3-8B on a one-example chat dataset
 ("Who trained you?" → "Snowflake AI Research"). Start with a short run:
 
 ```bash
-python -m recipes.sft.conversational.train \
+python -m examples.sft.conversational.train \
   config=/path/to/your-config.json \
   max_steps=10
 ```
 
-If you used `connections.toml` with a default connection, the recipe picks it
-up automatically. If you used a JSON config, pass the path as `config=`.
+The example uses the same connection resolution as the CLI, so a default
+connection in `connections.toml` is picked up automatically. Pass
+`connection=<name>` for a named profile, or `config=` for a
+[JSON connection file](setup.md#json-connection-file).
 
 What happens during this run:
 
@@ -103,15 +111,15 @@ is learning.
 
 ## Step 6: Verify with Inference
 
-The recipe prints a generate command after saving the checkpoint. Run it to
-confirm the model learned the expected answer:
+The example prints a generate command, with the job and checkpoint IDs filled
+in, after it saves the checkpoint. Run it to confirm the model learned the
+expected answer:
 
 ```bash
-python -m recipes.inference.generate \
+python -m examples.inference.generate \
   config=/path/to/your-config.json \
-  job_config=model-catalog/models/qwen3-8b/standard/h200-inference-full.json \
-  source_job_id=<training_job_id> \
-  checkpoint_id=<checkpoint_id> \
+  source_job_id=TRAINING_JOB_ID \
+  checkpoint_id=CHECKPOINT_ID \
   temperature=0 \
   prompt="Who trained you?"
 ```
@@ -124,8 +132,8 @@ Useful commands while jobs are running or after they complete:
 
 ```bash
 cortex-training list                  # list all your jobs
-cortex-training get <job_id>          # detailed job info
-cortex-training cancel <job_id>       # cancel a job and release GPUs
+cortex-training get JOB_ID            # detailed job info
+cortex-training cancel JOB_ID         # cancel a job and release GPUs
 cortex-training tui                   # terminal UI for browsing jobs and logs
 ```
 
@@ -133,12 +141,12 @@ cortex-training tui                   # terminal UI for browsing jobs and logs
 
 You have a working setup. From here:
 
-- **Try different training methods**: adjust the job config JSON to use
-  [LoRA](../../recipes/sft/README.md)
-  (`job_config=model-catalog/models/qwen3-8b/standard/h200-training-lora.json`), a different model, or different
-  hyperparameters
+- **Try different training methods**: pass `lora=true` for
+  [LoRA](../../examples/sft/README.md), `model=` for a different model from the
+  [model catalog](../../model-catalog/README.md), or `lr=`,
+  `train_batch_size=` and `max_seq_len=` for different hyperparameters
 - **Try reinforcement learning**: run the
-  [Math GRPO recipe](../../recipes/rl/README.md)
-- **Explore all recipes**: browse the [recipe catalog](../../recipes/README.md)
+  [Math GRPO example](../../examples/rl/README.md)
+- **Explore all examples**: browse the [example index](../../examples/README.md)
 - **Learn the CLI**: see the [CLI reference](../reference/cli.md) for all
   available commands

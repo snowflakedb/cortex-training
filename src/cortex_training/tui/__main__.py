@@ -174,10 +174,10 @@ def _build_read_only_client(parser: argparse.ArgumentParser, args: argparse.Name
 
     Its reads are bounded and its calls tagged as the TUI's. Whatever keeps it from
     connecting (a config it can't use, no database, no connection) exits with one of
-    ``parser``'s error lines, not a traceback. ``scripts/tui_screenshot.py`` builds
+    ``parser``'s error lines, not a traceback. ``tools/tui_screenshot.py`` builds
     its client here too, so the two stay the same.
     """
-    import cortex_training._cli as cli
+    import cortex_training.cli.commands as cli
 
     # Reuse the CLI's resolution: --config / login state / env / defaults.
     try:
@@ -211,7 +211,7 @@ def _build_read_only_client(parser: argparse.ArgumentParser, args: argparse.Name
     # defaults (ten retries, a ten-minute read timeout) left a view silent for
     # about a minute on a 404 or a failing service.
     args.max_retries, args.request_timeout = READ_MAX_RETRIES, READ_TIMEOUT
-    from cortex_training.snowflake_auth import SnowflakeProfileError
+    from cortex_training.client.auth import SnowflakeProfileError
 
     try:
         client = cli.build_client(args, cli._load_cortex_training_client_class())

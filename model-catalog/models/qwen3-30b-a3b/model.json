@@ -1,5 +1,6 @@
 {
-  "modelId": "Qwen/Qwen3-30B-A3B",
+  "$schema": "../../schema.json",
+  "model_id": "Qwen/Qwen3-30B-A3B",
   "license": {
     "name": "Apache 2.0",
     "url": "https://huggingface.co/Qwen/Qwen3-30B-A3B/blob/main/LICENSE"
@@ -9,5 +10,9 @@
     "num_moe_layers": 48,
     "topk": 8,
     "num_experts": 128
+  },
+  "last_validated": {
+    "standard/h200-inference-full": null,
+    "standard/h200-training-full": null
   }
 }

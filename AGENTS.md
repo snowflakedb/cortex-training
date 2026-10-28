@@ -12,9 +12,11 @@ All tests must pass.
 
 ## Context
 
-`src/cortex_training/client.py` is an HTTP client for the Cortex Training REST
-API. This repository is the client only; the service implementation lives
-elsewhere and is not public.
+`src/cortex_training/client/` is an HTTP client for the Cortex Training REST
+API (`core.py`, with its authentication, telemetry and config normalizers
+beside it), and `src/cortex_training/cli/` is the `cortex-training` (`ct`)
+command line. This repository is the client only; the service implementation
+lives elsewhere and is not public.
 
 The reference documents in this repository are the contract to code against:
 
@@ -39,4 +41,4 @@ The reference documents in this repository are the contract to code against:
   than only checking `isinstance(payload, bytes)`, which any encoding satisfies.
 - When you change a default, a flag, or a field, update the docs that quote it in
   the same change: `docs/reference/cli.md`, `docs/reference/rest-api.md`, and the
-  recipe READMEs plus `recipe.yaml`.
+  example READMEs plus `example.yaml`.

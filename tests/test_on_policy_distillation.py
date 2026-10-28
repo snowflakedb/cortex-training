@@ -1,10 +1,11 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""CPU contract tests for the on-policy distillation recipe."""
+"""CPU contract tests for the on-policy distillation example."""
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
 from dataclasses import field
@@ -12,25 +13,34 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from recipes.distillation import teacher as teacher_mod
-from recipes.distillation import train as runner
-from recipes.distillation.tasks.gsm8k import extract_answer
-from recipes.distillation.tasks.gsm8k import is_correct
-from recipes.distillation.tasks.gsm8k import parse_gold
-from recipes.utils import _forward_backward_payload
-from recipes.utils import collate
-from recipes.utils import sequence_from_rollout
+from examples.distillation import teacher as teacher_mod
+from examples.distillation import train as runner
+from examples.distillation.tasks.gsm8k import extract_answer
+from examples.distillation.tasks.gsm8k import is_correct
+from examples.distillation.tasks.gsm8k import parse_gold
+from examples.utils import _forward_backward_payload
+from examples.utils import collate
+from examples.utils import sequence_from_rollout
 
 from cortex_training import wire
 
 
 @dataclass
 class _Config:
-    config: str = "unused"
+    config: str | None = "unused"
+    connection: str | None = None
     job_id: str | None = None
     teacher_job_id: str | None = None
-    job_config: str = "configs/qwen3_0p6b_student.json"
-    teacher_job_config: str = "configs/qwen3_8b_teacher.json"
+    student: str = "Qwen/Qwen3-0.6B"
+    teacher: str = "Qwen/Qwen3-8B"
+    context: str = "standard"
+    teacher_context: str | None = None
+    hardware: str = "h200"
+    lora: bool = False
+    student_max_seq_len: int | None = 2048
+    teacher_max_seq_len: int | None = 4096
+    job_config: str | None = None
+    teacher_job_config: str | None = None
     renderer_name: str | None = "qwen3_disable_thinking"
     problems_per_batch: int = 2
     group_size: int = 2
@@ -288,6 +298,196 @@ def test_job_bodies_pair_a_student_with_a_sampling_only_teacher():
     assert runner.job_bodies(_Config(teacher_tau=0.0, reward_coef=1.0))[1] is None
 
 
+def test_job_bodies_build_from_the_catalog_with_the_small_footprint():
+    student, teacher = runner.job_bodies(_Config())
+    training = next(s for s in student["sub_job_configs"] if s["job_type"] == "training")["training_config"]
+    sampling = next(s for s in student["sub_job_configs"] if s["job_type"] == "sampling")["inference_config"]
+    teacher_cfg = teacher["sub_job_configs"][0]["inference_config"]
+
+    # The sizing flags and examples/distillation/overrides.json give a small job.
+    assert training["max_seq_len"] == 2048 and sampling["max_seq_len"] == 2048
+    assert training["n_gpus"] == 1 and sampling["n_gpus"] == 1
+    assert training["mb_spec"]["max_tokens_per_mb"] == 10240
+    assert training["ds_config"]["zero_optimization"]["reduce_scatter"] is True
+    # On-policy distillation replays no routing.
+    assert "router_replay" not in training and "router_replay" not in sampling
+    # The teacher is a larger model, sampling-only, with a wider window.
+    assert teacher["sub_job_configs"][0]["model_name"] == "Qwen/Qwen3-8B"
+    assert teacher_cfg["max_seq_len"] == 4096
+
+
+def test_job_bodies_enforce_a_teacher_window_above_the_student():
+    with pytest.raises(ValueError, match="must exceed the student"):
+        runner.job_bodies(_Config(student_max_seq_len=4096, teacher_max_seq_len=2048))
+
+
+def test_job_config_files_replace_the_catalog_bodies(tmp_path):
+    student_file = tmp_path / "student.json"
+    student_file.write_text(
+        json.dumps(
+            {
+                "hardware": "H200",
+                "sub_job_configs": [
+                    {"job_type": "training", "model_name": "org/S", "training_config": {"max_seq_len": 512, "n_gpus": 3}},
+                    {"job_type": "sampling", "model_name": "org/S", "inference_config": {"max_seq_len": 512, "n_gpus": 3}},
+                ],
+            }
+        )
+    )
+    teacher_file = tmp_path / "teacher.json"
+    teacher_file.write_text(
+        json.dumps(
+            {
+                "hardware": "H200",
+                "sub_job_configs": [
+                    {"job_type": "sampling", "model_name": "org/T", "inference_config": {"max_seq_len": 999, "n_gpus": 1}}
+                ],
+            }
+        )
+    )
+
+    student, teacher = runner.job_bodies(
+        _Config(job_config=str(student_file), teacher_job_config=str(teacher_file))
+    )
+
+    assert next(s for s in student["sub_job_configs"] if s["job_type"] == "training")["model_name"] == "org/S"
+    assert teacher["sub_job_configs"][0]["model_name"] == "org/T"
+
+
+def _teacher_file(tmp_path):
+    path = tmp_path / "teacher.json"
+    path.write_text(
+        json.dumps(
+            {
+                "hardware": "H200",
+                "sub_job_configs": [
+                    {"job_type": "sampling", "model_name": "org/T", "inference_config": {"max_seq_len": 999, "n_gpus": 1}}
+                ],
+            }
+        )
+    )
+    return path
+
+
+def _student_file(tmp_path):
+    path = tmp_path / "student.json"
+    path.write_text(
+        json.dumps(
+            {
+                "hardware": "H200",
+                "sub_job_configs": [
+                    {"job_type": "training", "model_name": "org/S", "training_config": {"max_seq_len": 512, "n_gpus": 1}},
+                    {"job_type": "sampling", "model_name": "org/S", "inference_config": {"max_seq_len": 512, "n_gpus": 1}},
+                ],
+            }
+        )
+    )
+    return path
+
+
+def test_a_manual_teacher_does_not_build_the_catalog_teacher(tmp_path):
+    # A model that is not in the catalog: building it as the catalog teacher would raise.
+    student, teacher = runner.job_bodies(
+        _Config(teacher="org/NotInCatalog", teacher_job_config=str(_teacher_file(tmp_path)))
+    )
+
+    # The catalog student is still built; the unused catalog teacher is not.
+    assert {sub["model_name"] for sub in student["sub_job_configs"]} == {"Qwen/Qwen3-0.6B"}
+    assert teacher["sub_job_configs"][0]["model_name"] == "org/T"
+
+
+def test_a_manual_student_does_not_build_the_catalog_student(tmp_path):
+    # A student model absent from the catalog: building it would raise if it weren't skipped.
+    student, teacher = runner.job_bodies(
+        _Config(student="org/NotInCatalog", job_config=str(_student_file(tmp_path)))
+    )
+
+    assert {sub["model_name"] for sub in student["sub_job_configs"]} == {"org/S"}
+    # The catalog teacher (the only side not supplied) is still built.
+    assert teacher["sub_job_configs"][0]["model_name"] == "Qwen/Qwen3-8B"
+
+
+def test_mismatched_student_windows_in_a_job_config_are_rejected(tmp_path, monkeypatch):
+    client = _FakeClient()
+    _patch_runner(monkeypatch, client)
+    student_file = tmp_path / "student.json"
+    student_file.write_text(
+        json.dumps(
+            {
+                "hardware": "H200",
+                "sub_job_configs": [
+                    {
+                        "job_type": "training",
+                        "model_name": "Qwen/Qwen3-0.6B",
+                        "training_config": {"max_seq_len": 2048, "n_gpus": 1, "train_batch_size": 1, "optimizer": {"lr": 1e-5}},
+                    },
+                    {
+                        "job_type": "sampling",
+                        "model_name": "Qwen/Qwen3-0.6B",
+                        "inference_config": {"max_seq_len": 4096, "n_gpus": 1},
+                    },
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="training max_seq_len .* and sampling max_seq_len .* must match"):
+        runner._train(_Config(job_config=str(student_file), teacher_tau=0.0, reward_coef=1.0), _Task())
+    assert client.created == []
+
+
+def test_a_student_job_config_with_mismatched_models_is_rejected(tmp_path):
+    student_file = tmp_path / "student.json"
+    student_file.write_text(
+        json.dumps(
+            {
+                "hardware": "H200",
+                "sub_job_configs": [
+                    {"job_type": "training", "model_name": "Qwen/Qwen3-0.6B", "training_config": {"max_seq_len": 2048, "n_gpus": 1}},
+                    {"job_type": "sampling", "model_name": "Qwen/Qwen3-8B", "inference_config": {"max_seq_len": 2048, "n_gpus": 1}},
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="must name the same model"):
+        runner.job_bodies(_Config(job_config=str(student_file), teacher_job_config=str(_teacher_file(tmp_path))))
+
+
+def test_a_teacher_job_config_with_duplicate_samplers_is_rejected(tmp_path):
+    teacher_file = tmp_path / "teacher.json"
+    teacher_file.write_text(
+        json.dumps(
+            {
+                "hardware": "H200",
+                "sub_job_configs": [
+                    {"job_type": "sampling", "model_name": "org/T", "inference_config": {"max_seq_len": 999, "n_gpus": 1}},
+                    {"job_type": "sampling", "model_name": "org/T", "inference_config": {"max_seq_len": 999, "n_gpus": 1}},
+                ],
+            }
+        )
+    )
+
+    # Duplicate teacher samplers are rejected (the runner would otherwise use only the first).
+    with pytest.raises(ValueError, match="exactly one sampling sub-job"):
+        runner.job_bodies(_Config(teacher_job_config=str(teacher_file)))
+
+
+def test_write_job_records_writes_a_student_and_a_teacher(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "CONFIGS_DIR", tmp_path)
+    student = {"sub_job_configs": [{"job_type": "training"}, {"job_type": "sampling"}]}
+    teacher = {"sub_job_configs": [{"job_type": "sampling"}]}
+
+    paths = runner.write_job_records(_Config(), student, teacher)
+
+    assert {path.name for path in paths} == {
+        "qwen3-0.6b-standard-h200-full-student.json",
+        "qwen3-8b-teacher.json",
+    }
+    # An attached or job_config= job writes no record.
+    assert runner.write_job_records(_Config(job_id="s", teacher_job_id="t"), student, teacher) == []
+
+
 # --- GSM8K task ---------------------------------------------------------------
 
 
@@ -339,6 +539,7 @@ class _FakeClient:
     cancelled: list = field(default_factory=list)
     generated: list = field(default_factory=list)
     synced: list = field(default_factory=list)
+    weight_formats: list = field(default_factory=list)
     frames: list = field(default_factory=list)
     steps: list = field(default_factory=list)
     _requests: dict = field(default_factory=dict)
@@ -417,6 +618,7 @@ class _FakeClient:
         bucket_size=None,
     ):
         self.synced.append((job_id, source_sub_job_id, tuple(target_sub_job_ids)))
+        self.weight_formats.append(weight_format)
         return self._request({"status": "ok"})
 
     def save(self, job_id, checkpoint_type=None):
@@ -432,7 +634,9 @@ def _patch_runner(monkeypatch, client) -> list:
     )
     renderer = SimpleNamespace(get_stop_sequences=lambda: [99])
     logged = []
-    monkeypatch.setattr(runner, "make_client", lambda path: client)
+    # The jobs are built from the catalog; keep each run's record out of the tree.
+    monkeypatch.setattr(runner, "write_job_records", lambda *args, **kwargs: [])
+    monkeypatch.setattr(runner, "make_client", lambda path, connection=None, **kw: client)
     monkeypatch.setattr(
         runner,
         "build_renderer",
@@ -478,6 +682,26 @@ def test_end_to_end_with_a_fake_client(monkeypatch):
         for _, metrics in logged
         if "teacher/clipped_fraction" in metrics
     )
+
+
+def test_full_distillation_syncs_full_weights(monkeypatch):
+    client = _FakeClient()
+    _patch_runner(monkeypatch, client)
+
+    runner._train(_Config(), _Task())
+
+    # A full-parameter student uses the server default weight format, not "lora".
+    assert client.weight_formats and all(fmt is None for fmt in client.weight_formats)
+
+
+def test_lora_distillation_syncs_the_adapter(monkeypatch):
+    client = _FakeClient()
+    _patch_runner(monkeypatch, client)
+
+    runner._train(_Config(lora=True), _Task())
+
+    # A LoRA student must sync with weight_format="lora" so the sampler's adapter updates.
+    assert client.weight_formats and all(fmt == "lora" for fmt in client.weight_formats)
 
 
 @pytest.mark.parametrize("attach", [False, True])
@@ -544,7 +768,7 @@ def test_clipped_fraction_counts_tokens_outside_the_clip():
 
 def test_entrypoint_runs_the_gsm8k_task(monkeypatch):
     pytest.importorskip("chz")
-    from recipes.distillation.on_policy import train as entry
+    from examples.distillation.on_policy import train as entry
 
     captured = {}
     monkeypatch.setattr(

@@ -1,260 +1,111 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/snowflakedb/cortex-training/model-catalog/schema.json",
-  "title": "Cortex Training model catalog",
+  "title": "Cortex Training catalog model",
+  "description": "model-catalog/models/<slug>/model.json. The job files beside it, <context>/<hw>-<kind>-<mode>.json, are create-job bodies; validate_catalog.py checks both.",
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "schemaVersion",
-    "catalog",
-    "lastReviewed",
-    "models"
+    "model_id",
+    "license",
+    "architecture",
+    "last_validated"
   ],
   "properties": {
     "$schema": {
       "type": "string"
     },
-    "schemaVersion": {
-      "const": 1
-    },
-    "catalog": {
-      "const": "cortex-training"
-    },
-    "lastReviewed": {
+    "model_id": {
+      "description": "Exact model ID. The folder name is its lowercased last segment.",
       "type": "string",
-      "format": "date"
+      "minLength": 1
     },
-    "models": {
-      "type": "array",
-      "minItems": 1,
-      "items": {
-        "$ref": "#/$defs/model"
-      }
-    }
-  },
-  "$defs": {
-    "recommendedProfile": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "maxContextTokens",
-        "recommendedProfileId"
-      ],
-      "properties": {
-        "maxContextTokens": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "recommendedProfileId": {
-          "type": "string",
-          "minLength": 1
-        },
-        "lastValidated": {
-          "type": "string",
-          "format": "date"
-        },
-        "longSequence": {
-          "$ref": "#/$defs/recommendedProfileVariant"
-        }
-      }
-    },
-    "recommendedProfileVariant": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "maxContextTokens",
-        "recommendedProfileId"
-      ],
-      "properties": {
-        "maxContextTokens": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "recommendedProfileId": {
-          "type": "string",
-          "minLength": 1
-        },
-        "lastValidated": {
-          "type": "string",
-          "format": "date"
-        }
-      }
-    },
-    "inferenceCapability": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "supported"
-      ],
-      "properties": {
-        "supported": {
-          "type": "boolean"
-        },
-        "maxContextTokens": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "recommendedProfileId": {
-          "type": "string",
-          "minLength": 1
-        },
-        "lastValidated": {
-          "type": "string",
-          "format": "date"
-        }
-      },
-      "allOf": [
-        {
-          "if": {
-            "properties": {
-              "supported": {
-                "const": true
-              }
-            }
-          },
-          "then": {
-            "required": [
-              "maxContextTokens",
-              "recommendedProfileId"
-            ]
-          },
-          "else": {
-            "not": {
-              "anyOf": [
-                {
-                  "required": [
-                    "maxContextTokens"
-                  ]
-                },
-                {
-                  "required": [
-                    "recommendedProfileId"
-                  ]
-                },
-                {
-                  "required": [
-                    "lastValidated"
-                  ]
-                }
-              ]
-            }
-          }
-        }
-      ]
-    },
-    "trainingCapability": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "supported"
-      ],
-      "properties": {
-        "supported": {
-          "type": "boolean"
-        },
-        "profiles": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "sftLora",
-            "sftFull",
-            "rlLora",
-            "rlFull"
-          ],
-          "properties": {
-            "sftLora": {
-              "$ref": "#/$defs/recommendedProfile"
-            },
-            "sftFull": {
-              "$ref": "#/$defs/recommendedProfile"
-            },
-            "rlLora": {
-              "$ref": "#/$defs/recommendedProfile"
-            },
-            "rlFull": {
-              "$ref": "#/$defs/recommendedProfile"
-            }
-          }
-        }
-      },
-      "allOf": [
-        {
-          "if": {
-            "properties": {
-              "supported": {
-                "const": true
-              }
-            }
-          },
-          "then": {
-            "required": [
-              "profiles"
-            ]
-          },
-          "else": {
-            "not": {
-              "required": [
-                "profiles"
-              ]
-            }
-          }
-        }
-      ]
-    },
-    "model": {
+    "license": {
       "type": "object",
       "additionalProperties": false,
       "required": [
         "name",
-        "modelId",
-        "license",
-        "capabilities"
+        "url"
       ],
       "properties": {
         "name": {
           "type": "string",
           "minLength": 1
         },
-        "modelId": {
+        "url": {
           "type": "string",
-          "minLength": 1
-        },
-        "license": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "name",
-            "url"
-          ],
-          "properties": {
-            "name": {
-              "type": "string",
-              "minLength": 1
-            },
-            "url": {
-              "type": "string",
-              "minLength": 1,
-              "format": "uri"
-            }
-          }
-        },
-        "capabilities": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "inference",
-            "training"
-          ],
-          "properties": {
-            "inference": {
-              "$ref": "#/$defs/inferenceCapability"
-            },
-            "training": {
-              "$ref": "#/$defs/trainingCapability"
-            }
-          }
+          "format": "uri",
+          "pattern": "^https://"
         }
       }
+    },
+    "architecture": {
+      "enum": [
+        "dense",
+        "moe"
+      ]
+    },
+    "moe": {
+      "description": "Routing geometry for router replay planning, as derived from the model config: num_hidden_layers, num_experts_per_tok, and the expert count.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "num_moe_layers",
+        "topk",
+        "num_experts"
+      ],
+      "properties": {
+        "num_moe_layers": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "topk": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "num_experts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65536
+        }
+      }
+    },
+    "last_validated": {
+      "description": "One entry for each job file of the model: the date of its last successful live run, or null.",
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^(standard|long)/(h200|b200|b300)-(training|inference)-(lora|full)$"
+      },
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "string",
+            "format": "date"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    }
+  },
+  "if": {
+    "properties": {
+      "architecture": {
+        "const": "moe"
+      }
+    }
+  },
+  "then": {
+    "required": [
+      "moe"
+    ]
+  },
+  "else": {
+    "not": {
+      "required": [
+        "moe"
+      ]
     }
   }
 }

@@ -1,8 +1,0 @@
-{
-  "modelId": "google/gemma-3-4b-it",
-  "license": {
-    "name": "Gemma",
-    "url": "https://ai.google.dev/gemma/terms"
-  },
-  "architecture": "dense"
-}

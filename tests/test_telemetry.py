@@ -22,7 +22,7 @@ from unittest.mock import MagicMock
 import pytest
 import requests
 
-from cortex_training.telemetry import (
+from cortex_training.client.telemetry import (
     CachedSessionTokenProvider,
     OtlpMetricEmitter,
     _otlp_value,
@@ -78,7 +78,7 @@ def test_session_token_is_cached_until_refresh(monkeypatch):
         {"token": "session-1", "validityInSeconds": 100}
     )
     now = iter([10.0, 10.0, 20.0])
-    monkeypatch.setattr("cortex_training.telemetry.time.monotonic", lambda: next(now))
+    monkeypatch.setattr("cortex_training.client.telemetry.time.monotonic", lambda: next(now))
 
     assert provider.get_token() == "session-1"
     assert provider.get_token() == "session-1"
@@ -101,7 +101,7 @@ def test_session_token_refreshes_after_expiry(monkeypatch):
         _response({"token": "session-2", "validityInSeconds": 100}),
     ]
     now = iter([0.0, 0.0, 101.0, 101.0])
-    monkeypatch.setattr("cortex_training.telemetry.time.monotonic", lambda: next(now))
+    monkeypatch.setattr("cortex_training.client.telemetry.time.monotonic", lambda: next(now))
 
     assert provider.get_token() == "session-1"
     assert provider.get_token() == "session-2"
@@ -119,7 +119,7 @@ def test_zero_validity_still_caches_token(monkeypatch):
         {"token": "session-1", "validityInSeconds": 0}
     )
     now = iter([0.0, 0.0, 1.0])
-    monkeypatch.setattr("cortex_training.telemetry.time.monotonic", lambda: next(now))
+    monkeypatch.setattr("cortex_training.client.telemetry.time.monotonic", lambda: next(now))
 
     assert provider.get_token() == "session-1"
     assert provider.get_token() == "session-1"
@@ -138,7 +138,7 @@ def test_emitter_discovers_hostname_once_and_posts_otlp_payload(monkeypatch):
     emitter._session = MagicMock()
     emitter._session.get.return_value = _response({"hostname": f"{COLLECTOR}/system"})
     emitter._session.post.return_value = _response()
-    monkeypatch.setattr("cortex_training.telemetry.time.time_ns", lambda: 123)
+    monkeypatch.setattr("cortex_training.client.telemetry.time.time_ns", lambda: 123)
 
     emitter.emit(
         "generate",
@@ -336,7 +336,7 @@ def test_consecutive_failures_disable_further_network_calls():
 
 
 def test_second_interrupt_during_exit_flush_is_quiet(monkeypatch):
-    from cortex_training import telemetry
+    from cortex_training.client import telemetry
 
     class Interrupted:
         def close(self, timeout):

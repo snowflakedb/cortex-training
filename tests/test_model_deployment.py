@@ -11,7 +11,7 @@ import requests
 import urllib3
 
 import cortex_training
-import cortex_training.client as client_module
+from cortex_training.client import core as client_module
 from cortex_training.client import (
     ModelDeploymentSpec,
     CortexTrainingClient,

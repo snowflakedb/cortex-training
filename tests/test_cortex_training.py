@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 import cortex_training
-import cortex_training._cli as cli_implementation
+import cortex_training.cli.commands as cli_implementation
 import cortex_training.cli as cortex_cli
 from tests.test_cli import FakeClient
 from tests.test_cli import _base_args

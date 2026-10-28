@@ -21,7 +21,7 @@ from fractions import Fraction
 
 import pytest
 
-from cortex_training import router_replay_planner as planner
+from examples import utils as planner
 
 GIB = 1024**3
 GEOMETRY = planner.MoEGeometry(num_moe_layers=40, topk=8)

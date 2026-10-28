@@ -2978,12 +2978,12 @@ async def _run_a_drag_across_job_list_rows_copies_that_span():
         # Held below the list, the drag stays in its rows: nothing else is highlighted.
         await _drag(mouse, (10, y + 4), (10, 38), via=[(10, 30), (10, 36)])
         assert set(screen.selections) == {table}
-        # A drag that starts on the column names stays on them.
+        # A drag that starts on the column names stays on them; the bars drawn between them aren't copied.
         names = table.region.y
         await _drag(mouse, (4, names), (40, names + 7), via=[(20, names + 3)])
         selection = screen.selections[table]
         assert (selection.start.y, selection.end.y) == (0, 0)
-        assert await _copied(app, pilot, copied) == lines[names][4:41].rstrip()
+        assert await _copied(app, pilot, copied) == lines[names][4:41].replace("┃", " ").rstrip()
         # A change to the rows (e: every job unfolded) drops a highlight in them.
         await _drag(mouse, (8, y), (16, y), via=[(12, y)])
         assert screen.selections
@@ -2994,6 +2994,86 @@ async def _run_a_drag_across_job_list_rows_copies_that_span():
 
 def test_a_drag_across_job_list_rows_copies_that_span():
     asyncio.run(_run_a_drag_across_job_list_rows_copies_that_span())
+
+
+async def _run_a_drag_on_a_column_s_bar_resizes_that_column():
+    from cortex_training.tui.clipboard import selected_text
+    from textual import events
+
+    app = CortexTrainingLogTUI(FakeClient(), poll_interval=0.01)
+    async with app.run_test(size=(200, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        mouse = _pointer(app, pilot)
+        names = table.region.y
+
+        def width(label):
+            return next(column.width for column in table.ordered_columns if column.key.value == label)
+
+        def bar_after(label):
+            line = _screen_lines(app)[names]
+            return line.index("┃", line.index(label))
+
+        # A bar at each column's right edge, in its padding: before every name but the first, and after the last.
+        line = _screen_lines(app)[names]
+        assert line.startswith(" Job ID ") and "┃ Status " in line and "┃ Type " in line
+        assert line.rstrip().endswith("Updated ┃")
+        # On a bar, or a blank cell beside one, the bar brightens and the pointer is a sideways arrow.
+        for x in (bar_after("Owner") - 1, bar_after("Owner"), bar_after("Owner") + 1):
+            await mouse(events.MouseMove, x, names)
+            assert table._hovered == "Owner" and table.styles.pointer == "ew-resize"
+        await mouse(events.MouseMove, bar_after("Owner") + 4, names)
+        assert table._hovered is None and table.styles.pointer == "default"
+        await pilot.press("down", "down")
+        cursor, row = table.cursor_row, table.get_row_at(2)
+        # Pressed on a bar, the column's right edge follows the pointer, while the drag lasts too.
+        x = bar_after("Status")
+        await mouse(events.MouseDown, x, names)
+        await mouse(events.MouseMove, x + 3, names)
+        assert width("Status") == 17
+        await mouse(events.MouseMove, x + 6, names)
+        await mouse(events.MouseUp, x + 6, names)
+        assert width("Status") == 20 and bar_after("Status") == x + 6
+        assert not screen.selections
+        # In place: the rows, and the cursor on them, stay; the LIVE row's rule runs the new width.
+        assert table.cursor_row == cursor and all(a is b for a, b in zip(table.get_row_at(2), row))
+        at = bar_after("Job ID") + 1
+        assert _screen_lines(app)[names + 1][at:at + 22] == " " + "─" * 20 + " "
+        # A blank cell either side of a bar takes it too, so a press a cell off still resizes.
+        x = bar_after("Type")
+        await _drag(mouse, (x + 1, names), (x + 3, names), via=[(x + 2, names)])
+        assert width("Type") == 15
+        x = bar_after("Type")
+        await _drag(mouse, (x - 1, names), (x - 3, names), via=[(x - 2, names)])
+        assert width("Type") == 13
+        # A drag on a name highlights it and leaves the widths, from a name's last letter beside its bar too.
+        x = _screen_lines(app)[names].index("Type")
+        await _drag(mouse, (x, names), (x + 3, names), via=[(x + 2, names)])
+        assert selected_text(screen) == "Type"
+        x = bar_after("Duration")  # Duration fills its column: its "n" is beside the bar
+        await _drag(mouse, (x - 1, names), (x - 6, names), via=[(x - 3, names)])
+        assert selected_text(screen) == "ration"
+        assert (width("Type"), width("Duration")) == (13, 8)
+        # No narrower than a few cells.
+        x = bar_after("Model")
+        await _drag(mouse, (x, names), (0, names), via=[(x - 10, names)])
+        assert width("Model") == 3
+        # The widths stay through a refresh and a narrower terminal.
+        await pilot.press("r")
+        assert await _pause_until(pilot, lambda: not screen._refreshing)
+        await pilot.resize_terminal(150, 40)
+        await pilot.pause(0.2)
+        assert (width("Status"), width("Model")) == (20, 3)
+        # A double-click on a bar gives its column back the width the list picks.
+        x = bar_after("Status")
+        await _click(mouse, x, names)
+        await _click(mouse, x, names)
+        assert await _pause_until(pilot, lambda: width("Status") == 14)
+        assert width("Model") == 3
+        await _settle(app, pilot)
+
+
+def test_a_drag_on_a_column_s_bar_resizes_that_column():
+    asyncio.run(_run_a_drag_on_a_column_s_bar_resizes_that_column())
 
 
 async def _run_job_list_clicks_still_click_with_text_selection():
@@ -3451,7 +3531,7 @@ def test_quit_without_job_id_derives_it_from_sub_job_id_and_reports_crashes(monk
             pass
 
     monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", FakeApp)
-    monkeypatch.setattr("cortex_training._cli.build_client", lambda args, cls: MagicMock())
+    monkeypatch.setattr("cortex_training.cli.commands.build_client", lambda args, cls: MagicMock())
     rc = tui_main.run(["--sub-job-id", "job-x:sampling:0", "--base-url", "http://localhost:1", "--database", "DB"])
     assert seen == {"job_id": "job-x", "sub_job_id": "job-x:sampling:0"}
     assert rc == 1  # the app's return code, not a blanket 0
@@ -3493,7 +3573,7 @@ def test_the_tui_tags_its_client_and_the_job_clients_it_opens(monkeypatch):
 def _screenshot_script():
     import importlib.util
 
-    path = Path(__file__).resolve().parents[1] / "scripts" / "tui_screenshot.py"
+    path = Path(__file__).resolve().parents[1] / "tools" / "tui_screenshot.py"
     spec = importlib.util.spec_from_file_location("tui_screenshot", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -3506,7 +3586,7 @@ class _ScreenshotClient:
 
 def test_the_tui_and_the_screenshot_script_build_the_same_bounded_client(monkeypatch):
     # One helper builds both, so a screenshot's reads are the TUI's: bounded, and tagged as the TUI's.
-    import cortex_training._cli as cli
+    import cortex_training.cli.commands as cli
 
     built = []
 
@@ -3533,7 +3613,7 @@ def test_the_tui_and_the_screenshot_script_build_the_same_bounded_client(monkeyp
 
 
 def test_the_screenshot_script_reads_only_the_account_it_is_named(tmp_path, monkeypatch, capsys):
-    import cortex_training._cli as cli
+    import cortex_training.cli.commands as cli
 
     script = _screenshot_script()
     built = []
@@ -3556,8 +3636,8 @@ def test_the_screenshot_script_reads_only_the_account_it_is_named(tmp_path, monk
 
 def test_the_screenshot_script_s_connection_errors_are_the_tui_s(tmp_path, monkeypatch, capsys):
     # On a machine with no account to read: the TUI's error and how to connect, not a traceback.
-    import cortex_training._cli as cli
-    from cortex_training.snowflake_auth import SnowflakeProfileError
+    import cortex_training.cli.commands as cli
+    from cortex_training.client.auth import SnowflakeProfileError
 
     script = _screenshot_script()
 
@@ -3584,7 +3664,7 @@ def test_the_screenshot_script_s_connection_errors_are_the_tui_s(tmp_path, monke
 
 
 def test_the_screenshot_script_says_what_it_reads_and_leaves_no_cache_behind(tmp_path, monkeypatch, capsys):
-    import cortex_training._cli as cli
+    import cortex_training.cli.commands as cli
 
     script = _screenshot_script()
     monkeypatch.setattr(cli, "build_client", lambda args, cls: _ScreenshotClient())
@@ -3657,7 +3737,7 @@ def test_the_log_poll_interval_must_be_positive_and_finite(value, capsys):
 
 
 def test_the_poll_interval_is_the_flag_s_alone_and_the_sign_in_names_what_the_config_gives(tmp_path, monkeypatch):
-    import cortex_training._cli as cli
+    import cortex_training.cli.commands as cli
 
     seen = []
 
@@ -3673,11 +3753,15 @@ def test_the_poll_interval_is_the_flag_s_alone_and_the_sign_in_names_what_the_co
 
     reads = []
     load_config = cli._load_config
-    monkeypatch.setattr(cli, "_load_config", lambda path: reads.append(path) or load_config(path))
+    monkeypatch.setattr(
+        cli,
+        "_load_config",
+        lambda path, **kwargs: reads.append(path) or load_config(path, **kwargs),
+    )
     monkeypatch.delenv("CORTEX_TRAINING_CONNECTION", raising=False)
     monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", FakeApp)
     built = []  # the poll interval each client is built with
-    monkeypatch.setattr("cortex_training._cli.build_client", lambda args, cls: built.append(args.poll_interval) or MagicMock())
+    monkeypatch.setattr("cortex_training.cli.commands.build_client", lambda args, cls: built.append(args.poll_interval) or MagicMock())
     path = tmp_path / "config.json"
     # The config's poll_interval is the CLI's result polling: neither the TUI's log polls nor a reason not to start.
     path.write_text(json.dumps({"base_url": "http://localhost:1", "database": "DB", "poll_interval": 10}),
@@ -5091,7 +5175,6 @@ def test_list_times_read_at_a_glance_and_say_how_long_they_last():
 
 
 def test_job_list_rows_say_what_their_columns_don_t():
-    from cortex_training.tui.job_list import _ListLayout
     from cortex_training.tui.job_list import _status_chips
 
     jid = "a" * 36
@@ -5134,10 +5217,15 @@ def test_job_list_rows_say_what_their_columns_don_t():
     assert JobListScreen._starts_unfolded({"job_id": "u", "status": "UNKNOWN"})
     assert not JobListScreen._starts_unfolded({**job, "status": "FAILED"})
 
-    layout = _ListLayout((("Job ID", 38), ("Status", 14)))
-    name, rule = JobListScreen._header_cells("HISTORY", 1234, layout)
+    from rich.console import Console
+
+    name, rule = JobListScreen._header_cells("HISTORY", 1234, ("Job ID", "Status"))
     assert str(name) == "HISTORY  1,234"
-    assert str(rule) == "" and rule.text().plain == "─" * 14  # drawn, but not in a copy of the list
+    console = Console(width=80)
+    for width in (14, 20):  # as wide as its column is drawn, a column dragged wider too
+        line, = console.render_lines(rule, console.options.update_width(width), pad=False)
+        assert "".join(segment.text for segment in line) == "─" * width
+    assert str(rule) == ""  # drawn, but not in a copy of the list
 
     live = [{"status": s} for s in ("RUNNING", "queued", "PENDING", "creating", "UNKNOWN", "RUNNING")]
     assert _status_chips(live, 21).plain == "● 2 running   ◔ 1 placing   ○ 2 pending   ? 1 unknown  │  21 in history"
@@ -5403,7 +5491,7 @@ def _run_tui_main(monkeypatch, client, during_run):
 
     monkeypatch.delenv("CORTEX_TRAINING_CONNECTION", raising=False)
     monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", FakeApp)
-    monkeypatch.setattr("cortex_training._cli.build_client", lambda args, cls: client)
+    monkeypatch.setattr("cortex_training.cli.commands.build_client", lambda args, cls: client)
     return tui_main.run(["--base-url", "http://localhost:1", "--database", "DB"])
 
 
@@ -5536,6 +5624,85 @@ async def _run_the_schema_column_names_each_jobs_database_and_schema():
 
 def test_the_schema_column_names_each_jobs_database_and_schema():
     asyncio.run(_run_the_schema_column_names_each_jobs_database_and_schema())
+
+
+async def _run_the_header_draws_which_list_is_shown_as_a_chip():
+    from dataclasses import replace
+    from cortex_training.tui.account import CAPPED
+    from cortex_training.tui.job_list import _ACCOUNT_CHIP
+    from cortex_training.tui.job_list import _SCHEMA_CHIP
+    from cortex_training.tui.job_list import _ListHeader
+
+    app = CortexTrainingLogTUI(FakeClient(), poll_interval=0.01)
+    async with app.run_test(size=(200, 40)) as pilot:
+        screen, _table = await _demo_list(app, pilot)
+        header = screen.query_one(_ListHeader)
+
+        def chips():
+            title = header.format_title()
+            return [(title.plain[span.start:span.end], str(span.style)) for span in title.spans
+                    if " on " in str(span.style)]
+
+        assert await _pause_until(pilot, lambda: not screen._refreshing)
+        assert chips() == [(f" Current schema: {screen._schema_label()} ", _SCHEMA_CHIP)]
+        screen._refreshing = screen._switching = True  # a pressed, the other list not read yet: no chip
+        assert screen.scope_chip() is None
+        screen._refreshing = screen._switching = False
+        screen, _table = await _account_list(app, pilot)
+        assert chips() == [(" all schemas ", _ACCOUNT_CHIP)]
+        # Cut short, the subtitle says only how far the list got: the chip comes first.
+        screen._scope = replace(screen._scope, walked=2000, stopped=CAPPED)
+        screen._update_subtitle()
+        assert app.sub_title.startswith("last refreshed ") and "all schemas" not in app.sub_title
+        assert header.format_title().plain.startswith("cortex training —  all schemas   ·  last refreshed ")
+        assert chips() == [(" all schemas ", _ACCOUNT_CHIP)]
+        await _settle(app, pilot)
+
+
+def test_the_header_draws_which_list_is_shown_as_a_chip():
+    asyncio.run(_run_the_header_draws_which_list_is_shown_as_a_chip())
+
+
+async def _run_a_long_schema_name_is_whole_where_the_screen_has_room():
+    app = CortexTrainingLogTUI(FakeClient(), poll_interval=0.01)
+    async with app.run_test(size=(200, 40)) as pilot:
+        screen, _table = await _account_list(app, pilot)
+        located = [{"database_name": "ML_PLATFORM_DB", "schema_name": name} for name in ("A", "EXPERIMENTS_TEAM_ALPHA")]
+        assert screen._location_column_width(located) == 37  # its widest name, past the 32 it once stopped at
+        # Room to spare: the column takes the whole name, and every other column keeps its width.
+        wide = dict(screen._layout_for(37).columns)
+        assert (wide["Schema"], wide["Job ID"], wide["Updated"]) == (37, 38, 8)
+        # None to spare: it holds to 32, and its cells cut the database name (see below).
+        await pilot.resize_terminal(150, 40)
+        await pilot.pause(0.1)
+        assert dict(screen._layout_for(37).columns)["Schema"] == 32
+        await _settle(app, pilot)
+
+
+def test_a_long_schema_name_is_whole_where_the_screen_has_room():
+    asyncio.run(_run_a_long_schema_name_is_whole_where_the_screen_has_room())
+
+
+def test_a_schema_cell_too_narrow_cuts_the_database_and_keeps_the_schema():
+    from rich.console import Console
+    from cortex_training.tui.job_list import _location_cell
+
+    cell = _location_cell({"database_name": "ML_PLATFORM_DB", "schema_name": "EXPERIMENTS_A"})
+    console = Console(width=80)
+
+    def drawn(width):
+        line, = console.render_lines(cell, console.options.update_width(width), pad=False)
+        return "".join(segment.text for segment in line)
+
+    assert drawn(40) == "ML_PLATFORM_DB.EXPERIMENTS_A"
+    # Two schemas of one database still read apart, so the cut is in the database name.
+    assert drawn(20) == "ML_PL….EXPERIMENTS_A"
+    assert drawn(15) == "….EXPERIMENTS_A"
+    assert drawn(10) == "ML_PLATFO…"  # too narrow for the schema too: the end is cut, as any cell's is
+    assert str(cell) == "ML_PLATFORM_DB.EXPERIMENTS_A"  # copied whole
+    quoted = _location_cell({"database_name": "ml", "schema_name": "dev"})
+    assert str(quoted) == '"ml"."dev"'
+    assert str(_location_cell({})) == "—"
 
 
 async def _run_a_whole_location_in_the_search_is_read_from_the_service():

@@ -1,22 +1,13 @@
 # Cortex Training REST API Reference
 
-> **Status.** This page is a repository snapshot for the client version in this
-> branch. The service's own OpenAPI specification remains the source of truth
-> for the wire schema.
+> **Status.** This page is the customer-facing REST contract: the client in this
+> repository codes against it, and it is the reference for anything a caller
+> can observe.
 >
 > **Scope.** This document describes the customer-facing Cortex Training REST
 > surface used by this repository's `CortexTrainingClient`. It covers REST paths,
 > request framing, asynchronous polling, client-visible schemas, checkpoints,
 > generation, operations, and logs.
->
-> **Sources used for this snapshot.** The client and wire implementation in
-> `src/cortex_training/client.py` and `src/cortex_training/wire.py`, the
-> command-line interface in `src/cortex_training/_cli.py`, their unit tests,
-> and their unit tests are the local evidence for this document. The service's
-> own OpenAPI specification remains the source of truth when it is available.
-> The server-side statements in sections 8.2 and 8.3 about `model_options`
-> and the `prime_rl` block describe server behavior and are not exercised by
-> this repository's tests.
 >
 > **Important distinction.** `CortexTrainingClient` is a low-level transport client.
 > ArcticTraining may put additional keys such as `context` and `processing`
@@ -81,13 +72,14 @@ is `log_prob`.
 ### 1.4 Supported models
 
 The machine-readable source of truth for model availability, workflow support,
-context limits, and recommended configurations is
-[`model-catalog/models.json`](../../model-catalog/models.json). Referenced
-profiles live under [`model-catalog/profiles/`](../../model-catalog/profiles/).
+context limits, and recommended configurations is the model catalog under
+[`model-catalog/models/`](../../model-catalog/models/): one folder per model,
+holding a job file for each supported context, hardware, training or inference
+sub-job, and LoRA or full mode. See the
+[catalog README](../../model-catalog/README.md).
 
 This API reference does not duplicate the model table. Run
-`python scripts/validate_model_catalog.py` after changing the catalog or a
-profile.
+`python model-catalog/validate_catalog.py` after changing the catalog.
 
 ---
 
@@ -116,7 +108,7 @@ as given.
 `CortexTrainingClient` defaults `endpoint` to `cortex-training`.
 
 ```python
-client = CortexTrainingClient.from_connection_name("training")
+client = CortexTrainingClient.from_configs(connection="training")
 ```
 
 The SQL statements API used by execution-log download is outside this prefix:
@@ -137,8 +129,9 @@ different name, pass it explicitly: `endpoint="my-endpoint-name"`.
 
 ### 2.2 Authentication
 
-`CortexTrainingClient.from_connection_name(...)` uses the Snowflake
-Connector's resolved REST origin and live session token:
+A client built from a Snowflake connection profile
+(`CortexTrainingClient.from_configs(...)`) uses the Snowflake Connector's
+resolved REST origin and live session token:
 
 ```http
 Authorization: Snowflake Token="<session-token>"
@@ -148,8 +141,8 @@ The client reconnects once and replays the request when Snowflake explicitly
 reports that the session token expired. Named profiles and the configured
 default profile are supported.
 
-Direct PAT compatibility is available through
-`CortexTrainingClient.from_pat(...)`, which sends:
+When no profile exists, `from_configs()` uses `CORTEX_TRAINING_HOST` and
+`CORTEX_TRAINING_PAT` (for CI), and sends:
 
 ```http
 Authorization: Bearer <PAT>
@@ -1157,6 +1150,7 @@ request_id = client.generate(
     sampling_params={"max_tokens": 64, "temperature": 0.7},
     routing_key="conversation-1",
     strict=False,
+    sub_job_id=f"{job_id}:sampling:1",   # optional
 )
 ```
 
@@ -1173,6 +1167,13 @@ Logical request object inside the DSSST1 frame:
 
 Rules:
 
+- `sub_job_id` is optional and names which sampling sub-job runs the request;
+  discover the ids from `get_job()`'s `sub_jobs`. It is sent as a **query
+  parameter** (`?sub_job_id=...`), not inside the frame, because the server routes
+  the request before it reads the DSSST1 body. If you omit it, the client sends no
+  `sub_job_id` and the server chooses the sub-job. Currently it uses the job's only
+  sampling sub-job, and rejects the request (listing the valid ids) when there are
+  several. Applies to `generate-stream` identically.
 - `prompts` is a list of string prompts and/or token-id lists. A flat list of
   integers such as `[1, 2, 3]`, and a bare 1-D tensor, are each read as one
   pre-tokenized prompt rather than as a batch. For a batch of several prompts,
@@ -1242,7 +1243,7 @@ re-tokenizing it: send the sequence as a pre-tokenized prompt with
 `max_tokens: 1` and read `prompt_logprobs[i]` as the log probability of prompt
 token `i`. The prompt must stay shorter than the sampling sub-job's
 `max_seq_len`. The
-[on-policy distillation recipe](../../recipes/distillation/README.md) scores
+[on-policy distillation example](../../examples/distillation/README.md) scores
 student rollouts with a teacher this way.
 
 ### 6.7 Streaming generate - `POST /{job_id}/generate-stream`
@@ -1766,11 +1767,14 @@ long-context/memory knobs:
 expert id as `uint8` when the model has at most 256 experts and as `uint16`
 when it has 257 to 65536 experts. A `uint16` capture uses twice as many bytes
 as a `uint8` capture for the same sequence length, MoE layer count, and top-k.
-The service does not choose the cap. Derive both the sampling and training
-caps with `cortex_training.router_replay_planner`, which selects that width
-from the expert count and includes it in `CachePlan.max_cache_bytes`. The same
-object can be set on a sampling sub-job through `extra_sampling["router_replay"]`.
-See [python-sdk.md](python-sdk.md#router-replay-capacity-planning).
+The service and the client do not choose the cap: set
+`router_replay.max_cache_bytes` in the job body for each sub-job (on a sampling
+sub-job built with the SDK, through `extra_sampling["router_replay"]`). The
+repository's RL example fills in `5368709120` (5 GiB) for training and
+`21474836480` (20 GiB) for sampling on MoE models, and describes an optional
+planner that sizes a cap from the expert count, sequence length, MoE layer
+count, and top-k; see
+[Router-replay capacity planning](../../examples/rl/README.md#router-replay-capacity-planning).
 
 For LoRA training, set `extra_training["peft_config"]` to a PEFT
 `LoraConfig`-compatible object. It is validated and rewritten client-side, so it
@@ -1884,7 +1888,7 @@ values work, the Value column says so: an even count, or the names that work.
 | `lm_head.token_chunk_size` | trainer | positive integer | `fused_lm_head_token_chunk_size`; also `prime_rl.fused_lm_head_token_chunk_size` when `ep_size` > 1 |
 | `lm_head.vocab_chunk_size` | trainer | positive integer; takes effect only with `lm_head.token_chunk_size` | `fused_lm_head_vocab_chunk_size` |
 | `lm_head.cross_entropy` | trainer | `true`, `false` or `liger` | `prime_rl.fused_cross_entropy` |
-| `liger` | trainer | `true` or `false` | `true` sets `model_provider` to `"liger"`; `false` sets nothing |
+| `liger` | trainer | `true` or `false` | `true` applies Liger kernels on a huggingface model; `false` sets nothing |
 | `moe.grouped_mm` | trainer | `true` or `false` | `prime_rl.moe_use_grouped_mm` |
 | `moe.comm_backend` | trainer | non-empty string (`deepep`, `uccl`) | `prime_rl.ep_comm_backend` |
 | `moe.comm_sms` | trainer | even positive integer | `prime_rl.deepep_num_sms` |
@@ -1908,9 +1912,9 @@ the sub-job starts depends on the model and on `ep_size`:
   `qwen3_5_moe` (or `qwen3_5_moe_text`) (in the
   [model catalog](../../model-catalog/README.md), Qwen3.6-35B-A3B), these fail
   at startup: `compile.fullgraph`, `lm_head.vocab_chunk_size`,
-  `attention.sparse_mla` and `numerics.fp32_residual`. `liger` set to `true`
-  never gets that far: it sets `model_provider` to `"liger"`, while `ep_size`
-  above 1 needs `"prime_rl"`, so the job is rejected before the model loads.
+  `attention.sparse_mla` and `numerics.fp32_residual`. `model_options.liger`
+  set to `true` applies to huggingface models. `ep_size` above 1 needs
+  `model_provider` `"arctic"`, so that combination is rejected before the model loads.
 - With `ep_size` > 1 a model that is not a supported MoE model fails.
 
 Other models or `ep_size` combinations may fail the job at startup.
@@ -1949,8 +1953,8 @@ Notes on single keys:
   `ep_size` > 1 also `prime_rl.fused_lm_head_token_chunk_size`). To turn fused
   cross-entropy off, set `lm_head.cross_entropy` to `false` with `ep_size` > 1,
   or the block entry `prime_rl.fused_cross_entropy` to `false` with
-  `model_provider` `prime_rl` and `ep_size` 1 or omitted; with `model_provider`
-  `liger`, use `huggingface`.
+  `model_provider` `arctic` and `ep_size` 1 or omitted; turn off
+  `model_options.liger`.
 - On server versions that have it, `numerics.fp32_parity` is on by default
   (`true`), so a job that sends no `model_options` runs it, and its
   log-probabilities and loss differ from those of a server version that predates
@@ -2030,7 +2034,7 @@ sent, the first in the order `activation_checkpointing`,
 `activation_checkpointing_freq`, `gradient_checkpointing_freq`,
 `gradient_checkpointing` counts. So `gradient_checkpointing=true` with
 `checkpointing.freq=1` is accepted. Different values are rejected.
-`liger=false` together with `model_provider="liger"` is rejected the same way.
+`liger=false` is rejected when the same training config already applies Liger kernels.
 With `ep_size` above 1 the `fp32_parity` field is not compared: the key writes
 `prime_rl.fp32_parity`, and the key is compared with that entry. The shipped
 dense training configs send `model_provider` `huggingface`, and the Qwen3.5 and
@@ -2105,9 +2109,10 @@ not list, such as `trust_remote_code`, has no key and stays in the block.
 
 With `ep_size` 1 or omitted, `lm_head.cross_entropy` fails at startup and the
 block entry `fused_cross_entropy` is the only spelling: with
-`model_provider="prime_rl"` it decides whether the server refuses
+`model_provider="arctic"` it decides whether the server refuses
 forward/backward requests whose loss needs per-token log-probabilities, and
-with `"liger"` or `"huggingface"` it has no effect.
+with `"huggingface"` it has no effect. `model_options.liger` is separate: it
+applies Liger kernels on a huggingface model.
 
 With `ep_size` 1 or omitted, the block entries `fp32_lm_head`,
 `fused_lm_head_token_chunk_size`, `ac_config` and `fp32_parity` have no effect,
@@ -2792,11 +2797,24 @@ in both keeps the `_stdout/` copy; the sub-job's result gets a warning.
 [section 12.4](#124-gpu-metrics-download)); that sub-job is written first, and
 without `sub_job_ids` there is no preview.
 
+The chunks are found with an experiment artifact `LIST` of each of the two
+roots. When `sub_job_ids` names one of the job's sub-jobs, the download lists
+only that sub-job's folder in each, `_stdout/{sub_job_id}/` and
+`checkpoints/_stdout/{sub_job_id}/`, so the listing returns that sub-job's
+chunks rather than the whole run's; naming several, or one whose id has
+characters other than letters, digits, `_`, `.`, `:` and `-`, lists the roots
+whole. Once
+a listing of both roots finds a sub-job's chunks under just one, the client,
+and every client `for_job()` makes from it, lists only that one for the
+sub-job's later downloads of the same kind of chunk that name it alone, until
+that finding is 10 minutes old; it lists the other root too when that one
+holds none of them. A sub-job with chunks under both roots has both listed.
+
 Each chunk is one experiment artifact `GET` into a private temporary directory.
 Up to `max_workers` (default 16) run at once on one Connector session, each on
 its own cursor; fetches may finish in any order, but chunks are appended
-strictly in sorted name order. The session, and the two listings that come
-first, are described in [section 12.7](#127-download-sessions). At most four fetched chunks per worker wait to
+strictly in sorted name order. The session, and the listings that come first,
+are described in [section 12.7](#127-download-sessions). At most four fetched chunks per worker wait to
 be appended, which bounds temporary disk use. `LIST` and `GET` are retried with
 bounded exponential backoff on transient Connector, network, and service
 errors; a session or token expiry reopens the session. Each `LIST` or `GET`
@@ -2887,7 +2905,9 @@ after saving any output, the exception carries
 `download_progress_saved = True`. `sub_job_ids` limits the download
 to those sub-jobs and raises `cortex_training.NoChunksError` (a `ValueError`
 with `sub_job_ids` and `available` attributes) before any `GET` if one has no
-chunks. Two downloads of the same output directory at once are unsupported.
+chunks. `available` names every other sub-job of the job that has chunks: a
+download that listed one sub-job alone then lists both roots whole to find them.
+Two downloads of the same output directory at once are unsupported.
 
 ### 12.4 GPU metrics download
 
@@ -2897,9 +2917,10 @@ stale_after_seconds=600, transfer_timeout_seconds=300, priority=(),
 on_commit=None, preview_seconds=None, on_preview=None)`
 applies the same reconstruction to
 `gpu.YYYYMMDD-HHMMSS.UUID.gz` chunks under `_metrics/{sub_job_id}/` and writes
-`<output_dir>/<sub_job_id>/gpu.jsonl`, including the options, retries, and the
-manifests beside that file. Unless `stale_after_seconds` is `None`, it also reads
-the job status. While the job is running it lists `_stdout/` too, and a running
+`<output_dir>/<sub_job_id>/gpu.jsonl`, including the options, listing, retries,
+and the manifests beside that file. Unless `stale_after_seconds` is `None`, it
+also reads the job status. While the job is running it also lists stdout
+chunks, limited by `sub_job_ids` as its metrics listing is, and a running
 sub-job that has had stdout chunks for at least two minutes (judged from its
 first stdout chunk and `state_changed_at`) but no metrics chunks is returned
 with `chunk_count` 0,
@@ -3055,10 +3076,13 @@ job's experiment run once and reuses it, since a job's run never changes: they
 share what they read, and remember the newest 256 jobs' runs. A failed read is
 not kept, so the next call tries again. A chunked download (stdout, GPU
 metrics, training metrics) lists its two roots, `_{name}/` and
-`checkpoints/_{name}/`, at the same time, each on its own cursor. If the first
-listing fails, the download waits up to 10 seconds for the second, which runs
-on the same session, before it closes that session; one still running then
-finishes on a session that is closed, never kept.
+`checkpoints/_{name}/` (for one sub-job, its folder in each: see
+[section 12.3](#123-persisted-stdout-download)), at the same time, each on its
+own cursor; one that lists only the root it knows for the sub-job makes one
+listing, then one of the other root if that one holds none of the sub-job's
+chunks. If the first listing fails, the download waits up to 10 seconds for
+the second, which runs on the same session, before it closes that session; one
+still running then finishes on a session that is closed, never kept.
 
 A PAT client opens its sessions with `platform_detection_timeout_seconds=0`
 (Connector 3.17.2 and later), which skips the Connector's cloud-metadata
@@ -3107,12 +3131,7 @@ most a second.
 ```python
 from cortex_training.client import CortexTrainingClient, SubJobConfig
 
-client = CortexTrainingClient.from_pat(
-    host=HOST,
-    pat=PAT,
-    database=DATABASE,
-    schema=SCHEMA,
-)
+client = CortexTrainingClient.from_configs(database=DATABASE, schema=SCHEMA)
 
 training = SubJobConfig.training_job(
     model_name="Qwen/Qwen3-1.7B",
@@ -3210,12 +3229,7 @@ in vLLM before the first adapter sync.
 ```python
 from cortex_training.client import CortexTrainingClient, SubJobConfig
 
-client = CortexTrainingClient.from_pat(
-    host=HOST,
-    pat=PAT,
-    database=DATABASE,
-    schema=SCHEMA,
-)
+client = CortexTrainingClient.from_configs(database=DATABASE, schema=SCHEMA)
 
 lora_config = {
     "peft_type": "Lora",
@@ -3483,7 +3497,7 @@ raised unchanged.
 `CortexTrainingClient` does not call the deployment itself; any
 OpenAI-compatible client does. This is the behavior a caller sees, as checked
 by the `test_tc6_*` cases in `tests/test_model_deployment_e2e.py`. The
-streaming recipe (`recipes/model_deployment/streaming.py`) codes against it.
+streaming example (`examples/model_deployment/streaming.py`) codes against it.
 
 | Item | Behavior |
 |---|---|
@@ -3509,7 +3523,7 @@ one `data: <chat.completion.chunk JSON>` line per chunk and a final
    counts.
 
 The status is already 200 once streaming starts, so a later failure cannot
-change it. The recipe treats a chunk with an `error` key, a `data` line that
+change it. The example treats a chunk with an `error` key, a `data` line that
 is not JSON, or a stream that ends without `[DONE]` as a failed call.
 
 `GET {base_url}/models` is meant to list the `READY` deployments the caller
