@@ -384,6 +384,35 @@ def test_qwen36_long_training_uses_sequence_parallelism():
         assert (config["n_gpus"], config["sp_size"], config["train_batch_size"]) == (8, 8, 1)
 
 
+def test_optimizer_offload_files_keep_the_moments_in_bfloat16():
+    # CPU-Adam holds the offloaded state in host memory, which the zone sizes
+    # per GPU. fp32 moments cost 16 bytes per parameter (4 master + 4 grad +
+    # 8 moments) against 8, so a body that leaves them out is one GPU-count
+    # reduction away from exhausting the host memory it is given.
+    offloaded = {
+        (model_id, key): (
+            _config(_body(model_id, key))["ds_config"]["bf16"].get("bf16_master_weights_and_grads"),
+            _config(_body(model_id, key))["ds_config"]["bf16"].get("bf16_optimizer_states"),
+        )
+        for model_id, files in EXPECTED_FILES.items()
+        for key in files
+        if "training" in key
+        and _config(_body(model_id, key))["ds_config"]["zero_optimization"].get("offload_optimizer")
+    }
+
+    assert offloaded == {
+        ("Qwen/Qwen3.8-Flash-Next", "standard/h200-training-full"): (True, True),
+        ("Qwen/Qwen3.8-Flash-Next", "long/h200-training-full"): (True, True),
+        ("google/gemma-4-31B-it", "standard/h200-training-full"): (True, True),
+        ("zai-org/GLM-4.5-Air", "standard/h200-training-full"): (True, True),
+        ("zai-org/GLM-4.5-Air", "long/h200-training-full"): (True, True),
+        ("zai-org/GLM-5.3-Flash", "standard/h200-training-lora"): (True, True),
+        ("zai-org/GLM-5.3-Flash", "long/h200-training-lora"): (True, True),
+        ("zai-org/GLM-5.3-Flash-BF16", "standard/h200-training-full"): (True, True),
+        ("zai-org/GLM-5.3-Flash-BF16", "long/h200-training-full"): (True, True),
+    }
+
+
 def test_lora_inference_files_match_their_training_adapter():
     for model_id, files in EXPECTED_FILES.items():
         for key in files:

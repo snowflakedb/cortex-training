@@ -1726,6 +1726,20 @@ long-context/memory knobs:
   to disable). Omitted uses the server default.
 - `ac_config`: activation-checkpointing config, including CPU activation offload
   via `offload_config.enabled=true`. Offload requires `mode="full"`.
+- `ds_config.zero_optimization.offload_optimizer`: `{"device": "cpu"}` moves the
+  optimizer state off the GPU and into the zone's **host** memory, which is
+  sized per GPU — so the host budget grows with `n_gpus` while the state to
+  hold does not. Budget about 8 bytes per parameter: master weights, gradients,
+  and both Adam moments, all in bfloat16. That is the server default for a
+  bfloat16 job; `bf16_master_weights_and_grads: false` or
+  `bf16_optimizer_states: false` in the `bf16` block doubles it to 16 bytes per
+  parameter (fp32 master, fp32 gradient, fp32 moments), as does
+  `training_config.fp32_masters`. A job whose state does not fit the host
+  budget dies during startup or at its first `step`, not at submission, so size
+  it before lowering `n_gpus`: a 27B model needs roughly 216 GB of host memory
+  with the default and 432 GB without it. `pin_memory: false` is recommended —
+  pinned host buffers cannot be swapped or reclaimed. The catalog's offload
+  bodies state all three keys explicitly.
 - `router_replay`: `{"enabled", "max_cache_bytes", "mode"}`. `mode` is
   `"strict"` (default) or `"best_effort"`; values other than `"strict"` and
   `"best_effort"` are rejected. It applies to the training sub-job
