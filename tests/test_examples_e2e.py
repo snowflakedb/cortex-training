@@ -45,6 +45,15 @@ EXAMPLES = {
         "examples.sft.conversational.train",
         ["max_steps=2", "max_seq_len=1024", "train_batch_size=4", "log_path={log_path}"],
     ),
+    # LoRA on a hybrid-attention model, which no other case covers: the other LoRA
+    # runs train a plain-attention dense model or a sequence-parallel MoE one, so a
+    # regression in how adapters compose with hybrid attention passes the rest of the
+    # suite. Trains on 8 data-parallel GPUs, and the server rejects a smaller batch.
+    "sft_lora_qwen35": (
+        "examples.sft.conversational.train",
+        ["model=Qwen/Qwen3.5-9B", "lora=true", "max_steps=2", "max_seq_len=1024",
+         "train_batch_size=8", "log_path={log_path}"],
+    ),
     "rl": (
         "examples.rl.math_grpo.train",
         ["max_steps=2", "problems_per_batch=4", "group_size=4", "max_tokens=512",
