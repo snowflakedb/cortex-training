@@ -1776,6 +1776,28 @@ planner that sizes a cap from the expert count, sequence length, MoE layer
 count, and top-k; see
 [Router-replay capacity planning](../../examples/rl/README.md#router-replay-capacity-planning).
 
+#### DFlash2 draft training
+
+`extra_training["model_provider"] = "dflash2"` trains a DFlash2 speculative-decoding
+draft against a frozen target. `model_name` is the frozen target, and the draft is
+configured by `extra_training["dflash2"]`, an object that must carry a
+`draft_config` or an `init_from`. The service validates the object, so unknown keys
+are rejected. It is required for this provider and rejected for any other.
+
+The service enforces these constraints when the job is created:
+
+- `activation_checkpointing` must be `false`; the draft recomputes its own forward.
+- `fp32_parity`, `fp32_residual`, and `text_config_overrides` are not accepted.
+- Master weights and optimizer states are kept in fp32. A `ds_config` that sets
+  `bf16.bf16_master_weights_and_grads` or `bf16.bf16_optimizer_states` is rejected.
+- Generic model patches, such as Liger kernels, are not applied.
+
+Requests use `processing.loss_fn="dflash2"`. It reads `loss_mask`, the usual
+prediction-aligned supervision mask, and does not use vocabulary `action_masks` or
+`compute_logprobs`. Its ratio metrics are returned as additive
+`loss_term_<name>__num` and `loss_term_<name>__den` pairs; divide them to get exact
+pooled ratios.
+
 For LoRA training, set `extra_training["peft_config"]` to a PEFT
 `LoraConfig`-compatible object. It is validated and rewritten client-side, so it
 must specify `peft_type="Lora"` — exactly that spelling, not the `"LORA"` a
@@ -2193,6 +2215,15 @@ sampling = SubJobConfig.sampling_job(
     },
 )
 ```
+
+To serve a draft trained with the `dflash2` provider, set
+`speculative_config.from_source_checkpoint` to `true` instead of `model`, and name
+the training job's weights-only checkpoint in `source_checkpoint_info`
+(`checkpoint_id` and `source_job_id`). The checkpoint is used as the draft model,
+`model_name` stays the target, and the flag is not forwarded to vLLM. The flag is
+accepted only on sampling jobs whose `source_checkpoint_info` names a checkpoint
+saved by a job on the service, and it cannot be combined with
+`speculative_config.model`.
 
 For LoRA sampling, set `extra_sampling["peft_config"]` when creating the
 sub-job. This enables the vLLM LoRA manager before the model starts. The
