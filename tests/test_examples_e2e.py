@@ -45,6 +45,10 @@ EXAMPLES = {
         "examples.sft.conversational.train",
         ["max_steps=2", "max_seq_len=1024", "train_batch_size=4", "log_path={log_path}"],
     ),
+    "custom_loss": (
+        "examples.sft.custom_loss.train",
+        ["max_steps=2", "max_seq_len=1024", "train_batch_size=4", "log_path={log_path}"],
+    ),
     "rl": (
         "examples.rl.math_grpo.train",
         ["max_steps=2", "problems_per_batch=4", "group_size=4", "max_tokens=512",

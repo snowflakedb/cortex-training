@@ -7,6 +7,7 @@ type on the command line instead of writing a job file.
 | Example | Method | Dataset |
 |---|---|---|
 | [Conversational SFT](sft/README.md) | LoRA or full-parameter SFT | Hugging Face chat datasets, GSM8K, identity |
+| [Custom-loss SFT](sft/custom_loss/README.md) | SFT with a loss written in PyTorch (focal loss) | The conversational SFT datasets |
 | [DARE-Bench agent SFT](sft/dare/README.md) | Full-parameter multi-turn tool SFT + agent eval | DARE-Bench |
 | [Math GRPO](rl/README.md) | Reinforcement learning | Hendrycks MATH, MATH-500 |
 | [On-policy distillation](distillation/README.md) | Distillation from a frozen teacher | GSM8K |
@@ -20,7 +21,7 @@ install and entry point.
 examples/
 ├── utils.py          # make_config, build_job and shared helpers
 ├── logging.py        # metrics logging
-├── sft/              # runner.py (shared loop), overrides.json, conversational/, dare/ (own overrides.json)
+├── sft/              # runner.py (shared loop), overrides.json, conversational/, custom_loss/, dare/ (own overrides.json)
 ├── rl/               # runner.py (shared loop), overrides.json, math_grpo/, configs/ (generated)
 ├── inference/        # serve.py, generate.py, evaluate.py, overrides.json
 ├── distillation/     # on_policy/, overrides.json, configs/ (generated)
@@ -51,6 +52,7 @@ To log metrics to Weights & Biases or Snowflake, see
 # Add connection=<profile> or config=<file> to choose a connection; with neither,
 # the default connection is used.
 python -m examples.sft.conversational.train config=/path/to/config.json
+python -m examples.sft.custom_loss.train config=/path/to/config.json
 python -m examples.rl.math_grpo.train config=/path/to/config.json
 python -m examples.distillation.on_policy.train config=/path/to/config.json
 python -m examples.inference.serve config=/path/to/config.json

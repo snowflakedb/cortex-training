@@ -8,7 +8,8 @@ datasets, `identity.py` scores identity evaluations, and `data/` holds the
 bundled data. It runs on the shared loop in `runner.py`.
 
 [DARE-Bench agent SFT](dare/README.md) uses the same loop for multi-turn
-tool-calling traces.
+tool-calling traces. [Custom-loss SFT](custom_loss/README.md) trains on the
+same datasets with a loss written in PyTorch.
 
 ## Run
 

@@ -22,6 +22,7 @@ DARE_OVERRIDES = EXAMPLES / "sft" / "dare" / "overrides.json"
 # metadata and data.
 EXAMPLE_FOLDERS = (
     "sft/conversational",
+    "sft/custom_loss",
     "sft/dare",
     "rl/math_grpo",
     "inference",
@@ -145,6 +146,7 @@ def test_examples_build_their_default_jobs_from_the_catalog():
         "examples.inference.generate",
         "examples.inference.evaluate",
         "examples.sft.conversational.train",
+        "examples.sft.custom_loss.train",
         "examples.rl.math_grpo.train",
     ],
 )
@@ -157,7 +159,9 @@ def test_examples_pick_their_job_by_model_context_hardware_and_lora(module_name)
     assert config.max_seq_len is None
 
 
-@pytest.mark.parametrize("module_name", ["examples.sft.conversational.train", "examples.rl.math_grpo.train"])
+@pytest.mark.parametrize(
+    "module_name", ["examples.sft.conversational.train", "examples.sft.custom_loss.train", "examples.rl.math_grpo.train"]
+)
 def test_training_settings_default_to_the_catalog_values(module_name):
     config = _import_example(module_name).Config(config="unused")
 
@@ -983,6 +987,7 @@ def test_lora_adapters_match_whatever_the_order_of_their_target_modules():
     "relative_path",
     [
         "examples/sft/conversational/train.py",
+        "examples/sft/custom_loss/train.py",
         "examples/rl/math_grpo/train.py",
         "examples/distillation/on_policy/train.py",
     ],
