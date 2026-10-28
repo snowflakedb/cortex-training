@@ -124,6 +124,7 @@ _TEXT_ON = [
     (("ACCENT", "OK", "INFO", "WARN", "ERR", "ENDED", "WARN_TEXT", "ERR_TEXT"), ("BACKGROUND", "SURFACE"), 4.5),
     (("ERR_TEXT", "TEXT"), ("ERR_SURFACE", "MARK_SURFACE"), 4.5),  # a traceback's rows, the line a jump landed on
     (("BACKGROUND",), ("ACCENT", "OK", "INFO", "WARN", "ERR", "ENDED"), 4.5),  # a status pill's word
+    (("ACCENT", "TEXT"), ("HIGHLIGHT",), 4.5),  # a highlighted row: the accent on its band, and a cell's text
 ]
 
 
@@ -133,6 +134,12 @@ def test_the_palette_s_text_reads_on_what_it_is_drawn_on(colors):
             for fores, backs, need in _TEXT_ON for fore in fores for back in backs
             if _contrast(getattr(theme, fore), getattr(theme, back), colors) < need]
     assert not weak, weak
+
+
+def test_the_highlighted_row_is_the_pair_the_contrast_check_reads():
+    variables = theme.CORTEX_THEME.variables
+    assert (variables["block-cursor-background"], variables["block-cursor-foreground"]) == (theme.HIGHLIGHT,
+                                                                                            theme.ACCENT)
 
 
 def test_a_status_differs_in_shape_not_only_in_color():

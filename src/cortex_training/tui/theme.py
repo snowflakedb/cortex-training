@@ -58,6 +58,7 @@ BRAND_ICON = "❆"
 BACKGROUND = "#0d1117"
 SURFACE = "#161b22"
 PANEL = "#21262d"
+HIGHLIGHT = "#383c47"  # the band behind a highlighted row (Textual's block cursor), its text in ACCENT
 # The Logs pane: a warning's and an error's message (in the level's own color, light enough
 # to read as text), a traceback's rows, and the line a jump (e, n) landed on.
 WARN_TEXT = WARN
@@ -88,11 +89,10 @@ CORTEX_THEME = Theme(
     panel=PANEL,
     dark=True,
     variables={
-        # A highlighted row: a gray band, its text in the accent.
-        "block-cursor-background": "#3d414d",
+        "block-cursor-background": HIGHLIGHT,
         "block-cursor-foreground": ACCENT,
         "block-cursor-text-style": "bold",
-        "block-cursor-blurred-background": "#3d414d80",
+        "block-cursor-blurred-background": f"{HIGHLIGHT}80",
         "block-hover-background": "#ffffff0d",
         "footer-key-foreground": ACCENT,
         "footer-description-foreground": MUTED,

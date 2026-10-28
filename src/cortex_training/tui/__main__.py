@@ -131,8 +131,8 @@ def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.Argument
                    help="Disable SSL certificate verification for authenticated requests.")
     p.add_argument(
         "--color", choices=terminal.COLOR_CHOICES, default="auto",
-        help=("auto (the default) draws in color unless NO_COLOR is set or TERM is dumb; always draws "
-              "in color anyway; never draws every color as its gray."),
+        help=("auto (the default) draws in color unless NO_COLOR is set to a non-empty value, or TERM "
+              "is dumb; always draws in color anyway; never draws every color as its gray."),
     )
     return p
 

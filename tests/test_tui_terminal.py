@@ -71,7 +71,7 @@ def _isolated_files(tmp_path, monkeypatch):
         ({"TERM": "xterm-256color"}, "never", Colors(False)),
         # Rich gives a dumb terminal no color system, so nothing would be styled: drawn with 256 colors.
         ({"TERM": "dumb"}, "auto", Colors(False, "TERM=dumb", "256")),
-        ({"TERM": "unknown"}, "auto", Colors(False, "TERM=dumb", "256")),
+        ({"TERM": "unknown"}, "auto", Colors(False, "TERM=unknown", "256")),  # the TERM as it is set
         ({"TERM": "dumb"}, "always", Colors(True, None, "256")),
         ({"TERM": "dumb"}, "never", Colors(False, None, "256")),
         # What Cursor's agent runner sets: NO_COLOR is the reason given.

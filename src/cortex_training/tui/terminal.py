@@ -59,8 +59,8 @@ def colors(choice: str = "auto", environ: Mapping[str, str] | None = None) -> Co
     a ``TEXTUAL_COLOR_SYSTEM`` of the user's own stays theirs.
     """
     environ = os.environ if environ is None else environ
-    dumb = (environ.get("TERM", "").lower() in _DUMB_TERMS
-            and environ.get("TEXTUAL_COLOR_SYSTEM", "auto") == "auto")
+    term = environ.get("TERM", "")
+    dumb = term.lower() in _DUMB_TERMS and environ.get("TEXTUAL_COLOR_SYSTEM", "auto") == "auto"
     color_system = _DUMB_COLOR_SYSTEM if dumb else None
     if choice == "always":
         return Colors(True, None, color_system)
@@ -69,7 +69,7 @@ def colors(choice: str = "auto", environ: Mapping[str, str] | None = None) -> Co
     if environ.get("NO_COLOR"):
         return Colors(False, "NO_COLOR is set", color_system)
     if dumb:
-        return Colors(False, "TERM=dumb", color_system)
+        return Colors(False, f"TERM={term}", color_system)  # as it is set: dumb, or unknown
     return Colors()
 
 
