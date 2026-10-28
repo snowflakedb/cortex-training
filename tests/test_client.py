@@ -1017,6 +1017,7 @@ class TestOperationMetrics:
         "save",
         "load",
         "forward",
+        "forward_backward_custom",
         "weight_sync",
         "bootstrap_router_replay",
         "router_replay_discard",

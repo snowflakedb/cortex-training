@@ -268,6 +268,7 @@ supported`. The short alias `log_prob` is rejected the same way.
 | `generate_stream(...)` | response dict | Same DSSST1 body encoding as `generate`, sent in one POST; read progress with `get_request_status` |
 | `weight_sync(job_id, source_sub_job_id, target_sub_job_ids, weight_format=None)` | `request_id` | `weight_format="lora"` syncs adapters only |
 | `forward(job_id, payload, ...)` | response dict | Byte frames that exceed the `/operation` JSON ceiling are request-chunked; see [rest-api.md section 7.1](rest-api.md#71-forward) |
+| `forward_backward_custom(job_id, data, loss_fn)` | result dict | Blocks. `data` items are token-id sequences or mappings with `"input_ids"`; `loss_fn(data, logprobs) -> (loss, metrics)` runs in this process on `data` unchanged, and its gradient trains the model through the server loss `weighted_cross_entropy`. Adds `loss`, `logprobs` and `logprob_max_abs_diff` to the result and merges `metrics`. See [Custom losses](#custom-losses) |
 | `poll_request(job_id, request_id)` | result dict | Handles backoff, DSSST1 decoding, chunked results, and envelope `metrics` merge (envelope wins on key collision) |
 | `get_request_status(job_id, request_id, max_events=None, cursor=None)` | status dict | |
 | `cancel_request(job_id, request_id, ...)` | response dict | |
@@ -294,6 +295,52 @@ repository's RL example fills in 5 GiB (training) and 20 GiB (sampling) for MoE
 models, and describes an optional planner that sizes a cap from the model's
 geometry; see
 [Router-replay capacity planning](../../examples/rl/README.md#router-replay-capacity-planning).
+
+### Custom losses
+
+`forward_backward_custom` trains on a custom loss `L` written in PyTorch over
+the per-token log-probabilities `logprobs`. It sends a forward pass for
+`logprobs`, runs your `loss_fn` locally, takes `g = dL/dlogprobs` with
+autograd, and sends a forward/backward request with the server loss
+`weighted_cross_entropy` and weights `w = -g`. That loss trains
+`L_surrogate = -sum(w * logprobs)`, whose model gradient is that of `L`. Call
+`step` afterwards as usual.
+
+```python
+def completion_nll(data, logprobs):
+    tokens = torch.cat([lp[item["prompt_length"] - 1:] for lp, item in zip(logprobs, data)])
+    loss = -tokens.mean()
+    return loss, {"nll": loss.item()}
+
+data = [{"input_ids": prompt + completion, "prompt_length": len(prompt)} for prompt, completion in rows]
+result = client.forward_backward_custom(job_id, data, completion_nll)
+client.poll_request(job_id, client.step(job_id))
+```
+
+- Each `data` item is a token-id sequence, or a mapping with `"input_ids"` and
+  any other keys the loss needs, with at least two tokens. The loss gets `data`
+  unchanged.
+- `logprobs[i]` is a float32 tensor of length `len(input_ids) - 1`: element `j`
+  is the log-probability of token `j + 1` under the current training weights,
+  at temperature 1.
+- The call raises before anything trains on malformed `data`, a loss that is
+  not a scalar or does not depend on the log-probabilities, a non-finite loss
+  or gradient, or a metric that is not a number. A service without
+  `weighted_cross_entropy` raises a `RuntimeError` saying it does not support
+  custom losses yet.
+- The result adds `loss` (the value of `L`), `logprobs` (what the loss saw,
+  detached) and `logprob_max_abs_diff` (the largest gap between the two
+  passes), and merges your metrics into `metrics`. The server's
+  `metrics["weighted_cross_entropy_objective_sum"]` is `L_surrogate`, not `L`.
+- A call needs at least as many items as the training sub-job has
+  data-parallel ranks. Do not run `step` or `load` on the job meanwhile. On
+  mixture-of-experts models, check `logprob_max_abs_diff`: the two passes can
+  route tokens differently.
+
+The request frames are in
+[rest-api.md section 10.5](rest-api.md#105-custom-losses). For a runnable
+training loop, see the
+[custom-loss SFT example](../../examples/sft/custom_loss/README.md).
 
 ## Checkpoints
 

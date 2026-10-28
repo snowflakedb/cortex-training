@@ -61,6 +61,7 @@ from collections.abc import Callable
 from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Mapping
+from collections.abc import Sequence
 from dataclasses import dataclass
 from dataclasses import field
 from concurrent.futures import Future
@@ -96,6 +97,7 @@ from cortex_training import wire
 from cortex_training._artifact_download import DownloadCancelled
 from cortex_training._artifact_download import NoChunksError
 from cortex_training.client import _account_jobs
+from cortex_training.client import custom_loss
 from cortex_training.client.auth import SnowflakeProfileAuth
 from cortex_training.client.auth import SnowflakeProfileError
 from cortex_training.client.auth import SnowflakeTelemetryTokenProvider
@@ -6783,6 +6785,74 @@ class CortexTrainingClient:
             sub_job_id=sub_job_id,
             sub_job_type=sub_job_type,
         )
+
+    def _forward_logprobs(self, job_id: str, tokens: list[list[int]]) -> list:
+        """Per-item log-probabilities from a no-gradient forward pass on the training sub-job."""
+        payload = custom_loss.build_forward_logprobs_payload(tokens)
+        body = self.forward(job_id, payload, sub_job_type=JobType.TRAINING.value)
+        result = self.poll_request(job_id, body["request_id"])
+        return custom_loss.logprobs_from_forward_result(result, tokens)
+
+    @_track_operation("forward_backward_custom")
+    def forward_backward_custom(
+        self,
+        job_id: str,
+        data: Sequence[Any],
+        loss_fn: custom_loss.CustomLossFn,
+    ) -> dict:
+        """Accumulate the gradient of a loss computed in this process. Blocks until done.
+
+        Each item of ``data`` is a token-id sequence or a mapping with
+        ``"input_ids"`` and any other keys. ``loss_fn(data, logprobs)`` gets
+        ``data`` unchanged and one differentiable float32 tensor per item, of length
+        ``len(input_ids) - 1``, whose element ``j`` is the log-probability of
+        token ``j + 1`` given the tokens before it. It returns
+        ``(loss, metrics)`` with ``loss``, the custom loss ``L``, a scalar tensor.
+
+        A forward pass on the training sub-job supplies the log-probabilities.
+        The client takes ``g = dL/dlogprobs`` with autograd and sends a
+        forward/backward request with the server loss
+        ``weighted_cross_entropy`` and weights ``w = -g``. That loss trains
+        ``L_surrogate = -sum(w * logprobs)``, so the model gradient is that of
+        ``L``; call :meth:`step` to apply it. The weights must not change
+        between the two passes, so do not run a ``step`` or ``load`` on the job
+        concurrently.
+
+        Malformed ``data``, a non-scalar loss, a loss that does not depend on
+        the log-probabilities, a non-finite loss or gradient, and non-numeric
+        metrics raise before the forward/backward request. A service without
+        ``weighted_cross_entropy`` raises a ``RuntimeError`` saying it does not
+        support custom losses yet.
+
+        Returns the forward/backward result with ``loss`` (the value of ``L``),
+        ``metrics`` updated with ``loss_fn``'s metrics, ``logprobs`` (what
+        ``loss_fn`` saw, detached), and, when the server returns the backward
+        pass's own log-probabilities, ``logprob_max_abs_diff``: the largest gap
+        between the two passes over all predicted tokens. The server's
+        ``metrics["weighted_cross_entropy_objective_sum"]`` is ``L_surrogate``,
+        not ``L``.
+        """
+        tokens = custom_loss.item_tokens(data)
+        logprobs = self._forward_logprobs(job_id, tokens)
+        loss, metrics, grads = custom_loss.apply_custom_loss(data, logprobs, loss_fn)
+        payload = custom_loss.build_custom_loss_backward_payload(tokens, grads)
+        request_id = self.forward_backward(job_id, payload)
+        try:
+            result = dict(self.poll_request(job_id, request_id))
+        except RuntimeError as exc:
+            unsupported = custom_loss.unsupported_server_error(exc)
+            if unsupported is None:
+                raise
+            raise unsupported from exc
+        result["loss"] = loss
+        result["metrics"] = {**(result.get("metrics") or {}), **metrics}
+        result["logprobs"] = logprobs
+        backward_logprobs = custom_loss.logprobs_from_backward_result(result, tokens)
+        if backward_logprobs is not None:
+            result["logprob_max_abs_diff"] = max(
+                float((before - after).abs().max()) for before, after in zip(logprobs, backward_logprobs)
+            )
+        return result
 
     @_track_operation("weight_sync")
     def weight_sync(
