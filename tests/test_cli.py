@@ -2564,7 +2564,7 @@ def test_download_interrupted_after_the_files_are_written_prints_the_resume_hint
     monkeypatch.setattr(client, "_experiment_run_uri", lambda _job: ("snow://run/", "RUN"))
     monkeypatch.setattr(client, "_open_experiment_artifact_connection", MagicMock)
     monkeypatch.setattr(
-        client, "_list_gzip_chunks", lambda *_args: ({sub: ["_metrics/c0.gz"]}, {})
+        client, "_list_gzip_chunks", lambda *_args, **_kwargs: ({sub: ["_metrics/c0.gz"]}, {})
     )
     # The stall check outlives the wait, as when the job lookup is slow.
     monkeypatch.setattr(client, "_STALL_CHECK_WAIT_SECONDS", 0.05)
@@ -3029,6 +3029,33 @@ def test_http_errors_include_response_details():
     assert 'response body: {"message":"backend detail"}' in err
 
 
+def test_a_schema_not_found_error_shows_the_server_message_once():
+    import requests
+
+    from cortex_training import CortexTrainingClient
+
+    client = CortexTrainingClient(
+        base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="PUBLIC", max_retries=0
+    )
+    message = "Schema MY_DB.PUBLIC is not found or not authorized"
+    response = requests.Response()
+    response.status_code = 400
+    response.url = "https://test.snowflakecomputing.com/error"
+    response.headers["Content-Type"] = "application/json"
+    response._content = json.dumps({"code": "517602", "message": message}).encode()
+    response._content_consumed = True
+    client._session = MagicMock()
+    client._session.get.return_value = response
+    stderr = io.StringIO()
+
+    rc = cli.main(["get", "job-1"], client_factory=lambda _args: client, stderr=stderr)
+
+    err = stderr.getvalue()
+    assert rc == 1
+    assert err.startswith("error: Role <ROLE> (couldn't determine your role) can't find database MY_DB")
+    assert err.count(message) == 1
+
+
 def test_invalid_job_json_returns_error(tmp_path):
     path = tmp_path / "job.json"
     path.write_text("[]", encoding="utf-8")
@@ -3457,10 +3484,10 @@ def test_build_client_uses_named_snowflake_connection(tmp_path, monkeypatch):
     args = cli.parse_args(["--connection", "training-profile", "list"])
     client_cls = MagicMock()
     connected = object()
-    client_cls.from_connection_name.return_value = connected
+    client_cls._from_profile.return_value = connected
 
     assert cli.build_client(args, client_cls) is connected
-    client_cls.from_connection_name.assert_called_once_with(
+    client_cls._from_profile.assert_called_once_with(
         connection_name="training-profile",
         database=None,
         schema=None,
@@ -3482,7 +3509,7 @@ def test_build_client_forwards_read_bounds_only_when_set(tmp_path, monkeypatch):
     client_cls = MagicMock()
 
     cli.build_client(args, client_cls)
-    kwargs = client_cls.from_connection_name.call_args.kwargs
+    kwargs = client_cls._from_profile.call_args.kwargs
     assert (kwargs["max_retries"], kwargs["request_timeout"]) == (2, (10.0, 45.0))
 
 

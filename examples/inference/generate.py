@@ -63,7 +63,10 @@ logging.getLogger("tinker_cookbook.renderers.base").setLevel(logging.ERROR)
 
 @chz.chz
 class Config:
-    config: str
+    # Legacy JSON connection file. Omit it to use `connection` or the default profile.
+    config: str | None = None
+    # Snowflake connection profile name (connections.toml). Use config or connection, not both.
+    connection: str | None = None
     job_id: str | None = None  # attach to a running inference endpoint
 
     # The job comes from model-catalog/models/; job_config= replaces it with a file.
@@ -122,7 +125,7 @@ def main(config: Config):
         config.enable_thinking,
     )
 
-    client = make_client(config.config)
+    client = make_client(config.config, config.connection)
     if source is not None:
         logger.info(
             "Creating inference endpoint from weights-only checkpoint %s (job %s)",

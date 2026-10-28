@@ -14,8 +14,8 @@ for a specific workload.
 | `Qwen/Qwen3-4B-Instruct-2507` | dense | standard, long | standard, long | 262,144 |
 | `Qwen/Qwen3-8B` | dense | standard | standard | — |
 | `Qwen/Qwen3.5-4B` | dense | standard, long | standard, long | 262,144 |
-| `Qwen/Qwen3.5-9B` | dense | long | long | 65,536 |
-| `Qwen/Qwen3.8-27B` | dense | standard, long | standard, long | 65,536 |
+| `Qwen/Qwen3.5-9B` | dense | standard, long | standard, long | 262,144 |
+| `Qwen/Qwen3.8-27B` | dense | standard, long | standard, long | 262,144 |
 | `Qwen/Qwen3-30B-A3B` | MoE | standard | standard | — |
 | `Qwen/Qwen3.6-35B-A3B` | MoE | standard, long | standard, long | 262,144 |
 | `Qwen/Qwen3.8-Flash-Next` | MoE | standard, long | standard, long | 262,144 |
@@ -29,7 +29,7 @@ for a specific workload.
 | `zai-org/GLM-4.5-Air` | MoE | standard, long | standard, long | 131,072 |
 | `zai-org/GLM-5.2` | MoE | — | standard | — |
 | `zai-org/GLM-5.2-FP8` | MoE | — | long | 1,048,576 |
-| `zai-org/GLM-5.3` | MoE | — | long | 720,896 |
+| `zai-org/GLM-5.3` | MoE | — | standard, long | 720,896 |
 | `zai-org/GLM-5.3-Flash` | MoE | standard, long | standard, long | 262,144 |
 | `zai-org/GLM-5.3-Flash-BF16` | MoE | standard, long | standard, long | 262,144 |
 | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` | MoE | standard, long | standard, long | 262,144 |
@@ -53,8 +53,8 @@ The examples that tokenize prompts pick a chat renderer from tinker-cookbook
   recommendation for the model, which is thinking on for hybrid Qwen3 models.
 
 tinker-cookbook lists no renderer for Qwen3-0.6B, Qwen3-1.7B, Qwen3.8-Flash-Next,
-the Gemma and MedGemma models, DeepSeek V4, DeepSeek V4.1, GLM 4.5 Air, GLM 5.2
-or GLM 5.3 Flash BF16, so pass `renderer_name=` for those; Math GRPO can't run them. Pick a
+the Gemma and MedGemma models, DeepSeek V4, GLM 4.5 Air, GLM 5.2 or GLM 5.3
+Flash BF16, so pass `renderer_name=` for those; Math GRPO can't run them. Pick a
 renderer from tinker-cookbook's
 [renderer list](https://tinker-docs.thinkingmachines.ai/tutorials/core-concepts/rendering/#available-renderers)
 whose chat template matches the model's own (its `tokenizer_config.json` on
@@ -79,9 +79,10 @@ renderers, so with a thinking-off default pass `enable_thinking=true` or
 - **DeepSeek V4.1-Flash:** full-parameter and attention LoRA train from the
   official checkpoint. LoRA inference records routes on every layer
   (`swa_bounded_replay` off). The sampler names the attention projections
-  `wq_a`, `wkv`, `wq_b`, and `wo_b`.
+  `wq_a`, `wkv`, `wq_b`, and `wo_b`. tinker-cookbook renders it as
+  `deepseekv4_1`, and `deepseekv4_1_disable_thinking` with thinking off.
 - **GLM 5.2 FP8:** the 1M-token file was validated with 1,048,575
   pre-tokenized input tokens plus one generated token.
 - **Qwen3.6-35B-A3B:** LoRA training and checkpoint save/load require the
-  `prime_rl` model provider, and LoRA is limited to `q_proj`, `k_proj`,
+  `arctic` model provider, and LoRA is limited to `q_proj`, `k_proj`,
   `v_proj`, and `o_proj`. Routed-expert LoRA is not yet supported.

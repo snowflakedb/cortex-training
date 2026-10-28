@@ -27,7 +27,8 @@ from cortex_training import wire
 
 @dataclass
 class _Config:
-    config: str = "unused"
+    config: str | None = "unused"
+    connection: str | None = None
     job_id: str | None = None
     teacher_job_id: str | None = None
     student: str = "Qwen/Qwen3-0.6B"
@@ -635,7 +636,7 @@ def _patch_runner(monkeypatch, client) -> list:
     logged = []
     # The jobs are built from the catalog; keep each run's record out of the tree.
     monkeypatch.setattr(runner, "write_job_records", lambda *args, **kwargs: [])
-    monkeypatch.setattr(runner, "make_client", lambda path: client)
+    monkeypatch.setattr(runner, "make_client", lambda path, connection=None, **kw: client)
     monkeypatch.setattr(
         runner,
         "build_renderer",

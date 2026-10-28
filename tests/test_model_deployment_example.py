@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from cortex_training.connection import ResolvedConnection
 from cortex_training.model_deployment import ModelDeploymentSpec
 from examples.model_deployment import streaming
 
@@ -246,7 +247,19 @@ def deploy(monkeypatch, tmp_path):
     connection.write_text(json.dumps({"host": "ACCOUNT.snowflakecomputing.com", "pat": "PAT"}))
     state = {"client": FakeClient(), "calls": []}
 
-    monkeypatch.setattr(module, "make_client", lambda path, **overrides: state["client"])
+    def fake_resolve(config=None, connection=None, **overrides):
+        state["resolved"] = (config, connection, overrides)
+        return ResolvedConnection(
+            client=state["client"],
+            source=f"connection profile '{connection}'" if connection else "config file",
+            host="ACCOUNT.snowflakecomputing.com",
+            database="DB",
+            schema="PUBLIC",
+            verify_ssl=True,
+            pat=state.get("pat", "PAT"),
+        )
+
+    monkeypatch.setattr(module, "resolve_example_connection", fake_resolve)
 
     def fake_stream_chat(base_url, pat, **kwargs):
         state["calls"].append((base_url, pat, kwargs))
@@ -316,3 +329,20 @@ def test_deploy_is_an_entrypoint():
     source = (EXAMPLE_DIR / "deploy.py").read_text()
     assert 'if __name__ == "__main__":' in source
     assert "chz.nested_entrypoint(main)" in source
+
+
+def test_deploy_without_pat_fails_before_creating_a_deployment(deploy):
+    deploy["pat"] = None
+    with pytest.raises(ValueError, match="calls the inference endpoint with a PAT"):
+        deploy["main"](deploy["config"]())
+    assert deploy["client"].created == []
+    assert deploy["calls"] == []
+
+
+def test_deploy_profile_without_pat_names_the_profile(deploy):
+    deploy["pat"] = None
+    module = deploy["module"]
+    config = module.Config(connection="training")
+    with pytest.raises(ValueError, match="connection profile 'training'"):
+        deploy["main"](config)
+    assert deploy["client"].created == []

@@ -93,8 +93,9 @@ python -m examples.sft.conversational.train \
   max_steps=10
 ```
 
-`config=` is a JSON connection file. The examples do not read
-`connections.toml`, so if you configured only that, create the file as in
+The example uses the same connection resolution as the CLI, so a default
+connection in `connections.toml` is picked up automatically. Pass
+`connection=<name>` for a named profile, or `config=` for a
 [JSON connection file](setup.md#json-connection-file).
 
 What happens during this run:

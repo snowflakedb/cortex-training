@@ -49,7 +49,7 @@ EXPECTED_FILES = {
     "Qwen/Qwen3-4B-Instruct-2507": _FULL_STANDARD_LONG,
     "Qwen/Qwen3-8B": _TRAINABLE_STANDARD,
     "Qwen/Qwen3.5-4B": _TRAINABLE_LONG + _TRAINABLE_STANDARD,
-    "Qwen/Qwen3.5-9B": _TRAINABLE_LONG,
+    "Qwen/Qwen3.5-9B": _TRAINABLE_STANDARD + ["long/h200-inference-full", "long/h200-training-full"],
     "Qwen/Qwen3.6-35B-A3B": _TRAINABLE_LONG + _TRAINABLE_STANDARD,
     "Qwen/Qwen3.8-27B": _TRAINABLE_LONG + _TRAINABLE_STANDARD,
     "Qwen/Qwen3-30B-A3B": [
@@ -91,7 +91,7 @@ EXPECTED_FILES = {
     "zai-org/GLM-4.5-Air": _FULL_STANDARD_LONG,
     "zai-org/GLM-5.2": ["standard/h200-inference-full"],
     "zai-org/GLM-5.2-FP8": ["long/h200-inference-full"],
-    "zai-org/GLM-5.3": ["long/h200-inference-full"],
+    "zai-org/GLM-5.3": ["standard/h200-inference-full", "long/h200-inference-full"],
     "zai-org/GLM-5.3-Flash": [
         "standard/h200-inference-full",
         "standard/h200-inference-lora",
@@ -132,10 +132,10 @@ def _config(body: dict) -> dict:
 def test_checked_in_catalog_is_valid():
     assert validate_catalog() == {
         "models": 25,
-        "files": 107,
-        "training": 53,
-        "inference": 54,
-        "rl": 47,
+        "files": 110,
+        "training": 54,
+        "inference": 56,
+        "rl": 48,
         "distillation": 1,
     }
 
@@ -214,12 +214,16 @@ def test_validation_dates_match_completed_live_smokes():
     }
 
     assert validated == {
+        ("Qwen/Qwen3-4B-Instruct-2507", "long/h200-inference-full"): "2026-10-14",
+        ("Qwen/Qwen3-4B-Instruct-2507", "long/h200-training-full"): "2026-10-14",
         ("Qwen/Qwen3.5-4B", "standard/h200-training-full"): "2026-09-02",
         ("Qwen/Qwen3.5-4B", "standard/h200-training-lora"): "2026-09-02",
+        ("Qwen/Qwen3.5-9B", "long/h200-inference-full"): "2026-10-14",
+        ("Qwen/Qwen3.5-9B", "long/h200-training-full"): "2026-10-14",
         ("Qwen/Qwen3.6-35B-A3B", "standard/h200-training-full"): "2026-09-02",
         ("Qwen/Qwen3.6-35B-A3B", "standard/h200-training-lora"): "2026-09-02",
-        ("Qwen/Qwen3.8-27B", "standard/h200-training-full"): "2026-09-02",
-        ("Qwen/Qwen3.8-27B", "standard/h200-training-lora"): "2026-09-02",
+        ("Qwen/Qwen3.8-27B", "long/h200-training-full"): "2026-09-02",
+        ("Qwen/Qwen3.8-27B", "long/h200-training-lora"): "2026-09-02",
         ("deepseek-ai/DeepSeek-V4-Flash-0731", "long/h200-inference-full"): "2026-09-01",
         ("deepseek-ai/DeepSeek-V4-Flash-0731", "long/h200-training-full"): "2026-10-23",
         ("deepseek-ai/DeepSeek-V4-Flash-0731", "long/h200-training-lora"): "2026-10-22",
@@ -229,7 +233,19 @@ def test_validation_dates_match_completed_live_smokes():
         ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "long/h200-training-lora"): "2026-10-26",
         ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "standard/h200-training-full"): "2026-10-23",
         ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "standard/h200-training-lora"): "2026-10-26",
+        ("google/gemma-4-31B-it", "long/h200-inference-full"): "2026-10-15",
+        ("google/gemma-4-31B-it", "long/h200-training-full"): "2026-10-15",
+        ("google/medgemma-1.5-4b-it", "long/h200-inference-full"): "2026-10-15",
+        ("google/medgemma-1.5-4b-it", "long/h200-training-full"): "2026-10-15",
+        ("google/medgemma-4b-it", "long/h200-inference-full"): "2026-10-15",
+        ("google/medgemma-4b-it", "long/h200-training-full"): "2026-10-15",
+        ("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "long/h200-training-full"): "2026-10-14",
+        ("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16", "long/h200-training-full"): "2026-10-14",
         ("zai-org/GLM-5.2-FP8", "long/h200-inference-full"): "2026-09-01",
+        ("zai-org/GLM-5.3-Flash", "long/h200-inference-lora"): "2026-10-20",
+        ("zai-org/GLM-5.3-Flash", "long/h200-training-lora"): "2026-10-20",
+        ("zai-org/GLM-5.3-Flash-BF16", "long/h200-inference-full"): "2026-10-20",
+        ("zai-org/GLM-5.3-Flash-BF16", "long/h200-training-full"): "2026-10-20",
     }
 
 
@@ -251,16 +267,18 @@ def test_files_keep_their_source_sequence_lengths():
         ("Qwen/Qwen3.5-4B", "long", "training"): 262144,
         ("Qwen/Qwen3.5-4B", "standard", "inference"): 32768,
         ("Qwen/Qwen3.5-4B", "standard", "training"): 32768,
-        ("Qwen/Qwen3.5-9B", "long", "inference"): 65536,
-        ("Qwen/Qwen3.5-9B", "long", "training"): 65536,
+        ("Qwen/Qwen3.5-9B", "long", "inference"): 262144,
+        ("Qwen/Qwen3.5-9B", "long", "training"): 262144,
+        ("Qwen/Qwen3.5-9B", "standard", "inference"): 65536,
+        ("Qwen/Qwen3.5-9B", "standard", "training"): 65536,
         ("Qwen/Qwen3.6-35B-A3B", "long", "inference"): 262144,
         ("Qwen/Qwen3.6-35B-A3B", "long", "training"): 262144,
         ("Qwen/Qwen3.6-35B-A3B", "standard", "inference"): 32768,
         ("Qwen/Qwen3.6-35B-A3B", "standard", "training"): 32768,
-        ("Qwen/Qwen3.8-27B", "long", "inference"): 65536,
-        ("Qwen/Qwen3.8-27B", "long", "training"): 65536,
-        ("Qwen/Qwen3.8-27B", "standard", "inference"): 32768,
-        ("Qwen/Qwen3.8-27B", "standard", "training"): 32768,
+        ("Qwen/Qwen3.8-27B", "long", "inference"): 262144,
+        ("Qwen/Qwen3.8-27B", "long", "training"): 262144,
+        ("Qwen/Qwen3.8-27B", "standard", "inference"): 65536,
+        ("Qwen/Qwen3.8-27B", "standard", "training"): 65536,
         ("deepseek-ai/DeepSeek-V4-Flash-0731", "long", "inference"): 1048576,
         ("deepseek-ai/DeepSeek-V4-Flash-0731", "long", "training"): 262144,
         ("deepseek-ai/DeepSeek-V4-Flash-0731", "standard", "inference"): 65536,
@@ -272,6 +290,7 @@ def test_files_keep_their_source_sequence_lengths():
         ("openai/gpt-oss-120b", "long", "inference"): 131072,
         ("zai-org/GLM-5.2", "standard", "inference"): 32768,
         ("zai-org/GLM-5.2-FP8", "long", "inference"): 1048576,
+        ("zai-org/GLM-5.3", "standard", "inference"): 65536,
         ("zai-org/GLM-5.3", "long", "inference"): 720896,
         ("Qwen/Qwen3-30B-A3B", "standard", "inference"): 40960,
         ("Qwen/Qwen3-30B-A3B", "standard", "training"): 40960,
@@ -383,12 +402,12 @@ def test_qwen3_8b_files_carry_the_example_defaults():
         "long/h200-inference-lora",
     ],
 )
-def test_qwen36_lora_uses_prime_rl_attention_targets(key):
+def test_qwen36_lora_uses_arctic_attention_targets(key):
     config = _config(_body("Qwen/Qwen3.6-35B-A3B", key))
 
     assert config["peft_config"]["target_modules"] == ["q_proj", "k_proj", "v_proj", "o_proj"]
     if "training" in key:
-        assert config["model_provider"] == "prime_rl"
+        assert config["model_provider"] == "arctic"
 
 
 def test_qwen36_long_training_uses_sequence_parallelism():
@@ -430,8 +449,17 @@ def test_lora_inference_files_match_their_training_adapter():
 )
 def test_qwen_inference_uses_single_gpu_tensor_parallelism(model_id):
     for key in EXPECTED_FILES[model_id]:
-        if "inference" in key:
+        # Qwen3.5-9B's 262,144-token long tier serves on eight GPUs instead.
+        if "inference" in key and (model_id, key) != ("Qwen/Qwen3.5-9B", "long/h200-inference-full"):
             assert _config(_body(model_id, key))["vllm_config"]["tensor_parallel_size"] == 1
+
+
+def test_qwen35_9b_long_tier_uses_eight_gpus():
+    training = _config(_body("Qwen/Qwen3.5-9B", "long/h200-training-full"))
+    inference = _config(_body("Qwen/Qwen3.5-9B", "long/h200-inference-full"))
+
+    assert (training["n_gpus"], training["sp_size"], training["train_batch_size"]) == (8, 8, 1)
+    assert (inference["n_gpus"], inference["vllm_config"]["tensor_parallel_size"]) == (8, 8)
 
 
 @pytest.mark.parametrize("model_id", ["deepseek-ai/DeepSeek-V4-Flash-0731", "openai/gpt-oss-120b"])
@@ -1006,9 +1034,9 @@ def test_smoke_request_is_the_catalog_file():
 
 
 def test_smoke_request_names_the_files_that_exist():
-    # Qwen3.5-9B ships only long-context files, so a standard inference request names them.
-    with pytest.raises(ValueError, match="has no standard/h200-inference-full.json; its catalog files are: long/"):
-        build_catalog_request(CATALOG_DIR, "Qwen/Qwen3.5-9B", "inference-full")
+    # Qwen3.5-9B's long tier has no LoRA files, so a long LoRA request names the files it has.
+    with pytest.raises(ValueError, match="has no long/h200-inference-lora.json; its catalog files are: long/"):
+        build_catalog_request(CATALOG_DIR, "Qwen/Qwen3.5-9B", "inference-lora", context="long")
 
 
 def test_smoke_request_rejects_a_mismatched_model_namespace():
@@ -1053,7 +1081,14 @@ def test_qwen38_sft_uses_chunked_logprob_loss(job, context):
     request = build_catalog_request(CATALOG_DIR, "Qwen/Qwen3.8-27B", job, context=context)
     training = request["sub_job_configs"][0]["training_config"]
 
-    assert training.get("sp_size", 1) == 1
+    # Each sequence is split across eight GPUs. 256K full fine-tuning needs
+    # four of those groups; a larger sequence-parallel degree does not divide
+    # the attention heads.
+    assert training["sp_size"] == 8
+    if context == "long" and job == "training-full":
+        assert (training["n_gpus"], training["train_batch_size"]) == (32, 4)
+    else:
+        assert (training["n_gpus"], training["train_batch_size"]) == (8, 1)
     assert training["fused_lm_head_token_chunk_size"] == 8192
 
     spec = build_forward_backward_probe_spec(

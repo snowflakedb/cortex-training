@@ -871,7 +871,8 @@ def _write_login_config_path(config_path: str) -> str:
     return saved_path
 
 
-def _load_config(path: str | None) -> dict[str, Any]:
+def _load_config(path: str | None, *, strict: bool = True) -> dict[str, Any]:
+    """Read a legacy JSON config. ``strict=False`` ignores unknown keys."""
     if not path:
         return {}
     path_obj = Path(path).expanduser()
@@ -896,7 +897,7 @@ def _load_config(path: str | None) -> dict[str, Any]:
             unknown.append(key)
             continue
         config[normalized] = value
-    if unknown:
+    if unknown and strict:
         names = ", ".join(sorted(unknown))
         raise ValueError(f"unknown config key(s): {names}")
     return config
@@ -944,12 +945,15 @@ def _has_connection(
 
 def _select_config(args: argparse.Namespace, *, load_login: bool) -> dict[str, Any]:
     args._legacy_config_selected = False
+    args._config_origin = None
+    strict = getattr(args, "_strict_config", True)
     if getattr(args, "connection", None):
         return {}
 
     if args.config:
         args._legacy_config_selected = True
-        return _load_config(args.config)
+        args._config_origin = "config file"
+        return _load_config(args.config, strict=strict)
 
     if not load_login:
         return {}
@@ -971,7 +975,8 @@ def _select_config(args: argparse.Namespace, *, load_login: bool) -> dict[str, A
         return {}
     args.config = login_config
     args._legacy_config_selected = True
-    return _load_config(login_config)
+    args._config_origin = "saved login"
+    return _load_config(login_config, strict=strict)
 
 
 def _resolve_args(
@@ -1110,12 +1115,12 @@ def build_client(args: argparse.Namespace, cortex_training_client_cls):
     if args.base_url:
         return cortex_training_client_cls(base_url=args.base_url, **kwargs)
     if args.use_connection_profile:
-        return cortex_training_client_cls.from_connection_name(
+        return cortex_training_client_cls._from_profile(
             connection_name=args.connection,
             verify_ssl=not args.no_verify_ssl,
             **kwargs,
         )
-    return cortex_training_client_cls.from_pat(
+    return cortex_training_client_cls._from_pat(
         host=_normalize_host(args.host),
         pat=args.pat,
         verify_ssl=not args.no_verify_ssl,

@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 
 import chz
+from examples.utils import example_connection_args
 from examples.utils import make_client
 from examples.utils import running_job
 from examples.inference.endpoint import inference_endpoint_body
@@ -32,7 +33,10 @@ logging.getLogger("urllib3").setLevel(logging.WARN)
 
 @chz.chz
 class Config:
-    config: str
+    # Legacy JSON connection file. Omit it to use `connection` or the default profile.
+    config: str | None = None
+    # Snowflake connection profile name (connections.toml). Use config or connection, not both.
+    connection: str | None = None
     job_id: str | None = None  # attach to a running inference endpoint
 
     # The job comes from model-catalog/models/; job_config= replaces it with a file.
@@ -52,7 +56,7 @@ class Config:
 
 def main(config: Config):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    client = make_client(config.config)
+    client = make_client(config.config, config.connection)
     body, source = inference_endpoint_body(
         model=config.model,
         context=config.context,
@@ -88,7 +92,7 @@ def main(config: Config):
     if config.max_seq_len is not None:
         job_args["max_seq_len"] = config.max_seq_len
     with running_job(client, body, job_id=config.job_id, keep_job=config.keep_job) as job_id:
-        log_endpoint_ready(config.config, job_id, job_args)
+        log_endpoint_ready(example_connection_args(config.config, config.connection), job_id, job_args)
 
 
 if __name__ == "__main__":

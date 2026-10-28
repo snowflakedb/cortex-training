@@ -15,6 +15,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = REPO_ROOT / "examples"
 RL_OVERRIDES = EXAMPLES / "rl" / "overrides.json"
+SFT_OVERRIDES = EXAMPLES / "sft" / "overrides.json"
+DARE_OVERRIDES = EXAMPLES / "sft" / "dare" / "overrides.json"
 
 # Each runnable example and the folder that holds its entry point, task,
 # metadata and data.
@@ -196,6 +198,26 @@ def test_moe_rl_example_fills_router_replay_with_the_fixed_default_caps():
     assert replay["max_cache_bytes"] == utils.DEFAULT_ROUTER_REPLAY_TRAINING_CACHE_BYTES
 
 
+def _sampling_window_exceeds_training(utils, model: str, context: str, hardware: str, lora: bool) -> bool:
+    """Whether this tier's inference file samples past its training window.
+
+    ``make_config(..., rl=True)`` rejects that pair. The catalog keeps both files
+    and builds no RL job, matching ``validate_catalog``.
+    """
+    folder = REPO_ROOT / "model-catalog" / "models" / utils.model_slug(model) / context
+
+    def window(kind: str):
+        path = folder / utils.catalog_file_name(hardware, kind, lora)
+        if not path.is_file():
+            return None
+        sub_job = json.loads(path.read_text())["sub_job_configs"][0]
+        block = sub_job.get("training_config") or sub_job.get("inference_config") or {}
+        return block.get("max_seq_len")
+
+    training, sampling = window("training"), window("inference")
+    return isinstance(training, int) and isinstance(sampling, int) and sampling > training
+
+
 def test_rl_overrides_restore_betas_packing_and_reduce_scatter_for_every_model():
     # rl/overrides.json restores the three RL settings shared by the pre-restructure
     # configs, for the default RL job and every model's RL job.
@@ -206,6 +228,8 @@ def test_rl_overrides_restore_betas_packing_and_reduce_scatter_for_every_model()
         folder = REPO_ROOT / "model-catalog" / "models" / utils.model_slug(model) / context
         if not (folder / utils.catalog_file_name(hardware, "inference", lora)).is_file():
             continue  # not an RL-capable selection (no matching inference file)
+        if _sampling_window_exceeds_training(utils, model, context, hardware, lora):
+            continue
         body = utils.build_job("rl", model=model, context=context, hardware=hardware, lora=lora, example_dir=rl_dir)
         training = _sub_job(body, "training")["training_config"]
         where = (model, context, hardware, lora)
@@ -310,6 +334,52 @@ def test_rl_job_config_is_used_as_is(tmp_path):
     assert _job_body("examples.rl.math_grpo.train", job_config=str(path)) == record
 
 
+def _by_job_type(body: dict) -> dict:
+    return {sub["job_type"]: sub for sub in body["sub_job_configs"]}
+
+
+@pytest.mark.parametrize(
+    ("model", "context", "lora"),
+    [("Qwen/Qwen3-8B", "standard", True), ("Qwen/Qwen3.6-35B-A3B", "long", False)],
+)
+@pytest.mark.parametrize("kind", ["training", "inference"])
+def test_an_rl_job_config_names_either_catalog_file_of_a_pair(model, context, lora, kind):
+    utils = _import_example("examples.utils")
+    folder = REPO_ROOT / "model-catalog" / "models" / utils.model_slug(model) / context
+    path = folder / utils.catalog_file_name("h200", kind, lora)
+
+    body = _job_body("examples.rl.math_grpo.train", job_config=str(path), model=model, context=context, lora=lora)
+
+    # The file plus its sibling's other sub-job, sampling first: the catalog's RL
+    # composition without rl/overrides.json or router replay.
+    composed = utils.make_config(model, context, lora=lora, rl=True)
+    for sub in composed["sub_job_configs"]:
+        (sub.get("training_config") or sub.get("inference_config")).pop("router_replay", None)
+    assert [sub["job_type"] for sub in body["sub_job_configs"]] == ["sampling", "training"]
+    assert body["hardware"] == composed["hardware"]
+    assert _by_job_type(body) == _by_job_type(composed)
+
+
+def test_an_rl_job_config_with_both_sub_jobs_is_not_paired(tmp_path):
+    utils = _import_example("examples.utils")
+    record = utils.make_config("Qwen/Qwen3-8B", "standard", lora=True, rl=True)
+    path = tmp_path / "h200-training-lora.json"
+    path.write_text(json.dumps(record))
+    sibling = REPO_ROOT / "model-catalog/models/qwen3-8b/standard/h200-inference-lora.json"
+    (tmp_path / "h200-inference-lora.json").write_text(sibling.read_text())
+
+    assert utils.build_job("rl", model="Qwen/Qwen3-8B", context="standard", job_config=str(path)) == record
+
+
+def test_an_rl_job_config_without_a_sibling_keeps_the_composition_error(tmp_path):
+    utils = _import_example("examples.utils")
+    path = tmp_path / "h200-training-lora.json"
+    path.write_text((REPO_ROOT / "model-catalog/models/qwen3-8b/standard/h200-training-lora.json").read_text())
+
+    with pytest.raises(ValueError, match=r"has sub-jobs \['training'\]; a rl job needs exactly \['sampling', 'training'\]"):
+        utils.build_job("rl", model="Qwen/Qwen3-8B", context="standard", job_config=str(path))
+
+
 def test_overrides_json_sits_between_the_catalog_and_the_command_line(tmp_path):
     utils = _import_example("examples.utils")
     (tmp_path / "overrides.json").write_text(
@@ -326,19 +396,31 @@ def test_overrides_json_sits_between_the_catalog_and_the_command_line(tmp_path):
 
 def test_every_example_ships_an_overrides_file_with_a_comment():
     # Every example ships an overrides.json carrying a human "_comment"; SFT and
-    # inference are comment-only (no real overrides), RL and distillation also
-    # carry their real settings.
-    sft = EXAMPLES / "sft" / "overrides.json"
+    # inference are comment-only (no real overrides), RL, distillation and DARE
+    # also carry their real settings.
+    sft = SFT_OVERRIDES
     inference = EXAMPLES / "inference" / "overrides.json"
     distillation_overrides = EXAMPLES / "distillation" / "overrides.json"
-    assert set(EXAMPLES.glob("*/overrides.json")) == {sft, RL_OVERRIDES, inference, distillation_overrides}
+    assert set(EXAMPLES.rglob("overrides.json")) == {
+        sft,
+        RL_OVERRIDES,
+        inference,
+        distillation_overrides,
+        DARE_OVERRIDES,
+    }
 
     for path in (sft, inference):
         data = json.loads(path.read_text())
         assert set(data) == {"_comment"} and isinstance(data["_comment"], str) and data["_comment"]
 
-    for path in (RL_OVERRIDES, distillation_overrides):
+    for path in (RL_OVERRIDES, distillation_overrides, DARE_OVERRIDES):
         assert isinstance(json.loads(path.read_text()).get("_comment"), str)
+
+    dare = json.loads(DARE_OVERRIDES.read_text())
+    ds_batch_fields = {"train_batch_size": None, "train_micro_batch_size_per_gpu": None, "gradient_accumulation_steps": None}
+    assert dare["sub_job_configs"] == [
+        {"job_type": "training", "training_config": {"n_gpus": 8, "ds_config": ds_batch_fields}}
+    ]
 
     override = json.loads(RL_OVERRIDES.read_text())
     (training,) = [sub for sub in override["sub_job_configs"] if sub["job_type"] == "training"]
@@ -353,6 +435,36 @@ def test_every_example_ships_an_overrides_file_with_a_comment():
     assert student_config["n_gpus"] == 1 and student_config["train_batch_size"] == 1
     assert student_config["mb_spec"] == {"max_tokens_per_mb": 10240}
     assert student_config["ds_config"]["zero_optimization"]["reduce_scatter"] is True
+
+
+def test_dare_applies_its_own_overrides_after_the_sft_file():
+    utils = _import_example("examples.utils")
+    dare = _import_example("examples.sft.dare.train")
+
+    body = _job_body("examples.sft.dare.train")
+
+    # The catalog file, sft/overrides.json, dare/overrides.json, then DARE's lr and batch defaults.
+    assert body == utils.build_job(
+        "training",
+        model="Qwen/Qwen3-8B",
+        context="standard",
+        example_dir=EXAMPLES / "sft",
+        overrides=[DARE_OVERRIDES],
+        lr=dare.Config().lr,
+        train_batch_size=dare.Config().train_batch_size,
+    )
+    assert _sub_job(body, "training")["training_config"]["n_gpus"] == 8
+    # Only DARE has the file: conversational SFT keeps the catalog's GPU count.
+    assert _sub_job(_job_body("examples.sft.conversational.train"), "training")["training_config"]["n_gpus"] == 4
+
+
+def test_an_override_that_moves_the_gpu_count_past_the_deepspeed_batch_is_rejected():
+    utils = _import_example("examples.utils")
+    more_gpus = {"sub_job_configs": [{"job_type": "training", "training_config": {"n_gpus": 8}}]}
+
+    # Qwen3-30B-A3B's file spells out a DeepSpeed batch of 4 for its 4 GPUs.
+    with pytest.raises(ValueError, match=r"ds_config train_batch_size 4 must equal .* 8 data-parallel ranks"):
+        utils.build_job("training", model="Qwen/Qwen3-30B-A3B", context="standard", overrides=[more_gpus])
 
 
 def test_the_sft_and_inference_overrides_files_are_no_ops(monkeypatch):
@@ -471,7 +583,7 @@ def _run_rl_example(monkeypatch, tmp_path, events, *, fail=None, renderer_error=
     ml_logger = type("Logger", (), {"log_metrics": lambda self, *args, **kwargs: None, "close": lambda self: None})()
     monkeypatch.setattr(runner, "write_job_record", write_job_record)
     monkeypatch.setattr(runner, "build_renderer", build_renderer)
-    monkeypatch.setattr(runner, "make_client", lambda config_path: _FakeJobClient(events, fail))
+    monkeypatch.setattr(runner, "make_client", lambda config_path, connection=None, **kw: _FakeJobClient(events, fail))
     monkeypatch.setattr(runner, "setup_logging", lambda *args, **kwargs: ml_logger)
     monkeypatch.setattr(runner, "save_example_checkpoints", lambda client, job_id: {"weights-only": {"checkpoint_id": "cp_1"}})
     config = module.Config(config="unused", max_steps=0, eval_every=0, **settings)
@@ -562,6 +674,71 @@ def test_a_job_config_run_writes_no_record(tmp_path, monkeypatch):
     assert path.read_text() == "previous run\n"
 
 
+class _RolloutClient(_FakeJobClient):
+    """A job client whose generate returns two rollouts with different rewards."""
+
+    def generate(self, job_id: str, *, prompts, sampling_params) -> str:
+        return "request-1"
+
+    def poll_request(self, job_id: str, request_id: str) -> dict:
+        return {"results": [{"text": "right", "token_ids": [3]}, {"text": "wrong", "token_ids": [4]}]}
+
+
+class _OneProblemTask:
+    name = "one problem"
+    evaluation_name = "none"
+
+    def load(self, seed: int):
+        return type("Dataset", (), {"train": [("problem", "right")], "test": None})()
+
+    def build_prompt(self, problem, renderer) -> list[int]:
+        return [1, 2]
+
+    def score_response(self, response, answer, *, result, max_tokens):
+        return float(response == answer), {}
+
+
+@pytest.mark.parametrize(
+    ("lora", "weight_sync_format", "sent"),
+    [
+        (False, "hf", "hf"),
+        (False, None, None),
+        (True, "hf", "lora"),
+    ],
+)
+def test_rl_weight_sync_format_applies_to_full_parameter_runs(tmp_path, monkeypatch, lora, weight_sync_format, sent):
+    runner = _import_example("examples.rl.runner")
+    module = _import_example("examples.rl.math_grpo.train")
+    syncs: list[dict] = []
+    renderer = type("Renderer", (), {"get_stop_sequences": lambda self: ["<|im_end|>"]})()
+    tokenizer = type("Tokenizer", (), {"pad_token_id": 0, "eos_token_id": 0})()
+    ml_logger = type("Logger", (), {"log_metrics": lambda self, *args, **kwargs: None, "close": lambda self: None})()
+    monkeypatch.setattr(runner, "CONFIGS_DIR", tmp_path / "configs")
+    monkeypatch.setattr(runner, "build_renderer", lambda model_name: (tokenizer, renderer, "fake"))
+    monkeypatch.setattr(runner, "make_client", lambda config_path, connection=None, **kw: _RolloutClient([]))
+    monkeypatch.setattr(runner, "setup_logging", lambda *args, **kwargs: ml_logger)
+    monkeypatch.setattr(runner, "sequence_from_rollout", lambda prompt, sampled, *, advantage: (prompt, sampled))
+    monkeypatch.setattr(runner, "collate", lambda datums, **kwargs: ({}, {}))
+    monkeypatch.setattr(runner, "forward_backward_step", lambda *args, **kwargs: ({"avg_loss": 0.0}, {}))
+    monkeypatch.setattr(runner, "sync_weights", lambda client, job_id, **kwargs: syncs.append(kwargs))
+    monkeypatch.setattr(runner, "save_example_checkpoints", lambda client, job_id: {"weights-only": {"checkpoint_id": "cp_1"}})
+
+    config = module.Config(
+        config="unused",
+        lora=lora,
+        weight_sync_format=weight_sync_format,
+        problems_per_batch=1,
+        group_size=2,
+        max_steps=1,
+        eval_every=0,
+    )
+    runner.train(config, _OneProblemTask())
+
+    # A full-parameter run sends the chosen format (None keeps the server default);
+    # a LoRA run always syncs only the adapter.
+    assert syncs == [{"weight_format": sent, "bucket_size": None}]
+
+
 def test_only_an_explicit_debug_image_tag_authorizes_debug_options(tmp_path, monkeypatch):
     import types
 
@@ -633,6 +810,46 @@ def _catalog_selections(kind: str) -> list[tuple[str, str, str, bool]]:
     return selections
 
 
+@pytest.mark.parametrize(("model", "context", "hardware", "lora"), _catalog_selections("training"))
+def test_dare_builds_a_runnable_mesh_or_stops_for_every_catalog_training_file(model, context, hardware, lora):
+    utils = _import_example("examples.utils")
+    catalog = utils.make_config(model, context, hardware=hardware, lora=lora)["sub_job_configs"][0]["training_config"]
+    # DARE's ds_config nulls let the server derive the batch, so only the catalog
+    # file's own sp_size/ep_size can fail to fit 8 GPUs.
+    reasons = utils.parallelism_errors(dict(catalog, n_gpus=8))
+
+    if reasons:
+        # Rejected before submission, naming the override and each reason.
+        with pytest.raises(ValueError) as raised:
+            _job_body("examples.sft.dare.train", model=model, context=context, hardware=hardware, lora=lora)
+        message = str(raised.value)
+        assert "training parallelism does not fit its GPU count after" in message
+        assert str(DARE_OVERRIDES) in message
+        assert all(reason in message for reason in reasons), message
+        return
+    body = _job_body("examples.sft.dare.train", model=model, context=context, hardware=hardware, lora=lora)
+    training = _sub_job(body, "training")["training_config"]
+    assert training["n_gpus"] == 8
+    assert utils.parallelism_errors(training) == []
+    assert utils._deepspeed_batch_errors(training) == []
+    # DeepSpeed's batch, as the server builds it, fits the 8-GPU layout.
+    ds_batch, micro, accumulation, ranks = _server_deepspeed_batch(training)
+    assert ds_batch == micro * accumulation * ranks
+
+
+def test_dare_keeps_a_fitting_mesh_and_rejects_one_that_needs_more_gpus():
+    # Qwen3-30B-A3B's 4-GPU EP4 mesh still divides 8 GPUs, and its catalog
+    # DeepSpeed batch of 4 is dropped for the server to derive at 8.
+    training = _sub_job(_job_body("examples.sft.dare.train", model="Qwen/Qwen3-30B-A3B"), "training")["training_config"]
+    assert (training["n_gpus"], training["ep_size"]) == (8, 4)
+    assert not {"train_batch_size", "train_micro_batch_size_per_gpu", "gradient_accumulation_steps"} & set(training["ds_config"])
+    assert _server_deepspeed_batch(training) == (8, 1, 1, 8)
+
+    # GLM-5.3-Flash-BF16 trains on a 16-GPU SP16/EP16 mesh, which 8 GPUs cannot hold.
+    with pytest.raises(ValueError, match=r"sp_size 16 must be a positive divisor of n_gpus 8; ep_size 16"):
+        _job_body("examples.sft.dare.train", model="zai-org/GLM-5.3-Flash-BF16")
+
+
 def _assert_serves_checkpoint(utils, training_sub: dict, args: dict) -> None:
     inference = utils.make_config(
         args["model"], args["context"], hardware=args["hardware"], lora=args["lora"], inference=True
@@ -653,6 +870,14 @@ def test_follow_up_commands_pick_an_inference_file_that_serves_the_checkpoint(mo
 
     args = utils.inference_job_args(body, context=context)
 
+    if args == {"job_config": utils.INFERENCE_JOB_CONFIG_PLACEHOLDER}:
+        # A training mesh with no sampler of this mode has nothing to follow up with.
+        folder = REPO_ROOT / "model-catalog" / "models" / utils.model_slug(model)
+        assert not any(
+            (folder / candidate / utils.catalog_file_name(hardware, "inference", lora)).is_file()
+            for candidate in ("standard", "long")
+        ), (model, context, hardware, lora)
+        return
     assert set(args) == {"model", "context", "hardware", "lora"}
     assert (args["model"], args["hardware"], args["lora"]) == (model, hardware, lora)
     _assert_serves_checkpoint(utils, body["sub_job_configs"][0], args)
@@ -679,6 +904,8 @@ def test_rl_follow_up_commands_serve_the_checkpoint():
     for model, context, hardware, lora in _catalog_selections("training"):
         folder = REPO_ROOT / "model-catalog" / "models" / utils.model_slug(model) / context
         if not (folder / utils.catalog_file_name(hardware, "inference", lora)).is_file():
+            continue
+        if _sampling_window_exceeds_training(utils, model, context, hardware, lora):
             continue
         body = utils.build_job("rl", model=model, context=context, hardware=hardware, lora=lora, rollout_batch_size=8)
         args = utils.inference_job_args(body, context=context)
@@ -782,6 +1009,25 @@ def test_lora_adapters_match_whatever_the_order_of_their_target_modules():
     assert utils.same_adapter(adapter, dict(adapter, target_modules=["v_proj", "q_proj"], task_type="CAUSAL_LM"))
     assert not utils.same_adapter(adapter, dict(adapter, r=16))
     assert not utils.same_adapter(adapter, None)
+
+
+def test_deepseek_v4_trainer_and_vllm_module_names_are_the_same_adapter():
+    utils = _import_example("examples.utils")
+    trainer = {
+        "peft_type": "Lora",
+        "r": 32,
+        "lora_alpha": 32,
+        "target_modules": r".*self_attn\.(q_a_proj|q_b_proj|kv_proj|o_b_proj)$",
+    }
+    sampler = {
+        "peft_type": "Lora",
+        "r": 32,
+        "lora_alpha": 32,
+        "target_modules": ["wq_a", "wkv", "wq_b", "wo_b"],
+    }
+
+    assert utils.same_adapter(trainer, sampler)
+    assert not utils.same_adapter(trainer, dict(sampler, target_modules=["wq_a"]))
 
 
 @pytest.mark.parametrize(
@@ -897,7 +1143,7 @@ def test_saved_checkpoints_print_a_command_that_serves_the_checkpoint(caplog):
     body = utils.build_job("training", model="Qwen/Qwen3.5-4B", context="standard", lora=True)
 
     utils.log_saved_checkpoints(
-        config_path="conn.json",
+        connection_args="config=conn.json",
         job_id="job-1",
         saved={"weights-only": {"checkpoint_id": "cp_1"}},
         sampling_command="evaluate",
@@ -929,7 +1175,7 @@ def test_saved_checkpoints_print_an_explicit_job_config_when_no_catalog_file_fit
     body = utils.make_config("Qwen/Qwen3-8B", "standard", overrides=[_training_override(model_name="org/Custom-8B")])
 
     utils.log_saved_checkpoints(
-        config_path="conn.json",
+        connection_args="config=conn.json",
         job_id="job-1",
         saved={"weights-only": {"checkpoint_id": "cp_1"}},
         sampling_command="sample",
@@ -968,14 +1214,14 @@ def _follow_up_body(module_name: str, args: dict[str, str]) -> dict:
             {"model": "zai-org/GLM-5.3", "context": "long", "hardware": "h200", "lora": "false", "max_seq_len": "65536"},
         ),
         (
-            {"model": "Qwen/Qwen3.5-9B", "context": "long", "lora": True},
-            {"model": "Qwen/Qwen3.5-9B", "context": "long", "hardware": "h200", "lora": "true"},
+            {"model": "Qwen/Qwen3.5-9B", "context": "standard", "lora": True},
+            {"model": "Qwen/Qwen3.5-9B", "context": "standard", "hardware": "h200", "lora": "true"},
         ),
     ],
 )
 def test_serve_prints_follow_up_commands_for_the_endpoint_it_built(caplog, monkeypatch, settings, printed):
     serve = _import_example("examples.inference.serve")
-    monkeypatch.setattr(serve, "make_client", lambda config_path: _FakeJobClient([]))
+    monkeypatch.setattr(serve, "make_client", lambda config_path, connection=None, **kw: _FakeJobClient([]))
     caplog.set_level("INFO", logger="examples.inference.endpoint")
 
     serve.main(serve.Config(config="conn.json", **settings))
@@ -990,7 +1236,7 @@ def test_serve_prints_follow_up_commands_for_the_endpoint_it_built(caplog, monke
 def test_serve_follow_up_commands_repeat_its_job_config(caplog, monkeypatch, tmp_path):
     utils = _import_example("examples.utils")
     serve = _import_example("examples.inference.serve")
-    monkeypatch.setattr(serve, "make_client", lambda config_path: _FakeJobClient([]))
+    monkeypatch.setattr(serve, "make_client", lambda config_path, connection=None, **kw: _FakeJobClient([]))
     caplog.set_level("INFO", logger="examples.inference.endpoint")
     job_config = tmp_path / "glm 5.3.json"
     job_config.write_text(json.dumps(utils.make_config("zai-org/GLM-5.3", "long", inference=True)))
@@ -1080,7 +1326,7 @@ def test_dare_evaluate_builds_its_inference_job_from_the_catalog(tmp_path):
     # catalog selectors so the evaluator rebuilds this job, not its defaults.
     task = _import_example("examples.sft.dare.task").DareTask(variant="fv")
     command = task.eval_command(
-        config_path="conn.json",
+        connection_args="config=conn.json",
         job_id="job-0",
         checkpoint_id="cp_1",
         job_args=utils.inference_job_args(

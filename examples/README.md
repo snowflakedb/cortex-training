@@ -20,7 +20,7 @@ install and entry point.
 examples/
 ├── utils.py          # make_config, build_job and shared helpers
 ├── logging.py        # metrics logging
-├── sft/              # runner.py (shared loop), overrides.json, conversational/, dare/
+├── sft/              # runner.py (shared loop), overrides.json, conversational/, dare/ (own overrides.json)
 ├── rl/               # runner.py (shared loop), overrides.json, math_grpo/, configs/ (generated)
 ├── inference/        # serve.py, generate.py, evaluate.py, overrides.json
 ├── distillation/     # on_policy/, overrides.json, configs/ (generated)
@@ -37,14 +37,19 @@ uv pip install -e .
 uv pip install 'tinker-cookbook[math-rl] @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
 ```
 
-Create a [JSON connection file](../docs/getting-started/setup.md#json-connection-file)
-from [`connection.json.template`](../docs/getting-started/connection.json.template).
+Set up a Snowflake connection profile (see
+[Set up the client](../docs/getting-started/setup.md)). A
+[JSON connection file](../docs/getting-started/setup.md#json-connection-file)
+(from [`connection.json.template`](../docs/getting-started/connection.json.template),
+with account host and PAT) also works, through `config=`.
 To log metrics to Weights & Biases or Snowflake, see
 [experiment tracking](../docs/guides/operations/wandb.md).
 
 ## Run an example
 
 ```bash
+# Add connection=<profile> or config=<file> to choose a connection; with neither,
+# the default connection is used.
 python -m examples.sft.conversational.train config=/path/to/config.json
 python -m examples.rl.math_grpo.train config=/path/to/config.json
 python -m examples.distillation.on_policy.train config=/path/to/config.json
@@ -52,7 +57,21 @@ python -m examples.inference.serve config=/path/to/config.json
 python -m examples.model_deployment.deploy config=/path/to/config.json
 ```
 
-`config=` is always the connection file, never a job body. The SFT, RL and
+Every example resolves its connection the same way the CLI does:
+
+- `connection=<name>` uses a profile from `~/.snowflake/connections.toml`
+  (`$SNOWFLAKE_HOME/connections.toml` if `SNOWFLAKE_HOME` is set).
+- `config=<file>` reads a legacy JSON file with `host`, `pat`, `database`, and
+  `schema`, exactly as before: only the file is used, and environment variables,
+  the saved login and profiles are ignored.
+- With neither, the sources are tried in order: `CORTEX_TRAINING_CONNECTION`,
+  `CORTEX_TRAINING_CONFIG`, complete credentials in the environment, the saved
+  `cortex-training login`, then the Snowflake default connection profile.
+
+Each run logs the target it connected to and the source, never the token. The
+`model_deployment` example needs a PAT (see its README).
+
+`config=` and `connection=` only choose the connection, never a job body. The SFT, RL and
 inference examples pick their job with these arguments (distillation uses
 `student=` and `teacher=` in place of `model=`):
 
@@ -78,7 +97,8 @@ overriding the one before:
    kind and mode (see the [catalog layout](../model-catalog/README.md#layout)).
    An RL job combines the training and inference files.
 2. **The example's `overrides.json`:** applies to every catalog-built run of
-   that example.
+   that example. An SFT task folder can add its own, applied after
+   `sft/overrides.json`: `sft/dare/overrides.json` trains DARE on 8 GPUs.
 3. **Command line:** `lr=`, `train_batch_size=`, `max_seq_len=`. When you leave
    them out, the values from the layers below stay.
 
@@ -100,6 +120,9 @@ Merge rules:
 - Other lists are replaced whole.
 - A `_comment` key, at any level, is a free-text note. It is stripped before
   merging.
+- If a merged training sub-job's `sp_size` or `ep_size` no longer divides its
+  `n_gpus`, or its `ds_config` batch fields no longer fit that layout, the build
+  stops with an error instead of submitting the job.
 
 For example, this override changes only the training learning rate:
 

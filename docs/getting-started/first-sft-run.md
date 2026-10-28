@@ -10,12 +10,12 @@ Install the example dependency:
 uv pip install 'tinker-cookbook @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
 ```
 
-Start with a short run. `config=` is your
+Start with a short run. It uses your default connection profile; pass
+`connection=<name>` for another profile, or `config=<file>` for a
 [JSON connection file](setup.md#json-connection-file):
 
 ```bash
 python -m examples.sft.conversational.train \
-  config=/path/to/config.json \
   max_steps=2
 ```
 

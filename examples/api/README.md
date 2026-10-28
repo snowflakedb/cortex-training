@@ -9,7 +9,7 @@ from the model catalog instead; see
 
 | File | Creates |
 |---|---|
-| [`training.json`](training.json) | A training sub-job for `Qwen/Qwen3.6-35B-A3B` (`prime_rl` provider) |
+| [`training.json`](training.json) | A training sub-job for `Qwen/Qwen3.6-35B-A3B` (`arctic` provider) |
 | [`sampling.json`](sampling.json) | A sampling sub-job for `Qwen/Qwen3.6-35B-A3B` |
 | [`rl.json`](rl.json) | Colocated training and sampling sub-jobs |
 | [`external-weights-training.json`](external-weights-training.json) | A training sub-job from a Hugging Face model directory on a stage |
@@ -33,7 +33,7 @@ from pathlib import Path
 
 from cortex_training import CortexTrainingClient
 
-client = CortexTrainingClient.from_connection_name("training")
+client = CortexTrainingClient.from_configs(connection="training")
 body = json.loads(Path("examples/api/rl.json").read_text())  # training + sampling
 job_id = client.create_job_from_body(body)["job_id"]
 client.wait_for_job(job_id)

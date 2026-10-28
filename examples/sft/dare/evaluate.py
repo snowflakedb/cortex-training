@@ -69,7 +69,10 @@ CATEGORIES = {
 
 @chz.chz
 class Config:
-    config: str
+    # Legacy JSON connection file. Omit it to use `connection` or the default profile.
+    config: str | None = None
+    # Snowflake connection profile name (connections.toml). Use config or connection, not both.
+    connection: str | None = None
     bench_dir: str
     job_id: str | None = None
 
@@ -304,7 +307,7 @@ def main(config: Config) -> dict[str, float]:
     )
     stop_sequences = renderer.get_stop_sequences()
     params = {"max_tokens": config.max_tokens, "temperature": config.temperature, **stop_params_for(stop_sequences)}
-    client = make_client(config.config)
+    client = make_client(config.config, config.connection)
     with sandbox_server as sandbox_url, running_job(
         client, body, job_id=config.job_id, keep_job=config.keep_job
     ) as job_id:

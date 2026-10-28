@@ -65,6 +65,8 @@ from cortex_training import CortexTrainingClient
 from cortex_training import wire
 from cortex_training.client import DEBUG_OPTIONS_ENV
 from cortex_training.client.peft import normalize_lora_peft_config
+from cortex_training.connection import ResolvedConnection
+from cortex_training.connection import resolve_connection
 
 logger = logging.getLogger(__name__)
 
@@ -83,12 +85,46 @@ def load_connection_mapping(config_path: str) -> dict[str, Any]:
     return config
 
 
-def make_client(config_path: str, **overrides: Any) -> CortexTrainingClient:
+# Used only for a JSON config or PAT connection that does not name a database.
+# A named profile keeps its own database.
+LEGACY_DEFAULT_DATABASE = "CORTEX_TRAINING_DB"
+
+
+def resolve_example_connection(
+    config: str | None = None,
+    connection: str | None = None,
+    **overrides: Any,
+) -> ResolvedConnection:
+    """Open the client an example runs against, and log what it connected to.
+
+    ``config=`` is a legacy JSON file and behaves exactly as it always has: only the
+    file is read, and the environment, saved login and profiles are ignored.
+    ``connection=`` names a profile. With neither, the CLI's resolution order is
+    used (see ``cortex_training.connection``).
+    """
+    if config and connection:
+        raise ValueError("pass either config= or connection=, not both")
+    if config:
+        resolved = _legacy_json_connection(config, overrides)
+    else:
+        resolved = resolve_connection(
+            None,
+            connection,
+            default_database=LEGACY_DEFAULT_DATABASE,
+            strict_config=False,
+            overrides=overrides,
+        )
+    logger.info("%s", resolved.describe())
+    return resolved
+
+
+def _legacy_json_connection(config_path: str, overrides: Mapping[str, Any]) -> ResolvedConnection:
+    """The pre-profile ``make_client``, unchanged, wrapped in a ``ResolvedConnection``."""
     config = load_connection_mapping(config_path)
 
     pat = config.get("pat")
     kwargs: dict[str, Any] = dict(
-        database=config.get("database", "CORTEX_TRAINING_DB"),
+        database=config.get("database", LEGACY_DEFAULT_DATABASE),
         schema=config.get("schema", "PUBLIC"),
         endpoint=config.get("endpoint", "cortex-training"),
         poll_interval=float(config.get("poll_interval", 0.5)),
@@ -101,12 +137,34 @@ def make_client(config_path: str, **overrides: Any) -> CortexTrainingClient:
         raise ValueError("connection config needs `host` (Snowflake PAT auth)")
     if pat is None:
         raise ValueError("no PAT found: put `pat` in the connection config")
-    return CortexTrainingClient.from_pat(
+    verify_ssl = bool(config.get("verify_ssl", True))
+    client = CortexTrainingClient._from_pat(host=host, pat=pat, verify_ssl=verify_ssl, **kwargs)
+    return ResolvedConnection(
+        client=client,
+        source="config file",
         host=host,
+        database=kwargs["database"],
+        schema=kwargs["schema"],
+        verify_ssl=verify_ssl,
         pat=pat,
-        verify_ssl=bool(config.get("verify_ssl", True)),
-        **kwargs,
     )
+
+
+def make_client(
+    config: str | None = None,
+    connection: str | None = None,
+    **overrides: Any,
+) -> CortexTrainingClient:
+    return resolve_example_connection(config, connection, **overrides).client
+
+
+def example_connection_args(config: str | None, connection: str | None) -> str:
+    """Render the connection argument for a copy-paste command, or ``""`` for the default."""
+    if config:
+        return f"config={config}"
+    if connection:
+        return f"connection={connection}"
+    return ""
 
 
 # ─── Job configs ─────────────────────────────────────────────────────────────
@@ -199,11 +257,13 @@ def source_checkpoint_info(
 def _sampling_cli(
     *,
     module: str,
-    config_path: str,
+    connection_args: str,
     job_id: str,
     extra: str = "",
 ) -> str:
-    line = f"  python -m {module} config={config_path} source_job_id={job_id}"
+    line = " ".join(
+        part for part in (f"  python -m {module}", connection_args, f"source_job_id={job_id}") if part
+    )
     if extra:
         line += extra
     return line
@@ -211,7 +271,7 @@ def _sampling_cli(
 
 def log_saved_checkpoints(
     *,
-    config_path: str,
+    connection_args: str,
     job_id: str,
     saved: Mapping[str, Mapping[str, Any]],
     sampling_command: str | None = None,
@@ -269,7 +329,7 @@ def log_saved_checkpoints(
         lead,
         _sampling_cli(
             module=module,
-            config_path=config_path,
+            connection_args=connection_args,
             job_id=job_id,
             extra=extra,
         ),
@@ -1942,6 +2002,40 @@ def parallelism_errors(training_config: Mapping[str, Any]) -> list[str]:
     return errors
 
 
+_DEEPSPEED_BATCH_KEYS = ("train_batch_size", "train_micro_batch_size_per_gpu", "gradient_accumulation_steps")
+
+
+def _deepspeed_batch_errors(training_config: Mapping[str, Any]) -> list[str]:
+    """Why a training config's ``ds_config`` batch fields don't fit its GPU layout (empty when they do).
+
+    The server fills DeepSpeed's batch fields from the GPU layout -- a
+    ``train_batch_size`` of ``n_gpus // sp_size``, one micro-batch per GPU and no
+    gradient accumulation -- and merges ``ds_config`` on top, so a file that sets
+    none of them always fits. DeepSpeed then needs ``train_batch_size ==
+    train_micro_batch_size_per_gpu * gradient_accumulation_steps * (n_gpus //
+    sp_size)``. Call it once :func:`parallelism_errors` passes, so ``sp_size``
+    divides ``n_gpus``; values other than integers are left to the server.
+    """
+    n_gpus = training_config.get("n_gpus")
+    if isinstance(n_gpus, bool) or not isinstance(n_gpus, int) or n_gpus <= 0:
+        return []
+    sp_size = training_config.get("sp_size") or 1
+    ranks = n_gpus // sp_size
+    ds_config = training_config.get("ds_config") or {}
+    batch, micro, accumulation = (
+        ds_config.get(key, default) for key, default in zip(_DEEPSPEED_BATCH_KEYS, (ranks, 1, 1))
+    )
+    if not all(isinstance(value, int) and not isinstance(value, bool) for value in (batch, micro, accumulation)):
+        return []
+    if batch == micro * accumulation * ranks:
+        return []
+    return [
+        f"ds_config train_batch_size {batch} must equal train_micro_batch_size_per_gpu {micro} * "
+        f"gradient_accumulation_steps {accumulation} * {ranks} data-parallel ranks (n_gpus {n_gpus} / "
+        f"sp_size {sp_size}); set those ds_config fields to null to let the server derive them"
+    ]
+
+
 def _body_max_seq_len(body: Mapping[str, Any], job_type: str, config_key: str) -> int:
     config = _sub_job_config(body, job_type, config_key)
     value = config.get("max_seq_len")
@@ -2090,6 +2184,41 @@ def _settings_override(
     return {"sub_job_configs": entries} if entries else {}
 
 
+def _with_sibling_sub_job(path: Path, body: dict[str, Any]) -> dict[str, Any]:
+    """Complete a one-sided RL ``job_config`` file from its sibling in the same folder.
+
+    A training-only file named ``*-training-*`` takes the sampling sub-jobs of
+    the matching ``*-inference-*`` file, and an inference-only file the training
+    sub-jobs of its ``-training-`` sibling, so ``job_config=`` can name either
+    catalog file of a pair. Sampling comes first, then training; the file's
+    ``hardware`` is kept, or the sibling's when the file has none. A body with
+    both kinds of sub-job, or a file without such a sibling, is returned as is.
+    """
+    jobs = list(body.get("sub_job_configs") or ())
+    kinds = {job.get("job_type") for job in jobs if isinstance(job, Mapping)}
+    if {"training", "sampling"} <= kinds:
+        return body
+    if "-training-" in path.name:
+        sibling, wanted = path.with_name(path.name.replace("-training-", "-inference-", 1)), "sampling"
+    elif "-inference-" in path.name:
+        sibling, wanted = path.with_name(path.name.replace("-inference-", "-training-", 1)), "training"
+    else:
+        return body
+    if not sibling.is_file():
+        return body
+    other = load_job_body(str(sibling))
+    extra = [job for job in other.get("sub_job_configs") or () if isinstance(job, Mapping) and job.get("job_type") == wanted]
+    if not extra:
+        return body
+    order = {"sampling": 0, "training": 1}
+    combined = sorted(jobs + extra, key=lambda job: order.get(job.get("job_type"), len(order)))
+    logger.info("Paired job_config %s with the %s sub-job of %s", path, wanted, sibling)
+    merged = {**body, "sub_job_configs": combined}
+    if not merged.get("hardware") and other.get("hardware"):
+        merged["hardware"] = other["hardware"]
+    return merged
+
+
 def build_job(
     kind: str,
     *,
@@ -2099,6 +2228,7 @@ def build_job(
     lora: bool = False,
     job_config: str | None = None,
     example_dir: str | os.PathLike | None = None,
+    overrides: Sequence[str | os.PathLike | Mapping[str, Any]] = (),
     search_dirs: Sequence[Path] = (),
     lr: float | None = None,
     train_batch_size: int | None = None,
@@ -2114,22 +2244,33 @@ def build_job(
 
     1. The model catalog file for ``model``, ``context``, ``hardware`` and
        ``lora`` (for ``rl``, the training and inference files combined).
-    2. ``overrides.json`` in ``example_dir``, when that file exists.
+    2. ``overrides.json`` in ``example_dir``, when that file exists, then
+       ``overrides`` (JSON files or dicts) in order.
     3. The command-line settings ``lr``, ``train_batch_size`` and
        ``max_seq_len``; ``None`` keeps the value from the layers below.
 
     The layers are merged by :func:`make_config`, which then fills in router
-    replay for an MoE RL job with the fixed default caps. A
+    replay for an MoE RL job with the fixed default caps. A merged training
+    sub-job whose ``sp_size``/``ep_size`` no longer divide its ``n_gpus``, or
+    whose ``ds_config`` batch fields no longer fit that layout, is rejected (see
+    :func:`parallelism_errors` and :func:`_deepspeed_batch_errors`). A
     ``job_config`` file replaces the first two layers and is used as is: the
     command-line settings still apply, and nothing is planned. The source
     checkpoint (inference jobs) and the debug image tag are added last, and
-    the final job is logged.
+    the final job is logged. For ``rl``, a ``job_config`` file with only a
+    training or only a sampling sub-job is first completed from its sibling
+    file (see :func:`_with_sibling_sub_job`).
     """
     if kind not in _JOB_KIND_SUB_JOBS:
         raise ValueError(f"kind must be one of {sorted(_JOB_KIND_SUB_JOBS)}, got {kind!r}")
+    if isinstance(overrides, (str, os.PathLike, Mapping)):
+        raise TypeError("overrides must be a list of JSON files or dicts")
     needed = _JOB_KIND_SUB_JOBS[kind]
     if job_config is not None:
-        body = load_job_body(job_config, search_dirs=search_dirs)
+        path = resolve_cortex_training_config_path(job_config, search_dirs=search_dirs)
+        body = load_job_body(str(path))
+        if kind == "rl":
+            body = _with_sibling_sub_job(path, body)
         found = [sub.get("job_type") for sub in body.get("sub_job_configs") or () if isinstance(sub, Mapping)]
         # Require the exact composition for the mode -- one sub-job of each needed
         # type and nothing else -- so an RL body (training + sampling) is not
@@ -2154,12 +2295,13 @@ def build_job(
             _check_rl_windows(body)
         logger.info("Using job_config %s as is; the model catalog and overrides.json are skipped", job_config)
     else:
-        overrides: list[Any] = []
+        layers: list[Any] = []
         if example_dir is not None and (Path(example_dir) / "overrides.json").is_file():
-            overrides.append(Path(example_dir) / "overrides.json")
+            layers.append(Path(example_dir) / "overrides.json")
+        layers.extend(overrides)
         settings = _settings_override(needed, lr=lr, train_batch_size=train_batch_size, max_seq_len=max_seq_len)
         if settings:
-            overrides.append(settings)
+            layers.append(settings)
         body = make_config(
             model,
             context,
@@ -2167,10 +2309,26 @@ def build_job(
             lora=lora,
             inference=kind == "inference",
             rl=kind == "rl",
-            overrides=overrides,
+            overrides=layers,
             rollout_batch_size=rollout_batch_size if kind == "rl" else None,
             catalog_dir=catalog_dir,
         )
+        # The catalog files are valid on their own, but an override can change
+        # n_gpus without the model's sp_size/ep_size (DARE's 8 GPUs on a 16-GPU
+        # mesh, for example) or its explicit DeepSpeed batch fields. Reject that
+        # here rather than submit a job no run can use.
+        for sub in body.get("sub_job_configs") or ():
+            if sub.get("job_type") != "training":
+                continue
+            training_config = sub.get("training_config") or {}
+            topology = parallelism_errors(training_config) or _deepspeed_batch_errors(training_config)
+            if topology:
+                files = ", ".join(str(layer) for layer in layers if isinstance(layer, (str, os.PathLike)))
+                raise ValueError(
+                    f"{model} ({context}) training parallelism does not fit its GPU count after "
+                    f"{files or 'the overrides'}: " + "; ".join(topology) + ". Edit the override, "
+                    "pick another model, or pass job_config= with a job file of your own."
+                )
     if source_checkpoint is not None:
         if kind != "inference":
             raise ValueError("a source checkpoint starts an inference job")
@@ -2196,6 +2354,21 @@ def build_job(
 INFERENCE_JOB_CONFIG_PLACEHOLDER = "INFERENCE_JOB_CONFIG"
 
 
+# Prime names DeepSeek-V4 attention projections q_a_proj, q_b_proj, kv_proj, and
+# o_b_proj. vLLM keeps the checkpoint names wq_a, wq_b, wkv, and wo_b. The catalog
+# records each side under the name that side loads; they are one adapter.
+_DEEPSEEK_V4_TRAINER_MODULES = r".*self_attn\.(q_a_proj|q_b_proj|kv_proj|o_b_proj)$"
+_DEEPSEEK_V4_VLLM_MODULES = ("wkv", "wo_b", "wq_a", "wq_b")
+
+
+def _canonical_target_modules(target_modules: Any) -> Any:
+    if target_modules == _DEEPSEEK_V4_TRAINER_MODULES or (
+        isinstance(target_modules, list) and tuple(target_modules) == _DEEPSEEK_V4_VLLM_MODULES
+    ):
+        return list(_DEEPSEEK_V4_VLLM_MODULES)
+    return target_modules
+
+
 def same_adapter(first: Any, second: Any) -> bool:
     """Whether two LoRA ``peft_config`` blocks describe the same adapter."""
     try:
@@ -2206,6 +2379,7 @@ def same_adapter(first: Any, second: Any) -> bool:
         for key in ("target_modules", "target_parameters"):
             if isinstance(config[key], list):
                 config[key] = sorted(config[key])
+        config["target_modules"] = _canonical_target_modules(config["target_modules"])
     return first == second
 
 

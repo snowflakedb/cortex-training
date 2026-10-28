@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 import os
@@ -24,6 +25,7 @@ from examples.utils import forward_backward_step
 from examples.utils import inference_job_args
 from examples.utils import log_saved_checkpoints
 from examples.utils import make_client
+from examples.utils import example_connection_args
 from examples.utils import running_job
 from examples.utils import save_example_checkpoints
 
@@ -38,7 +40,10 @@ _EXAMPLE_DIR = Path(__file__).resolve().parent
 
 
 class Config(Protocol):
-    config: str
+    # Legacy JSON connection file. Omit it to use `connection` or the default profile.
+    config: str | None = None
+    # Snowflake connection profile name (connections.toml). Use config or connection, not both.
+    connection: str | None = None
     job_id: str | None
     model: str
     context: str
@@ -72,7 +77,9 @@ class Task(Protocol):
 
 
 def job_body(config: Config) -> dict:
-    """The training job: the catalog file, sft/overrides.json, then ``config``."""
+    """The training job: the catalog file, sft/overrides.json, the example's own
+    overrides.json (see :func:`_example_overrides`), then ``config``.
+    """
     return build_job(
         "training",
         model=config.model,
@@ -81,12 +88,23 @@ def job_body(config: Config) -> dict:
         lora=config.lora,
         job_config=config.job_config,
         example_dir=_EXAMPLE_DIR,
+        overrides=_example_overrides(config),
         search_dirs=(_EXAMPLE_DIR,),
         lr=config.lr,
         train_batch_size=config.train_batch_size,
         max_seq_len=config.max_seq_len,
         debug_image_tag=config.debug_image_tag,
     )
+
+
+def _example_overrides(config: Config) -> list[Path]:
+    """The ``overrides.json`` next to the entry point that defines ``config``'s class.
+
+    It applies after ``sft/overrides.json`` to that example only, for example
+    ``sft/dare/overrides.json`` for DARE. An example without one gets none.
+    """
+    path = Path(inspect.getfile(type(config))).resolve().parent / "overrides.json"
+    return [path] if path.is_file() else []
 
 
 def causal_cross_entropy_processing() -> dict[str, Any]:
@@ -216,7 +234,8 @@ def train(config: Config, task: Task) -> dict[str, Any]:
         if eval_sequences:
             logger.info("valid_nll on %d held-out examples every %d steps", n_eval, eval_every)
 
-    client = make_client(config.config)
+    client = make_client(config.config, config.connection)
+    connection_args = example_connection_args(config.config, config.connection)
 
     def evaluate(job_id: str) -> dict[str, float]:
         eval_start = time.time()
@@ -294,7 +313,7 @@ def train(config: Config, task: Task) -> dict[str, Any]:
         if callable(eval_command):
             # A task with its own evaluation (e.g. DARE) prints that command.
             log_saved_checkpoints(
-                config_path=config.config,
+                connection_args=connection_args,
                 job_id=job_id,
                 saved=saved,
             )
@@ -303,7 +322,7 @@ def train(config: Config, task: Task) -> dict[str, Any]:
                 logger.info(
                     "Evaluate this weights-only checkpoint with:\n  %s",
                     eval_command(
-                        config_path=config.config,
+                        connection_args=connection_args,
                         job_id=job_id,
                         checkpoint_id=checkpoint_id,
                         job_args=inference_job_args(
@@ -315,7 +334,7 @@ def train(config: Config, task: Task) -> dict[str, Any]:
         else:
             sample_prompt = task.sample_prompt()
             log_saved_checkpoints(
-                config_path=config.config,
+                connection_args=connection_args,
                 job_id=job_id,
                 saved=saved,
                 sampling_command="sample",

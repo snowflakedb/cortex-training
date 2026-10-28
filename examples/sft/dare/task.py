@@ -217,7 +217,7 @@ class DareTask:
     def eval_command(
         self,
         *,
-        config_path: str,
+        connection_args: str,
         job_id: str,
         checkpoint_id: str,
         job_args: Mapping[str, Any] | None = None,
@@ -229,13 +229,17 @@ class DareTask:
             f" {name}={str(value).lower() if isinstance(value, bool) else shlex.quote(str(value))}"
             for name, value in (job_args or {}).items()
         )
-        return (
-            "python -m examples.sft.dare.evaluate "
-            f"config={config_path} "
-            "bench_dir=$BENCH_DIR "
-            "sandbox_python=$PWD/dare_sandbox_env/bin/python "
-            f"source_job_id={job_id} "
-            f"checkpoint_id={checkpoint_id} "
-            "log_path=/tmp/dare/sft"
-            f"{selectors}"
+        command = " ".join(
+            part
+            for part in (
+                "python -m examples.sft.dare.evaluate",
+                connection_args,
+                "bench_dir=$BENCH_DIR",
+                "sandbox_python=$PWD/dare_sandbox_env/bin/python",
+                f"source_job_id={job_id}",
+                f"checkpoint_id={checkpoint_id}",
+                "log_path=/tmp/dare/sft",
+            )
+            if part
         )
+        return command + selectors
