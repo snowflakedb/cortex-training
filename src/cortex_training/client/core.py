@@ -312,9 +312,10 @@ _ENDED_JOB_STATES = frozenset(
 # out the service's read-after-create window.
 _RECENTLY_CREATED_SECONDS = 120.0
 _SESSION_EXPIRED_CODES = frozenset({"390111", "390112", "390114"})
-# The Cortex Training API's code, on an HTTP 400, for a database or schema in the
-# URL path that it cannot resolve. The client explains it; it never creates one.
-_DATABASE_NOT_RESOLVED_CODE = "517602"
+# The Cortex Training API's invalid-request code, and its message for a URL
+# path DATABASE.SCHEMA it can't resolve (missing database or schema alike).
+_INVALID_REQUEST_CODE = "517602"
+_SCHEMA_NOT_FOUND_MESSAGE = re.compile(r"^Schema .+ is not found or not authorized")
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {
     _CHUNK_GROUP_RESTART_REQUIRED,
@@ -412,11 +413,13 @@ class ChunkGroupConflictError(ChunkGroupError):
 class DatabaseAccessError(requests.exceptions.HTTPError, RuntimeError):
     """The configured database or schema can't be found by the current role.
 
-    Raised for the API's HTTP 400 with code 517602. The client never creates a
-    database; the message says how to create it, get access, or use another.
-    ``kind`` is ``"database"`` or ``"schema"``, ``name`` the object, ``role``
-    the session's role (None when it can't be determined, as for PAT clients),
-    and ``statement`` the CREATE statement that would set it up.
+    Raised for the API's HTTP 400 with code 517602 and message "Schema ... is
+    not found or not authorized". The client never creates a database; the
+    message says how to create it, get access, or use another.
+    ``kind`` is ``"schema"``, ``name`` the ``DATABASE.SCHEMA``, ``role`` the
+    session's role (None when it can't be determined, as for PAT clients), and
+    ``statement`` the CREATE DATABASE and CREATE SCHEMA statements that would
+    set it up, separated by ``; ``.
     """
 
     def __init__(
@@ -648,6 +651,22 @@ def _response_error_code(response: requests.Response | None) -> str | None:
         if code is not None:
             return str(code)
     return None
+
+
+def _is_schema_not_found(response: requests.Response | None) -> bool:
+    """Whether ``response`` says the URL's schema can't be found."""
+    if response is None:
+        return False
+    try:
+        body = response.json()
+    except Exception:
+        return False
+    for candidate in _iter_error_dicts(body):
+        code = candidate.get("code") or candidate.get("error_code")
+        message = str(candidate.get("message") or "").strip()
+        if str(code) == _INVALID_REQUEST_CODE and _SCHEMA_NOT_FOUND_MESSAGE.match(message):
+            return True
+    return False
 
 
 def _chunk_group_error_detail(response: requests.Response | None) -> dict | None:
@@ -2427,6 +2446,15 @@ def _deprecated_constructor(name: str) -> str:
 # ─── HTTP client ─────────────────────────────────────────────────────────
 
 
+def _sub_job_id_params(sub_job_id: str | None) -> dict[str, dict[str, str]]:
+    """``params=`` kwargs for a sub-job-addressed request, or nothing when unset.
+
+    The key is omitted rather than sent empty so a request without a sub_job_id is
+    byte-identical to one from a client that predates the parameter.
+    """
+    return {"params": {"sub_job_id": sub_job_id}} if sub_job_id else {}
+
+
 class CortexTrainingClient:
     """HTTP client for the Cortex Training REST API (``cortex-training``).
 
@@ -2510,7 +2538,8 @@ class CortexTrainingClient:
         # means the job was fetched but exposes no sampling max_seq_len (skip
         # validation); a missing key means it has not been resolved yet (e.g. a
         # transient get_job failure), so a later call will retry.
-        self._sampling_max_seq_len: dict[str, int | None] = {}
+        # Keyed on (job_id, sub_job_id); sub_job_id is None for the unaddressed case.
+        self._sampling_max_seq_len: dict[tuple[str, str | None], int | None] = {}
         self._artifact_connection_config: dict[str, str] | None = None
         self._artifact_connection_factory: Callable[[], Any] | None = None
         # Download sessions kept open for the next download (see keep_artifact_sessions), and
@@ -2945,37 +2974,48 @@ class CortexTrainingClient:
             logger.debug("Could not read the session's role.", exc_info=True)
             return None
 
-    def _database_error(self, response: requests.Response) -> DatabaseAccessError:
-        """Explain an HTTP 400 with code 517602: the configured database or schema can't be found."""
+    def _schema_not_found_error(self, response: requests.Response) -> DatabaseAccessError:
+        """Explain an HTTP 400 saying the configured schema can't be found."""
         role = self._current_role()
-        who = f"Role {role}" if role else "Role <ROLE> (couldn't determine your role)"
+        sent_headers = getattr(getattr(response, "request", None), "headers", None) or self._session.headers
+        sent_pat = sent_headers.get("X-Snowflake-Authorization-Token-Type") == "PROGRAMMATIC_ACCESS_TOKEN"
+        if role:
+            who = f"Role {role}"
+        elif sent_pat:
+            who = "Your PAT's role (its role restriction, or your user's DEFAULT_ROLE if it has none)"
+        else:
+            who = "Role <ROLE> (couldn't determine your role)"
         grantee = role or "<ROLE>"
         source = ""
         if self._auth_provider is not None:
             profile = getattr(self._auth_provider, "connection_name", None)
             source = f" (from profile {profile})" if profile else " (from your default Snowflake profile)"
         database, schema = self.database, self.schema
-        if schema.upper() == "PUBLIC":
-            kind, name, statement = "database", database, f"CREATE DATABASE IF NOT EXISTS {database}"
-            lines = [
-                f"{who} can't find database {database}{source}.",
-                f"- If it doesn't exist: run `{statement}` (or ask an admin to).",
-                f"- If it exists: ask an admin to run `GRANT USAGE ON DATABASE {database} TO ROLE {grantee}`.",
-            ]
-        else:
-            kind, name = "schema", f"{database}.{schema}"
-            create_database = f"CREATE DATABASE IF NOT EXISTS {database}"
-            create_schema = f"CREATE SCHEMA IF NOT EXISTS {database}.{schema}"
-            statement = f"{create_database}; {create_schema}"
-            lines = [
-                f"{who} can't find database {database} or its schema {schema}{source}.",
-                f"- If they don't exist: run `{create_database}` and `{create_schema}` (or ask an admin to).",
-                f"- If they exist: ask an admin to run `GRANT USAGE ON DATABASE {database} TO ROLE {grantee}` "
-                f"and `GRANT USAGE ON SCHEMA {database}.{schema} TO ROLE {grantee}`.",
-            ]
+        create_database = f"CREATE DATABASE IF NOT EXISTS {database}"
+        create_schema = f"CREATE SCHEMA IF NOT EXISTS {database}.{schema}"
+        # The server's message is the same whether the database or the schema is missing, or
+        # the role can't use either, so the explanation covers all three.
+        lines = [
+            f"{who} can't find database {database} or its schema {schema}{source}.",
+            f"- If they don't exist: run `{create_database}` and `{create_schema}` (or ask an admin to).",
+            f"- If they exist: ask an admin to run `GRANT USAGE ON DATABASE {database} TO ROLE {grantee}` "
+            f"and `GRANT USAGE ON SCHEMA {database}.{schema} TO ROLE {grantee}`.",
+        ]
+        if not role and sent_pat:
+            lines.insert(
+                1,
+                "- If that's the wrong role: restrict the PAT to a role that has access, or run "
+                "`ALTER USER <USER> SET DEFAULT_ROLE = <ROLE>`. Snowsight shows the token's role under "
+                "Settings > Authentication.",
+            )
         lines.append("- Or use another database: --database NAME / CORTEX_TRAINING_DATABASE.")
         return DatabaseAccessError(
-            "\n".join(lines), response=response, kind=kind, name=name, role=role, statement=statement
+            "\n".join(lines),
+            response=response,
+            kind="schema",
+            name=f"{database}.{schema}",
+            role=role,
+            statement=f"{create_database}; {create_schema}",
         )
 
     def _redact_for_log(self, text: str) -> str:
@@ -3007,9 +3047,10 @@ class CortexTrainingClient:
     ) -> requests.Response:
         """Send one request with retries.
 
-        An HTTP 400 with code 517602 (the configured database or schema can't be
-        found) raises :class:`DatabaseAccessError`. ``explain_database=False``
-        leaves that answer as it is, for routes whose path names no database; a
+        An HTTP 400 saying the configured schema can't be found (code 517602,
+        "Schema ... is not found or not authorized") raises
+        :class:`DatabaseAccessError`. ``explain_database=False`` leaves that
+        answer as it is, for routes whose path names no database; a
         client from :meth:`for_job` always leaves it.
         """
         explain_database = explain_database and self._explain_database_errors
@@ -3141,9 +3182,9 @@ class CortexTrainingClient:
                 if (
                     explain_database
                     and status_code == 400
-                    and _response_error_code(resp) == _DATABASE_NOT_RESOLVED_CODE
+                    and _is_schema_not_found(resp)
                 ):
-                    raise self._database_error(resp)
+                    raise self._schema_not_found_error(resp)
                 try:
                     # requests.Response.raise_for_status() intentionally ignores 3xx.
                     if 300 <= resp.status_code < 400:
@@ -6087,6 +6128,7 @@ class CortexTrainingClient:
         sampling_params,
         routing_key,
         strict,
+        sub_job_id: str | None = None,
     ) -> bytes:
         """Encode a generate request body, for both the unary and stream calls.
 
@@ -6099,7 +6141,7 @@ class CortexTrainingClient:
 
         ``op`` only names the caller in the length-check error message.
         """
-        self._check_prompt_lengths(op, job_id, prompts)
+        self._check_prompt_lengths(op, job_id, prompts, sub_job_id)
         # Packed after validation so the check above still reads plain lists,
         # and so a rejected prompt is never converted for nothing.
         payload: dict = {"prompts": _pack_token_prompts(prompts)}
@@ -6125,39 +6167,69 @@ class CortexTrainingClient:
                 "bring the serialized request under the limit."
             )
 
-    def _resolve_sampling_max_seq_len(self, job_id: str) -> int | None:
-        """Return the sampling sub-job's ``max_seq_len``, or ``None`` if unknown.
+    def _resolve_sampling_max_seq_len(self, job_id: str, sub_job_id: str | None = None) -> int | None:
+        """Return a sampling sub-job's ``max_seq_len``, or ``None`` if unknown.
 
-        The value is read from the job's sampling ``inference_config`` (the same
-        number the backend launches vLLM with as ``max_model_len``) and cached
-        per ``job_id``. A successful lookup — including a definitive "no sampling
-        sub-job" miss — is cached; a transient ``get_job`` failure is not, so a
-        later call retries rather than disabling validation permanently.
+        The value is read from the sub-job's ``inference_config`` (the same number
+        the backend launches vLLM with as ``max_model_len``) and cached per
+        ``(job_id, sub_job_id)``. A successful lookup — including a definitive
+        "no sampling sub-job" miss — is cached; a transient ``get_job`` failure is
+        not, so a later call retries rather than disabling validation permanently.
+
+        ``sub_job_id`` selects one sub-job. Without it, the value is only resolved
+        when the job has exactly one sampling sub-job: guessing between several
+        risks rejecting a prompt the chosen zone would have accepted, so ``None``
+        (validation skipped) is returned instead and the server decides.
+
+        Only ``job_type == "sampling"`` sub-jobs are considered. ``log_prob``
+        sub-jobs also carry an ``inference_config``, and its window has no bearing
+        on where a generate request runs.
         """
-        if job_id in self._sampling_max_seq_len:
-            return self._sampling_max_seq_len[job_id]
+        cache_key = (job_id, sub_job_id)
+        if cache_key in self._sampling_max_seq_len:
+            return self._sampling_max_seq_len[cache_key]
         try:
             job = self.get_job(job_id)
         except Exception:
             # Don't let a transient lookup failure break generate, and don't
             # cache the miss — the real request will surface any hard error.
             return None
-        max_seq_len: int | None = None
-        for sub in job.get("sub_jobs", []) or []:
-            if not isinstance(sub, dict):
-                continue
+
+        def _window(sub: dict) -> int | None:
             cfg = sub.get("inference_config")
             if not isinstance(cfg, dict):
-                continue
+                return None
             raw = cfg.get("max_seq_len")
             # Proto numbers can arrive as floats (e.g. 2048.0); coerce to int.
             if isinstance(raw, (int, float)) and raw > 0:
-                max_seq_len = int(raw)
-                break
-        self._sampling_max_seq_len[job_id] = max_seq_len
+                return int(raw)
+            return None
+
+        # A sub-job record flattens its config into the record, so job_type sits at
+        # the top level. The REST schema accepts it case-insensitively, so normalise.
+        sampling = [
+            sub
+            for sub in (job.get("sub_jobs", []) or [])
+            if isinstance(sub, dict) and str(sub.get("job_type", "")).lower() == JobType.SAMPLING.value
+        ]
+        max_seq_len: int | None = None
+        if sub_job_id is not None:
+            for sub in sampling:
+                if sub.get("sub_job_id") == sub_job_id:
+                    max_seq_len = _window(sub)
+                    break
+        elif len(sampling) == 1:
+            max_seq_len = _window(sampling[0])
+        self._sampling_max_seq_len[cache_key] = max_seq_len
         return max_seq_len
 
-    def _check_prompt_lengths(self, op: str, job_id: str, prompts: list[str | list[int]]) -> None:
+    def _check_prompt_lengths(
+        self,
+        op: str,
+        job_id: str,
+        prompts: list[str | list[int]],
+        sub_job_id: str | None = None,
+    ) -> None:
         """Fail fast when a pre-tokenized prompt cannot fit the sampling window.
 
         Mirrors vLLM's decoder-prompt check (``vllm/v1/engine/input_processor``):
@@ -6193,7 +6265,7 @@ class CortexTrainingClient:
 
         if not any(_pretokenized(p) for p in prompts):
             return
-        max_seq_len = self._resolve_sampling_max_seq_len(job_id)
+        max_seq_len = self._resolve_sampling_max_seq_len(job_id, sub_job_id)
         if max_seq_len is None:
             return
         for i, prompt in enumerate(prompts):
@@ -6222,6 +6294,7 @@ class CortexTrainingClient:
         force_chunk: bool = False,
         allow_group_restart: bool = False,
         debug_context: dict[str, Any] | None = None,
+        sub_job_id: str | None = None,
     ) -> dict:
         chunks = wire.encode_byte_chunks(
             frame,
@@ -6247,6 +6320,7 @@ class CortexTrainingClient:
                     f"{self._prefix}/{job_id}/{path_suffix}",
                     data=chunk,
                     headers={"Content-Type": "application/octet-stream"},
+                    **_sub_job_id_params(sub_job_id),
                     retry_on=(_is_chunk_post_transient if allow_group_restart else _is_transient),
                     debug_context=debug_context,
                 )
@@ -6334,6 +6408,7 @@ class CortexTrainingClient:
         sampling_params: dict | list[dict | None] | None = None,
         routing_key: str | list[str | None] | None = None,
         strict: bool | None = None,
+        sub_job_id: str | None = None,
     ) -> str:
         """Submit a generate request to a sampling sub-job. Returns request_id.
 
@@ -6353,14 +6428,26 @@ class CortexTrainingClient:
           would require replicating the server tokenizer (including special
           tokens), so an over-long string instead fails server-side in vLLM
           with a ``maximum model length`` error rather than client-side.
+
+        Args:
+            sub_job_id: Optional. Which sampling sub-job runs the request, e.g.
+                ``"{job_id}:sampling:1"``; discover the ids from
+                :meth:`get_job`'s ``sub_jobs``. Sent as a query parameter, since
+                the body is an opaque frame. If omitted, no ``sub_job_id`` is
+                sent and the server chooses the sub-job; currently that is the
+                job's only sampling sub-job, and a job with several rejects the
+                request and lists the valid ids.
         """
-        body = self._build_generate_frame("generate", job_id, prompts, sampling_params, routing_key, strict)
+        body = self._build_generate_frame(
+            "generate", job_id, prompts, sampling_params, routing_key, strict, sub_job_id
+        )
         response = self._post_octet_request_chunks(
             job_id=job_id,
             path_suffix="generate",
             operation="generate",
             frame=body,
             max_bytes=self._MAX_GENERATE_BYTES,
+            sub_job_id=sub_job_id,
         )
         request_id = response["request_id"]
         self._generate_request_ids.add(request_id)
@@ -6374,6 +6461,7 @@ class CortexTrainingClient:
         sampling_params: dict | list[dict | None] | None = None,
         routing_key: str | list[str | None] | None = None,
         strict: bool | None = None,
+        sub_job_id: str | None = None,
     ) -> dict:
         """Start a streaming generate request. Returns the response body.
 
@@ -6389,14 +6477,21 @@ class CortexTrainingClient:
         prompts are checked client-side against the sampling sub-job's
         ``max_seq_len`` and fail fast, while over-long string prompts are left
         to fail server-side in vLLM (see :meth:`generate`).
+
+        Args:
+            sub_job_id: Optional. Which sampling sub-job runs the request; see
+                :meth:`generate` for the format and when it may be omitted.
         """
-        body = self._build_generate_frame("generate_stream", job_id, prompts, sampling_params, routing_key, strict)
+        body = self._build_generate_frame(
+            "generate_stream", job_id, prompts, sampling_params, routing_key, strict, sub_job_id
+        )
         self._check_generate_payload("generate_stream", body)
         resp = self._send(
             "POST",
             f"{self._prefix}/{job_id}/generate-stream",
             data=body,
             headers={"Content-Type": "application/octet-stream"},
+            **_sub_job_id_params(sub_job_id),
         )
         return resp.json()
 
