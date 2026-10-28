@@ -39,6 +39,7 @@ from cortex_training.tui import views
 from cortex_training.tui.resource import CHART_AXIS
 from cortex_training.tui.resource import CHART_MUTED
 from cortex_training.tui.resource import chart_hue
+from cortex_training.tui.widgets import _download_options
 
 _WARNING = "#fbbf24"
 
@@ -115,13 +116,14 @@ class _Pane(Vertical):
     def refresh_live(self) -> None:
         """UI thread. A live job's periodic refresh, while the tab is shown."""
         if self._shown and self._live():
-            self.reload()
+            self.reload(live=True)
 
     def action_refresh(self) -> None:
         self._shown = True
         self.reload()
 
-    def reload(self) -> None:
+    def reload(self, *, live: bool = False) -> None:
+        """UI thread. Read the tab's data again; ``live`` for a live job's periodic refresh."""
         raise NotImplementedError
 
     def redraw(self) -> None:
@@ -174,6 +176,9 @@ class TrainingPane(_Pane):
         self._window = training.DEFAULT_WINDOW
         self._everything = False  # also the metrics in training.HIDDEN_METRICS
         self._pick: str | None = None  # the sub-job Space last showed
+        # The sub-job the download running now is of, alone; and an r to do once it ends.
+        self._loading_scope: str | None = None
+        self._whole_pending = False
 
     # How often the local log is read while the tab is shown: it gains a row the moment a result
     # arrives, so a step appears within this, not after the stage's batched upload.
@@ -254,8 +259,10 @@ class TrainingPane(_Pane):
         return {series.name: chart_hue(index) for index, series in enumerate(sub_job.metrics(view, everything=True))}
 
     # ── reading ──
-    def reload(self) -> None:
+    def reload(self, *, live: bool = False) -> None:
         if self._loading:
+            if not live and self._loading_scope is not None:
+                self._whole_pending = True  # r while one sub-job alone downloads: every sub-job's next
             return
         if self._job().get("sub_jobs") and not self._sub_job_ids():
             self._downloaded = True  # no training sub-job: nothing to download for this tab
@@ -263,10 +270,15 @@ class TrainingPane(_Pane):
             return
         self._loading = True
         self.redraw()
-        self._refresh()
+        # A live job's refresh, once a whole-job download is in, downloads the tab's only sub-job
+        # alone: its LIST then returns that sub-job's chunks rather than the whole run's. With more,
+        # Space shows each as the newest refresh left it, so they are all downloaded.
+        ids = self._sub_job_ids()
+        self._loading_scope = ids[0] if live and self._downloaded and len(ids) == 1 else None
+        self._refresh(self._loading_scope)
 
     @work(thread=True, exclusive=True, group="training")
-    def _refresh(self) -> None:
+    def _refresh(self, scope: str | None = None) -> None:
         worker = get_current_worker()
         loader = training_loader(self._metrics_root, self._local_root)
 
@@ -275,21 +287,27 @@ class TrainingPane(_Pane):
             if not worker.is_cancelled:
                 self._post(self._accept, data)
 
+        # Once _finish is posted, a cancel is the next refresh starting (from _finish itself, for a
+        # queued r): saying so would mark that one finished while it runs.
+        finished = False
         try:
             show()  # what is cached, while the download runs
             source = self._source()
+            alone = _download_options(self._download, {"sub_job_ids": [scope]}) if scope else {}
             ok = self._download(priority=[source] if source else [], on_commit=lambda _result: show(),
-                                cancelled=lambda: worker.is_cancelled)
+                                cancelled=lambda: worker.is_cancelled, **alone)
             if not ok or worker.is_cancelled:
                 return
             data = loader.load()
             if not worker.is_cancelled:
+                finished = True
                 self._post(self._finish, data, None)
         except Exception as exc:  # noqa: BLE001 - said in the tab's header
             if not worker.is_cancelled:
+                finished = True
                 self._post(self._finish, None, views.access_hint(exc, "training metrics") or views.describe_error(exc))
         finally:
-            if worker.is_cancelled:
+            if worker.is_cancelled and not finished:
                 self._post(self._cancelled)
 
     def _accept(self, data: training.TrainingData) -> None:
@@ -298,15 +316,21 @@ class TrainingPane(_Pane):
 
     def _finish(self, data: training.TrainingData | None, error: str | None) -> None:
         self._loading = False
+        self._loading_scope = None
         self._error = error
         if data is not None:
             self._data = data
         if error is None:
             self._downloaded = True
         self.redraw()
+        if self._whole_pending:
+            # r while a download of one sub-job alone ran: every sub-job's, now.
+            self._whole_pending = False
+            self.reload()
 
     def _cancelled(self) -> None:
         self._loading = False
+        self._loading_scope = None
 
     # ── drawing ──
     def _width(self) -> int:

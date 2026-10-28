@@ -460,12 +460,12 @@ def test_both_listings_of_a_download_run_at_once(tmp_path, monkeypatch):
     started = {"_metrics": threading.Event(), "checkpoints/_metrics": threading.Event()}
     real = client_module.CortexTrainingClient._list_experiment_artifacts
 
-    def listing(connection, run_uri, run_name, artifact_root):
+    def listing(connection, run_uri, run_name, artifact_root, **kwargs):
         # Each waits for the other to start: one after the other, neither would.
         started[artifact_root].set()
         other = next(event for root, event in started.items() if root != artifact_root)
         assert other.wait(5), f"LIST {artifact_root} ran alone"
-        return real(connection, run_uri, run_name, artifact_root)
+        return real(connection, run_uri, run_name, artifact_root, **kwargs)
 
     monkeypatch.setattr(client_module.CortexTrainingClient, "_list_experiment_artifacts", staticmethod(listing))
     client.download_metrics("job-1", tmp_path)
@@ -479,10 +479,10 @@ def test_a_listing_that_fails_fails_the_download(tmp_path, monkeypatch, failing)
     client.keep_artifact_sessions = True
     real = client_module.CortexTrainingClient._list_experiment_artifacts
 
-    def listing(connection, run_uri, run_name, artifact_root):
+    def listing(connection, run_uri, run_name, artifact_root, **kwargs):
         if artifact_root == failing:
             raise RuntimeError(f"LIST {artifact_root} denied")
-        return real(connection, run_uri, run_name, artifact_root)
+        return real(connection, run_uri, run_name, artifact_root, **kwargs)
 
     monkeypatch.setattr(client_module.CortexTrainingClient, "_list_experiment_artifacts", staticmethod(listing))
     with pytest.raises(RuntimeError, match=f"LIST {failing} denied"):
@@ -500,14 +500,14 @@ def test_a_failed_first_listing_waits_for_the_other_before_its_session_is_closed
     real = client_module.CortexTrainingClient._list_experiment_artifacts
     side_started, order = threading.Event(), []
 
-    def listing(connection, run_uri, run_name, artifact_root):
+    def listing(connection, run_uri, run_name, artifact_root, **kwargs):
         if artifact_root == "_metrics":  # the first, on the download's own thread
             assert side_started.wait(5)
             raise RuntimeError("LIST _metrics denied")
         side_started.set()
         time.sleep(0.5)  # still running when the first fails
         order.append("side listing done")
-        return real(connection, run_uri, run_name, artifact_root)
+        return real(connection, run_uri, run_name, artifact_root, **kwargs)
 
     real_close = _FakeArtifactConnection.close
 
@@ -530,14 +530,14 @@ def test_a_side_listing_still_running_after_the_wait_leaves_its_session_closed(t
     real = client_module.CortexTrainingClient._list_experiment_artifacts
     side_started, release, side_ended = threading.Event(), threading.Event(), threading.Event()
 
-    def listing(connection, run_uri, run_name, artifact_root):
+    def listing(connection, run_uri, run_name, artifact_root, **kwargs):
         if artifact_root == "_metrics":
             assert side_started.wait(5)
             raise RuntimeError("LIST _metrics denied")
         side_started.set()
         try:
             assert release.wait(5)  # stuck past the wait
-            return real(connection, run_uri, run_name, artifact_root)
+            return real(connection, run_uri, run_name, artifact_root, **kwargs)
         finally:
             side_ended.set()
 

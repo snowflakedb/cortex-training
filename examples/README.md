@@ -20,7 +20,7 @@ install and entry point.
 examples/
 ├── utils.py          # make_config, build_job and shared helpers
 ├── logging.py        # metrics logging
-├── sft/              # runner.py (shared loop), overrides.json, conversational/, dare/
+├── sft/              # runner.py (shared loop), overrides.json, conversational/, dare/ (own overrides.json)
 ├── rl/               # runner.py (shared loop), overrides.json, math_grpo/, configs/ (generated)
 ├── inference/        # serve.py, generate.py, evaluate.py, overrides.json
 ├── distillation/     # on_policy/, overrides.json, configs/ (generated)
@@ -97,7 +97,8 @@ overriding the one before:
    kind and mode (see the [catalog layout](../model-catalog/README.md#layout)).
    An RL job combines the training and inference files.
 2. **The example's `overrides.json`:** applies to every catalog-built run of
-   that example.
+   that example. An SFT task folder can add its own, applied after
+   `sft/overrides.json`: `sft/dare/overrides.json` trains DARE on 8 GPUs.
 3. **Command line:** `lr=`, `train_batch_size=`, `max_seq_len=`. When you leave
    them out, the values from the layers below stay.
 
@@ -119,6 +120,9 @@ Merge rules:
 - Other lists are replaced whole.
 - A `_comment` key, at any level, is a free-text note. It is stripped before
   merging.
+- If a merged training sub-job's `sp_size` or `ep_size` no longer divides its
+  `n_gpus`, or its `ds_config` batch fields no longer fit that layout, the build
+  stops with an error instead of submitting the job.
 
 For example, this override changes only the training learning rate:
 
