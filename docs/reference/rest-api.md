@@ -1519,6 +1519,8 @@ operation receiver.
 
 **Replay coordination belongs in DSSST1 operation metadata, not the model batch.** Pass the pair-level `router_replay` descriptor through `wire.dumps(..., metadata=...)`. The frame stores the descriptor in the safetensors `__metadata__.op` field, and `wire.read_metadata(frame)` returns it. The server selects the bootstrapped pair using `metadata["router_replay"]["sampling_job_id"]`; a descriptor inside `batch` or model `kwargs` does not supply operation metadata.
 
+`router_replay.identity_version` is an integer that may be omitted for legacy replay IDs but must be `1` for `rr1:` sample IDs, where `1` denotes the version-1 exact replay identity protocol.
+
 ```python
 from cortex_training import wire
 
