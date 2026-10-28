@@ -496,11 +496,12 @@ def test_deepseek_v4_training_meshes_match_the_completed_h200_runs():
         assert training["attn_implementation"] == "eager"
         assert training["model_provider"] == "arctic"
         assert training["ac_config"]["offload_config"]["enabled"] is True
-        assert training["prime_rl"]["ep_comm_backend"] == "uccl"
+        assert training["model_options"]["moe"]["comm_backend"] == "uccl"
+        assert "prime_rl" not in training
         assert ds_config["bf16"]["bf16_optimizer_states"] is True
         assert ds_config["bf16"]["bf16_master_weights_and_grads"] is True
         if key.endswith("training-lora"):
-            assert training["prime_rl"]["fused_cross_entropy"] is False
+            assert training["model_options"]["lm_head"]["cross_entropy"] is False
             assert training["optimizer"]["lr"] == 1e-4
             assert training["peft_config"]["r"] == 32
             assert training["peft_config"]["target_modules"] == (
@@ -510,9 +511,9 @@ def test_deepseek_v4_training_meshes_match_the_completed_h200_runs():
             assert training["optimizer"]["lr"] == 2e-5
             assert "peft_config" not in training
         if key == "long/h200-training-full":
-            assert training["prime_rl"]["fused_cross_entropy"] == "liger"
+            assert training["model_options"]["lm_head"]["cross_entropy"] == "liger"
         elif not key.endswith("training-lora"):
-            assert training["prime_rl"]["fused_cross_entropy"] is False
+            assert training["model_options"]["lm_head"]["cross_entropy"] is False
         if key == "standard/h200-training-lora":
             assert "offload_optimizer" not in ds_config["zero_optimization"]
         else:
@@ -537,7 +538,11 @@ def test_deepseek_v41_training_meshes_match_the_completed_h200_runs():
         assert training["attn_implementation"] == "eager"
         assert training["model_provider"] == "arctic"
         assert "offload_config" not in training["ac_config"]
-        assert training["prime_rl"] == {"fused_cross_entropy": False, "ep_comm_backend": "uccl"}
+        assert "prime_rl" not in training
+        assert training["model_options"] == {
+            "lm_head": {"cross_entropy": False},
+            "moe": {"comm_backend": "uccl"},
+        }
         assert ds_config["bf16"]["bf16_optimizer_states"] is True
         assert ds_config["bf16"]["bf16_master_weights_and_grads"] is True
         assert ds_config["zero_optimization"]["parameter_alignment"] is True

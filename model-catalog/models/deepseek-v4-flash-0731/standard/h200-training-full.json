@@ -34,9 +34,13 @@
             "pin_memory_bucket_size_mib": 64
           }
         },
-        "prime_rl": {
-          "fused_cross_entropy": false,
-          "ep_comm_backend": "uccl"
+        "model_options": {
+          "lm_head": {
+            "cross_entropy": false
+          },
+          "moe": {
+            "comm_backend": "uccl"
+          }
         },
         "step_peak_memory_log": true,
         "optimizer": {
