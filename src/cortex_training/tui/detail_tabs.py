@@ -39,9 +39,10 @@ from cortex_training.tui import views
 from cortex_training.tui.resource import CHART_AXIS
 from cortex_training.tui.resource import CHART_MUTED
 from cortex_training.tui.resource import chart_hue
+from cortex_training.tui.theme import WARN_TEXT
 from cortex_training.tui.widgets import _download_options
 
-_WARNING = "#fbbf24"
+_WARNING = WARN_TEXT  # a warning's text, as on the Logs tab
 
 
 class _Pane(Vertical):
