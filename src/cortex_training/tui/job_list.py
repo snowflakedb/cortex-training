@@ -579,7 +579,7 @@ class JobListScreen(FollowsPointer, Screen):
         self._search_timer = None
         self._layout: _ListLayout | None = None  # the table's columns, once they exist
         # The widths the reader dragged columns to (label -> cells): kept over every list,
-        # refresh and terminal size, until a double-click on the column's name.
+        # refresh and terminal size, until a double-click on the column's bar.
         self._widths: dict[str, int] = {}
         self._notice: Content | None = None  # the stale-list notice, before wrapping
         # The line(s) under the header, before wrapping: a message, or (start parts, the sort).
@@ -645,7 +645,7 @@ class JobListScreen(FollowsPointer, Screen):
             self._render_jobs()
 
     def resize_column(self, label: str, width: int) -> None:
-        """A drag on the column names: ``label``'s column ``width`` cells wide from now on. Only it
+        """A drag on a column's bar: ``label``'s column ``width`` cells wide from now on. Only it
         changes while the drag lasts, so its edge stays under the pointer; the other columns fit
         around it once the drag ends (see :meth:`column_resized`)."""
         self._widths[label] = width
@@ -654,11 +654,11 @@ class JobListScreen(FollowsPointer, Screen):
             self._set_columns(self.query_one("#jobs", DataTable), _ListLayout(columns))
 
     def column_resized(self) -> None:
-        """A drag on the column names ended: the columns fit the screen around the widths set."""
+        """A drag on a column's bar ended: the columns fit the screen around the widths set."""
         self._fit_columns()
 
     def reset_column(self, label: str) -> None:
-        """``label``'s column back to the width the list picks for it (a double-click on its name)."""
+        """``label``'s column back to the width the list picks for it (a double-click on its bar)."""
         if self._widths.pop(label, None) is not None:
             self._fit_columns()
 
