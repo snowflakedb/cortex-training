@@ -1,0 +1,15 @@
+id: custom-loss-sft
+title: Supervised fine-tuning with a custom loss
+status: runnable
+task: sft
+methods:
+  - custom-loss
+  - lora
+  - full-parameter
+datasets:
+  - who_trained_you
+  - identity
+  - openai/gsm8k
+precision:
+  - bfloat16
+last_validated: null

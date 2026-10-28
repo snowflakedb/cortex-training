@@ -348,7 +348,9 @@ client.poll_request(job_id, client.step(job_id))
   route tokens differently.
 
 The request frames are in
-[rest-api.md section 10.5](rest-api.md#105-custom-losses).
+[rest-api.md section 10.5](rest-api.md#105-custom-losses). For a runnable
+training loop, see the
+[custom-loss SFT recipe](../../recipes/sft_quickstart/custom_loss/README.md).
 
 ## Checkpoints
 

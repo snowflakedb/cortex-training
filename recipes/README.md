@@ -7,6 +7,7 @@ type on the command line instead of writing a job file.
 | Recipe | Method | Dataset / Environment |
 |---|---|---|
 | [Conversational SFT](sft_quickstart/README.md) | LoRA or full-parameter SFT | Hugging Face chat datasets, GSM8K, identity |
+| [Custom-loss SFT](sft_quickstart/custom_loss/README.md) | SFT with a loss written in PyTorch (focal loss) | The conversational SFT datasets |
 | [DARE-Bench agent SFT](sft_quickstart/dare/README.md) | Full-parameter multi-turn tool SFT + agent eval | DARE-Bench |
 | [Math GRPO](rl_quickstart/README.md) | Reinforcement learning | Hendrycks MATH, MATH-500 |
 | [On-policy distillation](distillation/README.md) | Multi-turn tool-use distillation from a frozen teacher | Wiki-search trivia |
@@ -25,7 +26,7 @@ type on the command line instead of writing a job file.
 recipes/
 ├── utils.py                 # make_config, build_job and shared helpers
 ├── logging.py               # metrics logging
-├── sft_quickstart/          # runner.py (shared loop), overrides.json, conversational/, dare/
+├── sft_quickstart/          # runner.py (shared loop), overrides.json, conversational/, custom_loss/, dare/
 ├── rl_quickstart/           # runner.py (shared loop), overrides.json, math_grpo/, configs/ (generated)
 ├── distillation/            # runner.py (shared loop), episodes.py, overrides.json, on_policy/, tasks/, configs/ (generated)
 ├── inference/               # serve.py, generate.py, evaluate.py, overrides.json
@@ -62,6 +63,7 @@ To log metrics to Weights & Biases or Snowflake, see
 # With no connection argument, the profile `cortex-training login` saved is used.
 # Add connection=<profile> to choose another (config=<file> still works, deprecated).
 python -m recipes.sft_quickstart.conversational.train
+python -m recipes.sft_quickstart.custom_loss.train
 python -m recipes.rl_quickstart.math_grpo.train
 python -m recipes.distillation.on_policy.train
 python -m recipes.inference.serve
