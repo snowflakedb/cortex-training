@@ -2159,8 +2159,9 @@ def _fit_columns(values: tuple[float | None, ...], width: int) -> list[float | N
 
     With more values than columns, a column is the mean of those it covers (None where
     none has one). With fewer, each value is as many columns wide, give or take one where
-    they don't divide evenly: a window of few buckets (a job shorter than the window, or
-    a short window at a long scrape interval) still spans its chart.
+    they don't divide evenly, so the values span the ``width`` they are given. In a chart,
+    that is the part of the x axis their times cover (see :func:`_chart_spans`): all of
+    it for a window they cover, only the left part for a job shorter than the window.
     """
     if width <= 0 or not values:
         return []
