@@ -41,20 +41,21 @@ Set up a Snowflake connection profile (see
 [Set up the client](../docs/getting-started/setup.md)). A
 [JSON connection file](../docs/getting-started/setup.md#json-connection-file)
 (from [`connection.json.template`](../docs/getting-started/connection.json.template),
-with account host and PAT) also works, through `config=`.
+with account host and PAT) also works, through `config=`, but it's deprecated: each run warns,
+and it stops working in a future release.
 To log metrics to Weights & Biases or Snowflake, see
 [experiment tracking](../docs/guides/operations/wandb.md).
 
 ## Run an example
 
 ```bash
-# Add connection=<profile> or config=<file> to choose a connection; with neither,
-# the default connection is used.
-python -m examples.sft.conversational.train config=/path/to/config.json
-python -m examples.rl.math_grpo.train config=/path/to/config.json
-python -m examples.distillation.on_policy.train config=/path/to/config.json
-python -m examples.inference.serve config=/path/to/config.json
-python -m examples.model_deployment.deploy config=/path/to/config.json
+# With no connection argument, the profile `cortex-training login` saved is used.
+# Add connection=<profile> to choose another (config=<file> still works, deprecated).
+python -m examples.sft.conversational.train
+python -m examples.rl.math_grpo.train
+python -m examples.distillation.on_policy.train
+python -m examples.inference.serve
+python -m examples.model_deployment.deploy config=/path/to/config.json   # needs a PAT; not deprecated here
 ```
 
 Every example resolves its connection the same way the CLI does:
@@ -63,10 +64,12 @@ Every example resolves its connection the same way the CLI does:
   (`$SNOWFLAKE_HOME/connections.toml` if `SNOWFLAKE_HOME` is set).
 - `config=<file>` reads a legacy JSON file with `host`, `pat`, `database`, and
   `schema`, exactly as before: only the file is used, and environment variables,
-  the saved login and profiles are ignored.
-- With neither, the sources are tried in order: `CORTEX_TRAINING_CONNECTION`,
-  `CORTEX_TRAINING_CONFIG`, complete credentials in the environment, the saved
-  `cortex-training login`, then the Snowflake default connection profile.
+  the saved login and profiles are ignored. Deprecated: it warns.
+- With neither, the old sources still come first, each with a deprecation
+  warning: `CORTEX_TRAINING_CONNECTION`, `CORTEX_TRAINING_CONFIG`, complete
+  credentials in the environment, and `login.json` (from the old
+  `cortex-training login FILE`). Otherwise the profile `cortex-training login`
+  saved is used, then the Snowflake default connection profile.
 
 Each run logs the target it connected to and the source, never the token. The
 `model_deployment` example needs a PAT (see its README).

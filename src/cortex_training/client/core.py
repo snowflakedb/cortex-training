@@ -2608,6 +2608,16 @@ class CortexTrainingClient:
 
         resolution = _picker.resolve(connection=connection, database=database, schema=schema)
         logger.info("Cortex Training target: %s", resolution.describe())
+        return cls._from_resolution(resolution, **kwargs)
+
+    @classmethod
+    def _from_resolution(cls, resolution: Any, **kwargs: Any) -> "CortexTrainingClient":
+        """Create the client a :class:`~cortex_training._picker.Resolution` describes.
+
+        For callers that resolve first and show the target, such as the CLI.
+        """
+        from cortex_training import _picker
+
         if resolution.profile is None:
             return cls._from_pat(
                 host=resolution.host,

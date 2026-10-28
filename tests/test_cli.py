@@ -20,6 +20,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import threading
 import time
 from datetime import date
@@ -3208,20 +3209,23 @@ def test_invalid_config_value_type_returns_error(tmp_path):
 
 
 @pytest.mark.parametrize("config_flags", [[], ["--config"]])
-def test_the_old_login_form_no_longer_saves_the_config(tmp_path, monkeypatch, config_flags):
+def test_the_old_login_form_still_saves_the_config_with_a_warning(tmp_path, monkeypatch, config_flags):
     login_state = tmp_path / "login.json"
     config = _write_config(
         tmp_path,
         {"base_url": "http://login.local", "database": "LOGIN_DB"},
     )
     monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
-    stderr = io.StringIO()
+    stdout, stderr = io.StringIO(), io.StringIO()
 
-    rc = cli.main(["login"] + config_flags + [str(config)], stdout=io.StringIO(), stderr=stderr)
+    rc = cli.main(["login"] + config_flags + [str(config)], stdout=stdout, stderr=stderr)
 
-    assert rc == 2
-    assert not login_state.exists()
-    assert "no longer supported. Run `cortex-training login`" in stderr.getvalue()
+    assert rc == 0
+    assert json.loads(login_state.read_text())["config_path"] == str(config.resolve())
+    assert json.loads(stdout.getvalue()) == {"config_path": str(config.resolve()), "logged_in": True}
+    warning = stderr.getvalue()
+    assert "is deprecated and will stop working in a future release." in warning
+    assert f"cortex-training login --convert-legacy-config {config}" in warning
 
 
 def test_logged_in_config_is_used_without_config_arg(tmp_path, monkeypatch):
@@ -3432,25 +3436,29 @@ def test_named_connection_conflicts_with_direct_flags():
     assert "--connection cannot be combined" in stderr.getvalue()
 
 
+def _write_profiles(*names: str) -> None:
+    """Write minimal profiles to the temporary Snowflake folder (see conftest)."""
+    text = "".join(f'[{name}]\naccount = "ACME"\nuser = "ME"\n' for name in names)
+    (Path(os.environ["SNOWFLAKE_HOME"]) / "connections.toml").write_text(text)
+
+
 def test_build_client_uses_named_snowflake_connection(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "missing.json")
     )
+    _write_profiles("training-profile")
     args = cli.parse_args(["--connection", "training-profile", "list"])
     client_cls = MagicMock()
     connected = object()
-    client_cls._from_profile.return_value = connected
+    client_cls._from_resolution.return_value = connected
 
+    # A profile command connects through the picker, as from_configs() does.
     assert cli.build_client(args, client_cls) is connected
-    client_cls._from_profile.assert_called_once_with(
-        connection_name="training-profile",
-        database=None,
-        schema=None,
-        endpoint="cortex-training",
-        poll_interval=0.5,
-        poll_timeout=1800.0,
-        verify_ssl=True,
+    client_cls._from_resolution.assert_called_once_with(
+        args.resolution, verify_ssl=True, endpoint="cortex-training", poll_interval=0.5, poll_timeout=1800.0
     )
+    assert args.resolution.profile == "training-profile"
+    assert args.resolution.sources["profile"] == "passed in"
 
 
 def test_build_client_forwards_read_bounds_only_when_set(tmp_path, monkeypatch):
@@ -3459,12 +3467,13 @@ def test_build_client_forwards_read_bounds_only_when_set(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "missing.json")
     )
+    _write_profiles("training-profile")
     args = cli.parse_args(["--connection", "training-profile", "list"])
     args.max_retries, args.request_timeout = 2, (10.0, 45.0)
     client_cls = MagicMock()
 
     cli.build_client(args, client_cls)
-    kwargs = client_cls._from_profile.call_args.kwargs
+    kwargs = client_cls._from_resolution.call_args.kwargs
     assert (kwargs["max_retries"], kwargs["request_timeout"]) == (2, (10.0, 45.0))
 
 
@@ -3640,3 +3649,136 @@ def test_download_lock_paths_are_resolved(tmp_path, monkeypatch):
     root.release()
     with cli._output_dir_lock(Path("/")):
         pass
+
+
+# ─── Both ways work; the old ones warn (release 1) ──────────────────────────
+
+
+def _connect(argv, monkeypatch, **env):
+    """Run `list` with a fake client; return what it connected with and its stderr."""
+    for name in ("CORTEX_TRAINING_CONFIG", "CORTEX_TRAINING_CONNECTION", "CORTEX_TRAINING_HOST", "CORTEX_TRAINING_PAT",
+                 "CORTEX_TRAINING_DATABASE", "CORTEX_TRAINING_SCHEMA", "SNOWFLAKE_HOST", "SNOWFLAKE_PAT",
+                 "SNOWFLAKE_DATABASE", "SNOWFLAKE_SCHEMA", "CORTEX_TRAINING_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(Path(os.environ["SNOWFLAKE_HOME"]) / "no-login.json"))
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    seen = {}
+    stderr = io.StringIO()
+    rc = cli.main(argv + ["list"], client_factory=lambda args: seen.update(vars(args)) or FakeClient(),
+                  stdout=io.StringIO(), stderr=stderr)
+    return rc, seen, stderr.getvalue()
+
+
+def _save_choice(profile):
+    path = Path(os.environ["SNOWFLAKE_HOME"]) / "cortex-training" / "config.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"profile": profile}))
+
+
+def test_a_json_config_still_works_and_warns(tmp_path, monkeypatch):
+    config = _write_config(tmp_path, {"host": "acme.snowflakecomputing.com", "pat": "tok", "database": "DB"})
+    rc, seen, err = _connect(["--config", str(config)], monkeypatch)
+    assert rc == 0
+    assert (seen["use_connection_profile"], seen["host"], seen["pat"], seen["database"]) == (False, "acme.snowflakecomputing.com", "tok", "DB")
+    assert f"warning: Signing in with an old JSON config ({config}, from --config) is deprecated and will stop working in a future release." in err
+    assert f"`cortex-training login --convert-legacy-config {config}`" in err
+    assert "tok" not in err
+
+
+def test_cortex_training_config_and_login_json_still_work_and_say_where_from(tmp_path, monkeypatch):
+    config = _write_config(tmp_path, {"host": "acme.snowflakecomputing.com", "pat": "tok", "database": "DB"})
+    _, seen, err = _connect([], monkeypatch, CORTEX_TRAINING_CONFIG=str(config))
+    assert seen["host"] == "acme.snowflakecomputing.com" and "from CORTEX_TRAINING_CONFIG)" in err
+    login_state = tmp_path / "login.json"
+    login_state.write_text(json.dumps({"config_path": str(config)}))
+    monkeypatch.delenv("CORTEX_TRAINING_CONFIG")
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
+    seen.clear()
+    stderr = io.StringIO()
+    cli.main(["list"], client_factory=lambda args: seen.update(vars(args)) or FakeClient(), stdout=io.StringIO(), stderr=stderr)
+    assert seen["host"] == "acme.snowflakecomputing.com" and f"from {login_state})" in stderr.getvalue()
+
+
+def test_host_and_pat_flags_still_work_and_warn(monkeypatch):
+    rc, seen, err = _connect(["--host", "acme.snowflakecomputing.com", "--pat", "tok", "--database", "DB"], monkeypatch)
+    assert rc == 0 and (seen["host"], seen["pat"]) == ("acme.snowflakecomputing.com", "tok")
+    assert "warning: Signing in with --host and --pat is deprecated" in err
+
+
+def test_snowflake_credentials_still_work_and_warn(monkeypatch):
+    rc, seen, err = _connect([], monkeypatch, SNOWFLAKE_HOST="acme.snowflakecomputing.com", SNOWFLAKE_PAT="tok",
+                             SNOWFLAKE_DATABASE="DB")
+    assert rc == 0 and seen["use_connection_profile"] is False and seen["database"] == "DB"
+    assert "warning: SNOWFLAKE_HOST and SNOWFLAKE_PAT are deprecated and will stop working in a future release." in err
+
+
+def test_ci_credentials_warn_only_when_a_profile_exists(monkeypatch):
+    creds = dict(CORTEX_TRAINING_HOST="acme.snowflakecomputing.com", CORTEX_TRAINING_PAT="tok", CORTEX_TRAINING_DATABASE="DB")
+    _, seen, err = _connect([], monkeypatch, **creds)
+    assert seen["host"] == "acme.snowflakecomputing.com" and "warning" not in err
+    _write_profiles("prod")
+    _, seen, err = _connect([], monkeypatch, **creds)
+    assert seen["host"] == "acme.snowflakecomputing.com"  # still used, as before
+    assert "warning: CORTEX_TRAINING_HOST and CORTEX_TRAINING_PAT are used while you have a Snowflake connection profile." in err
+
+
+def test_without_an_old_form_the_saved_profile_is_used(monkeypatch):
+    _write_profiles("default", "train")
+    _save_choice("train")
+    rc, seen, err = _connect([], monkeypatch)
+    assert rc == 0 and seen["use_connection_profile"] is True and "warning" not in err
+    # The fake client factory skips build_client; the picker's choice is what build_client would use.
+    assert cli._picker_choice(argparse_namespace(seen)).profile == "train"
+
+
+def test_the_target_line_names_the_saved_profile(monkeypatch):
+    _write_profiles("default", "train")
+    _save_choice("train")
+    monkeypatch.setattr(cli, "_load_cortex_training_client_class", lambda: _ResolutionClient)
+    _, _, err = _connect_real(monkeypatch)
+    assert "→ profile train (saved by cortex-training login) · database CORTEX_TRAINING_DB (default) · schema PUBLIC (default)" in err
+
+
+def test_cortex_training_connection_still_works_and_warns(monkeypatch):
+    _write_profiles("default", "train")
+    rc, seen, err = _connect([], monkeypatch, CORTEX_TRAINING_CONNECTION="train")
+    assert rc == 0 and seen["connection"] == "train"
+    assert "warning: CORTEX_TRAINING_CONNECTION is deprecated" in err
+
+
+def test_snowflake_database_is_still_honored_with_a_warning(monkeypatch):
+    _write_profiles("default")
+    rc, seen, err = _connect([], monkeypatch, SNOWFLAKE_DATABASE="OLD_DB")
+    assert rc == 0
+    assert "warning: SNOWFLAKE_DATABASE is deprecated and will stop working in a future release. Use --database or CORTEX_TRAINING_DATABASE." in err
+    assert cli._picker_choice(argparse_namespace(seen)).database == "OLD_DB"
+
+
+def test_base_url_does_not_warn(monkeypatch):
+    rc, seen, err = _connect(_base_args(), monkeypatch)
+    assert rc == 0 and seen["base_url"] == "http://test.local" and "warning" not in err
+
+
+class _ResolutionClient:
+    """Stands in for CortexTrainingClient: builds from a picker resolution without connecting."""
+
+    @classmethod
+    def _from_resolution(cls, resolution, **kwargs):
+        return FakeClient()
+
+
+def _connect_real(monkeypatch):
+    """Run `list` through the real build_client (with _ResolutionClient); return rc, args, stderr."""
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(Path(os.environ["SNOWFLAKE_HOME"]) / "no-login.json"))
+    for name in ("CORTEX_TRAINING_CONNECTION", "CORTEX_TRAINING_DATABASE", "CORTEX_TRAINING_SCHEMA"):
+        monkeypatch.delenv(name, raising=False)
+    stderr = io.StringIO()
+    rc = cli.main(["list"], stdout=io.StringIO(), stderr=stderr)
+    return rc, None, stderr.getvalue()
+
+
+def argparse_namespace(values):
+    import argparse
+
+    return argparse.Namespace(**values)

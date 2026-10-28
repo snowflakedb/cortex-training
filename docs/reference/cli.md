@@ -80,11 +80,11 @@ positional `JOB_ID` after the subcommand.
 ### [Connection](#legacy-connection-config)
 
 ```bash
-cortex-training --connection training list    # Use a Snowflake profile
-cortex-training list                          # Use the configured default profile
 cortex-training login                         # Set up or check the profile to use
 cortex-training login training                # Use or create the profile "training"
-cortex-training --config config.json list     # Use config for one command
+cortex-training list                          # Use the profile login saved
+cortex-training --connection training list    # Use another profile for one command
+cortex-training --config config.json list     # Deprecated: an old JSON config (warns)
 ```
 
 ### [Submit Jobs](#submit-a-job)
@@ -219,15 +219,24 @@ chmod 600 ~/.snowflake/connections.toml
 cortex-training --connection training list
 ```
 
-`cortex-training list` with no connection arguments uses the
-Connector-configured default profile. Set
-`SNOWFLAKE_DEFAULT_CONNECTION_NAME=training`, configure
-`default_connection_name = "training"` in Snowflake's `config.toml`, or name
-the connection `[default]`.
+`cortex-training list` with no connection arguments uses the profile
+`cortex-training login` saved, else the Connector-configured default profile
+(`SNOWFLAKE_DEFAULT_CONNECTION_NAME`, `default_connection_name` in Snowflake's
+`config.toml`, or a profile named `[default]`). The database is `--database`,
+else `CORTEX_TRAINING_DATABASE`, else the profile's, else `CORTEX_TRAINING_DB`;
+the schema follows the same order and defaults to `PUBLIC`. Each command's
+first line on stderr names the profile, database, and schema, and where each
+came from.
 
-Profile lookup is a fallback. An explicit or remembered legacy JSON config, or
-a complete direct `--base-url` / `--host` + `--pat` connection, continues to
-win. This preserves existing scripts.
+The old ways still work, and each prints a warning that it's deprecated and
+will stop working in a future release: an explicit or remembered JSON config
+(`--config`, `CORTEX_TRAINING_CONFIG`, `login.json`), `--host` / `--pat`,
+`SNOWFLAKE_HOST` / `SNOWFLAKE_PAT` / `SNOWFLAKE_DATABASE` / `SNOWFLAKE_SCHEMA`,
+and `CORTEX_TRAINING_CONNECTION`. They win as before, so existing scripts keep
+working. `CORTEX_TRAINING_HOST` and `CORTEX_TRAINING_PAT` are for CI: when you
+also have a profile they still win, with a warning that the profile will be
+used instead in a future release. `--base-url`, for a local or mock server,
+doesn't warn.
 
 ### Legacy Connection Config
 
@@ -323,8 +332,8 @@ is piped. Login needs a terminal; in CI, set `CORTEX_TRAINING_HOST` and
 `CORTEX_TRAINING_PAT` instead.
 
 `cortex-training login config.json` and `login --config config.json`, which
-remembered a JSON config, are no longer supported. A JSON config still works
-for one command with:
+remember a JSON config in `login.json`, still work, with a deprecation warning.
+A JSON config also still works (with a warning) for one command with:
 
 ```bash
 cortex-training --config config.json list

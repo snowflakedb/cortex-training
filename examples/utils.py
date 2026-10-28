@@ -93,6 +93,8 @@ LEGACY_DEFAULT_DATABASE = "CORTEX_TRAINING_DB"
 def resolve_example_connection(
     config: str | None = None,
     connection: str | None = None,
+    *,
+    config_deprecated: bool = True,
     **overrides: Any,
 ) -> ResolvedConnection:
     """Open the client an example runs against, and log what it connected to.
@@ -104,7 +106,14 @@ def resolve_example_connection(
     """
     if config and connection:
         raise ValueError("pass either config= or connection=, not both")
-    if config:
+    if config and config_deprecated:
+        logger.warning(
+            "config=%s (an old JSON config) is deprecated and will stop working in a future release. "
+            "Convert it into a Snowflake connection profile with "
+            "`cortex-training login --convert-legacy-config %s`, then pass connection=NAME.",
+            config,
+            config,
+        )
         resolved = _legacy_json_connection(config, overrides)
     else:
         resolved = resolve_connection(

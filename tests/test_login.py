@@ -673,12 +673,14 @@ def test_validate_host_rejects(raw):
 
 
 @pytest.mark.parametrize("argv", [["login", "config.json"], ["login", "~/ct/config.json"], ["login", "--config", "ct.json"]])
-def test_the_old_login_forms_explain_what_replaced_them(argv, isolated):
+def test_the_old_login_forms_still_work_with_a_warning(argv, isolated):
+    # The old form remembers a JSON file, as before; here the file doesn't exist, so it fails as it always did.
     stderr = io.StringIO()
     code = _cli.main(argv, stdout=io.StringIO(), stderr=stderr, stdin=io.StringIO())
-    assert code == 2
-    assert "is no longer supported. Run `cortex-training login`" in stderr.getvalue()
-    assert not (_picker.config_path().parent / "login.json").exists()
+    assert code == 1
+    err = stderr.getvalue()
+    assert "is deprecated and will stop working in a future release." in err
+    assert "cortex-training login --convert-legacy-config" in err
 
 
 def test_the_cli_runs_the_new_login(monkeypatch, isolated):
