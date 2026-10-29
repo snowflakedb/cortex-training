@@ -977,8 +977,9 @@ class ResourceTab:
         if warnings:
             values["warning"] = _warning_text(warnings)
         alert = [("$warning", 0)] if warnings else [("", 0)]
-        # Parts: 0 scraped, 1 freshness, 2 state, 3 skipped rows, 4 warning.
-        second = _fit_line([scraped, fresh, state, note, alert], [3, 0, 1, 2, 3, 0], width, values, cut="problem")
+        # Parts: 0 scraped, 1 freshness, 2 state, 3 skipped rows, 4 warning. The scrape interval has
+        # no shorter form, so it goes last, once the others have shrunk (the clock first).
+        second = _fit_line([scraped, fresh, state, note, alert], [3, 1, 2, 3, 0], width, values, cut="problem")
         lines = [first, second]
         if kind == GPU and views.is_deployment(self._job):
             lines.append(Content(views.fit_cells(_DEPLOYMENT_MEMORY_NOTE, width) if width else _DEPLOYMENT_MEMORY_NOTE))
