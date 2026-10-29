@@ -956,7 +956,6 @@ class ResourceTab:
             window=window_label(self._resource_range),
             key=self._resource_range,  # "10m", "all": the window keys' own names
             scraped=scrape_text(resource),
-            scraped_short=scrape_text(resource, notes=False),
             fresh=freshness_text(resource, now, stale=stale, what=samples),
             fresh_short=freshness_text(resource, now, stale=stale, clock=False, what=samples),
         )
@@ -971,7 +970,7 @@ class ResourceTab:
         if not states:
             # Nothing shows, but the room a refresh's state needs stays free.
             state = [("", len(_SEPARATOR) + len(text)) for text in self._RESOURCE_REFRESHING]
-        scraped = [("$scraped", 0), ("$scraped_short", 0), ("", 0)]
+        scraped = [("$scraped", 0), ("", 0)]
         # A download that gave up on chunks: the telemetry on screen has holes, so say so
         # here rather than let it look complete. It goes last and is never dropped.
         warnings = self._source_warnings()

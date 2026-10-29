@@ -24,6 +24,7 @@ from pathlib import Path
 import threading
 from typing import Callable
 
+from rich.style import Style
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
@@ -159,6 +160,20 @@ def training_loader(metrics_root: Path, local_root: Path | None = None) -> train
 # Two charts to a row in a pane at least this wide, as on the Resources tab.
 _TWO_CHARTS_WIDTH = 90
 _CHART_HEIGHT = 6
+# The header's window and metrics words: a click on one does what its key does (see _TrainingStatus).
+_CLICK_WINDOW = Style.from_meta({"@click": "cycle_window"})
+_CLICK_EVERYTHING = Style.from_meta({"@click": "toggle_everything"})
+
+
+class _TrainingStatus(Static):
+    """The Training metrics header. A click on its window or on what metrics it shows runs here
+    (Textual sends a click's action to the widget clicked), and goes on to the pane, as w and a do."""
+
+    def action_cycle_window(self) -> None:
+        self.query_ancestor(TrainingPane).action_cycle_window()
+
+    def action_toggle_everything(self) -> None:
+        self.query_ancestor(TrainingPane).action_toggle_everything()
 
 
 class TrainingPane(_Pane):
@@ -212,7 +227,7 @@ class TrainingPane(_Pane):
             self._post(self._accept, data)
 
     def compose(self) -> ComposeResult:
-        yield Static("", id="training-status")
+        yield _TrainingStatus("", id="training-status")
         with VerticalScroll(id="training-pane"):
             # Per step, then per /fwd-bwd call, one after the other.
             for view in training.VIEWS:
@@ -391,12 +406,13 @@ class TrainingPane(_Pane):
             if sub_job.newest is not None:
                 text.append(f"  ·  newest row {views.fmt_ago(sub_job.newest, datetime.now(timezone.utc))}")
         if source is not None:
-            text.append(f"  ·  {training.window_label(self._window)} (w)")
+            # Each also a click away: the window cycles as w does, what is shown toggles as a does.
+            text.append("  ·  ")
+            text.append(f"{training.window_label(self._window)} (w)", style=_CLICK_WINDOW)
             hidden = sum(sub_job.hidden(view) for view in training.VIEWS) if sub_job is not None else 0
-            if self._everything:
-                text.append("  ·  all metrics (a)")
-            elif hidden:
-                text.append(f"  ·  {hidden:,} hidden (a)")
+            if hidden or self._everything:
+                text.append("  ·  ")
+                text.append("all metrics (a)" if self._everything else "training signals (a)", style=_CLICK_EVERYTHING)
         notes = []
         if self._loading:
             notes.append(("cached · refreshing…" if sub_job else "loading training metrics…", CHART_MUTED))

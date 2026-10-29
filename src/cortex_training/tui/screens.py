@@ -116,7 +116,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
         KEYS_BINDING,
         ("l", "open('logs')", "Logs"),
         ("g", "open('resource')", "Resources"),
-        Binding("m", "open('training')", "Training metrics", show=False),
+        ("m", "open('training')", "Training metrics"),
         ("c", "open('checkpoints')", "Checkpoints"),
         ("v", "open('serving')", "Serving"),
         ("r", "refresh", "Refresh"),
@@ -297,10 +297,9 @@ class JobSummaryScreen(FollowsPointer, Screen):
             self.refresh_bindings()
 
     # The next steps from here, under the title: the footer has them too, but it
-    # cuts its end on a narrow screen, and these say what each one opens.
-    # m (Training metrics) stays out, as in the footer.
+    # cuts its end on a narrow screen, and these say what each one opens: the tabs, in the job screen's order.
     _ACTIONS = (("serving", "v", "Serving"), ("logs", "l", "Logs"), ("resource", "g", "Resources"),
-                ("checkpoints", "c", "Checkpoints"))
+                ("training", "m", "Training metrics"), ("checkpoints", "c", "Checkpoints"))
 
     def _actions(self) -> tuple:
         tabs = v.job_tabs(self._job)

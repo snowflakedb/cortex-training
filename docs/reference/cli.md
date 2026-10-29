@@ -1241,7 +1241,8 @@ for. `esc` closes that panel first, before it clears a search or goes back.
 Opening a job shows it as cards. The job card is headed by its id, its status
 as a colored pill (`unknown` reads `? UNKNOWN`), and how long it has been
 going (`12m 04s so far`, or `lasted 1h 20m` once it ended), with the keys for
-`l Logs` and `g Resources` under it. Its facts follow: model, type, owner,
+its tabs under it (`l Logs`, `g Resources`, `m Training metrics`,
+`c Checkpoints`). Its facts follow: model, type, owner,
 requested GPUs, creation and update times, and the location when it is not the
 configured one, in two columns from about 90 columns wide and in one below.
 Values stop after three rows; `e` expands every value and the complete sub-job
@@ -1462,8 +1463,9 @@ its record says it is a deployment.
     `gradient_sample_numel`); per call, `rank` (the worker the result came
     from, currently always 0) while every call's is 0: a call from another
     worker shows it. The packing counts (`rl_model_calls`, `sft_model_calls`,
-    `sft_packed_rows`) always show. The header says how many are hidden
-    (`3 hidden (a)`), or `all metrics (a)` while they show.
+    `sft_packed_rows`) always show. The header says which show:
+    `training signals (a)`, or `all metrics (a)` once `a` shows them. A click
+    on it does what `a` does, and a click on the window beside it what `w` does.
   - The header names the sub-job, its newest step, how many calls were saved,
     the age of the newest row and the window, and with two or more
     training sub-jobs its place among them. `Space` shows the next one.

@@ -229,6 +229,8 @@ def test_preview_shows_cards_with_the_id_facts_lifecycle_and_callout():
             hero = _rows(app, "#hero")
             assert hero[0].startswith("JOB_ID") and "PENDING" in hero[0] and "so far" in hero[0]
             assert "l Logs" in hero[-1] and "g Resources" in hero[-1]
+            # Every tab's key, in the job screen's order.
+            assert hero[-1].rstrip().split("   ") == ["l Logs", "g Resources", "m Training metrics", "c Checkpoints"]
             health = app.screen.query_one("#health", Static)
             assert "quota_filled" in "".join(_rows(app, "#health")) and "waiting" in str(health.border_title)
             assert "opens its Logs" in str(app.screen.query_one("#subjobs-card").border_subtitle)
@@ -335,6 +337,7 @@ def test_a_deployment_s_preview_says_how_to_call_it_and_offers_serving():
             assert "READY" in "".join(hero_rows) and "RUNNING" not in "".join(hero_rows)  # deployment status words
             hero = hero_rows[-1]
             assert "v Serving" in hero and "l Logs" in hero and "g Resources" in hero and "Checkpoints" not in hero
+            assert "Training metrics" not in hero  # a deployment has no Training metrics tab
             screen = app.screen
             assert screen.check_action("open", ("serving",)) is True
             assert not screen.check_action("open", ("checkpoints",))
