@@ -1348,9 +1348,8 @@ its record says it is a deployment.
     `temp` (and the hottest GPU) and `GPUs reporting` (`8/8`, against those
     requested); the System view has `CPU util`, `memory` and `nodes
     reporting`. Only metrics the rows have get a tile. Each is coloured by
-    health, and a value that warns or is an error has `!` or `×` at its
-    edge, so it shows without color too. For the mean a tile is as healthy as
-    its least healthy GPU or node: GPU util under 50% warns; GPU memory used from 95% warns; GPU
+    health, and for the mean a tile is as healthy as its least healthy GPU or
+    node: GPU util under 50% warns; GPU memory used from 95% warns; GPU
     temperature from 85 °C warns and from 90 °C is an error; CPU util from 95%
     warns; node memory used from 90% warns and from 97% is an error; power
     isn't judged. `GPUs reporting` warns below the GPUs requested and is an
@@ -1799,11 +1798,10 @@ server), and in tmux, whose outer terminal also needs
 `NO_COLOR` set to anything but an empty string ([no-color.org](https://no-color.org))
 draws every color as its gray, and the TUI says so as it starts. `--color always`
 draws color anyway, `--color never` draws gray in any terminal, and
-`--color auto` is the default. No screen depends on color alone: a job's status
-has its glyph, and a KPI tile that warns or is an error has `!` or `×` at its
-edge. Some command runners set `NO_COLOR` and `TERM=dumb` for the commands they
-run (an AI agent's, such as Cursor's): a TUI started there is gray until
-`--color always`.
+`--color auto` is the default. A job's status keeps its glyph in gray, but a
+KPI tile's health is shown by its color alone. Some command runners set
+`NO_COLOR` and `TERM=dumb` for the commands they run (an AI agent's, such as
+Cursor's): a TUI started there is gray until `--color always`.
 
 Each glyph the TUI draws is one cell wide, and none is also an emoji (which some
 terminals draw in color, two cells wide). Borders, tables and charts line up

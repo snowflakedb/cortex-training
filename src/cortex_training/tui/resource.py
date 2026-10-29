@@ -2352,9 +2352,6 @@ def kpi_tiles(resource: KindResource, view: KindView, *, unit: int | None = None
 
 _TILE_GAP = 1  # cells between two tiles
 _TILE_EDGE = "▎"
-# The edge beside a tile's value when the value isn't healthy: a shape as well as a color,
-# so a warning and an error still show where there is no color (NO_COLOR, a copied strip).
-_TILE_MARKS = {"warn": "!", "err": "×"}
 
 
 def _tile_width(tile: Kpi, detail: bool) -> int:
@@ -2409,8 +2406,7 @@ def kpi_strip_spans(tiles: list[Kpi], width: int, *, styled: bool = True,
             value = views.fit_cells(tile.value, inner)
             rest = inner - views.cell_width(value)
             note = views.fit_cells(tile.detail, rest - 2) if keep[index] and rest > 3 else ""
-            mark = (f"{_TILE_MARKS.get(tile.health, _TILE_EDGE)} ", edge[1])
-            bottom += [mark, (value, f"bold {color} {card}" if styled else "")]
+            bottom += [edge, (value, f"bold {color} {card}" if styled else "")]
             tail = (f"  {note}" if note else "").ljust(rest) + " "
             bottom.append((tail, f"{FAINT if dim else MUTED} {card}" if styled else ""))
         lines += [top, bottom]
