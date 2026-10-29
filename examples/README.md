@@ -12,6 +12,7 @@ type on the command line instead of writing a job file.
 | [On-policy distillation](distillation/README.md) | Distillation from a frozen teacher | GSM8K |
 | [Inference endpoint](inference/README.md) | Serve, generate, evaluate open weights or a checkpoint | MATH-500, GSM8K, identity |
 | [Model deployment streaming](model_deployment/README.md) | OpenAI-compatible model deployment, streamed chat | Open weights, checkpoints |
+| [DFlash2 draft](dflash2/README.md) | Speculative-decoding draft training, then serving with the target | Target-written chats (UltraChat prompts) |
 
 GRPO also runs from [SkyRL](frameworks/skyrl/gsm8k_grpo/README.md), with its own
 install and entry point.
@@ -24,6 +25,7 @@ examples/
 ├── rl/               # runner.py (shared loop), overrides.json, math_grpo/, configs/ (generated)
 ├── inference/        # serve.py, generate.py, evaluate.py, overrides.json
 ├── distillation/     # on_policy/, overrides.json, configs/ (generated)
+├── dflash2/          # generate_data.py, train.py, evaluate.py, overrides.json, drafts/<model>.json
 ├── api/              # raw request bodies
 └── frameworks/       # SkyRL, tinker-cookbook and bring-your-own-agent docs
 ```
