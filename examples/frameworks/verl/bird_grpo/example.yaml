@@ -1,0 +1,15 @@
+id: verl-bird-grpo
+title: BIRD GRPO with VeRL
+status: runnable
+task: rl
+framework: Snowflake-AI-Research/verl
+methods:
+  - full-parameter
+models:
+  - Qwen/Qwen3-8B
+datasets:
+  - BIRD-SQL
+provenance:
+  project: Snowflake-AI-Research/Arctic-Platform
+  recipe: recipes/rl/verl/txt2sql/run_qwen3_8b_bird_grpo_cortex.sh
+last_validated: 2026-10-27

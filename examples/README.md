@@ -14,7 +14,8 @@ type on the command line instead of writing a job file.
 | [Model deployment streaming](model_deployment/README.md) | OpenAI-compatible model deployment, streamed chat | Open weights, checkpoints |
 
 GRPO also runs from [SkyRL](frameworks/skyrl/gsm8k_grpo/README.md), with its own
-install and entry point.
+install and entry point. [VeRL on BIRD](frameworks/verl/bird_grpo/README.md)
+trains Qwen3-8B with ZoRRo.
 
 ```text
 examples/

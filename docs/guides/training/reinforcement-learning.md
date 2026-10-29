@@ -15,6 +15,9 @@ end-to-end RL example. It demonstrates:
 with its trainer on a CPU driver and training and sampling in Cortex sub-jobs.
 Its GSM8K example lives in the Arctic Platform repository and has its own
 install.
+[VeRL on BIRD](../../../examples/frameworks/verl/bird_grpo/README.md) trains
+Qwen3-8B from VeRL, with ZoRRo, on the same split of 4 training GPUs and 4
+sampling GPUs.
 
 To train a model inside an agent you already have, see
 [Bring your own agent](../../../examples/frameworks/bring-your-own-agent.md). The agent
