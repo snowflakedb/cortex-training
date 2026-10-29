@@ -3503,14 +3503,22 @@ raised unchanged.
 ### 14.8 Calling a deployment
 
 `CortexTrainingClient` does not call the deployment itself; any
-OpenAI-compatible client does. This is the behavior a caller sees, as checked
-by the `test_tc6_*` cases in `tests/test_model_deployment_e2e.py`. The
-streaming example (`examples/model_deployment/streaming.py`) codes against it.
+OpenAI-compatible client does. `CortexTrainingClient.model_deployment_headers()`
+returns the auth headers below for the client's own credential, re-read on every
+call so a refreshed session is used. After a session-expired 401 (codes
+`390111`, `390112`, `390114`, or a 401 with no code), pass the rejected headers
+as `rejected=`: a profile client opens a new session only if it still holds the
+rejected token, so concurrent callers share one new session. This is the
+behavior a caller sees. The `test_tc6_*` cases in
+`tests/test_model_deployment_e2e.py` check it with a PAT; the session-token and
+`Accept` rows were checked by hand. The streaming example
+(`examples/model_deployment/streaming.py`) codes against it.
 
 | Item | Behavior |
 |---|---|
 | Path | `POST {base_url}/chat/completions`, with `base_url` = `<prefix>/inference/v1` ([section 14.1](#141-deployment-ids)) |
-| Auth | `Authorization: Bearer <PAT>` and `X-Snowflake-Authorization-Token-Type: PROGRAMMATIC_ACCESS_TOKEN` |
+| Auth | PAT: `Authorization: Bearer <PAT>` and `X-Snowflake-Authorization-Token-Type: PROGRAMMATIC_ACCESS_TOKEN`. Session token (a Snowflake connection profile): `Authorization: Snowflake Token="<session token>"`. A session token sent as `Bearer` is rejected with HTTP 401, code `390303`. |
+| `Accept` | Required. A request without `Accept` is rejected with HTTP 400, code `391902` ("Unsupported Accept header null"). OpenAI clients send it; with raw HTTP send `Accept: application/json` (`text/event-stream` when streaming). |
 | `model` | The deployment ID, `sf-ct-<UUID>`; responses echo it as `model` |
 | Length limit | `max_completion_tokens`. `max_tokens` is rejected with HTTP 400, `{"error": {"type": "invalid_request_error", "param": "max_tokens", "code": "unsupported_parameter"}}` |
 | Not enabled | HTTP 404 while inference is not enabled for the account |

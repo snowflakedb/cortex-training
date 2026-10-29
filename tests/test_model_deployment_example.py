@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 
 import pytest
+import requests
 
 from cortex_training.connection import ResolvedConnection
 from cortex_training.model_deployment import ModelDeploymentSpec
@@ -45,6 +47,9 @@ class FakeResponse:
     def json(self):
         return self._body
 
+    def close(self):
+        pass
+
     def __enter__(self):
         return self
 
@@ -53,13 +58,13 @@ class FakeResponse:
 
 
 class FakeSession:
-    def __init__(self, response):
-        self.response = response
+    def __init__(self, *responses):
+        self.responses = list(responses)
         self.calls = []
 
     def post(self, url, **kwargs):
         self.calls.append((url, kwargs))
-        return self.response
+        return self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
 
 
 @pytest.mark.parametrize("name", ["base-model.json", "checkpoint.json"])
@@ -222,6 +227,9 @@ class FakeClient:
         self.created = []
         self.dropped = []
 
+    def model_deployment_headers(self, *, rejected=None):
+        return {"Authorization": "Bearer PAT"}
+
     def create_model_deployment(self, spec):
         self.created.append(spec)
         return {"deployment": DEPLOYMENT_ID, "status": "PENDING"}
@@ -261,8 +269,8 @@ def deploy(monkeypatch, tmp_path):
 
     monkeypatch.setattr(module, "resolve_example_connection", fake_resolve)
 
-    def fake_stream_chat(base_url, pat, **kwargs):
-        state["calls"].append((base_url, pat, kwargs))
+    def fake_stream_chat(base_url, auth, **kwargs):
+        state["calls"].append((base_url, auth, kwargs))
         kwargs["on_delta"]("Hello")
         return streaming.ChatResult(text="Hello", time_to_first_token=0.1, total_seconds=0.2, chunks=1)
 
@@ -279,8 +287,9 @@ def test_deploy_creates_streams_and_drops(deploy, capsys):
     client = deploy["client"]
     assert client.created == [json.loads((EXAMPLE_DIR / "configs/base-model.json").read_text())]
     assert client.dropped == [DEPLOYMENT_ID]
-    base_url, pat, kwargs = deploy["calls"][0]
-    assert (base_url, pat, kwargs["model"]) == (BASE_URL, "PAT", DEPLOYMENT_ID)
+    base_url, auth, kwargs = deploy["calls"][0]
+    assert (base_url, kwargs["model"]) == (BASE_URL, DEPLOYMENT_ID)
+    assert auth == client.model_deployment_headers
     assert capsys.readouterr().out == "Hello\n"
 
 
@@ -331,18 +340,123 @@ def test_deploy_is_an_entrypoint():
     assert "chz.nested_entrypoint(main)" in source
 
 
-def test_deploy_without_pat_fails_before_creating_a_deployment(deploy):
-    deploy["pat"] = None
-    with pytest.raises(ValueError, match="calls the inference endpoint with a PAT"):
-        deploy["main"](deploy["config"]())
-    assert deploy["client"].created == []
-    assert deploy["calls"] == []
-
-
-def test_deploy_profile_without_pat_names_the_profile(deploy):
+@pytest.mark.parametrize("connection", [None, "training"])
+def test_deploy_runs_without_a_pat(deploy, connection):
     deploy["pat"] = None
     module = deploy["module"]
-    config = module.Config(connection="training")
-    with pytest.raises(ValueError, match="connection profile 'training'"):
-        deploy["main"](config)
-    assert deploy["client"].created == []
+    config = module.Config(connection=connection) if connection else module.Config()
+    module.main(config)
+    assert deploy["client"].created and deploy["client"].dropped == [DEPLOYMENT_ID]
+    # deploy.py wires in the client's own method, not a PAT.
+    assert deploy["calls"][0][1] == deploy["client"].model_deployment_headers
+
+
+EXPIRED = {"code": "390112", "message": "Your session has expired. Please login again."}
+
+
+class SessionHeaders:
+    """A ``model_deployment_headers`` stand-in that records ``rejected``."""
+
+    def __init__(self, authorization='Snowflake Token="old"'):
+        self.authorization = authorization
+        self.rejected = []
+
+    def __call__(self, *, rejected=None):
+        if rejected is None:
+            return {"Authorization": self.authorization}
+        self.rejected.append(rejected)
+        return {"Authorization": 'Snowflake Token="new"'}
+
+
+def _complete(auth, session):
+    return streaming.complete_chat(
+        BASE_URL, auth, model=DEPLOYMENT_ID, messages=streaming.chat_messages("Hi"),
+        max_completion_tokens=16, temperature=0.0, session=session,
+    )
+
+
+@pytest.mark.parametrize("body", [EXPIRED, {"error": {"code": 390114}}, None], ids=["code", "nested-code", "no-code"])
+def test_stream_chat_retries_a_session_expired_401_once_with_the_rejected_headers(body):
+    headers = SessionHeaders()
+    session = FakeSession(
+        FakeResponse(status_code=401, body=body, text="expired"),
+        FakeResponse(lines=sse(delta("ok", "stop"))),
+    )
+    result = streaming.stream_chat(
+        BASE_URL,
+        headers,
+        model=DEPLOYMENT_ID,
+        messages=streaming.chat_messages("Hi"),
+        max_completion_tokens=16,
+        temperature=0.0,
+        session=session,
+    )
+    assert result.text == "ok"
+    sent = [kwargs["headers"] for _, kwargs in session.calls]
+    assert [h["Authorization"] for h in sent] == ['Snowflake Token="old"', 'Snowflake Token="new"']
+    assert all(h["Content-Type"] == "application/json" for h in sent)
+    # The refresh is told which token was rejected, so it is single-flight.
+    assert [r["Authorization"] for r in headers.rejected] == ['Snowflake Token="old"']
+
+
+def test_a_second_session_expired_401_is_an_error():
+    session = FakeSession(FakeResponse(status_code=401, body=EXPIRED, text="expired"))
+    with pytest.raises(streaming.DeploymentCallError, match="HTTP 401"):
+        _complete(SessionHeaders(), session)
+    assert len(session.calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("auth", "body"),
+    [
+        ("PAT", EXPIRED),
+        # deploy.py passes the header function for PAT configs too.
+        (SessionHeaders("Bearer PAT"), EXPIRED),
+        # Any other Snowflake code is not an expiry: a new login would not help.
+        (SessionHeaders(), {"code": "390303", "message": "Invalid OAuth access token."}),
+    ],
+    ids=["pat-string", "pat-header-function", "non-expiry-code"],
+)
+def test_a_401_that_a_new_session_cannot_fix_is_not_retried(auth, body):
+    session = FakeSession(FakeResponse(status_code=401, body=body, text="no"))
+    with pytest.raises(streaming.DeploymentCallError, match="HTTP 401"):
+        _complete(auth, session)
+    assert len(session.calls) == 1
+    if isinstance(auth, SessionHeaders):
+        assert auth.rejected == []
+
+
+def test_stream_chat_decodes_non_ascii_deltas_as_utf8():
+    # No charset, so requests would decode text as Latin-1, where the second
+    # byte of "Å" (C3 85) is NEL, a line break for str.splitlines(). U+2028 is
+    # one too, and vLLM writes it unescaped.
+    text = "Å… 中\u2028end"
+    lines = [f"data: {json.dumps(delta(text, 'stop'), ensure_ascii=False)}", "", "data: [DONE]", ""]
+    response = requests.Response()
+    response.status_code = 200
+    response.headers["Content-Type"] = "text/event-stream"
+    response.encoding = requests.utils.get_encoding_from_headers(response.headers)
+    response.raw = io.BytesIO("\n".join(lines).encode("utf-8"))
+    result = streaming.stream_chat(
+        BASE_URL,
+        "PAT",
+        model=DEPLOYMENT_ID,
+        messages=streaming.chat_messages("Hi"),
+        max_completion_tokens=16,
+        temperature=0.0,
+        session=FakeSession(response),
+    )
+    assert result.text == text
+
+
+def test_pat_string_wire_headers_are_unchanged():
+    session = FakeSession(FakeResponse(body={"choices": [{"message": {"content": "x"}}]}))
+    streaming.complete_chat(
+        BASE_URL, "PAT", model=DEPLOYMENT_ID, messages=[], max_completion_tokens=1,
+        temperature=0.0, session=session,
+    )
+    assert session.calls[0][1]["headers"] == {
+        "Authorization": "Bearer PAT",
+        "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
+        "Content-Type": "application/json",
+    }

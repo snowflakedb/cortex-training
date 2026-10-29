@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from collections.abc import Iterable
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -46,6 +47,56 @@ def deployment_headers(pat: str) -> dict[str, str]:
         "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
         "Content-Type": "application/json",
     }
+
+
+# Either a PAT, or a function returning the auth headers, such as
+# ``CortexTrainingClient.model_deployment_headers``. After a session-expired 401
+# it is called with ``rejected=<the headers that were sent>`` to retry once.
+Auth = str | Callable[..., dict[str, str]]
+
+# Snowflake error codes for an expired or invalidated session token.
+SESSION_EXPIRED_CODES = frozenset({"390111", "390112", "390114"})
+
+
+def _headers(auth: Auth, rejected: dict[str, str] | None = None) -> dict[str, str]:
+    if isinstance(auth, str):
+        return deployment_headers(auth)
+    headers = auth() if rejected is None else auth(rejected=rejected)
+    return {**headers, "Content-Type": "application/json"}
+
+
+def _session_expired(sent: dict[str, str], response: requests.Response) -> bool:
+    """Whether ``response`` rejected the session token in ``sent`` as expired.
+
+    A PAT is never refreshed, and a 401 with any other Snowflake error code is
+    not an expiry, so neither is retried (that would only repeat a login).
+    """
+    if response.status_code != 401 or not sent.get("Authorization", "").startswith("Snowflake Token="):
+        return False
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    error = body.get("error") if isinstance(body, dict) else None
+    codes = [
+        str(code)
+        for code in (
+            body.get("code") if isinstance(body, dict) else None,
+            error.get("code") if isinstance(error, dict) else None,
+        )
+        if code is not None
+    ]
+    return not codes or any(code in SESSION_EXPIRED_CODES for code in codes)
+
+
+def _post(http: requests.Session, url: str, auth: Auth, extra: dict[str, str], **kwargs: Any) -> requests.Response:
+    """POST with ``auth``; a session-expired 401 is retried once with a new session."""
+    sent = _headers(auth)
+    response = http.post(url, headers={**sent, **extra}, **kwargs)
+    if not isinstance(auth, str) and _session_expired(sent, response):
+        response.close()
+        response = http.post(url, headers={**_headers(auth, rejected=sent), **extra}, **kwargs)
+    return response
 
 
 def chat_messages(prompt: str, system: str | None = None) -> list[dict[str, str]]:
@@ -130,7 +181,7 @@ def _raise_for_status(response: requests.Response) -> None:
 
 def stream_chat(
     base_url: str,
-    pat: str,
+    auth: Auth,
     *,
     model: str,
     messages: list[dict[str, str]],
@@ -146,9 +197,11 @@ def stream_chat(
     result = ChatResult()
     deltas: list[str] = []
     started = time.monotonic()
-    with http.post(
+    with _post(
+        http,
         f"{base_url.rstrip('/')}/chat/completions",
-        headers={**deployment_headers(pat), "Accept": "text/event-stream"},
+        auth,
+        {"Accept": "text/event-stream"},
         json={
             "model": model,
             "messages": messages,
@@ -163,7 +216,10 @@ def stream_chat(
         timeout=timeout,
     ) as response:
         _raise_for_status(response)
-        for chunk in iter_sse_chunks(response.iter_lines(decode_unicode=True)):
+        # Byte lines, decoded as UTF-8 by iter_sse_chunks: requests decodes an
+        # event-stream with no charset as Latin-1, and str.splitlines() also
+        # splits on U+0085 and U+2028, which can sit unescaped inside a chunk.
+        for chunk in iter_sse_chunks(response.iter_lines()):
             result.chunks += 1
             if chunk.get("usage"):
                 result.usage = chunk["usage"]
@@ -185,7 +241,7 @@ def stream_chat(
 
 def complete_chat(
     base_url: str,
-    pat: str,
+    auth: Auth,
     *,
     model: str,
     messages: list[dict[str, str]],
@@ -198,9 +254,11 @@ def complete_chat(
     """Run one non-streaming chat completion."""
     http = session or requests.Session()
     started = time.monotonic()
-    response = http.post(
+    response = _post(
+        http,
         f"{base_url.rstrip('/')}/chat/completions",
-        headers=deployment_headers(pat),
+        auth,
+        {},
         json={
             "model": model,
             "messages": messages,

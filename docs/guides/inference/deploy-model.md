@@ -11,8 +11,8 @@ For a runnable version of this page, see the
 generate through the Cortex Training generate API instead, see
 [Serve a Training Checkpoint](serve-checkpoint.md).
 
-Only `EVALUATION` deployments are supported today. They are ephemeral: a
-deployment holds its GPUs until you drop it.
+Only `EVALUATION` deployments are supported today. A deployment holds its GPUs
+until you drop it.
 
 ## 1. Write a spec
 
@@ -82,41 +82,77 @@ base_url = ready["base_url"]
 
 ## 3. Stream a chat completion
 
-Authenticate with the same programmatic access token (PAT) and pass the
-deployment ID as `model`. Inference is not yet available on all accounts;
+Authenticate the same way you did for the SDK and pass the deployment ID as
+`model`. `client.model_deployment_headers()` returns the right headers for
+either credential: `Authorization: Bearer <PAT>` plus
+`X-Snowflake-Authorization-Token-Type: PROGRAMMATIC_ACCESS_TOKEN` for a PAT, or
+`Authorization: Snowflake Token="<session token>"` for a connection profile
+(`CortexTrainingClient.from_connection_name`). A session token sent as a Bearer
+token is rejected with HTTP 401. Inference is not yet available on all accounts;
 until it is enabled for yours, requests return HTTP 404.
 
 With the `openai` package:
 
 ```python
-from openai import OpenAI
+from openai import AuthenticationError, OpenAI
 
-openai = OpenAI(
-    base_url=base_url,
-    api_key=PAT,  # sent as "Authorization: Bearer <PAT>"
-    default_headers={"X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN"},
-)
-stream = openai.chat.completions.create(
-    model="sf-ct-DEPLOYMENT_UUID",
-    messages=[{"role": "user", "content": "Write a haiku about snow."}],
-    max_completion_tokens=256,
-    stream=True,
-)
+
+def stream_haiku(headers):
+    openai = OpenAI(
+        base_url=base_url,
+        api_key="unused",  # the headers below replace the Authorization it sends
+        default_headers=headers,
+    )
+    return openai.chat.completions.create(
+        model="sf-ct-DEPLOYMENT_UUID",
+        messages=[{"role": "user", "content": "Write a haiku about snow."}],
+        max_completion_tokens=256,
+        stream=True,
+    )
+
+
+headers = client.model_deployment_headers()
+try:
+    stream = stream_haiku(headers)
+except AuthenticationError:  # HTTP 401
+    if not headers.get("Authorization", "").startswith("Snowflake Token="):
+        raise  # a PAT does not expire mid-run
+    # The session expired. An OpenAI client keeps the headers it was built
+    # with, so build a new one with the headers for a new session.
+    stream = stream_haiku(client.model_deployment_headers(rejected=headers))
 for chunk in stream:
     if chunk.choices and chunk.choices[0].delta.content:
         print(chunk.choices[0].delta.content, end="", flush=True)
 ```
 
-With `curl` (`-N` turns off buffering so events print as they arrive):
+A session token expires with its session, so take fresh headers from
+`client.model_deployment_headers()` for each `OpenAI` client rather than once
+per process. After a 401, pass the rejected headers back as `rejected=`: the
+client opens a new session only if no other caller already replaced the
+rejected one, so concurrent callers share the new session. The
+`examples/model_deployment` example also checks the 401's error code, and
+retries only a session expiry.
+
+`openai.models.list()` (`GET $BASE_URL/models` with the same headers) is meant
+to list your `READY` deployments, but it can return an empty list while a
+deployment is `READY`
+([known limitation 6](../../reference/rest-api.md#15-known-limitations)). Use
+`cortex-training model-deployment list` to find deployments.
+
+With `curl` (`-N` turns off buffering so events print as they arrive). For a PAT:
 
 ```bash
 curl -N "$BASE_URL/chat/completions" \
   -H "Authorization: Bearer $PAT" \
   -H "X-Snowflake-Authorization-Token-Type: PROGRAMMATIC_ACCESS_TOKEN" \
+  -H "Accept: text/event-stream" \
   -H "Content-Type: application/json" \
   -d '{"model": "sf-ct-DEPLOYMENT_UUID", "stream": true, "max_completion_tokens": 256,
        "messages": [{"role": "user", "content": "Write a haiku about snow."}]}'
 ```
+
+For a connection profile, replace the two PAT headers with
+`-H "Authorization: Snowflake Token=\"$SESSION_TOKEN\""`.
 
 The streamed response is server-sent events: one `data: {...}` line per
 `chat.completion.chunk`, whose `choices[0].delta.content` holds the next piece

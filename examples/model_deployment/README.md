@@ -28,12 +28,12 @@ uv pip install -e .
 uv pip install chz
 ```
 
-This example needs a PAT, not only a profile: the chat call sends it as a
-Bearer token. Pass `config=` with a JSON file from
-`docs/getting-started/connection.json.template` (`host`, `pat`, `database`,
-`schema`). With `connection=` or the default profile, the example stops before
-it creates a deployment, because profile connections send a session token and
-the endpoint's documented authentication is the PAT.
+Any connection works: `config=<JSON file>` (a PAT), `connection=<profile>`, or the
+default connection. The chat call authenticates the way the connection does,
+through `client.model_deployment_headers()`: a PAT is sent as a Bearer token, and
+a profile's session token as `Authorization: Snowflake Token="..."`. The headers
+are rebuilt for every request, and a 401 for an expired session opens a new
+session and retries once (a PAT is never retried).
 Inference is not yet available on all accounts: until it is enabled for yours,
 chat calls return HTTP 404.
 

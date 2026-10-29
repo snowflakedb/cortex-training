@@ -69,7 +69,7 @@ Every example resolves its connection the same way the CLI does:
   `cortex-training login`, then the Snowflake default connection profile.
 
 Each run logs the target it connected to and the source, never the token. The
-`model_deployment` example needs a PAT (see its README).
+`model_deployment` example works with any of these connections (see its README).
 
 `config=` and `connection=` only choose the connection, never a job body. The SFT, RL and
 inference examples pick their job with these arguments (distillation uses

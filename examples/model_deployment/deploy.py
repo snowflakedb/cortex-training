@@ -83,14 +83,6 @@ def main(config: Config) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     overrides = {"poll_timeout": config.timeout} if config.timeout is not None else {}
     resolved = resolve_example_connection(config.config, config.connection, **overrides)
-    # Check before create_model_deployment: a run that cannot authenticate its
-    # chat call must not start a deployment that holds GPUs.
-    if not resolved.pat:
-        raise ValueError(
-            "model_deployment calls the inference endpoint with a PAT, and this example "
-            f"only takes one from a JSON config file (you used {resolved.source}). "
-            "Pass config=<JSON file with host and pat>."
-        )
     client = resolved.client
 
     created = config.deployment is None
@@ -111,7 +103,8 @@ def main(config: Config) -> None:
         kwargs: dict[str, Any] = {"on_delta": _write_delta} if config.stream else {}
         result = call(
             base_url,
-            resolved.pat,
+            # Fetched per request; a session-expired 401 is retried once on a new session.
+            client.model_deployment_headers,
             model=deployment_id,
             messages=chat_messages(config.prompt, config.system),
             max_completion_tokens=config.max_completion_tokens,
