@@ -123,12 +123,15 @@ Create a JSON file outside the repository:
 }
 ```
 
-Register it once so subsequent commands use it automatically:
+Pass it to each command with `--config`:
 
 ```bash
-cortex-training login ~/cortex-training-config.json
-cortex-training capacity
+cortex-training --config ~/cortex-training-config.json capacity
 ```
+
+`cortex-training login` no longer remembers a JSON file. To set things up once,
+use a Snowflake connection profile (Option A), or run `cortex-training login`,
+which creates or picks one for you.
 
 ### Option C: Environment variables
 

@@ -67,10 +67,13 @@ _PROFILE_KEYS = ("host", "pat", "base_url", "account", "user", "password", "toke
 # An account host such as ACCOUNT.snowflakecomputing.com, with an optional port.
 _HOST = re.compile(r"[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+(:[0-9]{1,5})?")
 
-_PICK_ANOTHER = "Pass connection=NAME (--connection NAME) to use another profile."
+_PICK_ANOTHER = (
+    "Pass connection=NAME (--connection NAME) to use another profile, "
+    "or run `cortex-training login` to pick or set one up."
+)
 _SETUP_HINT = (
-    "Create a Snowflake connection profile (for example with `snow connection add`) "
-    "and pass connection=NAME, or name it in \"profile\" in config.json."
+    "Run `cortex-training login` to set one up, or create one (for example with "
+    "`snow connection add`) and pass connection=NAME."
 )
 
 
@@ -133,6 +136,17 @@ def load_config() -> tuple[dict[str, Any], Path]:
     if "profile" in data and not (isinstance(data["profile"], str) and data["profile"].strip()):
         raise PickerError(f"{path}: profile must be a non-empty string")
     return data, path
+
+
+def save_profile(profile: str) -> Path:
+    """Save ``profile`` as the one to use: ``config.json`` holds only ``"profile"``.
+
+    The ``cortex-training`` folder is created inside the Snowflake folder if it's
+    missing, readable only by the user, like the profile file next to it.
+    """
+    _, path = load_config()  # A file that can't be read back is an error, not overwritten.
+    _profiles.write_file(path, json.dumps({"profile": profile}, indent=2) + "\n")
+    return path
 
 
 def snowflake_profiles() -> tuple[str, str, Mapping[str, Mapping[str, Any]]]:

@@ -72,37 +72,27 @@ def test_all_commands_parse(argv):
     assert cortex_cli.parse_args(argv).command == expected
 
 
-@pytest.mark.parametrize("config_args", [["test.json"], ["--config", "test.json"]])
-def test_login_parses_config(config_args, monkeypatch):
+@pytest.mark.parametrize(("login_args", "name"), [([], None), (["training"], "training")])
+def test_login_takes_an_optional_profile_name(login_args, name, monkeypatch):
     monkeypatch.setenv("CORTEX_TRAINING_CONFIG", "environment.json")
-    args = cortex_cli.parse_args(["--config", "global.json", "login"] + config_args)
-    assert args.login_config == "test.json"
+    args = cortex_cli.parse_args(["--config", "global.json", "login"] + login_args)
+    assert args.login_name == name
     assert args.config == "global.json"
 
 
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ["login"],
-        ["--config", "global.json", "login"],
-        ["login", "--config"],
-        ["login", "test.json", "--config", "other.json"],
-        ["login", "--config", "other.json", "test.json"],
-    ],
-)
-def test_login_requires_exactly_one_config(argv, monkeypatch):
-    monkeypatch.setenv("CORTEX_TRAINING_CONFIG", "environment.json")
+def test_login_takes_at_most_one_name():
     with pytest.raises(SystemExit) as exc:
-        cortex_cli.parse_args(argv)
+        cortex_cli.parse_args(["login", "one", "two"])
     assert exc.value.code == 2
 
 
-def test_login_help_shows_both_config_forms(capsys):
+def test_login_help_shows_the_profile_name(capsys):
     with pytest.raises(SystemExit) as exc:
         cortex_cli.parse_args(["login", "--help"])
     assert exc.value.code == 0
     help_text = capsys.readouterr().out
-    assert "usage: cortex-training login [-h] (config | --config config)" in help_text
+    assert "usage: cortex-training login [-h] [NAME]" in help_text
+    assert "Connect Cortex Training to your Snowflake account." in help_text
 
 
 @pytest.mark.parametrize("command", ["fwd-bwd", "step", "load", "generate", "weight-sync"])
