@@ -145,14 +145,7 @@ def save_profile(profile: str) -> Path:
     missing, readable only by the user, like the profile file next to it.
     """
     _, path = load_config()  # A file that can't be read back is an error, not overwritten.
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        tmp_path.write_text(json.dumps({"profile": profile}, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp_path, path)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
+    _profiles.write_file(path, json.dumps({"profile": profile}, indent=2) + "\n")
     return path
 
 

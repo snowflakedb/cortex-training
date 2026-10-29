@@ -194,6 +194,16 @@ def _parse(path: Path, *, keep_format: bool = False) -> Any:
     return document if keep_format else document.unwrap()
 
 
+def write_file(path: Path, text: str) -> None:
+    """Write a small private file, such as Cortex Training's ``config.json``, as profiles are written.
+
+    Locked against concurrent writers, replaced atomically and durably, and
+    readable only by the user. A symlinked ``path`` keeps its link.
+    """
+    with _locked(path):
+        _replace(path, text)
+
+
 def _real(path: Path) -> Path:
     """The file ``path`` names, following symlinks, so a linked dotfile stays linked."""
     return Path(os.path.realpath(path))
