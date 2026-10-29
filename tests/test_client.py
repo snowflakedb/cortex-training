@@ -2215,6 +2215,27 @@ class TestCreateJob:
             c.create_job_from_body(body)
         c._session.post.assert_not_called()
 
+    @pytest.mark.parametrize(
+        ("provider", "sent"),
+        [("arctic", "prime_rl"), ("prime_rl", "prime_rl"), ("huggingface", "huggingface")],
+    )
+    def test_create_job_from_body_sends_arctic_provider_as_prime_rl(self, provider, sent):
+        c = _make_client(post_json={"job_id": "srv-raw"})
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": "training",
+                    "model_name": "gpt2",
+                    "training_config": {"model_provider": provider},
+                },
+            ],
+        }
+
+        c.create_job_from_body(body)
+
+        posted = c._session.post.call_args.kwargs["json"]
+        assert posted["sub_job_configs"][0]["training_config"]["model_provider"] == sent
+
     def test_create_job_from_body_ignores_absent_peft_config(self):
         c = _make_client(post_json={"job_id": "srv-raw"})
         body = {

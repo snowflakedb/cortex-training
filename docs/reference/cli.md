@@ -471,7 +471,8 @@ cortex-training submit examples/api/sampling.json
 ```
 
 That file creates a training sub-job for `Qwen/Qwen3.6-35B-A3B` with
-`training_config.model_provider` set to `arctic`.
+`training_config.model_provider` set to `arctic`. The server does not accept
+`arctic` yet, so `submit` (including `--dry-run`) sends it as `prime_rl`.
 
 ### Run A Forward-Backward Smoke Test
 
