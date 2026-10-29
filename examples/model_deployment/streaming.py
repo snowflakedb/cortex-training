@@ -49,24 +49,53 @@ def deployment_headers(pat: str) -> dict[str, str]:
     }
 
 
-# Either a PAT, or a function returning the auth headers (called with
-# ``refresh=True`` to retry once after a 401), such as
-# ``CortexTrainingClient.model_deployment_headers``.
+# Either a PAT, or a function returning the auth headers, such as
+# ``CortexTrainingClient.model_deployment_headers``. After a session-expired 401
+# it is called with ``rejected=<the headers that were sent>`` to retry once.
 Auth = str | Callable[..., dict[str, str]]
 
+# Snowflake error codes for an expired or invalidated session token.
+SESSION_EXPIRED_CODES = frozenset({"390111", "390112", "390114"})
 
-def _headers(auth: Auth, *, refresh: bool = False) -> dict[str, str]:
+
+def _headers(auth: Auth, rejected: dict[str, str] | None = None) -> dict[str, str]:
     if isinstance(auth, str):
         return deployment_headers(auth)
-    return {**auth(refresh=refresh), "Content-Type": "application/json"}
+    headers = auth() if rejected is None else auth(rejected=rejected)
+    return {**headers, "Content-Type": "application/json"}
+
+
+def _session_expired(sent: dict[str, str], response: requests.Response) -> bool:
+    """Whether ``response`` rejected the session token in ``sent`` as expired.
+
+    A PAT is never refreshed, and a 401 with any other Snowflake error code is
+    not an expiry, so neither is retried (that would only repeat a login).
+    """
+    if response.status_code != 401 or not sent.get("Authorization", "").startswith("Snowflake Token="):
+        return False
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    error = body.get("error") if isinstance(body, dict) else None
+    codes = [
+        str(code)
+        for code in (
+            body.get("code") if isinstance(body, dict) else None,
+            error.get("code") if isinstance(error, dict) else None,
+        )
+        if code is not None
+    ]
+    return not codes or any(code in SESSION_EXPIRED_CODES for code in codes)
 
 
 def _post(http: requests.Session, url: str, auth: Auth, extra: dict[str, str], **kwargs: Any) -> requests.Response:
-    """POST with ``auth``; a 401 with refreshable auth is retried once."""
-    response = http.post(url, headers={**_headers(auth), **extra}, **kwargs)
-    if response.status_code == 401 and not isinstance(auth, str):
+    """POST with ``auth``; a session-expired 401 is retried once with a new session."""
+    sent = _headers(auth)
+    response = http.post(url, headers={**sent, **extra}, **kwargs)
+    if not isinstance(auth, str) and _session_expired(sent, response):
         response.close()
-        response = http.post(url, headers={**_headers(auth, refresh=True), **extra}, **kwargs)
+        response = http.post(url, headers={**_headers(auth, rejected=sent), **extra}, **kwargs)
     return response
 
 
@@ -187,7 +216,10 @@ def stream_chat(
         timeout=timeout,
     ) as response:
         _raise_for_status(response)
-        for chunk in iter_sse_chunks(response.iter_lines(decode_unicode=True)):
+        # Byte lines, decoded as UTF-8 by iter_sse_chunks: requests decodes an
+        # event-stream with no charset as Latin-1, and str.splitlines() also
+        # splits on U+0085 and U+2028, which can sit unescaped inside a chunk.
+        for chunk in iter_sse_chunks(response.iter_lines()):
             result.chunks += 1
             if chunk.get("usage"):
                 result.usage = chunk["usage"]

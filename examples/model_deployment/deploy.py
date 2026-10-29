@@ -103,7 +103,7 @@ def main(config: Config) -> None:
         kwargs: dict[str, Any] = {"on_delta": _write_delta} if config.stream else {}
         result = call(
             base_url,
-            # Fetched per request, so an expired session is refreshed (once, on a 401).
+            # Fetched per request; a session-expired 401 is retried once on a new session.
             client.model_deployment_headers,
             model=deployment_id,
             messages=chat_messages(config.prompt, config.system),

@@ -834,32 +834,47 @@ still exits `0`.
 
 #### Calling A Deployment
 
-The `base_url` is an OpenAI-compatible endpoint. Authenticate with a Snowflake
-programmatic access token (PAT) and pass the deployment ID as `model`.
-Inference is not yet available on all accounts; until it is enabled for yours,
-requests return 404.
+The `base_url` is an OpenAI-compatible endpoint. Authenticate the same way the
+CLI does and pass the deployment ID as `model`.
+`CortexTrainingClient.model_deployment_headers()` returns the right headers for
+either credential: `Authorization: Bearer <PAT>` plus
+`X-Snowflake-Authorization-Token-Type: PROGRAMMATIC_ACCESS_TOKEN` for a PAT, or
+`Authorization: Snowflake Token="<session token>"` for a connection profile. A
+session token sent as a Bearer token is rejected with HTTP 401. Inference is not
+yet available on all accounts; until it is enabled for yours, requests return
+404.
 
 ```python
 from openai import OpenAI
 
-client = OpenAI(
-    base_url="https://ACCOUNT.snowflakecomputing.com/api/v2/databases/CORTEX_TRAINING_DB/schemas/PUBLIC/cortex-training/inference/v1",
-    api_key=PAT,  # sent as "Authorization: Bearer <PAT>"
-    default_headers={"X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN"},
+openai = OpenAI(
+    base_url=client.model_deployment_base_url,
+    api_key="unused",  # the headers below replace the Authorization it sends
+    default_headers=client.model_deployment_headers(),
 )
-response = client.chat.completions.create(
+response = openai.chat.completions.create(
     model="sf-ct-DEPLOYMENT_UUID",
     messages=[{"role": "user", "content": "Hello"}],
 )
 ```
 
+A session token expires with its session: take fresh headers for each `OpenAI`
+client, and after a session-expired 401 build a new one from
+`client.model_deployment_headers(rejected=<the rejected headers>)` and retry
+once. A PAT does not expire mid-run.
+
 ```bash
 curl "$BASE_URL/chat/completions" \
   -H "Authorization: Bearer $PAT" \
   -H "X-Snowflake-Authorization-Token-Type: PROGRAMMATIC_ACCESS_TOKEN" \
+  -H "Accept: application/json" \
   -H "Content-Type: application/json" \
   -d '{"model": "sf-ct-DEPLOYMENT_UUID", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
+
+For a connection profile, replace the two PAT headers with
+`-H "Authorization: Snowflake Token=\"$SESSION_TOKEN\""`. Without `Accept`
+the endpoint answers HTTP 400.
 
 Limit the reply length with `max_completion_tokens`; `max_tokens` is rejected
 with HTTP 400 (`unsupported_parameter`). `"stream": true` returns server-sent

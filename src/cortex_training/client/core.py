@@ -600,6 +600,18 @@ def _is_session_auth_expired_response(response: requests.Response) -> bool:
     return response.status_code == 401 and not structured_code_seen
 
 
+_SESSION_TOKEN_AUTHORIZATION = re.compile(r'^Snowflake Token="(.*)"$')
+
+
+def _session_token_from_headers(headers: Mapping[str, str]) -> str | None:
+    """Return the session token in a ``Snowflake Token="..."`` header, if any."""
+    for name, value in headers.items():
+        if name.lower() == "authorization":
+            match = _SESSION_TOKEN_AUTHORIZATION.match(str(value))
+            return match.group(1) if match else None
+    return None
+
+
 def _format_artifact_bytes(nbytes: int) -> str:
     """``1.1 MiB``-style size, with the unit chosen to fit."""
     value = float(nbytes)
@@ -2690,7 +2702,9 @@ class CortexTrainingClient:
         """OpenAI-compatible base URL for deployments in this database and schema."""
         return f"{self._prefix}/inference/v1"
 
-    def model_deployment_headers(self, *, refresh: bool = False) -> dict[str, str]:
+    def model_deployment_headers(
+        self, *, rejected: Mapping[str, str] | None = None
+    ) -> dict[str, str]:
         """Return the auth headers for calling a deployment's chat endpoint.
 
         The inference endpoint authenticates the same identity as the REST API
@@ -2701,10 +2715,15 @@ class CortexTrainingClient:
         - Profile clients (:meth:`from_connection_name`) get
           ``Authorization: Snowflake Token="<session token>"``. The token is read
           from the Connector session on every call, so a session that was
-          recreated is picked up. ``refresh=True`` first recreates the session
-          (unless another thread already did); use it once after a 401.
+          recreated is picked up.
         - Other clients (a bare ``base_url``) return whatever auth headers their
           HTTP session carries, possibly none.
+
+        After a session-expired 401, pass the headers that were rejected as
+        ``rejected``. A profile client then recreates its session only if it
+        still holds the rejected token, so callers that were all rejected with
+        the same token share one new session instead of logging each other
+        out. Clients without a session ignore ``rejected``.
 
         The result holds a secret: build it per request and never log it. It has
         no ``Content-Type``; callers add their own. An OpenAI-style client must
@@ -2712,9 +2731,10 @@ class CortexTrainingClient:
         """
         auth = self._auth_provider
         if auth is not None:
-            token = auth.get_token()
-            if refresh:
-                token = auth.refresh(token)
+            if rejected is None:
+                token = auth.get_token()
+            else:
+                token = auth.refresh(_session_token_from_headers(rejected))
             return {"Authorization": f'Snowflake Token="{token}"'}
         headers = self._session.headers
         return {

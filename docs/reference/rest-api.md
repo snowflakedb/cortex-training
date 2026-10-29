@@ -3461,11 +3461,15 @@ raised unchanged.
 
 `CortexTrainingClient` does not call the deployment itself; any
 OpenAI-compatible client does. `CortexTrainingClient.model_deployment_headers()`
-returns the auth headers above for the client's own credential (re-read on every
-call, so a refreshed session is used; `refresh=True` forces a new session after a
-401). This is the behavior a caller sees, as checked
-by the `test_tc6_*` cases in `tests/test_model_deployment_e2e.py`. The
-streaming example (`examples/model_deployment/streaming.py`) codes against it.
+returns the auth headers below for the client's own credential, re-read on every
+call so a refreshed session is used. After a session-expired 401 (codes
+`390111`, `390112`, `390114`, or a 401 with no code), pass the rejected headers
+as `rejected=`: a profile client opens a new session only if it still holds the
+rejected token, so concurrent callers share one new session. This is the
+behavior a caller sees. The `test_tc6_*` cases in
+`tests/test_model_deployment_e2e.py` check it with a PAT; the session-token and
+`Accept` rows were checked by hand. The streaming example
+(`examples/model_deployment/streaming.py`) codes against it.
 
 | Item | Behavior |
 |---|---|

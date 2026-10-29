@@ -24,15 +24,19 @@ from cortex_training.client.auth import SnowflakeProfileAuth
 from examples.model_deployment.streaming import deployment_headers
 
 
-def _connection(token: str) -> SimpleNamespace:
+def _connection(token: str, closed: list[str] | None = None) -> SimpleNamespace:
     rest = SimpleNamespace(token=token, server_url="https://account.example")
     return SimpleNamespace(
-        rest=rest, database="DB", schema="PUBLIC", role="R", close=lambda: None
+        rest=rest,
+        database="DB",
+        schema="PUBLIC",
+        role="R",
+        close=lambda: closed.append(token) if closed is not None else None,
     )
 
 
-def _profile_client(*tokens: str) -> CortexTrainingClient:
-    connections = iter(_connection(t) for t in tokens)
+def _profile_client(*tokens: str, closed: list[str] | None = None) -> CortexTrainingClient:
+    connections = iter(_connection(t, closed) for t in tokens)
     auth = SnowflakeProfileAuth("p", connect_factory=lambda **_: next(connections))
     client = CortexTrainingClient(base_url="https://account.example", database="DB", schema="PUBLIC")
     client._auth_provider = auth
@@ -48,7 +52,7 @@ def test_pat_client_headers_match_the_example_helper():
     }
     # The JSON/PAT path is unchanged on the wire: the same headers as before.
     assert {**headers, "Content-Type": "application/json"} == deployment_headers("PAT")
-    assert client.model_deployment_headers(refresh=True) == headers
+    assert client.model_deployment_headers(rejected=headers) == headers
 
 
 def test_profile_client_uses_the_session_token():
@@ -58,9 +62,22 @@ def test_profile_client_uses_the_session_token():
 
 def test_profile_client_rereads_and_refreshes_the_session():
     client = _profile_client("session-1", "session-2")
-    assert client.model_deployment_headers()["Authorization"] == 'Snowflake Token="session-1"'
-    assert client.model_deployment_headers(refresh=True)["Authorization"] == 'Snowflake Token="session-2"'
+    rejected = client.model_deployment_headers()
+    assert rejected["Authorization"] == 'Snowflake Token="session-1"'
+    assert client.model_deployment_headers(rejected=rejected)["Authorization"] == 'Snowflake Token="session-2"'
     assert client.model_deployment_headers()["Authorization"] == 'Snowflake Token="session-2"'
+
+
+def test_refreshes_rejected_with_the_same_token_share_one_new_session():
+    # Two callers both got a 401 for session-1. The second refresh must not
+    # replace (and log out) the session the first one just opened.
+    closed: list[str] = []
+    client = _profile_client("session-1", "session-2", "session-3", closed=closed)
+    rejected = client.model_deployment_headers()
+    first = client.model_deployment_headers(rejected=rejected)
+    second = client.model_deployment_headers(rejected={"authorization": rejected["Authorization"]})
+    assert first == second == {"Authorization": 'Snowflake Token="session-2"'}
+    assert closed == ["session-1"]
 
 
 def test_base_url_client_has_no_auth_headers():

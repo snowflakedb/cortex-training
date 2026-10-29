@@ -32,7 +32,8 @@ Any connection works: `config=<JSON file>` (a PAT), `connection=<profile>`, or t
 default connection. The chat call authenticates the way the connection does,
 through `client.model_deployment_headers()`: a PAT is sent as a Bearer token, and
 a profile's session token as `Authorization: Snowflake Token="..."`. The headers
-are rebuilt for every request, and a 401 refreshes the session once and retries.
+are rebuilt for every request, and a 401 for an expired session opens a new
+session and retries once (a PAT is never retried).
 Inference is not yet available on all accounts: until it is enabled for yours,
 chat calls return HTTP 404.
 
