@@ -3760,11 +3760,71 @@ def test_without_an_old_form_the_saved_profile_is_used(monkeypatch):
 
 
 def test_the_target_line_names_the_saved_profile(monkeypatch):
+    # A saved profile with no database of its own: the fallback is worth showing.
+    _write_profiles("default", "train")
+    _save_choice("train")
+    monkeypatch.setattr(cli, "_load_cortex_training_client_class", lambda: _ResolutionClient)
+    _, _, err = _connect_real(monkeypatch, tty=True)
+    assert "→ profile train (saved by cortex-training login) · database CORTEX_TRAINING_DB (default) · schema PUBLIC (default)" in err
+
+
+def test_the_target_line_is_only_for_a_terminal(monkeypatch):
     _write_profiles("default", "train")
     _save_choice("train")
     monkeypatch.setattr(cli, "_load_cortex_training_client_class", lambda: _ResolutionClient)
     _, _, err = _connect_real(monkeypatch)
-    assert "→ profile train (saved by cortex-training login) · database CORTEX_TRAINING_DB (default) · schema PUBLIC (default)" in err
+    assert "→" not in err
+
+
+def test_the_target_line_is_left_out_for_a_saved_profile_with_its_own_database(monkeypatch):
+    (Path(os.environ["SNOWFLAKE_HOME"]) / "connections.toml").write_text(
+        '[train]\naccount = "ACME"\nuser = "ME"\ndatabase = "TEAM_DB"\nschema = "RUNS"\n'
+    )
+    _save_choice("train")
+    monkeypatch.setattr(cli, "_load_cortex_training_client_class", lambda: _ResolutionClient)
+    _, _, err = _connect_real(monkeypatch, tty=True)
+    assert "→" not in err
+    # Any other choice is shown: here --connection, though it names the same profile.
+    _, _, err = _connect_real(monkeypatch, tty=True, argv=["--connection", "train"])
+    assert "→ profile train (from --connection) · database TEAM_DB (from profile train) · schema RUNS (from profile train)" in err
+
+
+def test_a_saved_profile_beats_login_json(tmp_path, monkeypatch):
+    config = _write_config(tmp_path, {"host": "acme.snowflakecomputing.com", "pat": "tok", "database": "DB"})
+    login_state = tmp_path / "login.json"
+    login_state.write_text(json.dumps({"config_path": str(config)}))
+    _write_profiles("default", "train")
+    _save_choice("train")
+    rc, seen, err = _connect([], monkeypatch, CORTEX_TRAINING_LOGIN_FILE=str(login_state))
+    assert rc == 0 and seen["use_connection_profile"] is True and seen["host"] is None
+    assert cli._picker_choice(argparse_namespace(seen)).profile == "train"
+    assert (
+        f"warning: {login_state} is ignored because a profile is saved; run "
+        f"`cortex-training login --convert-legacy-config {config}` to convert and remove it."
+    ) in err
+    assert "old JSON config" not in err
+    assert login_state.exists()  # Only ignored; converting removes it.
+
+
+def test_config_still_beats_a_saved_profile_with_its_warning(tmp_path, monkeypatch):
+    config = _write_config(tmp_path, {"host": "acme.snowflakecomputing.com", "pat": "tok", "database": "DB"})
+    _write_profiles("default", "train")
+    _save_choice("train")
+    for argv, env, source in (([ "--config", str(config)], {}, "--config"), ([], {"CORTEX_TRAINING_CONFIG": str(config)}, "CORTEX_TRAINING_CONFIG")):
+        rc, seen, err = _connect(argv, monkeypatch, **env)
+        assert rc == 0 and seen["use_connection_profile"] is False and seen["host"] == "acme.snowflakecomputing.com"
+        assert f"Signing in with an old JSON config ({config}, from {source}) is deprecated" in err
+        assert "is ignored because a profile is saved" not in err
+
+
+def test_the_old_login_file_form_says_a_saved_profile_wins(tmp_path, monkeypatch):
+    config = _write_config(tmp_path, {"host": "acme.snowflakecomputing.com", "pat": "tok", "database": "DB"})
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "login.json"))
+    _write_profiles("train")
+    _save_choice("train")
+    stderr = io.StringIO()
+    assert cli.main(["login", str(config)], stdout=io.StringIO(), stderr=stderr) == 0
+    assert f"warning: profile train is saved by `cortex-training login`, so commands use it and ignore {config}." in stderr.getvalue()
 
 
 def test_cortex_training_connection_still_works_and_warns(monkeypatch):
@@ -3795,13 +3855,18 @@ class _ResolutionClient:
         return FakeClient()
 
 
-def _connect_real(monkeypatch):
+class _Terminal(io.StringIO):
+    def isatty(self):
+        return True
+
+
+def _connect_real(monkeypatch, *, tty=False, argv=()):
     """Run `list` through the real build_client (with _ResolutionClient); return rc, args, stderr."""
     monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(Path(os.environ["SNOWFLAKE_HOME"]) / "no-login.json"))
     for name in ("CORTEX_TRAINING_CONNECTION", "CORTEX_TRAINING_DATABASE", "CORTEX_TRAINING_SCHEMA"):
         monkeypatch.delenv(name, raising=False)
-    stderr = io.StringIO()
-    rc = cli.main(["list"], stdout=io.StringIO(), stderr=stderr)
+    stderr = _Terminal() if tty else io.StringIO()
+    rc = cli.main([*argv, "list"], stdout=io.StringIO(), stderr=stderr)
     return rc, None, stderr.getvalue()
 
 

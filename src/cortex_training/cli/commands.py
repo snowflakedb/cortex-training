@@ -974,9 +974,20 @@ def _has_connection(
     return bool(database and (base_url or (host and pat)))
 
 
+def _saved_profile() -> str | None:
+    """The profile `cortex-training login` saved in config.json, if any."""
+    from cortex_training import _picker
+
+    try:
+        return _picker.load_config()[0].get("profile")
+    except Exception:
+        return None  # The picker reports a config.json it can't read.
+
+
 def _select_config(args: argparse.Namespace, *, load_login: bool) -> dict[str, Any]:
     args._legacy_config_selected = False
     args._config_origin = None
+    args._login_json_ignored = None
     strict = getattr(args, "_strict_config", True)
     if getattr(args, "connection", None):
         return {}
@@ -1003,6 +1014,10 @@ def _select_config(args: argparse.Namespace, *, load_login: bool) -> dict[str, A
     if login_config is None:
         return {}
     if not Path(login_config).expanduser().is_file():
+        return {}
+    if _saved_profile():
+        # A profile saved by the new `login` wins over the file the old `login` remembered.
+        args._login_json_ignored = login_config
         return {}
     args.config = login_config
     args._legacy_config_selected = True
@@ -1107,6 +1122,12 @@ def _old_connection_notes(args: argparse.Namespace, typed: Mapping[str, Any]) ->
         return []  # A local or mock server, during development.
     if args.use_connection_profile:
         notes = []
+        ignored = getattr(args, "_login_json_ignored", None)
+        if ignored:
+            notes.append(
+                f"{_login_state_path()} is ignored because a profile is saved; run "
+                f"`cortex-training login --convert-legacy-config {ignored}` to convert and remove it."
+            )
         for name, flag in (("database", "--database"), ("schema", "--schema")):
             variable = f"SNOWFLAKE_{name.upper()}"
             if not typed[name] and not _env(f"CORTEX_TRAINING_{name.upper()}") and _env(variable):
@@ -1170,6 +1191,22 @@ def _picker_choice(args: argparse.Namespace) -> Any:
         return None
 
     return _picker.resolve(connection=args.connection, database=given("database"), schema=given("schema"))
+
+
+def write_target_line(resolution: Any, stream: TextIO) -> None:
+    """Say where a command connects, when that could surprise someone typing it.
+
+    Only in a terminal, so scripts that read stderr never see it. Not for the
+    profile ``cortex-training login`` saved, unless the database or schema is
+    the fallback default.
+    """
+    if not getattr(stream, "isatty", lambda: False)():
+        return
+    sources = resolution.sources
+    saved = resolution.profile is not None and sources["profile"].startswith("saved in ")
+    if saved and "default" not in (sources["database"], sources["schema"]):
+        return
+    stream.write(target_line(resolution))
 
 
 def target_line(resolution: Any) -> str:
@@ -1437,6 +1474,12 @@ def _cmd_login(args: argparse.Namespace, stdin: TextIO, stdout: TextIO, stderr: 
             f"`cortex-training login --convert-legacy-config {path}` to convert this file.\n"
         )
         config_path = _write_login_config_path(path)
+        saved = _saved_profile()
+        if saved:
+            stderr.write(
+                f"warning: profile {saved} is saved by `cortex-training login`, so commands use it and "
+                f"ignore {path}. Run `cortex-training login --convert-legacy-config {path}` to use this file instead.\n"
+            )
         _print_json({"config_path": config_path, "logged_in": True}, stdout, compact=args.compact)
         return 0
     from cortex_training._login import run_login
@@ -2198,7 +2241,7 @@ def main(
                 # Its metrics say a command made the call (client.surface).
                 client._telemetry_surface = CLI_SURFACE
                 if getattr(parsed_args, "resolution", None) is not None:
-                    stderr.write(target_line(parsed_args.resolution))
+                    write_target_line(parsed_args.resolution, stderr)
                 return client
 
             client_factory = default_client_factory

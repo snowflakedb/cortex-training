@@ -81,8 +81,11 @@ chmod 600 ~/.snowflake/connections.toml
 
 #### Setting the default connection
 
-To avoid passing `--connection training` on every command, set a default using
-any of these methods:
+To avoid passing `--connection training` on every command, run
+`cortex-training login` and pick the profile. It saves your choice in
+`~/.snowflake/cortex-training/config.json`, and commands, the TUI, and the
+examples use it first. With no saved choice, they use Snowflake's default
+profile, which you can set with any of these methods:
 
 - Name the profile `[default]` instead of `[training]`
 - Set the environment variable:
@@ -159,7 +162,8 @@ Then it asks before each step:
      lists any that differ from the defaults, with the flags that set them
      (`--no-verify-ssl` for `verify_ssl: false`);
    - saving a copy of the old file without the PAT, as `<file>.bak`;
-   - deleting the old file, and `login.json` if it points to that file.
+   - signing in with the new profile, to check that it works;
+   - only then, deleting the old file, and `login.json` if it points to that file.
 
 Either every change happens, or every file is put back as it was.
 

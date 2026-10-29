@@ -224,9 +224,21 @@ cortex-training --connection training list
 (`SNOWFLAKE_DEFAULT_CONNECTION_NAME`, `default_connection_name` in Snowflake's
 `config.toml`, or a profile named `[default]`). The database is `--database`,
 else `CORTEX_TRAINING_DATABASE`, else the profile's, else `CORTEX_TRAINING_DB`;
-the schema follows the same order and defaults to `PUBLIC`. Each command's
-first line on stderr names the profile, database, and schema, and where each
-came from.
+the schema follows the same order and defaults to `PUBLIC`.
+
+**Changed:** a profile with no `database` used to be an error ("must set
+database"). It now uses `CORTEX_TRAINING_DB`. Set `database` in the profile, or
+pass `--database`, to use another.
+
+In a terminal, a command prints one line on stderr naming the profile,
+database, and schema, and where each came from, unless it's the profile
+`cortex-training login` saved with its own database and schema:
+
+```text
+→ profile train (from --connection) · database CORTEX_TRAINING_DB (default) · schema PUBLIC (default)
+```
+
+Scripts and CI (stderr not a terminal) never get this line.
 
 The old ways still work, and each prints a warning that it's deprecated and
 will stop working in a future release: an explicit or remembered JSON config
@@ -237,6 +249,12 @@ working. `CORTEX_TRAINING_HOST` and `CORTEX_TRAINING_PAT` are for CI: when you
 also have a profile they still win, with a warning that the profile will be
 used instead in a future release. `--base-url`, for a local or mock server,
 doesn't warn.
+
+One exception: a profile saved by `cortex-training login` wins over
+`login.json` (the file the old `login PATH` remembered). The command uses the
+profile and says `login.json` is ignored, with the command that converts and
+removes it. `--config` and `CORTEX_TRAINING_CONFIG` still win over a saved
+profile, since you pass them for that command.
 
 ### Legacy Connection Config
 
@@ -375,7 +393,8 @@ the file:
   with the flags that set them (`--endpoint`, `--poll-interval`,
   `--poll-timeout`, `--no-verify-ssl`);
 - it saves a copy of the file without the PAT as `PATH.bak`;
-- it deletes the file, and `login.json` if it points to it.
+- it signs in with the new profile, as commands will;
+- only if that works, it deletes the file, and `login.json` if it points to it.
 
 Either every change happens, or every file is put back as it was. If a check
 fails, or there's no `pat` in the file or the environment, or the file has a

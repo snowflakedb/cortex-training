@@ -229,7 +229,7 @@ def _build_read_only_client(parser: argparse.ArgumentParser, args: argparse.Name
 
     client._telemetry_surface = TUI_SURFACE
     if getattr(args, "resolution", None) is not None:
-        sys.stderr.write(cli.target_line(args.resolution))
+        cli.write_target_line(args.resolution, sys.stderr)
     return client, _sign_in(cli, args, from_config)
 
 

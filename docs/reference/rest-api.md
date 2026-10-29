@@ -138,8 +138,12 @@ Authorization: Snowflake Token="<session-token>"
 ```
 
 The client reconnects once and replays the request when Snowflake explicitly
-reports that the session token expired. Named profiles and the configured
-default profile are supported.
+reports that the session token expired. The profile is `connection=` if given,
+else the one `cortex-training login` saved (`"profile"` in
+`<Snowflake folder>/cortex-training/config.json`), else the Snowflake Connector's
+default profile. The database is `database=`, else `CORTEX_TRAINING_DATABASE`,
+else the profile's, else `CORTEX_TRAINING_DB`; the schema follows the same
+order and defaults to `PUBLIC`.
 
 When no profile exists, `from_configs()` uses `CORTEX_TRAINING_HOST` and
 `CORTEX_TRAINING_PAT` (for CI), and sends:
