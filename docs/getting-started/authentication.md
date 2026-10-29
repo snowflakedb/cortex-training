@@ -140,14 +140,18 @@ command turns it into a Snowflake connection profile:
 cortex-training login --convert-legacy-config ~/cortex-training-config.json
 ```
 
-It shows what the file holds (the PAT stays hidden), then asks before each step:
+It shows what the file holds (the PAT stays hidden). A `host`, `pat`,
+`database`, or `schema` the file leaves out comes from the environment variables
+the old CLI read (`CORTEX_TRAINING_*`, then `SNOWFLAKE_*`), and it shows which.
+Then it asks before each step:
 
 1. **It checks the PAT.** It signs in with it to look up your user and role, to
    check that Cortex Training is enabled, and to check the database. This only
    reads. If the database is missing, it shows the `CREATE DATABASE` statement
    and runs it only if you say yes. If a check fails, it says why and changes
    nothing.
-2. **It shows every change and asks once.** The changes are:
+2. **It shows every change and asks once.** No is the default, because the
+   last change deletes the old file. The changes are:
    - adding the profile (named `cortex-training`, or the next free name);
    - saving it as `"profile"` in `~/.snowflake/cortex-training/config.json`.
      That file holds only the profile, so the old file's `endpoint`,
