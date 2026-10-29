@@ -53,6 +53,13 @@ _NOTHING_CHANGED = "Nothing was changed."
 # Old file keys, and the alternative spellings the old CLI accepted.
 _OLD_KEYS = ("base_url", "host", "pat", "database", "schema", "endpoint", "poll_interval", "poll_timeout", "no_verify_ssl", "verify_ssl")
 _OLD_ALIASES = {"url": "base_url", "db": "database"}
+# Where the old CLI looked when the file left a value out, in order (the file always came first).
+_OLD_ENV = {
+    "host": ("CORTEX_TRAINING_HOST", "SNOWFLAKE_HOST"),
+    "pat": ("CORTEX_TRAINING_PAT", "SNOWFLAKE_PAT"),
+    "database": ("CORTEX_TRAINING_DATABASE", "SNOWFLAKE_DATABASE"),
+    "schema": ("CORTEX_TRAINING_SCHEMA", "SNOWFLAKE_SCHEMA"),
+}
 # Settings that move to config.json, in the order they're shown.
 _SETTINGS = ("endpoint", "poll_interval", "poll_timeout", "verify_ssl")
 
@@ -70,6 +77,8 @@ class OldConfig:
     database: str
     schema: str
     settings: dict[str, Any]
+    # Where host, pat, database and schema came from, when not the file: an env var, or "default".
+    sources: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -83,6 +92,11 @@ def read_old_config(path: Path) -> OldConfig:
     shown = _login._home(path)
     if not path.is_file():
         raise ConvertError(f"{shown} can't be used: there's no file there. Check the path, or {_LOGIN_HINT}.")
+    if path.resolve() == _picker.config_path().resolve():
+        raise ConvertError(
+            f"{shown} is where the new config.json goes, and it can hold only \"profile\". Move the old config "
+            f"somewhere else, for example `mv {shown} ~/cortex-training-old.json`, then convert it from there."
+        )
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
@@ -108,19 +122,40 @@ def read_old_config(path: Path) -> OldConfig:
             f"{shown} has keys an old config can't have: {', '.join(sorted(unknown))}. "
             f"Fix the file and run the command again, or {_LOGIN_HINT}."
         )
-    if config.get("base_url") and not config.get("host"):
+    # Fill what the file leaves out the way the old CLI did, so the profile reaches the same place.
+    sources: dict[str, str] = {}
+    for key, names in _OLD_ENV.items():
+        if _text(config.get(key)):
+            continue
+        name = next((name for name in names if os.environ.get(name)), None)
+        if name is not None:
+            config[key] = os.environ[name]
+            sources[key] = name
+    if config.get("base_url") and not _text(config.get("host")):
         raise ConvertError(
             f"{shown} points to a test server (base_url), which can't become a Snowflake profile. Keep using "
             "--base-url for test servers, or run `cortex-training login` to connect to a Snowflake account."
         )
-    if not _text(config.get("pat")):
-        raise ConvertError(f"{shown} has no pat, so there's no sign-in to convert. Run `cortex-training login` to set up a profile.")
-    if not _text(config.get("host")):
-        raise ConvertError(f"{shown} has no host, so there's no account to convert. Run `cortex-training login` to set up a profile.")
+    for key, what in (("pat", "sign-in"), ("host", "account")):
+        if not _text(config.get(key)):
+            raise ConvertError(
+                f"{shown} has no {key}, and neither {' nor '.join(_OLD_ENV[key])} is set, so there's no {what} "
+                "to convert. Run `cortex-training login` to set up a profile."
+            )
     try:
         host = _login.validate_host(str(config["host"]))
     except ValueError as exc:
-        raise ConvertError(f"{shown}: {exc} Fix the file and run the command again, or {_LOGIN_HINT}.") from exc
+        where = sources.get("host", shown)
+        raise ConvertError(f"{where}: {exc} Fix it and run the command again, or {_LOGIN_HINT}.") from exc
+    for key, kind in (("database", "database"), ("schema", "schema")):
+        if _text(config.get(key)):
+            try:
+                _database_setup.check_identifier(kind, _text(config[key]))
+            except ValueError as exc:
+                where = sources.get(key, shown)
+                raise ConvertError(f"{where}: {exc} Fix it and run the command again, or {_LOGIN_HINT}.") from exc
+        else:
+            sources[key] = "default"
     settings = {key: config[key] for key in ("endpoint", "poll_interval", "poll_timeout") if config.get(key) is not None}
     if config.get("no_verify_ssl") is not None:
         settings["verify_ssl"] = not config["no_verify_ssl"]
@@ -134,6 +169,7 @@ def read_old_config(path: Path) -> OldConfig:
         database=_text(config.get("database")) or _login.DEFAULT_DATABASE,
         schema=_text(config.get("schema")) or _login.DEFAULT_SCHEMA,
         settings=settings,
+        sources=sources,
     )
 
 
@@ -211,11 +247,18 @@ class _Converter:
     def show(self) -> None:
         old = self.old
         self.p.section(f"Found in {_login._home(old.path)}:")
-        self.p.say(f"  host      {old.host}")
-        self.p.say(f"  pat       {'•' * 8}")
-        self.p.say(f"  database  {old.database}    schema {old.schema}")
+        self.p.say(f"  host      {old.host}{self._source('host')}")
+        self.p.say(f"  pat       {'•' * 8}{self._source('pat')}")
+        self.p.say(f"  database  {old.database}{self._source('database')}    schema {old.schema}{self._source('schema')}")
         if old.settings:
             self.p.say(f"  settings  {', '.join(f'{key} {old.settings[key]}' for key in _SETTINGS if key in old.settings)}")
+
+    def _source(self, key: str) -> str:
+        """Where a value came from, when it isn't the file itself."""
+        source = self.old.sources.get(key)
+        if source is None:
+            return ""
+        return self.s.dim(" (the default)" if source == "default" else f" (from {source})")
 
     def check(self) -> Identity:
         """Ask, then check the PAT, Cortex Training, and the database; raise ConvertError on failure."""
@@ -343,7 +386,8 @@ class _Converter:
             self.p.say(f"{self.s.warn('Not kept:')} {', '.join(dropped)}.")
             self.p.say("   config.json holds only the profile now. Pass these when you run a command instead:")
             self.p.say(f"   {_flags_for(old.settings)}")
-        if not self.p.confirm("Go ahead?", default=True):
+        # No by default: this deletes the old file.
+        if not self.p.confirm("Go ahead?", default=False):
             raise ConvertError("Nothing was changed.")
 
 
@@ -415,26 +459,13 @@ class _Snapshot:
 
     def __init__(self, path: Path) -> None:
         self.path = path
-        self.data = path.read_bytes() if path.is_file() else None
+        self.text = path.read_text(encoding="utf-8") if path.is_file() else None
 
     def restore(self) -> None:
-        if self.data is None:
+        if self.text is None:
             self.path.unlink(missing_ok=True)
         else:
-            _write_atomic(self.path, self.data)
-
-
-def _write_atomic(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-        os.replace(tmp_path, path)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
+            _profiles.write_file(self.path, self.text)
 
 
 def apply(plan: Plan, old: OldConfig) -> None:
@@ -445,9 +476,9 @@ def apply(plan: Plan, old: OldConfig) -> None:
     try:
         _profiles.write_profile(plan.profile, plan.values)
         settings = json.dumps(plan.settings, indent=2) + "\n"
-        _write_atomic(config_file, settings.encode("utf-8"))
+        _profiles.write_file(config_file, settings)
         _picker.load_config()  # Refuse settings that commands couldn't read back.
-        _write_atomic(plan.backup, (json.dumps(_without_pat(old.raw), indent=2) + "\n").encode("utf-8"))
+        _profiles.write_file(plan.backup, json.dumps(_without_pat(old.raw), indent=2) + "\n")
         # Delete last, once every write has worked.
         for path in [old.path, *([plan.login_file] if plan.login_file else [])]:
             snapshot = _Snapshot(path)

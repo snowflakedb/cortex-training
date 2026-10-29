@@ -26,7 +26,7 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setenv("SNOWFLAKE_HOME", str(snowflake))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    for name in ("SNOWFLAKE_DEFAULT_CONNECTION_NAME", "CORTEX_TRAINING_HOST", "CORTEX_TRAINING_PAT", "CORTEX_TRAINING_LOGIN_FILE"):
+    for name in ("SNOWFLAKE_DEFAULT_CONNECTION_NAME", "CORTEX_TRAINING_LOGIN_FILE", *(n for names in _convert._OLD_ENV.values() for n in names)):
         monkeypatch.delenv(name, raising=False)
     return snowflake
 
@@ -145,8 +145,8 @@ def nothing_written(path, snowflake):
 
 # ─── The happy path ─────────────────────────────────────────────────────────
 
-# Check now? [Y] -> profile name [cortex-training] -> go ahead? [Y]
-YES = ["", "", ""]
+# Check now? [Y] -> profile name [cortex-training] -> go ahead? y (No is the default)
+YES = ["", "", "y"]
 
 
 def test_an_old_config_becomes_a_profile_and_settings(old_file, isolated):
@@ -191,7 +191,7 @@ def test_it_shows_the_file_and_asks_before_checking(old_file):
     assert "  ✓ Signed in as ME, role TRAINER" in err
     assert "  ✓ Cortex Training is enabled on this account" in err
     assert "  ✓ Database CORTEX_TRAINING_DB is ready" in err
-    assert "This will:" in err and "Go ahead? [Y/n]" in err
+    assert "This will:" in err and "Go ahead? [y/N]" in err
 
 
 def test_the_connection_wrapper_and_old_spellings_are_read(old_file):
@@ -242,7 +242,7 @@ def test_login_json_pointing_elsewhere_is_kept(old_file, tmp_path):
     ("content", "message"),
     [
         ("{not json", "isn't valid JSON (line 1: Expecting property name enclosed in double quotes). Fix the file"),
-        ({"host": HOST, "database": "DB"}, "has no pat, so there's no sign-in to convert. Run `cortex-training login`"),
+        ({"host": HOST, "database": "DB"}, "has no pat, and neither CORTEX_TRAINING_PAT nor SNOWFLAKE_PAT is set, so there's no sign-in to convert."),
         ({"base_url": "http://localhost:8080", "pat": PAT}, "points to a test server (base_url), which can't become a Snowflake profile."),
         ({"host": HOST, "pat": PAT, "password": "x"}, "has keys an old config can't have: password."),
         ([1, 2], "must hold a JSON object."),
@@ -328,7 +328,7 @@ def test_a_missing_database_is_created_only_after_asking(old_file):
     path = old_file()
     world = World(databases=set())
     # Check [Y] -> run CREATE [y] -> name -> go ahead
-    code, summary, err = convert(world, path, ["", "y", "", ""])
+    code, summary, err = convert(world, path, ["", "y", "", "y"])
     assert code == 0, err
     assert "CREATE DATABASE IF NOT EXISTS CORTEX_TRAINING_DB;" in err and "Run it? [y/N]" in err
     assert "CREATE DATABASE IF NOT EXISTS CORTEX_TRAINING_DB" in world.statements
@@ -352,7 +352,7 @@ def test_a_taken_name_gets_the_next_free_one_and_is_never_replaced(old_file, iso
     write_profiles(isolated, '[cortex-training]\naccount = "OTHER"\nuser = "SOMEONE"\n')
     path = old_file()
     # Check -> name: typing the taken name is refused -> accept the suggestion -> go ahead
-    code, summary, err = convert(World(), path, ["", "cortex-training", "", ""])
+    code, summary, err = convert(World(), path, ["", "cortex-training", "", "y"])
     assert code == 0, err
     assert "Profile cortex-training already exists, so the new one will be called cortex-training-2." in err
     assert "Profile cortex-training already exists; choose another name." in err
@@ -400,14 +400,14 @@ def test_a_failed_write_puts_every_file_back(old_file, isolated, monkeypatch):
     _picker.config_path().parent.mkdir(parents=True)
     _picker.config_path().write_text(json.dumps({"profile": "other"}))
     path = old_file()
-    real_write = _convert._write_atomic
+    real_write = _profiles.write_file
 
-    def fail_on_backup(target, data):
+    def fail_on_backup(target, text):
         if target.name.endswith(".bak"):
             raise OSError(28, "No space left on device")
-        real_write(target, data)
+        real_write(target, text)
 
-    monkeypatch.setattr(_convert, "_write_atomic", fail_on_backup)
+    monkeypatch.setattr(_profiles, "write_file", fail_on_backup)
     code, _, err = convert(World(), path, YES)
     assert code == 1
     assert "so every file was put back as it was." in err
@@ -456,3 +456,87 @@ def test_the_flag_takes_no_profile_name():
     code = _cli.main(["login", "train", "--convert-legacy-config", "ct.json"], stdout=io.StringIO(), stderr=stderr)
     assert code == 2
     assert "takes no profile name" in stderr.getvalue()
+
+
+# ─── Review follow-ups (Da, #166) ───────────────────────────────────────────
+
+
+def test_a_pat_left_out_of_the_file_comes_from_the_env_var_the_old_cli_used(old_file, monkeypatch):
+    path = old_file({"host": HOST, "database": "CORTEX_TRAINING_DB"})
+    monkeypatch.setenv("CORTEX_TRAINING_PAT", "env-secret-token")
+    code, summary, err = convert(World(), path, YES)
+    assert code == 0, err
+    assert _profiles.read_profiles()["cortex-training"]["token"] == "env-secret-token"
+    assert "pat       •••••••• (from CORTEX_TRAINING_PAT)" in err
+    assert "env-secret-token" not in err and "env-secret-token" not in json.dumps(summary)
+
+
+def test_a_database_left_out_of_the_file_comes_from_the_env_var_not_the_default(old_file, monkeypatch):
+    path = old_file({"host": HOST, "pat": PAT})
+    monkeypatch.setenv("CORTEX_TRAINING_DATABASE", "TEAM_DB")
+    world = World(databases={"TEAM_DB"})
+    code, summary, err = convert(world, path, YES)
+    assert code == 0, err
+    profile = _profiles.read_profiles()["cortex-training"]
+    assert (profile["database"], profile["schema"]) == ("TEAM_DB", "PUBLIC")
+    assert "database  TEAM_DB (from CORTEX_TRAINING_DATABASE)    schema PUBLIC (the default)" in err
+    assert "check that database TEAM_DB and schema PUBLIC are visible" in err
+
+
+def test_the_file_beats_the_env_vars_and_cortex_training_beats_snowflake(old_file, monkeypatch):
+    path = old_file({"pat": PAT, "database": "MY_DB"})
+    monkeypatch.setenv("CORTEX_TRAINING_DATABASE", "TEAM_DB")
+    monkeypatch.setenv("SNOWFLAKE_HOST", "acme-other.snowflakecomputing.com")
+    monkeypatch.setenv("SNOWFLAKE_SCHEMA", "SF_SCHEMA")
+    monkeypatch.setenv("CORTEX_TRAINING_SCHEMA", "CT_SCHEMA")
+    world = World(databases={"MY_DB"})
+    world.schemas = {"CT_SCHEMA"}
+    code, _, err = convert(world, path, YES)
+    assert code == 0, err
+    profile = _profiles.read_profiles()["cortex-training"]
+    assert (profile["host"], profile["database"], profile["schema"]) == ("acme-other.snowflakecomputing.com", "MY_DB", "CT_SCHEMA")
+    assert "host      acme-other.snowflakecomputing.com (from SNOWFLAKE_HOST)" in err
+    assert "database  MY_DB    schema CT_SCHEMA (from CORTEX_TRAINING_SCHEMA)" in err
+
+
+def test_a_database_name_from_an_env_var_that_isnt_an_identifier_stops(old_file, isolated, monkeypatch):
+    path = old_file({"host": HOST, "pat": PAT})
+    monkeypatch.setenv("CORTEX_TRAINING_DATABASE", "team db")
+    world = World()
+    code, _, err = convert(world, path)
+    assert code == 1
+    assert "CORTEX_TRAINING_DATABASE: 'team db' isn't a valid database name." in err
+    assert world.opened == 0 and nothing_written(path, isolated)
+
+
+def test_enter_at_go_ahead_changes_nothing(old_file, isolated):
+    # Converting deletes the old file, so No is the default.
+    path = old_file()
+    code, _, err = convert(World(), path, ["", "", ""])
+    assert code == 1
+    assert "Go ahead? [y/N]" in err and "Nothing was changed." in err
+    assert nothing_written(path, isolated)
+
+
+def test_a_symlinked_config_json_keeps_its_link(old_file, tmp_path):
+    target = tmp_path / "dotfiles" / "ct-config.json"
+    target.parent.mkdir()
+    target.write_text("{}")
+    link = _picker.config_path()
+    link.parent.mkdir(parents=True)
+    link.symlink_to(target)
+    code, _, err = convert(World(), old_file(), YES)
+    assert code == 0, err
+    assert link.is_symlink()
+    assert json.loads(target.read_text()) == {"profile": "cortex-training"}
+
+
+def test_an_old_file_at_the_new_config_json_path_says_so(old_file, isolated):
+    path = _picker.config_path()
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"host": HOST, "pat": PAT, "database": "CORTEX_TRAINING_DB"}))
+    world = World()
+    code, _, err = convert(world, path)
+    assert code == 1
+    assert "is where the new config.json goes, and it can hold only \"profile\". Move the old config" in err
+    assert world.opened == 0 and path.exists()
