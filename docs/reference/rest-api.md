@@ -1786,7 +1786,8 @@ count, and top-k; see
 
 #### DFlash2 draft training
 
-`extra_training["model_provider"]` accepts `huggingface`, `arctic`, and `dflash2`.
+`extra_training["model_provider"]` accepts `huggingface`, `arctic` (see the note on its
+spelling above), and `dflash2`.
 `dflash2` trains a DFlash2 speculative-decoding draft against a frozen target:
 `model_name` is the frozen target, and the draft is configured by
 `extra_training["dflash2"]`.
