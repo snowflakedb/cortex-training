@@ -2869,6 +2869,9 @@ def test_a_drag_in_a_job_list_cell_highlights_and_copies_just_its_text():
 
 async def _run_a_double_click_that_opens_a_job_leaves_the_list_unhighlighted():
     app = CortexTrainingLogTUI(FakeClient(), poll_interval=0.01)
+    # Each simulated event waits for a pause, so on a slow runner the two clicks can land
+    # further apart than Textual's 0.5 s double-click window; widen it so they still chain.
+    app.CLICK_CHAIN_TIME_THRESHOLD = 10.0
     async with app.run_test(size=(150, 40)) as pilot:
         screen, table = await _demo_list(app, pilot)
         mouse = _pointer(app, pilot)
