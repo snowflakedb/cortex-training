@@ -55,7 +55,6 @@ DEFAULT_SCHEMA = _picker.DEFAULT_SCHEMA
 
 # Cortex Training's error codes for the capacity check made right after sign-in.
 _NOT_ENABLED_CODE = "517600"  # HTTP 403: the API is not enabled for this account
-_NOT_RESOLVED_CODE = "517602"  # HTTP 400: the database or schema in the URL can't be resolved
 
 _LOGO = r"""
   ___   ___   ___  _____  ___ __  __
@@ -264,6 +263,17 @@ class Check:
     @property
     def usable(self) -> bool:
         return self.error is None and not self.missing
+
+
+def database_missing(exc: BaseException) -> bool:
+    """Whether a failed request means only that the configured database or schema can't be found.
+
+    The API's 517602 is a generic invalid-request code; only its "Schema … is not
+    found or not authorized" message means the database or schema (see #189).
+    """
+    from cortex_training.client.core import _is_schema_not_found
+
+    return _is_schema_not_found(getattr(exc, "response", None))
 
 
 def open_profile_client(profile: str, database: str, schema: str) -> Any:
@@ -489,11 +499,11 @@ class _Login:
 
     def _ask_database(self) -> str:
         self.p.say(self.s.dim(_DATABASE_HELP))
-        return self.p.ask("Database", default=DEFAULT_DATABASE)
+        return self.p.ask("Database", default=DEFAULT_DATABASE, validate=lambda name: _database_setup.check_identifier("database", name))
 
     def _ask_schema(self) -> str:
         # Enter keeps PUBLIC; a team that uses its own schema types it here.
-        return self.p.ask("Schema", default=DEFAULT_SCHEMA)
+        return self.p.ask("Schema", default=DEFAULT_SCHEMA, validate=lambda name: _database_setup.check_identifier("schema", name))
 
     def _write(self, name: str, values: Mapping[str, Any]) -> None:
         path = _profiles.write_profile(name, values)
@@ -590,9 +600,9 @@ class _Login:
             check.client.get_capacity()
             return None
         except Exception as exc:
-            code = _response_error_code(getattr(exc, "response", None))
-            if code == _NOT_RESOLVED_CODE:
+            if database_missing(exc):
                 return None  # Cortex Training answered; only the database is missing.
+            code = _response_error_code(getattr(exc, "response", None))
             account = _profiles.read_profiles().get(check.profile, {}).get("account", "this account")
             if code == _NOT_ENABLED_CODE:
                 return f"Cortex Training isn't enabled on account {account}"

@@ -23,12 +23,33 @@ showing the statement and getting a yes.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _SQLSTATE_EXISTS_WITHOUT_ACCESS = "42710"
 _SQLSTATE_INSUFFICIENT_PRIVILEGE = "42501"
+
+
+# A Snowflake identifier: unquoted (a letter or "_", then letters, digits, "_" or "$"),
+# or double-quoted, with "" for a quote inside.
+_IDENTIFIER = re.compile(r'[A-Za-z_][A-Za-z0-9_$]{0,254}|"(?:[^"]|""){1,255}"')
+
+
+def is_identifier(name: str) -> bool:
+    """Whether ``name`` can be used as a database or schema name as written."""
+    return bool(_IDENTIFIER.fullmatch(name))
+
+
+def check_identifier(kind: str, name: str) -> str:
+    """Return ``name``, or raise ValueError saying how to write a valid one."""
+    if not is_identifier(name):
+        raise ValueError(
+            f"{name!r} isn't a valid {kind} name. Use letters, digits, '_' or '$' (starting with a letter "
+            'or "_"), or put it in double quotes, like "My Db".'
+        )
+    return name
 
 
 class DatabaseSetupError(RuntimeError):
@@ -86,6 +107,8 @@ def resolved_identifier(name: str) -> str:
 
 def is_listed(client: Any, kind: str, name: str) -> bool:
     """Return True if ``client``'s role can see the database or schema ``name``."""
+    check_identifier(kind, name)
+    check_identifier("database", client.database)
     like = name.replace("'", "''")
     if kind == "database":
         statement = f"SHOW DATABASES LIKE '{like}'"
@@ -122,6 +145,9 @@ def full_name(client: Any, kind: str, name: str) -> str:
 
 def create_statements(client: Any, objects: list[tuple[str, str]]) -> list[str]:
     """The CREATE statements :func:`create` runs for ``objects``, to show before asking."""
+    check_identifier("database", client.database)
+    for kind, name in objects:
+        check_identifier(kind, name)
     return [f"CREATE {kind.upper()} IF NOT EXISTS {full_name(client, kind, name)}" for kind, name in objects]
 
 

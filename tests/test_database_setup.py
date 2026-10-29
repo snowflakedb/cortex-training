@@ -157,3 +157,18 @@ def test_sqlstate_is_read_from_connector_errors_and_sql_api_bodies():
     api_error.response = FakeResponse({"sqlState": "42710"})
     assert _database_setup._sqlstate(api_error) == "42710"
     assert _database_setup._sqlstate(Exception("plain")) is None
+
+
+@pytest.mark.parametrize(("name", "ok"), [("MY_DB", True), ("_x$1", True), ('"My DB"', True), ('"say ""hi"""', True),
+                                          ("my db", False), ("DB;DROP", False), ("1DB", False), ('"', False), ("", False)])
+def test_identifiers_are_checked(name, ok):
+    assert _database_setup.is_identifier(name) is ok
+
+
+def test_sql_is_never_built_from_a_name_that_is_not_an_identifier(monkeypatch):
+    client = pat_client(monkeypatch, database="MY_DB")
+    with pytest.raises(ValueError, match="isn't a valid schema name"):
+        _database_setup.create_statements(client, [("schema", "x; DROP DATABASE MY_DB")])
+    with pytest.raises(ValueError, match="isn't a valid database name"):
+        _database_setup.is_listed(client, "database", "a b")
+    assert client.sent == []

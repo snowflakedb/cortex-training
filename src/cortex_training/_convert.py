@@ -247,7 +247,7 @@ class _Converter:
             self.client.get_capacity()
         except Exception as exc:
             code = _response_error_code(getattr(exc, "response", None))
-            if code == _login._NOT_RESOLVED_CODE:
+            if _login.database_missing(exc):
                 pass  # Cortex Training answered; only the database is missing.
             elif code == _login._NOT_ENABLED_CODE:
                 account = _login.account_from_host(self.old.host)

@@ -1031,3 +1031,52 @@ def test_logs_and_scripts_get_no_logo_or_rules(isolated):
     _, _, err = login(World(databases={"TRAIN_DB"}), ["n", "3", "1"])
     assert "T R A I N I N G" not in err
     assert "─" * 20 not in err
+
+
+# ─── Review follow-ups (Da, #162) ───────────────────────────────────────────
+
+
+def test_save_profile_writes_through_a_symlinked_config_json(isolated, tmp_path):
+    # A dotfiles repo often links config files: the link stays, and the file it names is written.
+    target = tmp_path / "dotfiles" / "ct-config.json"
+    target.parent.mkdir()
+    target.write_text("{}")
+    link = _picker.config_path()
+    link.parent.mkdir(parents=True)
+    link.symlink_to(target)
+    _picker.save_profile("train")
+    assert link.is_symlink()
+    assert json.loads(target.read_text()) == {"profile": "train"}
+    assert oct(target.stat().st_mode & 0o777) == "0o600"
+
+
+@pytest.mark.parametrize("bad", ["my db", "DB;DROP", "it's", "1DB"])
+def test_a_database_name_that_is_not_an_identifier_is_asked_again(isolated, bad):
+    world = World(databases={"TEAM_DB"})
+    # host, user, role, PAT, a bad database, then a good one, schema, check
+    code, _, err = login(world, ["acme-new.snowflakecomputing.com", "ME", "", "tok", bad, "TEAM_DB", "", ""], name="fresh")
+    assert code == 0, err
+    assert f"{bad!r} isn't a valid database name." in err
+    assert _profiles.read_profiles()["fresh"]["database"] == "TEAM_DB"
+
+
+def test_a_quoted_schema_name_is_accepted(isolated):
+    world = World(databases={"TEAM_DB"})
+    code, _, err = login(world, ["acme-new.snowflakecomputing.com", "ME", "", "tok", "TEAM_DB", '"My Schema"', ""], name="fresh")
+    assert code == 0, err
+    assert _profiles.read_profiles()["fresh"]["schema"] == '"My Schema"'
+
+
+def test_a_517602_that_is_not_schema_not_found_is_not_a_missing_database(isolated):
+    # 517602 is the API's generic invalid-request code (#189); only "Schema … is not found" means the database.
+    write_profiles(isolated, PROFILES)
+    world = World(databases={"TRAIN_DB"})
+    world.service_error = None
+    def no_privilege():
+        raise ApiError(400, "517602", "Insufficient privileges to CREATE EXPERIMENT in schema TRAIN_DB.PUBLIC")
+    flow = _login._Login(_login._Prompter(io.StringIO(), io.StringIO()), world.open)
+    check = _login.Check("train", "TRAIN_DB", "PUBLIC")
+    check.client = world.open("train", "TRAIN_DB", "PUBLIC")
+    check.client.get_capacity = no_privilege
+    assert "didn't answer" in (flow.service_error(check) or "")
+    assert _login.database_missing(ApiError(400, "517602", "Schema TRAIN_DB.PUBLIC is not found or not authorized"))
