@@ -504,6 +504,12 @@ def build_parser(
         help="Print at most this many of the newest matching jobs.",
     )
 
+    subparsers.add_parser(
+        "models",
+        help="List active models configured for new jobs.",
+        description="List active models configured for new jobs.",
+    )
+
     capacity = subparsers.add_parser(
         "capacity",
         help="Show reserved GPU capacity and current usage for the caller account.",
@@ -1115,12 +1121,12 @@ def build_client(args: argparse.Namespace, cortex_training_client_cls):
     if args.base_url:
         return cortex_training_client_cls(base_url=args.base_url, **kwargs)
     if args.use_connection_profile:
-        return cortex_training_client_cls.from_connection_name(
+        return cortex_training_client_cls._from_profile(
             connection_name=args.connection,
             verify_ssl=not args.no_verify_ssl,
             **kwargs,
         )
-    return cortex_training_client_cls.from_pat(
+    return cortex_training_client_cls._from_pat(
         host=_normalize_host(args.host),
         pat=args.pat,
         verify_ssl=not args.no_verify_ssl,
@@ -1976,6 +1982,13 @@ def _run(
         return 0
     if args.command == "list":
         return _cmd_list(args, client, stdout)
+    if args.command == "models":
+        _print_json(
+            {"models": client.list_models()},
+            stdout,
+            compact=args.compact,
+        )
+        return 0
     if args.command == "capacity":
         return _cmd_capacity(args, client, stdout)
     if args.command == "cancel":

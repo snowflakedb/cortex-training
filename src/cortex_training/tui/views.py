@@ -1279,13 +1279,20 @@ def client_location(client: Any) -> Optional[tuple]:
     return None
 
 
+def location_parts(job: Any) -> Optional[tuple]:
+    """``(DB, SCHEMA)`` of a row that names its location, as :func:`location_label` draws
+    them on either side of its dot; None without one."""
+    names = location_names(job)
+    if names is None:
+        return None
+    return printable(sql_identifier(names[0])), printable(sql_identifier(names[1]))
+
+
 def location_label(job: Any) -> str:
     """``DB.SCHEMA`` of a row that names its location, each name quoted when SQL
     needs it (``TEAM_DB.EXPERIMENTS``, ``"ml"."dev"``); ``""`` without one."""
-    names = location_names(job)
-    if names is None:
-        return ""
-    return printable(f"{sql_identifier(names[0])}.{sql_identifier(names[1])}")
+    parts = location_parts(job)
+    return "" if parts is None else ".".join(parts)
 
 
 def location_filter_text(location: Optional[tuple]) -> str:

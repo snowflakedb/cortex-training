@@ -45,6 +45,13 @@ EXAMPLES = {
         "examples.sft.conversational.train",
         ["max_steps=2", "max_seq_len=1024", "train_batch_size=4", "log_path={log_path}"],
     ),
+    # The only LoRA run on a hybrid-attention model: the others are dense plain-attention
+    # or sequence-parallel MoE. 8 data-parallel GPUs, so the server needs batch 8.
+    "sft_lora_qwen35": (
+        "examples.sft.conversational.train",
+        ["model=Qwen/Qwen3.5-9B", "lora=true", "max_steps=2", "max_seq_len=1024",
+         "train_batch_size=8", "log_path={log_path}"],
+    ),
     "rl": (
         "examples.rl.math_grpo.train",
         ["max_steps=2", "problems_per_batch=4", "group_size=4", "max_tokens=512",
@@ -68,10 +75,11 @@ EXAMPLES = {
          "eval_max_tokens=256", "eval_every=1", "n_val=16", "n_test=32",
          "n_kl_eval=8", "warmup_steps=0", "log_path={log_path}"],
     ),
-    # Two steps at a small batch, with valid_nll on the held-out traces before and after.
+    # Two steps, with valid_nll before and after. DARE trains on 8 data-parallel
+    # GPUs, and the server rejects a batch smaller than that.
     "dare_train": (
         "examples.sft.dare.train",
-        ["max_steps=2", "train_batch_size=4", "eval_every=2", "log_path={log_path}"],
+        ["max_steps=2", "train_batch_size=8", "eval_every=2", "log_path={log_path}"],
     ),
     # Base model on two v1 (reference-scored) tasks.
     "dare_evaluate": (

@@ -11,7 +11,7 @@
         "max_seq_len": 65536,
         "train_batch_size": 1,
         "gradient_clipping": 1.0,
-        "model_provider": "prime_rl",
+        "model_provider": "arctic",
         "attn_implementation": "sparse_mla",
         "cuda_allocator_conf": "expandable_segments:True",
         "activation_checkpointing": true,

@@ -439,8 +439,23 @@ def test_chart_uses_fixed_scale_labels_and_fits_narrow_width(tmp_path):
 
     wide = render_chart(view, 120).splitlines()
     assert all(len(line) == 120 for line in wide)
+    assert wide[0].index("▁") == len("100% ┤")  # 61 buckets across 113 columns start at the axis
     assert wide[0].index("▁") == wide[2].index(view.start.astimezone().strftime("%H:%M"))
     assert wide[2].endswith(view.end.astimezone().strftime("%H:%M"))
+
+
+def test_a_job_shorter_than_its_window_charts_from_the_left_on_the_window_s_scale(tmp_path):
+    # 2m40s of 5 s samples, as a job cancelled early has: "last 10m" runs ten minutes from its first sample,
+    # the samples on the left of its 113 columns, and the whole job spans them all.
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    _write_metrics(tmp_path, "job:training:0", [_row(start + timedelta(seconds=5 * i), 0, 10) for i in range(33)])
+    views = load_resource_data(tmp_path).sub_jobs["job:training:0"].views
+    row, axis, times = render_chart(views["10m"], 120).splitlines()
+    assert row == "100% ┤" + "▁" * 31 + "◂" + " " * 82  # 160 s of 600 s: the first 31 columns
+    assert axis == "  0% └" + "─" * 114
+    clock = [moment.astimezone().strftime("%H:%M") for moment in (start, start + timedelta(minutes=10))]
+    assert [times.split()[0], times.split()[-1]] == clock
+    assert render_chart(views["all"], 120).splitlines()[0] == "100% ┤" + "▁" * 113 + "◂"
 
 
 def test_only_gauges_named_with_a_unit_are_metrics():
@@ -581,6 +596,48 @@ def test_chart_has_no_now_marker_when_the_newest_bucket_is_a_gap():
     assert not any("◂" in _text(line) for line in lines)
 
 
+def test_a_window_of_fewer_buckets_than_columns_spans_the_chart():
+    # A short window at a long scrape interval, its samples covering it: each bucket is as many of the 33
+    # columns wide, from the axis on, so nothing is blank between the axis and the bars.
+    row, axis, times = (_text(line) for line in _chart([10.0, 50.0, 90.0], width=40, height=1, hue=None))
+    assert row == "100% ┤" + "▁" * 11 + "▄" * 11 + "█" * 11 + "◂"
+    assert axis == "  0% └" + "─" * 34
+    # The times span it too: the window's start under the first column, its end under the marker.
+    assert times.startswith(" " * 6 + _T0.astimezone().strftime("%H:%M")) and len(times) == 40
+    # Where they don't divide evenly, some buckets are a column wider.
+    row = _text(_chart([10.0, 50.0, 90.0, 50.0], width=40, height=1, hue=None)[0])
+    assert row == "100% ┤" + "▁" * 9 + "▄" * 8 + "█" * 8 + "▄" * 8 + "◂"
+
+
+def _clock(moment) -> str:
+    return moment.astimezone().strftime("%H:%M")
+
+
+def test_a_window_longer_than_its_samples_keeps_its_time_scale():
+    # Five minutes of samples under "last 10m", over 33 columns: half of them. A job that short starts at the
+    # left, the rest of its window blank after the marker; a window whose older samples are still loading ends
+    # at the right, where its newest samples are, with the older ones to come before them.
+    view = resource_module.KindView(name="10m", start=_T0, end=_T0 + timedelta(minutes=5), label="",
+                                    charts={BUSY: (10.0,) * 61})
+    metric = resource_module.Metric(key=BUSY, name="GPU util %", unit="%", scale=100.0)
+
+    def chart(complete):
+        return [_text(line) for line in resource_module.metric_chart_spans(view, metric, 40, height=1,
+                                                                           complete=complete)]
+
+    row, axis, times = chart(True)
+    assert row == "100% ┤" + "▁" * 17 + "◂" + " " * 16
+    assert axis == "  0% └" + "─" * 34  # unbroken past the newest sample: no gap, just time to come
+    assert times.split() == [_clock(_T0), _clock(_T0 + timedelta(minutes=5)), _clock(_T0 + timedelta(minutes=10))]
+    row, axis, times = chart(False)
+    assert row == "100% ┤" + " " * 16 + "▁" * 17 + "◂"
+    assert axis == "  0% └" + "─" * 34
+    assert times.split() == [_clock(_T0 - timedelta(minutes=5)), _clock(_T0), _clock(_T0 + timedelta(minutes=5))]
+    # The gridline runs on through the blank time, past the marker.
+    rows = [_text(line) for line in resource_module.metric_chart_spans(view, metric, 40, height=4)]
+    assert rows[2] == " 50% ┤" + "┈" * 34
+
+
 def test_mix_blends_a_hue_over_the_background():
     assert resource_module.mix("#ffffff", 1.0, "#000000") == "#ffffff"
     assert resource_module.mix("#ffffff", 0.0, "#000000") == "#000000"
@@ -670,6 +727,18 @@ def test_kpi_strip_fills_its_width_and_drops_details_before_wrapping():
     assert len(resource_module.kpi_strip_spans(tiles, 12)) == 4
     edge = resource_module.kpi_strip_spans(tiles, 80)[1][0]
     assert edge == ("▎ ", f"{resource_module.HEALTH_COLORS['ok']} on {resource_module.SURFACE}")
+
+
+def test_a_tile_that_warns_or_errs_says_so_in_shape_as_well_as_color():
+    # Without color (NO_COLOR, or the strip copied as text) a warning and an error still show.
+    tiles = [resource_module.Kpi("GPU util", "40%", "", "warn"), resource_module.Kpi("temp", "91 °C", "", "err"),
+             resource_module.Kpi("power", "632 W"), resource_module.Kpi("memory", "50%", "", "ok")]
+    top, bottom = (_text(line) for line in resource_module.kpi_strip_spans(tiles, 80, styled=False))
+    assert top.count("▎") == 4  # the labels keep the bar
+    assert "! 40%" in bottom and "× 91 °C" in bottom and "▎ 632 W" in bottom and "▎ 50%" in bottom
+    marks = [span for span in resource_module.kpi_strip_spans(tiles, 80)[1] if span[0] in ("! ", "× ")]
+    assert [style.split()[0] for _text_, style in marks] == [resource_module.HEALTH_COLORS["warn"],
+                                                              resource_module.HEALTH_COLORS["err"]]
 
 
 def test_stats_table_heads_line_up_with_their_columns(tmp_path):
