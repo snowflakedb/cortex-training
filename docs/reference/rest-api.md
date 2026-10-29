@@ -1778,19 +1778,39 @@ count, and top-k; see
 
 #### DFlash2 draft training
 
-`extra_training["model_provider"] = "dflash2"` trains a DFlash2 speculative-decoding
-draft against a frozen target. `model_name` is the frozen target, and the draft is
-configured by `extra_training["dflash2"]`, an object that must carry a
-`draft_config` or an `init_from`. The service validates the object, so unknown keys
-are rejected. It is required for this provider and rejected for any other.
+`extra_training["model_provider"]` accepts `huggingface`, `arctic`, and `dflash2`.
+`dflash2` trains a DFlash2 speculative-decoding draft against a frozen target:
+`model_name` is the frozen target, and the draft is configured by
+`extra_training["dflash2"]`.
 
-The service enforces these constraints when the job is created:
+`extra_training["dflash2"]` is required when the provider is `dflash2` and is
+rejected for every other provider. Unknown keys are rejected.
 
-- `activation_checkpointing` must be `false`; the draft recomputes its own forward.
-- `fp32_parity`, `fp32_residual`, and `text_config_overrides` are not accepted.
-- Master weights and optimizer states are kept in fp32. A `ds_config` that sets
-  `bf16.bf16_master_weights_and_grads` or `bf16.bf16_optimizer_states` is rejected.
-- Generic model patches, such as Liger kernels, are not applied.
+| Key | Default | Meaning |
+|---|---|---|
+| `draft_config` | required | Contents of the draft's `config.json` (`architectures` and `dflash_config`) |
+| `init_from` | none | Existing draft directory to start from |
+| `attention_backend` | `sdpa` | `sdpa`, `flex_attention`, or `eager` |
+| `num_anchors` | `512` | Anchor blocks sampled per sequence; greater than zero |
+| `loss_decay_gamma` | `7.0` | Per-slot loss decay; greater than zero, or `null` to disable |
+| `selector_loss_alpha` | `1.0` | Weight of the selector loss; zero or greater |
+| `selector_stop_gradient` | `false` | Detach the selector's inputs so only its own parameters train on its loss |
+| `objective_chunk_blocks` | `128` | Blocks per vocabulary-projection chunk; bounds memory |
+| `seed` | `0` | Seed for draft initialization and anchor sampling |
+
+A `dflash2` job is rejected when any of these hold:
+
+- `activation_checkpointing` is anything other than `false`. The draft
+  recomputes its own forward, so the default of `true` must be overridden.
+- `fp32_parity`, `fp32_residual`, or `text_config_overrides` is set.
+- `ds_config.bf16.bf16_master_weights_and_grads` or
+  `ds_config.bf16.bf16_optimizer_states` is enabled. The service keeps master
+  weights and optimizer states in fp32 for this provider, whatever the job
+  asks for, so these two flags cannot turn that off. Copying a `ds_config` from
+  another job that sets either flag fails.
+- A generic model patch, such as Liger kernels, is requested.
+- `sp_size` or `ep_size` is greater than one. The provider supports data
+  parallelism only.
 
 Requests use `processing.loss_fn="dflash2"`. It reads `loss_mask`, the usual
 prediction-aligned supervision mask, and does not use vocabulary `action_masks` or
@@ -2217,13 +2237,19 @@ sampling = SubJobConfig.sampling_job(
 ```
 
 To serve a draft trained with the `dflash2` provider, set
-`speculative_config.from_source_checkpoint` to `true` instead of `model`, and name
-the training job's weights-only checkpoint in `source_checkpoint_info`
-(`checkpoint_id` and `source_job_id`). The checkpoint is used as the draft model,
-`model_name` stays the target, and the flag is not forwarded to vLLM. The flag is
-accepted only on sampling jobs whose `source_checkpoint_info` names a checkpoint
-saved by a job on the service, and it cannot be combined with
-`speculative_config.model`.
+`vllm_config.speculative_config.from_source_checkpoint` to `true` instead of
+`model`, and name the training job's weights-only checkpoint in
+`source_checkpoint_info` (`checkpoint_id` and `source_job_id`). The checkpoint
+becomes the draft model, `model_name` stays the target, and the flag is not
+forwarded to vLLM. The checkpoint is not treated as a LoRA adapter.
+
+The flag is rejected unless all of these hold:
+
+- The job is a sampling job.
+- `source_checkpoint_info` names a checkpoint saved by Cortex Training, not an
+  `external_stage_path`.
+- `speculative_config.model` is not set. A job names its draft either by `model`
+  or by this flag, not both.
 
 For LoRA sampling, set `extra_sampling["peft_config"]` when creating the
 sub-job. This enables the vLLM LoRA manager before the model starts. The
