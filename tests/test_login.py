@@ -1078,3 +1078,35 @@ def test_a_517602_that_is_not_schema_not_found_is_not_a_missing_database(isolate
     check.client.get_capacity = no_privilege
     assert "didn't answer" in (flow.service_error(check) or "")
     assert _login.database_missing(ApiError(400, "517602", "Schema TRAIN_DB.PUBLIC is not found or not authorized"))
+
+
+# ─── A profile name used twice ──────────────────────────────────────────────
+
+
+def test_login_offers_to_fix_a_duplicated_profile_then_carries_on(isolated):
+    write_profiles(isolated, PROFILES + '\n    [train]\n    account = "ACME-PROD"\n    user = "ME"\n')
+    lines = [n for n, line in enumerate((isolated / "connections.toml").read_text().splitlines(), 1) if line == "[train]"]
+    _picker.save_profile("train")
+    world = World(databases={"TRAIN_DB"})
+    # Fix it now? Enter -> Keep using train? Enter
+    code, summary, err = login(world, ["", ""])
+    assert code == 0, err
+    assert f"connections.toml has 2 profiles named train (lines {lines[0]} and {lines[1]})." in err
+    assert f"  2. Rename the profile train at line {lines[1]} to train-duplicate-1" in err
+    assert "Fix it now? [Y/n]" in err
+    assert f"✓ Renamed the profile train at line {lines[1]} to train-duplicate-1" in err
+    assert "It works. Keep using train?" in err and summary["profile"] == "train"
+    assert set(_profiles.read_profiles()) == {"prod", "train", "other", "train-duplicate-1"}
+    assert (isolated / "connections.toml.bak").exists()
+
+
+def test_declining_the_duplicate_fix_changes_nothing(isolated):
+    text = PROFILES + '\n    [train]\n    account = "ACME-PROD"\n    user = "ME"\n'
+    write_profiles(isolated, text)
+    world = World()
+    code, _, err = login(world, ["n"])
+    assert code == 1
+    assert "Nothing was changed." in err and "rename or remove the extra ones" in err
+    assert (isolated / "connections.toml").read_text() == textwrap.dedent(text)
+    assert not (isolated / "connections.toml.bak").exists()
+    assert world.opened == []
