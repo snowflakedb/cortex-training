@@ -105,7 +105,8 @@ cortex-training list
 cortex-training list --status running
 cortex-training list --status active,failed --user JDOE --since 2026-10-01 --limit 20
 cortex-training list --all                    # Every schema you can see
-cortex-training get JOB_ID
+cortex-training get JOB_ID                    # Its config, which submit takes as it is
+cortex-training get JOB_ID --raw              # Its record: status, sub-job ids, times
 cortex-training wait JOB_ID                   # Wait until running, not finished
 cortex-training cancel JOB_ID
 cortex-training checkpoints JOB_ID
@@ -168,7 +169,7 @@ cortex-training model-deployment drop sf-ct-DEPLOYMENT_UUID
 
 ```bash
 cortex-training --compact list
-cortex-training get JOB_ID | jq '.sub_jobs'
+cortex-training get JOB_ID | jq '.sub_job_configs'
 cortex-training --help
 cortex-training fwd-bwd --help
 ```
@@ -178,7 +179,7 @@ cortex-training fwd-bwd --help
 | Command | Default behavior | Alternative |
 |---------|------------------|-------------|
 | `submit` | Return after submission | `--wait` waits until running; `--dry-run` validates without submitting |
-| `wait JOB_ID` | Wait until running, not until training finishes | Use `get JOB_ID` to inspect current status |
+| `wait JOB_ID` | Wait until running, not until training finishes | Use `get JOB_ID --raw` to inspect current status |
 | `fwd-bwd`, `generate` | Poll the submitted request until completion | Set top-level `"poll": false` in the input JSON |
 | `step` | Poll until completion; learning rate `1e-4` | Set `--lr`; polling cannot be disabled |
 | `load`, `weight-sync` | Poll the submitted request until completion | `--no-poll` returns without waiting for the result |
@@ -308,6 +309,7 @@ cortex-training list --status running
 cortex-training list --status active,failed --user JDOE --since 2026-10-01 --limit 20
 cortex-training list --all
 cortex-training get JOB_ID
+cortex-training get JOB_ID --raw
 cortex-training checkpoints JOB_ID
 cortex-training cancel JOB_ID
 cortex-training wait JOB_ID
@@ -333,9 +335,45 @@ with `account-level job listing is not enabled for this account`. A bad
 `--status`, `--since`, `--until`, or `--limit`, or an empty `--user`, exits
 with status 2 before connecting.
 
-`get` fetches current job details; `checkpoints` lists saved checkpoints.
-`wait` waits for the job to reach **running**, not for training to finish.
-See [Manage Jobs](../guides/operations/manage-jobs.md) for the operational workflow.
+`get` prints a job's config as a CreateJob body that `submit` takes as it is,
+to launch another job configured like it; `get --raw` prints the job's record
+as the service returns it, with its status, sub-job ids and times.
+`checkpoints` lists saved checkpoints. `wait` waits for the job to reach
+**running**, not for training to finish. See
+[Manage Jobs](../guides/operations/manage-jobs.md) for the operational workflow.
+
+```bash
+cortex-training get JOB_ID > job.json
+cortex-training submit job.json
+```
+
+The body has every field you can set on a job, each with the value the job runs
+with: its `hardware`, `comment`, `experiment_name`, `idle_timeout_seconds` and
+`pending_timeout_seconds`, and under `sub_job_configs` each sub-job's
+`job_type`, `model_name`, `dtype`, `seed`, `source_checkpoint_info` and
+training or inference config. Edit any of it before you submit. Whole numbers
+print as integers (`4`, not `4.0`). What the service sets is left out: the job
+and sub-job ids, statuses, times, submitter, owner and image (a new job runs the
+current image).
+
+- Each sub-job's config is its effective config, with the service's defaults
+  filled in, once the job is running on a service that reports one. Before
+  then, and on services that don't, it is the config as submitted, and a field
+  the job did not set (`dtype`, say) is `null`, the service's default.
+- A timeout the job did not set is the service's default: 1800 seconds idle,
+  86400 pending.
+- `experiment_name` is the job's experiment, so the new job joins it as a new
+  run; make it `null` for an experiment of its own. When the experiment can't
+  be read, `get` warns and prints `null`. A model deployment has `null`
+  `experiment_name` and `pending_timeout_seconds`: it cannot set them.
+- `comment`, `seed` and `source_checkpoint_info` are `null` when the job has
+  none.
+- `vllm_config.max_model_len` follows `max_seq_len`: change both together.
+- A sub-job started from external weights has
+  `source_checkpoint_info.external_stage_path` `null`: the job record does not
+  say which weights, so set it before you submit.
+- For a record without `hardware` (the service could not read the job's
+  details), `get` fails and prints nothing; `get --raw` still prints the record.
 
 ### List Available Models
 
@@ -533,7 +571,7 @@ session's training sub-job. Sampling sub-jobs are not valid targets.
 To find the training sub-job and its GPU count:
 
 ```bash
-cortex-training get JOB_ID | jq '.sub_jobs[] | select(.job_type=="training") | {sub_job_id, n_gpus: .training_config.n_gpus}'
+cortex-training get JOB_ID --raw | jq '.sub_jobs[] | select(.job_type=="training") | {sub_job_id, n_gpus: .training_config.n_gpus}'
 ```
 
 `get` takes the job id as a positional argument, so `--job-id` is not used here.
@@ -1273,13 +1311,13 @@ box unless the service sends a reason. The Sub-jobs card shows type, status
 screens omit Type, and wider tables scroll with `←` / `→` or `Home` / `End`;
 the card's bottom border says so (`e whole table`, `← → scroll`).
 
-The Config card under it follows the highlighted row: that sub-job's submitted
-config, exactly as `cortex-training get JOB_ID` prints that sub-job's entry
-(indented JSON by key, values as the service returns them, aliases as
-submitted), without the fields the service adds (`sub_job_id`, `status`). On
-the entire-job row, each sub-job's goes under its name, side by side when each
-has at least 40 cells. A line wider than its column is cut with `…` until `e`,
-which also puts the sub-jobs one under the other.
+The Config card under it follows the highlighted row. On the entire-job row it
+is the job's config exactly as `cortex-training get JOB_ID` prints it, a body
+that `submit` takes as it is (see [Manage existing jobs](#manage-existing-jobs));
+on a sub-job's row, the same body with that sub-job alone, so a copy of it
+launches just that one. Its `experiment_name` is read once when the preview
+opens; until then, or when it can't be read, it is `null` and the card's bottom
+border says so. A line wider than the card is cut with `…` until `e`.
 
 Live previews refresh every 60 seconds, on return from details, or on `r`; a
 dim line at the end of the job card reports reads, slow reads and refresh
@@ -1825,7 +1863,7 @@ Use the global `--compact` flag for compact JSON, or pipe output to `jq`:
 
 ```bash
 cortex-training --compact list
-cortex-training get JOB_ID | jq '.sub_jobs'
+cortex-training get JOB_ID | jq '.sub_job_configs'
 ```
 
 Use `cortex-training --help` to list commands and global flags, or

@@ -40,6 +40,7 @@ from rich.cells import cell_len
 from cortex_training.client.core import _deployment_id_from_job_id
 from cortex_training.client.core import _model_deployment_status
 from cortex_training.client.core import _model_deployment_sub_job
+from cortex_training.client.core import create_job_body_from_job
 from cortex_training.model_deployment import DEPLOYMENT_STATUSES_WITHOUT_ENDPOINT
 from cortex_training.model_deployment import WIRE_DEPLOYMENT_CLASS
 from cortex_training.model_deployment import WIRE_INFERENCE_CONFIG
@@ -549,18 +550,17 @@ def within_retention(job: dict, now: datetime, days: int = RETENTION_DAYS) -> bo
     return created is None or (now - created).total_seconds() <= days * 86400
 
 
-# A sub-job entry's fields the service adds, not part of what was submitted (and
-# the label :func:`sub_jobs` adds to an entry without an id).
-_NOT_SUBMITTED = frozenset({"sub_job_id", "status", "label"})
-
-
-def subjob_config_json(sj: dict) -> list:
-    """One sub-job's submitted config as the lines ``cortex-training get`` prints
-    for it: its entry in the job record (type, model, dtype, seed and its
-    training or inference config) without the fields the service adds, as
-    indented JSON by key, values exactly as the service returned them."""
-    submitted = {key: value for key, value in sj.items() if key not in _NOT_SUBMITTED}
-    return json.dumps(submitted, indent=2, sort_keys=True, default=str).splitlines()
+def job_config_json(job: dict, sub_job: Optional[dict] = None, *, experiment_name: Optional[str] = None) -> list:
+    """The job's config as the lines ``cortex-training get`` prints: a CreateJob
+    body that ``submit`` takes as it is, with ``experiment_name`` the job's
+    experiment (see the client's ``create_job_body_from_job``). With ``sub_job``,
+    one of the job's entries, the body has that sub-job alone, so a copy of it
+    launches just that one. Raises ``ValueError`` for a job that cannot be copied."""
+    if sub_job is not None:
+        # Without the label sub_jobs gives an entry that has no id.
+        job = {**job, "sub_jobs": [{key: value for key, value in sub_job.items() if key != "label"}]}
+    return json.dumps(create_job_body_from_job(job, experiment_name=experiment_name),
+                      indent=2, sort_keys=True).splitlines()
 
 
 def preview_facts(job: dict, now: datetime, *, base_url: str = "") -> list:

@@ -482,6 +482,55 @@ The response shape consumed by this repository is flat at each sub-job:
 }
 ```
 
+Each `sub_jobs[]` entry is the sub-job's config plus the `sub_job_id` and
+`status` the service adds. On service versions that report it, once the job is
+running the config is the sub-job's **effective** config: `job_type`,
+`model_name`, `dtype`, `seed` (`null` when unset), any `source_checkpoint_info`,
+and the `training_config` or `inference_config` the job runs with, the service's
+defaults filled in (`null` for an optional field left unset). A key the service
+did not use, such as a misspelled one, is not in it. Before the job runs, on
+services that don't report it, and for model deployments, the entry is the
+config as submitted, and its whole numbers may come back as floats
+(`"n_gpus": 4.0`).
+
+The record also has `hardware` (the default when none was set), `comment`
+(`null` when none was set), and `idle_timeout_seconds` /
+`pending_timeout_seconds` when they were set (see
+[section 5.1](#51-create-job---post-)). It does not name the job's experiment;
+see [section 5.7](#57-experiment-run---get-job_idexperiment-run).
+
+#### Launching a job like another
+
+`create_job_body_from_job(job, experiment_name=...)` turns a Get job record
+into a CreateJob body for a job configured like it, which
+`create_job_from_body()` takes as it is:
+
+```python
+from cortex_training import create_job_body_from_job
+
+name = client.get_experiment_run(job_id)["experiment_name"]
+body = create_job_body_from_job(client.get_job(job_id), experiment_name=name)
+new_job_id = client.create_job_from_body(body)["job_id"]
+```
+
+The body has `hardware`, `comment`, `experiment_name`, `idle_timeout_seconds`,
+`pending_timeout_seconds` and `sub_job_configs`, each with the value the job
+runs with, and each sub-job has the record's fields plus `dtype`, `seed` and
+`source_checkpoint_info`. A timeout the record lacks is the service's default
+from [section 5.1](#51-create-job---post-) (1800 and 86400 seconds); a
+`comment`, `dtype`, `seed` or `source_checkpoint_info` it lacks is `null`, as is
+`experiment_name` when none is given. Given the job's own, the new job joins
+that experiment as a new run. A model deployment, which can set neither, keeps
+`pending_timeout_seconds` and `experiment_name` `null`. Left out are `job_id`
+(the service rejects one on create), `sub_job_id`, `status`, `reason`, the
+times, `submitted_by`, `owner_role` and `image_tag` (a new job runs the current
+image). A sub-job started from external weights has
+`source_checkpoint_info: {"external_stage_path": null}` to fill in, as the record
+does not say which weights. Whole-number floats become integers. It raises
+`ValueError` for a record with no sub-jobs or no `hardware` (the service could
+not read the job). `cortex-training get JOB_ID` prints the same body, with the
+job's experiment; `get --raw` prints the record.
+
 `wait_for_job()` repeatedly calls this endpoint until `running`.
 
 `state_changed_at` (UTC time the job entered its current `status`) is optional

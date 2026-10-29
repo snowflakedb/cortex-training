@@ -132,7 +132,8 @@ Useful commands while jobs are running or after they complete:
 
 ```bash
 cortex-training list                  # list all your jobs
-cortex-training get JOB_ID            # detailed job info
+cortex-training get JOB_ID --raw      # detailed job info
+cortex-training get JOB_ID            # its config, to submit again
 cortex-training cancel JOB_ID         # cancel a job and release GPUs
 cortex-training tui                   # terminal UI for browsing jobs and logs
 ```

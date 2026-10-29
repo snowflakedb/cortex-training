@@ -64,33 +64,67 @@ def test_preview_facts_leave_the_hero_and_lifecycle_out():
     assert [label for label, _value in v.preview_facts(located, NOW)][-1] == "Schema"
 
 
-def test_subjob_config_json_is_what_ct_get_prints():
+EXPERIMENT_RUN = {"experiment_name": "DB.SCHEMA.EXPERIMENT", "experiment_run_name": "RUN"}
+
+
+def _get_prints(job: dict) -> list:
+    """The lines `cortex-training get JOB_ID` prints for ``job``, in EXPERIMENT_RUN's experiment."""
+    import io
+
+    import cortex_training.cli.commands as cli
+
+    client = MagicMock()
+    client.get_job.return_value = job
+    client.get_experiment_run.return_value = EXPERIMENT_RUN
+    stdout = io.StringIO()
+    assert cli.main(["--base-url", "http://test.local", "--database", "DB", "get", "JOB_ID"],
+                    client_factory=lambda _args: client, stdout=stdout) == 0
+    return stdout.getvalue().splitlines()
+
+
+def test_job_config_json_is_what_ct_get_prints():
     sj = {"sub_job_id": "JOB_ID:training:0", "status": "RUNNING", "job_type": "TRAINING",
           "model_name": "Qwen/Qwen3-8B", "dtype": "bfloat16", "seed": 42.0,
           "training_config": {"n_gpus": 8.0, "max_seq_len": 4096.0, "gradient_checkpointing": True,
                               "optimizer": {"type": "AdamW", "params": {"lr": 1e-5, "beta2": 0.95}}}}
-    # The entry as `cortex-training get` prints it (indent 2, by key, values as
-    # returned, aliases as submitted), without the fields the service adds.
-    entry = {key: value for key, value in sj.items() if key not in ("sub_job_id", "status")}
-    assert v.subjob_config_json(sj) == json.dumps(entry, indent=2, sort_keys=True).splitlines()
-    shown = "\n".join(v.subjob_config_json(sj))
-    assert '"n_gpus": 8.0' in shown and '"gradient_checkpointing": true' in shown and '"type": "AdamW"' in shown
-    assert "sub_job_id" not in shown and "RUNNING" not in shown
-    assert v.subjob_config_json({"sub_job_id": "JOB_ID:training:0", "status": "RUNNING"}) == ["{}"]
+    job = _job(hardware="H200", sub_jobs=[sj])
+    lines = v.job_config_json(job, experiment_name="DB.SCHEMA.EXPERIMENT")
+    # What `cortex-training get` prints: a body submit takes as it is, every
+    # field that can be set, without the fields the service adds.
+    assert lines == _get_prints(job)
+    body = json.loads("\n".join(lines))
+    assert body["hardware"] == "H200" and body["pending_timeout_seconds"] == 86400
+    assert body["experiment_name"] == "DB.SCHEMA.EXPERIMENT"
+    shown = "\n".join(lines)
+    assert '"n_gpus": 8,' in shown and '"gradient_checkpointing": true' in shown and '"type": "AdamW"' in shown
+    assert "sub_job_id" not in shown and "RUNNING" not in shown and "JOB_ID" not in shown
+    with pytest.raises(ValueError, match="no hardware"):
+        v.job_config_json(_job(sub_jobs=[sj]))  # the service could not read the job
 
 
-def test_subjob_config_json_escapes_what_a_terminal_would_act_on():
-    lines = v.subjob_config_json({"job_type": "training", "training_config": {"a\nb": "x\x1b[2Jy\u2028z"}})
-    assert len(lines) == 6 and not any(ch in "".join(lines) for ch in "\n\x1b\u2028")
+def test_job_config_json_for_a_sub_job_has_it_alone():
+    training = {"sub_job_id": "JOB_ID:training:0", "job_type": "training", "training_config": {"n_gpus": 1}}
+    sampling = {"job_type": "sampling", "label": "config #1", "inference_config": {"n_gpus": 1}}
+    job = _job(hardware="B200", sub_jobs=[training, sampling])
+    body = json.loads("\n".join(v.job_config_json(job, sampling)))
+    assert body["hardware"] == "B200"
+    assert [sj["job_type"] for sj in body["sub_job_configs"]] == ["sampling"]
+    assert "label" not in body["sub_job_configs"][0]  # the TUI's own, not the service's
+
+
+def test_job_config_json_escapes_what_a_terminal_would_act_on():
+    job = _job(hardware="H200", sub_jobs=[{"job_type": "training", "training_config": {"a\nb": "x\x1b[2Jy\u2028z"}}])
+    lines = v.job_config_json(job)
+    assert '"a\\nb"' in "".join(lines) and not any(ch in "".join(lines) for ch in "\n\x1b\u2028")
 
 
 def test_multiplexed_sub_job_shows_its_source():
     target = "JOB_ID:training:0"
     shared = {"sub_job_id": "JOB_ID:sampling:0", "job_type": "sampling", "status": "RUNNING",
               "inference_config": {"max_seq_len": 4096.0, "n_gpus": 2.0, "multiplex_job_id": target}}
-    assert f'    "multiplex_job_id": "{target}",' in v.subjob_config_json(shared)
-    job = _job(sub_jobs=[{"sub_job_id": target, "job_type": "training", "status": "RUNNING",
-                          "training_config": {"n_gpus": 4.0}}, shared])
+    job = _job(hardware="H200", sub_jobs=[{"sub_job_id": target, "job_type": "training", "status": "RUNNING",
+                                           "training_config": {"n_gpus": 4.0}}, shared])
+    assert f'"multiplex_job_id": "{target}",' in "\n".join(v.job_config_json(job, shared))
     rows = dict(JobSummaryScreen(MagicMock(), "JOB_ID", job=job)._subjob_rows(job))
     # The table has no Config column: the config card shows it.
     assert len(rows["sj-1"]) == 5 and "multiplex_job_id" not in "".join(c.plain for c in rows["sj-1"])
@@ -264,11 +298,77 @@ def test_preview_of_a_running_job_has_no_callout_and_one_column_when_narrow():
 
 
 def test_config_card_follows_the_highlighted_row():
-    job = _job("RUNNING", sub_jobs=[
+    job = _job("RUNNING", hardware="H200", idle_timeout_seconds=3600, sub_jobs=[
         {"sub_job_id": "JOB_ID:training:0", "job_type": "training", "status": "RUNNING", "model_name": "org/model",
          "training_config": {"n_gpus": 8.0, "optimizer": {"name": "adamw", "lr": 1e-5}}},
         {"sub_job_id": "JOB_ID:sampling:0", "job_type": "sampling", "status": "RUNNING", "model_name": "org/model",
          "inference_config": {"n_gpus": 2.0, "max_seq_len": 4096.0}}])
+    client = MagicMock()
+    client.list_jobs.return_value = [job]
+    client.get_job.return_value = job
+    client.get_experiment_run.return_value = EXPERIMENT_RUN
+
+    async def run():
+        app = CortexTrainingLogTUI(client, poll_interval=0.01)
+        async with app.run_test(size=(150, 60)) as pilot:
+            app.push_screen(JobSummaryScreen(client, "JOB_ID", job=job))
+            for _ in range(50):
+                await pilot.pause(0.02)
+                if isinstance(app.screen, JobSummaryScreen) and "DB.SCHEMA.EXPERIMENT" in "".join(_rows(app, "#config")):
+                    break
+            card = app.screen.query_one("#config-card")
+            # The job's row: the whole job as `cortex-training get` prints it.
+            assert "entire job" in str(card.border_title) and "as cortex-training get prints it" in str(card.border_subtitle)
+            assert [row.rstrip() for row in _rows(app, "#config")] == _get_prints(job)
+            text = "\n".join(_rows(app, "#config"))
+            assert '"hardware": "H200"' in text and '"idle_timeout_seconds": 3600' in text
+            assert '"experiment_name": "DB.SCHEMA.EXPERIMENT"' in text and '"pending_timeout_seconds": 86400' in text
+            assert client.get_experiment_run.call_count == 1
+            assert '"max_seq_len": 4096' in text and '"lr": 1e-05' in text
+            await pilot.press("down")
+            await pilot.pause(0.1)
+            # A sub-job's row: the same body with that sub-job alone.
+            text = "\n".join(_rows(app, "#config"))
+            assert "training #0" in str(card.border_title)
+            assert '"name": "adamw"' in text and "max_seq_len" not in text and '"hardware": "H200"' in text
+            await pilot.press("down")
+            await pilot.pause(0.1)
+            assert "sampling #0" in str(card.border_title) and "optimizer" not in "\n".join(_rows(app, "#config"))
+            app.workers.cancel_all()
+            await pilot.pause(0.1)
+
+    asyncio.run(run())
+
+
+def test_config_card_says_when_it_could_not_read_the_experiment():
+    job = _job("RUNNING", hardware="H200", sub_jobs=[
+        {"sub_job_id": "JOB_ID:training:0", "job_type": "training", "status": "RUNNING", "training_config": {"n_gpus": 8}}])
+    client = MagicMock()
+    client.list_jobs.return_value = [job]
+    client.get_job.return_value = job
+    client.get_experiment_run.side_effect = RuntimeError("HTTP 503")
+
+    async def run():
+        app = CortexTrainingLogTUI(client, poll_interval=0.01)
+        async with app.run_test(size=(150, 42)) as pilot:
+            app.push_screen(JobSummaryScreen(client, "JOB_ID", job=job))
+            for _ in range(50):
+                await pilot.pause(0.02)
+                if isinstance(app.screen, JobSummaryScreen) and "couldn't read" in str(
+                        app.screen.query_one("#config-card").border_subtitle):
+                    break
+            assert "couldn't read the experiment: RuntimeError: HTTP 503" in str(app.screen.query_one("#config-card").border_subtitle)
+            assert '"experiment_name": null' in "\n".join(_rows(app, "#config"))
+            app.workers.cancel_all()
+            await pilot.pause(0.1)
+
+    asyncio.run(run())
+
+
+def test_config_card_says_why_it_has_no_config():
+    # Without hardware the service could not read the job, so there is no body to submit.
+    job = _job("RUNNING", sub_jobs=[{"sub_job_id": "JOB_ID:training:0", "job_type": "training", "status": "RUNNING",
+                                     "training_config": {"n_gpus": 8}}])
     client = MagicMock()
     client.list_jobs.return_value = [job]
     client.get_job.return_value = job
@@ -279,23 +379,9 @@ def test_config_card_follows_the_highlighted_row():
             app.push_screen(JobSummaryScreen(client, "JOB_ID", job=job))
             for _ in range(50):
                 await pilot.pause(0.02)
-                if isinstance(app.screen, JobSummaryScreen) and '"lr": 1e-05' in "".join(_rows(app, "#config")):
+                if isinstance(app.screen, JobSummaryScreen) and "no config" in "".join(_rows(app, "#config")):
                     break
-            card = app.screen.query_one("#config-card")
-            # The job's row: each sub-job's config as JSON under its name.
-            text = "\n".join(_rows(app, "#config"))
-            assert "every sub-job" in str(card.border_title) and "as cortex-training get shows it" in str(card.border_subtitle)
-            # Side by side: both sub-jobs' names on the first row.
-            assert "training #0" in text.splitlines()[0] and "sampling #0" in text.splitlines()[0]
-            assert '"max_seq_len": 4096.0' in text and '"lr": 1e-05' in text
-            await pilot.press("down")
-            await pilot.pause(0.1)
-            text = "\n".join(_rows(app, "#config"))
-            assert "training #0" in str(card.border_title)
-            assert '"name": "adamw"' in text and "max_seq_len" not in text
-            await pilot.press("down")
-            await pilot.pause(0.1)
-            assert "sampling #0" in str(card.border_title) and "optimizer" not in "\n".join(_rows(app, "#config"))
+            assert "no config to show: the job record has no hardware" in " ".join(_rows(app, "#config"))
             app.workers.cancel_all()
             await pilot.pause(0.1)
 

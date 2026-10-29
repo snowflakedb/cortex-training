@@ -162,6 +162,8 @@ class JobSummaryScreen(FollowsPointer, Screen):
         self._fetch_error: str | None = None  # why the last get_job gave no copy, until one does
         self._scope_by_row: dict = {}
         self._sub_job_by_row: dict = {}  # each sub-job row's entry, for the config card
+        self._experiment: str | None = None  # the job's experiment, for the config card, once read
+        self._experiment_error: str | None = None  # why the last try to read it failed
         self._reread_on_resume = False  # set when the details open over this preview
         self._expanded = False  # e: every value whole, however long, and the whole sub-job table
         self._long = False  # some value or table cell is (or, expanded, would be) cut
@@ -443,62 +445,36 @@ class JobSummaryScreen(FollowsPointer, Screen):
                                Text(str(sj.get("model_name") or "—")), Text(v.sub_job_gpu_text(sj))]))
         return rows
 
-    # Sub-jobs' configs go side by side on the job's row while each column has
-    # at least this many cells, else one under the other.
-    _CONFIG_COLUMN_LEAST = 40
     _JSON_KEY = re.compile(r'^(\s*)("(?:[^"\\]|\\.)*")(: )(.*)$')
 
     def _render_config(self, width: int) -> bool:
-        """Fill the config card for the highlighted row: that sub-job's config as
-        indented JSON, or on the job's row (and the "status unavailable" one),
-        each sub-job's under its name, side by side when they fit. Return whether
-        a line is (or, expanded, would be) cut."""
+        """Fill the config card for the highlighted row: the job's config as
+        ``cortex-training get`` prints it, a body that ``submit`` takes as it is,
+        with only that sub-job on a sub-job's row. Return whether a line is (or,
+        expanded, would be) cut."""
         card = self.query_one("#config-card")
-        subs = list(self._sub_job_by_row.values())
         picked = self._sub_job_by_row.get(self._highlighted_key())
-        shown = [picked] if picked is not None else subs
-        whose = v.sub_job_label(shown[0]) if len(shown) == 1 else "every sub-job"
+        whose = v.sub_job_label(picked) if picked is not None else "entire job"
         card.border_title = Content.assemble((" Config ", f"bold {theme.TEXT}"), (f"· {whose} ", theme.MUTED))
-        card.border_subtitle = Content.styled(" submitted config, as cortex-training get shows it ", theme.MUTED)
+        if self._experiment or v.is_deployment(self._job):
+            card.border_subtitle = Content.styled(" as cortex-training get prints it, for submit ", theme.MUTED)
+        elif self._experiment_error:
+            card.border_subtitle = Content.styled(
+                f" couldn't read the experiment: {self._experiment_error}; null gives a copy its own ", theme.WARN)
+        else:
+            card.border_subtitle = Content.styled(" reading the job's experiment… ", theme.MUTED)
         body = self.query_one("#config", Static)
-        if not shown:
+        if not self._sub_job_by_row:
             body.update(Content.styled("the service sent no sub-job configs", theme.FAINT))
             return False
-        blocks = []  # each sub-job's rows: its name (when more than one), then its JSON
-        for sj in shown:
-            head = []
-            if len(shown) > 1:
-                model = str(sj.get("model_name") or "")
-                head = [Content.assemble((v.sub_job_label(sj), f"bold {theme.TEXT}"),
-                                         *([(f"   {v.printable(model)}", theme.MUTED)] if model else []))]
-            lines = v.subjob_config_json(sj)
-            blocks.append((head, [] if lines == ["{}"] else lines))
-        count = len(blocks)
-        column = (width - self._GUTTER * (count - 1)) // count
-        if self._expanded or column < self._CONFIG_COLUMN_LEAST:
-            count, column = 1, width
-        long = False
-        columns = []
-        for head, lines in blocks:
-            rows = list(head)
-            for line in lines or ["no config sent"]:
-                long = long or v.cell_width(line) > column
-                cut = line if self._expanded else v.fit_cells(line, column)
-                rows.append(self._json_row(cut) if lines else Content.styled(cut, theme.FAINT))
-            columns.append(rows)
-        if count == 1:  # one under the other, a blank row between
-            out = []
-            for rows in columns:
-                out += ([Content("")] if out else []) + rows
-        else:
-            out = []
-            for i in range(max(len(rows) for rows in columns)):
-                row = Content("")
-                for c, rows in enumerate(columns):
-                    if i < len(rows):
-                        row = row + Content(" " * (c * (column + self._GUTTER) - row.cell_length)) + rows[i]
-                out.append(row)
-        body.update(Content("\n").join(out))
+        try:
+            lines = v.job_config_json(self._job, picked, experiment_name=self._experiment)
+        except ValueError as exc:
+            body.update(Content.styled(f"no config to show: {exc}", theme.FAINT))
+            return False
+        long = any(v.cell_width(line) > width for line in lines)
+        body.update(Content("\n").join(
+            self._json_row(line if self._expanded else v.fit_cells(line, width)) for line in lines))
         return long
 
     def _json_row(self, line: str) -> Content:
@@ -578,6 +554,23 @@ class JobSummaryScreen(FollowsPointer, Screen):
         if not (isinstance(job, dict) and job):
             job, error = None, error or "the service sent an empty answer"
         call_on_screen(self, self._apply_job, job, error)
+        # Then the config card's experiment_name, once the job shows: read once, as
+        # a job's never changes. A deployment has none.
+        if job is not None and self._experiment is None and not v.is_deployment(job):
+            call_on_screen(self, self._apply_experiment, *self._read_experiment())
+
+    def _read_experiment(self) -> tuple:
+        """(the job's experiment, None), or (None, why it could not be read)."""
+        try:
+            run = self._client.get_experiment_run(self._job_id)
+        except Exception as exc:  # noqa: BLE001 - said on the config card
+            return None, v.collapse(v.describe_error(exc))
+        name = run.get("experiment_name") if isinstance(run, dict) else None
+        return (name, None) if isinstance(name, str) and name else (None, "the service sent no experiment name")
+
+    def _apply_experiment(self, name: str | None, error: str | None) -> None:
+        self._experiment, self._experiment_error = name, error
+        self._refresh_view()
 
     def _apply_job(self, job: dict | None, error: str | None = None) -> None:
         self._loading = False
