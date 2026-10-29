@@ -3,7 +3,7 @@
   "model_id": "deepseek-ai/DeepSeek-V4-Flash-0731",
   "license": {
     "name": "MIT",
-    "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/LICENSE"
+    "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731/blob/main/LICENSE"
   },
   "architecture": "moe",
   "moe": {
@@ -12,6 +12,11 @@
     "num_experts": 256
   },
   "last_validated": {
-    "long/h200-inference-full": "2026-09-01"
+    "long/h200-inference-full": "2026-09-01",
+    "long/h200-training-full": "2026-10-23",
+    "long/h200-training-lora": "2026-10-22",
+    "standard/h200-inference-full": null,
+    "standard/h200-training-full": "2026-10-23",
+    "standard/h200-training-lora": "2026-10-22"
   }
 }

@@ -778,7 +778,9 @@ def _runtime_error_from_logs(client: CortexTrainingClient, job_id: str) -> str |
             if match not in unique:
                 unique.append(match)
         return "\n".join(unique[-5:])
-    return errors[-1][:2000]
+    # Whole record: these are tracebacks from the worker, and the innermost frames
+    # that name the failure are at the end.
+    return errors[-1]
 
 
 @contextlib.contextmanager
@@ -2354,6 +2356,21 @@ def build_job(
 INFERENCE_JOB_CONFIG_PLACEHOLDER = "INFERENCE_JOB_CONFIG"
 
 
+# Prime names DeepSeek-V4 attention projections q_a_proj, q_b_proj, kv_proj, and
+# o_b_proj. vLLM keeps the checkpoint names wq_a, wq_b, wkv, and wo_b. The catalog
+# records each side under the name that side loads; they are one adapter.
+_DEEPSEEK_V4_TRAINER_MODULES = r".*self_attn\.(q_a_proj|q_b_proj|kv_proj|o_b_proj)$"
+_DEEPSEEK_V4_VLLM_MODULES = ("wkv", "wo_b", "wq_a", "wq_b")
+
+
+def _canonical_target_modules(target_modules: Any) -> Any:
+    if target_modules == _DEEPSEEK_V4_TRAINER_MODULES or (
+        isinstance(target_modules, list) and tuple(target_modules) == _DEEPSEEK_V4_VLLM_MODULES
+    ):
+        return list(_DEEPSEEK_V4_VLLM_MODULES)
+    return target_modules
+
+
 def same_adapter(first: Any, second: Any) -> bool:
     """Whether two LoRA ``peft_config`` blocks describe the same adapter."""
     try:
@@ -2364,6 +2381,7 @@ def same_adapter(first: Any, second: Any) -> bool:
         for key in ("target_modules", "target_parameters"):
             if isinstance(config[key], list):
                 config[key] = sorted(config[key])
+        config["target_modules"] = _canonical_target_modules(config["target_modules"])
     return first == second
 
 

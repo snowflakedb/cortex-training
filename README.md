@@ -58,6 +58,7 @@ options.
 The CLI runs the same step-level operations the examples call, one at a time:
 
 ```bash
+cortex-training models                                           # list active configured models
 cortex-training submit examples/api/rl.json --wait               # training + sampling job
 cortex-training --job JOB_ID fwd-bwd examples/api/fwd-bwd.json   # forward-backward pass
 cortex-training --job JOB_ID step --lr 1e-4                      # optimizer step

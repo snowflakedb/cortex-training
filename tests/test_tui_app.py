@@ -256,7 +256,9 @@ async def _run_resource_tab(tmp_path):
         assert ok
         tabs = app.screen.query_one("#job-tabs", TabbedContent)
         assert tabs.active == "logs"
-        assert {pane.id for pane in app.screen.query("TabPane")} == {"logs", "resource", "training", "checkpoints"}
+        # Serving is composed for every job, hidden for a training one.
+        panes = {pane.id for pane in app.screen.query("TabPane")}
+        assert panes == {"serving", "logs", "resource", "training", "checkpoints"}
         c.download_metrics.assert_not_called()
 
         tabs.active = "resource"
@@ -271,6 +273,7 @@ async def _run_resource_tab(tmp_path):
         status = str(app.screen.query_one("#resource-status", Static).render())
         assert "2 reporting" in status
         assert "training #0" in status  # named by type and index
+        assert "reserved" not in status  # the memory note is a deployment's
         calls = c.download_metrics.call_count
 
         # w cycles the GPU window; the digits do nothing on the job detail screen.
@@ -358,6 +361,32 @@ async def _run_resource_tab(tmp_path):
 def test_resource_tab_is_lazy_and_renders_multiple_gpus(tmp_path, monkeypatch):
     monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
     asyncio.run(_run_resource_tab(tmp_path))
+
+
+def test_a_deployment_s_resources_say_its_memory_is_reserved(tmp_path):
+    c = _client()
+    c.get_job.return_value = {"job_id": "7", "status": "RUNNING", "sub_jobs": [
+        {"sub_job_id": "7:sampling:0", "job_type": "sampling", "status": "RUNNING",
+         "inference_config": {"deployment_class": "EVALUATION", "num_replicas": 1.0}}]}
+
+    def download(job_id, output_dir, **_kwargs):
+        _write_gpu_metrics(output_dir, "7:sampling:0", gpu_count=1)
+        return []
+
+    c.download_metrics.side_effect = download
+
+    async def run():
+        app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+        async with app.run_test(size=(130, 36)) as pilot:
+            assert await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen)
+                               and app.screen._current_source == "7:sampling:0")
+            await pilot.press("g")
+            assert await _wait(pilot, app, lambda: "reserved up front" in
+                               str(app.screen.query_one("#resource-status", Static).render()), tries=300)
+            app.workers.cancel_all()
+            await pilot.pause()
+
+    asyncio.run(run())
 
 
 async def _run_resource_cold_cache_failure():
@@ -456,6 +485,39 @@ async def _run_resource_partial_download_failure():
 def test_resource_partial_download_is_reparsed_after_failure(tmp_path, monkeypatch):
     monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
     asyncio.run(_run_resource_partial_download_failure())
+
+
+async def _run_resource_narrow_header_keeps_the_scrape_interval_last():
+    c = _client()
+
+    def download(job_id, output_dir, *, resume, **_kwargs):
+        _write_gpu_metrics(output_dir, "7:training:0", gpu_count=1)
+        return []
+
+    c.download_metrics.side_effect = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(130, 36)) as pilot:
+        ok = await _wait(pilot, app, lambda: app.screen._current_source is not None)
+        assert ok
+        app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        ok = await _wait(pilot, app, lambda: not app.screen._resource_loading and "scraped every 5 s" in str(
+            app.screen.query_one("#resource-status", Static).render()))
+        assert ok
+        seen = []
+        for width in range(130, 40, -2):
+            await pilot.resize_terminal(width, 36)
+            await pilot.pause()
+            second = str(app.screen.query_one("#resource-status", Static).render()).split("\n")[1]
+            # The interval, and the freshness clock ("newest 30 s ago (12:34:56)").
+            seen.append(("scraped every 5 s" in second, "(" in second))
+        # Narrower, the clock goes first, then the interval: never the interval while the clock shows.
+        assert (True, True) in seen and (True, False) in seen and (False, True) not in seen, seen
+        await _settle(app, pilot)
+
+
+def test_a_narrow_resource_header_drops_the_clock_before_the_scrape_interval(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    asyncio.run(_run_resource_narrow_header_keeps_the_scrape_interval_last())
 
 
 async def _run_resource_partial_other_sub_job_retries():
@@ -1729,7 +1791,7 @@ def test_e_jumps_to_the_errors_and_the_bar_says_where_the_reader_is():
             assert s._jump == ("problem", 3, 3) and bar(s)[1].strip() == "problem 3/3"
             _live_page(s, ["line new"])
             await pilot.pause()
-            assert bar(s)[0] == "⏸ PAUSED · 2 new lines · p resumes"  # (the third failure, and this)
+            assert bar(s)[0] == "‖ PAUSED · 2 new lines · p resumes"  # (the third failure, and this)
             await pilot.press("p")
             await pilot.pause()
             assert not s._paused and s._logview.mark is None and s._jump is None
@@ -2869,6 +2931,9 @@ def test_a_drag_in_a_job_list_cell_highlights_and_copies_just_its_text():
 
 async def _run_a_double_click_that_opens_a_job_leaves_the_list_unhighlighted():
     app = CortexTrainingLogTUI(FakeClient(), poll_interval=0.01)
+    # Each simulated event waits for a pause, so on a slow runner the two clicks can land
+    # further apart than Textual's 0.5 s double-click window; widen it so they still chain.
+    app.CLICK_CHAIN_TIME_THRESHOLD = 10.0
     async with app.run_test(size=(150, 40)) as pilot:
         screen, table = await _demo_list(app, pilot)
         mouse = _pointer(app, pilot)
@@ -2969,7 +3034,7 @@ async def _run_a_drag_across_job_list_rows_copies_that_span():
         assert first.startswith(lines[y][20:40]) and last.startswith(lines[y + 3][:40])
         assert last.endswith(lines[y + 3][56:61]) and "PENDING" in last
         assert re.search(r"\d{4}-\d\d-\d\d \d\d:\d\d", first) and "ago" not in text
-        assert not set("●◔◐○✕⊘✓") & set(text)
+        assert not set("●◔◐○×−✓") & set(text)
         # Drawn over the same characters (a line's trailing blank isn't copied, nor drawn).
         assert _highlighted_columns(app, y, table) == list(range(20, len(lines[y].rstrip())))
         assert _highlighted_columns(app, y + 1, table) == list(range(len(lines[y + 1].rstrip())))
@@ -2978,12 +3043,12 @@ async def _run_a_drag_across_job_list_rows_copies_that_span():
         # Held below the list, the drag stays in its rows: nothing else is highlighted.
         await _drag(mouse, (10, y + 4), (10, 38), via=[(10, 30), (10, 36)])
         assert set(screen.selections) == {table}
-        # A drag that starts on the column names stays on them.
+        # A drag that starts on the column names stays on them; the bars drawn between them aren't copied.
         names = table.region.y
         await _drag(mouse, (4, names), (40, names + 7), via=[(20, names + 3)])
         selection = screen.selections[table]
         assert (selection.start.y, selection.end.y) == (0, 0)
-        assert await _copied(app, pilot, copied) == lines[names][4:41].rstrip()
+        assert await _copied(app, pilot, copied) == lines[names][4:41].replace("┃", " ").rstrip()
         # A change to the rows (e: every job unfolded) drops a highlight in them.
         await _drag(mouse, (8, y), (16, y), via=[(12, y)])
         assert screen.selections
@@ -2994,6 +3059,86 @@ async def _run_a_drag_across_job_list_rows_copies_that_span():
 
 def test_a_drag_across_job_list_rows_copies_that_span():
     asyncio.run(_run_a_drag_across_job_list_rows_copies_that_span())
+
+
+async def _run_a_drag_on_a_column_s_bar_resizes_that_column():
+    from cortex_training.tui.clipboard import selected_text
+    from textual import events
+
+    app = CortexTrainingLogTUI(FakeClient(), poll_interval=0.01)
+    async with app.run_test(size=(200, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        mouse = _pointer(app, pilot)
+        names = table.region.y
+
+        def width(label):
+            return next(column.width for column in table.ordered_columns if column.key.value == label)
+
+        def bar_after(label):
+            line = _screen_lines(app)[names]
+            return line.index("┃", line.index(label))
+
+        # A bar at each column's right edge, in its padding: before every name but the first, and after the last.
+        line = _screen_lines(app)[names]
+        assert line.startswith(" Job ID ") and "┃ Status " in line and "┃ Type " in line
+        assert line.rstrip().endswith("Updated ┃")
+        # On a bar, or a blank cell beside one, the bar brightens and the pointer is a sideways arrow.
+        for x in (bar_after("Owner") - 1, bar_after("Owner"), bar_after("Owner") + 1):
+            await mouse(events.MouseMove, x, names)
+            assert table._hovered == "Owner" and table.styles.pointer == "ew-resize"
+        await mouse(events.MouseMove, bar_after("Owner") + 4, names)
+        assert table._hovered is None and table.styles.pointer == "default"
+        await pilot.press("down", "down")
+        cursor, row = table.cursor_row, table.get_row_at(2)
+        # Pressed on a bar, the column's right edge follows the pointer, while the drag lasts too.
+        x = bar_after("Status")
+        await mouse(events.MouseDown, x, names)
+        await mouse(events.MouseMove, x + 3, names)
+        assert width("Status") == 17
+        await mouse(events.MouseMove, x + 6, names)
+        await mouse(events.MouseUp, x + 6, names)
+        assert width("Status") == 20 and bar_after("Status") == x + 6
+        assert not screen.selections
+        # In place: the rows, and the cursor on them, stay; the LIVE row's rule runs the new width.
+        assert table.cursor_row == cursor and all(a is b for a, b in zip(table.get_row_at(2), row))
+        at = bar_after("Job ID") + 1
+        assert _screen_lines(app)[names + 1][at:at + 22] == " " + "─" * 20 + " "
+        # A blank cell either side of a bar takes it too, so a press a cell off still resizes.
+        x = bar_after("Type")
+        await _drag(mouse, (x + 1, names), (x + 3, names), via=[(x + 2, names)])
+        assert width("Type") == 15
+        x = bar_after("Type")
+        await _drag(mouse, (x - 1, names), (x - 3, names), via=[(x - 2, names)])
+        assert width("Type") == 13
+        # A drag on a name highlights it and leaves the widths, from a name's last letter beside its bar too.
+        x = _screen_lines(app)[names].index("Type")
+        await _drag(mouse, (x, names), (x + 3, names), via=[(x + 2, names)])
+        assert selected_text(screen) == "Type"
+        x = bar_after("Duration")  # Duration fills its column: its "n" is beside the bar
+        await _drag(mouse, (x - 1, names), (x - 6, names), via=[(x - 3, names)])
+        assert selected_text(screen) == "ration"
+        assert (width("Type"), width("Duration")) == (13, 8)
+        # No narrower than a few cells.
+        x = bar_after("Model")
+        await _drag(mouse, (x, names), (0, names), via=[(x - 10, names)])
+        assert width("Model") == 3
+        # The widths stay through a refresh and a narrower terminal.
+        await pilot.press("r")
+        assert await _pause_until(pilot, lambda: not screen._refreshing)
+        await pilot.resize_terminal(150, 40)
+        await pilot.pause(0.2)
+        assert (width("Status"), width("Model")) == (20, 3)
+        # A double-click on a bar gives its column back the width the list picks.
+        x = bar_after("Status")
+        await _click(mouse, x, names)
+        await _click(mouse, x, names)
+        assert await _pause_until(pilot, lambda: width("Status") == 14)
+        assert width("Model") == 3
+        await _settle(app, pilot)
+
+
+def test_a_drag_on_a_column_s_bar_resizes_that_column():
+    asyncio.run(_run_a_drag_on_a_column_s_bar_resizes_that_column())
 
 
 async def _run_job_list_clicks_still_click_with_text_selection():
@@ -4611,7 +4756,7 @@ async def _run_e_holds_for_its_list_and_jobs_a_refresh_adds_start_as_usual(fold)
         assert all(screen._is_expanded(job) is not fold for job in listed)  # e's choice holds for them
         by_id = {views.job_id_of(job): job for job in screen._all_jobs}
         assert screen._is_expanded(by_id["new-live-job"]) and not screen._is_expanded(by_id["new-ended-job"])
-        assert screen._all_folded is None
+        assert screen._all_folded == {False: None, True: None}
         await _settle(app, pilot)
 
 
@@ -5095,7 +5240,6 @@ def test_list_times_read_at_a_glance_and_say_how_long_they_last():
 
 
 def test_job_list_rows_say_what_their_columns_don_t():
-    from cortex_training.tui.job_list import _ListLayout
     from cortex_training.tui.job_list import _status_chips
 
     jid = "a" * 36
@@ -5104,7 +5248,7 @@ def test_job_list_rows_say_what_their_columns_don_t():
     # Drawn (.plain) with the theme's glyph; copied (str) as the word alone.
     cancelled = JobListScreen._status_cell("JOB_STATE_CANCELLED")
     running = JobListScreen._status_cell("RUNNING", glyph_only=True)
-    assert (cancelled.plain, str(cancelled)) == ("⊘ CANCELLED", "CANCELLED")
+    assert (cancelled.plain, str(cancelled)) == ("− CANCELLED", "CANCELLED")
     assert (running.plain, str(running)) == ("●", "RUNNING")
 
     job = {"job_id": "j", "status": "RUNNING", "sub_jobs": [
@@ -5138,10 +5282,15 @@ def test_job_list_rows_say_what_their_columns_don_t():
     assert JobListScreen._starts_unfolded({"job_id": "u", "status": "UNKNOWN"})
     assert not JobListScreen._starts_unfolded({**job, "status": "FAILED"})
 
-    layout = _ListLayout((("Job ID", 38), ("Status", 14)))
-    name, rule = JobListScreen._header_cells("HISTORY", 1234, layout)
+    from rich.console import Console
+
+    name, rule = JobListScreen._header_cells("HISTORY", 1234, ("Job ID", "Status"))
     assert str(name) == "HISTORY  1,234"
-    assert str(rule) == "" and rule.text().plain == "─" * 14  # drawn, but not in a copy of the list
+    console = Console(width=80)
+    for width in (14, 20):  # as wide as its column is drawn, a column dragged wider too
+        line, = console.render_lines(rule, console.options.update_width(width), pad=False)
+        assert "".join(segment.text for segment in line) == "─" * width
+    assert str(rule) == ""  # drawn, but not in a copy of the list
 
     live = [{"status": s} for s in ("RUNNING", "queued", "PENDING", "creating", "UNKNOWN", "RUNNING")]
     assert _status_chips(live, 21).plain == "● 2 running   ◔ 1 placing   ○ 2 pending   ? 1 unknown  │  21 in history"
@@ -5232,7 +5381,7 @@ def test_a_highlight_of_job_list_rows_copies_whole_times_and_status_words():
             await _drag(mouse, (0, y), (table.region.right - 1, y), via=[(40, y)])
             row = await _copied(app, pilot, copied)
             assert "RUNNING" in row and re.search(r"\d{4}-\d\d-\d\d \d\d:\d\d", row)
-            assert "ago" not in row and not set("●◔◐○✕⊘✓") & set(row)
+            assert "ago" not in row and not set("●◔◐○×−✓") & set(row)
             # From the LIVE heading through the sub-jobs: the heading's rule isn't copied, a
             # sub-job drawn as the glyph alone copies its word, and the columns stay in line.
             await _drag(mouse, (0, y - 1), (table.region.right - 1, y + 2), via=[(40, y)])
@@ -5540,6 +5689,85 @@ async def _run_the_schema_column_names_each_jobs_database_and_schema():
 
 def test_the_schema_column_names_each_jobs_database_and_schema():
     asyncio.run(_run_the_schema_column_names_each_jobs_database_and_schema())
+
+
+async def _run_the_header_draws_which_list_is_shown_as_a_chip():
+    from dataclasses import replace
+    from cortex_training.tui.account import CAPPED
+    from cortex_training.tui.job_list import _ACCOUNT_CHIP
+    from cortex_training.tui.job_list import _SCHEMA_CHIP
+    from cortex_training.tui.job_list import _ListHeader
+
+    app = CortexTrainingLogTUI(FakeClient(), poll_interval=0.01)
+    async with app.run_test(size=(200, 40)) as pilot:
+        screen, _table = await _demo_list(app, pilot)
+        header = screen.query_one(_ListHeader)
+
+        def chips():
+            title = header.format_title()
+            return [(title.plain[span.start:span.end], str(span.style)) for span in title.spans
+                    if " on " in str(span.style)]
+
+        assert await _pause_until(pilot, lambda: not screen._refreshing)
+        assert chips() == [(f" Current schema: {screen._schema_label()} ", _SCHEMA_CHIP)]
+        screen._refreshing = screen._switching = True  # a pressed, the other list not read yet: no chip
+        assert screen.scope_chip() is None
+        screen._refreshing = screen._switching = False
+        screen, _table = await _account_list(app, pilot)
+        assert chips() == [(" all schemas ", _ACCOUNT_CHIP)]
+        # Cut short, the subtitle says only how far the list got: the chip comes first.
+        screen._scope = replace(screen._scope, walked=2000, stopped=CAPPED)
+        screen._update_subtitle()
+        assert app.sub_title.startswith("last refreshed ") and "all schemas" not in app.sub_title
+        assert header.format_title().plain.startswith("cortex training —  all schemas   ·  last refreshed ")
+        assert chips() == [(" all schemas ", _ACCOUNT_CHIP)]
+        await _settle(app, pilot)
+
+
+def test_the_header_draws_which_list_is_shown_as_a_chip():
+    asyncio.run(_run_the_header_draws_which_list_is_shown_as_a_chip())
+
+
+async def _run_a_long_schema_name_is_whole_where_the_screen_has_room():
+    app = CortexTrainingLogTUI(FakeClient(), poll_interval=0.01)
+    async with app.run_test(size=(200, 40)) as pilot:
+        screen, _table = await _account_list(app, pilot)
+        located = [{"database_name": "ML_PLATFORM_DB", "schema_name": name} for name in ("A", "EXPERIMENTS_TEAM_ALPHA")]
+        assert screen._location_column_width(located) == 37  # its widest name, past the 32 it once stopped at
+        # Room to spare: the column takes the whole name, and every other column keeps its width.
+        wide = dict(screen._layout_for(37).columns)
+        assert (wide["Schema"], wide["Job ID"], wide["Updated"]) == (37, 38, 8)
+        # None to spare: it holds to 32, and its cells cut the database name (see below).
+        await pilot.resize_terminal(150, 40)
+        await pilot.pause(0.1)
+        assert dict(screen._layout_for(37).columns)["Schema"] == 32
+        await _settle(app, pilot)
+
+
+def test_a_long_schema_name_is_whole_where_the_screen_has_room():
+    asyncio.run(_run_a_long_schema_name_is_whole_where_the_screen_has_room())
+
+
+def test_a_schema_cell_too_narrow_cuts_the_database_and_keeps_the_schema():
+    from rich.console import Console
+    from cortex_training.tui.job_list import _location_cell
+
+    cell = _location_cell({"database_name": "ML_PLATFORM_DB", "schema_name": "EXPERIMENTS_A"})
+    console = Console(width=80)
+
+    def drawn(width):
+        line, = console.render_lines(cell, console.options.update_width(width), pad=False)
+        return "".join(segment.text for segment in line)
+
+    assert drawn(40) == "ML_PLATFORM_DB.EXPERIMENTS_A"
+    # Two schemas of one database still read apart, so the cut is in the database name.
+    assert drawn(20) == "ML_PL….EXPERIMENTS_A"
+    assert drawn(15) == "….EXPERIMENTS_A"
+    assert drawn(10) == "ML_PLATFO…"  # too narrow for the schema too: the end is cut, as any cell's is
+    assert str(cell) == "ML_PLATFORM_DB.EXPERIMENTS_A"  # copied whole
+    quoted = _location_cell({"database_name": "ml", "schema_name": "dev"})
+    assert str(quoted) == '"ml"."dev"'
+    assert str(_location_cell({})) == "—"
 
 
 async def _run_a_whole_location_in_the_search_is_read_from_the_service():

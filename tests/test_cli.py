@@ -67,6 +67,7 @@ class FakeClient:
         self.capacity_breakdown_errors = {}
         self.checkpoints_job_id = None
         self.jobs = None
+        self.models_requested = False
         self.account_jobs = []
         self.account_jobs_pulled = 0
         self.iter_jobs_filters = None
@@ -91,6 +92,13 @@ class FakeClient:
         if self.jobs is not None:
             return self.jobs
         return [{"job_id": "j1", "status": status or "running"}]
+
+    def list_models(self):
+        self.models_requested = True
+        return [
+            {"name": "Qwen/Qwen3-0.6B"},
+            {"name": "Qwen/Qwen3-8B"},
+        ]
 
     def iter_jobs(self, **filters):
         self.iter_jobs_filters = filters
@@ -605,6 +613,17 @@ def test_submit_dry_run_prints_the_normalized_peft_config(tmp_path):
     peft = json.loads(stdout.getvalue())["sub_job_configs"][0]["training_config"]["peft_config"]
     assert peft["task_type"] == "CAUSAL_LM"
     assert peft["target_parameters"] == []
+
+
+def test_submit_dry_run_prints_arctic_provider_as_prime_rl():
+    stdout = io.StringIO()
+    path = Path(__file__).resolve().parents[1] / "examples" / "api" / "training.json"
+
+    rc = cli.main(["submit", str(path), "--dry-run"], stdout=stdout)
+
+    assert rc == 0
+    config = json.loads(stdout.getvalue())["sub_job_configs"][0]["training_config"]
+    assert config["model_provider"] == "prime_rl"
 
 
 # Spellings a caller could plausibly put in job JSON for the unsupported
@@ -1177,6 +1196,34 @@ def test_list_sorts_missing_created_at_after_dated_jobs():
         "latest",
         "missing",
     ]
+
+
+def test_models_dispatches_without_job_id_and_prints_models():
+    instances = []
+    stdout = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["models"],
+        client_factory=_factory(instances),
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert instances[0].models_requested is True
+    assert json.loads(stdout.getvalue()) == {
+        "models": [
+            {"name": "Qwen/Qwen3-0.6B"},
+            {"name": "Qwen/Qwen3-8B"},
+        ],
+    }
+
+
+def test_models_help_explains_model_availability(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        cli.parse_args(["models", "--help"])
+
+    assert exc_info.value.code == 0
+    assert "List active models configured for new jobs." in capsys.readouterr().out
 
 
 def test_get_prints_job():
@@ -2564,7 +2611,7 @@ def test_download_interrupted_after_the_files_are_written_prints_the_resume_hint
     monkeypatch.setattr(client, "_experiment_run_uri", lambda _job: ("snow://run/", "RUN"))
     monkeypatch.setattr(client, "_open_experiment_artifact_connection", MagicMock)
     monkeypatch.setattr(
-        client, "_list_gzip_chunks", lambda *_args: ({sub: ["_metrics/c0.gz"]}, {})
+        client, "_list_gzip_chunks", lambda *_args, **_kwargs: ({sub: ["_metrics/c0.gz"]}, {})
     )
     # The stall check outlives the wait, as when the job lookup is slow.
     monkeypatch.setattr(client, "_STALL_CHECK_WAIT_SECONDS", 0.05)
@@ -3027,6 +3074,33 @@ def test_http_errors_include_response_details():
     assert "500 Server Error" in err
     assert "snowflake request id: sf-req-1" in err
     assert 'response body: {"message":"backend detail"}' in err
+
+
+def test_a_schema_not_found_error_shows_the_server_message_once():
+    import requests
+
+    from cortex_training import CortexTrainingClient
+
+    client = CortexTrainingClient(
+        base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="PUBLIC", max_retries=0
+    )
+    message = "Schema MY_DB.PUBLIC is not found or not authorized"
+    response = requests.Response()
+    response.status_code = 400
+    response.url = "https://test.snowflakecomputing.com/error"
+    response.headers["Content-Type"] = "application/json"
+    response._content = json.dumps({"code": "517602", "message": message}).encode()
+    response._content_consumed = True
+    client._session = MagicMock()
+    client._session.get.return_value = response
+    stderr = io.StringIO()
+
+    rc = cli.main(["get", "job-1"], client_factory=lambda _args: client, stderr=stderr)
+
+    err = stderr.getvalue()
+    assert rc == 1
+    assert err.startswith("error: Role <ROLE> (couldn't determine your role) can't find database MY_DB")
+    assert err.count(message) == 1
 
 
 def test_invalid_job_json_returns_error(tmp_path):

@@ -1,17 +1,18 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The job screen's Training metrics tab.
+"""The job screen's Training metrics tab, and the base it shares with the Serving tab
+(:class:`~cortex_training.tui.serving_view.ServingPane`).
 
-The tab is one widget that reads and draws its own data, so the job screen
+Each tab is one widget that reads and draws its own data, so the job screen
 only places it, tells it when it is shown (:meth:`activate`) and when a live
 job's periodic refresh is due (:meth:`refresh_live`). It reads the job as the
-screen knows it through the ``job`` callable it is given, and fetches its rows
-through the screen's ``download``, which writes into the same cache directory
-as the Resources tab, under the same lock.
+screen knows it through the ``job`` callable it is given, and fetches its data
+through the screen's ``download``: Training metrics into the same cache directory
+as the Resources tab, under the same lock; Serving into its own copy of the console.
 
-The pane's keys (``w``, ``a``, ``Space``, ``r``) are its own bindings, which win
-over the screen's while the focus is inside the pane.
+A pane's keys (Training metrics' ``w``, ``a``, ``Space``, ``r``; Serving's ``r``) are
+its own bindings, which win over the screen's while the focus is inside the pane.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from pathlib import Path
 import threading
 from typing import Callable
 
+from rich.style import Style
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
@@ -39,12 +41,15 @@ from cortex_training.tui import views
 from cortex_training.tui.resource import CHART_AXIS
 from cortex_training.tui.resource import CHART_MUTED
 from cortex_training.tui.resource import chart_hue
+from cortex_training.tui.theme import WARN_TEXT
+from cortex_training.tui.widgets import _download_options
 
-_WARNING = "#fbbf24"
+_WARNING = WARN_TEXT  # a warning's text, as on the Logs tab
 
 
 class _Pane(Vertical):
-    """What both tabs share: posting a worker's answer to the UI thread while the pane is up."""
+    """What the Training metrics and Serving panes share: being shown (and so loaded), and
+    posting a worker's answer to the UI thread while the pane is up."""
 
     def __init__(self, client, job_id: str, *, job: Callable[[], dict], id: str) -> None:
         super().__init__(id=id)
@@ -54,6 +59,11 @@ class _Pane(Vertical):
         self._shown = False  # activated at least once: the first show loads
         self._loading = False
         self._error: str | None = None
+
+    @property
+    def opened(self) -> bool:
+        """Whether the tab was opened at least once (and so has loaded), not whether it is on screen now."""
+        return self._shown
 
     def _post(self, fn, *args) -> None:
         """Worker thread: run ``fn(*args)`` on the UI thread, dropped once the pane is gone."""
@@ -115,13 +125,14 @@ class _Pane(Vertical):
     def refresh_live(self) -> None:
         """UI thread. A live job's periodic refresh, while the tab is shown."""
         if self._shown and self._live():
-            self.reload()
+            self.reload(live=True)
 
     def action_refresh(self) -> None:
         self._shown = True
         self.reload()
 
-    def reload(self) -> None:
+    def reload(self, *, live: bool = False) -> None:
+        """UI thread. Read the tab's data again; ``live`` for a live job's periodic refresh."""
         raise NotImplementedError
 
     def redraw(self) -> None:
@@ -149,6 +160,20 @@ def training_loader(metrics_root: Path, local_root: Path | None = None) -> train
 # Two charts to a row in a pane at least this wide, as on the Resources tab.
 _TWO_CHARTS_WIDTH = 90
 _CHART_HEIGHT = 6
+# The header's window and metrics words: a click on one does what its key does (see _TrainingStatus).
+_CLICK_WINDOW = Style.from_meta({"@click": "cycle_window"})
+_CLICK_EVERYTHING = Style.from_meta({"@click": "toggle_everything"})
+
+
+class _TrainingStatus(Static):
+    """The Training metrics header. A click on its window or on what metrics it shows runs here
+    (Textual sends a click's action to the widget clicked), and goes on to the pane, as w and a do."""
+
+    def action_cycle_window(self) -> None:
+        self.query_ancestor(TrainingPane).action_cycle_window()
+
+    def action_toggle_everything(self) -> None:
+        self.query_ancestor(TrainingPane).action_toggle_everything()
 
 
 class TrainingPane(_Pane):
@@ -174,6 +199,9 @@ class TrainingPane(_Pane):
         self._window = training.DEFAULT_WINDOW
         self._everything = False  # also the metrics in training.HIDDEN_METRICS
         self._pick: str | None = None  # the sub-job Space last showed
+        # The sub-job the download running now is of, alone; and an r to do once it ends.
+        self._loading_scope: str | None = None
+        self._whole_pending = False
 
     # How often the local log is read while the tab is shown: it gains a row the moment a result
     # arrives, so a step appears within this, not after the stage's batched upload.
@@ -199,7 +227,7 @@ class TrainingPane(_Pane):
             self._post(self._accept, data)
 
     def compose(self) -> ComposeResult:
-        yield Static("", id="training-status")
+        yield _TrainingStatus("", id="training-status")
         with VerticalScroll(id="training-pane"):
             # Per step, then per /fwd-bwd call, one after the other.
             for view in training.VIEWS:
@@ -254,8 +282,10 @@ class TrainingPane(_Pane):
         return {series.name: chart_hue(index) for index, series in enumerate(sub_job.metrics(view, everything=True))}
 
     # ── reading ──
-    def reload(self) -> None:
+    def reload(self, *, live: bool = False) -> None:
         if self._loading:
+            if not live and self._loading_scope is not None:
+                self._whole_pending = True  # r while one sub-job alone downloads: every sub-job's next
             return
         if self._job().get("sub_jobs") and not self._sub_job_ids():
             self._downloaded = True  # no training sub-job: nothing to download for this tab
@@ -263,10 +293,15 @@ class TrainingPane(_Pane):
             return
         self._loading = True
         self.redraw()
-        self._refresh()
+        # A live job's refresh, once a whole-job download is in, downloads the tab's only sub-job
+        # alone: its LIST then returns that sub-job's chunks rather than the whole run's. With more,
+        # Space shows each as the newest refresh left it, so they are all downloaded.
+        ids = self._sub_job_ids()
+        self._loading_scope = ids[0] if live and self._downloaded and len(ids) == 1 else None
+        self._refresh(self._loading_scope)
 
     @work(thread=True, exclusive=True, group="training")
-    def _refresh(self) -> None:
+    def _refresh(self, scope: str | None = None) -> None:
         worker = get_current_worker()
         loader = training_loader(self._metrics_root, self._local_root)
 
@@ -275,21 +310,27 @@ class TrainingPane(_Pane):
             if not worker.is_cancelled:
                 self._post(self._accept, data)
 
+        # Once _finish is posted, a cancel is the next refresh starting (from _finish itself, for a
+        # queued r): saying so would mark that one finished while it runs.
+        finished = False
         try:
             show()  # what is cached, while the download runs
             source = self._source()
+            alone = _download_options(self._download, {"sub_job_ids": [scope]}) if scope else {}
             ok = self._download(priority=[source] if source else [], on_commit=lambda _result: show(),
-                                cancelled=lambda: worker.is_cancelled)
+                                cancelled=lambda: worker.is_cancelled, **alone)
             if not ok or worker.is_cancelled:
                 return
             data = loader.load()
             if not worker.is_cancelled:
+                finished = True
                 self._post(self._finish, data, None)
         except Exception as exc:  # noqa: BLE001 - said in the tab's header
             if not worker.is_cancelled:
+                finished = True
                 self._post(self._finish, None, views.access_hint(exc, "training metrics") or views.describe_error(exc))
         finally:
-            if worker.is_cancelled:
+            if worker.is_cancelled and not finished:
                 self._post(self._cancelled)
 
     def _accept(self, data: training.TrainingData) -> None:
@@ -298,15 +339,21 @@ class TrainingPane(_Pane):
 
     def _finish(self, data: training.TrainingData | None, error: str | None) -> None:
         self._loading = False
+        self._loading_scope = None
         self._error = error
         if data is not None:
             self._data = data
         if error is None:
             self._downloaded = True
         self.redraw()
+        if self._whole_pending:
+            # r while a download of one sub-job alone ran: every sub-job's, now.
+            self._whole_pending = False
+            self.reload()
 
     def _cancelled(self) -> None:
         self._loading = False
+        self._loading_scope = None
 
     # ── drawing ──
     def _width(self) -> int:
@@ -359,12 +406,13 @@ class TrainingPane(_Pane):
             if sub_job.newest is not None:
                 text.append(f"  ·  newest row {views.fmt_ago(sub_job.newest, datetime.now(timezone.utc))}")
         if source is not None:
-            text.append(f"  ·  {training.window_label(self._window)} (w)")
+            # Each also a click away: the window cycles as w does, what is shown toggles as a does.
+            text.append("  ·  ")
+            text.append(f"{training.window_label(self._window)} (w)", style=_CLICK_WINDOW)
             hidden = sum(sub_job.hidden(view) for view in training.VIEWS) if sub_job is not None else 0
-            if self._everything:
-                text.append("  ·  all metrics (a)")
-            elif hidden:
-                text.append(f"  ·  {hidden:,} hidden (a)")
+            if hidden or self._everything:
+                text.append("  ·  ")
+                text.append("all metrics (a)" if self._everything else "training signals (a)", style=_CLICK_EVERYTHING)
         notes = []
         if self._loading:
             notes.append(("cached · refreshing…" if sub_job else "loading training metrics…", CHART_MUTED))

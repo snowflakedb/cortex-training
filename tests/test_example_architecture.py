@@ -198,6 +198,26 @@ def test_moe_rl_example_fills_router_replay_with_the_fixed_default_caps():
     assert replay["max_cache_bytes"] == utils.DEFAULT_ROUTER_REPLAY_TRAINING_CACHE_BYTES
 
 
+def _sampling_window_exceeds_training(utils, model: str, context: str, hardware: str, lora: bool) -> bool:
+    """Whether this tier's inference file samples past its training window.
+
+    ``make_config(..., rl=True)`` rejects that pair. The catalog keeps both files
+    and builds no RL job, matching ``validate_catalog``.
+    """
+    folder = REPO_ROOT / "model-catalog" / "models" / utils.model_slug(model) / context
+
+    def window(kind: str):
+        path = folder / utils.catalog_file_name(hardware, kind, lora)
+        if not path.is_file():
+            return None
+        sub_job = json.loads(path.read_text())["sub_job_configs"][0]
+        block = sub_job.get("training_config") or sub_job.get("inference_config") or {}
+        return block.get("max_seq_len")
+
+    training, sampling = window("training"), window("inference")
+    return isinstance(training, int) and isinstance(sampling, int) and sampling > training
+
+
 def test_rl_overrides_restore_betas_packing_and_reduce_scatter_for_every_model():
     # rl/overrides.json restores the three RL settings shared by the pre-restructure
     # configs, for the default RL job and every model's RL job.
@@ -208,6 +228,8 @@ def test_rl_overrides_restore_betas_packing_and_reduce_scatter_for_every_model()
         folder = REPO_ROOT / "model-catalog" / "models" / utils.model_slug(model) / context
         if not (folder / utils.catalog_file_name(hardware, "inference", lora)).is_file():
             continue  # not an RL-capable selection (no matching inference file)
+        if _sampling_window_exceeds_training(utils, model, context, hardware, lora):
+            continue
         body = utils.build_job("rl", model=model, context=context, hardware=hardware, lora=lora, example_dir=rl_dir)
         training = _sub_job(body, "training")["training_config"]
         where = (model, context, hardware, lora)
@@ -848,6 +870,14 @@ def test_follow_up_commands_pick_an_inference_file_that_serves_the_checkpoint(mo
 
     args = utils.inference_job_args(body, context=context)
 
+    if args == {"job_config": utils.INFERENCE_JOB_CONFIG_PLACEHOLDER}:
+        # A training mesh with no sampler of this mode has nothing to follow up with.
+        folder = REPO_ROOT / "model-catalog" / "models" / utils.model_slug(model)
+        assert not any(
+            (folder / candidate / utils.catalog_file_name(hardware, "inference", lora)).is_file()
+            for candidate in ("standard", "long")
+        ), (model, context, hardware, lora)
+        return
     assert set(args) == {"model", "context", "hardware", "lora"}
     assert (args["model"], args["hardware"], args["lora"]) == (model, hardware, lora)
     _assert_serves_checkpoint(utils, body["sub_job_configs"][0], args)
@@ -874,6 +904,8 @@ def test_rl_follow_up_commands_serve_the_checkpoint():
     for model, context, hardware, lora in _catalog_selections("training"):
         folder = REPO_ROOT / "model-catalog" / "models" / utils.model_slug(model) / context
         if not (folder / utils.catalog_file_name(hardware, "inference", lora)).is_file():
+            continue
+        if _sampling_window_exceeds_training(utils, model, context, hardware, lora):
             continue
         body = utils.build_job("rl", model=model, context=context, hardware=hardware, lora=lora, rollout_batch_size=8)
         args = utils.inference_job_args(body, context=context)
@@ -977,6 +1009,25 @@ def test_lora_adapters_match_whatever_the_order_of_their_target_modules():
     assert utils.same_adapter(adapter, dict(adapter, target_modules=["v_proj", "q_proj"], task_type="CAUSAL_LM"))
     assert not utils.same_adapter(adapter, dict(adapter, r=16))
     assert not utils.same_adapter(adapter, None)
+
+
+def test_deepseek_v4_trainer_and_vllm_module_names_are_the_same_adapter():
+    utils = _import_example("examples.utils")
+    trainer = {
+        "peft_type": "Lora",
+        "r": 32,
+        "lora_alpha": 32,
+        "target_modules": r".*self_attn\.(q_a_proj|q_b_proj|kv_proj|o_b_proj)$",
+    }
+    sampler = {
+        "peft_type": "Lora",
+        "r": 32,
+        "lora_alpha": 32,
+        "target_modules": ["wq_a", "wkv", "wq_b", "wo_b"],
+    }
+
+    assert utils.same_adapter(trainer, sampler)
+    assert not utils.same_adapter(trainer, dict(sampler, target_modules=["wq_a"]))
 
 
 @pytest.mark.parametrize(

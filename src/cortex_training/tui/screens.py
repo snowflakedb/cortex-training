@@ -48,10 +48,12 @@ from cortex_training.tui.widgets import close_keys_panel
 from cortex_training.tui.widgets import hanging
 from cortex_training.tui.widgets import is_shown
 
-def status_text(status) -> Text:
+def status_text(status, word=None) -> Text:
     """A status as the sub-job table shows it, a badge: ``● RUNNING``, in the
-    theme's glyph and color for it (:func:`~cortex_training.tui.theme.status_badge`)."""
-    word = v.status_word(status)
+    theme's glyph and color for it (:func:`~cortex_training.tui.theme.status_badge`).
+    ``word`` overrides the word shown (a deployment's own status words), colors
+    still come from ``status`` itself."""
+    word = word if word is not None else v.status_word(status)
     look = theme.status_look(status)
     return Text.assemble((f"{look.glyph} ", look.color), (word.upper(), look.style)) if word != "?" else Text("?")
 
@@ -114,8 +116,9 @@ class JobSummaryScreen(FollowsPointer, Screen):
         KEYS_BINDING,
         ("l", "open('logs')", "Logs"),
         ("g", "open('resource')", "Resources"),
-        Binding("m", "open('training')", "Training metrics", show=False),
+        ("m", "open('training')", "Training metrics"),
         ("c", "open('checkpoints')", "Checkpoints"),
+        ("v", "open('serving')", "Serving"),
         ("r", "refresh", "Refresh"),
         # check_action exposes the applicable expansion binding.
         Binding("e", "expand_values", "Full text"),
@@ -162,6 +165,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
         self._reread_on_resume = False  # set when the details open over this preview
         self._expanded = False  # e: every value whole, however long, and the whole sub-job table
         self._long = False  # some value or table cell is (or, expanded, would be) cut
+        self._footer_keys: tuple | None = None  # (long, is a deployment) the footer was last built for
         self._table_shown = None  # what the sub-job table holds, so an unchanged refresh leaves it be
 
     def compose(self) -> ComposeResult:
@@ -235,6 +239,8 @@ class JobSummaryScreen(FollowsPointer, Screen):
             return self._long and not self._expanded
         if action == "collapse_values":
             return self._long and self._expanded
+        if action == "open" and parameters:
+            return parameters[0] in v.job_tabs(self._job)
         return True
 
     def action_expand_values(self) -> None:
@@ -257,7 +263,8 @@ class JobSummaryScreen(FollowsPointer, Screen):
         # markup, so it shows literally. Each wrapped row's indent is a run of its
         # own too, so the text after it starts where the indent ends.
         self.query_one("#hero", Static).update(Content("\n").join(self._hero(width, now)))
-        grid, long = self._grid(v.preview_facts(job, now), width)
+        base_url = self._client.model_deployment_base_url if v.is_deployment(job) else ""
+        grid, long = self._grid(v.preview_facts(job, now, base_url=base_url), width)
         self.query_one("#preview", Static).update(Content("\n").join(grid + self._lifecycle_rows(now, width)))
         self._render_fetch()
         self._render_health()
@@ -282,19 +289,28 @@ class JobSummaryScreen(FollowsPointer, Screen):
         card = self.query_one("#subjobs-card")
         card.border_title = Content.styled(" Sub-jobs ", f"bold {theme.TEXT}")
         card.border_subtitle = Content.styled(f" {' · '.join(hints)} ", theme.MUTED)
-        if long != self._long:
-            self._long = long
-            self.refresh_bindings()  # e appears in the footer, or goes
+        self._long = long
+        keys = (long, v.is_deployment(self._job))
+        if keys != self._footer_keys:
+            # e comes or goes, or a job opened by id turned out to be a deployment.
+            self._footer_keys = keys
+            self.refresh_bindings()
 
     # The next steps from here, under the title: the footer has them too, but it
-    # cuts its end on a narrow screen, and these say what each one opens.
-    _ACTIONS = (("l", "Logs"), ("g", "Resources"), ("c", "Checkpoints"))
+    # cuts its end on a narrow screen, and these say what each one opens: the tabs, in the job screen's order.
+    _ACTIONS = (("serving", "v", "Serving"), ("logs", "l", "Logs"), ("resource", "g", "Resources"),
+                ("training", "m", "Training metrics"), ("checkpoints", "c", "Checkpoints"))
+
+    def _actions(self) -> tuple:
+        tabs = v.job_tabs(self._job)
+        return tuple((key, label) for tab, key, label in self._ACTIONS if tab in tabs)
 
     def _hero(self, width: int, now: datetime) -> list:
         """The card's head, as rows: the job id, its status pill and how long it
         has been going; then the next steps' keys."""
         job = self._job
-        pill = theme.status_pill(job.get("status"))
+        word = v.status_word_for(job, job.get("status")) if v.is_deployment(job) else None
+        pill = theme.status_pill(job.get("status"), word=word)
         elapsed = v.elapsed_text(job, now)
         tail = Content.assemble("   ", pill, *(("   ", (elapsed, theme.MUTED)) if elapsed else ()))
         rows = []
@@ -305,7 +321,8 @@ class JobSummaryScreen(FollowsPointer, Screen):
         title = v.fit_cells(v.job_id_of(job) or self._job_id, max(self._TITLE_LEAST, width - tail.cell_length))
         rows.insert(0, Content.styled(title, f"bold {theme.TEXT}") + tail)
         actions = Content("   ").join(
-            Content.assemble((key, f"bold {theme.ACCENT}"), (f" {label}", theme.MUTED)) for key, label in self._ACTIONS)
+            Content.assemble((key, f"bold {theme.ACCENT}"), (f" {label}", theme.MUTED))
+            for key, label in self._actions())
         return [*rows, actions]
 
     def _fact_rows(self, label: str, value: str, width: int) -> tuple:
@@ -411,7 +428,8 @@ class JobSummaryScreen(FollowsPointer, Screen):
         """The sub-job table's rows as ``(key, cells)``; also maps each row to its scope."""
         self._scope_by_row = {"all": None}
         self._sub_job_by_row = {}
-        rows = [("all", [Text("▸ entire job", style="bold"), Text(v.job_type_label(job)), status_text(job.get("status")),
+        rows = [("all", [Text("▸ entire job", style="bold"), Text(v.job_type_label(job)),
+                         status_text(job.get("status"), word=v.status_word_for(job, job.get("status"))),
                          Text(", ".join(v.job_models(job)) or "—"), Text(v.job_gpu_cell(job, "requested"))])]
         if v.is_unknown(job):
             rows.append(("note", [Text("  ? status unavailable", style=theme.WARN), Text(""), status_text("unknown"),
@@ -421,8 +439,8 @@ class JobSummaryScreen(FollowsPointer, Screen):
             self._scope_by_row[key] = sj.get("sub_job_id")
             self._sub_job_by_row[key] = sj
             rows.append((key, [Text(f"  {v.sub_job_label(sj)}"), Text(v.sub_job_type(sj)),
-                               status_text(sj.get("status")), Text(str(sj.get("model_name") or "—")),
-                               Text(v.sub_job_gpu_text(sj))]))
+                               status_text(sj.get("status"), word=v.status_word_for(job, sj.get("status"))),
+                               Text(str(sj.get("model_name") or "—")), Text(v.sub_job_gpu_text(sj))]))
         return rows
 
     # Sub-jobs' configs go side by side on the job's row while each column has
@@ -518,7 +536,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
         else:
             after_refresh(self, body.scroll_to_widget, table, animate=False)
 
-    # The callout's color, by its tone: red for a failure, amber while waiting (or
+    # The callout's color, by its tone: red for a failure, orange while waiting (or
     # when the state is unavailable), calm once the job ended without failing.
     _TONES = {"failed": theme.ERR, "waiting": theme.WARN, "unknown": theme.WARN, "starting": theme.INFO,
               "running": theme.OK, "ended": theme.ENDED}

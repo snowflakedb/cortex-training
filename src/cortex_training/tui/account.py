@@ -182,6 +182,15 @@ def _walked_text(scope: ListScope) -> str:
     return held + ("" if scope.active_missing else " + every active job") + f" ({_more(scope)})"
 
 
+def scope_name(scope: ListScope, *, location: str, declined: bool = False) -> str:
+    """The words of :func:`scope_text` that name which list it is: ``all schemas``, else
+    ``Current schema: DB.SCHEMA`` (``Current schema only:`` where it stands in for all schemas,
+    ``declined`` or unavailable). The job list's header draws them as a chip."""
+    if scope.kind == ACCOUNT:
+        return "all schemas"
+    return f"Current schema{' only' if declined or scope.kind != SCHEMA else ''}: {location}"
+
+
 def scope_text(scope: ListScope, *, location: str, only: str = "", declined: str = "") -> str:
     """A short header for this scope; ``only`` names its sole location, and ``declined`` why
     ``a`` couldn't show all schemas, for the configured schema's list shown in their place.
@@ -189,20 +198,21 @@ def scope_text(scope: ListScope, *, location: str, only: str = "", declined: str
     A narrowed listing (:attr:`ListScope.narrowed`) says so in place of ``only``: the rows do
     share one location, but because the walk asked for it, not because the account holds no other.
     """
+    name = scope_name(scope, location=location, declined=bool(declined))
     if scope.kind == ACCOUNT:
         narrowed = f"narrowed to {scope.narrowed}" if scope.narrowed else ""
         if scope.truncated:
             walked = _walked_text(scope)
             return f"{narrowed}: {walked}" if narrowed else walked
         if narrowed:
-            return f"all schemas, {narrowed}"
-        return f"all schemas (all in {only})" if only else "all schemas"
+            return f"{name}, {narrowed}"
+        return f"{name} (all in {only})" if only else name
     if scope.kind == SCHEMA:
-        current = f"Current schema only: {location} ({declined})" if declined else f"Current schema: {location}"
+        current = f"{name} ({declined})" if declined else name
         # Scoped to its one schema, this list is read a page at a time like the account-wide
         # one, so it too can be cut short or still loading.
         return f"{current}, {_walked_text(scope)}" if scope.truncated else current
-    return f"Current schema only: {location} ({unavailable_text(scope)})"
+    return f"{name} ({unavailable_text(scope)})"
 
 
 def unavailable_text(scope: ListScope) -> str:
@@ -224,16 +234,16 @@ def loaded_text(scope: Optional[ListScope]) -> str:
     return held + ("" if scope.active_missing else " and every active job") + f"; {_more(scope)}"
 
 
-def empty_text(scope: ListScope) -> str:
-    """The list's message when a walk cut short (or still loading) left no job to show."""
+def empty_text(scope: ListScope, what: str = "jobs") -> str:
+    """The list's message when a walk cut short (or still loading) left no job (or ``what``) to show."""
     where = f" in {scope.narrowed}" if scope.narrowed else ""
     which = "The account-wide list" if scope.kind == ACCOUNT else "This schema's list"
     if scope.loading:
-        return (f"{which} has no jobs to show among its newest {scope.walked:,}{where} yet; "
+        return (f"{which} has no {what} to show among its newest {scope.walked:,}{where} yet; "
                 f"{'older' if scope.loading == OLDER else 'older active'} jobs are still loading.")
     held = (f"in its first {scope.pages} pages" if scope.stopped == PAGE_LIMIT
             else f"among its newest {scope.walked:,}")
-    return f"{which} returned no jobs to show {held}{where}; more may exist. r reads it again."
+    return f"{which} returned no {what} to show {held}{where}; more may exist. r reads it again."
 
 
 def _one_line(text: str) -> str:

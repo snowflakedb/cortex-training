@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from dataclasses import replace
 from datetime import datetime
 from datetime import timezone
+from rich.segment import Segment
+from rich.style import Style
 from rich.text import Text
 from textual import events
 from textual import work
@@ -37,7 +39,9 @@ from textual.containers import VerticalScroll
 from textual.content import Content
 from textual.coordinate import Coordinate
 from textual.css.query import NoMatches
+from textual.geometry import Region
 from textual.screen import Screen
+from textual.strip import Strip
 from textual.widgets import DataTable
 from textual.widgets import Footer
 from textual.widgets import Header
@@ -58,10 +62,13 @@ from cortex_training.tui.account import Listing
 from cortex_training.tui.account import ListScope
 from cortex_training.tui.account import empty_text
 from cortex_training.tui.account import loaded_text
+from cortex_training.tui.account import scope_name
 from cortex_training.tui.account import scope_text
 from cortex_training.tui.account import stopped_scope
 from cortex_training.tui.account import unavailable_text
+from cortex_training.tui.format import cut_cells
 from cortex_training.tui.format import format_created_at
+from cortex_training.tui.format import one_line
 from cortex_training.tui.widgets import FollowsPointer
 from cortex_training.tui.widgets import _BLANK
 from cortex_training.tui.widgets import _ERROR_LOG
@@ -84,18 +91,70 @@ from cortex_training.tui.widgets import wrapped_parts
 _SCHEMA_COLUMN = "Schema"
 
 
+# The header's chip naming the list on screen: all schemas filled in the brand blue, the
+# configured schema's own list in the text color, so which one is shown reads at a glance.
+_ACCOUNT_CHIP = f"bold {theme.BACKGROUND} on {theme.ACCENT}"
+_SCHEMA_CHIP = f"bold {theme.BACKGROUND} on {theme.TEXT}"
+
+
+class _ListHeader(Header):
+    """The job list's header, its subtitle dim as every screen's but for the words naming the
+    list on screen (see :meth:`JobListScreen.scope_chip`), drawn as a chip; put first where the
+    line doesn't name the list (all schemas cut short says only how far it got)."""
+
+    def format_title(self) -> Content:
+        title, sub_title = self.screen_title, self.screen_sub_title
+        chip = self.screen.scope_chip() if sub_title else None
+        if chip is None:
+            return super().format_title()
+        words, style = chip
+        at = sub_title.find(words)
+        before, after = (sub_title[:at], sub_title[at + len(words):]) if at >= 0 else ("", "  ·  " + sub_title)
+        return Content.assemble(title, (" — ", "dim"), (before, "dim"), (f" {words} ", style), (after, "dim"))
+
+
 class _RuleCell(_FixedCell):
-    """A hairline across a column (a LIVE/HISTORY heading's): drawn, but no text, so a
-    copy of the list (``str()`` of each cell) leaves it out."""
+    """A hairline across a column (a LIVE/HISTORY heading's), as wide as the column is
+    drawn, so it follows a column dragged wider: drawn, but no text, so a copy of the
+    list (``str()`` of each cell) leaves it out."""
 
-    __slots__ = ("rule",)
+    __slots__ = ()
 
-    def __init__(self, width: int, style: str) -> None:
+    def __init__(self, style: str) -> None:
         super().__init__("", style)
-        self.rule = "─" * width
 
-    def text(self) -> Text:
-        return Text(self.rule, style=self.style, overflow="crop", no_wrap=True)
+    def __rich_console__(self, console, options):
+        return Text("─" * options.max_width, style=self.style, no_wrap=True).__rich_console__(console, options)
+
+
+class _LocationCell(_FixedCell):
+    """A job's ``DB.SCHEMA`` in the Schema column, copied whole. Where the column is too
+    narrow for it, the database name is cut (``TEAM_D….EXPERIMENTS``), so the schema the
+    column is named for stays whole while it fits, and two schemas of one database
+    still read apart."""
+
+    __slots__ = ("schema",)
+
+    def __init__(self, database: str, schema: str) -> None:
+        super().__init__(f"{database}.{schema}", theme.MUTED)
+        self.schema = schema
+
+    def __rich_console__(self, console, options):
+        room, plain = options.max_width, self.plain
+        keep = views.cell_width(self.schema) + 2  # the schema, and "…." before it
+        if views.cell_width(plain) > room >= keep:
+            database = plain[:len(plain) - len(self.schema) - 1]
+            plain = f"{cut_cells(database, room - keep)}….{self.schema}"
+        # Narrower still, the end is cut, as any cell's is.
+        return Text(plain, style=self.style, overflow="ellipsis", no_wrap=True).__rich_console__(console, options)
+
+
+def _location_cell(job: dict) -> _FixedCell:
+    """The Schema column's cell: the job's ``DB.SCHEMA`` (see :class:`_LocationCell`), else ``—``."""
+    parts = views.location_parts(job)
+    if parts is None:
+        return _cell("—", theme.MUTED)
+    return _LocationCell(*(part.replace("\n", " ") for part in parts))  # on one line, as _cell makes a cell
 
 
 class _CopiedCell(_FixedCell):
@@ -143,6 +202,10 @@ _CHIP_ORDER = ("running", "initializing", "placing", "pending", "unknown")
 _CHIP_OF = {"creating": "placing", "queued": "pending"}
 
 
+def _chip_rank(key: str) -> tuple:
+    return (_CHIP_ORDER.index(key) if key in _CHIP_ORDER else len(_CHIP_ORDER), key)
+
+
 def _status_chips(live: list, history: int, *, live_so_far: bool = False, unknown_so_far: bool = False,
                   history_so_far: bool = False) -> Content:
     """The counts on the line above the list, each live status as its glyph, count and
@@ -152,14 +215,22 @@ def _status_chips(live: list, history: int, *, live_so_far: bool = False, unknow
     active jobs are all listed, but no status filter lists an unknown job), the history
     (``history_so_far``)."""
     so_far = Content.styled(" so far", theme.FAINT)
-    counts = Counter(_CHIP_OF.get(key, key) for key in (theme.status_key(job.get("status")) for job in live))
+    # A deployment counts under its status as its row says it (ready, not running); two
+    # statuses with one word (placing and initializing) share a chip, drawn as the first.
+    counts: Counter = Counter()
+    looks: dict = {}
+    for job in live:
+        key = theme.status_key(job.get("status"))
+        key = _CHIP_OF.get(key, key)
+        word = views.status_word_for(job, job.get("status")) if views.is_deployment(job) else key
+        counts[word] += 1
+        looks[word] = min(looks.get(word, key), key, key=_chip_rank)
     chips = []
-    for key in [*_CHIP_ORDER, *sorted(set(counts) - set(_CHIP_ORDER))]:
-        if counts.get(key):
-            look = theme.status_look(key)
-            chips.append(Content.assemble((f"{look.glyph} ", look.color), (f"{counts[key]:,} ", f"bold {theme.TEXT}"),
-                                          (key, theme.MUTED),
-                                          so_far if key == "unknown" and unknown_so_far and not live_so_far else ""))
+    for word in sorted(counts, key=lambda w: _chip_rank(looks[w])):
+        look = theme.status_look(looks[word])
+        tail = so_far if looks[word] == "unknown" and unknown_so_far and not live_so_far else ""
+        chips.append(Content.assemble((f"{look.glyph} ", look.color), (f"{counts[word]:,} ", f"bold {theme.TEXT}"),
+                                      (word, theme.MUTED), tail))
     chips = chips or [Content.styled("no live jobs", theme.MUTED)]
     ended = Content.assemble("  ", ("│", theme.FAINT), "  ", (f"{history:,} ", f"bold {theme.TEXT}"),
                              ("in history", theme.MUTED))
@@ -182,7 +253,7 @@ class _JobRows:
     """One job's table rows as last built, and what they were built from."""
 
     # Slots: one of these per listed job, kept between renders.
-    __slots__ = ("job", "stale_at", "cells", "sub_cells", "sub_keys", "layout", "expanded", "row", "subs")
+    __slots__ = ("job", "stale_at", "cells", "sub_cells", "sub_keys", "labels", "expanded", "row", "subs")
 
     def __init__(self, job: dict, stale_at: float, cells: dict) -> None:
         self.job = job  # the record (compared by identity: a refresh keeps an unchanged record)
@@ -192,14 +263,16 @@ class _JobRows:
         self.cells = cells  # column label -> cell: the job's row, but for its Job ID
         self.sub_cells: tuple | None = None  # ((row key suffix, {label: cell}), ...): its sub-job rows (and note)
         self.sub_keys: tuple = ()  # ((job id, sub-job id) or None for the note, ...) beside sub_cells
-        self.layout = None  # the layout row and subs are in
+        # The columns (labels, in order) row and subs are in; their widths don't change the cells.
+        self.labels: tuple | None = None
         self.expanded: bool | None = None  # whether row and subs are for the job unfolded
         self.row: tuple = ()
         self.subs: tuple = ()  # ((row key suffix, cells), ...); none while folded
 
 
 class _JobTable(SelectableTable):
-    """The selectable job table with fold-aware navigation."""
+    """The selectable job table with fold-aware navigation, and a bar after each column's
+    name that a drag moves, making the column wider or narrower (see :meth:`_bars`)."""
 
     BINDINGS = [
         Binding("home", "first_job", "First job", show=False),
@@ -208,6 +281,11 @@ class _JobTable(SelectableTable):
         Binding("left", "cursor_left", "Fold sub-jobs, else scroll left", show=False),
     ]
     _MARKERS = ("▸ ", "▾ ")
+    _MIN_WIDTH = 3  # the narrowest a drag leaves a column: a character or two and "…"
+    _BAR = "┃"  # heavy, so it reads as a handle
+    # A drag on a bar under way: (its column's label, the column's width, the press's screen x).
+    _grab: tuple | None = None
+    _hovered: str | None = None  # the label of the column whose bar the pointer is on
 
     def action_first_job(self) -> None:
         self.move_cursor(row=min(1, self.row_count - 1), animate=False)  # row 0 is the LIVE/HISTORY header
@@ -225,9 +303,15 @@ class _JobTable(SelectableTable):
             super().action_cursor_left()
 
     def on_click(self, event: events.Click) -> None:
-        """A click on a job's ▸/▾ marker unfolds or folds it; any other click is the table's own, unless swallowed."""
+        """A click on a job's ▸/▾ marker unfolds or folds it, and a double-click on a column's
+        bar gives it back the width the list picks; any other click is the table's own, unless swallowed."""
         if self.swallowed(event):
             return
+        if event.chain == 2:
+            edge = self._edge_at(event)
+            if edge is not None:
+                self.screen.reset_column(edge[0])
+                return
         key = self._marker_at(event)
         if key is not None and self.screen.toggle_job_at(key):
             event.prevent_default()  # the table's own handler would open the job on a second click
@@ -251,6 +335,131 @@ class _JobTable(SelectableTable):
         if offset.x - left != self.cell_padding:  # the arrow: ▸ and ▾ are one cell wide, after the padding
             return None
         return self.ordered_rows[row].key.value
+
+    # ─── column widths ───────────────────────────────────────────────────────
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        """A press on a column's bar grabs it: the bar, the column's right edge, follows the pointer."""
+        edge = self._edge_at(event) if event.button == 1 else None
+        if edge is None:
+            return
+        self._grab = (*edge, event.screen_x)
+        self.capture_mouse()
+        # Textual started a highlight at the press: a drag that resizes highlights nothing.
+        self.screen.clear_selection()
+        self._redraw_names()  # the bar held is drawn in the accent
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        if self._grab is not None:
+            label, width, x = self._grab
+            self.screen.resize_column(label, max(self._MIN_WIDTH, width + event.screen_x - x))
+            return
+        edge = self._edge_at(event)
+        self._hover(edge[0] if edge is not None else None)
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        if self._grab is not None:
+            self._let_go()
+
+    def on_mouse_release(self, event: events.MouseRelease) -> None:
+        if self._grab is not None:  # the capture ended without a release here (another screen opened)
+            self._let_go()
+
+    def on_leave(self, event: events.Leave) -> None:
+        if self._grab is None:
+            self._hover(None)
+
+    def _let_go(self) -> None:
+        self._grab = None
+        self.release_mouse()
+        self._hover(None)
+        self._redraw_names()
+        self.screen.column_resized()
+
+    def _hover(self, label: str | None) -> None:
+        """The pointer on ``label``'s bar (None: on none): the bar brighter, and the pointer a
+        sideways arrow where the terminal draws pointer shapes."""
+        if label != self._hovered:
+            self._hovered = label
+            self._redraw_names()
+        shape = "ew-resize" if label is not None else "default"
+        if self.styles.pointer != shape:
+            self.styles.pointer = shape
+
+    def _redraw_names(self) -> None:
+        """Draw the column names again (their line stays at the top as the rows scroll)."""
+        self.refresh(Region(0, 0, self.size.width, self.header_height))
+
+    def _edge_at(self, event: events.MouseEvent) -> tuple | None:
+        """``(label, width)`` of the column whose bar ``event`` is on, or on a blank cell beside
+        (so a press a cell off still takes it), else None: a press on a name highlights it, as
+        a press on any text does."""
+        if not self.on_header(event.screen_y):
+            return None
+        offset = event.get_content_offset(self)
+        if offset is None:
+            return None
+        x = offset.x
+        bars = dict(self._bars(self.scroll_offset.x))
+        for at in (x, x - 1, x + 1):  # the bar itself, else the one beside a blank cell
+            column = bars.get(at)
+            if column is not None and (at == x or self._blank_name_cell(x)):
+                return column.key.value, column.width
+        return None
+
+    def _blank_name_cell(self, x: int) -> bool:
+        """Whether the column names draw no text at content offset ``x`` (padding, or past a short name)."""
+        scroll_x = self.scroll_offset.x
+        line = self._render_line(0, scroll_x, scroll_x + self.size.width, self.rich_style)
+        return not line.crop(x, x + 1).text.strip()
+
+    def _bars(self, scroll_x: int) -> list:
+        """``(x, column)`` for each column's bar drawn on the column names, scrolled ``scroll_x``
+        cells sideways: in the last cell of the column (its padding after the name), at the
+        column's right edge, which a drag on the bar moves. A fixed column's is always in
+        view; another's only where it is scrolled clear of them."""
+        columns = self.ordered_columns
+        left = self._row_label_column_width
+        fixed = left + sum(column.get_render_width(self) for column in columns[:self.fixed_columns])
+        bars = []
+        for index, column in enumerate(columns):
+            left += column.get_render_width(self)
+            x = left - 1 if index < self.fixed_columns else left - 1 - scroll_x
+            if index < self.fixed_columns or fixed <= x < self.size.width:
+                bars.append((x, column))
+        return bars
+
+    def _render_line(self, y: int, x1: int, x2: int, base_style: Style) -> Strip:
+        """A line of the table; on the column names, a bar at each column's right edge. Drawn
+        over the padding there, so the text (what a highlight copies) is as it was."""
+        strip = super()._render_line(y, x1, x2, base_style)
+        if y or not self.show_header:
+            return strip
+        held = self._grab[0] if self._grab is not None else None
+        for x, column in self._bars(x1):
+            if x >= strip.cell_length:
+                continue
+            under = next((segment.style for segment in strip.crop(x, x + 1) if segment.style), None)
+            label = column.key.value
+            color = theme.ACCENT if label == held else theme.MUTED if label == self._hovered else theme.FAINT
+            bar = Segment(self._BAR, (under or Style()) + Style(color=color, bold=False))
+            strip = Strip.join([strip.crop(0, x), Strip([bar], 1), strip.crop(x + 1)])
+        return strip
+
+    def set_widths(self, widths: dict) -> None:
+        """Columns ``widths`` (label -> cells) wide, in place: the rows, the cursor and the
+        scroll stay (``clear(columns=True)`` would build the table again from the top)."""
+        changed = False
+        for column in self.ordered_columns:
+            width = widths.get(column.key.value, column.width)
+            if column.width != width:
+                column.width, changed = width, True
+        if changed:
+            # As DataTable does when a cell changes: its drawn lines are drawn again, at the new widths.
+            self._clear_caches()
+            self._update_count += 1
+            self._require_update_dimensions = True
+            self.refresh()
 
     def replace_rows(self, rows: list) -> None:
         """Show ``rows`` (``(key, cells)`` pairs, in order) in place of the table's rows."""
@@ -305,6 +514,8 @@ class JobListScreen(FollowsPointer, Screen):
         Binding("a", "show_list('schema')", "Current schema"),
         Binding("f", "full_list('all')", "All jobs"),
         Binding("f", "full_list('newest')", "Newest 2,000"),
+        Binding("d", "show_view('deployments')", "Deployments"),
+        Binding("d", "show_view('jobs')", "Jobs"),
         ("s", "cycle_sort", "Sort"),
         ("o", "toggle_order", "Order"),
         ("e", "expand_all", "Expand/collapse all"),
@@ -325,6 +536,8 @@ class JobListScreen(FollowsPointer, Screen):
     _PATCH_REMOVALS = 64
     _DECLINED_CELLS = 60  # the header's reason a could not show all schemas; the notice has it in full
     _LOCATION_AT = [label for label, _width in _COLUMNS].index("GPUs") + 1
+    # The Schema column is as wide as its widest DB.SCHEMA, at least the first and, where
+    # the screen has no room spare, at most the second (see _layout_for).
     _LOCATION_WIDTHS = (10, 32)
 
     def __init__(self, client, *, poll_interval=1.0, now=None, clients=None, lister=None):
@@ -344,12 +557,14 @@ class JobListScreen(FollowsPointer, Screen):
         # asked for every job of it: kept across refreshes, until another list is shown.
         self._cut_listing: Listing | None = None
         self._full_list = False
+        self._deployments = False  # d: the Deployments view, else training and sampling jobs
         self._filter = ""
         self._sort = "created"
         self._descending = True
         self._expanded: set = set()
         self._collapsed: set = set()  # jobs folded by the reader (or by an e that holds no more)
-        self._all_folded: bool | None = None  # e: every job folded (True) or unfolded (False); None before
+        # e, per view (deployments or not): every job folded (True) or unfolded (False); None before
+        self._all_folded: dict[bool, bool | None] = {False: None, True: None}
         self._last_refreshed = None
         self._loaded_at: float | None = None  # monotonic time of the last good load
         self._failed_at: str | None = None  # HH:MM:SS of the last failed load, while it stands
@@ -379,6 +594,9 @@ class JobListScreen(FollowsPointer, Screen):
         self._narrowing = False
         self._search_timer = None
         self._layout: _ListLayout | None = None  # the table's columns, once they exist
+        # The widths the reader dragged columns to (label -> cells): kept over every list,
+        # refresh and terminal size, until a double-click on the column's bar.
+        self._widths: dict[str, int] = {}
         self._notice: Content | None = None  # the stale-list notice, before wrapping
         # The line(s) under the header, before wrapping: a message, or (start parts, the sort).
         self._info: Content | tuple | None = None
@@ -386,9 +604,9 @@ class JobListScreen(FollowsPointer, Screen):
         self._rows: dict[tuple, _JobRows] = {}
         self._hay: dict[tuple, tuple] = {}  # job key -> (record, search_haystack)
         self._resolved: tuple | None = None  # (search text, the jobs list it was resolved against, query)
-        self._headers: dict[str, tuple] = {}  # LIVE/HISTORY -> ((count, so_far, layout), cells)
+        self._headers: dict[str, tuple] = {}  # LIVE/HISTORY -> ((count, so_far, column labels), cells)
         self._keys: dict[tuple, str] = {}  # job key -> its row's table key
-        self._shown: tuple | None = None  # what the table holds: (layout, ((row key, cells), ...))
+        self._shown: tuple | None = None  # what the table holds: (column labels, ((row key, cells), ...))
         self._placed_key: str | None = None  # the row the last render put the cursor on
         self._reader_moved = False  # the reader moved the cursor since the list (or a sort) placed it
 
@@ -396,7 +614,7 @@ class JobListScreen(FollowsPointer, Screen):
         return views.job_key(job, self._clients.home)
 
     def compose(self) -> ComposeResult:
-        yield Header(icon=theme.BRAND_ICON)
+        yield _ListHeader(icon=theme.BRAND_ICON)
         yield Static("", id="listinfo")
         yield Static("", id="listnotice")
         yield _JobTable(id="jobs", cursor_type="row", zebra_stripes=False, fixed_columns=self._FIXED_COLUMNS)
@@ -435,8 +653,30 @@ class JobListScreen(FollowsPointer, Screen):
         self._paint_notice()
         self._paint_nomatch()
         self._paint_help()
-        if self._layout != self._layout_for(self._location_column_width(self._recent())):
+        self._fit_columns()
+
+    def _fit_columns(self) -> None:
+        """Draw the list again if its columns would change: the terminal's width, or a column's, did."""
+        if self._layout != self._layout_for(self._location_column_width(self._in_view(self._recent()))):
             self._render_jobs()
+
+    def resize_column(self, label: str, width: int) -> None:
+        """A drag on a column's bar: ``label``'s column ``width`` cells wide from now on. Only it
+        changes while the drag lasts, so its edge stays under the pointer; the other columns fit
+        around it once the drag ends (see :meth:`column_resized`)."""
+        self._widths[label] = width
+        if self._layout is not None:
+            columns = tuple((name, width if name == label else was) for name, was in self._layout.columns)
+            self._set_columns(self.query_one("#jobs", DataTable), _ListLayout(columns))
+
+    def column_resized(self) -> None:
+        """A drag on a column's bar ended: the columns fit the screen around the widths set."""
+        self._fit_columns()
+
+    def reset_column(self, label: str) -> None:
+        """``label``'s column back to the width the list picks for it (a double-click on its bar)."""
+        if self._widths.pop(label, None) is not None:
+            self._fit_columns()
 
     def on_descendant_focus(self, event) -> None:
         self._paint_help()
@@ -467,16 +707,23 @@ class JobListScreen(FollowsPointer, Screen):
         widget.update(lines[2:])  # the first line starts at the edge, the others under it
 
     def _layout_for(self, location_width: int) -> _ListLayout:
-        """Fit columns, narrowing the job id while keeping the sorted time visible."""
+        """Fit columns, narrowing the job id while keeping the sorted time visible. A column the
+        reader dragged keeps the width they gave it. The Schema column (``location_width``: its
+        widest name) is at most ``_LOCATION_WIDTHS[1]`` wide, and wider only into room the other
+        columns leave, so a long name is cut only where the screen has no room for it."""
         table = self.query_one("#jobs", DataTable)
         pad = 2 * table.cell_padding
         room = (self.size.width or self.app.size.width) - table.styles.scrollbar_size_vertical
         columns = list(self._COLUMNS)
         if location_width:
-            columns.insert(self._LOCATION_AT, (_SCHEMA_COLUMN, location_width))
+            columns.insert(self._LOCATION_AT, (_SCHEMA_COLUMN, min(location_width, self._LOCATION_WIDTHS[1])))
+        sized = self._widths
+        columns = [(label, sized.get(label, width)) for label, width in columns]
         name_base = dict(self._COLUMNS)["Job ID"]
         spare = room - pad - sum(width + pad for label, width in columns if label != "Job ID")
-        if spare >= name_base:
+        if "Job ID" in sized:
+            name = sized["Job ID"]
+        elif spare >= name_base:
             name = name_base
         else:
             first = set(self._FIRST_COLUMNS) - {"Job ID"}
@@ -486,18 +733,28 @@ class JobListScreen(FollowsPointer, Screen):
             name = max(self._NAME_MIN, min(name_base, room - pad - needed))
         columns = [(label, name if label == "Job ID" else width) for label, width in columns]
         labels = [label for label, _width in columns]
+        if location_width and _SCHEMA_COLUMN not in sized:
+            at = labels.index(_SCHEMA_COLUMN)
+            spare = room - sum(width + pad for _label, width in columns)
+            width = columns[at][1]
+            columns[at] = (_SCHEMA_COLUMN, width + max(0, min(spare, location_width - width)))
         if self._sort == "updated":
             ends = sum(width + pad for _label, width in columns[: labels.index("Updated") + 1])
-            if ends > room:  # out of view: put it where Created is (the two have the same width)
+            if ends > room:  # out of view: put it where Created is (each keeps its own width)
                 at_created, at_updated = labels.index("Created"), labels.index("Updated")
                 columns[at_created], columns[at_updated] = columns[at_updated], columns[at_created]
         return _ListLayout(tuple(columns))
 
     def _set_columns(self, table: DataTable, layout: _ListLayout) -> None:
-        """Set the table's columns up for ``layout`` (clearing it) when they aren't the ones it has."""
+        """Set the table's columns up for ``layout`` when they aren't the ones it has: in place
+        where only their widths changed, else from scratch (clearing it)."""
         if layout == self._layout:
             return
+        resized = self._layout is not None and layout.labels == self._layout.labels
         self._layout = layout
+        if resized:
+            table.set_widths(dict(layout.columns))
+            return
         table.clear(columns=True)
         for label, width in layout.columns:
             table.add_column(label, width=width, key=label)
@@ -508,16 +765,25 @@ class JobListScreen(FollowsPointer, Screen):
         now = self._clock()
         return [j for j in self._all_jobs if views.within_retention(j, now)]
 
+    def _in_view(self, jobs: list) -> list:
+        """The jobs of the view on screen: deployments (d) or every other job."""
+        return [job for job in jobs if views.is_deployment(job) == self._deployments]
+
+    def _other_view_text(self, count: int) -> str:
+        noun = "job" if self._deployments else "deployment"
+        return f"{count:,} {noun}{'' if count == 1 else 's'} · d shows {'it' if count == 1 else 'them'}"
+
     def _location_column_width(self, jobs: list) -> int:
-        """The Schema column's width for ``jobs``; 0 (hidden) when they all share one location.
+        """The width ``jobs``' widest DB.SCHEMA takes, at least ``_LOCATION_WIDTHS[0]``: the
+        Schema column's, where the screen has room (see :meth:`_layout_for`); 0 (hidden) when
+        they all share one location.
 
         A narrowed list (see :func:`cortex_training.tui.views.pushdown_location`) therefore hides
         it, and the header names the location instead (see :func:`_scope_text`)."""
         labels = {views.location_label(job) for job in jobs}
         if len(labels) <= 1:
             return 0
-        low, high = self._LOCATION_WIDTHS
-        return max(low, min(high, max(views.cell_width(label) for label in labels)))
+        return max(self._LOCATION_WIDTHS[0], max(views.cell_width(label) for label in labels))
 
     def _clock(self) -> datetime:
         return self._now or datetime.now(timezone.utc)
@@ -535,13 +801,14 @@ class JobListScreen(FollowsPointer, Screen):
                 shown = f"showing the partial {which} list"
             else:
                 shown = f"list from {self._last_refreshed}" if self._last_refreshed else ""
-            bits = [switching, shown]
+            bits = ["deployments" if self._deployments else "", switching, shown]
             self.app.sub_title = "  ·  ".join(bit for bit in bits if bit)
             return
         if self._scope is not None and self._scope.loading:
             # The list's first pages: how far it is, in place of when it was refreshed.
             # Only the account-wide list names itself here; the schema's own text already does.
-            bits = ("all schemas" if self._scope.kind == ACCOUNT else "", self._scope_text())
+            bits = ("deployments" if self._deployments else "", "all schemas" if self._scope.kind == ACCOUNT else "",
+                    self._scope_text())
             self.app.sub_title = "  ·  ".join(bit for bit in bits if bit)
             return
         if self._refreshing:
@@ -558,7 +825,7 @@ class JobListScreen(FollowsPointer, Screen):
                 refresh_status += f" (list from {self._last_refreshed[:5]})"
         else:
             refresh_status = f"last refreshed {self._last_refreshed or '—'}"
-        bits = [refresh_status, self._scope_text()]
+        bits = ["deployments" if self._deployments else "", refresh_status, self._scope_text()]
         self.app.sub_title = "  ·  ".join(bit for bit in bits if bit)
 
     def _switching_text(self) -> str:
@@ -575,6 +842,16 @@ class JobListScreen(FollowsPointer, Screen):
             return "loading all schemas…"
         return f"loading the current schema, {self._schema_label()}…"
 
+    def scope_chip(self) -> tuple | None:
+        """``(words, style)``: the words of the header naming the list on screen (``all schemas``,
+        ``Current schema: DB.SCHEMA``) and the chip the header draws them as; None before the
+        first list, and while ``a`` reads the other one (the header says so instead)."""
+        if self._scope is None or (self._refreshing and self._switching):
+            return None
+        declined = bool(self._declined) and self._scope.kind == SCHEMA
+        words = one_line(scope_name(self._scope, location=self._schema_label(), declined=declined))
+        return words, _ACCOUNT_CHIP if self._scope.kind == ACCOUNT else _SCHEMA_CHIP
+
     def _scope_text(self) -> str:
         """What the list on screen covers ("all schemas", ...); "" before the first list."""
         if self._scope is None:
@@ -587,7 +864,7 @@ class JobListScreen(FollowsPointer, Screen):
             # holds no other, so the header must not claim it covered every schema.
             only = ""
         else:
-            labels = {views.location_label(job) for job in self._all_jobs}
+            labels = {views.location_label(job) for job in self._in_view(self._all_jobs)}
             only = next(iter(labels)) if len(labels) == 1 else ""
         return scope_text(self._scope, location=self._schema_label(), only=only)
 
@@ -678,6 +955,16 @@ class JobListScreen(FollowsPointer, Screen):
         # the header says so now.
         self._update_subtitle()
 
+    def action_show_view(self, which: str) -> None:
+        """``d``: show the deployments (``which`` "deployments") or every other job ("jobs")."""
+        deployments = which == "deployments"
+        if deployments == self._deployments:
+            return
+        self._deployments = deployments
+        self.refresh_bindings()  # the footer's d names the other view now
+        self._render_jobs(top=True)
+        self._update_subtitle()
+
     def _refresh_tick(self) -> None:
         if self.app.screen is self:
             self._refresh_jobs()
@@ -703,6 +990,9 @@ class JobListScreen(FollowsPointer, Screen):
             # Only a list cut short with every job at hand has them to show; of f's two
             # bindings, the one for the other way.
             return self._cut_listing is not None and (parameters[:1] == ("all",)) != self._full_list
+        if action == "show_view":
+            # One of d's two bindings, the one for the other view.
+            return (parameters[:1] == ("deployments",)) != self._deployments
         return True
 
     def action_filter(self) -> None:
@@ -793,7 +1083,8 @@ class JobListScreen(FollowsPointer, Screen):
         if job_key in self._expanded:
             return True
         # e's choice holds for the jobs listed after it, too (a later page's).
-        return self._starts_unfolded(job) if self._all_folded is None else not self._all_folded
+        folded = self._all_folded[views.is_deployment(job)]
+        return self._starts_unfolded(job) if folded is None else not folded
 
     @staticmethod
     def _starts_unfolded(job: dict) -> bool:
@@ -871,26 +1162,26 @@ class JobListScreen(FollowsPointer, Screen):
         return True
 
     def action_expand_all(self) -> None:
-        with_subs = [j for j in self._all_jobs if self._expandable(j)]
+        with_subs = [j for j in self._in_view(self._all_jobs) if self._expandable(j)]
         # Every job folded, or every one unfolded: those listed since too; a fold or unfold
         # after it is the job's own.
-        self._all_folded = bool(with_subs) and all(self._is_expanded(j) for j in with_subs)
-        self._expanded.clear()
-        self._collapsed.clear()
+        self._all_folded[self._deployments] = bool(with_subs) and all(self._is_expanded(j) for j in with_subs)
+        for job in self._in_view(self._all_jobs):
+            self._expanded.discard(self._job_key(job))
+            self._collapsed.discard(self._job_key(job))
         self._render_jobs()
 
     def _settle_folds(self) -> None:
         """e's choice holds for the list in front of the reader (and its later pages): once
         another list comes (a, or a refresh), the jobs it covered keep it, each as its own fold,
         and jobs new since start as every job does (live unfolded, history folded)."""
-        if self._all_folded is None:
-            return
-        chosen = self._collapsed if self._all_folded else self._expanded
         for job in self._all_jobs:
+            folded = self._all_folded[views.is_deployment(job)]
             key = self._job_key(job)
-            if key not in self._expanded and key not in self._collapsed and self._expandable(job):
-                chosen.add(key)
-        self._all_folded = None
+            if (folded is not None and key not in self._expanded and key not in self._collapsed
+                    and self._expandable(job)):
+                (self._collapsed if folded else self._expanded).add(key)
+        self._all_folded = {False: None, True: None}
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id != "jobfilter":
@@ -1084,7 +1375,7 @@ class JobListScreen(FollowsPointer, Screen):
         return None
 
     def _merged(self, rows: list) -> list:
-        """Reuse unchanged records and retain an UNKNOWN row's known creation time."""
+        """Reuse unchanged records and retain an UNKNOWN row's known creation time (and a deployment's sub-jobs)."""
         merged = []
         for job in rows:
             if not (isinstance(job, dict) and views.job_id_of(job)):
@@ -1093,6 +1384,7 @@ class JobListScreen(FollowsPointer, Screen):
             if old is not None:
                 if not job.get("created_at") and old.get("created_at"):
                     job = {**job, "created_at": old["created_at"]}
+                job = views.keep_deployment(old, job)
                 if job == old:
                     job = old
             merged.append(job)
@@ -1155,12 +1447,13 @@ class JobListScreen(FollowsPointer, Screen):
         return _cell(f"role {role}", theme.MUTED) if role else _cell("—", theme.FAINT)
 
     @staticmethod
-    def _status_cell(status, *, glyph_only: bool = False) -> _FixedCell:
+    def _status_cell(status, *, glyph_only: bool = False, word: str | None = None) -> _FixedCell:
         """``● RUNNING``: the theme's glyph and word, in the status's color, as every screen
         draws a status (``glyph_only``: the glyph alone, for a sub-job in its job's status).
-        Copied as the word alone, also where only the glyph is drawn."""
+        Copied as the word alone, also where only the glyph is drawn. ``word`` overrides the
+        status's own word (a deployment's, e.g. ``READY``); the color still comes from ``status``."""
         look = theme.status_look(status)
-        word = views.status_word(status).upper()
+        word = (word if word is not None else views.status_word(status)).upper()
         if glyph_only:
             return _CopiedCell(_cell(look.glyph, look.color), word)
         return _CopiedCell(_FixedCell.assemble((f"{look.glyph} ", look.color), (word, look.style)), word)
@@ -1179,7 +1472,7 @@ class JobListScreen(FollowsPointer, Screen):
         span, span_lasts = self._span_cell(job, now)
         # Plain text throughout: DataTable parses a str cell as markup.
         cells = {
-            "Status": self._status_cell(job.get("status")),
+            "Status": self._status_cell(job.get("status"), word=views.status_word_for(job, job.get("status"))),
             "Type": _cell(views.job_type_label(job)),
             "Created": created,
             "Duration": span,
@@ -1188,7 +1481,7 @@ class JobListScreen(FollowsPointer, Screen):
             # Requested GPUs; "shared" for a job that runs only on another job's GPUs.
             "GPUs": _cell(views.job_gpu_cell(job, str(job.get("hardware") or ""))),
             # Plain text: a quoted name can hold anything, brackets included.
-            _SCHEMA_COLUMN: _cell(views.location_label(job) or "—", theme.MUTED),
+            _SCHEMA_COLUMN: _location_cell(job),
             "Updated": updated,
         }
         return cells, now.timestamp() + min(created_lasts, updated_lasts, span_lasts)
@@ -1222,7 +1515,8 @@ class JobListScreen(FollowsPointer, Screen):
         return {
             "Job ID": _FixedCell.assemble(("  ", ""), (f"{'└' if last else '├'} ", theme.FAINT),
                                           (views.sub_job_label(sj), theme.MUTED)),
-            "Status": cls._status_cell(status, glyph_only=same) if told else _BLANK,
+            "Status": cls._status_cell(status, glyph_only=same, word=views.status_word_for(job, status)) if told
+            else _BLANK,
             "Model": _cell(model, theme.FAINT) if shown else _BLANK,
             "GPUs": _cell(gpus, theme.FAINT) if gpus_told else _BLANK,
         }
@@ -1244,25 +1538,25 @@ class JobListScreen(FollowsPointer, Screen):
         return tuple(subs), tuple(keys)
 
     @staticmethod
-    def _header_cells(group: str, count: int, layout: _ListLayout, so_far: bool = False) -> tuple:
+    def _header_cells(group: str, count: int, labels: tuple, so_far: bool = False) -> tuple:
         """A LIVE/HISTORY row, drawn as a section heading: its title and count in the
         Job ID column (``so_far``: "…" after it, while more jobs load), and a rule across
         the columns after (drawn, not copied)."""
         style = f"bold {theme.OK}" if group == "LIVE" else f"bold {theme.MUTED}"
         name = _cell(f"{group}  {count:,}{'…' if so_far else ''}", style)
-        return tuple(name if column == "Job ID" else _RuleCell(width, theme.RULE) for column, width in layout.columns)
+        return tuple(name if column == "Job ID" else _RuleCell(theme.RULE) for column in labels)
 
-    def _header(self, group: str, count: int, layout: _ListLayout, so_far: bool = False) -> tuple:
+    def _header(self, group: str, count: int, labels: tuple, so_far: bool = False) -> tuple:
         """A LIVE/HISTORY row, kept while it reads the same."""
         kept = self._headers.get(group)
-        if kept is not None and kept[0] == (count, so_far, layout):
+        if kept is not None and kept[0] == (count, so_far, labels):
             return kept[1]
-        cells = self._header_cells(group, count, layout, so_far)
-        self._headers[group] = ((count, so_far, layout), cells)
+        cells = self._header_cells(group, count, labels, so_far)
+        self._headers[group] = ((count, so_far, labels), cells)
         return cells
 
     def _job_rows(self, job: dict, layout: _ListLayout) -> _JobRows:
-        """Cached rows for a job, layout, and expansion state. Its cells are built again
+        """Cached rows for a job, its columns, and expansion state. Its cells are built again
         only when its record changed, or one of its relative times would read
         differently now (see :meth:`_job_cells`)."""
         job_key = self._job_key(job)
@@ -1274,7 +1568,7 @@ class JobListScreen(FollowsPointer, Screen):
             rows = _JobRows(job, stale_at, cells)
             self._rows[job_key] = rows
         expanded = self._is_expanded(job)
-        if rows.layout != layout or rows.expanded != expanded:
+        if rows.labels != layout.labels or rows.expanded != expanded:
             unfolded = expanded if self._expandable(job) else None
             name = rows.cells.get("Job ID") or self._row_or_note(
                 job, lambda: {"Job ID": self._name_cell(job, unfolded)})["Job ID"]
@@ -1288,7 +1582,7 @@ class JobListScreen(FollowsPointer, Screen):
                                   for suffix, sub in rows.sub_cells)
             else:
                 rows.subs = ()
-            rows.layout, rows.expanded = layout, expanded
+            rows.labels, rows.expanded = layout.labels, expanded
         return rows
 
     def _query(self) -> views.Query:
@@ -1322,10 +1616,10 @@ class JobListScreen(FollowsPointer, Screen):
             return
         if self._pages_failed:
             # The first pages of a list whose later ones failed (or were never read).
-            text = (f"✕ load failed {self._failed_at or ''}: {self._list_error or ''}; "
+            text = (f"× load failed {self._failed_at or ''}: {self._list_error or ''}; "
                     f"showing the {len(self._all_jobs):,} jobs read before it (r reads them all again)")
         else:
-            text = (f"✕ refresh failed {self._failed_at or ''}: {self._list_error or ''}; "
+            text = (f"× refresh failed {self._failed_at or ''}: {self._list_error or ''}; "
                     f"showing the list from {(self._last_refreshed or '—')[:5]}")
         self._notice = Content.assemble("   ", (text, theme.ERR))
         self._paint_notice()
@@ -1334,7 +1628,7 @@ class JobListScreen(FollowsPointer, Screen):
         if self._notice is None:
             return
         widget = self.query_one("#listnotice", Static)
-        # Wrapped lines continue under the message ("   ✕ " is five cells), not at the edge.
+        # Wrapped lines continue under the message ("   × " is five cells), not at the edge.
         widget.update(hanging(self._notice, widget.size.width or self.size.width or self.app.size.width, 5))
 
     def _paint_info(self) -> None:
@@ -1388,6 +1682,7 @@ class JobListScreen(FollowsPointer, Screen):
         now = self._clock()
         home = self._clients.home
         found = [job for job in self._all_jobs if not views.within_retention(job, now)
+                 and views.is_deployment(job) == self._deployments
                  and views.job_matches_query(job, query, home=home, hay=self._haystack(job))]
         return [views.job_id_of(j) for j in views.sort_job_list(found, "created", True)]
 
@@ -1424,7 +1719,8 @@ class JobListScreen(FollowsPointer, Screen):
                     anchor = (key, table.cursor_row - round(table.scroll_y), table.scroll_x)
                 if str(key).startswith("hdr-"):
                     keep_header = key  # so does a LIVE/HISTORY row, while the list grows
-        recent = self._recent()
+        everyone = self._recent()
+        recent = self._in_view(everyone)
         layout = self._layout_for(self._location_column_width(recent))
         self._show_notice()
         info_line.set_class(False, "error")
@@ -1440,7 +1736,8 @@ class JobListScreen(FollowsPointer, Screen):
             info_line.update(Text(f"[error] {self._list_error}  (r retries{hint})", style=theme.ERR))
             self._hide_table(table, layout, "")  # an empty message keeps the search box at the bottom
             return
-        hidden = len(self._all_jobs) - len(recent)
+        hidden = len(self._all_jobs) - len(everyone)
+        others = len(everyone) - len(recent)  # the other view's, so nothing looks lost
         query = self._query()
         home = self._clients.home
         if query.empty and not query.errors:
@@ -1461,6 +1758,8 @@ class JobListScreen(FollowsPointer, Screen):
         live_so_far = active_so_far or older
         left = [_status_chips(live, len(history), live_so_far=active_so_far, unknown_so_far=older,
                               history_so_far=older)]
+        if others:
+            left.append(Content.styled(self._other_view_text(others), theme.MUTED))
         if self._filter:
             # The count before the query: a long query wraps, the count stays in view.
             # The search text is shown literally (assembled, never parsed as markup).
@@ -1481,19 +1780,32 @@ class JobListScreen(FollowsPointer, Screen):
                 # A schema's whole list held to its newest jobs: f searches every one of them.
                 everything = (len(self._cut_listing.everything)
                               if self._cut_listing is not None and not self._full_list else 0)
+                there = sum(1 for job in everyone if views.is_deployment(job) != self._deployments
+                            and views.job_matches_query(job, query, home=home, hay=self._haystack(job)))
+                noun = "job" if self._deployments else "deployment"
+                noun_here = "deployment" if self._deployments else "job"
+                elsewhere = f"d shows the {there:,} matching {noun}{'' if there == 1 else 's'}." if there else ""
                 found = dict(cut=loaded_text(self._scope), older=self._older_matches(query) if hidden else (),
                              location=self._schema_label() if one else "", widen=widen, narrow=narrow,
-                             everything=everything)
-                message = views.no_match_message(self._filter, query, len(recent), **found)
-            elif self._scope is not None and self._scope.truncated:
-                message = empty_text(self._scope)
-            elif self._scope is not None and self._scope.kind == ACCOUNT:
-                where = f"in {self._scope.narrowed}" if self._scope.narrowed else "in any database and schema"
-                message = f"No jobs created in the last 6 months that this role can see, {where}."
+                             everything=everything, elsewhere=elsewhere)
+                message = views.no_match_message(self._filter, query, len(recent), noun=noun_here, **found)
             else:
-                message = f"No jobs created in the last 6 months in {self._schema_label()} that this role can see."
-                if widen:
-                    message += "\n  a lists every database and schema."
+                what = "jobs"
+                if others:
+                    what = "deployments" if self._deployments else "training or sampling jobs"
+                if self._scope is not None and self._scope.truncated:
+                    message = empty_text(self._scope, what)
+                elif self._scope is not None and self._scope.kind == ACCOUNT:
+                    where = f"in {self._scope.narrowed}" if self._scope.narrowed else "in any database and schema"
+                    message = f"No {what} created in the last 6 months that this role can see, {where}."
+                else:
+                    message = (f"No {what} created in the last 6 months in {self._schema_label()} "
+                               "that this role can see.")
+                    if widen:
+                        message += "\n  a lists every database and schema."
+                if others:
+                    other = "job" if self._deployments else "deployment"
+                    message += f"\n  d shows the {others:,} {other}{'' if others == 1 else 's'}."
             self._hide_table(table, layout, message)
             return
         self._show_nomatch(None)
@@ -1511,7 +1823,7 @@ class JobListScreen(FollowsPointer, Screen):
             if not jobs:
                 continue
             so_far = live_so_far if group == "LIVE" else older
-            plan.append((f"hdr-{group.lower()}", self._header(group, len(jobs), layout, so_far)))
+            plan.append((f"hdr-{group.lower()}", self._header(group, len(jobs), layout.labels, so_far)))
             if plan[-1][0] == keep_header:
                 target_row = len(plan) - 1
             for job in jobs:
@@ -1533,24 +1845,27 @@ class JobListScreen(FollowsPointer, Screen):
                         target_row = len(plan) - 1
         self._job_by_item = job_by_item
         self._sub_by_item = sub_by_item
-        # Reuse identical row objects, or reorder them without rebuilding.
+        # Reuse identical row objects, or reorder them without rebuilding; new widths alone
+        # (a column dragged, the screen resized) change the columns in place.
+        if self._layout is not None and self._layout.labels == layout.labels:
+            self._set_columns(table, layout)
         shown = self._shown
-        same = (shown is not None and shown[0] == layout and len(shown[1]) == len(plan)
+        same = (shown is not None and shown[0] == layout.labels and len(shown[1]) == len(plan)
                 and table.row_count == len(plan)
                 and all(a[0] == b[0] and a[1] is b[1] for a, b in zip(shown[1], plan)))
         if not same:
-            if (shown is not None and shown[0] == layout and table.row_count == len(plan)
+            if (shown is not None and shown[0] == layout.labels and table.row_count == len(plan)
                     and {key: id(cells) for key, cells in shown[1]} == {key: id(cells) for key, cells in plan}):
                 at = layout.labels.index("Job ID")
                 position = {id(cells[at]): index for index, (_key, cells) in enumerate(plan)}
                 table.sort("Job ID", key=lambda name: position[id(name)])
-            elif (steady and shown is not None and shown[0] == layout and table.row_count == len(shown[1])
+            elif (steady and shown is not None and shown[0] == layout.labels and table.row_count == len(shown[1])
                   and len({key for key, _cells in shown[1]} - {key for key, _cells in plan}) <= self._PATCH_REMOVALS):
                 table.patch_rows(plan, shown[1])  # a page more: the rows on screen stay
             else:
                 self._set_columns(table, layout)
                 table.replace_rows(plan)
-            self._shown = (layout, tuple(plan))
+            self._shown = (layout.labels, tuple(plan))
         if target_row is None:
             target_row = 1  # first job row (row 0 is a group header)
         target_row = min(target_row, table.row_count - 1)

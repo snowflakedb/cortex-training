@@ -39,8 +39,10 @@ from typing import Mapping
 from cortex_training._artifact_download import read_manifest
 from cortex_training.tui import views
 from cortex_training.tui.theme import BACKGROUND
+from cortex_training.tui.theme import CHART_HUES
 from cortex_training.tui.theme import ERR
 from cortex_training.tui.theme import FAINT
+from cortex_training.tui.theme import GRID
 from cortex_training.tui.theme import MUTED
 from cortex_training.tui.theme import OK
 from cortex_training.tui.theme import SURFACE
@@ -82,8 +84,6 @@ _NEWEST_FIRST_SLACK_S = 120.0
 # Reporting tolerates independent worker uploads.
 _REPORTING_TOLERANCE_S = 120.0
 _INTERVAL_DELTAS = 64
-# Each GPU's newest samples looked at for how often its values change (about 21 minutes at 5 s).
-_VALUE_RUN_SAMPLES = 256
 # Min and max come from the average across units at each sampling interval; a
 # finer interval than this many buckets over the raw retention is coarsened.
 _MAX_NATIVE_BUCKETS = 20_000
@@ -179,7 +179,6 @@ class KindResource:
     first_sample_ts: datetime | None = None
     sample_interval_s: float | None = None
     reported_interval_s: float | None = None
-    value_interval_s: float | None = None
     partial: bool = False
     reporting_unit_ids: tuple[int, ...] = ()
     latest: Mapping[str, float | None] = field(default_factory=dict)
@@ -412,16 +411,15 @@ class _Kind:
     other: str  # the free bytes (GPU: used / (used + free)) or the total (system: used / total)
     other_is_free: bool
     bridge: bool  # carry a unit across one missed scrape (see _BRIDGE_INTERVALS)
-    value_note: bool  # derive how often the headline values change
     # Fields that stay the same through a job: the header names them (node_allocation_text),
     # and they get no chart or stats row. They are read even without a unit (cpu_count).
     constant: tuple[str, ...] = ()
 
 
 _GPU_KIND = _Kind(GPU, 2, "global_gpu_index", "GPU", 0, "gpu_util_pct", "fb_used_pct",
-                  "fb_used_bytes", "fb_free_bytes", True, False, True)
+                  "fb_used_bytes", "fb_free_bytes", True, False)
 _SYSTEM_KIND = _Kind(SYSTEM, 3, "worker_num", "node", 1, "cpu_util_pct", "mem_used_pct",
-                     "mem_used_bytes", "mem_total_bytes", False, True, False, ("cpu_count", "mem_total_bytes"))
+                     "mem_used_bytes", "mem_total_bytes", False, True, ("cpu_count", "mem_total_bytes"))
 _KIND_SPECS = {GPU: _GPU_KIND, SYSTEM: _SYSTEM_KIND}
 
 
@@ -1334,35 +1332,6 @@ def _merge(pair: tuple[float | None, float | None], values) -> tuple[float | Non
     return (min(points), max(points)) if points else (None, None)
 
 
-def _value_interval(series: _Series) -> float | None:
-    """How often the GPUs' busy values change, from their recent samples (None if unknown).
-
-    DCGM refreshes a field on its own schedule, often far less often than the
-    sampler scrapes, so consecutive rows repeat a value. A value can also stay
-    the same across a refresh, so each GPU's time between changes is a multiple
-    of the refresh: its lower quartile estimates it, and the median over GPUs
-    leaves out an idle GPU's long runs. Runs cut short by the samples' ends
-    don't count.
-    """
-    slot = series.slot_of.get(series.spec.headline)
-    if slot is None:
-        return None
-    per_unit: list[float] = []
-    for unit in series.units.values():
-        unit.sort()
-        column = unit.cols[slot]
-        if column is None:
-            continue
-        ts = unit.ts[-(_VALUE_RUN_SAMPLES + 1):]
-        util = column[-(_VALUE_RUN_SAMPLES + 1):]
-        changes = [ts[i] for i in range(1, len(ts))
-                   if util[i] == util[i] and util[i - 1] == util[i - 1] and util[i] != util[i - 1]]
-        runs = sorted(b - a for a, b in zip(changes, changes[1:]))
-        if len(runs) >= 2:
-            per_unit.append(runs[len(runs) // 4])
-    return median(per_unit) if per_unit else None
-
-
 def _derived_interval(series: _Series) -> float | None:
     """The median spacing of each unit's recent consecutive samples."""
     deltas: list[float] = []
@@ -1628,7 +1597,6 @@ def _snapshot(series: _Series, partial: bool, shown_window: str | None = None,
         first_sample_ts=_utc(series.first),
         sample_interval_s=interval,
         reported_interval_s=reported,
-        value_interval_s=_value_interval(series) if spec.value_note else None,
         partial=partial,
         reporting_unit_ids=capture.reporting,
         latest={key: _scaled(capture.mean[slot], factor) for key, slot, factor in zip(keys, slots, factors)},
@@ -2154,11 +2122,19 @@ def skipped_rows_text(count: int, *, short: bool = False) -> str:
 _BLOCKS = "▁▂▃▄▅▆▇█"
 
 
-def _collapse(values: tuple[float | None, ...], width: int) -> list[float | None]:
+def _fit_columns(values: tuple[float | None, ...], width: int) -> list[float | None]:
+    """``values`` across ``width`` columns, oldest first.
+
+    With more values than columns, a column is the mean of those it covers (None where
+    none has one). With fewer, each value is as many columns wide, give or take one where
+    they don't divide evenly, so the values span the ``width`` they are given. In a chart,
+    that is the part of the x axis their times cover (see :func:`_chart_spans`): all of
+    it for a window they cover, only the left part for a job shorter than the window.
+    """
     if width <= 0 or not values:
         return []
     if len(values) <= width:
-        return list(values)
+        return [values[column * len(values) // width] for column in range(width)]
     collapsed: list[float | None] = []
     for column in range(width):
         start = math.floor(column * len(values) / width)
@@ -2210,7 +2186,7 @@ def worst_health(healths) -> str | None:
 
 
 _EIGHTHS_WIDE = "▏▎▍▌▋▊▉█"
-METER_TRACK = "#30363d"  # the theme's border: seen under a list's highlight, never read as a value
+METER_TRACK = GRID  # seen under a list's highlight, never read as a value
 
 
 def meter_spans(value: float | None, scale: float, cells: int, color: str | None = None,
@@ -2414,8 +2390,8 @@ def _eighths(value: float | None, height: int, scale: float) -> int | None:
     return min(height * 8, max(1, math.ceil(value / scale * height * 8)))
 
 
-def _time_labels(start: datetime, end: datetime, chart_width: int, inner: int) -> str:
-    """The times under a chart's bars: start, middle and end, or fewer where they don't fit.
+def _time_labels(start: datetime, end: datetime, chart_width: int) -> str:
+    """The times under a chart's ``chart_width`` columns: start, middle and end, or fewer where they don't fit.
 
     No label repeats another: a span under two minutes shows seconds, and a
     label that would still read the same as its neighbour is left out. A span
@@ -2425,31 +2401,23 @@ def _time_labels(start: datetime, end: datetime, chart_width: int, inner: int) -
     dated = span >= timedelta(days=1) and chart_width >= 2 * len("10-13 20:59") + 1
     precise = span < timedelta(minutes=2)
     times = (start, start + span / 2, end)
-    padding = " " * (inner - chart_width)
     shape = "%m-%d %H:%M" if dated else "%H:%M:%S" if precise else "%H:%M"
     first, middle, last = (moment.astimezone().strftime(shape) for moment in times)
     size = len(last)
     if chart_width >= 3 * size + 2 and len({first, middle, last}) == 3:
         left_gap = (chart_width - 3 * size) // 2
         right_gap = chart_width - 3 * size - left_gap
-        return padding + first + (" " * left_gap) + middle + (" " * right_gap) + last
+        return first + (" " * left_gap) + middle + (" " * right_gap) + last
     if chart_width >= 2 * size + 1 and first != last:
-        return padding + first + (" " * (chart_width - 2 * size)) + last
-    # Too few columns for two labels: the newest sample's time ends under the bars,
-    # reaching into the empty space before them when it fits there.
-    newest = end.astimezone().strftime("%m-%d %H:%M" if dated else "%H:%M")
-    return newest.rjust(inner) if inner >= len(newest) else ""
+        return first + (" " * (chart_width - 2 * size)) + last
+    # Too few columns for two labels: the end's time alone, under the right edge.
+    label = end.astimezone().strftime("%m-%d %H:%M" if dated else "%H:%M")
+    return label.rjust(chart_width) if chart_width >= len(label) else ""
 
 
-# Each chart's colour, by its place in the metrics' order: GPU util % (or CPU util %)
-# green, memory used % cyan, then on round the palette. Hues that read on the theme's
-# background, a step lighter than its status colours, so a chart's line never reads as
-# a status; the same chart keeps its colour across windows, units and refreshes.
-CHART_HUES = ("#4ade80", "#22d3ee", "#60a5fa", "#a78bfa", "#fbbf24", "#fb7185", "#2dd4bf", "#f472b6", "#a3e635",
-              "#fb923c")
 # The frame, labels and the 50% gridline, quieter than the series: the theme's own tones.
 CHART_AXIS = FAINT
-CHART_GRID = "#30363d"  # the theme's border: seen, never read as data
+CHART_GRID = GRID
 CHART_MUTED = MUTED
 _GRID = "┈"
 # The baseline under a column without a sample: a gap reads as missing data, never as a 0.
@@ -2475,31 +2443,52 @@ def mix(hue: str, share: float, base: str = BACKGROUND) -> str:
     )
 
 
+def _columns_between(start: datetime, end: datetime, x_axis: tuple[datetime, datetime],
+                     columns: int) -> tuple[int, int]:
+    """The first and last of a chart's ``columns`` that ``start`` to ``end`` falls in, on an x axis
+    from ``x_axis[0]`` to ``x_axis[1]``, each column an equal share of its time."""
+    low, high = x_axis
+    total = (high - low).total_seconds()
+    if total <= 0:
+        return 0, columns - 1
+
+    def column(moment: datetime) -> int:
+        return min(columns - 1, max(0, math.floor((moment - low).total_seconds() / total * columns)))
+
+    first = column(start)
+    return first, max(first, column(end))
+
+
 def _chart_spans(values, start: datetime, end: datetime, width: int, height: int, labels: tuple[str, str, str],
-                 scale: float, hue: str | None) -> list[list[tuple[str, str]]]:
+                 scale: float, hue: str | None,
+                 x_axis: tuple[datetime, datetime] | None = None) -> list[list[tuple[str, str]]]:
     """The lines of an area chart of ``values`` from 0 to ``scale``, ``height`` rows tall,
     its axis labelled ``labels``: each line a list of ``(text, style)`` spans.
 
-    Each column rises to its value in eighths of a row. With a ``hue``, the cell where a
-    column ends (its top edge) is in the hue and the cells under it in a faint fill of it
-    (see :data:`_FILL_SHARE`), so the eye follows the series' line; the frame is muted.
-    Without one, every style is empty and the glyphs are the same. A column without a
-    sample stays blank down to the baseline, which is broken under it (:data:`_GAP_AXIS`).
-    The middle label's row has a dotted gridline where the series stays under it. In
-    the column right of the chart, :data:`_NOW` marks the row the newest column reaches;
-    there is none when the newest column is a gap (nothing is known about now).
+    The x axis runs between the times ``x_axis`` gives, the values' own ``start`` and
+    ``end`` by default. The values span their share of its columns (see
+    :func:`_fit_columns`), and its time before or after them is blank over an unbroken
+    baseline. Each column rises to its value in eighths of a row. With a ``hue``, the
+    cell where a column ends (its top edge) is in the hue and the cells under it in a
+    faint fill of it (see :data:`_FILL_SHARE`), so the eye follows the series' line; the
+    frame is muted. Without one, every style is empty and the glyphs are the same. A
+    column without a sample stays blank down to the baseline, which is broken under it
+    (:data:`_GAP_AXIS`). The middle label's row has a dotted gridline where the series
+    stays under it. In the column right of the newest one, :data:`_NOW` marks the row it
+    reaches; there is none when the newest column is a gap (nothing is known about now).
     """
     if width <= 0:
         return [[("", "")]]
     axis_style, grid_style = (CHART_AXIS, CHART_GRID) if hue else ("", "")
     axis = max(len(label) for label in labels)
     if width < axis + 4:
-        return [[("".join(level_glyph(value, scale) for value in _collapse(values, width)), hue or "")]]
+        return [[("".join(level_glyph(value, scale) for value in _fit_columns(values, width)), hue or "")]]
     height = max(1, height)
-    inner = max(1, width - axis - 3)  # the marker's column follows the chart's
-    columns = _collapse(values, inner)
-    chart_width = len(columns)
-    padding = " " * (inner - chart_width)
+    inner = max(1, width - axis - 3)  # the newest column's marker follows it
+    x_axis = x_axis or (start, end)
+    first, last = _columns_between(start, end, x_axis, inner)
+    before, after = first, inner - 1 - last
+    columns = _fit_columns(values, last - first + 1) or [None] * (last - first + 1)
     reach = [_eighths(value, height, scale) for value in columns]
     newest = reach[-1] if reach else None
     now_level = None if newest is None else (newest - 1) // 8
@@ -2533,22 +2522,43 @@ def _chart_spans(values, start: datetime, end: datetime, width: int, height: int
                 cells.append((_GRID, "grid") if grid else (" ", "gap"))
         # Runs of edge, fill and gridline, each in its own style.
         runs = groupby(cells, itemgetter(1))
-        lines.append([(mark, axis_style), (padding, ""),
-                      *(("".join(cell for cell, _kind in run), styles[kind]) for kind, run in runs),
-                      (_NOW, hue or "") if level == now_level else (" ", "")])
+        # The axis's time before and after the values: blank, the gridline running on through it.
+        empty = (lambda count: (_GRID * count, grid_style)) if grid else (lambda count: (" " * count, ""))
+        line = [(mark, axis_style)]
+        if before:
+            line.append(empty(before))
+        line += [("".join(cell for cell, _kind in run), styles[kind]) for kind, run in runs]
+        line.append((_NOW, hue or "") if level == now_level else empty(1) if after else (" ", ""))
+        if after:
+            line.append(empty(after))
+        lines.append(line)
     baseline = "".join("─" if eighths is not None else _GAP_AXIS for eighths in reach)
-    lines.append([(f"{bottom:>{axis}} └{padding}{baseline}─", axis_style)])
-    # The times span the marker's column too: the newest one ends under "now".
-    lines.append([((" " * (axis + 2) + _time_labels(start, end, chart_width + 1, inner + 1)).rstrip(), axis_style)])
+    lines.append([(f"{bottom:>{axis}} └{'─' * before}{baseline}─{'─' * after}", axis_style)])
+    # The times span the marker's column too: the axis's end is under the chart's right edge.
+    lines.append([((" " * (axis + 2) + _time_labels(*x_axis, inner + 1)).rstrip(), axis_style)])
     return lines
 
 
+def _x_axis(view: KindView, complete: bool) -> tuple[datetime, datetime]:
+    """The times ``view``'s charts run between: its window, ending at its newest sample. A job
+    shorter than the window has the window from its first sample instead, so its samples start
+    at the left; a window whose older samples are still loading (not ``complete``) keeps ending
+    at its newest, the older ones to come at the left."""
+    duration = RANGES.get(view.name)
+    if duration is None or view.end - view.start >= duration:
+        return view.start, view.end
+    if complete:
+        return view.start, view.start + duration
+    return view.end - duration, view.end
+
+
 def metric_chart_spans(view: KindView, metric: Metric, width: int, *, height: int = 2,
-                       hue: str | None = None) -> list[list[tuple[str, str]]]:
+                       hue: str | None = None, complete: bool = True) -> list[list[tuple[str, str]]]:
     """``metric``'s chart in ``view`` as lines of ``(text, style)`` spans (see :func:`_chart_spans`), its axis
-    labelled by :func:`axis_labels`: with an even ``height`` the middle label's row tops out at half the scale."""
+    labelled by :func:`axis_labels`: with an even ``height`` the middle label's row tops out at half the scale.
+    The x axis spans the window (see :func:`_x_axis`; ``complete`` as :func:`window_complete` says)."""
     return _chart_spans(view.chart(metric.key), view.start, view.end, width, height, axis_labels(metric),
-                        metric.scale, hue)
+                        metric.scale, hue, x_axis=_x_axis(view, complete))
 
 
 def has_metric_samples(view: KindView, key: str) -> bool:
@@ -2572,28 +2582,10 @@ def format_age(seconds: float) -> str:
     return f"{seconds} s" if seconds < 60 else views.fmt_duration(seconds)
 
 
-def scrape_text(sub_job: KindResource, *, notes: bool = True) -> str:
-    """``scraped every 5 s (values change about every 1m)``; ``notes=False``: ``scraped every 5 s``.
-
-    "Scraped": the sampler reads DCGM at this interval, but DCGM may refresh a
-    field less often, so consecutive samples can repeat a value. When the busy
-    values change less often than every two scrapes, the text says how often:
-    the newest value can be that much older than the newest row.
-    """
-    derived, reported = sub_job.sample_interval_s, sub_job.reported_interval_s
-    scraped = derived or reported
-    text = f"scraped every {format_interval(scraped)}"
-    if not notes:
-        return text
-    found = []
-    if derived and reported and abs(derived - reported) > 0.25 * reported:
-        found.append(f"rows report {format_interval(reported)}")
-    changes = sub_job.value_interval_s
-    if changes and scraped and changes > 2 * scraped:
-        found.append(f"values change about every {format_interval(changes)}")
-    if found:
-        text += f" ({'; '.join(found)})"
-    return text
+def scrape_text(sub_job: KindResource) -> str:
+    """``scraped every 5 s``: how often the sampler reads the sub-job's GPUs or nodes (the rows'
+    spacing, else the interval they report)."""
+    return f"scraped every {format_interval(sub_job.sample_interval_s or sub_job.reported_interval_s)}"
 
 
 def freshness_text(sub_job: KindResource, now: datetime, *, stale: bool = False,
