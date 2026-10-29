@@ -1797,8 +1797,8 @@ rejected for every other provider. Unknown keys are rejected.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `draft_config` | required | Contents of the draft's `config.json` (`architectures` and `dflash_config`) |
-| `init_from` | none | Existing draft directory to start from |
+| `draft_config` | required | Contents of the draft's `config.json` (`architectures` and `dflash_config`); always required, even with `init_from` |
+| `init_from` | none | Optional existing draft directory (with `model.safetensors`) to warm-start the weights from; the architecture still comes from `draft_config` |
 | `attention_backend` | `sdpa` | `sdpa`, `flex_attention`, or `eager` |
 | `num_anchors` | `512` | Anchor blocks sampled per sequence; greater than zero |
 | `loss_decay_gamma` | `7.0` | Per-slot loss decay; greater than zero, or `null` to disable |
@@ -1817,9 +1817,10 @@ A `dflash2` job is rejected when any of these hold:
   weights and optimizer states in fp32 for this provider, whatever the job
   asks for, so these two flags cannot turn that off. Copying a `ds_config` from
   another job that sets either flag fails.
-- A generic model patch, such as Liger kernels, is requested.
+- A generic model patch, such as Liger kernels, is requested. Patches are
+  rejected, not ignored.
 - `sp_size` or `ep_size` is greater than one. The provider supports data
-  parallelism only.
+  parallelism only, so both must be `1` or omitted.
 
 Requests use `processing.loss_fn="dflash2"`. It reads `loss_mask`, the usual
 prediction-aligned supervision mask, and does not use vocabulary `action_masks` or
