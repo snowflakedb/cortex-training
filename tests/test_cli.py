@@ -615,6 +615,17 @@ def test_submit_dry_run_prints_the_normalized_peft_config(tmp_path):
     assert peft["target_parameters"] == []
 
 
+def test_submit_dry_run_prints_arctic_provider_as_prime_rl():
+    stdout = io.StringIO()
+    path = Path(__file__).resolve().parents[1] / "examples" / "api" / "training.json"
+
+    rc = cli.main(["submit", str(path), "--dry-run"], stdout=stdout)
+
+    assert rc == 0
+    config = json.loads(stdout.getvalue())["sub_job_configs"][0]["training_config"]
+    assert config["model_provider"] == "prime_rl"
+
+
 # Spellings a caller could plausibly put in job JSON for the unsupported
 # log-probability type.
 LOG_PROBABILITY_JOB_TYPES = [

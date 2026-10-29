@@ -1728,7 +1728,15 @@ use stage 2 with `zero_optimization.offload_optimizer`. Examples include
 [below](#prime_rl-block-deprecated)), `router_replay`, `peft_config`,
 `model_options` (see [below](#model_options)), the memory-diagnostics settings
 in [section 8.5](#85-memory-diagnostics-settings), and these newer
-long-context/memory knobs:
+long-context/memory knobs.
+
+`model_provider` `"arctic"` is the name the shipped MoE configs and this
+document use, but the server accepts that provider only as `"prime_rl"` for
+now. The Python client and `cortex-training submit` send a training
+`model_provider` of `"arctic"` as `"prime_rl"`; a request sent without the
+client must use `"prime_rl"`.
+
+The long-context/memory knobs:
 
 - `sp_size`: Ulysses sequence-parallel degree, sharding each sample's sequence
   across `sp_size` ranks. `1` (default) disables it; the server requires

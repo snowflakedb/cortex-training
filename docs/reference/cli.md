@@ -471,7 +471,8 @@ cortex-training submit examples/api/sampling.json
 ```
 
 That file creates a training sub-job for `Qwen/Qwen3.6-35B-A3B` with
-`training_config.model_provider` set to `arctic`.
+`training_config.model_provider` set to `arctic`. The server does not accept
+`arctic` yet, so `submit` (including `--dry-run`) sends it as `prime_rl`.
 
 ### Run A Forward-Backward Smoke Test
 
@@ -1099,7 +1100,7 @@ history` (counting the jobs a search matches, followed by `N matches for
 QUERY`, while there is one), and ends with the sort (`sort: created ↓ newest
 first`). The Status column draws each status as a glyph and the word:
 `● RUNNING`, `◐ INITIALIZING`, `◔ PLACING` (and `creating`), `○ PENDING` (and
-`queued`), `? UNKNOWN`, `✕ FAILED`, `⊘ CANCELLED`, and `✓` for `terminated`,
+`queued`), `? UNKNOWN`, `× FAILED`, `− CANCELLED`, and `✓` for `terminated`,
 `done` and `succeeded`.
 
 Rows show the job id, status, type, created time, duration and owner, then
@@ -1240,15 +1241,15 @@ Missing times show `—`, and a clock up to five minutes ahead reads `just now`.
 **Lifecycle** runs from `created_at` to `state_changed_at`, the two times the
 job record has, and on to now while the job is live, with how long each step
 took: `◇ Created 15:14 ── 3m 10s ─▸ ● Running since 15:17 ── 9m 02s so far ─▸
-now`, or `◇ Created 2026-10-12 15:41 ── 2h 00m ─▸ ✕ Failed 2026-10-12 17:41
+now`, or `◇ Created 2026-10-12 15:41 ── 2h 00m ─▸ × Failed 2026-10-12 17:41
 (5d 22h ago)`. States in between have no time in the record and get no step;
 a live job still in the state it was created in is one step (`○ Created,
 pending since 15:14`). An `unknown` job's state has no time.
 
 A callout box under the job card says where the job stands, titled and colored
 by state: red for a failure (`Why it failed`, or `Failed before it got GPUs`);
-amber while it waits (`Why it's waiting`, `Placing on GPUs`) or while its
-status is unavailable; blue while `initializing` (`Starting up`); gray once it
+orange while it waits (`Why it's waiting`, `Placing on GPUs`) or while its
+status is unavailable; cyan while `initializing` (`Starting up`); gray once it
 was cancelled, terminated or completed. It shows the service's `reason` and
 `reason_details` (a failure always has a reason, `not reported` when none is
 sent), or what the state means, and where to look next. A running job has no
@@ -1289,14 +1290,14 @@ next tab, round to Logs after the last.
   carry no sub-job tag; each starts with its time (`HH:MM:SS`), and its
   wrapped rows start under the end of that time. The list marks each sub-job
   with its status's glyph and colour (`●` running, `◐` initializing, `◔`
-  placing, `○` pending, `✕` failed, `⊘` cancelled, `✓` ended, `?` unknown), with the status under its name; the one the
+  placing, `○` pending, `×` failed, `−` cancelled, `✓` ended, `?` unknown), with the status under its name; the one the
   pane shows has an accent edge and a bold name. Saved logs (`s`) and copies
   stay as the lines came, uncoloured. In the pane the time is faint, the level
   has its severity's colour (a warning's or an error's message is tinted to
   match), the logger name is muted, a traceback is one block on a dark red
   background from its `Traceback (most recent call last):` to the exception
   that ends it (with any chained to it), and what the filter matches is marked
-  in amber.
+  in orange.
 - **Resources** shows telemetry (`download_metrics`) for one sub-job at a
   time. `Space` (or a click on its name) shows the next one; `<` and `>` go
   back and forth. Its two-line pinned header names the sub-job, position,
@@ -1322,8 +1323,9 @@ next tab, round to Logs after the last.
     `temp` (and the hottest GPU) and `GPUs reporting` (`8/8`, against those
     requested); the System view has `CPU util`, `memory` and `nodes
     reporting`. Only metrics the rows have get a tile. Each is coloured by
-    health, and for the mean a tile is as healthy as its least healthy GPU or
-    node: GPU util under 50% warns; GPU memory used from 95% warns; GPU
+    health, and a value that warns or is an error has `!` or `×` at its
+    edge, so it shows without color too. For the mean a tile is as healthy as
+    its least healthy GPU or node: GPU util under 50% warns; GPU memory used from 95% warns; GPU
     temperature from 85 °C warns and from 90 °C is an error; CPU util from 95%
     warns; node memory used from 90% warns and from 97% is an error; power
     isn't judged. `GPUs reporting` warns below the GPUs requested and is an
@@ -1522,13 +1524,13 @@ any filter, level, or pause.
 
 The bar under the pane says, at its left end, what the pane shows and whether
 it follows the log: `● LIVE · following` while it tails a running sub-job and
-keeps to the newest line; `⏸ PAUSED · 12 new lines · p resumes` once you pause
+keeps to the newest line; `‖ PAUSED · 12 new lines · p resumes` once you pause
 (`p`) or jump to an error (`e`), as the subtitle's `PAUSED` says;
 `↑ SCROLLED UP · 12 new lines · p follows` once you scroll up from the end
 (each counts the lines that came since); `✓ SAVED CONSOLE` for a finished
 job's saved console; `↓ DOWNLOADING training #0`, a bar and `8/12 chunks`
 while that console downloads; `○ WAITING` while the job or sub-job waits to
-start (the status line says why); and `✕ STOPPED · r retries` when the tail
+start (the status line says why); and `× STOPPED · r retries` when the tail
 stopped on an error. In the middle is the filter box (`/` focuses it). At its
 right end are chips for what is found or set, in this order: where the last
 jump landed (`error 2/5` or `no errors` for `e` / `E`, `problem 2/5` or
@@ -1725,6 +1727,48 @@ staging directories, which live in the system temp directory
 older TUIs), interrupted `.removing-*` dirs, `.console-*` / `.tmp-*.swp` partials
 older than an hour, and lease markers older than 30 minutes.
 
+#### Terminals
+
+The TUI draws the same screens in any terminal that runs full-screen programs.
+What a terminal changes is how many colors it says it has, in `COLORTERM` and
+`TERM`, and the TUI draws its palette for each:
+
+| The terminal says | The TUI draws | Usually |
+|-------------------|---------------|---------|
+| `COLORTERM=truecolor` (or `24bit`) | the palette as it is | iTerm2, VS Code, Cursor, Ghostty, kitty, WezTerm, Windows Terminal |
+| `TERM=...-256color`, no `COLORTERM` | each color as the nearest of 256, so surfaces, cards and the header stay apart as grays | macOS Terminal, a session over SSH (which passes `TERM` on but not `COLORTERM`), tmux with `default-terminal` `tmux-256color` |
+| `TERM=xterm`, `screen` or `linux`, or no `TERM` | 16 colors, with a note as it starts that shades are approximate | tmux or screen left at plain `screen` |
+| `TERM=dumb` or `unknown` | grays, with 256 colors, so the highlighted row still shows | a tool's command runner |
+
+Where the terminal has 24-bit color but doesn't say so, set
+`COLORTERM=truecolor` where the TUI starts: on the remote host over SSH (or send
+it, with `SendEnv COLORTERM` in `~/.ssh/config` and `AcceptEnv COLORTERM` on the
+server), and in tmux, whose outer terminal also needs
+`set -as terminal-features ',*:RGB'`. `TEXTUAL_COLOR_SYSTEM` (`truecolor`,
+`256` or `standard`) sets the colors outright.
+
+`NO_COLOR` set to anything but an empty string ([no-color.org](https://no-color.org))
+draws every color as its gray, and the TUI says so as it starts. `--color always`
+draws color anyway, `--color never` draws gray in any terminal, and
+`--color auto` is the default. No screen depends on color alone: a job's status
+has its glyph, and a KPI tile that warns or is an error has `!` or `×` at its
+edge. Some command runners set `NO_COLOR` and `TERM=dumb` for the commands they
+run (an AI agent's, such as Cursor's): a TUI started there is gray until
+`--color always`.
+
+Each glyph the TUI draws is one cell wide, and none is also an emoji (which some
+terminals draw in color, two cells wide). Borders, tables and charts line up
+where the terminal counts East Asian ambiguous-width characters (box drawing,
+`●`, `…`) as one cell, as terminals do by default; set to draw them double
+width (iTerm2's "Ambiguous characters are double-width", some CJK setups),
+every border breaks, as in any Textual app. Every view works at 80×24; a
+smaller terminal cuts columns, long values and the footer's keys, and `?`
+still lists every key.
+
+Over SSH the TUI copies through OSC 52 alone, since this machine's clipboard
+tools would copy on the remote host. The terminal has to accept OSC 52 (some ask
+first), and in tmux it needs `set -s set-clipboard on`.
+
 ### JSON Output And Help
 
 Commands other than the TUI write JSON to stdout, pretty-printed by default.
@@ -1776,6 +1820,10 @@ program that made the call in `client.surface`: `cli` for these commands, `tui`
 for the TUI, `sdk` for Python code. `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY`
 set truthy also emits successful outcomes for every other essential operation;
 set falsy, it emits failures only, the TUI's included. See the [Python SDK reference](python-sdk.md#client-metrics).
+
+`NO_COLOR` (not empty) draws `cortex-training tui` in gray unless it is started
+with `--color always`; `COLORTERM`, `TERM` and `TEXTUAL_COLOR_SYSTEM` say how
+many colors the terminal has. See [Terminals](#terminals).
 
 `CORTEX_TRAINING_DISABLE_TENSOR_PROMPTS` (truthy) sends pre-tokenized prompts
 as JSON lists inside the request frame instead of as tensors. The request body

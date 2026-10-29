@@ -1574,10 +1574,10 @@ class JobListScreen(FollowsPointer, Screen):
             return
         if self._pages_failed:
             # The first pages of a list whose later ones failed (or were never read).
-            text = (f"✕ load failed {self._failed_at or ''}: {self._list_error or ''}; "
+            text = (f"× load failed {self._failed_at or ''}: {self._list_error or ''}; "
                     f"showing the {len(self._all_jobs):,} jobs read before it (r reads them all again)")
         else:
-            text = (f"✕ refresh failed {self._failed_at or ''}: {self._list_error or ''}; "
+            text = (f"× refresh failed {self._failed_at or ''}: {self._list_error or ''}; "
                     f"showing the list from {(self._last_refreshed or '—')[:5]}")
         self._notice = Content.assemble("   ", (text, theme.ERR))
         self._paint_notice()
@@ -1586,7 +1586,7 @@ class JobListScreen(FollowsPointer, Screen):
         if self._notice is None:
             return
         widget = self.query_one("#listnotice", Static)
-        # Wrapped lines continue under the message ("   ✕ " is five cells), not at the edge.
+        # Wrapped lines continue under the message ("   × " is five cells), not at the edge.
         widget.update(hanging(self._notice, widget.size.width or self.size.width or self.app.size.width, 5))
 
     def _paint_info(self) -> None:

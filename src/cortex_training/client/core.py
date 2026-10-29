@@ -1537,14 +1537,20 @@ def _reject_zero_stage_3(ds_config: Any, *, location: str) -> None:
         )
 
 
+# ``model_provider`` names the client accepts but the server does not yet, and
+# the name each is sent as. Drop an entry once the server accepts the new name.
+_MODEL_PROVIDER_WIRE_ALIASES = {"arctic": "prime_rl"}
+
+
 def _validate_raw_sub_job_configs(sub_job_configs: list) -> None:
     """Validate a raw create-job body in place: canonicalize every ``peft_config`` and reject ZeRO-3.
 
     The typed path validates these through :class:`TrainingConfig` /
     :class:`InferenceConfig`; this gives raw bodies the same guarantee so an
     adapter that weight sync cannot carry, or an unsupported ZeRO stage, is
-    rejected before the request is sent. Everything else in the body, including
-    ``optimizer``, is forwarded as given.
+    rejected before the request is sent. A training ``model_provider`` of
+    ``"arctic"`` is rewritten to ``"prime_rl"``, the name the server accepts.
+    Everything else in the body, including ``optimizer``, is forwarded as given.
     """
     for index, sub_job in enumerate(sub_job_configs):
         if not isinstance(sub_job, dict):
@@ -1557,6 +1563,9 @@ def _validate_raw_sub_job_configs(sub_job_configs: list) -> None:
                 job_config.get("ds_config"),
                 location=f"sub_job_configs[{index}].training_config.ds_config",
             )
+            provider = job_config.get("model_provider")
+            if isinstance(provider, str) and provider in _MODEL_PROVIDER_WIRE_ALIASES:
+                job_config["model_provider"] = _MODEL_PROVIDER_WIRE_ALIASES[provider]
         peft_config = job_config.get("peft_config") if isinstance(job_config, dict) else None
         if peft_config is None:
             continue
