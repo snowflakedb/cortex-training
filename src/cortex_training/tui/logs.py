@@ -2411,7 +2411,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
 
     def _log_live(self) -> Content:
         """The bar's left end: what the pane shows, and whether it follows the log.
-        ``● LIVE · following``, ``⏸ PAUSED · 12 new lines · p resumes``, ``✓ SAVED CONSOLE``,
+        ``● LIVE · following``, ``‖ PAUSED · 12 new lines · p resumes``, ``✓ SAVED CONSOLE``,
         a download's progress, or the wait the status line above explains."""
         source = self._current_source
         state = self._bar_state
@@ -2434,16 +2434,16 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
             return state("○", "WAITING", theme.WARN)
         if self._tail_live:
             if self._idle_paused:
-                return state("⏸", "PAUSED", theme.WARN, "no input · p resumes")
+                return state("‖", "PAUSED", theme.WARN, "no input · p resumes")
             if self._away_from_end():
                 new = f"{self._count(self._unseen, 'new line')} · " if self._unseen else ""
                 # Paused (p, or a jump) as the subtitle says, or only scrolled up from the end.
                 if self._paused:
-                    return state("⏸", "PAUSED", theme.WARN, f"{new}p resumes")
+                    return state("‖", "PAUSED", theme.WARN, f"{new}p resumes")
                 return state("↑", "SCROLLED UP", theme.WARN, f"{new}p follows")
             return state("●", "LIVE", theme.OK, "catching up" if self._behind_note else "following")
         if self._tail_error:
-            return state("✕", "STOPPED", theme.ERR, "r retries")
+            return state("×", "STOPPED", theme.ERR, "r retries")
         return state("◌", "CACHED", theme.MUTED, "saved on this machine")
 
     @staticmethod

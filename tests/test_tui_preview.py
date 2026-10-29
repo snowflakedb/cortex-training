@@ -180,7 +180,7 @@ def test_callout_for_running_and_unknown_jobs():
 
 def test_status_text_is_a_badge():
     assert status_text("JOB_STATE_RUNNING").plain == "● RUNNING"
-    assert status_text("FAILED").plain == "✕ FAILED"
+    assert status_text("FAILED").plain == "× FAILED"
     assert status_text("").plain == "?"
 
 

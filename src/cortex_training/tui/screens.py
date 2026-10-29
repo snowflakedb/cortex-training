@@ -518,7 +518,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
         else:
             after_refresh(self, body.scroll_to_widget, table, animate=False)
 
-    # The callout's color, by its tone: red for a failure, amber while waiting (or
+    # The callout's color, by its tone: red for a failure, orange while waiting (or
     # when the state is unavailable), calm once the job ended without failing.
     _TONES = {"failed": theme.ERR, "waiting": theme.WARN, "unknown": theme.WARN, "starting": theme.INFO,
               "running": theme.OK, "ended": theme.ENDED}

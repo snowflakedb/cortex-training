@@ -23,14 +23,13 @@ from cortex_training.tui.theme import INFO
 from cortex_training.tui.theme import MARK_SURFACE
 from cortex_training.tui.theme import MUTED
 from cortex_training.tui.theme import OK
+from cortex_training.tui.theme import SUB_JOB_COLORS
+from cortex_training.tui.theme import SUB_JOB_OTHER
 from cortex_training.tui.theme import TEXT
 from cortex_training.tui.theme import WARN
 from cortex_training.tui.theme import WARN_TEXT
 
 NOTE = f"italic {MUTED}"
-# A sub-job's colour, by its type: its name on the Resources tab.
-SUB_JOB_COLORS = {"training": "#22d3ee", "sampling": "#c084fc", "log_prob": "#fbbf24", "logprob": "#fbbf24"}
-SUB_JOB_OTHER = "#60a5fa"
 TIME = FAINT
 LOGGER = MUTED
 KEY = FAINT

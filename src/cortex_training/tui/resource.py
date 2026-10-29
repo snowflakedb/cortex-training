@@ -39,8 +39,10 @@ from typing import Mapping
 from cortex_training._artifact_download import read_manifest
 from cortex_training.tui import views
 from cortex_training.tui.theme import BACKGROUND
+from cortex_training.tui.theme import CHART_HUES
 from cortex_training.tui.theme import ERR
 from cortex_training.tui.theme import FAINT
+from cortex_training.tui.theme import GRID
 from cortex_training.tui.theme import MUTED
 from cortex_training.tui.theme import OK
 from cortex_training.tui.theme import SURFACE
@@ -2218,7 +2220,7 @@ def worst_health(healths) -> str | None:
 
 
 _EIGHTHS_WIDE = "▏▎▍▌▋▊▉█"
-METER_TRACK = "#30363d"  # the theme's border: seen under a list's highlight, never read as a value
+METER_TRACK = GRID  # seen under a list's highlight, never read as a value
 
 
 def meter_spans(value: float | None, scale: float, cells: int, color: str | None = None,
@@ -2350,6 +2352,9 @@ def kpi_tiles(resource: KindResource, view: KindView, *, unit: int | None = None
 
 _TILE_GAP = 1  # cells between two tiles
 _TILE_EDGE = "▎"
+# The edge beside a tile's value when the value isn't healthy: a shape as well as a color,
+# so a warning and an error still show where there is no color (NO_COLOR, a copied strip).
+_TILE_MARKS = {"warn": "!", "err": "×"}
 
 
 def _tile_width(tile: Kpi, detail: bool) -> int:
@@ -2404,7 +2409,8 @@ def kpi_strip_spans(tiles: list[Kpi], width: int, *, styled: bool = True,
             value = views.fit_cells(tile.value, inner)
             rest = inner - views.cell_width(value)
             note = views.fit_cells(tile.detail, rest - 2) if keep[index] and rest > 3 else ""
-            bottom += [edge, (value, f"bold {color} {card}" if styled else "")]
+            mark = (f"{_TILE_MARKS.get(tile.health, _TILE_EDGE)} ", edge[1])
+            bottom += [mark, (value, f"bold {color} {card}" if styled else "")]
             tail = (f"  {note}" if note else "").ljust(rest) + " "
             bottom.append((tail, f"{FAINT if dim else MUTED} {card}" if styled else ""))
         lines += [top, bottom]
@@ -2447,15 +2453,9 @@ def _time_labels(start: datetime, end: datetime, chart_width: int) -> str:
     return label.rjust(chart_width) if chart_width >= len(label) else ""
 
 
-# Each chart's colour, by its place in the metrics' order: GPU util % (or CPU util %)
-# green, memory used % cyan, then on round the palette. Hues that read on the theme's
-# background, a step lighter than its status colours, so a chart's line never reads as
-# a status; the same chart keeps its colour across windows, units and refreshes.
-CHART_HUES = ("#4ade80", "#22d3ee", "#60a5fa", "#a78bfa", "#fbbf24", "#fb7185", "#2dd4bf", "#f472b6", "#a3e635",
-              "#fb923c")
 # The frame, labels and the 50% gridline, quieter than the series: the theme's own tones.
 CHART_AXIS = FAINT
-CHART_GRID = "#30363d"  # the theme's border: seen, never read as data
+CHART_GRID = GRID
 CHART_MUTED = MUTED
 _GRID = "┈"
 # The baseline under a column without a sample: a gap reads as missing data, never as a 0.

@@ -21,8 +21,11 @@ import argparse
 import math
 import os
 import re
+import sys
 import threading
 from pathlib import Path
+
+from cortex_training.tui import terminal
 
 _CONNECT_HINT = ("to connect, run 'cortex-training login config.json', set CORTEX_TRAINING_CONFIG, pass "
                  "--config config.json, --connection NAME, --base-url (local/mock), or --host + --pat")
@@ -126,6 +129,11 @@ def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.Argument
     )
     p.add_argument("--no-verify-ssl", action="store_true",
                    help="Disable SSL certificate verification for authenticated requests.")
+    p.add_argument(
+        "--color", choices=terminal.COLOR_CHOICES, default="auto",
+        help=("auto (the default) draws in color unless NO_COLOR is set to a non-empty value, or TERM "
+              "is dumb; always draws in color anyway; never draws every color as its gray."),
+    )
     return p
 
 
@@ -142,6 +150,10 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     problem = textual_problem()
     if problem:
         parser.exit(2, f"{parser.prog}: error: {problem}\n")
+    colors = terminal.colors(args.color)
+    if colors.color_system and "textual.constants" not in sys.modules:
+        # Textual reads its color system once, as it is first imported.
+        os.environ["TEXTUAL_COLOR_SYSTEM"] = colors.color_system
     try:
         from cortex_training.tui.app import CortexTrainingLogTUI
     except ImportError as exc:
@@ -161,6 +173,7 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     # list so the user can choose one.
     app = CortexTrainingLogTUI(client, args.job_id, sub_job_id=args.sub_job_id, poll_interval=log_poll_interval)
     app.sign_in = sign_in  # for the commands the TUI shows to copy
+    app.colors = colors
     try:
         app.run()
     finally:
