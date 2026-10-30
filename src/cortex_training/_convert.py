@@ -24,10 +24,11 @@ database, and settings. Converting it:
    can be created after showing the SQL and asking. Nothing local is written
    if a check fails;
 3. shows every change and asks once;
-4. writes a Snowflake connection profile, sets it in ``config.json`` with the
-   old settings, saves a copy of the old file without the PAT, then deletes
-   the old file (and ``login.json`` if it points to it). Either every change
-   happens, or every file is put back as it was.
+4. writes a Snowflake connection profile, sets it in ``config.json``, and
+   saves a copy of the old file without the PAT; then signs in with the new
+   profile, and only if that works deletes the old file (and ``login.json`` if
+   it points to it). Either every change happens, or every file is put back
+   as it was.
 """
 
 from __future__ import annotations
@@ -378,8 +379,9 @@ class _Converter:
         )
         self.p.say(f"  2. Set Cortex Training to use it, in {_login._home(_picker.config_path())}")
         self.p.say(f"  3. Save a copy of the old config without the PAT: {_login._home(plan.backup)}")
-        deleted = _login._home(old.path) + (f" and {_login._home(plan.login_file)}" if plan.login_file else "")
-        self.p.say(f"  4. Delete {deleted}")
+        self.p.say(f"  4. Sign in with profile {plan.profile} to check that it works")
+        self.p.say(f"  5. Only if it works, delete {_kept(plan, old)}")
+        self.p.say("   If anything fails, every file is put back as it was.")
         dropped = _dropped_settings(old.settings)
         if dropped:
             self.p.say()
@@ -389,6 +391,29 @@ class _Converter:
         # No by default: this deletes the old file.
         if not self.p.confirm("Go ahead?", default=False):
             raise ConvertError("Nothing was changed.")
+
+
+    def check_new_profile(self, plan: Plan, open_profile: Callable[[str, str, str], Any]) -> None:
+        """Sign in with the profile just written, as commands will; raise if it doesn't work."""
+        self.p.section(f"Checking profile {plan.profile}...")
+        client = open_profile(plan.profile, self.old.database, self.old.schema)
+        try:
+            client.get_capacity()
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+        self.p.say(f"  {self.s.ok(f'Signed in with profile {plan.profile}')}")
+
+
+class _NewProfileFailed(Exception):
+    """Signing in with the new profile failed; the cause is chained."""
+
+
+def _kept(plan: Plan, old: OldConfig) -> str:
+    """The old file, and login.json when it points to it: deleted only once the new profile works."""
+    return _login._home(old.path) + (f" and {_login._home(plan.login_file)}" if plan.login_file else "")
 
 
 # The client's defaults. Old files often list these (the 3.1 template does), and
@@ -468,8 +493,12 @@ class _Snapshot:
             _profiles.write_file(self.path, self.text)
 
 
-def apply(plan: Plan, old: OldConfig) -> None:
-    """Make every change in ``plan``, or put every file back as it was and raise."""
+def apply(plan: Plan, old: OldConfig, check: Callable[[], None] | None = None) -> None:
+    """Make every change in ``plan``, or put every file back as it was and raise.
+
+    ``check`` signs in with the new profile after the writes; the old file and
+    ``login.json`` are deleted only if it returns.
+    """
     config_file = _picker.config_path()
     snapshots = [_Snapshot(_profiles.profile_file()), _Snapshot(config_file), _Snapshot(plan.backup)]
     removed: list[_Snapshot] = []
@@ -479,7 +508,12 @@ def apply(plan: Plan, old: OldConfig) -> None:
         _profiles.write_file(config_file, settings)
         _picker.load_config()  # Refuse settings that commands couldn't read back.
         _profiles.write_file(plan.backup, json.dumps(_without_pat(old.raw), indent=2) + "\n")
-        # Delete last, once every write has worked.
+        if check is not None:
+            try:
+                check()
+            except Exception as exc:
+                raise _NewProfileFailed() from exc
+        # Delete last, once every write has worked and the new profile signs in.
         for path in [old.path, *([plan.login_file] if plan.login_file else [])]:
             snapshot = _Snapshot(path)
             path.unlink()
@@ -490,6 +524,13 @@ def apply(plan: Plan, old: OldConfig) -> None:
                 snapshot.restore()
             except Exception:
                 pass
+        if isinstance(exc, _NewProfileFailed):
+            cause = exc.__cause__
+            raise ConvertError(
+                f"Signing in with profile {plan.profile} didn't work: {explain(cause, old)}\n\n"
+                f"Every file was put back as it was; {_kept(plan, old)} {'are' if plan.login_file else 'is'} kept. "
+                "If Cortex Training or the network was briefly unavailable, run the command again in a few minutes."
+            ) from cause
         if isinstance(exc, Exception):
             raise ConvertError(f"Couldn't finish the conversion ({_login._first_line(exc)}), so every file was put back as it was.") from exc
         raise
@@ -503,6 +544,7 @@ def run_convert(
     stderr: TextIO,
     interactive: bool | None = None,
     open_client: Callable[[OldConfig], Any] = open_pat_client,
+    open_profile: Callable[[str, str, str], Any] = _login.open_profile_client,
 ) -> int:
     """Run ``cortex-training login --convert-legacy-config PATH``; return the exit code."""
     if interactive is None:
@@ -524,7 +566,7 @@ def run_convert(
         identity = converter.check()
         plan = converter.plan(identity)
         converter.confirm(plan)
-        apply(plan, old)
+        apply(plan, old, check=lambda: converter.check_new_profile(plan, open_profile))
     except KeyboardInterrupt:
         stderr.write("\nConversion cancelled. No files were changed.\n")
         if converter is not None and converter.created_database:

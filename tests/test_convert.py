@@ -66,10 +66,31 @@ class World:
         self.create_error = None
         self.statements = []
         self.opened = 0
+        self.profile_error = None
+        self.profiles_opened = []
 
     def open(self, old):
         self.opened += 1
         return FakePatClient(self, old)
+
+    def open_profile(self, profile, database, schema):
+        # Commands sign in from the profile file, so it must be written by now.
+        assert profile in _profiles.read_profiles()
+        self.profiles_opened.append((profile, database, schema))
+        return FakeProfileClient(self)
+
+
+class FakeProfileClient:
+    def __init__(self, world):
+        self.world = world
+
+    def get_capacity(self):
+        if self.world.profile_error:
+            raise self.world.profile_error
+        return {}
+
+    def close(self):
+        pass
 
 
 class FakePatClient:
@@ -123,7 +144,9 @@ def _rows(columns, data):
 
 def convert(world, path, answers=()):
     stdin, stdout, stderr = io.StringIO("".join(f"{a}\n" for a in answers)), io.StringIO(), io.StringIO()
-    code = _convert.run_convert(str(path), stdin=stdin, stdout=stdout, stderr=stderr, interactive=True, open_client=world.open)
+    code = _convert.run_convert(
+        str(path), stdin=stdin, stdout=stdout, stderr=stderr, interactive=True, open_client=world.open, open_profile=world.open_profile
+    )
     summary = json.loads(stdout.getvalue()) if code == 0 else None
     return code, summary, stderr.getvalue()
 
@@ -540,3 +563,49 @@ def test_an_old_file_at_the_new_config_json_path_says_so(old_file, isolated):
     assert code == 1
     assert "is where the new config.json goes, and it can hold only \"profile\". Move the old config" in err
     assert world.opened == 0 and path.exists()
+
+
+# ─── Review follow-ups (Da, #202) ───────────────────────────────────────────
+
+
+def _point_login_json_at(path):
+    login_file = _cli._login_state_path()
+    login_file.parent.mkdir(parents=True, exist_ok=True)
+    login_file.write_text(json.dumps({"config_path": str(path)}))
+    return login_file
+
+
+def test_the_plan_says_it_signs_in_with_the_new_profile_before_deleting(old_file):
+    path = old_file()
+    _point_login_json_at(path)
+    world = World()
+    code, _, err = convert(world, path, YES)
+    assert code == 0, err
+    assert "  4. Sign in with profile cortex-training to check that it works" in err
+    assert "  5. Only if it works, delete " in err
+    assert "  ✓ Signed in with profile cortex-training" in err
+    assert world.profiles_opened == [("cortex-training", "CORTEX_TRAINING_DB", "PUBLIC")]
+
+
+def test_old_files_are_removed_only_when_the_new_profile_signs_in(old_file):
+    path = old_file()
+    login_file = _point_login_json_at(path)
+    code, _, err = convert(World(), path, YES)
+    assert code == 0, err
+    assert not path.exists() and not login_file.exists()
+
+
+def test_a_new_profile_that_cant_sign_in_puts_every_file_back(old_file, isolated):
+    path = old_file()
+    login_file = _point_login_json_at(path)
+    login_before = login_file.read_text()
+    world = World()
+    world.profile_error = ApiError(403, "390100", "Programmatic access token is invalid")
+    code, _, err = convert(world, path, YES)
+    assert code == 1
+    assert "Signing in with profile cortex-training didn't work:" in err
+    assert "Every file was put back as it was;" in err and "are kept." in err
+    assert "run the command again in a few minutes." in err
+    assert path.exists() and login_file.read_text() == login_before
+    assert not (isolated / "connections.toml").exists() and config() is None
+    assert not path.with_name("ct-config.json.bak").exists()

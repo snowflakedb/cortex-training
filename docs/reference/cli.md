@@ -80,11 +80,11 @@ positional `JOB_ID` after the subcommand.
 ### [Connection](#legacy-connection-config)
 
 ```bash
-cortex-training --connection training list    # Use a Snowflake profile
-cortex-training list                          # Use the configured default profile
 cortex-training login                         # Set up or check the profile to use
 cortex-training login training                # Use or create the profile "training"
-cortex-training --config config.json list     # Use config for one command
+cortex-training list                          # Use the profile login saved
+cortex-training --connection training list    # Use another profile for one command
+cortex-training --config config.json list     # Deprecated: an old JSON config (warns)
 ```
 
 ### [Submit Jobs](#submit-a-job)
@@ -219,15 +219,43 @@ chmod 600 ~/.snowflake/connections.toml
 cortex-training --connection training list
 ```
 
-`cortex-training list` with no connection arguments uses the
-Connector-configured default profile. Set
-`SNOWFLAKE_DEFAULT_CONNECTION_NAME=training`, configure
-`default_connection_name = "training"` in Snowflake's `config.toml`, or name
-the connection `[default]`.
+`cortex-training list` with no connection arguments uses the profile
+`cortex-training login` saved, else the Connector-configured default profile
+(`SNOWFLAKE_DEFAULT_CONNECTION_NAME`, `default_connection_name` in Snowflake's
+`config.toml`, or a profile named `[default]`). The database is `--database`,
+else `CORTEX_TRAINING_DATABASE`, else the profile's, else `CORTEX_TRAINING_DB`;
+the schema follows the same order and defaults to `PUBLIC`.
 
-Profile lookup is a fallback. An explicit or remembered legacy JSON config, or
-a complete direct `--base-url` / `--host` + `--pat` connection, continues to
-win. This preserves existing scripts.
+**Changed:** a profile with no `database` used to be an error ("must set
+database"). It now uses `CORTEX_TRAINING_DB`. Set `database` in the profile, or
+pass `--database`, to use another.
+
+In a terminal, a command prints one line on stderr naming the profile,
+database, and schema, and where each came from, unless it's the profile
+`cortex-training login` saved with its own database and schema:
+
+```text
+→ profile train (from --connection) · database CORTEX_TRAINING_DB (default) · schema PUBLIC (default)
+```
+
+Scripts and CI (stderr not a terminal) never get this line.
+
+The old ways still work, and each prints a warning that it's deprecated and
+will stop working in a future release: an explicit or remembered JSON config
+(`--config`, `CORTEX_TRAINING_CONFIG`, `login.json`), `--host` / `--pat`,
+`SNOWFLAKE_HOST` / `SNOWFLAKE_PAT` / `SNOWFLAKE_DATABASE` / `SNOWFLAKE_SCHEMA`,
+and `CORTEX_TRAINING_CONNECTION`. They win as before, so existing scripts keep
+working. `CORTEX_TRAINING_HOST` and `CORTEX_TRAINING_PAT` are for CI: when you
+also have a profile they still win, with a warning that the profile will be
+used instead in a future release. `--base-url`, for a local or mock server,
+doesn't warn.
+
+One exception: a profile saved by `cortex-training login` wins over
+`login.json` (the file the old `login PATH` remembered), as long as that profile
+still exists. The command uses the profile and says `login.json` is ignored,
+with the command that converts and removes it. If the saved profile is gone,
+`login.json` keeps working, with its deprecation warning. `--config` and `CORTEX_TRAINING_CONFIG` still win over a saved
+profile, since you pass them for that command.
 
 ### Legacy Connection Config
 
@@ -323,8 +351,8 @@ is piped. Login needs a terminal; in CI, set `CORTEX_TRAINING_HOST` and
 `CORTEX_TRAINING_PAT` instead.
 
 `cortex-training login config.json` and `login --config config.json`, which
-remembered a JSON config, are no longer supported. A JSON config still works
-for one command with:
+remember a JSON config in `login.json`, still work, with a deprecation warning.
+A JSON config also still works (with a warning) for one command with:
 
 ```bash
 cortex-training --config config.json list
@@ -366,7 +394,8 @@ the file:
   with the flags that set them (`--endpoint`, `--poll-interval`,
   `--poll-timeout`, `--no-verify-ssl`);
 - it saves a copy of the file without the PAT as `PATH.bak`;
-- it deletes the file, and `login.json` if it points to it.
+- it signs in with the new profile, as commands will;
+- only if that works, it deletes the file, and `login.json` if it points to it.
 
 Either every change happens, or every file is put back as it was. If a check
 fails, or there's no `pat` in the file or the environment, or the file has a
