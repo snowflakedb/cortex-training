@@ -1,0 +1,15 @@
+id: skyrl-bird-grpo
+title: BIRD GRPO with SkyRL
+status: runnable
+task: rl
+framework: NovaSky-AI/SkyRL
+methods:
+  - full-parameter
+models:
+  - Qwen/Qwen3-8B
+datasets:
+  - BIRD-SQL
+provenance:
+  project: Snowflake-AI-Research/Arctic-Platform
+  recipe: recipes/rl/skyrl/txt2sql/run_qwen3_0.6b_bird_grpo_cortex.sh
+last_validated: 2026-10-27

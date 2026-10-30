@@ -6,6 +6,8 @@ own install and entry point.
 - [SkyRL](skyrl/gsm8k_grpo/README.md): runs GRPO with its trainer on a CPU
   driver and training and sampling in Cortex sub-jobs. The GSM8K example lives
   in the Arctic Platform repository.
+- [SkyRL on BIRD](skyrl/bird_grpo/README.md): the same driver shape for
+  Qwen3-8B on BIRD-SQL, with ZoRRo.
 - [Tinker](tinker/README.md): run a tinker-cookbook recipe, or the Tinker client, on Cortex.
 - [Bring your own agent](bring-your-own-agent.md): train a model inside the
   agent you already run. The agent sends its model calls to a per-rollout

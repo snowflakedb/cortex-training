@@ -29,6 +29,7 @@ EXAMPLE_FOLDERS = (
     "distillation",
     "dflash2",
     "frameworks/skyrl/gsm8k_grpo",
+    "frameworks/skyrl/bird_grpo",
 )
 
 
@@ -1435,7 +1436,7 @@ _UPSTREAM_REFERENCES = (
     ("*", re.compile(r"tinker_cookbook\.recipes\.")),
     ("examples/frameworks/*", re.compile(r"cookbook", re.IGNORECASE)),
     ("examples/*example.yaml", re.compile(r"^  recipe: ")),
-    ("examples/frameworks/skyrl/*", re.compile(r"Arctic-Platform/(?:blob/main/)?recipes/")),
+    ("examples/frameworks/skyrl/*", re.compile(r"Arctic-Platform/(?:blob/(?:main|sfc-gh-truwase/zorro-train-client)/)?recipes/")),
     # The OpenHands / bring-your-own-agent integration docs describe the Arctic
     # Platform OpenHands recipe (another project), so they may name "recipe".
     ("examples/frameworks/openhands.md", re.compile(r"recipe", re.IGNORECASE)),

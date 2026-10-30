@@ -15,6 +15,8 @@ end-to-end RL example. It demonstrates:
 with its trainer on a CPU driver and training and sampling in Cortex sub-jobs.
 Its GSM8K example lives in the Arctic Platform repository and has its own
 install.
+[SkyRL on BIRD](../../../examples/frameworks/skyrl/bird_grpo/README.md) trains
+Qwen3-8B the same way, with ZoRRo.
 
 To train a model inside an agent you already have, see
 [Bring your own agent](../../../examples/frameworks/bring-your-own-agent.md). The agent

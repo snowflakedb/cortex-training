@@ -15,7 +15,8 @@ type on the command line instead of writing a job file.
 | [DFlash2 draft](dflash2/README.md) | Speculative-decoding draft training, then serving with the target | Target-written chats (UltraChat prompts) |
 
 GRPO also runs from [SkyRL](frameworks/skyrl/gsm8k_grpo/README.md), with its own
-install and entry point.
+install and entry point. [SkyRL on BIRD](frameworks/skyrl/bird_grpo/README.md)
+trains Qwen3-8B with ZoRRo.
 
 ```text
 examples/
