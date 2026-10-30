@@ -973,6 +973,8 @@ split across several chunks. Each chunk is posted to the same path; only the
 last response may carry the `request_id`. See
 [section 9.3](#93-request-chunking).
 
+**Router replay coordination belongs in frame operation metadata.** For requests that replay sampler routing, encode `router_replay` with `wire.dumps(..., metadata=...)` and use the sampling zone ID returned by bootstrap, not the public sampling sub-job ID. See [section 7.4](#74-bootstrap-router-replay) for the source/target mapping and encoding example.
+
 Typical polled result:
 
 ```json
@@ -1459,6 +1461,8 @@ split with `wire.encode_byte_chunks` (`kind="request"`, `operation="forward"`)
 and each chunk is its own POST whose `payload_b64` is that request chunk. Only
 the last POST returns the pollable `request_id`.
 
+**Forward-only replay uses the same metadata contract as forward/backward.** Put `router_replay` in the DSSST1 frame's operation metadata and use the bootstrap-returned sampling zone ID; see [section 7.4](#74-bootstrap-router-replay). Do not put replay coordination in the outer `/operation` JSON envelope or the model batch.
+
 The ceiling is `CORTEX_TRAINING_FORWARD_OPERATION_MAX_JSON_BYTES` (integer
 bytes, default 16 MiB, minimum 16 KiB). Dict payloads stay a single plain
 `/operation` POST.
@@ -1569,6 +1573,32 @@ replay target/operation receiver. `max_cache_bytes` is optional.
 For a mixed training/sampling job, pass `sub_job_id=target_sub_job_id` (or the
 matching `sub_job_type`) because the low-level client does not infer the
 operation receiver.
+
+**Successful bootstrap returns the sampling zone ID to use for replay coordination.** Read `sampling_job_id` from the completed `bootstrap-router-replay` result. If the deployment initially returns a `request_id`, poll that request before reading the result. The returned ID identifies the sampling backend paired with the training backend; it is not necessarily the public sampling sub-job ID supplied as `source_sub_job_id`. Retain the mapping for that specific source/target pair, and use the returned ID for subsequent `forward` and `forward-backward` replay requests. Do not reuse the mapping for a different pair.
+
+**Replay coordination belongs in DSSST1 operation metadata, not the model batch.** Pass the pair-level `router_replay` descriptor through `wire.dumps(..., metadata=...)`. The frame stores the descriptor in the safetensors `__metadata__.op` field, and `wire.read_metadata(frame)` returns it. The server selects the bootstrapped pair using `metadata["router_replay"]["sampling_job_id"]`; a descriptor inside `batch` or model `kwargs` does not supply operation metadata.
+
+`router_replay.identity_version` is an integer that may be omitted for legacy replay IDs but must be `1` for `rr1:` sample IDs, where `1` denotes the version-1 exact replay identity protocol.
+
+```python
+from cortex_training import wire
+
+# bootstrap_result is the completed bootstrap result for this source/target pair.
+frame = wire.dumps(
+    batch,
+    metadata={
+        "response_options": {"format": "dssst1", "delivery": "chunked"},
+        "router_replay": {
+            "sampling_job_id": bootstrap_result["sampling_job_id"],
+            "identity_version": 1,
+        },
+    },
+)
+```
+
+**Per-row replay inputs remain in the model payload.** Keep `rr_sample_ids`, `rr_replay_meta`, and `rr_discard` in the batch or model arguments expected by the training backend; only the pair-level `router_replay` descriptor belongs in operation metadata. Both forward endpoints use this placement. Request chunking wraps the completed frame and preserves its replay metadata when the frame is reassembled.
+
+**The low-level client sends the caller's encoded sampler ID unchanged.** `forward()` and `forward_backward()` do not translate public sampling sub-job IDs to sampling zone IDs. Callers must encode the ID returned by bootstrap, or use a higher-level transport that retains the source/target mapping and rewrites the ID before frame serialization.
 
 ### 7.5 Router replay discard
 
@@ -2481,6 +2511,8 @@ Safetensors metadata contains:
 - `dss`: the nested structure skeleton and wire version `DSSST1`.
 - `op`: optional operation metadata such as response options, router replay,
   and request/result chunk descriptors.
+
+**Router replay uses the `op` metadata object for both forward endpoints.** See [section 7.4](#74-bootstrap-router-replay) for the `router_replay` descriptor, the bootstrap-returned sampling zone ID, and an encoding example. Per-row replay inputs remain in the model payload, not operation metadata.
 
 Encode/decode:
 
