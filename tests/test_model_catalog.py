@@ -44,7 +44,7 @@ _FULL_STANDARD_LONG = [
     "long/h200-training-full",
 ]
 EXPECTED_FILES = {
-    "Qwen/Qwen3-0.6B": _TRAINABLE_LONG + _TRAINABLE_STANDARD,
+    "Qwen/Qwen3-0.6B": _TRAINABLE_STANDARD,
     "Qwen/Qwen3-1.7B": _TRAINABLE_STANDARD,
     "Qwen/Qwen3-4B-Instruct-2507": _FULL_STANDARD_LONG,
     "Qwen/Qwen3-8B": _TRAINABLE_STANDARD,
@@ -121,10 +121,10 @@ def _config(body: dict) -> dict:
 def test_checked_in_catalog_is_valid():
     assert validate_catalog() == {
         "models": 21,
-        "files": 102,
-        "training": 50,
-        "inference": 52,
-        "rl": 47,
+        "files": 98,
+        "training": 48,
+        "inference": 50,
+        "rl": 45,
         "distillation": 1,
     }
 
@@ -232,8 +232,6 @@ def test_files_keep_their_source_sequence_lengths():
     }
 
     assert lengths == {
-        ("Qwen/Qwen3-0.6B", "long", "inference"): 40960,
-        ("Qwen/Qwen3-0.6B", "long", "training"): 40960,
         ("Qwen/Qwen3-0.6B", "standard", "inference"): 32768,
         ("Qwen/Qwen3-0.6B", "standard", "training"): 32768,
         ("Qwen/Qwen3-1.7B", "standard", "inference"): 32768,
@@ -361,14 +359,13 @@ def test_qwen3_8b_files_carry_the_example_defaults():
     assert inference["peft_config"] == lora["peft_config"]
 
 
-def test_qwen3_0_6b_standard_and_long_fit_on_one_gpu():
-    for context in ("standard", "long"):
-        for mode in ("full", "lora"):
-            training = _config(_body("Qwen/Qwen3-0.6B", f"{context}/h200-training-{mode}"))
-            inference = _config(_body("Qwen/Qwen3-0.6B", f"{context}/h200-inference-{mode}"))
-            assert (training["n_gpus"], training["train_batch_size"]) == (1, 1)
-            assert training["ds_config"]["train_batch_size"] == 1
-            assert (inference["n_gpus"], inference["vllm_config"]["tensor_parallel_size"]) == (1, 1)
+def test_qwen3_0_6b_standard_fits_on_one_gpu():
+    for mode in ("full", "lora"):
+        training = _config(_body("Qwen/Qwen3-0.6B", f"standard/h200-training-{mode}"))
+        inference = _config(_body("Qwen/Qwen3-0.6B", f"standard/h200-inference-{mode}"))
+        assert (training["n_gpus"], training["train_batch_size"], training["max_seq_len"]) == (1, 1, 32768)
+        assert training["ds_config"]["train_batch_size"] == 1
+        assert (inference["n_gpus"], inference["max_seq_len"], inference["vllm_config"]["tensor_parallel_size"]) == (1, 32768, 1)
 
 
 @pytest.mark.parametrize(
