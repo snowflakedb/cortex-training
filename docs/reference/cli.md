@@ -338,6 +338,41 @@ export CORTEX_TRAINING_CONFIG=/path/to/config.json
 
 Explicit CLI flags override config values.
 
+To turn a JSON config into a Snowflake connection profile instead:
+
+```bash
+cortex-training login --convert-legacy-config PATH
+```
+
+It reads the file's `host`, `pat`, `database`, and `schema` (also inside a
+`"connection"` object, and spelled `db`). A value the file leaves out comes from
+where the old CLI looked next: `CORTEX_TRAINING_HOST`, `CORTEX_TRAINING_PAT`,
+`CORTEX_TRAINING_DATABASE`, or `CORTEX_TRAINING_SCHEMA`, then the matching
+`SNOWFLAKE_*` variable, then the defaults (`CORTEX_TRAINING_DB`, `PUBLIC`). It
+shows where each value came from. Database and schema names must be Snowflake
+identifiers. It asks before signing in with the PAT to look up its user and
+role, to check that Cortex Training is enabled, and to check the database. It
+creates a missing database only after showing the SQL and asking. Then it shows
+every change and asks once, with No as the default (`[y/N]`), since it deletes
+the file:
+
+- it adds a profile with `authenticator = "PROGRAMMATIC_ACCESS_TOKEN"`. The
+  profile is named `cortex-training`, or the next free name (an existing
+  profile is never replaced). Its host is kept as written, and its account is
+  the host's first part;
+- it saves the profile name in `config.json`, which holds only the profile. The
+  file's `endpoint`, `poll_interval`, `poll_timeout`, and `verify_ssl` (or
+  `no_verify_ssl`) aren't kept: it lists any that differ from the defaults,
+  with the flags that set them (`--endpoint`, `--poll-interval`,
+  `--poll-timeout`, `--no-verify-ssl`);
+- it saves a copy of the file without the PAT as `PATH.bak`;
+- it deletes the file, and `login.json` if it points to it.
+
+Either every change happens, or every file is put back as it was. If a check
+fails, or there's no `pat` in the file or the environment, or the file has a
+`base_url` instead of a `host`, or the file is the new `config.json` itself, it
+says why and changes nothing. It needs a terminal, and takes no profile name.
+
 ### Manage Existing Jobs
 
 ```bash
