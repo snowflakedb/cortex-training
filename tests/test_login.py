@@ -748,7 +748,7 @@ def test_the_list_explains_what_makes_a_good_profile(isolated):
     assert "Cortex Training needs three things:" in err
     assert "Let's see what you already have." in err
     assert status(err, "train") == "? Cortex Training not checked (you skipped the check); checked when you pick it"
-    assert "account ACME-PROD · user ME · role TRAINER · database TRAIN_DB" in err
+    assert "account ACME-PROD · user ME · role TRAINER\n" in err and "     database TRAIN_DB\n" in err
     assert "signs in with a key file (no prompts)" in err
 
 
@@ -847,9 +847,9 @@ def test_checking_shows_each_accounts_status_and_signs_in_once_per_account(isola
     world.not_enabled = {"beta"}
     code, summary, err = login(world, ["y", "1"])
     assert code == 0
-    assert status(err, "alpha") == "✓ Cortex Training is enabled on ACME-ALPHA"
-    assert status(err, "alpha2") == "✓ Cortex Training is enabled on ACME-ALPHA"
-    assert status(err, "beta") == "✗ Cortex Training is not enabled on ACME-BETA"
+    assert status(err, "alpha") == "✓ Connects to Cortex Training on ACME-ALPHA"
+    assert status(err, "alpha2") == "✓ Connects to Cortex Training on ACME-ALPHA"
+    assert status(err, "beta") == "✗ ACME-BETA doesn't have Cortex Training access"
     assert status(err, "desk") == "? Cortex Training not checked yet; checked when you pick it"
     probed = [client.profile for client in world.opened[:2]]
     assert sorted(probed) == ["alpha", "beta"]  # one per account; desk never signed in
@@ -915,7 +915,7 @@ def test_the_check_tries_the_accounts_next_profile_when_one_cannot_sign_in(isola
     world.sign_in_error["alpha"] = "Password was not given but private key is encrypted"
     _, _, err = login(world, ["y", "2"])
     assert status(err, "alpha").startswith("? Couldn't check Cortex Training: couldn't sign in: Password was not given")
-    assert status(err, "alpha2") == "✓ Cortex Training is enabled on ACME-ALPHA"
+    assert status(err, "alpha2") == "✓ Connects to Cortex Training on ACME-ALPHA"
 
 
 def test_when_no_profile_on_an_account_signs_in_the_others_say_so(isolated):

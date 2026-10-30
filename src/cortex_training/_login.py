@@ -743,9 +743,10 @@ class _Login:
             return self.s.unknown("Cortex Training not checked yet; checked when you pick it")
         label, reason = status
         if label == CT_ENABLED:
-            return self.s.ok(self.s.green(f"Cortex Training is enabled on {account}"))
+            # Like the check: the profile reaches Cortex Training, not "everything works".
+            return self.s.ok(self.s.green(f"Connects to Cortex Training on {account}"))
         if label == CT_NOT_ENABLED:
-            return self.s.bad(self.s.red(f"Cortex Training is not enabled on {account}"))
+            return self.s.bad(self.s.red(f"{account} doesn't have Cortex Training access"))
         return self.s.unknown(f"Couldn't check Cortex Training: {reason}")
 
     # ── Flow ────────────────────────────────────────────────────────────
@@ -784,7 +785,11 @@ class _Login:
                 label += self.s.dim(" (current)")
             lines = [f"{label}  {self._status_line(name, hint, failed)}"]
             if hint.usable:
-                lines.append(f"{indent}     {self.s.dim(hint.summary)}")
+                # account · user · role, then the database, so each line fits an 80-column terminal.
+                who, _, database = hint.summary.rpartition(" · ")
+                lines.append(f"{indent}     {self.s.dim(who or database)}")
+                if who:
+                    lines.append(f"{indent}     {self.s.dim(database)}")
                 lines.append(f"{indent}     {self.s.dim('signs in with ' + hint.sign_in)}")
             options.append("\n".join(lines))
         options.append(self.s.bold("Create a new profile"))

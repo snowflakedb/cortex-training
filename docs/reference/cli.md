@@ -324,8 +324,10 @@ cortex-training login training   # use or create the profile "training"
    enabled. Before listing, login offers to check which accounts have it by
    signing in once to each account (read-only), using only profiles that sign
    in without prompts; it lists the accounts it would contact and asks first.
-   Each profile then shows whether Cortex Training is enabled on its account
-   (✓), not enabled (✗, can't be picked), or not checked yet (?).
+   Each profile then shows whether it connects to Cortex Training on its
+   account (✓), whether the account doesn't have Cortex Training access (✗,
+   can't be picked), or not checked yet (?). A ✓ means the profile connects,
+   not that its role has every privilege an operation needs.
    After you pick, login signs in and asks Cortex Training right away. If the
    profile can't sign in, or Cortex Training isn't enabled on its account,
    login says why and returns to the list before anything is created.
