@@ -21,11 +21,12 @@ import argparse
 import math
 import os
 import re
+import sys
 import threading
 from pathlib import Path
 
-_CONNECT_HINT = ("to connect, run 'cortex-training login config.json', set CORTEX_TRAINING_CONFIG, pass "
-                 "--config config.json, --connection NAME, --base-url (local/mock), or --host + --pat")
+_CONNECT_HINT = ("to connect, run 'cortex-training login' to set up a Snowflake connection profile, or pass "
+                 "--connection NAME (or --base-url for a local or mock server)")
 # Bounds for every TUI read.
 READ_MAX_RETRIES = 2
 READ_TIMEOUT = (10.0, 45.0)
@@ -103,7 +104,7 @@ def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.Argument
         "--connection",
         "-c",
         default=os.environ.get("CORTEX_TRAINING_CONNECTION"),
-        help="Snowflake connection profile name.",
+        help="Snowflake connection profile to use (default: the one `cortex-training login` saved).",
     )
     p.add_argument("--base-url", help="Direct base URL for a local or otherwise compatible server.")
     p.add_argument("--host", help="Snowflake account host for PAT auth.")
@@ -206,6 +207,9 @@ def _build_read_only_client(parser: argparse.ArgumentParser, args: argparse.Name
         and (args.host is None or args.pat is None)
     ):
         parser.error(f"no connection configured: {_CONNECT_HINT}")
+    # The old ways still work, with the same warnings as the CLI.
+    for note in getattr(args, "_deprecations", ()):
+        sys.stderr.write(f"warning: {note}\n")
 
     # Every read the TUI makes, the job list's too, is bounded here: the client's own
     # defaults (ten retries, a ten-minute read timeout) left a view silent for
@@ -224,6 +228,8 @@ def _build_read_only_client(parser: argparse.ArgumentParser, args: argparse.Name
     from cortex_training.client import TUI_SURFACE
 
     client._telemetry_surface = TUI_SURFACE
+    if getattr(args, "resolution", None) is not None:
+        cli.write_target_line(args.resolution, sys.stderr)
     return client, _sign_in(cli, args, from_config)
 
 

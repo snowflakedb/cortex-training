@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 
 import pytest
 
@@ -67,6 +69,13 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "no-login.json"))
     FakeProfileAuth.instances = []
     monkeypatch.setattr(client_module, "SnowflakeProfileAuth", FakeProfileAuth)
+    # The profiles these tests name, in the temporary Snowflake folder (see conftest):
+    # the picker checks that a profile exists before signing in with it.
+    profiles = "".join(
+        f'[{name}]\naccount = "ACME"\nuser = "ME"\ndatabase = "PROFILE_DB"\n'
+        for name in ("training", "from-env", "default")
+    )
+    (Path(os.environ["SNOWFLAKE_HOME"]) / "connections.toml").write_text(profiles)
     return monkeypatch
 
 
@@ -198,7 +207,8 @@ def test_config_and_connection_together_are_rejected(env, tmp_path):
 def test_no_arguments_falls_back_to_the_default_profile(env):
     resolved = utils.resolve_example_connection()
 
-    assert [auth.connection_name for auth in FakeProfileAuth.instances] == [None]
+    # The picker names the default profile itself instead of leaving it to the Connector.
+    assert [auth.connection_name for auth in FakeProfileAuth.instances] == ["default"]
     assert resolved.source == "default Snowflake connection profile"
     assert resolved.pat is None
 
@@ -405,3 +415,38 @@ def test_config_overrides_are_passed_through_like_before(env, tmp_path):
 def test_config_and_connection_together_are_rejected(env, tmp_path):
     with pytest.raises(ValueError, match="either config= or connection="):
         utils.resolve_example_connection(pat_config(tmp_path), "training")
+
+
+# ─── Both ways work; the old ones warn (release 1) ──────────────────────────
+
+
+def test_an_example_config_still_works_and_warns(env, tmp_path, caplog):
+    path = pat_config(tmp_path)
+    with caplog.at_level("WARNING"):
+        resolved = utils.resolve_example_connection(config=path)
+    assert resolved.source == "config file"
+    assert f"config={path} (an old JSON config) is deprecated and will stop working in a future release." in caplog.text
+    assert f"`cortex-training login --convert-legacy-config {path}`" in caplog.text
+
+
+def test_an_example_without_arguments_uses_the_saved_profile(env):
+    path = Path(os.environ["SNOWFLAKE_HOME"]) / "cortex-training" / "config.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"profile": "training"}))
+    resolved = utils.resolve_example_connection()
+    assert [auth.connection_name for auth in FakeProfileAuth.instances] == ["training"]
+    assert resolved.source == "connection profile 'training' (saved by cortex-training login)"
+
+
+def test_an_example_reached_by_cortex_training_config_warns(env, tmp_path, caplog):
+    env.setenv("CORTEX_TRAINING_CONFIG", pat_config(tmp_path))
+    with caplog.at_level("WARNING"):
+        utils.resolve_example_connection()
+    assert "from CORTEX_TRAINING_CONFIG) is deprecated and will stop working in a future release." in caplog.text
+
+
+def test_an_example_that_needs_a_pat_doesn_t_call_its_config_deprecated(env, tmp_path, caplog):
+    # The model deployment example needs config= (a PAT) until deployments accept profile sign-ins.
+    with caplog.at_level("WARNING"):
+        utils.resolve_example_connection(config=pat_config(tmp_path), config_deprecated=False)
+    assert "deprecated" not in caplog.text

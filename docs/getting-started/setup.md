@@ -52,7 +52,9 @@ the profile `[default]` to run `cortex-training capacity` without
 
 ## JSON connection file
 
-Existing JSON connection files still work with `--config`, and as an example's `config=`.
+Existing JSON connection files still work with `--config`, and as an example's `config=`, but
+they're deprecated: each use prints a warning, and they stop working in a future release.
+Convert one into a profile with `cortex-training login --convert-legacy-config FILE`.
 From a clone, copy the [template](connection.json.template) to a location outside the repository:
 
 ```bash
