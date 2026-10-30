@@ -605,6 +605,7 @@ def test_a_new_profile_that_cant_sign_in_puts_every_file_back(old_file, isolated
     assert code == 1
     assert "Signing in with profile cortex-training didn't work:" in err
     assert "Every file was put back as it was;" in err and "are kept." in err
+    assert "run the command again in a few minutes." in err
     assert path.exists() and login_file.read_text() == login_before
     assert not (isolated / "connections.toml").exists() and config() is None
     assert not path.with_name("ct-config.json.bak").exists()

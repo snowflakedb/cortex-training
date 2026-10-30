@@ -528,7 +528,8 @@ def apply(plan: Plan, old: OldConfig, check: Callable[[], None] | None = None) -
             cause = exc.__cause__
             raise ConvertError(
                 f"Signing in with profile {plan.profile} didn't work: {explain(cause, old)}\n\n"
-                f"Every file was put back as it was; {_kept(plan, old)} {'are' if plan.login_file else 'is'} kept."
+                f"Every file was put back as it was; {_kept(plan, old)} {'are' if plan.login_file else 'is'} kept. "
+                "If Cortex Training or the network was briefly unavailable, run the command again in a few minutes."
             ) from cause
         if isinstance(exc, Exception):
             raise ConvertError(f"Couldn't finish the conversion ({_login._first_line(exc)}), so every file was put back as it was.") from exc

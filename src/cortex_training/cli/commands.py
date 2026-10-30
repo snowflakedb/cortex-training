@@ -975,13 +975,16 @@ def _has_connection(
 
 
 def _saved_profile() -> str | None:
-    """The profile `cortex-training login` saved in config.json, if any."""
+    """The profile `cortex-training login` saved in config.json, if it still exists."""
     from cortex_training import _picker
+    from cortex_training import _profiles
 
     try:
-        return _picker.load_config()[0].get("profile")
+        name = _picker.load_config()[0].get("profile")
+        # A saved name whose profile is gone doesn't replace a login.json that still works.
+        return name if name and name in _profiles.read_profiles() else None
     except Exception:
-        return None  # The picker reports a config.json it can't read.
+        return None  # The picker reports a config.json or profile file it can't read.
 
 
 def _select_config(args: argparse.Namespace, *, load_login: bool) -> dict[str, Any]:

@@ -251,9 +251,10 @@ used instead in a future release. `--base-url`, for a local or mock server,
 doesn't warn.
 
 One exception: a profile saved by `cortex-training login` wins over
-`login.json` (the file the old `login PATH` remembered). The command uses the
-profile and says `login.json` is ignored, with the command that converts and
-removes it. `--config` and `CORTEX_TRAINING_CONFIG` still win over a saved
+`login.json` (the file the old `login PATH` remembered), as long as that profile
+still exists. The command uses the profile and says `login.json` is ignored,
+with the command that converts and removes it. If the saved profile is gone,
+`login.json` keeps working, with its deprecation warning. `--config` and `CORTEX_TRAINING_CONFIG` still win over a saved
 profile, since you pass them for that command.
 
 ### Legacy Connection Config

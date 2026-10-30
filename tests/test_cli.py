@@ -3806,6 +3806,19 @@ def test_a_saved_profile_beats_login_json(tmp_path, monkeypatch):
     assert login_state.exists()  # Only ignored; converting removes it.
 
 
+def test_login_json_still_works_when_the_saved_profile_is_gone(tmp_path, monkeypatch):
+    # Only a saved profile that exists replaces the file login.json remembers.
+    config = _write_config(tmp_path, {"host": "acme.snowflakecomputing.com", "pat": "tok", "database": "DB"})
+    login_state = tmp_path / "login.json"
+    login_state.write_text(json.dumps({"config_path": str(config)}))
+    _write_profiles("default", "train")
+    _save_choice("gone")
+    rc, seen, err = _connect([], monkeypatch, CORTEX_TRAINING_LOGIN_FILE=str(login_state))
+    assert rc == 0 and seen["use_connection_profile"] is False and seen["host"] == "acme.snowflakecomputing.com"
+    assert f"Signing in with an old JSON config ({config}, from {login_state}) is deprecated" in err
+    assert "is ignored because a profile is saved" not in err
+
+
 def test_config_still_beats_a_saved_profile_with_its_warning(tmp_path, monkeypatch):
     config = _write_config(tmp_path, {"host": "acme.snowflakecomputing.com", "pat": "tok", "database": "DB"})
     _write_profiles("default", "train")
