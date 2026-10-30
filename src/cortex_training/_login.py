@@ -276,6 +276,16 @@ def database_missing(exc: BaseException) -> bool:
     return _is_schema_not_found(getattr(exc, "response", None))
 
 
+def privilege_note(role: str | None) -> list[str]:
+    """What login's checks can't confirm yet: creating jobs needs USE CORTEX TRAINING on the role."""
+    role = role or "<your role>"
+    return [
+        f"Creating training jobs also needs the USE CORTEX TRAINING privilege on role {role}, which these",
+        "checks can't confirm. If a job is refused for it, ask an account admin to run:",
+        f"  GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE {role};",
+    ]
+
+
 def open_profile_client(profile: str, database: str, schema: str) -> Any:
     """Sign in with ``profile``; the client never creates a database on its own."""
     from cortex_training.client import CortexTrainingClient
@@ -580,7 +590,9 @@ class _Login:
         if result.error:
             self.p.say(f"  {self.s.bad(result.error)}")
             return result
-        self.p.say(f"  {self.s.ok('Cortex Training is enabled on this account')}")
+        # Capacity answering means the account has Cortex Training, not that this role can
+        # create jobs (that also needs USE CORTEX TRAINING; see privilege_note).
+        self.p.say(f"  {self.s.ok('Connected to Cortex Training on this account')}")
         result.missing = _database_setup.missing(result.client)
         if result.missing is None:
             self.p.say(f"  {self.s.unknown(f'Could not check database {database}; continuing')}")
@@ -1029,6 +1041,9 @@ def run_login(
         prompter.say(style.dim(f"(Saved in {_home(saved)}.)"))
         prompter.say()
         prompter.say(f"Try it:  {style.cyan('cortex-training capacity')}")
+    prompter.say()
+    for line in privilege_note(check.role if check is not None else None):
+        prompter.say(style.dim(line))
     remind_environment(prompter, findings, shell)
     if not getattr(stdout, "isatty", lambda: False)():
         values = _profiles.read_profiles().get(chosen, {})

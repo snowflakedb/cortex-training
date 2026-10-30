@@ -955,7 +955,7 @@ def test_the_ending_says_what_to_do_next(isolated):
     code, _, err = login(World(databases={"TRAIN_DB"}), ["n", "3", "1"])
     assert code == 0
     assert "  ✓ Signed in to ACME-PROD as ME (role TRAINER)" in err
-    assert "  ✓ Cortex Training is enabled on this account" in err
+    assert "  ✓ Connected to Cortex Training on this account" in err
     assert "  ✓ Database TRAIN_DB is ready" in err
     assert "You're all set. Cortex Training will use profile train." in err
     assert "Try it:  cortex-training capacity" in err
@@ -1080,3 +1080,16 @@ def test_a_517602_that_is_not_schema_not_found_is_not_a_missing_database(isolate
     check.client.get_capacity = no_privilege
     assert "didn't answer" in (flow.service_error(check) or "")
     assert _login.database_missing(ApiError(400, "517602", "Schema TRAIN_DB.PUBLIC is not found or not authorized"))
+
+
+def test_login_ends_with_the_privilege_it_cant_check(isolated):
+    # Capacity answers for any role; creating jobs also needs USE CORTEX TRAINING on it.
+    write_profiles(isolated, PROFILES)
+    _picker.save_profile("train")
+    world = World(databases={"TRAIN_DB"})
+    code, _, err = login(world, [""])
+    assert code == 0, err
+    assert "Connected to Cortex Training on this account" in err
+    assert "Cortex Training is enabled on this account" not in err
+    assert "Creating training jobs also needs the USE CORTEX TRAINING privilege on role" in err
+    assert "GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE " in err

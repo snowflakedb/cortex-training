@@ -343,6 +343,16 @@ cortex-training login training   # use or create the profile "training"
    name. The name is saved only when a profile passes, or when you chose not
    to check a new one.
 
+A passing check (`✓ Connected to Cortex Training on this account`) means the
+account has Cortex Training and the profile reaches it. It doesn't confirm
+that the role can create jobs: that also needs the `USE CORTEX TRAINING`
+privilege on the role, which login can't check yet. So login, and
+`--convert-legacy-config`, end with the GRANT to ask an account admin for:
+
+```sql
+GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE <role>;
+```
+
 Login never changes an existing profile. New profiles go to the file the
 Snowflake Connector reads: `connections.toml`, or `config.toml` when your
 profiles live there. Prompts and progress go to stderr, in color in a terminal
@@ -379,7 +389,7 @@ where the old CLI looked next: `CORTEX_TRAINING_HOST`, `CORTEX_TRAINING_PAT`,
 `SNOWFLAKE_*` variable, then the defaults (`CORTEX_TRAINING_DB`, `PUBLIC`). It
 shows where each value came from. Database and schema names must be Snowflake
 identifiers. It asks before signing in with the PAT to look up its user and
-role, to check that Cortex Training is enabled, and to check the database. It
+role, to check that Cortex Training answers for the account, and to check the database. It
 creates a missing database only after showing the SQL and asking. Then it shows
 every change and asks once, with No as the default (`[y/N]`), since it deletes
 the file:

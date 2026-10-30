@@ -212,7 +212,7 @@ def test_it_shows_the_file_and_asks_before_checking(old_file):
     assert f"host      {HOST}" in err and "pat       ••••••••" in err
     assert "This only reads; nothing is changed.\nCheck now? [Y/n]" in err
     assert "  ✓ Signed in as ME, role TRAINER" in err
-    assert "  ✓ Cortex Training is enabled on this account" in err
+    assert "  ✓ Connected to Cortex Training on this account" in err
     assert "  ✓ Database CORTEX_TRAINING_DB is ready" in err
     assert "This will:" in err and "Go ahead? [y/N]" in err
 
@@ -609,3 +609,10 @@ def test_a_new_profile_that_cant_sign_in_puts_every_file_back(old_file, isolated
     assert path.exists() and login_file.read_text() == login_before
     assert not (isolated / "connections.toml").exists() and config() is None
     assert not path.with_name("ct-config.json.bak").exists()
+
+
+def test_a_conversion_ends_with_the_privilege_it_cant_check(old_file):
+    code, _, err = convert(World(), old_file(), YES)
+    assert code == 0, err
+    assert "Creating training jobs also needs the USE CORTEX TRAINING privilege on role TRAINER" in err
+    assert "  GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE TRAINER;" in err
