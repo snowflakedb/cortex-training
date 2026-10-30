@@ -2182,14 +2182,7 @@ it does not list has no replacement and stays in the block.
 | `seq_len` | on server versions with this behavior, set by the server from `max_seq_len` with `ep_size` > 1 (below); no effect with `ep_size` 1 or omitted |
 | `reduce_dtype` | rejected: gradient reduction always runs in fp32 |
 | `tiled_mlp_token_chunk_size` | rejected in the block: use `tiled_mlp.token_chunk_size` |
-| `trust_remote_code` | on server versions that have it, the top-level field `trust_remote_code` (below) |
-
-**`trust_remote_code`.** `training_config.trust_remote_code` (`true` or
-`false`) says whether the expert-parallel model may run code from the model
-repository. It applies only with `ep_size` > 1 and is rejected otherwise;
-unset keeps the model's own default. A job that sends both the field and the
-block entry must give them the same value. A job that imports an external
-checkpoint always loads it with `false`.
+| `trust_remote_code` | rejected: a job cannot set it, in the block, in `training_config` or at the job level; each model keeps its own default, and an imported external checkpoint always loads with `false` |
 
 With `ep_size` 1 or omitted, `lm_head.cross_entropy` fails at startup and the
 model has no fused cross-entropy, so on server versions with this behavior the
