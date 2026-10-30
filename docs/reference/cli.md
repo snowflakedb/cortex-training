@@ -344,14 +344,9 @@ cortex-training login training   # use or create the profile "training"
    to check a new one.
 
 A passing check (`✓ Connected to Cortex Training on this account`) means the
-account has Cortex Training and the profile reaches it. It doesn't confirm
-that the role can create jobs: that also needs the `USE CORTEX TRAINING`
-privilege on the role, which login can't check yet. So login, and
-`--convert-legacy-config`, end with the GRANT to ask an account admin for:
-
-```sql
-GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE <role>;
-```
+profile connects to Cortex Training on that account. It doesn't test every
+privilege an operation can need, so login and `--convert-legacy-config` end by
+saying so: if your role lacks one, that operation's error says which.
 
 Login never changes an existing profile. New profiles go to the file the
 Snowflake Connector reads: `connections.toml`, or `config.toml` when your

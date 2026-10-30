@@ -611,8 +611,8 @@ def test_a_new_profile_that_cant_sign_in_puts_every_file_back(old_file, isolated
     assert not path.with_name("ct-config.json.bak").exists()
 
 
-def test_a_conversion_ends_with_the_privilege_it_cant_check(old_file):
+def test_a_conversion_says_what_its_checks_dont_cover(old_file):
     code, _, err = convert(World(), old_file(), YES)
     assert code == 0, err
-    assert "Creating training jobs also needs the USE CORTEX TRAINING privilege on role TRAINER" in err
-    assert "  GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE TRAINER;" in err
+    assert "This profile connects to Cortex Training on this account. Your role may still lack" in err
+    assert "USE CORTEX TRAINING" not in err

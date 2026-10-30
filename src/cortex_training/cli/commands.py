@@ -374,9 +374,9 @@ checks that:
   - there is a database for Cortex Training to keep your training jobs and
     checkpoints in (we recommend CORTEX_TRAINING_DB).
 
-Creating training jobs also needs the USE CORTEX TRAINING privilege on
-your role, which these checks can't confirm; login ends with the GRANT to
-ask an account admin for.
+These checks show the profile connects to Cortex Training. Your role may
+still lack privileges that some operations need; if one is refused, its
+error says which.
 
 login never changes your existing profiles, and asks before it creates
 anything. Your choice is saved in ~/.snowflake/cortex-training/config.json.

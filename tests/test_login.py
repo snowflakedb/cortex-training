@@ -1082,8 +1082,8 @@ def test_a_517602_that_is_not_schema_not_found_is_not_a_missing_database(isolate
     assert _login.database_missing(ApiError(400, "517602", "Schema TRAIN_DB.PUBLIC is not found or not authorized"))
 
 
-def test_login_ends_with_the_privilege_it_cant_check(isolated):
-    # Capacity answers for any role; creating jobs also needs USE CORTEX TRAINING on it.
+def test_login_says_what_its_checks_dont_cover(isolated):
+    # The checks show the profile connects; an operation can still need more privileges.
     write_profiles(isolated, PROFILES)
     _picker.save_profile("train")
     world = World(databases={"TRAIN_DB"})
@@ -1091,5 +1091,6 @@ def test_login_ends_with_the_privilege_it_cant_check(isolated):
     assert code == 0, err
     assert "Connected to Cortex Training on this account" in err
     assert "Cortex Training is enabled on this account" not in err
-    assert "Creating training jobs also needs the USE CORTEX TRAINING privilege on role" in err
-    assert "GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE " in err
+    assert "This profile connects to Cortex Training on this account. Your role may still lack" in err
+    assert "privileges that some operations need; if one is refused, its error says which." in err
+    assert "USE CORTEX TRAINING" not in err

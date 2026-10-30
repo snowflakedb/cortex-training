@@ -276,14 +276,11 @@ def database_missing(exc: BaseException) -> bool:
     return _is_schema_not_found(getattr(exc, "response", None))
 
 
-def privilege_note(role: str | None) -> list[str]:
-    """What login's checks can't confirm yet: creating jobs needs USE CORTEX TRAINING on the role."""
-    role = role or "<your role>"
-    return [
-        f"Creating training jobs also needs the USE CORTEX TRAINING privilege on role {role}, which these",
-        "checks can't confirm. If a job is refused for it, ask an account admin to run:",
-        f"  GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE {role};",
-    ]
+# What the checks show, and what they don't: an operation can need privileges they don't test.
+PRIVILEGE_NOTE = [
+    "This profile connects to Cortex Training on this account. Your role may still lack",
+    "privileges that some operations need; if one is refused, its error says which.",
+]
 
 
 def open_profile_client(profile: str, database: str, schema: str) -> Any:
@@ -590,8 +587,8 @@ class _Login:
         if result.error:
             self.p.say(f"  {self.s.bad(result.error)}")
             return result
-        # Capacity answering means the account has Cortex Training, not that this role can
-        # create jobs (that also needs USE CORTEX TRAINING; see privilege_note).
+        # Capacity answering means the profile reaches Cortex Training on this account, not
+        # that the role has every privilege an operation needs (see PRIVILEGE_NOTE).
         self.p.say(f"  {self.s.ok('Connected to Cortex Training on this account')}")
         result.missing = _database_setup.missing(result.client)
         if result.missing is None:
@@ -1042,7 +1039,7 @@ def run_login(
         prompter.say()
         prompter.say(f"Try it:  {style.cyan('cortex-training capacity')}")
     prompter.say()
-    for line in privilege_note(check.role if check is not None else None):
+    for line in PRIVILEGE_NOTE:
         prompter.say(style.dim(line))
     remind_environment(prompter, findings, shell)
     if not getattr(stdout, "isatty", lambda: False)():
