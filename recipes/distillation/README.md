@@ -95,9 +95,9 @@ python -m recipes.utils --distillation \
   --override recipes/distillation/overrides.json -o dist.json
 ```
 
-This writes `dist.json` (student) and `dist.teacher.json` (teacher). Without
-`--override`, the student gets the catalog's full size: 8 training and 8
-sampling GPUs.
+This writes `dist.json` (student) and `dist.teacher.json` (teacher). The
+catalog student is 1 training GPU and 1 sampling GPU. `overrides.json` also
+sets packing, the Hugging Face model provider, and ZeRO `reduce_scatter`.
 
 ## Expected Results
 
@@ -143,12 +143,9 @@ python -m recipes.inference.serve config=/path/to/config.json \
   source_job_id=STUDENT_JOB_ID checkpoint_id=CHECKPOINT_ID
 ```
 
-The catalog's Qwen3-0.6B inference file uses eight GPUs. To serve on fewer,
-write the job with
-`python -m recipes.utils --model Qwen/Qwen3-0.6B --context standard --inference -o serve.json`,
-lower its `n_gpus`, and pass `job_config=serve.json` instead of `model=` and
-`context=`. To generate from or evaluate the checkpoint, also pass
-`renderer_name=qwen3_disable_thinking`, as training does.
+The catalog's Qwen3-0.6B standard inference file uses one GPU, so `model=` and
+`context=standard` serve the checkpoint directly. To generate from or evaluate
+it, also pass `renderer_name=qwen3_disable_thinking`, as training does.
 
 `recipes.inference.evaluate task=gsm8k` uses a different prompt and answer
 format (the bare question, graded on `#### n` or the last number), so its

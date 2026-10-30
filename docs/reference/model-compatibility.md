@@ -9,7 +9,7 @@ for a specific workload.
 
 | Model | Architecture | Training | Inference | Long-context `max_seq_len` |
 |---|---|---|---|---|
-| `Qwen/Qwen3-0.6B` | dense | standard | standard | — |
+| `Qwen/Qwen3-0.6B` | dense | standard, long | standard, long | 40,960 |
 | `Qwen/Qwen3-1.7B` | dense | standard | standard | — |
 | `Qwen/Qwen3-4B-Instruct-2507` | dense | standard, long | standard, long | 262,144 |
 | `Qwen/Qwen3-8B` | dense | standard | standard | — |

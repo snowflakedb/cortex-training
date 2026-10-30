@@ -44,7 +44,7 @@ _FULL_STANDARD_LONG = [
     "long/h200-training-full",
 ]
 EXPECTED_FILES = {
-    "Qwen/Qwen3-0.6B": _TRAINABLE_STANDARD,
+    "Qwen/Qwen3-0.6B": _TRAINABLE_LONG + _TRAINABLE_STANDARD,
     "Qwen/Qwen3-1.7B": _TRAINABLE_STANDARD,
     "Qwen/Qwen3-4B-Instruct-2507": _FULL_STANDARD_LONG,
     "Qwen/Qwen3-8B": _TRAINABLE_STANDARD,
@@ -121,10 +121,10 @@ def _config(body: dict) -> dict:
 def test_checked_in_catalog_is_valid():
     assert validate_catalog() == {
         "models": 21,
-        "files": 98,
-        "training": 48,
-        "inference": 50,
-        "rl": 45,
+        "files": 102,
+        "training": 50,
+        "inference": 52,
+        "rl": 47,
         "distillation": 1,
     }
 
@@ -232,6 +232,8 @@ def test_files_keep_their_source_sequence_lengths():
     }
 
     assert lengths == {
+        ("Qwen/Qwen3-0.6B", "long", "inference"): 40960,
+        ("Qwen/Qwen3-0.6B", "long", "training"): 40960,
         ("Qwen/Qwen3-0.6B", "standard", "inference"): 32768,
         ("Qwen/Qwen3-0.6B", "standard", "training"): 32768,
         ("Qwen/Qwen3-1.7B", "standard", "inference"): 32768,
@@ -357,6 +359,16 @@ def test_qwen3_8b_files_carry_the_example_defaults():
     assert (lora["n_gpus"], lora["optimizer"]["lr"]) == (4, 1e-04)
     assert (inference["n_gpus"], inference["vllm_config"]["tensor_parallel_size"]) == (2, 1)
     assert inference["peft_config"] == lora["peft_config"]
+
+
+def test_qwen3_0_6b_standard_and_long_fit_on_one_gpu():
+    for context in ("standard", "long"):
+        for mode in ("full", "lora"):
+            training = _config(_body("Qwen/Qwen3-0.6B", f"{context}/h200-training-{mode}"))
+            inference = _config(_body("Qwen/Qwen3-0.6B", f"{context}/h200-inference-{mode}"))
+            assert (training["n_gpus"], training["train_batch_size"]) == (1, 1)
+            assert training["ds_config"]["train_batch_size"] == 1
+            assert (inference["n_gpus"], inference["vllm_config"]["tensor_parallel_size"]) == (1, 1)
 
 
 @pytest.mark.parametrize(
@@ -968,7 +980,7 @@ def test_full_context_training_probe_uses_exact_declared_limit():
         full_context=True,
     )
 
-    assert len(spec["payload"]["input_ids"]) == 8
+    assert len(spec["payload"]["input_ids"]) == 1
     assert len(spec["payload"]["input_ids"][0]) == 32768
     assert set(spec["payload"]["input_ids"][0]) == {1}
 
@@ -1029,7 +1041,7 @@ def test_rl_forward_backward_probe_uses_packing_aware_grpo_contract():
     spec = build_forward_backward_probe_spec(request, "rl-full")
     payload = spec["payload"]
 
-    assert len(payload["input_ids"]) == 8
+    assert len(payload["input_ids"]) == 1
     assert payload["include_attention_mask"] is True
     assert payload["labels"] == "none"
     assert spec["processing"] == {
@@ -1039,7 +1051,7 @@ def test_rl_forward_backward_probe_uses_packing_aware_grpo_contract():
             "eps_clip": 0.2,
             "loss_agg_mode": "token-mean",
             "entropy_coeff": 0.0,
-            "global_batch_size": 8,
+            "global_batch_size": 1,
         },
     }
     assert spec["context"]["advantages"]["dtype"] == "float32"
