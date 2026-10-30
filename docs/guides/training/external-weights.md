@@ -63,18 +63,17 @@ directory with `PUT`.
     `CREATE_STAGE = False` in the Python script, or omit the `CREATE STAGE`
     statement from `upload.sql`.
 
-  To get either one granted, find the role that owns the schema: run
-  `SHOW SCHEMAS LIKE 'MY_SCHEMA' IN DATABASE MY_DB;` and read the `owner`
-  column. A user with that role, or with a role that has the `MANAGE GRANTS`
-  privilege, can run the grant:
+  The role that owns the schema grants `CREATE STAGE`, and the role that owns
+  the stage grants `READ` and `WRITE`. A role with the `MANAGE GRANTS` privilege
+  can grant either. To find the owner, read the `owner` column of
+  `SHOW SCHEMAS LIKE 'MY_SCHEMA' IN DATABASE MY_DB;` or
+  `SHOW STAGES LIKE 'MODEL_IMPORT' IN SCHEMA MY_DB.MY_SCHEMA;`.
 
   ```sql
   -- To let the upload role create its own stage:
   GRANT CREATE STAGE ON SCHEMA MY_DB.MY_SCHEMA TO ROLE UPLOAD_ROLE;
 
-  -- Or, to create the stage for it:
-  CREATE STAGE MY_DB.MY_SCHEMA.MODEL_IMPORT
-    ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
+  -- Or, to let it upload to an existing stage created with SNOWFLAKE_SSE encryption:
   GRANT READ, WRITE ON STAGE MY_DB.MY_SCHEMA.MODEL_IMPORT TO ROLE UPLOAD_ROLE;
   ```
 - The role that submits the training job must be able to read the stage. If it
