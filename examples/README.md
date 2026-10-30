@@ -9,7 +9,7 @@ type on the command line instead of writing a job file.
 | [Conversational SFT](sft/README.md) | LoRA or full-parameter SFT | Hugging Face chat datasets, GSM8K, identity |
 | [DARE-Bench agent SFT](sft/dare/README.md) | Full-parameter multi-turn tool SFT + agent eval | DARE-Bench |
 | [Math GRPO](rl/math_grpo/README.md) | Reinforcement learning | Hendrycks MATH, MATH-500 |
-| [Reverse-text RL, following prime-rl](rl/prime_rl_reverse_text/README.md) | SFT warmup, then async RL with prime-rl's schedule and IPO loss (or its earlier DPPO+KL, or clipped GRPO) | Reverse-text SFT and RL sets |
+| [Reverse-text RL, following prime-rl](rl/async_rl_reverse_text/README.md) | SFT warmup, then async RL with prime-rl's schedule and IPO loss (or its earlier DPPO+KL, or clipped GRPO) | Reverse-text SFT and RL sets |
 | [On-policy distillation](distillation/README.md) | Distillation from a frozen teacher | GSM8K |
 | [Inference endpoint](inference/README.md) | Serve, generate, evaluate open weights or a checkpoint | MATH-500, GSM8K, identity |
 | [Model deployment streaming](model_deployment/README.md) | OpenAI-compatible model deployment, streamed chat | Open weights, checkpoints |
@@ -54,8 +54,8 @@ To log metrics to Weights & Biases or Snowflake, see
 # the default connection is used.
 python -m examples.sft.conversational.train config=/path/to/config.json
 python -m examples.rl.math_grpo.train config=/path/to/config.json
-python -m examples.rl.prime_rl_reverse_text.sft config=/path/to/config.json
-python -m examples.rl.prime_rl_reverse_text.train config=/path/to/config.json
+python -m examples.rl.async_rl_reverse_text.sft config=/path/to/config.json
+python -m examples.rl.async_rl_reverse_text.train config=/path/to/config.json
 python -m examples.distillation.on_policy.train config=/path/to/config.json
 python -m examples.inference.serve config=/path/to/config.json
 python -m examples.model_deployment.deploy config=/path/to/config.json

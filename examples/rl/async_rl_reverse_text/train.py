@@ -46,11 +46,11 @@ from typing import Any
 import chz
 import torch
 from examples.logging import setup_logging
-from examples.rl.prime_rl_reverse_text.task import RL_DATASET
-from examples.rl.prime_rl_reverse_text.task import ReverseTextTask
-from examples.rl.prime_rl_reverse_text.task import lcs_reward
-from examples.rl.prime_rl_reverse_text.task import load_tasks
-from examples.rl.prime_rl_reverse_text.task import task_messages
+from examples.rl.async_rl_reverse_text.task import RL_DATASET
+from examples.rl.async_rl_reverse_text.task import ReverseTextTask
+from examples.rl.async_rl_reverse_text.task import lcs_reward
+from examples.rl.async_rl_reverse_text.task import load_tasks
+from examples.rl.async_rl_reverse_text.task import task_messages
 from examples.utils import build_job
 from examples.utils import build_renderer
 from examples.utils import collate

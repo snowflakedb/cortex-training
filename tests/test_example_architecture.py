@@ -24,7 +24,7 @@ EXAMPLE_FOLDERS = (
     "sft/conversational",
     "sft/dare",
     "rl/math_grpo",
-    "rl/prime_rl_reverse_text",
+    "rl/async_rl_reverse_text",
     "inference",
     "model_deployment",
     "distillation",
@@ -402,7 +402,7 @@ def test_every_example_ships_an_overrides_file_with_a_comment():
     sft = SFT_OVERRIDES
     inference = EXAMPLES / "inference" / "overrides.json"
     distillation_overrides = EXAMPLES / "distillation" / "overrides.json"
-    prime_rl_overrides = EXAMPLES / "rl" / "prime_rl_reverse_text" / "overrides.json"
+    prime_rl_overrides = EXAMPLES / "rl" / "async_rl_reverse_text" / "overrides.json"
     assert set(EXAMPLES.rglob("overrides.json")) == {
         sft,
         RL_OVERRIDES,

@@ -33,14 +33,14 @@ Install the client and the example dependencies as described in the
 newer. Then run the SFT warmup:
 
 ```bash
-python -m examples.rl.prime_rl_reverse_text.sft config=/path/to/config.json
+python -m examples.rl.async_rl_reverse_text.sft config=/path/to/config.json
 ```
 
 The SFT run ends by saving a weights-only and a resumable checkpoint and logging
 the RL command. Start RL from them:
 
 ```bash
-python -m examples.rl.prime_rl_reverse_text.train \
+python -m examples.rl.async_rl_reverse_text.train \
   config=/path/to/config.json \
   init_source_job_id=SFT_JOB_ID \
   init_checkpoint_id=WEIGHTS_ONLY_CHECKPOINT_ID \

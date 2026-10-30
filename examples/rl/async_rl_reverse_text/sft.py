@@ -35,9 +35,9 @@ from typing import Any
 
 import chz
 from examples.logging import setup_logging
-from examples.rl.prime_rl_reverse_text.train import EXAMPLE_DIR
-from examples.rl.prime_rl_reverse_text.train import data_parallel_size
-from examples.rl.prime_rl_reverse_text.task import SFT_DATASET
+from examples.rl.async_rl_reverse_text.train import EXAMPLE_DIR
+from examples.rl.async_rl_reverse_text.train import data_parallel_size
+from examples.rl.async_rl_reverse_text.task import SFT_DATASET
 from examples.utils import TrainSequence
 from examples.utils import build_job
 from examples.utils import build_renderer
@@ -252,7 +252,7 @@ def main(config: Config) -> None:
         resumable = save_checkpoint(client, job_id, checkpoint_type="resumable")
         logger.info(
             "Start the RL stage from these checkpoints with:\n"
-            "  python -m examples.rl.prime_rl_reverse_text.train %s init_source_job_id=%s "
+            "  python -m examples.rl.async_rl_reverse_text.train %s init_source_job_id=%s "
             "init_checkpoint_id=%s init_trainer_checkpoint_id=%s",
             example_connection_args(config.config, config.connection),
             job_id,
