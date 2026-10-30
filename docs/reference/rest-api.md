@@ -482,6 +482,55 @@ The response shape consumed by this repository is flat at each sub-job:
 }
 ```
 
+Each `sub_jobs[]` entry is the sub-job's config plus the `sub_job_id` and
+`status` the service adds. On service versions that report it, once the job is
+running the config is the sub-job's **effective** config: `job_type`,
+`model_name`, `dtype`, `seed` (`null` when unset), any `source_checkpoint_info`,
+and the `training_config` or `inference_config` the job runs with, the service's
+defaults filled in (`null` for an optional field left unset). A key the service
+did not use, such as a misspelled one, is not in it. Before the job runs, on
+services that don't report it, and for model deployments, the entry is the
+config as submitted, and its whole numbers may come back as floats
+(`"n_gpus": 4.0`).
+
+The record also has `hardware` (the default when none was set), `comment`
+(`null` when none was set), and `idle_timeout_seconds` /
+`pending_timeout_seconds` when they were set (see
+[section 5.1](#51-create-job---post-)). It does not name the job's experiment;
+see [section 5.7](#57-experiment-run---get-job_idexperiment-run).
+
+#### Launching a job like another
+
+`create_job_body_from_job(job, experiment_name=...)` turns a Get job record
+into a CreateJob body for a job configured like it, which
+`create_job_from_body()` takes as it is:
+
+```python
+from cortex_training import create_job_body_from_job
+
+name = client.get_experiment_run(job_id)["experiment_name"]
+body = create_job_body_from_job(client.get_job(job_id), experiment_name=name)
+new_job_id = client.create_job_from_body(body)["job_id"]
+```
+
+The body has `hardware`, `comment`, `experiment_name`, `idle_timeout_seconds`,
+`pending_timeout_seconds` and `sub_job_configs`, each with the value the job
+runs with, and each sub-job has the record's fields plus `dtype`, `seed` and
+`source_checkpoint_info`. A timeout the record lacks is the service's default
+from [section 5.1](#51-create-job---post-) (1800 and 86400 seconds); a
+`comment`, `dtype`, `seed` or `source_checkpoint_info` it lacks is `null`, as is
+`experiment_name` when none is given. Given the job's own, the new job joins
+that experiment as a new run. A model deployment, which can set neither, keeps
+`pending_timeout_seconds` and `experiment_name` `null`. Left out are `job_id`
+(the service rejects one on create), `sub_job_id`, `status`, `reason`, the
+times, `submitted_by`, `owner_role` and `image_tag` (a new job runs the current
+image). A sub-job started from external weights has
+`source_checkpoint_info: {"external_stage_path": null}` to fill in, as the record
+does not say which weights. Whole-number floats become integers. It raises
+`ValueError` for a record with no sub-jobs or no `hardware` (the service could
+not read the job). `cortex-training get JOB_ID` prints the same body, with the
+job's experiment; `get --raw` prints the record.
+
 `wait_for_job()` repeatedly calls this endpoint until `running`.
 
 `state_changed_at` (UTC time the job entered its current `status`) is optional
@@ -848,6 +897,16 @@ No body.
 ```
 
 The URLs are short-lived.
+
+The CLI command `cortex-training download-checkpoint JOB_ID CHECKPOINT_ID` with
+`--output-dir DIRECTORY` lists checkpoints, calls this export endpoint, and
+downloads the returned HTTPS links. It accepts repeated `--include` filename
+globs and automatically resumes `.partial` files using HTTP Range requests.
+The CLI always displays byte and file progress on stderr without
+changing the JSON summary on stdout.
+The server-provided `size_bytes` must be a non-negative integer or decimal
+string; the CLI verifies the downloaded size before promoting a file. See
+[Download a checkpoint](cli.md#download-a-checkpoint) for flags and output.
 
 ### 5.10 Delete checkpoint
 
@@ -1728,7 +1787,15 @@ use stage 2 with `zero_optimization.offload_optimizer`. Examples include
 [below](#prime_rl-block-deprecated)), `router_replay`, `peft_config`,
 `model_options` (see [below](#model_options)), the memory-diagnostics settings
 in [section 8.5](#85-memory-diagnostics-settings), and these newer
-long-context/memory knobs:
+long-context/memory knobs.
+
+`model_provider` `"arctic"` is the name the shipped MoE configs and this
+document use, but the server accepts that provider only as `"prime_rl"` for
+now. The Python client and `cortex-training submit` send a training
+`model_provider` of `"arctic"` as `"prime_rl"`; a request sent without the
+client must use `"prime_rl"`.
+
+The long-context/memory knobs:
 
 - `sp_size`: Ulysses sequence-parallel degree, sharding each sample's sequence
   across `sp_size` ranks. `1` (default) disables it; the server requires
@@ -1775,6 +1842,10 @@ repository's RL example fills in `5368709120` (5 GiB) for training and
 planner that sizes a cap from the expert count, sequence length, MoE layer
 count, and top-k; see
 [Router-replay capacity planning](../../examples/rl/README.md#router-replay-capacity-planning).
+
+`extra_training["model_provider"] = "dflash2"` trains a DFlash2
+speculative-decoding draft against a frozen target. Its options and rules are in
+[section 8.6](#86-dflash2-draft-training-and-serving).
 
 For LoRA training, set `extra_training["peft_config"]` to a PEFT
 `LoraConfig`-compatible object. It is validated and rewritten client-side, so it
@@ -2194,6 +2265,10 @@ sampling = SubJobConfig.sampling_job(
 )
 ```
 
+To serve a draft trained with the `dflash2` provider, set
+`speculative_config.from_source_checkpoint` instead of `model`; see
+[section 8.6](#86-dflash2-draft-training-and-serving).
+
 For LoRA sampling, set `extra_sampling["peft_config"]` when creating the
 sub-job. This enables the vLLM LoRA manager before the model starts. The
 adapter's `r`, `lora_alpha`, and `target_modules` must match the training
@@ -2298,6 +2373,88 @@ training = SubJobConfig.training_job(
 off by default. Failure snapshots on a failed `/forward-backward` or `/step` are
 independent of these flags. Per-rank operator diagnostics configured by the
 launcher are out of scope for this client-facing surface.
+
+### 8.6 DFlash2 draft training and serving
+
+A DFlash2 draft is a speculative-decoding draft model trained against a frozen
+target. It spans the training sub-job ([section 8.2](#82-trainingconfig)), the
+checkpoint it saves ([section 8.4](#84-source_checkpoint_info)), and a sampling
+sub-job that serves it as the speculator ([section 8.3](#83-inferenceconfig)).
+
+#### Training a draft
+
+`extra_training["model_provider"]` accepts `huggingface`, `arctic` ([section
+8.2](#82-trainingconfig) explains its spelling), and `dflash2`. With `dflash2`,
+`model_name` is the frozen target, and the draft is configured by
+`extra_training["dflash2"]`.
+
+`extra_training["dflash2"]` is required when the provider is `dflash2` and is
+rejected for every other provider. Unknown keys are rejected.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `draft_config` | required | Contents of the draft's `config.json` (`architectures` and `dflash_config`); always required, even with `init_from` |
+| `init_from` | none | Optional existing draft directory (with `model.safetensors`) to warm-start the weights from; the architecture still comes from `draft_config` |
+| `attention_backend` | `sdpa` | `sdpa`, `flex_attention`, or `eager` |
+| `num_anchors` | `512` | Anchor blocks sampled per sequence; greater than zero |
+| `loss_decay_gamma` | `7.0` | Per-slot loss decay; greater than zero, or `null` to disable |
+| `selector_loss_alpha` | `1.0` | Weight of the selector loss; zero or greater |
+| `selector_stop_gradient` | `false` | Detach the selector's inputs so only its own parameters train on its loss |
+| `objective_chunk_blocks` | `128` | Blocks per vocabulary-projection chunk; bounds memory |
+| `seed` | `0` | Seed for draft initialization and anchor sampling |
+
+A `dflash2` job is rejected when any of these hold:
+
+- `activation_checkpointing` is anything other than `false`. The draft
+  recomputes its own forward, so the default of `true` must be overridden.
+- `fp32_parity`, `fp32_residual`, or `text_config_overrides` is set.
+- `ds_config.bf16.bf16_master_weights_and_grads` or
+  `ds_config.bf16.bf16_optimizer_states` is enabled. The service keeps master
+  weights and optimizer states in fp32 for this provider, whatever the job
+  asks for, so these two flags cannot turn that off. Copying a `ds_config` from
+  another job that sets either flag fails.
+- A generic model patch, such as Liger kernels, is requested. Patches are
+  rejected, not ignored.
+- `sp_size` or `ep_size` is greater than one. The provider supports data
+  parallelism only, so both must be `1` or omitted.
+
+Requests use `processing.loss_fn="dflash2"`. It reads `loss_mask`, the usual
+prediction-aligned supervision mask, and does not use vocabulary `action_masks` or
+`compute_logprobs`. Its ratio metrics are returned as additive
+`loss_term_<name>__num` and `loss_term_<name>__den` pairs; divide them to get exact
+pooled ratios.
+
+```python
+training = SubJobConfig.training_job(
+    model_name="Qwen/Qwen3-8B",  # the frozen target
+    optimizer={"name": "AdamW", "lr": 1e-4},
+    max_seq_len=2048,
+    train_batch_size=8,
+    n_gpus=8,
+    extra_training={
+        "model_provider": "dflash2",
+        "activation_checkpointing": False,
+        "dflash2": {"draft_config": draft_config},  # contents of the draft's config.json
+    },
+)
+```
+
+#### Serving a trained draft
+
+To serve a draft trained with the `dflash2` provider, set
+`vllm_config.speculative_config.from_source_checkpoint` to `true` instead of
+`model`, and name the training job's weights-only checkpoint in
+`source_checkpoint_info` (`checkpoint_id` and `source_job_id`). The checkpoint
+becomes the draft model, `model_name` stays the target, and the flag is not
+forwarded to vLLM. The checkpoint is not treated as a LoRA adapter.
+
+The flag is rejected unless all of these hold:
+
+- The job is a sampling job.
+- `source_checkpoint_info` names a checkpoint saved by Cortex Training, not an
+  `external_stage_path`.
+- `speculative_config.model` is not set. A job names its draft either by `model`
+  or by this flag, not both.
 
 ---
 
@@ -3332,6 +3489,12 @@ server already knows the source job's model and rejects one that does not
 match it, so `create` reads the training sub-job's `model_name` from
 `GET /{source job_id}` and sends that. `model` is rejected as an unknown key.
 
+The checkpoint can come from a full fine-tune or a LoRA training job. For a
+LoRA checkpoint, the server copies the source training sub-job's
+`training_config.peft_config` into the deployment, so it serves the base model
+with the trained adapter. The spec has no LoRA settings, and `peft_config`
+cannot be set on a deployment.
+
 Client-side checks (all others are left to the server):
 
 | Field | Rule |
@@ -3495,9 +3658,11 @@ raised unchanged.
 ### 14.8 Calling a deployment
 
 `CortexTrainingClient` does not call the deployment itself; any
-OpenAI-compatible client does. This is the behavior a caller sees, as checked
-by the `test_tc6_*` cases in `tests/test_model_deployment_e2e.py`. The
-streaming example (`examples/model_deployment/streaming.py`) codes against it.
+OpenAI-compatible client does. This is the behavior a caller sees. The
+`test_tc6_*` cases in `tests/test_model_deployment_e2e.py` check the path,
+auth, `model`, and length-limit rows against a `READY` deployment; the error
+rows are not exercised by a live test. The streaming example
+(`examples/model_deployment/streaming.py`) codes against it.
 
 | Item | Behavior |
 |---|---|
@@ -3505,7 +3670,11 @@ streaming example (`examples/model_deployment/streaming.py`) codes against it.
 | Auth | `Authorization: Bearer <PAT>` and `X-Snowflake-Authorization-Token-Type: PROGRAMMATIC_ACCESS_TOKEN` |
 | `model` | The deployment ID, `sf-ct-<UUID>`; responses echo it as `model` |
 | Length limit | `max_completion_tokens`. `max_tokens` is rejected with HTTP 400, `{"error": {"type": "invalid_request_error", "param": "max_tokens", "code": "unsupported_parameter"}}` |
-| Not enabled | HTTP 404 while inference is not enabled for the account |
+| Not ready | HTTP 503 `endpoint_failed` while the deployment is `PENDING` or `INITIALIZING`, and possibly briefly after it is dropped. Check its status with `get_model_deployment` |
+| Unavailable | HTTP 503 on a `READY` deployment: `endpoint_failed` when it is temporarily unavailable, or `frontend_overloaded` when the service is busy. Retry shortly |
+| Not found | HTTP 404 `model_not_found` for an unknown or malformed ID, a deployment that has failed or been dropped, or one the caller does not own or that lives in another schema. The last two are deliberate, so a caller cannot tell whether someone else's deployment exists |
+| Not permitted | HTTP 403 `feature_disabled` when Cortex Training or model deployments are not enabled for the account, or its trial has expired or has no expiration configured; the message says which. HTTP 403 `deployment_class_not_served` when the deployment exists but this endpoint does not serve its class |
+| Routes off | HTTP 405 with an empty body when the inference routes are turned off for the account, or for a wrong HTTP method |
 
 Without `stream`, the response is one `chat.completion` object with
 `choices[0].message.content`, `finish_reason`, and `usage`.

@@ -1537,14 +1537,20 @@ def _reject_zero_stage_3(ds_config: Any, *, location: str) -> None:
         )
 
 
+# ``model_provider`` names the client accepts but the server does not yet, and
+# the name each is sent as. Drop an entry once the server accepts the new name.
+_MODEL_PROVIDER_WIRE_ALIASES = {"arctic": "prime_rl"}
+
+
 def _validate_raw_sub_job_configs(sub_job_configs: list) -> None:
     """Validate a raw create-job body in place: canonicalize every ``peft_config`` and reject ZeRO-3.
 
     The typed path validates these through :class:`TrainingConfig` /
     :class:`InferenceConfig`; this gives raw bodies the same guarantee so an
     adapter that weight sync cannot carry, or an unsupported ZeRO stage, is
-    rejected before the request is sent. Everything else in the body, including
-    ``optimizer``, is forwarded as given.
+    rejected before the request is sent. A training ``model_provider`` of
+    ``"arctic"`` is rewritten to ``"prime_rl"``, the name the server accepts.
+    Everything else in the body, including ``optimizer``, is forwarded as given.
     """
     for index, sub_job in enumerate(sub_job_configs):
         if not isinstance(sub_job, dict):
@@ -1557,6 +1563,9 @@ def _validate_raw_sub_job_configs(sub_job_configs: list) -> None:
                 job_config.get("ds_config"),
                 location=f"sub_job_configs[{index}].training_config.ds_config",
             )
+            provider = job_config.get("model_provider")
+            if isinstance(provider, str) and provider in _MODEL_PROVIDER_WIRE_ALIASES:
+                job_config["model_provider"] = _MODEL_PROVIDER_WIRE_ALIASES[provider]
         peft_config = job_config.get("peft_config") if isinstance(job_config, dict) else None
         if peft_config is None:
             continue
@@ -1564,6 +1573,90 @@ def _validate_raw_sub_job_configs(sub_job_configs: list) -> None:
             peft_config,
             location=f"sub_job_configs[{index}].{config_key}.peft_config",
         )
+
+
+# ─── Relaunching a job ───────────────────────────────────────────────────
+
+# The CreateJob fields a Get job record holds besides its sub-jobs (all but
+# experiment_name, which the job's experiment run has). job_id is not one: the
+# service gives each new job its own and rejects one in the body.
+_RELAUNCH_JOB_FIELDS = ("hardware", "comment", "experiment_name", "idle_timeout_seconds", "pending_timeout_seconds")
+# The timeouts a job that sets none runs with: the service's defaults, as section
+# 5.1 of docs/reference/rest-api.md gives them. A record has a timeout only when
+# it was set, so a body states these for one that was not.
+_DEFAULT_IDLE_TIMEOUT_SECONDS = 1800
+_DEFAULT_PENDING_TIMEOUT_SECONDS = 86_400
+# A sub-job's CreateJob fields that its record entry can leave out when unset; a
+# body has each, null for the service's default.
+_RELAUNCH_SUB_JOB_FIELDS = ("dtype", "seed", "source_checkpoint_info")
+# A sub-job entry's fields the service adds.
+_SUB_JOB_SERVICE_FIELDS = frozenset({"sub_job_id", "status"})
+
+
+def _whole_numbers_as_ints(value: Any) -> Any:
+    """``value`` with each whole float as an int. Until the service reports a
+    sub-job's effective config it returns the submitted one with every number a
+    float (``"n_gpus": 4.0``), and a LoRA ``r`` of ``8.0`` fails ``peft_config``
+    validation."""
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, Mapping):
+        return {key: _whole_numbers_as_ints(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_whole_numbers_as_ints(item) for item in value]
+    return value
+
+
+def create_job_body_from_job(job: Mapping[str, Any], *, experiment_name: str | None = None) -> dict:
+    """A CreateJob body that launches a job configured like ``job``, a Get job record.
+
+    The body has every field a caller can set on a job, each with the value the
+    job runs with: its ``hardware``, ``comment``, timeouts and
+    ``experiment_name`` (the job's experiment, from :meth:`get_experiment_run`;
+    a copy then joins it as a new run), and its sub-jobs as ``sub_job_configs``,
+    each config as the record has it. That is the sub-job's effective config,
+    server defaults included, once the job is running on a service that reports
+    one, and the config as submitted before then. A timeout the job did not set
+    is the service's default; a ``comment``, ``seed``, ``dtype`` or
+    ``source_checkpoint_info`` the record leaves out is null, as is
+    ``experiment_name`` when not given. A model deployment keeps the
+    ``pending_timeout_seconds`` and ``experiment_name`` it cannot set null. The
+    fields the service adds (``job_id``, ``status``, ``sub_job_id``, times,
+    submitter, owner, image) are left out. A sub-job started from external
+    weights has ``source_checkpoint_info.external_stage_path`` null, to fill in:
+    the record does not say which weights.
+
+    Raises ``ValueError`` for a record that cannot be copied: one with no
+    sub-jobs, or one with no ``hardware`` (the service could not read the job).
+    """
+    sub_jobs = job.get("sub_jobs") if isinstance(job, Mapping) else None
+    if not isinstance(sub_jobs, list) or not sub_jobs:
+        raise ValueError("the job record has no sub_jobs to copy")
+    if not job.get("hardware"):
+        raise ValueError("the job record has no hardware: the service could not read the job's details; try again")
+    body: dict[str, Any] = {key: job.get(key) for key in _RELAUNCH_JOB_FIELDS}
+    if _model_deployment_sub_job(job) is None:
+        if body["idle_timeout_seconds"] is None:
+            body["idle_timeout_seconds"] = _DEFAULT_IDLE_TIMEOUT_SECONDS
+        if body["pending_timeout_seconds"] is None:
+            body["pending_timeout_seconds"] = _DEFAULT_PENDING_TIMEOUT_SECONDS
+        body["experiment_name"] = experiment_name
+    configs = []
+    for index, sub_job in enumerate(sub_jobs):
+        if not isinstance(sub_job, Mapping):
+            raise ValueError(f"sub_jobs[{index}] is not an object")
+        config = {key: value for key, value in sub_job.items() if key not in _SUB_JOB_SERVICE_FIELDS}
+        for key in _RELAUNCH_SUB_JOB_FIELDS:
+            config.setdefault(key, None)
+        source = config["source_checkpoint_info"]
+        if isinstance(source, Mapping):
+            # The service reports is_external, and rejects it on create, in place of
+            # the stage path it never returns.
+            config["source_checkpoint_info"] = ({"external_stage_path": None} if source.get("is_external")
+                                                else {k: v for k, v in source.items() if k != "is_external"})
+        configs.append(config)
+    body["sub_job_configs"] = configs
+    return _whole_numbers_as_ints(body)
 
 
 # ─── Model deployments ───────────────────────────────────────────────────
