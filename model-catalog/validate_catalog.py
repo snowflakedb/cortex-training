@@ -19,7 +19,9 @@ folder this checks that:
   standard ones;
 - model.json's ``last_validated`` dates name exactly the model's files;
 - ``make_config(..., rl=True)`` builds a valid job for each context, hardware
-  and mode that has both a training and an inference file;
+  and mode that has both a training and an inference file, except a pair whose
+  sampling ``max_seq_len`` exceeds the training window (that rollout cannot be
+  collated, so the files stay as separate training and inference jobs);
 - ``make_distillation_config`` builds a valid student job (training + sampling)
   and a sampling-only teacher job for the default distillation selection, with
   the teacher's ``max_seq_len`` above the student's.
@@ -64,16 +66,16 @@ class CatalogValidationError(ValueError):
 
 
 def examples_utils():
-    """Import the repository's examples.utils, never another ``examples`` package."""
+    """Import the repository's recipes.utils, never another ``recipes`` package."""
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
-    import examples
-    from examples import utils
+    import recipes
+    from recipes import utils
 
-    location = Path(examples.__file__).resolve().parent
-    if location != REPO_ROOT / "examples":
+    location = Path(recipes.__file__).resolve().parent
+    if location != REPO_ROOT / "recipes":
         raise ImportError(
-            f"`examples` resolves to {location}, not this repository's examples/; "
+            f"`recipes` resolves to {location}, not this repository's recipes/; "
             f"put {REPO_ROOT} first on sys.path"
         )
     return utils
@@ -358,6 +360,39 @@ def _context_errors(lengths: dict[str, list[int]]) -> list[str]:
     return []
 
 
+def _file_max_seq_len(catalog_file: CatalogFile) -> int | None:
+    try:
+        body = _load_json_object(catalog_file.path)
+    except CatalogValidationError:
+        return None
+    sub_jobs = body.get("sub_job_configs")
+    if not isinstance(sub_jobs, list) or not sub_jobs or not isinstance(sub_jobs[0], dict):
+        return None
+    config = sub_jobs[0].get("training_config") or sub_jobs[0].get("inference_config")
+    if not isinstance(config, dict):
+        return None
+    value = config.get("max_seq_len")
+    return value if _positive_int(value) else None
+
+
+def _sampling_window_exceeds_training(files: list[CatalogFile], context: str, hardware: str, mode: str) -> bool:
+    """True when this tier's inference file samples past the training window.
+
+    ``make_config(..., rl=True)`` rejects that pair: the runner collates each
+    rollout at the training ``max_seq_len``. The files remain valid on their
+    own, so the catalog keeps them and does not build an RL job.
+    """
+    windows: dict[str, int] = {}
+    for catalog_file in files:
+        if (catalog_file.context, catalog_file.hardware, catalog_file.mode) != (context, hardware, mode):
+            continue
+        length = _file_max_seq_len(catalog_file)
+        if length is not None:
+            windows[catalog_file.kind] = length
+    training, inference = windows.get("training"), windows.get("inference")
+    return training is not None and inference is not None and inference > training
+
+
 def _rl_errors(model_id: str, files: list[CatalogFile], catalog_dir: Path) -> tuple[list[str], int]:
     """Build every RL job the model's files allow with make_config and check it."""
     utils = examples_utils()
@@ -365,7 +400,11 @@ def _rl_errors(model_id: str, files: list[CatalogFile], catalog_dir: Path) -> tu
     for catalog_file in files:
         kinds.setdefault((catalog_file.context, catalog_file.hardware, catalog_file.mode), set()).add(catalog_file.kind)
     errors = []
-    combinations = sorted(key for key, found in kinds.items() if found == set(utils.CATALOG_KINDS))
+    combinations = []
+    for context, hardware, mode in sorted(key for key, found in kinds.items() if found == set(utils.CATALOG_KINDS)):
+        if _sampling_window_exceeds_training(files, context, hardware, mode):
+            continue
+        combinations.append((context, hardware, mode))
     for context, hardware, mode in combinations:
         label = f"make_config(model={model_id!r}, context={context!r}, hardware={hardware!r}, lora={mode == 'lora'}, rl=True)"
         try:
@@ -403,7 +442,7 @@ def _distillation_errors(catalog_dir: Path) -> tuple[list[str], int]:
     missing = [model_id for model_id in (student, teacher) if not (catalog_dir / utils.model_slug(model_id)).is_dir()]
     if missing:
         return [f"{label}: default distillation model(s) missing from the catalog: {', '.join(missing)}"], 0
-    overrides_path = REPO_ROOT / "examples" / "distillation" / "overrides.json"
+    overrides_path = REPO_ROOT / "recipes" / "distillation" / "overrides.json"
     if not overrides_path.is_file():
         return [f"{label}: the example's shipped overrides.json is missing at {overrides_path}"], 0
     try:
