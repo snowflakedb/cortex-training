@@ -3,9 +3,9 @@
 Train a model on Hendrycks MATH with grouped policy optimization, and evaluate on
 MATH-500. Each run creates one job with colocated training and sampling
 sub-jobs. The loop generates rollouts, scores them, trains, and syncs weights to
-the sampler. The example is in `math_grpo/`: `train.py` is the entry point and
+the sampler. The example is in ``: `train.py` is the entry point and
 `task.py` holds the prompt, scoring and evaluation. It runs on the shared loop
-in `runner.py`.
+in `../runner.py`.
 
 ## Run
 
@@ -44,20 +44,20 @@ python -m examples.rl.math_grpo.train config=/path/to/config.json \
 | `eval_every=`, `n_test=` | 10, all | MATH-500 eval cadence (`0` skips it) and size |
 | `weight_sync_format=` | server default | `vllm` or `hf` for full-parameter weight sync. LoRA jobs always sync `lora` |
 | `weight_sync_bucket_size=` | server default | Weight-sync transfer bucket in bytes. Set it above the largest single tensor |
-| `job_config=` | none | Use this job file instead of the catalog and `overrides.json`; `lr=`, `train_batch_size=` and `max_seq_len=` still apply |
-| `wandb_project=`, `sf_tracking=` | off | [Experiment tracking](../../docs/guides/operations/wandb.md) |
+| `job_config=` | none | Use this job file instead of the catalog and `../overrides.json`; `lr=`, `train_batch_size=` and `max_seq_len=` still apply |
+| `wandb_project=`, `sf_tracking=` | off | [Experiment tracking](../../../docs/guides/operations/wandb.md) |
 
 ## How the job is built
 
 The job is built as described in
-[How an example builds its job](../README.md#how-an-example-builds-its-job).
+[How an example builds its job](../../README.md#how-an-example-builds-its-job).
 For RL, the model's training and inference files are combined into one job, and
-[`rl/overrides.json`](overrides.json) adds the RL tuning that every model
+[`rl/overrides.json`](../overrides.json) adds the RL tuning that every model
 shares: optimizer betas `(0.9, 0.95)`, `mb_spec.max_tokens_per_mb` 10240, and
 ZeRO `reduce_scatter`. Edit that file to change these for every run.
 
 `job_config=` also takes either file of a catalog pair, such as a model's
-`<hw>-training-<lora|full>.json` under `model-catalog/models/`: a file with only
+`<hw>-training-<lora|full>.json` under `../../../model-catalog/models`: a file with only
 a training or only a sampling sub-job takes the other sub-job from the file
 beside it whose name swaps `-training-` and `-inference-`. The pair is used as
 is, without `rl/overrides.json` or router replay.
@@ -96,7 +96,7 @@ replay.
 ## Router-replay capacity planning
 
 To size caps for a specific job instead of using the fixed defaults, use the
-planner in `examples/utils.py` (`plan_router_replay_caps`, or
+planner in `../../utils.py` (`plan_router_replay_caps`, or
 `plan_training_cache_bytes` and `plan_sampling_cache_bytes`). Then set the
 result in `rl/overrides.json`. The planner only calculates: it doesn't call the
 service or change a job.
@@ -111,7 +111,7 @@ backlog       = max_inflight_rollouts + ceil(batch_size * over_generation_multip
 
 The defaults are `routing_skew=2.0` and `safety_factor=1.2`. The skew is an
 estimate, not an upper bound. See
-[REST API section 8.2](../../docs/reference/rest-api.md#82-trainingconfig) for
+[REST API section 8.2](../../../docs/reference/rest-api.md#82-trainingconfig) for
 `max_cache_bytes`.
 
 ```python
@@ -133,10 +133,10 @@ training_cap = utils.plan_training_cache_bytes(
 
 Model-specific job fields are documented in the reference docs:
 
-- MoE LoRA targets attention only: see [LoRA and QLoRA](../../docs/guides/training/lora-and-qlora.md).
+- MoE LoRA targets attention only: see [LoRA and QLoRA](../../../docs/guides/training/lora-and-qlora.md).
 - `prime_rl` versus `model_options`, and `numerics.fp32_parity` (on by default
   for Qwen3.5-family models; turn it off if a job runs out of memory): see
-  [REST API `model_options`](../../docs/reference/rest-api.md#model_options).
+  [REST API `model_options`](../../../docs/reference/rest-api.md#model_options).
 
 ## Evaluation and logs
 

@@ -561,6 +561,40 @@ def sequence_from_rollout(
     return TrainSequence(input_ids=tokens, loss_mask=loss_mask, advantage=advantage)
 
 
+def sampled_logprobs_shifted(
+    prompt_lengths: Sequence[int],
+    results: Sequence[Mapping[str, Any]],
+    width: int,
+) -> torch.Tensor:
+    """Sampler logprobs placed on the positions that predict each sampled token.
+
+    Column ``i`` holds the log probability of token ``i + 1``, the layout the
+    GRPO processor reads as ``old_log_probs_shifted``. Sample with
+    ``"logprobs": 0, "return_sampled_logprobs_only": True`` so ``logprobs`` is
+    one float per sampled token. vLLM reports these before temperature scaling.
+    """
+    if len(prompt_lengths) != len(results):
+        raise ValueError(f"{len(prompt_lengths)} prompt lengths but {len(results)} rollouts")
+    rows: list[list[float]] = []
+    for row_index, (prompt_len, result) in enumerate(zip(prompt_lengths, results)):
+        tokens = result.get("token_ids") or []
+        scores = result.get("logprobs")
+        if not isinstance(scores, Sequence) or isinstance(scores, (str, bytes)) or len(scores) != len(tokens):
+            raise ValueError(
+                f"rollout {row_index} needs one sampled logprob per token; sample with "
+                '"logprobs": 0 and "return_sampled_logprobs_only": True'
+            )
+        if prompt_len <= 0 or prompt_len - 1 + len(tokens) > width:
+            raise ValueError(f"rollout {row_index} does not fit a width-{width} batch")
+        row = [0.0] * width
+        for offset, score in enumerate(scores):
+            if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score):
+                raise ValueError(f"rollout {row_index} token {offset}: sampled logprob is not a finite float")
+            row[prompt_len - 1 + offset] = float(score)
+        rows.append(row)
+    return torch.tensor(rows, dtype=torch.float32)
+
+
 def collate(
     sequences: Sequence[TrainSequence],
     pad_token_id: int,
