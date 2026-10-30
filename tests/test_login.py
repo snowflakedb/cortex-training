@@ -1094,3 +1094,19 @@ def test_login_says_what_its_checks_dont_cover(isolated):
     assert "This profile connects to Cortex Training on this account. Your role may still lack" in err
     assert "privileges that some operations need; if one is refused, its error says which." in err
     assert "USE CORTEX TRAINING" not in err
+
+
+def test_the_note_is_yellow_in_a_terminal(isolated, monkeypatch):
+    class Terminal(io.StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    write_profiles(isolated, PROFILES)
+    _picker.save_profile("train")
+    world = World(databases={"TRAIN_DB"})
+    stderr = Terminal()
+    code = _login.run_login(None, stdin=io.StringIO("\n"), stdout=io.StringIO(), stderr=stderr, interactive=True, open_client=world.open)
+    assert code == 0
+    assert f"\x1b[33m{_login.PRIVILEGE_NOTE[0]}\x1b[0m" in stderr.getvalue()

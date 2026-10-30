@@ -592,7 +592,7 @@ def run_convert(
     prompter.say(f"Try it:  {style.cyan(f'cortex-training --connection {plan.profile} capacity')}")
     prompter.say()
     for line in _login.PRIVILEGE_NOTE:
-        prompter.say(style.dim(line))
+        prompter.say(style.yellow(line))
     _login.remind_environment(prompter, findings, shell)
     if not getattr(stdout, "isatty", lambda: False)():
         json.dump(

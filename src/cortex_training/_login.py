@@ -1045,7 +1045,7 @@ def run_login(
         prompter.say(f"Try it:  {style.cyan('cortex-training capacity')}")
     prompter.say()
     for line in PRIVILEGE_NOTE:
-        prompter.say(style.dim(line))
+        prompter.say(style.yellow(line))
     remind_environment(prompter, findings, shell)
     if not getattr(stdout, "isatty", lambda: False)():
         values = _profiles.read_profiles().get(chosen, {})
