@@ -1,0 +1,21 @@
+{
+  "_comment": "The SFT warmup job (sft.py), on top of the catalog's Qwen3-0.6B training file: one GPU, a 4096-token window, and prime-rl's SFT AdamW (lr 2e-5, weight decay 0.01, betas 0.9/0.999). The DeepSpeed batch fields are dropped for the single GPU, and bf16 stays enabled (fp32 master weights).",
+  "sub_job_configs": [
+    {
+      "job_type": "training",
+      "training_config": {
+        "n_gpus": 1,
+        "max_seq_len": 4096,
+        "train_batch_size": 1,
+        "model_provider": "huggingface",
+        "fused_lm_head_token_chunk_size": null,
+        "optimizer": {"lr": 2e-05, "weight_decay": 0.01},
+        "ds_config": {
+          "train_batch_size": null,
+          "train_micro_batch_size_per_gpu": null,
+          "gradient_accumulation_steps": null
+        }
+      }
+    }
+  ]
+}

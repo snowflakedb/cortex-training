@@ -8,7 +8,8 @@ type on the command line instead of writing a job file.
 |---|---|---|
 | [Conversational SFT](sft/README.md) | LoRA or full-parameter SFT | Hugging Face chat datasets, GSM8K, identity |
 | [DARE-Bench agent SFT](sft/dare/README.md) | Full-parameter multi-turn tool SFT + agent eval | DARE-Bench |
-| [Math GRPO](rl/README.md) | Reinforcement learning | Hendrycks MATH, MATH-500 |
+| [Math GRPO](rl/math_grpo/README.md) | Reinforcement learning | Hendrycks MATH, MATH-500 |
+| [Reverse-text RL, following prime-rl](rl/prime_rl_reverse_text/README.md) | SFT warmup, then async RL with prime-rl's schedule and IPO loss (or its earlier DPPO+KL, or clipped GRPO) | Reverse-text SFT and RL sets |
 | [On-policy distillation](distillation/README.md) | Distillation from a frozen teacher | GSM8K |
 | [Inference endpoint](inference/README.md) | Serve, generate, evaluate open weights or a checkpoint | MATH-500, GSM8K, identity |
 | [Model deployment streaming](model_deployment/README.md) | OpenAI-compatible model deployment, streamed chat | Open weights, checkpoints |
@@ -21,7 +22,8 @@ examples/
 ├── utils.py          # make_config, build_job and shared helpers
 ├── logging.py        # metrics logging
 ├── sft/              # runner.py (shared loop), overrides.json, conversational/, dare/ (own overrides.json)
-├── rl/               # runner.py (shared loop), overrides.json, math_grpo/, configs/ (generated)
+├── rl/               # runner.py (shared loop), overrides.json, math_grpo/, configs/ (generated);
+│                     #   prime_rl_reverse_text/ (own loop, overrides.json, sft_overrides.json)
 ├── inference/        # serve.py, generate.py, evaluate.py, overrides.json
 ├── distillation/     # on_policy/, overrides.json, configs/ (generated)
 ├── api/              # raw request bodies
@@ -52,6 +54,8 @@ To log metrics to Weights & Biases or Snowflake, see
 # the default connection is used.
 python -m examples.sft.conversational.train config=/path/to/config.json
 python -m examples.rl.math_grpo.train config=/path/to/config.json
+python -m examples.rl.prime_rl_reverse_text.sft config=/path/to/config.json
+python -m examples.rl.prime_rl_reverse_text.train config=/path/to/config.json
 python -m examples.distillation.on_policy.train config=/path/to/config.json
 python -m examples.inference.serve config=/path/to/config.json
 python -m examples.model_deployment.deploy config=/path/to/config.json
@@ -104,7 +108,7 @@ overriding the one before:
 
 `job_config=FILE` replaces layers 1 and 2; the command-line layer still
 applies on top of it. Without `job_config=`, an RL job on an MoE model also gets
-[router replay](rl/README.md#router-replay) filled in after the merge. The
+[router replay](rl/math_grpo/README.md#router-replay) filled in after the merge. The
 final job is logged before it is submitted.
 
 Distillation builds a student and a teacher job instead; see

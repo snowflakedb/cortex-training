@@ -78,7 +78,7 @@ is or customize. Each builds its job from the
 supported model, context and GPU type.
 
 - **[Conversational SFT](examples/sft/README.md)**: supervised fine-tuning on chat datasets with LoRA or full-parameter training.
-- **[Math GRPO](examples/rl/README.md)**: reinforcement learning for mathematical reasoning with verifiable rewards.
+- **[Math GRPO](examples/rl/math_grpo/README.md)**: reinforcement learning for mathematical reasoning with verifiable rewards.
 - **[Inference](examples/inference/README.md)**: serve a model or checkpoint, generate responses, and evaluate.
 
 The [example index](examples/README.md) lists every example and explains how to

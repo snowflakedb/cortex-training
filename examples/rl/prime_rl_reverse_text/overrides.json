@@ -1,0 +1,28 @@
+{
+  "_comment": "The RL job (train.py), on top of the catalog's Qwen3-0.6B training and inference files: prime-rl's deployment of one training GPU and one sampling GPU, its 2048-token window, and its AdamW (lr 3e-6, weight decay 0.01, betas 0.9/0.999). The DeepSpeed batch fields are dropped for the single GPU, and bf16 stays enabled (fp32 master weights; see the README). The SFT warmup uses sft_overrides.json.",
+  "sub_job_configs": [
+    {
+      "job_type": "training",
+      "training_config": {
+        "n_gpus": 1,
+        "max_seq_len": 2048,
+        "train_batch_size": 1,
+        "model_provider": "huggingface",
+        "activation_checkpointing": null,
+        "fused_lm_head_token_chunk_size": null,
+        "mb_spec": {"max_tokens_per_mb": 16384},
+        "optimizer": {"lr": 3e-06, "weight_decay": 0.01},
+        "ds_config": {
+          "train_batch_size": null,
+          "train_micro_batch_size_per_gpu": null,
+          "gradient_accumulation_steps": null,
+          "zero_optimization": {"reduce_scatter": true}
+        }
+      }
+    },
+    {
+      "job_type": "sampling",
+      "inference_config": {"n_gpus": 1, "max_seq_len": 2048}
+    }
+  ]
+}

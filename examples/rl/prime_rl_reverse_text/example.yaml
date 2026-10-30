@@ -1,0 +1,15 @@
+id: prime-rl-reverse-text
+title: Asynchronous reverse-text RL following prime-rl
+status: runnable
+task: rl
+methods:
+  - full-parameter
+datasets:
+  - willcb/R1-reverse-wikipedia-paragraphs-v1-1000
+  - PrimeIntellect/Reverse-Text-RL
+precision:
+  - bfloat16
+provenance:
+  project: prime-rl
+  recipe: examples/basic/reverse-text (sft.toml, rl.toml), orchestrator, and IPO loss at a1822f7a0 (DPPO+KL at 0c58f007b as loss=dppo)
+last_validated: 2026-10-29
