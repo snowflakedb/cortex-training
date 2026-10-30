@@ -169,7 +169,13 @@ def build_forward_backward_probe_spec(
         "position_ids": "arange",
     }
     spec: dict[str, Any] = {"payload": payload}
+    model_options = training.get("model_options") or {}
     token_chunk_size = training.get("fused_lm_head_token_chunk_size")
+    if token_chunk_size is None:
+        token_chunk_size = model_options.get(
+            "lm_head.token_chunk_size",
+            (model_options.get("lm_head") or {}).get("token_chunk_size"),
+        )
     if token_chunk_size is None:
         token_chunk_size = (training.get("prime_rl") or {}).get(
             "fused_lm_head_token_chunk_size"

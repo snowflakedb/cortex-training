@@ -1880,9 +1880,9 @@ top-level `fused_cross_entropy` is read
 only by the client. In the `prime_rl` block the server also reads
 `fused_cross_entropy`: with `ep_size` > 1, `false` there turns the fused head
 off. With `ep_size` > 1 the model reads the fp32 head and the chunk size
-only from the `prime_rl` block entries, which `lm_head.fp32` and
-`lm_head.token_chunk_size` also write; a top-level `fp32_lm_head` alone has no
-effect there. With `ep_size` > 1 a top-level `fused_lm_head_token_chunk_size`
+only from the keys `lm_head.fp32` and `lm_head.token_chunk_size` or the
+`prime_rl` block entries; a top-level `fp32_lm_head` alone has no effect
+there. With `ep_size` > 1 a top-level `fused_lm_head_token_chunk_size`
 alone does not install the chunked head in the model, but the server still
 switches the job to chunked log-probability handling, so do not send it alone
 there: use `lm_head.token_chunk_size` with `lm_head.cross_entropy` set to
@@ -1955,23 +1955,25 @@ values work, the Value column says so: an even count, or the names that work.
 | `checkpointing.targets` | trainer | list of strings (target names the model's layers support, such as `norm`) | `ac_config.targets`; used only with `checkpointing.mode` `selective` |
 | `checkpointing.offload` | trainer | `true` or `false` | `ac_config.offload_config.enabled`; `false` sets nothing when no `ac_config` block results (see below) |
 | `tiled_mlp.token_chunk_size` | trainer | positive integer | `tiled_mlp_token_chunk_size` |
-| `lm_head.fp32` | both | `true` or `false` | `fp32_lm_head`; also `prime_rl.fp32_lm_head` when `ep_size` > 1 |
-| `lm_head.token_chunk_size` | trainer | positive integer | `fused_lm_head_token_chunk_size`; also `prime_rl.fused_lm_head_token_chunk_size` when `ep_size` > 1 |
+| `lm_head.fp32` | both | `true` or `false` | `fp32_lm_head`; also the block entry `prime_rl.fp32_lm_head`'s option when `ep_size` > 1 |
+| `lm_head.token_chunk_size` | trainer | positive integer | `fused_lm_head_token_chunk_size`; also the block entry `prime_rl.fused_lm_head_token_chunk_size`'s option when `ep_size` > 1 |
 | `lm_head.vocab_chunk_size` | trainer | positive integer; takes effect only with `lm_head.token_chunk_size` | `fused_lm_head_vocab_chunk_size` |
-| `lm_head.cross_entropy` | trainer | `true`, `false` or `liger` | `prime_rl.fused_cross_entropy` |
+| `lm_head.cross_entropy` | trainer | `true`, `false` or `liger` | the block entry `prime_rl.fused_cross_entropy`'s option |
 | `liger` | trainer | `true` or `false` | `true` applies Liger kernels on a huggingface model; `false` sets nothing |
-| `moe.grouped_mm` | trainer | `true` or `false` | `prime_rl.moe_use_grouped_mm` |
-| `moe.comm_backend` | trainer | non-empty string (`deepep`, `uccl`) | `prime_rl.ep_comm_backend` |
-| `moe.comm_sms` | trainer | even positive integer | `prime_rl.deepep_num_sms` |
-| `moe.comm_token_chunk` | trainer | positive integer | `prime_rl.deepep_token_chunk_size` |
+| `moe.grouped_mm` | trainer | `true` or `false` | the block entry `prime_rl.moe_use_grouped_mm`'s option |
+| `moe.comm_backend` | trainer | non-empty string (`deepep`, `uccl`) | the block entry `prime_rl.ep_comm_backend`'s option |
+| `moe.comm_sms` | trainer | even positive integer | the block entry `prime_rl.deepep_num_sms`'s option |
+| `moe.comm_token_chunk` | trainer | positive integer | the block entry `prime_rl.deepep_token_chunk_size`'s option |
 | `attention.backend` | trainer | non-empty string (see below) | `attn_implementation` |
-| `attention.sparse_mla` | trainer | not available for any model in the catalog that supports training | `prime_rl.sparse_mla_backend` |
+| `attention.sparse_mla` | trainer | not available for any model in the catalog that supports training | the block entry `prime_rl.sparse_mla_backend`'s option |
 | `compile.fullgraph` | trainer | `true` or `false` | `compile.fullgraph` |
-| `numerics.fp32_parity` | trainer | `true` or `false` (default `true`) | `prime_rl.fp32_parity` when `ep_size` > 1; the top-level field `fp32_parity` otherwise |
+| `numerics.fp32_parity` | trainer | `true` or `false` (default `true`) | the block entry `prime_rl.fp32_parity`'s option when `ep_size` > 1; the top-level field `fp32_parity` otherwise |
 | `numerics.fp32_residual` | trainer | `true` or `false` (experimental, default `false`) | the top-level field `fp32_residual` |
-| `numerics.optimization_dtype` | trainer | `bfloat16` or `float32` | `prime_rl.optimization_dtype` when `ep_size` > 1; nothing otherwise |
+| `numerics.optimization_dtype` | trainer | `bfloat16` or `float32` | the block entry `prime_rl.optimization_dtype`'s option when `ep_size` > 1; nothing otherwise |
 
-An omitted `ep_size` counts as 1 throughout this section. Which keys fail when
+A key the Sets column gives as a block entry's option sets the same model
+option as that entry, without writing the entry into the job's `prime_rl`
+block. An omitted `ep_size` counts as 1 throughout this section. Which keys fail when
 the sub-job starts depends on the model and on `ep_size`:
 
 - With `ep_size` 1 or omitted these keys fail at startup:
@@ -2023,9 +2025,10 @@ Notes on single keys:
   `lm_head.token_chunk_size` and `fused_lm_head_token_chunk_size` unset (with
   `ep_size` > 1 also `prime_rl.fused_lm_head_token_chunk_size`). To turn fused
   cross-entropy off, set `lm_head.cross_entropy` to `false` with `ep_size` > 1,
-  or the block entry `prime_rl.fused_cross_entropy` to `false` with
-  `model_provider` `arctic` and `ep_size` 1 or omitted; turn off
-  `model_options.liger`.
+  and turn off `model_options.liger`. With `ep_size` 1 or omitted there is no
+  other fused cross-entropy to turn off; older server versions also want the
+  block entry `prime_rl.fused_cross_entropy` set to `false` with
+  `model_provider` `arctic`.
 - On server versions that have it, `numerics.fp32_parity` is on by default
   (`true`), so a job that sends no `model_options` runs it, and its
   log-probabilities and loss differ from those of a server version that predates
@@ -2106,8 +2109,9 @@ sent, the first in the order `activation_checkpointing`,
 `gradient_checkpointing` counts. So `gradient_checkpointing=true` with
 `checkpointing.freq=1` is accepted. Different values are rejected.
 `liger=false` is rejected when the same training config already applies Liger kernels.
-With `ep_size` above 1 the `fp32_parity` field is not compared: the key writes
-`prime_rl.fp32_parity`, and the key is compared with that entry. The shipped
+With `ep_size` above 1 the `fp32_parity` field is not compared: the key sets
+the option of the block entry `prime_rl.fp32_parity`, and is compared with that
+entry when the block sends it. The shipped
 dense training configs send `model_provider` `huggingface`, and the Qwen3.5 and
 Qwen3.8 ones a `fused_lm_head_token_chunk_size` of 8192, so `liger: true`, or a
 `lm_head.token_chunk_size` other than 8192, is rejected as a conflict until you
@@ -2130,7 +2134,8 @@ sampler's.
   a positive integer;
 - a field and its key with different values;
 - a field that a key writes into and that holds something other than an
-  object, such as `prime_rl` set to a number together with a `moe.*` key;
+  object, such as `ac_config` set to a number together with a
+  `checkpointing.*` key;
 - the chunked LM head combinations described in the notes above.
 
 The client does not catch these inputs. A rejected input may be refused when
@@ -2157,8 +2162,8 @@ working: the server still accepts the block and reads it as before, apart from
 the `seq_len` default described below and the `numerics.fp32_parity` default
 (see the notes on single keys), which applies whether or not a job sends the
 block. The table gives the entries that have a
-key, and a few that the server sets, ignores or rejects. An entry that it does
-not list, such as `trust_remote_code`, has no key and stays in the block.
+replacement, and a few that the server sets, ignores or rejects. An entry that
+it does not list has no replacement and stays in the block.
 
 | Block entry | Replacement |
 |---|---|
@@ -2167,7 +2172,7 @@ not list, such as `trust_remote_code`, has no key and stays in the block.
 | `deepep_num_sms` | `moe.comm_sms` |
 | `deepep_token_chunk_size` | `moe.comm_token_chunk` |
 | `moe_use_grouped_mm` | `moe.grouped_mm` |
-| `fused_cross_entropy` | `lm_head.cross_entropy` with `ep_size` > 1; no key with `ep_size` 1 or omitted (see below) |
+| `fused_cross_entropy` | `lm_head.cross_entropy` with `ep_size` > 1; nothing with `ep_size` 1 or omitted (see below) |
 | `fused_lm_head_token_chunk_size` | an integer: `lm_head.token_chunk_size`; `"disabled"` or `"auto"` mean no chunked head: omit the key |
 | `fp32_lm_head` | `lm_head.fp32` |
 | `fp32_parity` | `numerics.fp32_parity` with `ep_size` > 1. Only Qwen3.5-MoE models on server versions that have the option read this entry; a server version without the option, or another model, fails an `ep_size` > 1 job that carries it when the sub-job starts. With `ep_size` 1 or omitted the entry has no effect, while the key does |
@@ -2177,13 +2182,22 @@ not list, such as `trust_remote_code`, has no key and stays in the block.
 | `seq_len` | on server versions with this behavior, set by the server from `max_seq_len` with `ep_size` > 1 (below); no effect with `ep_size` 1 or omitted |
 | `reduce_dtype` | rejected: gradient reduction always runs in fp32 |
 | `tiled_mlp_token_chunk_size` | rejected in the block: use `tiled_mlp.token_chunk_size` |
+| `trust_remote_code` | on server versions that have it, the top-level field `trust_remote_code` (below) |
+
+**`trust_remote_code`.** `training_config.trust_remote_code` (`true` or
+`false`) says whether the expert-parallel model may run code from the model
+repository. It applies only with `ep_size` > 1 and is rejected otherwise;
+unset keeps the model's own default. A job that sends both the field and the
+block entry must give them the same value. A job that imports an external
+checkpoint always loads it with `false`.
 
 With `ep_size` 1 or omitted, `lm_head.cross_entropy` fails at startup and the
-block entry `fused_cross_entropy` is the only spelling: with
-`model_provider="arctic"` it decides whether the server refuses
-forward/backward requests whose loss needs per-token log-probabilities, and
-with `"huggingface"` it has no effect. `model_options.liger` is separate: it
-applies Liger kernels on a huggingface model.
+model has no fused cross-entropy, so on server versions with this behavior the
+block entry `fused_cross_entropy` has no effect. Older server versions, with
+`model_provider="arctic"`, use it to decide whether to refuse forward/backward
+requests whose loss needs per-token log-probabilities, and refuse them unless
+it is `false`. `model_options.liger` is separate: it applies Liger kernels on a
+huggingface model.
 
 With `ep_size` 1 or omitted, the block entries `fp32_lm_head`,
 `fused_lm_head_token_chunk_size`, `ac_config` and `fp32_parity` have no effect,
