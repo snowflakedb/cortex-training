@@ -10,13 +10,13 @@ Check capacity first with `cortex-training capacity`.
 
 ```bash
 # Original Hugging Face weights
-python -m examples.inference.serve config=/path/to/config.json
+python -m examples.inference.serve
 
 # Any catalog model with an inference file, e.g. GLM-5.3
-python -m examples.inference.serve config=/path/to/config.json model=zai-org/GLM-5.3 context=long
+python -m examples.inference.serve model=zai-org/GLM-5.3 context=long
 
 # A checkpoint from a training example
-python -m examples.inference.serve config=/path/to/config.json \
+python -m examples.inference.serve \
   model=MODEL context=CONTEXT hardware=HARDWARE lora=LORA \
   source_job_id=TRAINING_JOB_ID checkpoint_id=CHECKPOINT_ID
 ```
@@ -48,7 +48,7 @@ against its context). Without `job_id=`,
 the example creates a one-shot endpoint and releases it when done.
 
 ```bash
-python -m examples.inference.generate config=/path/to/config.json \
+python -m examples.inference.generate \
   job_id=JOB_ID model=MODEL context=CONTEXT hardware=HARDWARE lora=LORA \
   prompt="Who trained you?"
 ```
@@ -68,11 +68,11 @@ Other options: `prompts_file=`, `out=` (a JSONL file), `max_tokens=` (512),
 
 ```bash
 # Against a running endpoint (the arguments serve printed)
-python -m examples.inference.evaluate config=/path/to/config.json \
+python -m examples.inference.evaluate \
   job_id=JOB_ID model=MODEL context=CONTEXT hardware=HARDWARE lora=LORA
 
 # Against a checkpoint, one-shot
-python -m examples.inference.evaluate config=/path/to/config.json \
+python -m examples.inference.evaluate \
   model=MODEL context=CONTEXT hardware=HARDWARE lora=LORA \
   source_job_id=TRAINING_JOB_ID checkpoint_id=CHECKPOINT_ID \
   task=gsm8k temperature=0 max_tokens=1024

@@ -13,21 +13,21 @@ The default is Qwen3-8B LoRA at standard context on H200: 4 training GPUs and 2
 sampling GPUs. Check capacity first with `cortex-training capacity`.
 
 ```bash
-python -m examples.rl.math_grpo.train config=/path/to/config.json
+python -m examples.rl.math_grpo.train
 ```
 
 Other models:
 
 ```bash
 # Qwen3-8B full-parameter
-python -m examples.rl.math_grpo.train config=/path/to/config.json lora=false
+python -m examples.rl.math_grpo.train lora=false
 
 # Qwen3.6-35B-A3B (MoE) LoRA; add lora=false for full-parameter
-python -m examples.rl.math_grpo.train config=/path/to/config.json \
+python -m examples.rl.math_grpo.train \
   model=Qwen/Qwen3.6-35B-A3B context=long lora=true max_tokens=2048
 
 # Qwen3.8-27B full-parameter
-python -m examples.rl.math_grpo.train config=/path/to/config.json \
+python -m examples.rl.math_grpo.train \
   model=Qwen/Qwen3.8-27B lora=false \
   max_tokens=2048 weight_sync_bucket_size=3221225472
 ```
@@ -146,7 +146,7 @@ prints a matching `examples.inference.evaluate` command that uses the same
 prompt, grader and decoding:
 
 ```bash
-python -m examples.inference.evaluate config=/path/to/config.json \
+python -m examples.inference.evaluate \
   model=MODEL context=CONTEXT hardware=HARDWARE lora=LORA \
   source_job_id=TRAINING_JOB_ID checkpoint_id=CHECKPOINT_ID \
   temperature=1.0 max_tokens=MAX_TOKENS

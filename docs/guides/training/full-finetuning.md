@@ -6,8 +6,7 @@ full file in the [model catalog](../../../model-catalog/README.md), is one of
 those, so the plain command is already a full fine-tune:
 
 ```bash
-python -m examples.sft.conversational.train \
-  config=/path/to/config.json
+python -m examples.sft.conversational.train
 ```
 
 For a MoE model, pick it from the catalog; its training file sets
@@ -15,7 +14,6 @@ For a MoE model, pick it from the catalog; its training file sets
 
 ```bash
 python -m examples.sft.conversational.train \
-  config=/path/to/config.json \
   model=Qwen/Qwen3.6-35B-A3B \
   context=long
 ```

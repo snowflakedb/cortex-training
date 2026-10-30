@@ -9,7 +9,6 @@ trains all parameters. The SFT example defaults to full-parameter training:
 
 ```bash
 python -m examples.sft.conversational.train \
-  config=/path/to/config.json \
   lora=true
 ```
 

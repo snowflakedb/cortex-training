@@ -54,7 +54,7 @@ Check capacity first with `cortex-training capacity`. Install the dependencies
 listed in the [examples prerequisites](../README.md#prerequisites).
 
 ```bash
-python -m examples.distillation.on_policy.train config=/path/to/config.json
+python -m examples.distillation.on_policy.train
 ```
 
 Both jobs are cancelled after the final checkpoint is saved.
@@ -138,7 +138,7 @@ The run saves a weights-only checkpoint of the student and logs its
 `checkpoint_id`. Serve it with the inference example:
 
 ```bash
-python -m examples.inference.serve config=/path/to/config.json \
+python -m examples.inference.serve \
   model=Qwen/Qwen3-0.6B context=standard \
   source_job_id=STUDENT_JOB_ID checkpoint_id=CHECKPOINT_ID
 ```

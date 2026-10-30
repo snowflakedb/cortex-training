@@ -18,7 +18,7 @@ the run:
 
 ```bash
 python -m examples.sft.conversational.train \
-  config=/path/to/config.json wandb_project=cortex-training
+  wandb_project=cortex-training
 ```
 
 ## Snowflake experiment tracking

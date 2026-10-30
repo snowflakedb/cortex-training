@@ -6,7 +6,6 @@ weights-only checkpoint produced by a training run:
 
 ```bash
 python -m examples.inference.serve \
-  config=/path/to/config.json \
   model=MODEL context=CONTEXT hardware=HARDWARE lora=LORA \
   source_job_id=TRAINING_JOB_ID \
   checkpoint_id=CHECKPOINT_ID

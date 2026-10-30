@@ -87,18 +87,15 @@ pass `job_config=` for it.
 ```bash
 # 1. Baseline
 python -m examples.sft.dare.evaluate \
-  config=/path/to/config.json \
   bench_dir=$BENCH_DIR \
   sandbox_python=$PWD/dare_sandbox_env/bin/python \
   log_path=/tmp/dare/base
 
 # 2. Train (prints the step-3 command, with the job and checkpoint IDs, when it finishes)
-python -m examples.sft.dare.train \
-  config=/path/to/config.json
+python -m examples.sft.dare.train
 
 # 3. Score the checkpoint
 python -m examples.sft.dare.evaluate \
-  config=/path/to/config.json \
   bench_dir=$BENCH_DIR \
   sandbox_python=$PWD/dare_sandbox_env/bin/python \
   source_job_id=TRAINING_JOB_ID \
