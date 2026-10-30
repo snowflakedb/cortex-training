@@ -6,6 +6,9 @@ own install and entry point.
 - [SkyRL](skyrl/gsm8k_grpo/README.md): runs GRPO with its trainer on a CPU
   driver and training and sampling in Cortex sub-jobs. The GSM8K example lives
   in the Arctic Platform repository.
+- [prime-rl](prime-rl.md): runs GRPO from prime-rl's orchestrator with training
+  and sampling in Cortex sub-jobs. Its math (`i3_math`) and SWE (`r2e-gym`, with
+  an agentic grading policy) examples live in the Arctic Platform repository.
 - [Tinker](tinker/README.md): run a tinker-cookbook recipe, or the Tinker client, on Cortex.
 - [Bring your own agent](bring-your-own-agent.md): train a model inside the
   agent you already run. The agent sends its model calls to a per-rollout

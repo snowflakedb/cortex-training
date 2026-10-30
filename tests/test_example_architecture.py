@@ -1440,6 +1440,7 @@ _UPSTREAM_REFERENCES = (
     # Platform OpenHands recipe (another project), so they may name "recipe".
     ("examples/frameworks/openhands.md", re.compile(r"recipe", re.IGNORECASE)),
     ("examples/frameworks/bring-your-own-agent.md", re.compile(r"recipe", re.IGNORECASE)),
+    ("examples/frameworks/prime-rl.md", re.compile(r"recipe", re.IGNORECASE)),
 )
 
 
@@ -1483,6 +1484,19 @@ def _is_upstream_reference(path: PurePosixPath, line: str) -> bool:
         fnmatch.fnmatch(path.as_posix(), pattern) and reference.search(line)
         for pattern, reference in _UPSTREAM_REFERENCES
     )
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("examples/frameworks/prime-rl.md", True),
+        ("examples/frameworks/README.md", False),
+        ("docs/guides/training/reinforcement-learning.md", False),
+        ("examples/rl/README.md", False),
+    ],
+)
+def test_prime_rl_upstream_reference_is_scoped_to_its_guide(path, expected):
+    assert _is_upstream_reference(PurePosixPath(path), "Run an upstream recipe.") is expected
 
 
 def test_recipe_only_names_other_projects():
