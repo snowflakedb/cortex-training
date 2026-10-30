@@ -43,7 +43,8 @@ tokenizer.save_pretrained("/absolute/path/to/model")
 ## Upload the weights to a stage
 
 The source must be a readable, S3-backed Snowflake stage. The steps below create
-a named internal stage and upload the directory with `PUT`.
+a named internal stage, or use one that already exists, and upload the
+directory with `PUT`.
 
 ### Before you start
 
@@ -51,8 +52,31 @@ a named internal stage and upload the directory with `PUT`.
   file, as configured in [Set Up the Client](../../getting-started/setup.md).
   Confirm it with `cortex-training --connection NAME capacity` (profile) or
   `cortex-training --config PATH capacity` (JSON config).
-- A role with `USAGE` on the database and schema and `CREATE STAGE` on the
-  schema. The role that creates the stage owns it and can upload to it.
+- A role that can upload to the stage, with `USAGE` on the database and schema
+  plus one of:
+  - `CREATE STAGE` on the schema, to create the stage yourself. The role that
+    creates the stage owns it and can upload to it. Without this privilege, the
+    `CREATE STAGE` statement fails with
+    `Insufficient privileges to operate on schema 'MY_SCHEMA'`.
+  - `READ` and `WRITE` on a stage that someone else created, with the
+    encryption described below. In the upload steps, set
+    `CREATE_STAGE = False` in the Python script, or omit the `CREATE STAGE`
+    statement from `upload.sql`.
+
+  To get either one granted, find the role that owns the schema: run
+  `SHOW SCHEMAS LIKE 'MY_SCHEMA' IN DATABASE MY_DB;` and read the `owner`
+  column. A user with that role, or with a role that has the `MANAGE GRANTS`
+  privilege, can run the grant:
+
+  ```sql
+  -- To let the upload role create its own stage:
+  GRANT CREATE STAGE ON SCHEMA MY_DB.MY_SCHEMA TO ROLE UPLOAD_ROLE;
+
+  -- Or, to create the stage for it:
+  CREATE STAGE MY_DB.MY_SCHEMA.MODEL_IMPORT
+    ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
+  GRANT READ, WRITE ON STAGE MY_DB.MY_SCHEMA.MODEL_IMPORT TO ROLE UPLOAD_ROLE;
+  ```
 - The role that submits the training job must be able to read the stage. If it
   is a different role, grant it access:
   `GRANT READ ON STAGE MY_DB.MY_SCHEMA.MODEL_IMPORT TO ROLE TRAINING_ROLE;`
@@ -83,12 +107,14 @@ PROFILE = "training"                      # your connections.toml profile
 STAGE = "MY_DB.MY_SCHEMA.MODEL_IMPORT"
 MODEL_DIR = "/absolute/path/to/model"      # directory holding config.json
 TARGET = f"@{STAGE}/qwen-sft-run7"
+CREATE_STAGE = True                       # False to upload to a stage you were granted
 
 with snowflake.connector.connect(connection_name=PROFILE) as conn:
     cur = conn.cursor()
-    # SNOWFLAKE_SSE lets the service read the stage; the default encryption
-    # for a named internal stage does not.
-    cur.execute(f"CREATE STAGE IF NOT EXISTS {STAGE} ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')")
+    if CREATE_STAGE:
+        # SNOWFLAKE_SSE lets the service read the stage; the default encryption
+        # for a named internal stage does not.
+        cur.execute(f"CREATE STAGE IF NOT EXISTS {STAGE} ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')")
     # PUT compresses by default, which would turn safetensors into .gz files.
     cur.execute(f"PUT file://{MODEL_DIR}/* {TARGET} AUTO_COMPRESS = FALSE OVERWRITE = TRUE")
     for row in cur.execute(f"LIST {TARGET}"):
@@ -124,6 +150,7 @@ you can run the same statements from a file instead:
 `snow sql -c training -f upload.sql`, where `upload.sql` contains:
 
 ```sql
+-- Omit this statement to upload to a stage you were granted.
 CREATE STAGE IF NOT EXISTS MY_DB.MY_SCHEMA.MODEL_IMPORT
   ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 
