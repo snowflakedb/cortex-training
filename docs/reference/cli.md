@@ -343,7 +343,17 @@ cortex-training login training   # use or create the profile "training"
    name. The name is saved only when a profile passes, or when you chose not
    to check a new one.
 
-Login never changes an existing profile. New profiles go to the file the
+If your profile file names a profile more than once (for example, a profile
+pasted in twice), Snowflake can't read the file, so no profile in it works.
+Login says which name and lines, shows the fix, and asks first: it saves a copy
+of the file as `connections.toml.bak` (or `config.toml.bak`), keeps the first
+profile of each name, and renames the others `NAME-duplicate-1`,
+`NAME-duplicate-2`, and so on. Nothing else in the file changes, and login then
+carries on. Other commands say the same thing and point to `cortex-training
+login`.
+
+Login never changes an existing profile, except to rename a duplicated one as
+above, after asking. New profiles go to the file the
 Snowflake Connector reads: `connections.toml`, or `config.toml` when your
 profiles live there. Prompts and progress go to stderr, in color in a terminal
 (set `NO_COLOR` to turn color off); a JSON summary goes to stdout only when it

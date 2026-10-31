@@ -478,6 +478,36 @@ class _Login:
     def profiles(self) -> dict[str, dict[str, Any]]:
         return _profiles.read_profiles()
 
+    def fix_duplicates(self) -> None:
+        """Offer to rename profiles whose name is used twice; no profile in such a file works."""
+        try:
+            path = _profiles.profile_file()
+        except _profiles.DuplicateProfilesError as exc:
+            path = exc.path  # config.toml, when there's no connections.toml
+        if not path.is_file():
+            return
+        duplicates = _profiles.find_duplicates(path)
+        if not duplicates:
+            return
+        found = _profiles.describe_duplicates(duplicates)
+        self.p.section(f"Your profile file {_home(path)} {found}.")
+        self.p.say("Snowflake can't read the file until each name is used once, so no profile in it works right now.")
+        self.p.say()
+        self.p.say("This will:")
+        self.p.say(f"  1. Save a copy of the file next to it, as {path.name}.bak")
+        for step, (line, name, new) in enumerate(_profiles.planned_renames(path), start=2):
+            self.p.say(f"  {step}. Rename the profile {name} at line {line} to {new}")
+        self.p.say("Nothing else in the file changes. You can delete the renamed copies later.")
+        if not self.p.confirm("Fix it now?", default=True):
+            raise LoginCancelled(
+                f"Nothing was changed. {_home(path)} {found}: rename or remove the extra ones, then run "
+                "`cortex-training login` again."
+            )
+        backup, renames = _profiles.rename_duplicates(path)
+        for line, old, new in renames:
+            self.p.say(f"  {self.s.ok(f'Renamed the profile {old} at line {line} to {new}')}")
+        self.p.say(self.s.dim(f"(A copy of the old file is in {_home(backup)}.)"))
+
     def _unused_name(self, base: str) -> str:
         names = set(self.profiles())
         if base not in names:
@@ -946,6 +976,7 @@ def run_login(
     prompter.logo()
     report_environment(prompter, findings, shell)
     try:
+        login.fix_duplicates()
         settings, config_file = _picker.load_config()
         profiles = login.profiles()
         current = settings.get("profile")

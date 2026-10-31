@@ -306,3 +306,19 @@ def test_role_comes_from_the_connection_without_sql() -> None:
     assert connection._cursor.executed == []
     connection.role = None
     assert auth.role is None
+
+
+def test_a_profile_file_naming_a_profile_twice_is_explained(tmp_path, monkeypatch) -> None:
+    # The Connector only says "An unknown error happened while loading" such a file.
+    monkeypatch.setenv("SNOWFLAKE_HOME", str(tmp_path))
+    (tmp_path / "connections.toml").write_text('[demo]\nuser = "A"\n[demo]\nuser = "B"\n')
+
+    def connect(**_kwargs):
+        raise RuntimeError(f"An unknown error happened while loading '{tmp_path / 'connections.toml'}'")
+
+    with pytest.raises(SnowflakeProfileError) as excinfo:
+        SnowflakeProfileAuth("demo", connect_factory=connect)
+    message = str(excinfo.value)
+    assert "could not open Snowflake connection 'demo':" in message
+    assert "has 2 profiles named demo (lines 1 and 3)." in message
+    assert "Run `cortex-training login` to fix it" in message
