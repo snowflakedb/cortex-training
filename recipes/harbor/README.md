@@ -50,12 +50,14 @@ cortex-training login ~/cortex-training-config.json
 cortex-training capacity
 ```
 
-The driver needs no GPU. To mirror task images into the default Snowflake
-sandbox, it needs
-[`crane`](https://github.com/google/go-containerregistry/blob/main/cmd/crane/README.md)
-on its `PATH` (no Docker daemon), and your Snowflake image registry has to accept
-pushes from the driver's network. Tasks that run on the sandbox catalog image
-(`base_image`, below) need neither.
+The driver needs no GPU and no Docker daemon. Rollouts run in Snowflake
+sandboxes, so you also need:
+- A Snowflake [connection](https://docs.snowflake.com/en/developer-guide/snowflake-cli/connecting/configure-connections)
+  that logs in without a browser, such as a programmatic access token or a key
+  pair. The run logs in again every 20 minutes.
+- A role that can create sandboxes.
+- For tasks that reach the internet, an external access integration that allows
+  the hosts they need.
 
 ## Install
 
@@ -95,14 +97,15 @@ provides the pinned `harbor` CLI with that environment importable:
 ```bash
 uv run --extra harbor harbor run -p /path/to/eval_tasks -a <your agent> -m <your model> \
   --env arctic_platform.integrations.harbor.snowflake_sandbox:SnowflakeSandboxEnvironment \
-  --ek image_repo=DB.SCHEMA.REPO --ek connection=MY_CONN --ek role=MY_ROLE
+  --ek base_image=sandbox-base --ek connection=MY_CONN --ek role=MY_ROLE
 ```
 
-`image_repo` is the image repository task images are mirrored into, and the
-role needs WRITE on it. If the registry rejects the push (for example
-`HTTP 444: source IP address not allowed`), replace `image_repo` with
-`--ek base_image=sandbox-base`. Each task's Dockerfile is then replayed on the
-sandbox catalog image, which has Python and git, so nothing is pushed.
+`base_image=sandbox-base` starts each sandbox from the Snowflake catalog image
+and replays the task's `environment/Dockerfile` on it, so no image is built or
+pushed. `sandbox-base` is Chainguard Linux with Python 3.11, pip and git, and
+has `apk` rather than `apt-get`. Replay handles one `FROM` stage with `RUN`,
+`COPY`/`ADD` of local files, `ENV`, `ARG`, `WORKDIR`, `USER` and `ENTRYPOINT`,
+and refuses anything else.
 
 ## 2. Train on the same tasks
 
@@ -112,29 +115,37 @@ that identifies your job.
 ```bash
 export TRAIN_HARBOR_TASKS=/path/to/train_tasks
 export EVAL_HARBOR_TASKS=/path/to/eval_tasks
-export HARBOR_ENV_KWARGS='{"image_repo": "DB.SCHEMA.REPO", "connection": "MY_CONN", "role": "MY_ROLE"}'
+export HARBOR_ENV_KWARGS='{"base_image": "sandbox-base", "connection": "MY_CONN", "role": "MY_ROLE"}'
 export HARBOR_SKILL=/path/to/SKILL.md   # optional: ":"-separated SKILL.md paths
 export ARCTIC_CORTEX_JOB_COMMENT="your name, harbor rl"
 
 bash recipes/rl/harbor/run_qwen35_4b.sh trainer.max_training_steps=50
 ```
 
-`HARBOR_ENV_KWARGS` takes the same keys as `--ek`: `image_repo`, `base_image`,
-`connection`, `role`, `prebuilt_image`, `egress_eai` (for tasks that reach the
-internet, such as `git clone` from GitHub), and `image_platform`. A `base_image`,
-or a `prebuilt_image` that is already a sandbox image path
-(`/DB/SCHEMA/REPO/IMAGE:TAG`), needs neither `image_repo` nor `crane`. The
-launcher checks these before it provisions GPUs.
+`HARBOR_ENV_KWARGS` takes the same keys as `--ek`. Add `"egress_eai": "MY_EAI"`
+for tasks that reach the internet, such as a `git clone` from GitHub.
+
+Before it provisions GPUs, the launcher runs the first training task once, in
+its sandbox, with an agent that does nothing, and grades it. If the sandbox,
+the Dockerfile replay or `tests/test.sh` fails, it prints the cause and exits
+without creating a Cortex job. `HARBOR_SKIP_TASK_CHECK=1` skips this check.
 
 Snowflake allows 100 live sandboxes per owner, and suspended ones count. A run
+keeps at most 90 alive and starts at most 16 at a time. The launcher warns when
+sandboxes left from an earlier run would push you over the limit. A run
 terminates its sandboxes when it ends, even if it fails. If the driver is killed
 outright, clean up as the
 [Harbor recipe README](https://github.com/Snowflake-AI-Research/Arctic-Platform/tree/main/recipes/rl/harbor#1-any-harbor-task-set)
 shows.
 
-Other sandboxes: `HARBOR_ENV=docker`, `modal`, `daytona` or `e2b`.
-`HARBOR_ENV=host` runs tasks as plain subprocesses on the driver, with no
-isolation, so it is only for tasks you trust and needs `HARBOR_ALLOW_HOST_EXEC=1`.
+Tasks with their own images (`image_repo`, which mirrors each task's `FROM`
+image into your Snowflake image registry, or `prebuilt_image`) are described in
+that README but were not tested end to end in this release.
+
+Other sandboxes: `HARBOR_ENV=host` runs tasks as plain subprocesses on the
+driver, with no isolation, so it is only for tasks you trust and needs
+`HARBOR_ALLOW_HOST_EXEC=1`. Harbor's other environments (`docker`, `modal`,
+`daytona`, `e2b`) are accepted but were not tested with this recipe.
 
 ## 3. Read the reward
 
@@ -163,14 +174,16 @@ uv run recipes/rl/harbor/prepare_data.py \
 
 export TRAIN_HARBOR_TASKS=~/data/swe-smith-harbor-tasks/train
 export EVAL_HARBOR_TASKS=~/data/swe-smith-harbor-tasks/eval
-export HARBOR_ENV_KWARGS='{"base_image": "sandbox-base", "connection": "MY_CONN", "egress_eai": "GITHUB_ACCESS"}'
+export HARBOR_ENV_KWARGS='{"base_image": "sandbox-base", "connection": "MY_CONN", "role": "MY_ROLE", "egress_eai": "MY_GITHUB_EAI"}'
 export ARCTIC_CORTEX_JOB_COMMENT="your name, harbor localization"
 
 bash recipes/rl/harbor/run_qwen35_4b.sh trainer.max_training_steps=100
 ```
 
 Each task clones its repository from GitHub when its sandbox starts, so
-`egress_eai` must allow `github.com`.
+`egress_eai` must allow `github.com`. In a 25-step run on Snowflake sandboxes,
+the mean reward was `0.59` over steps 1–10, `1.81` over steps 11–20 and `2.39`
+over steps 21–25.
 
 ## Settings
 
