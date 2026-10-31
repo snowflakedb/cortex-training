@@ -139,6 +139,7 @@ written next to it. Each rollout's conversation and reward are saved under
 `trajectories/step_*/`. A rollout that ended without a grade (the sandbox never
 started, the agent or the verifier crashed) is saved as `.error` with its
 traceback and is left out of the loss. If every rollout of a step errors, the
+step is rerun up to 3 times, after waits of 1, 2, and 4 minutes, and then the
 run stops.
 
 ## Example: SWE-smith code localization as Harbor tasks
