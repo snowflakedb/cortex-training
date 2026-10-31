@@ -132,7 +132,8 @@ class SnowflakeProfileAuth:
                 return connect()
             return connect(connection_name=self.connection_name)
         except Exception as exc:
-            message = f"could not open {self._profile_label()}: {exc}"
+            # The Connector can't load a file that names a profile twice, and doesn't say why.
+            message = f"could not open {self._profile_label()}: {_duplicate_profiles() or exc}"
             if _is_pat_rejected(exc):
                 message += "\n" + credentials_rejected_hint(
                     "Snowflake rejected your programmatic access token (PAT)."
@@ -312,3 +313,16 @@ class SnowflakeTelemetryTokenProvider:
     def close(self) -> None:
         # CortexTrainingClient owns and closes the shared profile session.
         return None
+
+
+def _duplicate_profiles() -> str | None:
+    """Why the profile file can't be loaded, when it names a profile more than once."""
+    from cortex_training import _profiles
+
+    try:
+        _profiles.read_profiles()
+    except _profiles.DuplicateProfilesError as exc:
+        return str(exc)
+    except Exception:
+        return None
+    return None
