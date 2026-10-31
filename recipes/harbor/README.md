@@ -126,6 +126,12 @@ or a `prebuilt_image` that is already a sandbox image path
 (`/DB/SCHEMA/REPO/IMAGE:TAG`), needs neither `image_repo` nor `crane`. The
 launcher checks these before it provisions GPUs.
 
+Snowflake allows 100 live sandboxes per owner, and suspended ones count. A run
+terminates its sandboxes when it ends, even if it fails. If the driver is killed
+outright, clean up as the
+[Harbor recipe README](https://github.com/Snowflake-AI-Research/Arctic-Platform/tree/main/recipes/rl/harbor#1-any-harbor-task-set)
+shows.
+
 Other sandboxes: `HARBOR_ENV=docker`, `modal`, `daytona` or `e2b`.
 `HARBOR_ENV=host` runs tasks as plain subprocesses on the driver, with no
 isolation, so it is only for tasks you trust and needs `HARBOR_ALLOW_HOST_EXEC=1`.
