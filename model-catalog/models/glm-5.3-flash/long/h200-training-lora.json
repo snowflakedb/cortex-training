@@ -36,10 +36,14 @@
         },
         "tiled_mlp_token_chunk_size": 1024,
         "step_peak_memory_log": true,
-        "prime_rl": {
-          "ep_comm_backend": "deepep",
-          "deepep_token_chunk_size": 8192,
-          "fused_cross_entropy": false
+        "model_options": {
+          "moe": {
+            "comm_backend": "deepep",
+            "comm_token_chunk": 8192
+          },
+          "lm_head": {
+            "cross_entropy": false
+          }
         },
         "optimizer": {
           "name": "AdamW",

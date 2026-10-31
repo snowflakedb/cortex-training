@@ -738,6 +738,15 @@ def test_lora_adapters_must_be_valid(catalog, change, match):
     _invalid(catalog, r"submit --dry-run fails: sub_job_configs\[0\]\." + match)
 
 
+def test_training_files_do_not_carry_the_prime_rl_block(catalog):
+    _edit_config(
+        catalog / "qwen3-8b/standard/h200-training-full.json",
+        lambda config: config.update(prime_rl={"fused_cross_entropy": False}),
+    )
+
+    _invalid(catalog, r"training_config\.prime_rl is deprecated: set its options as training_config\.model_options keys")
+
+
 def test_full_files_do_not_carry_peft_config(catalog):
     peft = _config(_body("Qwen/Qwen3-8B", "standard/h200-training-lora"))["peft_config"]
     _edit_config(
@@ -1010,6 +1019,19 @@ def test_qwen38_sft_uses_chunked_logprob_loss(job, context):
         "config": {},
     }
     assert spec["context"]["loss_mask"]["data"][0][-2:] == [1.0, 0.0]
+
+
+@pytest.mark.parametrize("job", ["training-lora", "training-full"])
+def test_qwen36_long_sft_reads_the_chunk_size_from_model_options(job):
+    request = build_catalog_request(CATALOG_DIR, "Qwen/Qwen3.6-35B-A3B", job, context="long")
+    training = request["sub_job_configs"][0]["training_config"]
+
+    assert "fused_lm_head_token_chunk_size" not in training
+    assert training["model_options"]["lm_head"] == {"token_chunk_size": 8192, "cross_entropy": False}
+
+    spec = build_forward_backward_probe_spec(request, job, full_context=True)
+    assert spec["payload"]["labels"] == "none"
+    assert spec["processing"]["post"] == ["compute_logprobs"]
 
 
 def test_smoke_rl_request_combines_the_training_and_inference_files():

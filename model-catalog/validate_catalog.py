@@ -260,6 +260,11 @@ def _sub_job_errors(sub_job: dict[str, Any]) -> list[str]:
         else:
             if not optimizer and config.get("gradient_clipping", hoisted_clipping) is None:
                 errors.append(f"{config_key}.optimizer must carry at least one setting")
+        if "prime_rl" in config:
+            errors.append(
+                f"{config_key}.prime_rl is deprecated: set its options as {config_key}.model_options keys "
+                "(docs/reference/rest-api.md#model_options)"
+            )
     return errors
 
 

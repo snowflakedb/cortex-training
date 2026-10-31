@@ -43,14 +43,18 @@
           "name": "AdamW",
           "weight_decay": 0.0
         },
-        "prime_rl": {
-          "ep_comm_backend": "deepep",
-          "fp32_lm_head": false,
-          "fused_cross_entropy": "liger",
-          "fused_lm_head_token_chunk_size": "disabled",
-          "moe_use_grouped_mm": true,
-          "optimization_dtype": "bfloat16",
-          "seq_len": 128
+        "model_options": {
+          "moe": {
+            "comm_backend": "deepep",
+            "grouped_mm": true
+          },
+          "lm_head": {
+            "fp32": false,
+            "cross_entropy": "liger"
+          },
+          "numerics": {
+            "optimization_dtype": "bfloat16"
+          }
         },
         "train_batch_size": 8
       }
