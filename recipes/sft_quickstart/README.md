@@ -16,21 +16,21 @@ The default is Qwen3-8B full-parameter at standard context on H200, thinking
 off, for 100 steps. Check capacity first with `cortex-training capacity`.
 
 ```bash
-python -m recipes.sft_quickstart.conversational.train config=/path/to/config.json
+python -m recipes.sft_quickstart.conversational.train
 ```
 
 Other models and modes:
 
 ```bash
 # LoRA
-python -m recipes.sft_quickstart.conversational.train config=/path/to/config.json lora=true
+python -m recipes.sft_quickstart.conversational.train lora=true
 
 # Any catalog model and context, e.g. Qwen3.6-35B-A3B (MoE) at 262K
-python -m recipes.sft_quickstart.conversational.train config=/path/to/config.json \
+python -m recipes.sft_quickstart.conversational.train \
   model=Qwen/Qwen3.6-35B-A3B context=long lora=true
 
 # Smaller batch and shorter sequences than the catalog file
-python -m recipes.sft_quickstart.conversational.train config=/path/to/config.json \
+python -m recipes.sft_quickstart.conversational.train \
   train_batch_size=2 max_seq_len=8192 lr=1e-5
 ```
 
@@ -86,7 +86,7 @@ does (see [Serve](../inference/README.md#serve)). On the default task, the
 answer should be `Snowflake AI Research`:
 
 ```bash
-python -m recipes.inference.generate config=/path/to/config.json \
+python -m recipes.inference.generate \
   model=MODEL context=CONTEXT hardware=HARDWARE lora=LORA \
   source_job_id=TRAINING_JOB_ID checkpoint_id=CHECKPOINT_ID \
   temperature=0 prompt="Who trained you?"
@@ -101,5 +101,5 @@ with `task=identity` (after identity SFT) or `task=gsm8k` (after GSM8K SFT).
 `conversational/qwen3_8b_sft_training_multiplex.ipynb` build their job with
 `make_config(model="Qwen/Qwen3-8B", context="standard")`, plus a small override
 for the demo (128-token sequences, batch 8). Start Jupyter inside the
-repository. The notebooks read the connection file from
-`~/cortex-training-config.json`, or from `CORTEX_TRAINING_CONFIG` if that's set.
+repository. The notebooks connect with the profile `cortex-training login`
+saved; edit the first cell to pass `connection="NAME"` for another profile.
