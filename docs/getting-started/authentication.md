@@ -149,7 +149,7 @@ the old CLI read (`CORTEX_TRAINING_*`, then `SNOWFLAKE_*`), and it shows which.
 Then it asks before each step:
 
 1. **It checks the PAT.** It signs in with it to look up your user and role, to
-   check that Cortex Training is enabled, and to check the database. This only
+   check that Cortex Training answers for the account, and to check the database. This only
    reads. If the database is missing, it shows the `CREATE DATABASE` statement
    and runs it only if you say yes. If a check fails, it says why and changes
    nothing.

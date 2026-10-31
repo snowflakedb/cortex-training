@@ -324,8 +324,10 @@ cortex-training login training   # use or create the profile "training"
    enabled. Before listing, login offers to check which accounts have it by
    signing in once to each account (read-only), using only profiles that sign
    in without prompts; it lists the accounts it would contact and asks first.
-   Each profile then shows whether Cortex Training is enabled on its account
-   (✓), not enabled (✗, can't be picked), or not checked yet (?).
+   Each profile then shows whether it connects to Cortex Training on its
+   account (✓), whether the account doesn't have Cortex Training access (✗,
+   can't be picked), or not checked yet (?). A ✓ means the profile connects,
+   not that its role has every privilege an operation needs.
    After you pick, login signs in and asks Cortex Training right away. If the
    profile can't sign in, or Cortex Training isn't enabled on its account,
    login says why and returns to the list before anything is created.
@@ -342,6 +344,11 @@ cortex-training login training   # use or create the profile "training"
 5. It checks the result with one more capacity request, then saves the profile
    name. The name is saved only when a profile passes, or when you chose not
    to check a new one.
+
+A passing check (`✓ Connected to Cortex Training on this account`) means the
+profile connects to Cortex Training on that account. It doesn't test every
+privilege an operation can need, so login and `--convert-legacy-config` end by
+saying so: if your role lacks one, that operation's error says which.
 
 If your profile file names a profile more than once (for example, a profile
 pasted in twice), Snowflake can't read the file, so no profile in it works.
@@ -389,7 +396,7 @@ where the old CLI looked next: `CORTEX_TRAINING_HOST`, `CORTEX_TRAINING_PAT`,
 `SNOWFLAKE_*` variable, then the defaults (`CORTEX_TRAINING_DB`, `PUBLIC`). It
 shows where each value came from. Database and schema names must be Snowflake
 identifiers. It asks before signing in with the PAT to look up its user and
-role, to check that Cortex Training is enabled, and to check the database. It
+role, to check that Cortex Training answers for the account, and to check the database. It
 creates a missing database only after showing the SQL and asking. Then it shows
 every change and asks once, with No as the default (`[y/N]`), since it deletes
 the file:

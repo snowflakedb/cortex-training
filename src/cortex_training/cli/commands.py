@@ -370,9 +370,13 @@ login helps you use a profile you already have, or create a new one, and
 checks that:
 
   - it can sign in to your Snowflake account,
-  - Cortex Training is enabled on that account, and
+  - Cortex Training answers for that account, and
   - there is a database for Cortex Training to keep your training jobs and
     checkpoints in (we recommend CORTEX_TRAINING_DB).
+
+These checks show the profile connects to Cortex Training. Your role may
+still lack privileges that some operations need; if one is refused, its
+error says which.
 
 login never changes your existing profiles, and asks before it creates
 anything. Your choice is saved in ~/.snowflake/cortex-training/config.json.

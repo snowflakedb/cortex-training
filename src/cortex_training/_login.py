@@ -276,6 +276,13 @@ def database_missing(exc: BaseException) -> bool:
     return _is_schema_not_found(getattr(exc, "response", None))
 
 
+# What the checks show, and what they don't: an operation can need privileges they don't test.
+PRIVILEGE_NOTE = [
+    "This profile connects to Cortex Training on this account. Your role may still lack",
+    "privileges that some operations need; if one is refused, its error says which.",
+]
+
+
 def open_profile_client(profile: str, database: str, schema: str) -> Any:
     """Sign in with ``profile``; the client never creates a database on its own."""
     from cortex_training.client import CortexTrainingClient
@@ -610,7 +617,9 @@ class _Login:
         if result.error:
             self.p.say(f"  {self.s.bad(result.error)}")
             return result
-        self.p.say(f"  {self.s.ok('Cortex Training is enabled on this account')}")
+        # Capacity answering means the profile reaches Cortex Training on this account, not
+        # that the role has every privilege an operation needs (see PRIVILEGE_NOTE).
+        self.p.say(f"  {self.s.ok('Connected to Cortex Training on this account')}")
         result.missing = _database_setup.missing(result.client)
         if result.missing is None:
             self.p.say(f"  {self.s.unknown(f'Could not check database {database}; continuing')}")
@@ -764,9 +773,10 @@ class _Login:
             return self.s.unknown("Cortex Training not checked yet; checked when you pick it")
         label, reason = status
         if label == CT_ENABLED:
-            return self.s.ok(self.s.green(f"Cortex Training is enabled on {account}"))
+            # Like the check: the profile reaches Cortex Training, not "everything works".
+            return self.s.ok(self.s.green(f"Connects to Cortex Training on {account}"))
         if label == CT_NOT_ENABLED:
-            return self.s.bad(self.s.red(f"Cortex Training is not enabled on {account}"))
+            return self.s.bad(self.s.red(f"{account} doesn't have Cortex Training access"))
         return self.s.unknown(f"Couldn't check Cortex Training: {reason}")
 
     # ── Flow ────────────────────────────────────────────────────────────
@@ -805,7 +815,11 @@ class _Login:
                 label += self.s.dim(" (current)")
             lines = [f"{label}  {self._status_line(name, hint, failed)}"]
             if hint.usable:
-                lines.append(f"{indent}     {self.s.dim(hint.summary)}")
+                # account · user · role, then the database, so each line fits an 80-column terminal.
+                who, _, database = hint.summary.rpartition(" · ")
+                lines.append(f"{indent}     {self.s.dim(who or database)}")
+                if who:
+                    lines.append(f"{indent}     {self.s.dim(database)}")
                 lines.append(f"{indent}     {self.s.dim('signs in with ' + hint.sign_in)}")
             options.append("\n".join(lines))
         options.append(self.s.bold("Create a new profile"))
@@ -1060,6 +1074,9 @@ def run_login(
         prompter.say(style.dim(f"(Saved in {_home(saved)}.)"))
         prompter.say()
         prompter.say(f"Try it:  {style.cyan('cortex-training capacity')}")
+    prompter.say()
+    for line in PRIVILEGE_NOTE:
+        prompter.say(style.yellow(line))
     remind_environment(prompter, findings, shell)
     if not getattr(stdout, "isatty", lambda: False)():
         values = _profiles.read_profiles().get(chosen, {})

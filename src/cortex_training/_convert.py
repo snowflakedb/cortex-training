@@ -20,7 +20,7 @@ database, and settings. Converting it:
 
 1. reads the file and shows what it holds, with the PAT hidden;
 2. asks, then uses the PAT to look up its user and role, to check that
-   Cortex Training is enabled, and to check the database. A missing database
+   Cortex Training answers for the account, and to check the database. A missing database
    can be created after showing the SQL and asking. Nothing local is written
    if a check fails;
 3. shows every change and asks once;
@@ -267,7 +267,7 @@ class _Converter:
         self.p.say()
         self.p.say(f"To check this PAT, Cortex Training will sign in to {self.s.bold(old.host)} with it and:")
         self.p.say("  - ask who it signs in as (user and role)")
-        self.p.say("  - check that Cortex Training is enabled on the account")
+        self.p.say("  - check that Cortex Training answers for the account")
         self.p.say(f"  - check that database {old.database} and schema {old.schema} are visible to that role")
         self.p.say("This only reads; nothing is changed.")
         if not self.p.confirm("Check now?", default=True):
@@ -301,7 +301,7 @@ class _Converter:
                 ) from exc
             else:
                 raise ConvertError(f"{explain(exc, self.old)}\n\n{_NOTHING_CHANGED}") from exc
-        self.p.say(f"  {self.s.ok('Cortex Training is enabled on this account')}")
+        self.p.say(f"  {self.s.ok('Connected to Cortex Training on this account')}")
 
     def _check_database(self, identity: Identity) -> None:
         database = self.old.database
@@ -590,6 +590,9 @@ def run_convert(
         prompter.say(f"Not kept: {', '.join(_dropped_settings(old.settings))}. Pass them as {_flags_for(old.settings)}.")
     prompter.say()
     prompter.say(f"Try it:  {style.cyan(f'cortex-training --connection {plan.profile} capacity')}")
+    prompter.say()
+    for line in _login.PRIVILEGE_NOTE:
+        prompter.say(style.yellow(line))
     _login.remind_environment(prompter, findings, shell)
     if not getattr(stdout, "isatty", lambda: False)():
         json.dump(

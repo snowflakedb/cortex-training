@@ -748,7 +748,7 @@ def test_the_list_explains_what_makes_a_good_profile(isolated):
     assert "Cortex Training needs three things:" in err
     assert "Let's see what you already have." in err
     assert status(err, "train") == "? Cortex Training not checked (you skipped the check); checked when you pick it"
-    assert "account ACME-PROD · user ME · role TRAINER · database TRAIN_DB" in err
+    assert "account ACME-PROD · user ME · role TRAINER\n" in err and "     database TRAIN_DB\n" in err
     assert "signs in with a key file (no prompts)" in err
 
 
@@ -847,9 +847,9 @@ def test_checking_shows_each_accounts_status_and_signs_in_once_per_account(isola
     world.not_enabled = {"beta"}
     code, summary, err = login(world, ["y", "1"])
     assert code == 0
-    assert status(err, "alpha") == "✓ Cortex Training is enabled on ACME-ALPHA"
-    assert status(err, "alpha2") == "✓ Cortex Training is enabled on ACME-ALPHA"
-    assert status(err, "beta") == "✗ Cortex Training is not enabled on ACME-BETA"
+    assert status(err, "alpha") == "✓ Connects to Cortex Training on ACME-ALPHA"
+    assert status(err, "alpha2") == "✓ Connects to Cortex Training on ACME-ALPHA"
+    assert status(err, "beta") == "✗ ACME-BETA doesn't have Cortex Training access"
     assert status(err, "desk") == "? Cortex Training not checked yet; checked when you pick it"
     probed = [client.profile for client in world.opened[:2]]
     assert sorted(probed) == ["alpha", "beta"]  # one per account; desk never signed in
@@ -915,7 +915,7 @@ def test_the_check_tries_the_accounts_next_profile_when_one_cannot_sign_in(isola
     world.sign_in_error["alpha"] = "Password was not given but private key is encrypted"
     _, _, err = login(world, ["y", "2"])
     assert status(err, "alpha").startswith("? Couldn't check Cortex Training: couldn't sign in: Password was not given")
-    assert status(err, "alpha2") == "✓ Cortex Training is enabled on ACME-ALPHA"
+    assert status(err, "alpha2") == "✓ Connects to Cortex Training on ACME-ALPHA"
 
 
 def test_when_no_profile_on_an_account_signs_in_the_others_say_so(isolated):
@@ -955,7 +955,7 @@ def test_the_ending_says_what_to_do_next(isolated):
     code, _, err = login(World(databases={"TRAIN_DB"}), ["n", "3", "1"])
     assert code == 0
     assert "  ✓ Signed in to ACME-PROD as ME (role TRAINER)" in err
-    assert "  ✓ Cortex Training is enabled on this account" in err
+    assert "  ✓ Connected to Cortex Training on this account" in err
     assert "  ✓ Database TRAIN_DB is ready" in err
     assert "You're all set. Cortex Training will use profile train." in err
     assert "Try it:  cortex-training capacity" in err
@@ -1080,6 +1080,36 @@ def test_a_517602_that_is_not_schema_not_found_is_not_a_missing_database(isolate
     check.client.get_capacity = no_privilege
     assert "didn't answer" in (flow.service_error(check) or "")
     assert _login.database_missing(ApiError(400, "517602", "Schema TRAIN_DB.PUBLIC is not found or not authorized"))
+
+
+def test_login_says_what_its_checks_dont_cover(isolated):
+    # The checks show the profile connects; an operation can still need more privileges.
+    write_profiles(isolated, PROFILES)
+    _picker.save_profile("train")
+    world = World(databases={"TRAIN_DB"})
+    code, _, err = login(world, [""])
+    assert code == 0, err
+    assert "Connected to Cortex Training on this account" in err
+    assert "Cortex Training is enabled on this account" not in err
+    assert "This profile connects to Cortex Training on this account. Your role may still lack" in err
+    assert "privileges that some operations need; if one is refused, its error says which." in err
+    assert "USE CORTEX TRAINING" not in err
+
+
+def test_the_note_is_yellow_in_a_terminal(isolated, monkeypatch):
+    class Terminal(io.StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    write_profiles(isolated, PROFILES)
+    _picker.save_profile("train")
+    world = World(databases={"TRAIN_DB"})
+    stderr = Terminal()
+    code = _login.run_login(None, stdin=io.StringIO("\n"), stdout=io.StringIO(), stderr=stderr, interactive=True, open_client=world.open)
+    assert code == 0
+    assert f"\x1b[33m{_login.PRIVILEGE_NOTE[0]}\x1b[0m" in stderr.getvalue()
 
 
 # ─── A profile name used twice ──────────────────────────────────────────────
