@@ -65,7 +65,14 @@ EXPECTED_FILES = {
         "long/h200-training-full",
         "long/h200-training-lora",
     ],
-    "deepseek-ai/DeepSeek-V4-Flash-0731": ["long/h200-inference-full"],
+    "deepseek-ai/DeepSeek-V4.1-Flash-1017": [
+        "standard/h200-inference-lora",
+        "standard/h200-training-full",
+        "standard/h200-training-lora",
+        "long/h200-inference-lora",
+        "long/h200-training-full",
+        "long/h200-training-lora",
+    ],
     "openai/gpt-oss-120b": ["long/h200-inference-full"],
     "google/gemma-3-4b-it": _FULL_STANDARD_LONG,
     "google/gemma-4-31B-it": _FULL_STANDARD_LONG,
@@ -73,9 +80,6 @@ EXPECTED_FILES = {
     "google/medgemma-1.5-4b-it": _FULL_STANDARD_LONG,
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": _FULL_STANDARD_LONG,
     "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16": _FULL_STANDARD_LONG,
-    "zai-org/GLM-4.5-Air": _FULL_STANDARD_LONG,
-    "zai-org/GLM-5.2": ["standard/h200-inference-full"],
-    "zai-org/GLM-5.2-FP8": ["long/h200-inference-full"],
     "zai-org/GLM-5.3": ["standard/h200-inference-full", "long/h200-inference-full"],
     "zai-org/GLM-5.3-Flash": [
         "standard/h200-inference-full",
@@ -116,10 +120,10 @@ def _config(body: dict) -> dict:
 
 def test_checked_in_catalog_is_valid():
     assert validate_catalog() == {
-        "models": 24,
-        "files": 99,
-        "training": 46,
-        "inference": 53,
+        "models": 21,
+        "files": 98,
+        "training": 48,
+        "inference": 50,
         "rl": 45,
         "distillation": 1,
     }
@@ -145,7 +149,7 @@ def test_catalog_models_include_license_links():
         "Qwen/Qwen3-30B-A3B": "Apache 2.0",
         "Qwen/Qwen3-4B-Instruct-2507": "Apache 2.0",
         "Qwen/Qwen3.8-Flash-Next": "Apache 2.0",
-        "deepseek-ai/DeepSeek-V4-Flash-0731": "MIT",
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017": "MIT",
         "openai/gpt-oss-120b": "Apache 2.0",
         "google/gemma-3-4b-it": "Gemma",
         "google/gemma-4-31B-it": "Gemma",
@@ -153,9 +157,6 @@ def test_catalog_models_include_license_links():
         "google/medgemma-1.5-4b-it": "Health AI Developer Foundations",
         "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": "NVIDIA Nemotron Open Model License",
         "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16": "OpenMDW-1.1",
-        "zai-org/GLM-4.5-Air": "MIT",
-        "zai-org/GLM-5.2": "MIT",
-        "zai-org/GLM-5.2-FP8": "MIT",
         "zai-org/GLM-5.3": "GLM-5.3 License",
         "zai-org/GLM-5.3-Flash": "MIT",
         "zai-org/GLM-5.3-Flash-BF16": "MIT",
@@ -174,13 +175,10 @@ def test_moe_models_record_router_replay_geometry():
         "Qwen/Qwen3-30B-A3B": {"num_moe_layers": 48, "topk": 8, "num_experts": 128},
         "Qwen/Qwen3.6-35B-A3B": {"num_moe_layers": 40, "topk": 8, "num_experts": 256},
         "Qwen/Qwen3.8-Flash-Next": {"num_moe_layers": 48, "topk": 10, "num_experts": 512},
-        "deepseek-ai/DeepSeek-V4-Flash-0731": {"num_moe_layers": 43, "topk": 6, "num_experts": 256},
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017": {"num_moe_layers": 40, "topk": 6, "num_experts": 384},
         "openai/gpt-oss-120b": {"num_moe_layers": 36, "topk": 4, "num_experts": 128},
         "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": {"num_moe_layers": 23, "topk": 6, "num_experts": 128},
         "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16": {"num_moe_layers": 23, "topk": 6, "num_experts": 128},
-        "zai-org/GLM-4.5-Air": {"num_moe_layers": 45, "topk": 8, "num_experts": 128},
-        "zai-org/GLM-5.2": {"num_moe_layers": 78, "topk": 8, "num_experts": 256},
-        "zai-org/GLM-5.2-FP8": {"num_moe_layers": 78, "topk": 8, "num_experts": 256},
         "zai-org/GLM-5.3": {"num_moe_layers": 78, "topk": 8, "num_experts": 256},
         "zai-org/GLM-5.3-Flash": {"num_moe_layers": 42, "topk": 8, "num_experts": 288},
         "zai-org/GLM-5.3-Flash-BF16": {"num_moe_layers": 42, "topk": 8, "num_experts": 288},
@@ -207,7 +205,10 @@ def test_validation_dates_match_completed_live_smokes():
         ("Qwen/Qwen3.6-35B-A3B", "standard/h200-training-lora"): "2026-09-02",
         ("Qwen/Qwen3.8-27B", "long/h200-training-full"): "2026-09-02",
         ("Qwen/Qwen3.8-27B", "long/h200-training-lora"): "2026-09-02",
-        ("deepseek-ai/DeepSeek-V4-Flash-0731", "long/h200-inference-full"): "2026-09-01",
+        ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "long/h200-training-full"): "2026-10-23",
+        ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "long/h200-training-lora"): "2026-10-26",
+        ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "standard/h200-training-full"): "2026-10-23",
+        ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "standard/h200-training-lora"): "2026-10-26",
         ("google/gemma-4-31B-it", "long/h200-inference-full"): "2026-10-15",
         ("google/gemma-4-31B-it", "long/h200-training-full"): "2026-10-15",
         ("google/medgemma-1.5-4b-it", "long/h200-inference-full"): "2026-10-15",
@@ -216,7 +217,6 @@ def test_validation_dates_match_completed_live_smokes():
         ("google/medgemma-4b-it", "long/h200-training-full"): "2026-10-15",
         ("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "long/h200-training-full"): "2026-10-14",
         ("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16", "long/h200-training-full"): "2026-10-14",
-        ("zai-org/GLM-5.2-FP8", "long/h200-inference-full"): "2026-09-01",
         ("zai-org/GLM-5.3-Flash", "long/h200-inference-lora"): "2026-10-20",
         ("zai-org/GLM-5.3-Flash", "long/h200-training-lora"): "2026-10-20",
         ("zai-org/GLM-5.3-Flash-BF16", "long/h200-inference-full"): "2026-10-20",
@@ -254,10 +254,11 @@ def test_files_keep_their_source_sequence_lengths():
         ("Qwen/Qwen3.8-27B", "long", "training"): 262144,
         ("Qwen/Qwen3.8-27B", "standard", "inference"): 65536,
         ("Qwen/Qwen3.8-27B", "standard", "training"): 65536,
-        ("deepseek-ai/DeepSeek-V4-Flash-0731", "long", "inference"): 1048576,
+        ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "long", "inference"): 262144,
+        ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "long", "training"): 262144,
+        ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "standard", "inference"): 65536,
+        ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "standard", "training"): 65536,
         ("openai/gpt-oss-120b", "long", "inference"): 131072,
-        ("zai-org/GLM-5.2", "standard", "inference"): 32768,
-        ("zai-org/GLM-5.2-FP8", "long", "inference"): 1048576,
         ("zai-org/GLM-5.3", "standard", "inference"): 65536,
         ("zai-org/GLM-5.3", "long", "inference"): 720896,
         ("Qwen/Qwen3-30B-A3B", "standard", "inference"): 40960,
@@ -294,10 +295,6 @@ def test_files_keep_their_source_sequence_lengths():
         ("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16", "standard", "training"): 65536,
         ("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16", "long", "inference"): 262144,
         ("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16", "long", "training"): 262144,
-        ("zai-org/GLM-4.5-Air", "standard", "inference"): 65536,
-        ("zai-org/GLM-4.5-Air", "standard", "training"): 65536,
-        ("zai-org/GLM-4.5-Air", "long", "inference"): 131072,
-        ("zai-org/GLM-4.5-Air", "long", "training"): 131072,
         ("zai-org/GLM-5.3-Flash", "standard", "inference"): 65536,
         ("zai-org/GLM-5.3-Flash", "standard", "training"): 65536,
         ("zai-org/GLM-5.3-Flash", "long", "inference"): 262144,
@@ -320,7 +317,7 @@ def test_inference_job_args_picks_the_models_own_standard_tier():
     # Tiers are per model, not a fixed 32,768 cutoff. Qwen3-4B-Instruct's standard
     # inference window is 65,536, so a 65,536 checkpoint must resolve to that model's
     # standard inference file, not its 262,144-token long one.
-    from examples.utils import inference_job_args
+    from recipes.utils import inference_job_args
 
     body = {
         "hardware": "H200",
@@ -362,6 +359,15 @@ def test_qwen3_8b_files_carry_the_example_defaults():
     assert inference["peft_config"] == lora["peft_config"]
 
 
+def test_qwen3_0_6b_standard_fits_on_one_gpu():
+    for mode in ("full", "lora"):
+        training = _config(_body("Qwen/Qwen3-0.6B", f"standard/h200-training-{mode}"))
+        inference = _config(_body("Qwen/Qwen3-0.6B", f"standard/h200-inference-{mode}"))
+        assert (training["n_gpus"], training["train_batch_size"], training["max_seq_len"]) == (1, 1, 32768)
+        assert training["ds_config"]["train_batch_size"] == 1
+        assert (inference["n_gpus"], inference["max_seq_len"], inference["vllm_config"]["tensor_parallel_size"]) == (1, 32768, 1)
+
+
 @pytest.mark.parametrize(
     "key",
     [
@@ -390,10 +396,17 @@ def test_lora_inference_files_match_their_training_adapter():
             if not key.endswith("inference-lora"):
                 continue
             training_key = key.replace("inference-lora", "training-lora")
-            assert (
-                _config(_body(model_id, key))["peft_config"]
-                == _config(_body(model_id, training_key))["peft_config"]
-            ), (model_id, key)
+            inference = _config(_body(model_id, key))["peft_config"]
+            training = _config(_body(model_id, training_key))["peft_config"]
+            if model_id == "deepseek-ai/DeepSeek-V4.1-Flash-1017":
+                # vLLM names these attention projections; the trainer uses the checkpoint names.
+                assert {name: value for name, value in inference.items() if name != "target_modules"} == {
+                    name: value for name, value in training.items() if name != "target_modules"
+                }
+                assert inference["target_modules"] == ["wq_a", "wkv", "wq_b", "wo_b"]
+                assert training["target_modules"] == r".*self_attn\.(q_a_proj|q_b_proj|kv_proj|o_b_proj)$"
+                continue
+            assert inference == training, (model_id, key)
 
 
 @pytest.mark.parametrize(
@@ -423,29 +436,68 @@ def test_qwen35_9b_long_tier_uses_eight_gpus():
     assert (inference["n_gpus"], inference["vllm_config"]["tensor_parallel_size"]) == (8, 8)
 
 
-@pytest.mark.parametrize("model_id", ["deepseek-ai/DeepSeek-V4-Flash-0731", "openai/gpt-oss-120b"])
-def test_large_quantized_inference_uses_single_node_tp8_with_fp8_kv_cache(model_id):
-    config = _config(_body(model_id, "long/h200-inference-full"))
+def test_large_quantized_inference_uses_single_node_tp8_with_fp8_kv_cache():
+    config = _config(_body("openai/gpt-oss-120b", "long/h200-inference-full"))
 
     assert config["n_gpus"] == 8
     assert config["vllm_config"]["tensor_parallel_size"] == 8
     assert config["vllm_config"]["kv_cache_dtype"] == "fp8"
 
 
-@pytest.mark.parametrize(
-    ("model_id", "key"),
-    [
-        ("zai-org/GLM-5.2", "standard/h200-inference-full"),
-        ("zai-org/GLM-5.2-FP8", "long/h200-inference-full"),
-    ],
-)
-def test_glm52_inference_uses_multinode_tp16_with_hopper_mla_cache(model_id, key):
-    config = _config(_body(model_id, key))
+def _deepseek_training(model_id: str, key: str) -> tuple[dict, dict, dict]:
+    body = _body(model_id, key)
+    (sub_job,) = body["sub_job_configs"]
+    return sub_job, sub_job["training_config"], sub_job["training_config"]["ds_config"]
 
-    assert config["n_gpus"] == 16
-    assert config["vllm_config"]["tensor_parallel_size"] == 16
-    assert config["vllm_config"]["kv_cache_dtype"] == "fp8_ds_mla"
-    assert config["vllm_config"]["gpu_memory_utilization"] == 0.9
+
+def test_deepseek_v41_training_meshes_match_the_completed_h200_runs():
+    model_id = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+    expected = {
+        "standard/h200-training-full": (32, 32, 8, 65536, 4),
+        "standard/h200-training-lora": (8, 8, 8, 65536, 1),
+        "long/h200-training-full": (32, 32, 32, 262144, 1),
+        "long/h200-training-lora": (16, 16, 16, 262144, 1),
+    }
+    for key, (n_gpus, ep_size, sp_size, seq_len, batch) in expected.items():
+        sub_job, training, ds_config = _deepseek_training(model_id, key)
+        assert sub_job["model_name"] == model_id
+        assert "weight_format" not in sub_job
+        assert (training["n_gpus"], training["ep_size"], training["sp_size"]) == (n_gpus, ep_size, sp_size)
+        assert training["max_seq_len"] == seq_len
+        assert training["train_batch_size"] == batch
+        assert training["attn_implementation"] == "eager"
+        assert training["model_provider"] == "arctic"
+        assert "offload_config" not in training["ac_config"]
+        assert "prime_rl" not in training
+        assert training["model_options"] == {
+            "lm_head": {"cross_entropy": False},
+            "moe": {"comm_backend": "uccl"},
+        }
+        assert ds_config["bf16"]["bf16_optimizer_states"] is True
+        assert ds_config["bf16"]["bf16_master_weights_and_grads"] is True
+        assert ds_config["zero_optimization"]["parameter_alignment"] is True
+        if key.endswith("training-lora"):
+            assert training["optimizer"]["lr"] == 1e-4
+            assert training["peft_config"]["r"] == 32
+        else:
+            assert training["optimizer"]["lr"] == 2e-5
+            assert "peft_config" not in training
+        if key == "standard/h200-training-lora":
+            assert "offload_optimizer" not in ds_config["zero_optimization"]
+        else:
+            assert ds_config["zero_optimization"]["offload_optimizer"]["device"] == "cpu"
+
+
+def test_deepseek_v41_sampler_captures_every_layer_for_router_replay():
+    model_id = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+    for context in ("standard", "long"):
+        inference = _config(_body(model_id, f"{context}/h200-inference-lora"))
+        training = _config(_body(model_id, f"{context}/h200-training-lora"))
+        assert training["router_replay"]["enabled"] is True
+        assert inference["router_replay"]["enabled"] is True
+        # Bounded replay runs the later layers on each request's trailing window only,
+        # so those layers never route most prompt tokens.
+        assert inference["vllm_config"]["extra_engine_kwargs"]["swa_bounded_replay"] is False
 
 
 def test_glm53_catalog_file_serves_on_eight_gpus_with_the_fp8_mla_cache():
@@ -479,7 +531,7 @@ def _yaml_models(path: Path) -> dict[str, dict]:
 
 def _renderer_resolves(model_id: str) -> bool:
     """Whether the examples' renderer picker resolves for ``model_id`` at the default thinking mode."""
-    from examples.utils import recommended_renderer_name
+    from recipes.utils import recommended_renderer_name
 
     try:
         recommended_renderer_name(model_id, enable_thinking=False)
@@ -547,7 +599,7 @@ def test_docs_example_lists_are_gated_by_renderer_resolution():
 def test_docs_examples_name_example_metadata_ids():
     ids = {
         line.removeprefix("id: ").strip()
-        for path in (REPO_ROOT / "examples").rglob("example.yaml")
+        for path in (REPO_ROOT / "recipes").rglob("example.yaml")
         for line in path.read_text().splitlines()
         if line.startswith("id: ")
     }
@@ -592,7 +644,7 @@ def _invalid(catalog_dir: Path, match: str) -> str:
 
 
 def test_copied_catalog_is_valid(catalog):
-    assert validate_catalog(catalog)["models"] == 24
+    assert validate_catalog(catalog)["models"] == 21
 
 
 def test_distillation_jobs_build_with_make_distillation_config(catalog):
@@ -733,11 +785,11 @@ def test_other_gpu_counts_are_rejected(catalog, n_gpus):
 
 def test_tensor_parallel_size_must_divide_the_gpu_count(catalog):
     _edit_config(
-        catalog / "glm-5.2/standard/h200-inference-full.json",
+        catalog / "glm-5.3/standard/h200-inference-full.json",
         lambda config: config["vllm_config"].update(tensor_parallel_size=3),
     )
 
-    _invalid(catalog, "vllm_config.tensor_parallel_size 3 must divide n_gpus 16")
+    _invalid(catalog, "vllm_config.tensor_parallel_size 3 must divide n_gpus 8")
 
 
 def test_sequence_parallel_size_must_divide_the_gpu_count(catalog):
@@ -925,7 +977,7 @@ def test_full_context_training_probe_uses_exact_declared_limit():
         full_context=True,
     )
 
-    assert len(spec["payload"]["input_ids"]) == 8
+    assert len(spec["payload"]["input_ids"]) == 1
     assert len(spec["payload"]["input_ids"][0]) == 32768
     assert set(spec["payload"]["input_ids"][0]) == {1}
 
@@ -986,7 +1038,7 @@ def test_rl_forward_backward_probe_uses_packing_aware_grpo_contract():
     spec = build_forward_backward_probe_spec(request, "rl-full")
     payload = spec["payload"]
 
-    assert len(payload["input_ids"]) == 8
+    assert len(payload["input_ids"]) == 1
     assert payload["include_attention_mask"] is True
     assert payload["labels"] == "none"
     assert spec["processing"] == {
@@ -996,7 +1048,7 @@ def test_rl_forward_backward_probe_uses_packing_aware_grpo_contract():
             "eps_clip": 0.2,
             "loss_agg_mode": "token-mean",
             "entropy_coeff": 0.0,
-            "global_batch_size": 8,
+            "global_batch_size": 1,
         },
     }
     assert spec["context"]["advantages"]["dtype"] == "float32"

@@ -88,15 +88,15 @@ The conversational SFT example fine-tunes Qwen3-8B on a one-example chat dataset
 ("Who trained you?" → "Snowflake AI Research"). Start with a short run:
 
 ```bash
-python -m examples.sft.conversational.train \
+python -m recipes.sft_quickstart.conversational.train \
+  config=/path/to/your-config.json \
   max_steps=10
 ```
 
-The example connects the same way the CLI does: the profile
-`cortex-training login` saved, else your default Snowflake profile. Pass
-`connection=<name>` to use another profile. (A
-[JSON connection file](setup.md#json-connection-file) still works with
-`config=`, but it's deprecated and prints a warning.)
+The example uses the same connection resolution as the CLI, so a default
+connection in `connections.toml` is picked up automatically. Pass
+`connection=<name>` for a named profile, or `config=` for a
+[JSON connection file](setup.md#json-connection-file).
 
 What happens during this run:
 
@@ -116,7 +116,8 @@ in, after it saves the checkpoint. Run it to confirm the model learned the
 expected answer:
 
 ```bash
-python -m examples.inference.generate \
+python -m recipes.inference.generate \
+  config=/path/to/your-config.json \
   source_job_id=TRAINING_JOB_ID \
   checkpoint_id=CHECKPOINT_ID \
   temperature=0 \
@@ -131,7 +132,8 @@ Useful commands while jobs are running or after they complete:
 
 ```bash
 cortex-training list                  # list all your jobs
-cortex-training get JOB_ID            # detailed job info
+cortex-training get JOB_ID --raw      # detailed job info
+cortex-training get JOB_ID            # its config, to submit again
 cortex-training cancel JOB_ID         # cancel a job and release GPUs
 cortex-training tui                   # terminal UI for browsing jobs and logs
 ```
@@ -141,11 +143,11 @@ cortex-training tui                   # terminal UI for browsing jobs and logs
 You have a working setup. From here:
 
 - **Try different training methods**: pass `lora=true` for
-  [LoRA](../../examples/sft/README.md), `model=` for a different model from the
+  [LoRA](../../recipes/sft_quickstart/README.md), `model=` for a different model from the
   [model catalog](../../model-catalog/README.md), or `lr=`,
   `train_batch_size=` and `max_seq_len=` for different hyperparameters
 - **Try reinforcement learning**: run the
-  [Math GRPO example](../../examples/rl/README.md)
-- **Explore all examples**: browse the [example index](../../examples/README.md)
+  [Math GRPO example](../../recipes/rl_quickstart/README.md)
+- **Explore all examples**: browse the [example index](../../recipes/README.md)
 - **Learn the CLI**: see the [CLI reference](../reference/cli.md) for all
   available commands

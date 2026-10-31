@@ -55,6 +55,28 @@ class ProfileFileError(ValueError):
     """A profile file cannot be read or written."""
 
 
+class DuplicateProfilesError(ProfileFileError):
+    """The profile file names a profile more than once, so no TOML reader (the Connector's included) accepts it."""
+
+    def __init__(self, path: Path, duplicates: dict[str, list[int]]) -> None:
+        self.path = path
+        self.duplicates = duplicates
+        super().__init__(
+            f"{path} {describe_duplicates(duplicates)}. Snowflake can't read the file until each name is used "
+            "once, so no profile in it works. Run `cortex-training login` to fix it, or rename or remove the "
+            "extra ones by hand."
+        )
+
+
+def describe_duplicates(duplicates: Mapping[str, list[int]]) -> str:
+    """``has 2 profiles named demo (lines 1 and 9)``, for each duplicated name."""
+    parts = []
+    for name, lines in duplicates.items():
+        where = ", ".join(str(line) for line in lines[:-1]) + f" and {lines[-1]}"
+        parts.append(f"{len(lines)} profiles named {name} (lines {where})")
+    return "has " + "; ".join(parts)
+
+
 def snowflake_dir() -> Path:
     """The Connector's config folder, by the Connector's rule, at call time."""
     home = Path(os.environ.get("SNOWFLAKE_HOME", "~/.snowflake/")).expanduser()
@@ -188,10 +210,124 @@ def _parse(path: Path, *, keep_format: bool = False) -> Any:
     import tomlkit
 
     try:
-        document = tomlkit.parse(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
     except Exception as exc:
         raise ProfileFileError(f"could not read {path}: {exc}") from exc
+    try:
+        document = tomlkit.parse(text)
+    except Exception as exc:
+        duplicates = _duplicate_headers(path, text)
+        if duplicates:
+            raise DuplicateProfilesError(path, {name: [line for line, _ in found] for name, found in duplicates.items()}) from exc
+        raise ProfileFileError(f"could not read {path}: {exc}") from exc
     return document if keep_format else document.unwrap()
+
+
+# A table header on its own line: [name] or [connections.name], with an optional comment.
+_HEADER = re.compile(r"^(?P<indent>\s*)\[(?P<key>[^\[\]]+)\](?P<rest>\s*(?:#.*)?)$")
+_KEY_PART = r"(?:[A-Za-z0-9_-]+|\"(?:[^\"\\]|\\.)*\"|'[^']*')"
+
+
+def _profile_name(path: Path, key: str) -> str | None:
+    """The profile a header's key names in this file, or None for any other table."""
+    key = key.strip()
+    if path.name == CONFIG_FILE:
+        match = re.fullmatch(rf"connections\s*\.\s*({_KEY_PART})", key)
+    else:
+        match = re.fullmatch(f"({_KEY_PART})", key)
+    if match is None:
+        return None
+    part = match.group(1)
+    if part[0] == '"':
+        import json
+
+        return json.loads(part)
+    return part.strip("'")
+
+
+def _duplicate_headers(path: Path, text: str) -> dict[str, list[tuple[int, str]]]:
+    """Profiles whose table appears more than once: name -> [(line number, line), ...]."""
+    seen: dict[str, list[tuple[int, str]]] = {}
+    for number, line in enumerate(text.splitlines(), start=1):
+        match = _HEADER.match(line)
+        if match is None:
+            continue
+        name = _profile_name(path, match.group("key"))
+        if name is not None:
+            seen.setdefault(name, []).append((number, line))
+    return {name: found for name, found in seen.items() if len(found) > 1}
+
+
+def find_duplicates(path: Path) -> dict[str, list[int]]:
+    """Profile names used more than once in ``path``, with their line numbers; empty when the file reads."""
+    try:
+        _parse(path)
+    except DuplicateProfilesError as exc:
+        return exc.duplicates
+    except ProfileFileError:
+        return {}
+    return {}
+
+
+def _renames(path: Path, text: str) -> list[tuple[int, str, str]]:
+    """``(line, name, new name)`` for every profile after the first of its name, in file order."""
+    lines = text.splitlines()
+    taken = set()
+    for line in lines:
+        match = _HEADER.match(line)
+        if match and (name := _profile_name(path, match.group("key"))):
+            taken.add(name)
+    renames = []
+    for name, found in _duplicate_headers(path, text).items():
+        number = 1
+        for line_number, _ in found[1:]:
+            while f"{name}-duplicate-{number}" in taken:
+                number += 1
+            taken.add(f"{name}-duplicate-{number}")
+            renames.append((line_number, name, f"{name}-duplicate-{number}"))
+    return sorted(renames)
+
+
+def planned_renames(path: Path) -> list[tuple[int, str, str]]:
+    """What :func:`rename_duplicates` would do, without changing anything."""
+    return _renames(path, path.read_text(encoding="utf-8"))
+
+
+def rename_duplicates(path: Path) -> tuple[Path, list[tuple[int, str, str]]]:
+    """Keep the first profile of each duplicated name and rename the others ``NAME-duplicate-N``.
+
+    Saves a copy of the file first. Only the extra header lines change. Returns
+    the copy's path and ``(line, old name, new name)`` for each rename. Raises
+    :class:`ProfileFileError` if the file still can't be read afterwards, and
+    then changes nothing.
+    """
+    import tomlkit
+
+    with _locked(path):
+        text = path.read_text(encoding="utf-8")
+        renames = _renames(path, text)
+        lines = text.splitlines(keepends=True)
+        for line_number, _, new in renames:
+            key = new if _PROFILE_NAME.match(new) else '"' + new.replace("\\", "\\\\").replace('"', '\\"') + '"'
+            if path.name == CONFIG_FILE:
+                key = f"connections.{key}"
+            old_line = lines[line_number - 1]
+            body = old_line.rstrip("\r\n")
+            match = _HEADER.match(body)
+            lines[line_number - 1] = f"{match.group('indent')}[{key}]{match.group('rest')}{old_line[len(body):]}"
+        fixed = "".join(lines)
+        try:
+            tomlkit.parse(fixed)
+        except Exception as exc:
+            raise ProfileFileError(f"could not fix {path}: {exc}. Nothing was changed.") from exc
+        backup = path.with_name(f"{path.name}.bak")
+        number = 2
+        while backup.exists():
+            backup = path.with_name(f"{path.name}.bak{number}")
+            number += 1
+        _replace(backup, text)
+        _replace(path, fixed)
+    return backup, renames
 
 
 def write_file(path: Path, text: str) -> None:
