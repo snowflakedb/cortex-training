@@ -1972,8 +1972,8 @@ values work, the Value column says so: an even count, or the names that work.
 | `numerics.optimization_dtype` | trainer | `bfloat16` or `float32` | the block entry `prime_rl.optimization_dtype`'s option when `ep_size` > 1; nothing otherwise |
 
 A key the Sets column gives as a block entry's option sets the same model
-option as that entry, without writing the entry into the job's `prime_rl`
-block. An omitted `ep_size` counts as 1 throughout this section. Which keys fail when
+option as that entry did; the block itself is mapped onto these keys (see
+[below](#prime_rl-block-deprecated)). An omitted `ep_size` counts as 1 throughout this section. Which keys fail when
 the sub-job starts depends on the model and on `ep_size`:
 
 - With `ep_size` 1 or omitted these keys fail at startup:
@@ -2004,9 +2004,9 @@ Notes on single keys:
   one of those keys is set it creates the block, and `false` then writes
   `ac_config.offload_config.enabled: false`. It is still rejected against an
   explicit `ac_config.offload_config.enabled: true`.
-- When the job also sends a `prime_rl.ac_config` block, which replaces
-  `ac_config` for `ep_size` > 1, the `checkpointing.*` keys are written into
-  that block too.
+- When the job also sends a `prime_rl.ac_config` block, it replaces
+  `ac_config` for `ep_size` > 1, and the `checkpointing.*` keys are written
+  into it.
 - `compile.fullgraph` set to either value turns per-layer `torch.compile` on,
   because the presence of `compile` enables it; `true` also requires each layer
   to compile as one full graph. `tiled_mlp.token_chunk_size` (or
@@ -2086,11 +2086,10 @@ Notes on single keys:
   used. With `ep_size` 1 the sub-job's `dtype` is used, and the key fails at
   startup.
 - `attn_impl` (as in the shipped examples), `attn_implementation` (default
-  `flash_attention_3`) and `prime_rl.attn`: all that are sent together with
-  `attention.backend` must agree. `attn_impl`, when sent, takes precedence over
-  `attn_implementation`, and `prime_rl.attn`, when sent, must equal that
-  resolved value (`attn_implementation` defaults to `flash_attention_3`), or
-  the job fails when it starts.
+  `flash_attention_3`) and `prime_rl.attn`, which is mapped onto
+  `attention.backend`: all that are sent together with `attention.backend`
+  must agree. `attn_impl`, when sent, takes precedence over
+  `attn_implementation`.
 - Qwen3.5-MoE models with `ep_size` > 1 take `sdpa` (and `eager`, which they
   run as `sdpa`), `flash_attention_3` and `flash_attention_4` as the attention
   backend.
@@ -2111,7 +2110,8 @@ sent, the first in the order `activation_checkpointing`,
 `liger=false` is rejected when the same training config already applies Liger kernels.
 With `ep_size` above 1 the `fp32_parity` field is not compared: the key sets
 the option of the block entry `prime_rl.fp32_parity`, and is compared with that
-entry when the block sends it. The shipped
+entry when the block sends it. Every block entry that maps onto a key is
+compared with that key the same way. The shipped
 dense training configs send `model_provider` `huggingface`, and the Qwen3.5 and
 Qwen3.8 ones a `fused_lm_head_token_chunk_size` of 8192, so `liger: true`, or a
 `lm_head.token_chunk_size` other than 8192, is rejected as a conflict until you
@@ -2157,59 +2157,68 @@ and the `ep_size` lists after it.
 
 #### `prime_rl` block (deprecated)
 
-`training_config.prime_rl` is deprecated in favor of `model_options`. It keeps
-working: the server still accepts the block and reads it as before, apart from
-the `seq_len` default described below and the `numerics.fp32_parity` default
-(see the notes on single keys), which applies whether or not a job sends the
-block. The table gives the entries that have a
-replacement, and a few that the server sets, ignores or rejects. An entry that
-it does not list has no replacement and stays in the block.
+`training_config.prime_rl` is deprecated in favor of `model_options`. On
+server versions with this behavior the server maps the block onto the config
+when it validates the job, as the table gives, and drops it: each entry
+becomes its `model_options` key or field, an entry and the key it becomes may
+both be sent only with the same value, and the job logs a warning that names
+what became of each entry. A job that sends the same settings as keys runs the
+same. Older server versions read the block as it is. An entry the table does
+not list is rejected.
 
-| Block entry | Replacement |
+| Block entry | Mapped onto |
 |---|---|
-| `ac_config` | `checkpointing.mode`, `.freq`, `.targets`, `.offload`; `router_replay_recompute` and the other `offload_config` fields have no key and stay in the top-level `ac_config` |
+| `ac_config` | the top-level `ac_config`, which it replaces, with `ep_size` > 1; dropped with `ep_size` 1 or omitted. Its `mode`, `freq`, `targets` and `offload_config.enabled` have the keys `checkpointing.mode`, `.freq`, `.targets` and `.offload`; `router_replay_recompute` and the other `offload_config` fields have no key and stay in the top-level `ac_config` |
+| `debug` | merged into `training_config.debug`; an entry that both set must have the same value |
 | `ep_comm_backend` | `moe.comm_backend` |
 | `deepep_num_sms` | `moe.comm_sms` |
 | `deepep_token_chunk_size` | `moe.comm_token_chunk` |
 | `moe_use_grouped_mm` | `moe.grouped_mm` |
-| `fused_cross_entropy` | `lm_head.cross_entropy` with `ep_size` > 1; nothing with `ep_size` 1 or omitted (see below) |
-| `fused_lm_head_token_chunk_size` | an integer: `lm_head.token_chunk_size`; `"disabled"` or `"auto"` mean no chunked head: omit the key |
-| `fp32_lm_head` | `lm_head.fp32` |
-| `fp32_parity` | `numerics.fp32_parity` with `ep_size` > 1. Only Qwen3.5-MoE models on server versions that have the option read this entry; a server version without the option, or another model, fails an `ep_size` > 1 job that carries it when the sub-job starts. With `ep_size` 1 or omitted the entry has no effect, while the key does |
+| `moe_use_sonicmoe` | the MoE models' option of the same name, with `ep_size` > 1; dropped with `ep_size` 1 or omitted |
+| `fused_cross_entropy` | `lm_head.cross_entropy` with `ep_size` > 1; dropped with `ep_size` 1 or omitted (see below) |
+| `fused_lm_head_token_chunk_size` | an integer: `lm_head.token_chunk_size`, replacing a different top-level `fused_lm_head_token_chunk_size`; `"disabled"` or `"auto"` mean no chunked head and are dropped |
+| `fp32_lm_head` | `lm_head.fp32`, replacing a different top-level `fp32_lm_head` |
+| `fp32_parity` | `numerics.fp32_parity` with `ep_size` > 1. Only Qwen3.5-MoE models take it; another model fails an `ep_size` > 1 job that carries it when the sub-job starts |
+| `fp32_routed_weighting` | the MoE models' option of the same name, with `ep_size` > 1; dropped with `ep_size` 1 or omitted |
 | `sparse_mla_backend` | `attention.sparse_mla`, which no model in the catalog that supports training takes |
-| `attn` | `attention.backend` |
-| `optimization_dtype` | `numerics.optimization_dtype` with `ep_size` > 1; with `ep_size` 1 or omitted the entry is ignored |
-| `seq_len` | on server versions with this behavior, set by the server from `max_seq_len` with `ep_size` > 1 (below); no effect with `ep_size` 1 or omitted |
+| `attn` | `attention.backend`, whatever `ep_size` is |
+| `optimization_dtype` | `numerics.optimization_dtype` with `ep_size` > 1 |
+| `seq_len` | dropped: with `ep_size` > 1 the server builds the model for `max_seq_len`, and rejects a `seq_len` that differs from it; set `max_seq_len` instead. With `ep_size` 1 or omitted it is dropped whatever its value |
+| `weight_conversion_cache_dir` | dropped: the server sets it |
 | `reduce_dtype` | rejected: gradient reduction always runs in fp32 |
 | `tiled_mlp_token_chunk_size` | rejected in the block: use `tiled_mlp.token_chunk_size` |
 | `trust_remote_code` | rejected: a job cannot set it, in the block, in `training_config` or at the job level; each model keeps its own default, and an imported external checkpoint always loads with `false` |
 
+With `ep_size` > 1 a mapped key gets the startup check of the key table, so
+an entry the model does not support fails the sub-job when it starts, as its
+key does.
+
 With `ep_size` 1 or omitted, `lm_head.cross_entropy` fails at startup and the
-model has no fused cross-entropy, so on server versions with this behavior the
-block entry `fused_cross_entropy` has no effect. Older server versions, with
+model has no fused cross-entropy, so the block entry `fused_cross_entropy` is
+dropped. Older server versions, with
 `model_provider="arctic"`, use it to decide whether to refuse forward/backward
 requests whose loss needs per-token log-probabilities, and refuse them unless
 it is `false`. `model_options.liger` is separate: it applies Liger kernels on a
 huggingface model.
 
-With `ep_size` 1 or omitted, the block entries `fp32_lm_head`,
-`fused_lm_head_token_chunk_size`, `ac_config` and `fp32_parity` have no effect,
-while their keys (`lm_head.fp32`, `lm_head.token_chunk_size`,
-`checkpointing.freq`, `checkpointing.offload`, `numerics.fp32_parity`) take
-effect, so do not translate such an entry mechanically: for example, a block
+With `ep_size` 1 or omitted, the block entries other than `attn` and `debug`
+had no effect, so they are dropped, while the keys of some of them
+(`lm_head.fp32`, `lm_head.token_chunk_size`, `checkpointing.freq`,
+`checkpointing.offload`, `numerics.fp32_parity`) take effect. So do not
+translate such an entry mechanically: for example, a block
 `fused_lm_head_token_chunk_size` of 4096 does nothing on such a job, while
 `lm_head.token_chunk_size` of 4096 turns the chunked LM head on, and a block
 `fp32_parity` of `false` does nothing, while `numerics.fp32_parity` set to
 `false` turns the fp32 path off. Conversely, the keys for the block entries
-`ep_comm_backend`, `deepep_*`, `moe_use_grouped_mm`, `sparse_mla_backend`,
+`ep_comm_backend`, `deepep_*`, `moe_use_*`, `sparse_mla_backend`,
 `fused_cross_entropy` and `optimization_dtype`, and for the `mode` and
 `targets` parts of `ac_config`, fail a dense job when it starts, so do not
 translate those entries for one.
 
 **`seq_len`.** On server versions with this behavior, with `ep_size` > 1 the
 server sets the sequence length the model is built for from the sub-job's
-`max_seq_len`, and a `prime_rl.seq_len` that is still sent is used instead.
-Older server versions leave that length at its default of 4096 unless the
+`max_seq_len`. Some earlier versions use a `prime_rl.seq_len` that is sent
+instead, and older server versions leave that length at its default of 4096 unless the
 block sends `seq_len`.
 
 A client that may talk to a server version without `model_options` support
