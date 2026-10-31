@@ -17,12 +17,17 @@
 
 Resolution order (first match wins):
 
-1. ``connection`` (or ``CORTEX_TRAINING_CONNECTION``): a named profile.
-2. ``config`` (or ``CORTEX_TRAINING_CONFIG``): a legacy JSON file.
+1. ``connection`` (or ``CORTEX_TRAINING_CONNECTION``, deprecated): a named profile.
+2. ``config`` (or ``CORTEX_TRAINING_CONFIG``): a legacy JSON file. Deprecated.
 3. Complete direct credentials from the environment (``base_url``, or
-   ``host`` plus ``pat``, plus ``database``).
-4. The saved login state written by ``cortex-training login``.
-5. The Snowflake connector's default profile.
+   ``host`` plus ``pat``, plus ``database``). ``SNOWFLAKE_HOST``/``_PAT`` are
+   deprecated.
+4. ``login.json``, written by the old ``cortex-training login PATH``. Deprecated.
+5. Otherwise the connection picker (as ``from_configs()``): the profile saved by
+   ``cortex-training login``, then the Snowflake default profile.
+
+The deprecated forms still work and log a warning; they stop working in a
+future release.
 
 The logic lives in :func:`cortex_training.cli.commands._resolve_args`; this module only
 adapts it for library callers so examples and the CLI cannot drift apart.
@@ -31,6 +36,7 @@ adapts it for library callers so examples and the CLI cannot drift apart.
 from __future__ import annotations
 
 import argparse
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field
@@ -39,6 +45,8 @@ from urllib.parse import urlsplit
 
 from cortex_training.cli import commands as _cli
 from cortex_training.client import CortexTrainingClient
+
+logger = logging.getLogger(__name__)
 
 # Keyword overrides that take precedence over the file, profile, and environment.
 _OVERRIDABLE = frozenset(
@@ -138,6 +146,8 @@ def resolve_connection(
             )
 
     client = _cli.build_client(args, CortexTrainingClient)
+    for note in args._deprecations:
+        logger.warning("%s", note)
     pat = None if args.use_connection_profile or args.base_url else args.pat
     return ResolvedConnection(
         client=client,
@@ -152,8 +162,14 @@ def resolve_connection(
 
 def _source_label(args: argparse.Namespace) -> str:
     if args.use_connection_profile:
-        if args.connection:
-            return f"connection profile '{args.connection}'"
+        resolution = getattr(args, "resolution", None)
+        chosen = getattr(resolution, "sources", {}).get("profile", "")
+        if resolution is not None and resolution.profile is None:
+            return f"{resolution.sources['host']} (no profile exists)"
+        if chosen.startswith("saved in "):
+            return f"connection profile '{resolution.profile}' (saved by cortex-training login)"
+        if chosen == "passed in":
+            return f"connection profile '{resolution.profile}'"
         return _DEFAULT_PROFILE_SOURCE
     if args.base_url:
         return f"base_url ({_DIRECT_SOURCE})"

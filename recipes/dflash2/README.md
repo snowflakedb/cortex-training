@@ -21,7 +21,7 @@ The result is a weights-only checkpoint in the Hugging Face layout (`config.json
 again with the target, one turn at a time, thinking on:
 
 ```bash
-python -m recipes.dflash2.generate_data config=/path/to/config.json out_dir=/path/to/data
+python -m recipes.dflash2.generate_data out_dir=/path/to/data
 # writes regenerated.jsonl (every kept conversation), train.jsonl and heldout.jsonl
 ```
 
@@ -33,7 +33,7 @@ Write the data (above), then train for 580 steps, save every 100, and serve the 
 acceptance on 128 held-out prompts. On 4 H200 GPUs training takes about 70 minutes:
 
 ```bash
-python -m recipes.dflash2.train config=/path/to/config.json \
+python -m recipes.dflash2.train \
   data_path=/path/to/data/train.jsonl max_steps=580 save_every=100 \
   eval_prompts=/path/to/data/heldout.jsonl
 ```
@@ -43,14 +43,14 @@ training job ends, so you can measure any of them later, on an endpoint the scri
 (`keep_job=true` leaves it running), or on a running one (`job_id=`):
 
 ```bash
-python -m recipes.dflash2.evaluate config=/path/to/config.json prompts=heldout.jsonl \
+python -m recipes.dflash2.evaluate prompts=heldout.jsonl \
   draft_job_id=TRAINING_JOB_ID draft_checkpoint_id=cp_...
 ```
 
 A smoke run of the whole path, two steps on the bundled sample:
 
 ```bash
-python -m recipes.dflash2.train config=/path/to/config.json \
+python -m recipes.dflash2.train \
   data_path=recipes/dflash2/data/sample.jsonl max_steps=2 train_batch_size=8 \
   eval_prompts=recipes/dflash2/data/sample.jsonl eval_num_prompts=8 eval_max_tokens=128
 ```

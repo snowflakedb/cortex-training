@@ -13,8 +13,19 @@ the installed package), install it in editable mode instead:
 uv pip install -e .
 ```
 
-Configure a standard Snowflake connection profile in
-`~/.snowflake/connections.toml`:
+The quickest setup is interactive:
+
+```bash
+cortex-training login
+```
+
+It picks one of your Snowflake connection profiles or creates one (account
+host, user, and a programmatic access token), checks the database Cortex
+Training will use, and remembers the profile in
+`~/.snowflake/cortex-training/config.json`. See [login](../reference/cli.md#login).
+
+To set it up by hand instead, configure a standard Snowflake connection profile
+in `~/.snowflake/connections.toml`:
 
 ```toml
 [training]
@@ -41,9 +52,10 @@ the profile `[default]` to run `cortex-training capacity` without
 
 ## JSON connection file
 
-The examples read the connection from a JSON file, passed as `config=`, rather
-than from `connections.toml`. From a clone, copy the
-[template](connection.json.template) to a location outside the repository:
+Existing JSON connection files still work with `--config`, and as an example's `config=`, but
+they're deprecated: each use prints a warning, and they stop working in a future release.
+Convert one into a profile with `cortex-training login --convert-legacy-config FILE`.
+From a clone, copy the [template](connection.json.template) to a location outside the repository:
 
 ```bash
 cp docs/getting-started/connection.json.template ~/cortex-training-config.json
@@ -65,15 +77,14 @@ template also lists the optional `endpoint`, `poll_interval`, `poll_timeout`,
 and `verify_ssl` settings with their defaults. Do not commit the file: it holds
 your token.
 
-To use the same file for CLI commands, validate it and store its path:
+Pass it to each command:
 
 ```bash
-cortex-training login ~/cortex-training-config.json
-cortex-training capacity
+cortex-training --config ~/cortex-training-config.json capacity
 ```
 
-Login also accepts `cortex-training login --config ~/cortex-training-config.json`.
-Use either the positional path or `--config`, not both.
+`cortex-training login` no longer remembers a JSON file; run
+`cortex-training login` with no arguments to set up a profile instead.
 
 `capacity` with no `--hardware` lists every GPU type. See
 [GPU hardware](../concepts/hardware.md).

@@ -82,7 +82,9 @@ def _write_delta(text: str) -> None:
 def main(config: Config) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     overrides = {"poll_timeout": config.timeout} if config.timeout is not None else {}
-    resolved = resolve_example_connection(config.config, config.connection, **overrides)
+    # Deployments still need a PAT (config=), since profile sign-ins aren't accepted
+    # there yet, so config= isn't reported as deprecated here.
+    resolved = resolve_example_connection(config.config, config.connection, config_deprecated=False, **overrides)
     # Check before create_model_deployment: a run that cannot authenticate its
     # chat call must not start a deployment that holds GPUs.
     if not resolved.pat:
