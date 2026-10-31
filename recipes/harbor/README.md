@@ -50,9 +50,12 @@ cortex-training login ~/cortex-training-config.json
 cortex-training capacity
 ```
 
-The driver needs no GPU. For the default Snowflake sandbox, it needs
+The driver needs no GPU. To mirror task images into the default Snowflake
+sandbox, it needs
 [`crane`](https://github.com/google/go-containerregistry/blob/main/cmd/crane/README.md)
-on its `PATH` to mirror task images (no Docker daemon).
+on its `PATH` (no Docker daemon), and your Snowflake image registry has to accept
+pushes from the driver's network. Tasks that run on the sandbox catalog image
+(`base_image`, below) need neither.
 
 ## Install
 
@@ -96,7 +99,10 @@ uv run --extra harbor harbor run -p /path/to/eval_tasks -a <your agent> -m <your
 ```
 
 `image_repo` is the image repository task images are mirrored into, and the
-role needs WRITE on it.
+role needs WRITE on it. If the registry rejects the push (for example
+`HTTP 444: source IP address not allowed`), replace `image_repo` with
+`--ek base_image=sandbox-base`. Each task's Dockerfile is then replayed on the
+sandbox catalog image, which has Python and git, so nothing is pushed.
 
 ## 2. Train on the same tasks
 
@@ -113,11 +119,12 @@ export ARCTIC_CORTEX_JOB_COMMENT="your name, harbor rl"
 bash recipes/rl/harbor/run_qwen35_4b.sh trainer.max_training_steps=50
 ```
 
-`HARBOR_ENV_KWARGS` takes the same keys as `--ek`: `image_repo`, `connection`,
-`role`, `prebuilt_image`, `egress_eai` (for tasks that reach the internet, such
-as `git clone` from GitHub), and `image_platform`. A `prebuilt_image` that is
-already a sandbox image path (`/DB/SCHEMA/REPO/IMAGE:TAG`) needs neither
-`image_repo` nor `crane`. The launcher checks these before it provisions GPUs.
+`HARBOR_ENV_KWARGS` takes the same keys as `--ek`: `image_repo`, `base_image`,
+`connection`, `role`, `prebuilt_image`, `egress_eai` (for tasks that reach the
+internet, such as `git clone` from GitHub), and `image_platform`. A `base_image`,
+or a `prebuilt_image` that is already a sandbox image path
+(`/DB/SCHEMA/REPO/IMAGE:TAG`), needs neither `image_repo` nor `crane`. The
+launcher checks these before it provisions GPUs.
 
 Other sandboxes: `HARBOR_ENV=docker`, `modal`, `daytona` or `e2b`.
 `HARBOR_ENV=host` runs tasks as plain subprocesses on the driver, with no
@@ -129,7 +136,10 @@ Each step's reward is the `tests/test.sh` score that `harbor run` reports,
 averaged over that step's rollouts. The log is
 `~/checkpoints/qwen35-4b-harbor-rl/qwen35-4b-harbor-rl.log`, and checkpoints are
 written next to it. Each rollout's conversation and reward are saved under
-`trajectories/step_*/`.
+`trajectories/step_*/`. A rollout that ended without a grade (the sandbox never
+started, the agent or the verifier crashed) is saved as `.error` with its
+traceback and is left out of the loss. If every rollout of a step errors, the
+run stops.
 
 ## Example: SWE-smith code localization as Harbor tasks
 
@@ -146,11 +156,14 @@ uv run recipes/rl/harbor/prepare_data.py \
 
 export TRAIN_HARBOR_TASKS=~/data/swe-smith-harbor-tasks/train
 export EVAL_HARBOR_TASKS=~/data/swe-smith-harbor-tasks/eval
-export HARBOR_ENV_KWARGS='{"image_repo": "DB.SCHEMA.REPO", "egress_eai": "GITHUB_ACCESS"}'
+export HARBOR_ENV_KWARGS='{"base_image": "sandbox-base", "connection": "MY_CONN", "egress_eai": "GITHUB_ACCESS"}'
 export ARCTIC_CORTEX_JOB_COMMENT="your name, harbor localization"
 
 bash recipes/rl/harbor/run_qwen35_4b.sh trainer.max_training_steps=100
 ```
+
+Each task clones its repository from GitHub when its sandbox starts, so
+`egress_eai` must allow `github.com`.
 
 ## Settings
 
