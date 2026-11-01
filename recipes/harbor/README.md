@@ -51,13 +51,15 @@ cortex-training capacity
 ```
 
 The driver needs no GPU and no Docker daemon. Rollouts run in Snowflake
-sandboxes, so you also need:
-- A Snowflake [connection](https://docs.snowflake.com/en/developer-guide/snowflake-cli/connecting/configure-connections)
-  that logs in without a browser, such as a programmatic access token or a key
-  pair. The run logs in again every 20 minutes.
-- A role that can create sandboxes.
-- For tasks that reach the internet, an external access integration that allows
-  the hosts they need.
+sandboxes, which log in through a connection profile in
+`~/.snowflake/connections.toml`:
+- The `training` profile from [setup](../../docs/getting-started/setup.md)
+  works as is. It logs in with a programmatic access token, so it needs no
+  browser, which matters because the run logs in again every 20 minutes. The
+  commands below pass it as `connection`.
+- `role` must be a role that can create sandboxes.
+- For tasks that reach the internet, you also need an external access
+  integration that allows the hosts they need.
 
 ## Install
 
@@ -77,7 +79,8 @@ The run script installs OpenHands and Harbor itself.
 
 The Arctic Platform launcher reads its connection only from `ARCTIC_CORTEX_*`
 environment variables, so `cortex-training login` alone is not enough. Export
-them from the config JSON you log in with:
+them from the config JSON you log in with (this uses
+[`jq`](https://jqlang.org/download/)):
 
 ```bash
 cfg=~/cortex-training-config.json
@@ -97,7 +100,7 @@ provides the pinned `harbor` CLI with that environment importable:
 ```bash
 uv run --extra harbor harbor run -p /path/to/eval_tasks -a <your agent> -m <your model> \
   --env arctic_platform.integrations.harbor.snowflake_sandbox:SnowflakeSandboxEnvironment \
-  --ek base_image=sandbox-base --ek connection=MY_CONN --ek role=MY_ROLE
+  --ek base_image=sandbox-base --ek connection=training --ek role=MY_ROLE
 ```
 
 `base_image=sandbox-base` starts each sandbox from the Snowflake catalog image
@@ -115,7 +118,7 @@ that identifies your job.
 ```bash
 export TRAIN_HARBOR_TASKS=/path/to/train_tasks
 export EVAL_HARBOR_TASKS=/path/to/eval_tasks
-export HARBOR_ENV_KWARGS='{"base_image": "sandbox-base", "connection": "MY_CONN", "role": "MY_ROLE"}'
+export HARBOR_ENV_KWARGS='{"base_image": "sandbox-base", "connection": "training", "role": "MY_ROLE"}'
 export HARBOR_SKILL=/path/to/SKILL.md   # optional: ":"-separated SKILL.md paths
 export ARCTIC_CORTEX_JOB_COMMENT="your name, harbor rl"
 
@@ -174,7 +177,7 @@ uv run recipes/rl/harbor/prepare_data.py \
 
 export TRAIN_HARBOR_TASKS=~/data/swe-smith-harbor-tasks/train
 export EVAL_HARBOR_TASKS=~/data/swe-smith-harbor-tasks/eval
-export HARBOR_ENV_KWARGS='{"base_image": "sandbox-base", "connection": "MY_CONN", "role": "MY_ROLE", "egress_eai": "MY_GITHUB_EAI"}'
+export HARBOR_ENV_KWARGS='{"base_image": "sandbox-base", "connection": "training", "role": "MY_ROLE", "egress_eai": "MY_GITHUB_EAI"}'
 export ARCTIC_CORTEX_JOB_COMMENT="your name, harbor localization"
 
 bash recipes/rl/harbor/run_qwen35_4b.sh trainer.max_training_steps=100
