@@ -144,8 +144,12 @@ shows.
 A task whose `task.toml` sets `[environment] docker_image` to an image already
 in a Snowflake image repository (`/DB/SCHEMA/REPO/IMAGE:TAG`) runs on that
 image as is and needs no Dockerfile; `prebuilt_image` runs every task on one
-such image. Mirroring other images into your repository (`image_repo`) is
-described in that README but was not tested end to end in this release.
+such image. To use an image of your own, first
+[push it to an image repository](https://docs.snowflake.com/en/developer-guide/snowpark-container-services/working-with-registry-repository)
+in your account. This was tested with an image Snowflake already provides;
+pushing your own image, and mirroring other images into your repository
+(`image_repo`, described in that README), were not tested end to end in this
+release.
 
 Other sandboxes: `HARBOR_ENV=host` runs tasks as plain subprocesses on the
 driver, with no isolation, so it is only for tasks you trust and needs
