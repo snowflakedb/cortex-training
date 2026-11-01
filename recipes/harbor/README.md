@@ -141,9 +141,11 @@ outright, clean up as the
 [Harbor recipe README](https://github.com/Snowflake-AI-Research/Arctic-Platform/tree/main/recipes/rl/harbor#1-any-harbor-task-set)
 shows.
 
-Tasks with their own images (`image_repo`, which mirrors each task's `FROM`
-image into your Snowflake image registry, or `prebuilt_image`) are described in
-that README but were not tested end to end in this release.
+A task whose `task.toml` sets `[environment] docker_image` to an image already
+in a Snowflake image repository (`/DB/SCHEMA/REPO/IMAGE:TAG`) runs on that
+image as is and needs no Dockerfile; `prebuilt_image` runs every task on one
+such image. Mirroring other images into your repository (`image_repo`) is
+described in that README but was not tested end to end in this release.
 
 Other sandboxes: `HARBOR_ENV=host` runs tasks as plain subprocesses on the
 driver, with no isolation, so it is only for tasks you trust and needs
@@ -161,6 +163,18 @@ started, the agent or the verifier crashed) is saved as `.error` with its
 traceback and is left out of the loss. If every rollout of a step errors, the
 step is rerun up to 3 times, after waits of 1, 2, and 4 minutes, and then the
 run stops.
+
+To also evaluate during training, append
+`trainer.eval_before_train=true trainer.eval_interval=10` to the run script:
+the model is evaluated on `EVAL_HARBOR_TASKS` before the first step and every
+10 steps after it, and each evaluation prints `eval/all/avg_score` in the log.
+
+To compare the trained model with your baseline in `harbor run`,
+[deploy](../../docs/guides/inference/deploy-model.md) the `weights-only`
+checkpoint the run ends with and evaluate the deployment with the recipe's
+agent, as the
+[Harbor recipe README](https://github.com/Snowflake-AI-Research/Arctic-Platform/blob/main/recipes/rl/harbor/README.md#evaluate)
+shows.
 
 ## Example: SWE-smith code localization as Harbor tasks
 
@@ -205,7 +219,8 @@ Loss settings and everything else pass through as trailing Hydra flags.
 
 ## Stop
 
-Ctrl-C, `kill`, or the end of training cancels the Cortex job. A driver killed
+Ctrl-C, `kill`, or the end of training cancels the Cortex job, and the driver
+exits within about 2 minutes, once its rollouts stop. A driver killed
 with `kill -9` or by the OOM killer cannot cancel it. The server reclaims that
 job after 30 idle minutes; set `ARCTIC_CORTEX_IDLE_TIMEOUT_SECONDS` (at least
 300) to shorten that.
