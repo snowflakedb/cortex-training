@@ -368,6 +368,13 @@ def test_qwen3_0_6b_standard_fits_on_one_gpu():
         assert (inference["n_gpus"], inference["max_seq_len"], inference["vllm_config"]["tensor_parallel_size"]) == (1, 32768, 1)
 
 
+def test_gemma4_31b_training_uses_sdpa():
+    # Full-attention layers have head_dim 512, past FlashAttention 3's 256.
+    for key in ("standard/h200-training-full", "long/h200-training-full"):
+        training = _config(_body("google/gemma-4-31B-it", key))
+        assert training["attn_implementation"] == "sdpa"
+
+
 @pytest.mark.parametrize(
     "key",
     [

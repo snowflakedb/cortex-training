@@ -13,7 +13,7 @@
         "train_batch_size": 1,
         "gradient_clipping": 1.0,
         "model_provider": "huggingface",
-        "attn_implementation": "flash_attention_3",
+        "attn_implementation": "sdpa",
         "activation_checkpointing": true,
         "fused_lm_head_token_chunk_size": 8192,
         "optimizer": {

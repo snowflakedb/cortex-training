@@ -61,6 +61,9 @@ renderers, so with a thinking-off default pass `enable_thinking=true` or
 
 ## Model notes
 
+- **Gemma 4 31B:** both training tiers use SDPA. Full-attention layers have head
+  dimension 512, which FlashAttention 3 rejects. Gemma 3 and MedGemma keep
+  FlashAttention 3; every one of their layers is 256.
 - **DeepSeek V4.1-Flash:** full-parameter and attention LoRA train from the
   official checkpoint. LoRA inference records routes on every layer
   (`swa_bounded_replay` off). The sampler names the attention projections
