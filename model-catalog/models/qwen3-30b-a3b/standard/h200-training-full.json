@@ -7,7 +7,7 @@
       "dtype": "bfloat16",
       "seed": 42,
       "training_config": {
-        "n_gpus": 4,
+        "n_gpus": 8,
         "max_seq_len": 40960,
         "train_batch_size": 4,
         "gradient_clipping": 1.0,

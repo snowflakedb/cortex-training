@@ -1465,15 +1465,19 @@ def test_examples_folder_is_renamed_to_recipes():
     assert (REPO_ROOT / "recipes").is_dir()
 
 
-# A catalog job file is picked by model, context, hardware and mode, so nothing
-# outside the model's folder names one by path (tests aside).
+# Recipes resolve catalog jobs by model/context/hardware/mode. Only the catalog
+# sweep matrix and tests may name an exact job file outside its model folder.
 _CATALOG_JOB_FILE = re.compile(r"\b(standard|long)/(h200|b200|b300)-(training|inference)-(lora|full)\.json")
 
 
 def test_nothing_outside_the_catalog_names_a_catalog_job_file():
     found = []
     for path in _repository_files():
-        if path.parts[:2] == ("model-catalog", "models") or path.parts[0] == "tests":
+        if (
+            path.parts[:2] == ("model-catalog", "models")
+            or path.parts[0] == "tests"
+            or path == PurePosixPath("model-catalog/rl-pairings.json")
+        ):
             continue
         data = (REPO_ROOT / path).read_bytes()
         if b"\0" in data:
@@ -1483,6 +1487,17 @@ def test_nothing_outside_the_catalog_names_a_catalog_job_file():
                 found.append(f"{path}:{number}: {line.strip()}")
 
     assert found == []
+
+
+def test_pairing_matrix_only_names_matching_catalog_job_files():
+    catalog = REPO_ROOT / "model-catalog"
+    manifest = json.loads((catalog / "rl-pairings.json").read_text())
+    for pairing in manifest["pairings"]:
+        for key in ("training_config", "inference_config"):
+            reference = Path(pairing[key])
+            assert reference.parent == Path("models") / pairing["model"] / pairing["context"]
+            assert _CATALOG_JOB_FILE.search(reference.as_posix())
+            assert (catalog / reference).is_file()
 
 
 def test_repository_search_skips_ignored_and_hidden_files():

@@ -18,3 +18,8 @@ config.json
 # local records regenerated per run.
 recipes/rl_quickstart/configs/
 recipes/distillation/configs/
+examples/rl/configs/
+examples/distillation/configs/
+
+# Live catalog lifecycle reports contain account-specific job identifiers.
+model-catalog/results/

@@ -9,7 +9,7 @@
       "training_config": {
         "n_gpus": 32,
         "max_seq_len": 262144,
-        "train_batch_size": 4,
+        "train_batch_size": 1,
         "sp_size": 8,
         "gradient_clipping": 1.0,
         "attn_implementation": "flash_attention_3",
@@ -26,9 +26,6 @@
           "eps": 1e-08
         },
         "ds_config": {
-          "train_batch_size": 4,
-          "train_micro_batch_size_per_gpu": 1,
-          "gradient_accumulation_steps": 1,
           "zero_optimization": {
             "stage": 2
           },
