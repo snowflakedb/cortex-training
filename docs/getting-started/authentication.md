@@ -113,16 +113,36 @@ If a command can't find the database, it stops with an error that names your
 role and the database, and how to fix it: create it, ask an admin for
 `GRANT USAGE`, or use another database with `--database`.
 
-### Option B: JSON config (legacy)
+### Option B: Environment variables (CI)
 
-Before connection profiles, Cortex Training connected with a JSON file
-(`host`, `pat`, `database`, `schema`). For a new setup, use a profile (Option
-A). An existing file keeps working the ways it did, each with a deprecation
-warning, until a future release: `--config FILE`, `CORTEX_TRAINING_CONFIG`, a
-file remembered with `cortex-training login FILE`, and a recipe's `config=`.
+For CI and other places without a profile, set credentials in the environment:
 
-**Convert a JSON config into a profile.** If you already use a JSON config, one
-command turns it into a Snowflake connection profile:
+```bash
+export CORTEX_TRAINING_HOST="ACCOUNT.snowflakecomputing.com"
+export CORTEX_TRAINING_PAT="YOUR_PAT"
+export CORTEX_TRAINING_DATABASE="CORTEX_TRAINING_DB"
+export CORTEX_TRAINING_SCHEMA="PUBLIC"
+```
+
+Then run commands directly:
+
+```bash
+cortex-training capacity
+```
+
+`CORTEX_TRAINING_HOST` and `CORTEX_TRAINING_PAT` are meant for machines with no
+profile. If you also have a profile, they're still used for now, with a
+warning that the profile will be used instead in a future release.
+`CORTEX_TRAINING_DATABASE` and `CORTEX_TRAINING_SCHEMA` choose the database and
+schema with any connection.
+
+Use the `CORTEX_TRAINING_` names; the older `SNOWFLAKE_`-prefixed ones still
+work for now and will be deprecated in a future release.
+
+## Old users who log in with config.json
+
+If you log in with a JSON config file (`host`, `pat`, `database`, `schema`),
+one command turns it into a Snowflake connection profile:
 
 ```bash
 cortex-training login --convert-legacy-config ~/cortex-training-config.json
@@ -152,32 +172,10 @@ Then it asks before each step:
 
 Either every change happens, or every file is put back as it was.
 
-### Option C: Environment variables (CI)
-
-For CI and other places without a profile, set credentials in the environment:
-
-```bash
-export CORTEX_TRAINING_HOST="ACCOUNT.snowflakecomputing.com"
-export CORTEX_TRAINING_PAT="YOUR_PAT"
-export CORTEX_TRAINING_DATABASE="CORTEX_TRAINING_DB"
-export CORTEX_TRAINING_SCHEMA="PUBLIC"
-```
-
-Then run commands directly:
-
-```bash
-cortex-training capacity
-```
-
-`CORTEX_TRAINING_HOST` and `CORTEX_TRAINING_PAT` are meant for machines with no
-profile. If you also have a profile, they're still used for now, with a
-warning that the profile will be used instead in a future release.
-`CORTEX_TRAINING_DATABASE` and `CORTEX_TRAINING_SCHEMA` choose the database and
-schema with any connection.
-
-The Snowflake-prefixed variants (`SNOWFLAKE_PAT`, `SNOWFLAKE_HOST`,
-`SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA`) still work, with a deprecation
-warning; use the `CORTEX_TRAINING_` names instead.
+Until you convert, the file keeps working the ways it did. See
+[Older Connection Methods](../reference/cli.md#older-connection-methods) if the
+profile setup doesn't work for you; they will be deprecated in a future
+release.
 
 ## Troubleshooting
 

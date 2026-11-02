@@ -54,23 +54,9 @@ the profile `[default]`.
 
 ## JSON connection file
 
-Before connection profiles, Cortex Training connected with a JSON file holding
-a host, a programmatic access token (`pat`), a database, and a schema (the
-[template](connection.json.template) shows the format). New setups should use
-a profile, as above.
-
-If you already have one, convert it into a profile with one command:
-
-```bash
-cortex-training login --convert-legacy-config ~/cortex-training-config.json
-```
-
-It shows every change and asks first; see
-[authentication](authentication.md#option-b-json-config-legacy). Until you
-convert, the file keeps working the ways it did, each with a deprecation
-warning: `--config FILE`, `CORTEX_TRAINING_CONFIG`, a file remembered with
-`cortex-training login FILE`, and a recipe's `config=`. JSON files stop working
-in a future release.
+Have a JSON connection file from an older setup? Convert it into a profile with
+`cortex-training login --convert-legacy-config FILE` (see
+[authentication](authentication.md#old-users-who-log-in-with-configjson)).
 
 `capacity` with no `--hardware` lists every GPU type. See
 [GPU hardware](../concepts/hardware.md).

@@ -1067,7 +1067,8 @@ def _select_config(args: argparse.Namespace, *, load_login: bool) -> dict[str, A
     return _load_config(login_config, strict=strict)
 
 
-_FUTURE = "is deprecated and will stop working in a future release."
+# The old ways keep working, as a fallback while the profile path settles in.
+_FUTURE = "will be deprecated in a future release."
 
 
 def _resolve_args(
@@ -1195,9 +1196,8 @@ def _old_connection_notes(args: argparse.Namespace, typed: Mapping[str, Any]) ->
         ]
     snowflake = [name for name in ("SNOWFLAKE_HOST", "SNOWFLAKE_PAT") if _env(name) and not _env(f"CORTEX_TRAINING_{name[10:]}")]
     if snowflake:
-        future = _FUTURE if len(snowflake) == 1 else _FUTURE.replace("is deprecated", "are deprecated")
         return [
-            f"{' and '.join(snowflake)} {future} Run `cortex-training login` to set up a Snowflake "
+            f"{' and '.join(snowflake)} {_FUTURE} Run `cortex-training login` to set up a Snowflake "
             "connection profile (in CI, use CORTEX_TRAINING_HOST and CORTEX_TRAINING_PAT)."
         ]
     if _snowflake_profiles_exist():

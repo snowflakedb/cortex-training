@@ -679,7 +679,7 @@ def test_the_old_login_forms_still_work_with_a_warning(argv, isolated):
     code = _cli.main(argv, stdout=io.StringIO(), stderr=stderr, stdin=io.StringIO())
     assert code == 1
     err = stderr.getvalue()
-    assert "is deprecated and will stop working in a future release." in err
+    assert "will be deprecated in a future release." in err
     assert "cortex-training login --convert-legacy-config" in err
 
 

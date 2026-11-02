@@ -26,8 +26,8 @@ Resolution order (first match wins):
 5. Otherwise the connection picker (as ``from_configs()``): the profile saved by
    ``cortex-training login``, then the Snowflake default profile.
 
-The deprecated forms still work and log a warning; they stop working in a
-future release.
+The older forms still work, as a fallback, and log a warning that they will be
+deprecated in a future release.
 
 The logic lives in :func:`cortex_training.cli.commands._resolve_args`; this module only
 adapts it for library callers so examples and the CLI cannot drift apart.

@@ -4,9 +4,9 @@ The examples take two separate things:
 
 - `connection=` or `config=` — the Snowflake connection. Omit both to use the
   same resolution as the CLI (see [Set up the client](../../getting-started/setup.md)).
-  `config=` is a legacy JSON file with account host, PAT, database, and schema;
-  it still works, with a deprecation warning (see
-  [JSON connection file](../../getting-started/setup.md#json-connection-file)).
+  `config=` is an older JSON connection file; it still works and will be
+  deprecated in a future release (see
+  [Older Connection Methods](../cli.md#older-connection-methods)).
 - The job — a create-job body holding the whole training configuration. The
   example builds it from the [model catalog](../../../model-catalog/README.md),
   or takes your own file with `job_config=`; see
