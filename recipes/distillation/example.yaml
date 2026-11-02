@@ -1,22 +1,30 @@
 id: on-policy-distillation
-title: On-policy distillation
+title: On-policy distillation for multi-turn tool use
 status: runnable
 task: distillation
 methods:
   - lora
   - full-parameter
 models:
-  - Qwen/Qwen3-0.6B
+  - Qwen/Qwen3.5-2B
+  - Qwen/Qwen3.5-4B
 teacher_models:
-  - Qwen/Qwen3-8B
+  - Qwen/Qwen3.8-27B
+  - Qwen/Qwen3.8-Flash-Next
+judge_models:
+  - Qwen/Qwen3-30B-A3B
 datasets:
-  - openai/gsm8k
+  - willcb/wiki-trivia-questions-v4
+  - willcb/rare-wiki-pages
+dataset_revisions:
+  willcb/wiki-trivia-questions-v4: e89661d423c07ca26cf67d5eb311e016b7d26cd3
+  willcb/rare-wiki-pages: 12f1fb49a52f33a8e963d511b0fdf455480d8aa4
 precision:
   - bfloat16
 default_training_gpus: 1
 provenance:
   project: thinking-machines-lab/tinker-cookbook
   recipe: tinker_cookbook/distillation/train_on_policy.py
-# Pending: the catalog-driven flow has not been validated on a live run yet.
-# The table in README.md will be refreshed when it is.
-last_validated: null
+# The README results are full-parameter 40-step runs with the same job settings
+# (student 1 + 1 GPUs at lr 1e-6, teacher and judge on 2 GPUs, Flash-Next on 8).
+last_validated: 2026-10-22
