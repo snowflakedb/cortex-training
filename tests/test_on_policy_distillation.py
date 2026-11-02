@@ -612,7 +612,7 @@ def test_teacher_and_judge_gpus_none_keep_the_catalog_footprint():
     bodies = runner.job_bodies(_Config(teacher_gpus=None, judge_gpus=None))
 
     assert _sub(bodies["teacher"], "sampling")["inference_config"]["n_gpus"] == 8
-    assert _sub(bodies["judge"], "sampling")["inference_config"]["n_gpus"] == 4
+    assert _sub(bodies["judge"], "sampling")["inference_config"]["n_gpus"] == 8
 
 
 def test_job_bodies_enforce_a_teacher_window_above_the_student():

@@ -1008,6 +1008,8 @@ def test_qwen38_sft_uses_chunked_logprob_loss(job, context):
     assert training["sp_size"] == 8
     if context == "long" and job == "training-full":
         assert (training["n_gpus"], training["train_batch_size"]) == (32, 4)
+    elif job == "training-full":
+        assert (training["n_gpus"], training["train_batch_size"]) == (16, 2)
     else:
         assert (training["n_gpus"], training["train_batch_size"]) == (8, 1)
     assert training["fused_lm_head_token_chunk_size"] == 8192
