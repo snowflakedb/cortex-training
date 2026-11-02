@@ -559,6 +559,59 @@ class _FakeJobClient:
         self._call("cancel")
 
 
+class _FakeJobsClient:
+    """Records ``running_jobs`` calls with one id per created job; ``fail_wait`` names one that fails to start."""
+
+    def __init__(self, fail_wait: str | None = None, error_log: str | None = None):
+        self.events: list[str] = []
+        self.created = 0
+        self.fail_wait = fail_wait
+        self.error_log = error_log
+
+    def create_job_from_body(self, body: dict) -> dict:
+        self.created += 1
+        job_id = f"job-{self.created}"
+        self.events.append(f"create {job_id}")
+        return {"job_id": job_id}
+
+    def wait_for_job(self, job_id: str) -> None:
+        self.events.append(f"wait {job_id}")
+        if job_id == self.fail_wait:
+            raise RuntimeError(f"job {job_id} failed")
+
+    def fetch_execution_logs(self, job_id: str) -> list[dict]:
+        line = json.dumps({"level": "ERROR", "msg": self.error_log})
+        return [{"content": line}] if self.error_log else []
+
+    def cancel_job(self, job_id: str) -> None:
+        self.events.append(f"cancel {job_id}")
+
+
+def test_running_jobs_creates_every_job_before_waiting_and_cancels_only_its_own():
+    utils = _import_example("recipes.utils")
+    client = _FakeJobsClient()
+    bodies = {"student": {}, "teacher": {}, "judge": {}}
+
+    with utils.running_jobs(client, bodies, {"judge": "attached-1"}) as ids:
+        assert ids == {"student": "job-1", "teacher": "job-2", "judge": "attached-1"}
+        assert client.events == [
+            "create job-1", "create job-2", "wait job-1", "wait job-2", "wait attached-1",
+        ]
+
+    assert client.events[-2:] == ["cancel job-2", "cancel job-1"]
+
+
+def test_running_jobs_reports_the_logged_cause_and_cancels_what_it_created():
+    utils = _import_example("recipes.utils")
+    client = _FakeJobsClient(fail_wait="job-2", error_log="RuntimeError: CUDA out of memory")
+
+    with pytest.raises(RuntimeError, match="job job-2 failed\nRuntimeError: CUDA out of memory"):
+        with utils.running_jobs(client, {"student": {}, "teacher": {}}):
+            pass
+
+    assert client.events[-2:] == ["cancel job-2", "cancel job-1"]
+
+
 class _EmptyTask:
     name = "empty"
     evaluation_name = "none"
@@ -1054,7 +1107,7 @@ def test_task_modules_are_entrypoints(relative_path):
     [
         ("recipes/sft_quickstart/runner.py", "recipes.sft_quickstart.conversational"),
         ("recipes/rl_quickstart/runner.py", "recipes.rl_quickstart.math_grpo"),
-        ("recipes/distillation/train.py", ".tasks."),
+        ("recipes/distillation/runner.py", ".tasks."),
     ],
 )
 def test_shared_runners_are_task_agnostic_libraries(relative_path, example_package):

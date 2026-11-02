@@ -25,7 +25,7 @@ recipes/
 ├── logging.py               # metrics logging
 ├── sft_quickstart/          # runner.py (shared loop), overrides.json, conversational/, dare/
 ├── rl_quickstart/           # runner.py (shared loop), overrides.json, math_grpo/, configs/ (generated)
-├── distillation/            # on_policy/, overrides.json, configs/ (generated)
+├── distillation/            # runner.py (shared loop), episodes.py, overrides.json, on_policy/, tasks/, configs/ (generated)
 ├── inference/               # serve.py, generate.py, evaluate.py, overrides.json
 ├── dflash2/                 # generate_data.py, train.py, evaluate.py, overrides.json, drafts/<model>.json
 ├── model_deployment/        # deploy.py, streaming.py, configs/

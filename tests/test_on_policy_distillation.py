@@ -17,7 +17,7 @@ import pytest
 import torch
 from recipes.distillation import episodes as episodes_mod
 from recipes.distillation import teacher as teacher_mod
-from recipes.distillation import train as runner
+from recipes.distillation import runner
 from recipes.distillation.tasks import wiki_search
 from recipes.utils import _forward_backward_payload
 from recipes.utils import collate

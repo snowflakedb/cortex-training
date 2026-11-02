@@ -18,8 +18,6 @@ comparison.
 
 from __future__ import annotations
 
-import contextlib
-import dataclasses
 import json
 import logging
 import math
@@ -27,23 +25,22 @@ import os
 import random
 import statistics
 import time
-from collections.abc import Iterator
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 from typing import Protocol
 
-from recipes.distillation.episodes import EPISODE_ENDS
 from recipes.distillation.episodes import ChatFormat
-from recipes.distillation.episodes import Episode
 from recipes.distillation.episodes import agent_teacher_logprobs
+from recipes.distillation.episodes import episode_metrics
+from recipes.distillation.episodes import judge
 from recipes.distillation.episodes import run_episodes
 from recipes.distillation.episodes import shifted_tensor
 from recipes.distillation.episodes import teacher_scoring_inputs
 from recipes.distillation.episodes import train_sequences
+from recipes.distillation.episodes import write_episodes
 from recipes.distillation.teacher import check_shared_tokenizer
 from recipes.distillation.teacher import clipped_fraction
-from recipes.distillation.teacher import generate_results
 from recipes.distillation.teacher import reverse_kl_estimates
 from recipes.distillation.teacher import score_with_teacher
 from recipes.logging import setup_logging
@@ -56,6 +53,7 @@ from recipes.utils import make_distillation_config
 from recipes.utils import model_slug
 from recipes.utils import optimizer_step
 from recipes.utils import parallelism_errors
+from recipes.utils import running_jobs
 from recipes.utils import same_adapter
 from recipes.utils import save_example_checkpoints
 from recipes.utils import sync_weights
@@ -72,7 +70,6 @@ CONFIGS_DIR = _EXAMPLE_DIR / "configs"
 _CONFIG_SEARCH_DIRS = (_EXAMPLE_DIR, CONFIGS_DIR)
 _OVERRIDES = _EXAMPLE_DIR / "overrides.json"
 _LR_SCHEDULES = ("constant", "cosine")
-JUDGE_PARAMS = {"temperature": 0.0, "max_tokens": 8}
 
 
 class Config(Protocol):
@@ -458,97 +455,6 @@ def teacher_overhead(
     return max(0, first) + max(0, per_turn) * max(0, max_turns - 1)
 
 
-@contextlib.contextmanager
-def running_jobs(
-    client: Any, bodies: dict[str, dict], attach: dict[str, str | None]
-) -> Iterator[dict[str, str]]:
-    """Create (or attach to) every job, wait for all, and cancel the ones created here."""
-    job_ids: dict[str, str] = {}
-    created: list[str] = []
-    try:
-        for name, body in bodies.items():
-            if attach.get(name):
-                job_ids[name] = str(attach[name])
-                logger.info("attaching to %s job %s", name, job_ids[name])
-            else:
-                job_ids[name] = client.create_job_from_body(body)["job_id"]
-                created.append(job_ids[name])
-                logger.info("created %s job %s", name, job_ids[name])
-        for name, job_id in job_ids.items():
-            client.wait_for_job(job_id)
-            logger.info("%s job %s is running", name, job_id)
-        yield job_ids
-    finally:
-        for job_id in reversed(created):
-            try:
-                client.cancel_job(job_id)
-                logger.info("cancelled job %s", job_id)
-            except Exception:
-                logger.exception("failed to cancel job %s -- cancel it by hand", job_id)
-
-
-def judge(
-    client: Any,
-    job_id: str,
-    fmt: ChatFormat,
-    task: Task,
-    episodes: Sequence[Episode],
-    max_prompts_per_request: int | None,
-) -> None:
-    """Grade every episode that ended with a final answer; the rest score 0."""
-    for e in episodes:
-        e.reward = 0.0
-    answered = [e for e in episodes if e.end == "answer" and e.final]
-    if not answered:
-        return
-    prompts = [
-        fmt.render([{"role": "user", "content": task.judge_prompt(e.problem, e.final)}])
-        for e in answered
-    ]
-    params = {"stop_token_ids": fmt.stop_ids, **JUDGE_PARAMS}
-    results = generate_results(client, job_id, prompts, params, max_prompts_per_request)
-    for e, result in zip(answered, results):
-        tokens = [int(t) for t in result.get("token_ids") or []]
-        e.reward = task.judge_verdict(fmt.tok.decode(tokens, skip_special_tokens=True))
-
-
-def episode_metrics(prefix: str, episodes: Sequence[Episode]) -> dict[str, float]:
-    return {
-        f"{prefix}/correct": statistics.fmean(e.reward for e in episodes),
-        f"{prefix}/turns": statistics.fmean(e.turns for e in episodes),
-        f"{prefix}/tool_calls": statistics.fmean(e.tool_calls for e in episodes),
-        f"{prefix}/agent_tokens": statistics.fmean(e.agent_tokens for e in episodes),
-        **{
-            f"{prefix}/end_{end}": statistics.fmean(e.end == end for e in episodes)
-            for end in EPISODE_ENDS
-        },
-    }
-
-
-def write_episodes(
-    path: Path, step: int, episodes: Sequence[Episode], fmt: ChatFormat, transcripts: int
-) -> None:
-    """Append one JSON line per episode; the first ``transcripts`` include the full conversation."""
-    with open(path, "a") as f:
-        for i, e in enumerate(episodes):
-            row: dict[str, Any] = {
-                "step": step,
-                "problem": dataclasses.asdict(e.problem)
-                if dataclasses.is_dataclass(e.problem)
-                else str(e.problem),
-                "final": e.final,
-                "reward": e.reward,
-                "end": e.end,
-                "turns": e.turns,
-                "tool_calls": e.tool_calls,
-            }
-            if i < transcripts and e.spans[0]:
-                row["transcript"] = fmt.tok.decode(
-                    e.ids[0][e.spans[0][0][0] :], skip_special_tokens=False
-                )
-            f.write(json.dumps(row) + "\n")
-
-
 def _train(config: Config, task: Task) -> None:
     from tinker_cookbook.tokenizer_utils import get_tokenizer
 
@@ -694,7 +600,15 @@ def _train(config: Config, task: Task) -> None:
                     want_logprobs=False,
                     **episode_args,
                 )
-                judge(client, judge_job, judge_fmt, task, episodes, config.max_prompts_per_request)
+                judge(
+                    client,
+                    judge_job,
+                    judge_fmt,
+                    episodes,
+                    judge_prompt=task.judge_prompt,
+                    judge_verdict=task.judge_verdict,
+                    max_prompts_per_request=config.max_prompts_per_request,
+                )
                 metrics.update(episode_metrics(prefix, episodes))
                 name = "teacher_eval_episodes.jsonl" if prefix != "test" else "eval_episodes.jsonl"
                 write_episodes(log_dir / name, step, episodes, fmt, transcripts=3)
@@ -742,7 +656,15 @@ def _train(config: Config, task: Task) -> None:
                 want_logprobs=True,
                 **episode_args,
             )
-            judge(client, judge_job, judge_fmt, task, episodes, config.max_prompts_per_request)
+            judge(
+                client,
+                judge_job,
+                judge_fmt,
+                episodes,
+                judge_prompt=task.judge_prompt,
+                judge_verdict=task.judge_verdict,
+                max_prompts_per_request=config.max_prompts_per_request,
+            )
             metrics.update(episode_metrics("rollout", episodes))
             metrics["time/rollouts"] = time.time() - start
             write_episodes(log_dir / "train_episodes.jsonl", step, episodes, student, transcripts=2)

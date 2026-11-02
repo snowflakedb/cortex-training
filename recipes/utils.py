@@ -783,6 +783,26 @@ def _runtime_error_from_logs(client: CortexTrainingClient, job_id: str) -> str |
     return errors[-1]
 
 
+def _wait_until_running(client: CortexTrainingClient, job_id: str) -> None:
+    """Wait for a job's workers; a failed start raises with the cause from its logs."""
+    try:
+        client.wait_for_job(job_id)
+    except RuntimeError as exc:
+        detail = _runtime_error_from_logs(client, job_id)
+        if detail:
+            raise RuntimeError(f"{exc}\n{detail}") from exc
+        raise
+    logger.info("job %s is running", job_id)
+
+
+def _cancel_job(client: CortexTrainingClient, job_id: str) -> None:
+    try:
+        client.cancel_job(job_id)
+        logger.info("cancelled job %s", job_id)
+    except Exception:
+        logger.exception("failed to cancel job %s -- check it by hand", job_id)
+
+
 @contextlib.contextmanager
 def running_job(
     client: CortexTrainingClient,
@@ -806,25 +826,47 @@ def running_job(
         job_id = client.create_job_from_body(job_body)["job_id"]
         logger.info("created job %s; waiting for workers", job_id)
     assert job_id is not None
-    try:
-        client.wait_for_job(job_id)
-    except RuntimeError as exc:
-        detail = _runtime_error_from_logs(client, job_id)
-        if detail:
-            raise RuntimeError(f"{exc}\n{detail}") from exc
-        raise
-    logger.info("job %s is running", job_id)
+    _wait_until_running(client, job_id)
     try:
         yield job_id
     finally:
         if keep_job:
             logger.info("leaving job %s running", job_id)
         else:
-            try:
-                client.cancel_job(job_id)
-                logger.info("cancelled job %s", job_id)
-            except Exception:
-                logger.exception("failed to cancel job %s -- check it by hand", job_id)
+            _cancel_job(client, job_id)
+
+
+@contextlib.contextmanager
+def running_jobs(
+    client: CortexTrainingClient,
+    job_bodies: Mapping[str, dict],
+    job_ids: Mapping[str, str | None] | None = None,
+) -> Iterator[dict[str, str]]:
+    """Yield the ids of several running jobs by name, cancelling the ones created here.
+
+    Like :func:`running_job` for a set of jobs: every job is created before any
+    is waited on, so they start together. ``job_ids`` maps a name to an existing
+    job to attach to instead; attached jobs are left running. If creating or
+    starting any job fails, the jobs already created are cancelled.
+    """
+    attach = job_ids or {}
+    ids: dict[str, str] = {}
+    created: list[str] = []
+    try:
+        for name, body in job_bodies.items():
+            if attach.get(name):
+                ids[name] = str(attach[name])
+                logger.info("attaching to %s job %s; waiting for workers", name, ids[name])
+            else:
+                ids[name] = client.create_job_from_body(body)["job_id"]
+                created.append(ids[name])
+                logger.info("created %s job %s; waiting for workers", name, ids[name])
+        for job_id in ids.values():
+            _wait_until_running(client, job_id)
+        yield ids
+    finally:
+        for job_id in reversed(created):
+            _cancel_job(client, job_id)
 
 
 # ─── Router replay capacity planning ─────────────────────────────────────────

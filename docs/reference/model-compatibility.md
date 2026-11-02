@@ -40,18 +40,20 @@ model's catalog folder lists exactly which files it has. The examples pick a fil
 [Run an example](../../recipes/README.md#run-an-example)).
 
 The examples that tokenize prompts pick a chat renderer from tinker-cookbook
-(`recipes.inference.serve` needs none):
+(`recipes.inference.serve` and distillation need none):
 
 - Conversational SFT and the inference `generate`/`evaluate` commands default
   to thinking off, and accept `enable_thinking=` and `renderer_name=`. DARE
   defaults to thinking on.
-- Distillation defaults to `renderer_name=qwen3_disable_thinking`.
 - Math GRPO takes no renderer arguments and uses tinker-cookbook's top
   recommendation for the model, which is thinking on for hybrid Qwen3 models.
+- Distillation takes no renderer arguments: it renders each conversation with
+  the model's own chat template from its tokenizer, thinking off, so it also
+  runs models that tinker-cookbook has no renderer for.
 
-tinker-cookbook lists no renderer for Qwen3-0.6B, Qwen3-1.7B, Qwen3.8-Flash-Next,
-the Gemma and MedGemma models, or GLM 5.3 Flash BF16, so pass `renderer_name=`
-for those; Math GRPO can't run them. Pick a
+tinker-cookbook lists no renderer for Qwen3-0.6B, Qwen3-1.7B, Qwen3.5-2B,
+Qwen3.8-Flash-Next, the Gemma and MedGemma models, or GLM 5.3 Flash BF16, so
+pass `renderer_name=` for those; Math GRPO can't run them. Pick a
 renderer from tinker-cookbook's
 [renderer list](https://tinker-docs.thinkingmachines.ai/tutorials/core-concepts/rendering/#available-renderers)
 whose chat template matches the model's own (its `tokenizer_config.json` on

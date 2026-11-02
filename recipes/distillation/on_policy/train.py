@@ -4,11 +4,11 @@ import chz
 from recipes.distillation.tasks.wiki_search import DEFAULT_INDEX_DIR
 from recipes.distillation.tasks.wiki_search import WikiIndex
 from recipes.distillation.tasks.wiki_search import WikiSearchTask
-from recipes.distillation.train import job_bodies
-from recipes.distillation.train import lr_at
-from recipes.distillation.train import processing_block
-from recipes.distillation.train import train
-from recipes.distillation.train import validate_config
+from recipes.distillation.runner import job_bodies
+from recipes.distillation.runner import lr_at
+from recipes.distillation.runner import processing_block
+from recipes.distillation.runner import train
+from recipes.distillation.runner import validate_config
 from recipes.utils import DEFAULT_DISTILLATION_CONTEXT
 from recipes.utils import DEFAULT_DISTILLATION_JUDGE
 from recipes.utils import DEFAULT_DISTILLATION_JUDGE_GPUS

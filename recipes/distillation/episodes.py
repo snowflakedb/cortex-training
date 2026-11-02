@@ -25,6 +25,10 @@ appended tool turns match the model's chat template.
 Each model in an episode (the agent, and the teacher that scores it) keeps its
 own running copy of the conversation in its own chat format. The models share a
 tokenizer, so the agent's tokens are appended unchanged to every copy.
+
+Everything that works on episodes lives here: playing, grading, aligning them
+with the teacher, turning them into training sequences, and their metrics and
+logs. The runner owns the jobs, the config, and the training step.
 """
 
 from __future__ import annotations
@@ -32,8 +36,10 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
+import statistics
 from collections.abc import Callable
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -49,6 +55,7 @@ XML_PARAM = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>", re.DOTAL
 INVALID_TOOL_CALL = "invalid_tool_call"
 EPISODE_ENDS = ("answer", "max_turns", "context", "length", "empty")
 _THINK_OFF_HEADER = "<think>\n\n</think>\n\n"
+JUDGE_PARAMS = {"temperature": 0.0, "max_tokens": 8}
 
 
 class ChatFormat:
@@ -285,3 +292,67 @@ def shifted_tensor(rows: Sequence[Sequence[float]], loss_mask: torch.Tensor) -> 
     for row, values in enumerate(rows):
         out[row, : len(values)] = torch.tensor(list(values), dtype=torch.float32)
     return out
+
+
+def judge(
+    client: Any,
+    job_id: str,
+    fmt: ChatFormat,
+    episodes: Sequence[Episode],
+    *,
+    judge_prompt: Callable[[Any, str], str],
+    judge_verdict: Callable[[str], float],
+    max_prompts_per_request: int | None = None,
+) -> None:
+    """Grade every episode that ended with a final answer; the rest score 0."""
+    for e in episodes:
+        e.reward = 0.0
+    answered = [e for e in episodes if e.end == "answer" and e.final]
+    if not answered:
+        return
+    prompts = [
+        fmt.render([{"role": "user", "content": judge_prompt(e.problem, e.final)}])
+        for e in answered
+    ]
+    params = {"stop_token_ids": fmt.stop_ids, **JUDGE_PARAMS}
+    results = generate_results(client, job_id, prompts, params, max_prompts_per_request)
+    for e, result in zip(answered, results):
+        tokens = [int(t) for t in result.get("token_ids") or []]
+        e.reward = judge_verdict(fmt.tok.decode(tokens, skip_special_tokens=True))
+
+
+def episode_metrics(prefix: str, episodes: Sequence[Episode]) -> dict[str, float]:
+    return {
+        f"{prefix}/correct": statistics.fmean(e.reward for e in episodes),
+        f"{prefix}/turns": statistics.fmean(e.turns for e in episodes),
+        f"{prefix}/tool_calls": statistics.fmean(e.tool_calls for e in episodes),
+        f"{prefix}/agent_tokens": statistics.fmean(e.agent_tokens for e in episodes),
+        **{
+            f"{prefix}/end_{end}": statistics.fmean(e.end == end for e in episodes)
+            for end in EPISODE_ENDS
+        },
+    }
+
+
+def write_episodes(
+    path: Path, step: int, episodes: Sequence[Episode], fmt: ChatFormat, transcripts: int
+) -> None:
+    """Append one JSON line per episode; the first ``transcripts`` include the full conversation."""
+    with open(path, "a") as f:
+        for i, e in enumerate(episodes):
+            row: dict[str, Any] = {
+                "step": step,
+                "problem": dataclasses.asdict(e.problem)
+                if dataclasses.is_dataclass(e.problem)
+                else str(e.problem),
+                "final": e.final,
+                "reward": e.reward,
+                "end": e.end,
+                "turns": e.turns,
+                "tool_calls": e.tool_calls,
+            }
+            if i < transcripts and e.spans[0]:
+                row["transcript"] = fmt.tok.decode(
+                    e.ids[0][e.spans[0][0][0] :], skip_special_tokens=False
+                )
+            f.write(json.dumps(row) + "\n")
