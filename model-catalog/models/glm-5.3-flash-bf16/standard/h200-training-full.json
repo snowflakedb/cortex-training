@@ -36,10 +36,14 @@
         },
         "tiled_mlp_token_chunk_size": 1024,
         "step_peak_memory_log": true,
-        "prime_rl": {
-          "ep_comm_backend": "uccl",
-          "fused_cross_entropy": false
-        },
+        "model_options": {
+          "moe": {
+            "comm_backend": "uccl"
+          },
+          "lm_head": {
+            "cross_entropy": false
+          }
+	},
         "optimizer": {
           "name": "AdamW",
           "lr": 2e-05,

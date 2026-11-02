@@ -35,8 +35,10 @@
           }
         },
         "step_peak_memory_log": true,
-        "prime_rl": {
-          "fused_cross_entropy": false
+        "model_options": {
+          "lm_head": {
+            "cross_entropy": false
+          }
         },
         "optimizer": {
           "name": "AdamW",
