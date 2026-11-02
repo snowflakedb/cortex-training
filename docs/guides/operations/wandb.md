@@ -18,7 +18,7 @@ the run:
 
 ```bash
 python -m recipes.sft_quickstart.conversational.train \
-  config=/path/to/config.json wandb_project=cortex-training
+  wandb_project=cortex-training
 ```
 
 ## Snowflake experiment tracking

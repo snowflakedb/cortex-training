@@ -81,8 +81,11 @@ chmod 600 ~/.snowflake/connections.toml
 
 #### Setting the default connection
 
-To avoid passing `--connection training` on every command, set a default using
-any of these methods:
+To avoid passing `--connection training` on every command, run
+`cortex-training login` and pick the profile. It saves your choice in
+`~/.snowflake/cortex-training/config.json`, and commands, the TUI, and the
+examples use it first. With no saved choice, they use Snowflake's default
+profile, which you can set with any of these methods:
 
 - Name the profile `[default]` instead of `[training]`
 - Set the environment variable:
@@ -123,12 +126,46 @@ Create a JSON file outside the repository:
 }
 ```
 
-Register it once so subsequent commands use it automatically:
+Pass it to each command with `--config`:
 
 ```bash
-cortex-training login ~/cortex-training-config.json
-cortex-training capacity
+cortex-training --config ~/cortex-training-config.json capacity
 ```
+
+`cortex-training login` no longer remembers a JSON file. To set things up once,
+use a Snowflake connection profile (Option A), or run `cortex-training login`,
+which creates or picks one for you.
+
+**Convert a JSON config into a profile.** If you already use a JSON config, one
+command turns it into a Snowflake connection profile:
+
+```bash
+cortex-training login --convert-legacy-config ~/cortex-training-config.json
+```
+
+It shows what the file holds (the PAT stays hidden). A `host`, `pat`,
+`database`, or `schema` the file leaves out comes from the environment variables
+the old CLI read (`CORTEX_TRAINING_*`, then `SNOWFLAKE_*`), and it shows which.
+Then it asks before each step:
+
+1. **It checks the PAT.** It signs in with it to look up your user and role, to
+   check that Cortex Training answers for the account, and to check the database. This only
+   reads. If the database is missing, it shows the `CREATE DATABASE` statement
+   and runs it only if you say yes. If a check fails, it says why and changes
+   nothing.
+2. **It shows every change and asks once.** No is the default, because the
+   last change deletes the old file. The changes are:
+   - adding the profile (named `cortex-training`, or the next free name);
+   - saving it as `"profile"` in `~/.snowflake/cortex-training/config.json`.
+     That file holds only the profile, so the old file's `endpoint`,
+     `poll_interval`, `poll_timeout`, and `verify_ssl` aren't kept; the converter
+     lists any that differ from the defaults, with the flags that set them
+     (`--no-verify-ssl` for `verify_ssl: false`);
+   - saving a copy of the old file without the PAT, as `<file>.bak`;
+   - signing in with the new profile, to check that it works;
+   - only then, deleting the old file, and `login.json` if it points to that file.
+
+Either every change happens, or every file is put back as it was.
 
 ### Option C: Environment variables
 

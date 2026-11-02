@@ -73,22 +73,22 @@ the judge. Check capacity first with `cortex-training capacity`. Install the
 dependencies listed in the [examples prerequisites](../README.md#prerequisites).
 
 ```bash
-python -m recipes.distillation.on_policy.train config=/path/to/config.json
+python -m recipes.distillation.on_policy.train
 ```
 
 The other validated pairs:
 
 ```bash
 # Qwen3.8-Flash-Next -> Qwen3.5-4B (twelve GPUs: the teacher uses eight)
-python -m recipes.distillation.on_policy.train config=/path/to/config.json \
+python -m recipes.distillation.on_policy.train \
   teacher=Qwen/Qwen3.8-Flash-Next teacher_gpus=8
 
 # Qwen3.8-27B -> Qwen3.5-2B
-python -m recipes.distillation.on_policy.train config=/path/to/config.json \
+python -m recipes.distillation.on_policy.train \
   student=Qwen/Qwen3.5-2B
 
 # Qwen3.8-Flash-Next -> Qwen3.5-2B
-python -m recipes.distillation.on_policy.train config=/path/to/config.json \
+python -m recipes.distillation.on_policy.train \
   student=Qwen/Qwen3.5-2B teacher=Qwen/Qwen3.8-Flash-Next teacher_gpus=8
 ```
 
@@ -221,7 +221,7 @@ The run saves a weights-only checkpoint of the student and logs its
 `checkpoint_id`. Serve it with the inference example:
 
 ```bash
-python -m recipes.inference.serve config=/path/to/config.json \
+python -m recipes.inference.serve \
   model=Qwen/Qwen3.5-4B context=standard \
   source_job_id=STUDENT_JOB_ID checkpoint_id=CHECKPOINT_ID
 ```

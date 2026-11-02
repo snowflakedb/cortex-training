@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import json
+import os
 import re
 import sys
 import types
@@ -74,8 +75,38 @@ def test_the_first_cell_fails_clearly_when_examples_resolves_elsewhere(name, mon
         exec(compile(_guard(name), str(NOTEBOOKS[name]), "exec"), {})
 
 
+def _run_first_cell(name, monkeypatch):
+    monkeypatch.setattr(sys, "path", [entry for entry in sys.path if Path(entry or ".").resolve() != REPO_ROOT])
+    monkeypatch.chdir(NOTEBOOKS[name].parent)
+    exec(compile(_source(_notebook(name)["cells"][0]), str(NOTEBOOKS[name]), "exec"), {})
+
+
 @pytest.mark.parametrize("name", NOTEBOOKS)
-def test_the_first_cell_builds_the_client_from_the_whole_connection_file(name, monkeypatch, tmp_path):
+def test_the_first_cell_connects_with_the_saved_profile(name, monkeypatch):
+    pytest.importorskip("torch")
+    import cortex_training
+
+    (Path(os.environ["SNOWFLAKE_HOME"]) / "connections.toml").write_text('[train]\naccount = "ACME"\nuser = "ME"\n')
+    saved = Path(os.environ["SNOWFLAKE_HOME"]) / "cortex-training" / "config.json"
+    saved.parent.mkdir(parents=True)
+    saved.write_text(json.dumps({"profile": "train"}))
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(Path(os.environ["SNOWFLAKE_HOME"]) / "no-login.json"))
+    captured: dict = {}
+
+    def fake_from_resolution(resolution, **kwargs):
+        captured["profile"] = resolution.profile
+        return types.SimpleNamespace(database=resolution.database, schema=resolution.schema, base_url="https://acme.example.com")
+
+    monkeypatch.setattr(cortex_training.CortexTrainingClient, "_from_resolution", staticmethod(fake_from_resolution))
+    _run_first_cell(name, monkeypatch)
+    assert captured == {"profile": "train"}
+    source = _source(_notebook(name)["cells"][0])
+    assert "client = make_client()" in source
+    assert "cortex-training-config.json" not in source and "from_pat(" not in source
+
+
+@pytest.mark.parametrize("name", NOTEBOOKS)
+def test_the_first_cell_still_honors_a_whole_old_connection_file(name, monkeypatch, tmp_path):
     pytest.importorskip("torch")
     import cortex_training
 
@@ -83,7 +114,7 @@ def test_the_first_cell_builds_the_client_from_the_whole_connection_file(name, m
 
     def fake_from_pat(**kwargs):
         captured.update(kwargs)
-        return object()
+        return types.SimpleNamespace(database=kwargs["database"], schema=kwargs["schema"])
 
     monkeypatch.setattr(cortex_training.CortexTrainingClient, "_from_pat", staticmethod(fake_from_pat))
     config_file = tmp_path / "conn.json"
@@ -102,12 +133,9 @@ def test_the_first_cell_builds_the_client_from_the_whole_connection_file(name, m
         )
     )
     monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(config_file))
-    monkeypatch.setattr(sys, "path", [entry for entry in sys.path if Path(entry or ".").resolve() != REPO_ROOT])
-    monkeypatch.chdir(NOTEBOOKS[name].parent)
+    _run_first_cell(name, monkeypatch)
 
-    exec(compile(_source(_notebook(name)["cells"][0]), str(NOTEBOOKS[name]), "exec"), {})
-
-    # The whole mapping propagates from the file, not the old hard-coded placeholders.
+    # The whole mapping propagates from the file (with a deprecation warning).
     assert captured["host"] == "acct.example.com"
     assert captured["pat"] == "tok-123"
     assert captured["database"] == "MY_DB"
@@ -116,10 +144,6 @@ def test_the_first_cell_builds_the_client_from_the_whole_connection_file(name, m
     assert captured["verify_ssl"] is False
     assert captured["poll_interval"] == 2.5
     assert captured["poll_timeout"] == 42.0
-    # No placeholder identifiers or hard-coded from_pat call remain in the cell.
-    source = _source(_notebook(name)["cells"][0])
-    assert "ACCOUNT.snowflakecomputing.com" not in source
-    assert "from_pat(" not in source
 
 
 def _job_body(name: str) -> dict:
