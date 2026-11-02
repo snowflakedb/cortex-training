@@ -45,46 +45,32 @@ chmod 600 ~/.snowflake/connections.toml
 cortex-training --connection training capacity
 ```
 
-Set `SNOWFLAKE_DEFAULT_CONNECTION_NAME=training`, configure
+To run commands without `--connection`, save the profile as the one Cortex
+Training uses with `cortex-training login training`. Without a saved profile,
+Cortex Training uses Snowflake's default profile: set
+`SNOWFLAKE_DEFAULT_CONNECTION_NAME=training`, configure
 `default_connection_name = "training"` in Snowflake's `config.toml`, or name
-the profile `[default]` to run `cortex-training capacity` without
-`--connection`.
+the profile `[default]`.
 
 ## JSON connection file
 
-Existing JSON connection files still work with `--config`, and as an example's `config=`, but
-they're deprecated: each use prints a warning, and they stop working in a future release.
-Convert one into a profile with `cortex-training login --convert-legacy-config FILE`.
-From a clone, copy the [template](connection.json.template) to a location outside the repository:
+Before connection profiles, Cortex Training connected with a JSON file holding
+a host, a programmatic access token (`pat`), a database, and a schema (the
+[template](connection.json.template) shows the format). New setups should use
+a profile, as above.
+
+If you already have one, convert it into a profile with one command:
 
 ```bash
-cp docs/getting-started/connection.json.template ~/cortex-training-config.json
+cortex-training login --convert-legacy-config ~/cortex-training-config.json
 ```
 
-Otherwise create it by hand:
-
-```json
-{
-  "host": "ACCOUNT.snowflakecomputing.com",
-  "pat": "YOUR_PROGRAMMATIC_ACCESS_TOKEN",
-  "database": "CORTEX_TRAINING_DB",
-  "schema": "PUBLIC"
-}
-```
-
-Fill in the account host, programmatic access token, database, and schema. The
-template also lists the optional `endpoint`, `poll_interval`, `poll_timeout`,
-and `verify_ssl` settings with their defaults. Do not commit the file: it holds
-your token.
-
-Pass it to each command:
-
-```bash
-cortex-training --config ~/cortex-training-config.json capacity
-```
-
-`cortex-training login` no longer remembers a JSON file; run
-`cortex-training login` with no arguments to set up a profile instead.
+It shows every change and asks first; see
+[authentication](authentication.md#option-b-json-config-legacy). Until you
+convert, the file keeps working the ways it did, each with a deprecation
+warning: `--config FILE`, `CORTEX_TRAINING_CONFIG`, a file remembered with
+`cortex-training login FILE`, and a recipe's `config=`. JSON files stop working
+in a future release.
 
 `capacity` with no `--hardware` lists every GPU type. See
 [GPU hardware](../concepts/hardware.md).

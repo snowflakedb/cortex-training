@@ -115,26 +115,11 @@ role and the database, and how to fix it: create it, ask an admin for
 
 ### Option B: JSON config (legacy)
 
-Create a JSON file outside the repository:
-
-```json
-{
-  "host": "ACCOUNT.snowflakecomputing.com",
-  "pat": "YOUR_PAT",
-  "database": "CORTEX_TRAINING_DB",
-  "schema": "PUBLIC"
-}
-```
-
-Pass it to each command with `--config`:
-
-```bash
-cortex-training --config ~/cortex-training-config.json capacity
-```
-
-`cortex-training login` no longer remembers a JSON file. To set things up once,
-use a Snowflake connection profile (Option A), or run `cortex-training login`,
-which creates or picks one for you.
+Before connection profiles, Cortex Training connected with a JSON file
+(`host`, `pat`, `database`, `schema`). For a new setup, use a profile (Option
+A). An existing file keeps working the ways it did, each with a deprecation
+warning, until a future release: `--config FILE`, `CORTEX_TRAINING_CONFIG`, a
+file remembered with `cortex-training login FILE`, and a recipe's `config=`.
 
 **Convert a JSON config into a profile.** If you already use a JSON config, one
 command turns it into a Snowflake connection profile:
@@ -167,9 +152,9 @@ Then it asks before each step:
 
 Either every change happens, or every file is put back as it was.
 
-### Option C: Environment variables
+### Option C: Environment variables (CI)
 
-Set credentials directly in your shell:
+For CI and other places without a profile, set credentials in the environment:
 
 ```bash
 export CORTEX_TRAINING_HOST="ACCOUNT.snowflakecomputing.com"
@@ -184,11 +169,15 @@ Then run commands directly:
 cortex-training capacity
 ```
 
-Environment variables override both `connections.toml` and JSON config values.
-This is useful for CI/CD pipelines or when you don't want secrets in files.
+`CORTEX_TRAINING_HOST` and `CORTEX_TRAINING_PAT` are meant for machines with no
+profile. If you also have a profile, they're still used for now, with a
+warning that the profile will be used instead in a future release.
+`CORTEX_TRAINING_DATABASE` and `CORTEX_TRAINING_SCHEMA` choose the database and
+schema with any connection.
 
-Snowflake-prefixed variants (`SNOWFLAKE_PAT`, `SNOWFLAKE_HOST`,
-`SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA`) are also accepted.
+The Snowflake-prefixed variants (`SNOWFLAKE_PAT`, `SNOWFLAKE_HOST`,
+`SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA`) still work, with a deprecation
+warning; use the `CORTEX_TRAINING_` names instead.
 
 ## Troubleshooting
 

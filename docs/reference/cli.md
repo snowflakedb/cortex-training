@@ -63,11 +63,11 @@ See [jobs and sub-jobs](../concepts/jobs-and-subjobs.md) and the
 
 ## Quick Reference
 
-Global flags such as `--config`, `--job`, and `--compact` go **before** the
+Global flags such as `--connection`, `--job`, and `--compact` go **before** the
 subcommand. `--job-id` is an alias for `--job`:
 
 ```bash
-cortex-training --config config.json list
+cortex-training --connection training list
 cortex-training --job JOB_ID step
 cortex-training checkpoints JOB_ID
 ```
@@ -1101,24 +1101,20 @@ cortex-training tui                 # opens the job list of the configured datab
 cortex-training tui JOB_ID          # opens that job's dashboard directly
 ```
 
-Without login state, pass connection details the same way as the CLI:
+The TUI connects the same way as the CLI: the profile `cortex-training login`
+saved, or another one with `--connection`:
 
 ```bash
 cortex-training tui JOB_ID --connection training
-cortex-training tui JOB_ID --config config.json
-cortex-training tui JOB_ID --host ACCOUNT.snowflakecomputing.com --pat YOUR_PAT \
-  --database CORTEX_TRAINING_DB --schema PUBLIC --endpoint cortex-training
 cortex-training tui JOB_ID --base-url http://localhost:8084   # local/mock
 ```
 
-Keep the PAT out of your shell history by exporting it instead (omit `JOB_ID`
-to open the job list):
+The old forms still work, each with a deprecation warning:
 
 ```bash
-export CORTEX_TRAINING_PAT='YOUR_PROGRAMMATIC_ACCESS_TOKEN'
-cortex-training tui \
-  --host ACCOUNT.snowflakecomputing.com \
-  --database CORTEX_TRAINING_DB --schema PUBLIC
+cortex-training tui JOB_ID --config config.json
+cortex-training tui JOB_ID --host ACCOUNT.snowflakecomputing.com --pat YOUR_PAT \
+  --database CORTEX_TRAINING_DB --schema PUBLIC --endpoint cortex-training
 ```
 
 No command, the TUI included, creates the configured database or schema; when
@@ -2042,19 +2038,25 @@ usage: cortex-training --job JOB_ID fwd-bwd [-h] json_file
 Connection values can also come from:
 
 ```bash
-CORTEX_TRAINING_CONNECTION
-SNOWFLAKE_DEFAULT_CONNECTION_NAME
-CORTEX_TRAINING_CONFIG
-CORTEX_TRAINING_BASE_URL
-CORTEX_TRAINING_HOST
-SNOWFLAKE_HOST
-CORTEX_TRAINING_PAT
-SNOWFLAKE_PAT
+SNOWFLAKE_DEFAULT_CONNECTION_NAME   # Snowflake's default profile
 CORTEX_TRAINING_DATABASE
-SNOWFLAKE_DATABASE
 CORTEX_TRAINING_SCHEMA
-SNOWFLAKE_SCHEMA
+CORTEX_TRAINING_HOST                # CI, with no profile
+CORTEX_TRAINING_PAT                 # CI, with no profile
 CORTEX_TRAINING_ENDPOINT
+CORTEX_TRAINING_BASE_URL            # local or mock server
+```
+
+These still work, each with a deprecation warning, and stop working in a
+future release:
+
+```bash
+CORTEX_TRAINING_CONNECTION          # use --connection, or cortex-training login
+CORTEX_TRAINING_CONFIG              # convert with login --convert-legacy-config
+SNOWFLAKE_HOST                      # use CORTEX_TRAINING_HOST
+SNOWFLAKE_PAT                       # use CORTEX_TRAINING_PAT
+SNOWFLAKE_DATABASE                  # use CORTEX_TRAINING_DATABASE
+SNOWFLAKE_SCHEMA                    # use CORTEX_TRAINING_SCHEMA
 ```
 
 `CORTEX_TRAINING_DISABLE_LOCAL_TRAINING_METRICS` (truthy) stops the client
@@ -2085,14 +2087,14 @@ minimum 16 KiB). Frames larger than that are split into request chunks.
 
 ### Troubleshooting
 
-If you see `provide --base-url for local/mock use, or both --host and --pat`,
-the CLI found a `host` but no PAT. Add `"pat": "..."` to `config.json` or set
-`CORTEX_TRAINING_PAT`.
+If no profile is found, run `cortex-training login` to set one up, or pass
+`--connection NAME`. With no old connection form in use, the CLI uses the
+profile `cortex-training login` saved, then the Snowflake Connector's default
+profile.
 
-If no legacy config or complete direct connection is present, the CLI falls
-back to the Snowflake Connector's configured default. If your profile is not
-named `default`, pass `--connection NAME` or set
-`SNOWFLAKE_DEFAULT_CONNECTION_NAME`.
+If you see `provide --base-url for local/mock use, or both --host and --pat`,
+the CLI found a `host` but no PAT. Set `CORTEX_TRAINING_PAT`, add `"pat": "..."`
+to an old JSON file, or switch to a profile with `cortex-training login`.
 
 If Snowflake rejects your PAT, the CLI keeps the original error and adds next
 steps: `394400 (08001) ... Programmatic access token is invalid` from a
