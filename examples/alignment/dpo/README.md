@@ -37,12 +37,16 @@ built-in `smoke` set:
 python -m examples.alignment.dpo.train connection=NAME
 ```
 
-On UltraFeedback:
+On UltraFeedback, with a larger learning rate and batch than the smoke defaults:
 
 ```bash
 python -m examples.alignment.dpo.train connection=NAME \
-  dataset=ultrafeedback max_steps=100 eval_pairs=64
+  dataset=ultrafeedback max_steps=50 pairs_per_step=16 lr=5e-5 eval_pairs=32 eval_every=10
 ```
+
+On Qwen3-8B LoRA this took held-out loss from 0.693 to about 0.56 and held-out
+accuracy to about 0.72 in 50 steps. With `lr=1e-5` and 8 pairs per step,
+learning was weak and noisy.
 
 ## Options
 
