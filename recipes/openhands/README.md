@@ -60,7 +60,8 @@ The run script installs OpenHands itself.
 
 The Arctic Platform launcher reads its connection only from `ARCTIC_CORTEX_*`
 environment variables, so `cortex-training login` alone is not enough. Export
-them from the config JSON you log in with:
+them from the config JSON you log in with (this uses
+[`jq`](https://jqlang.org/download/)):
 
 ```bash
 cfg=~/cortex-training-config.json
