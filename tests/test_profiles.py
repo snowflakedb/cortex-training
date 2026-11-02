@@ -371,3 +371,76 @@ def test_replacing_a_profile_drops_keys_not_given(snowflake_home):
     _profiles.write_profile("keys", {"account": "ACME", "private_key_file": "/k.p8"})
     _profiles.write_profile("keys", {"account": "ACME"})
     assert _profiles.read_profiles()["keys"] == {"account": "ACME"}
+
+
+# ─── A profile name used twice ──────────────────────────────────────────────
+
+DUPLICATED = """\
+# my profiles
+[demo]
+account = "ACME"
+user = "ME"
+
+[other]
+account = "B"
+user = "ME"
+
+[demo]  # pasted again
+account = "ACME"
+user = "ME"
+
+[demo]
+account = "C"
+user = "ME"
+"""
+
+
+def test_a_duplicated_profile_says_which_lines_and_how_to_fix_it(snowflake_home):
+    (snowflake_home / "connections.toml").write_text(DUPLICATED)
+    with pytest.raises(_profiles.DuplicateProfilesError) as caught:
+        _profiles.read_profiles()
+    assert caught.value.duplicates == {"demo": [2, 10, 14]}
+    assert "has 3 profiles named demo (lines 2, 10 and 14)." in str(caught.value)
+    assert "Run `cortex-training login` to fix it" in str(caught.value)
+
+
+def test_duplicates_are_renamed_after_a_backup_and_nothing_else_changes(snowflake_home):
+    path = snowflake_home / "connections.toml"
+    path.write_text(DUPLICATED)
+    assert _profiles.planned_renames(path) == [(10, "demo", "demo-duplicate-1"), (14, "demo", "demo-duplicate-2")]
+    backup, renames = _profiles.rename_duplicates(path)
+    assert renames == [(10, "demo", "demo-duplicate-1"), (14, "demo", "demo-duplicate-2")]
+    assert backup == snowflake_home / "connections.toml.bak" and backup.read_text() == DUPLICATED
+    assert mode(backup) == 0o600
+    expected = DUPLICATED.replace("[demo]  # pasted", "[demo-duplicate-1]  # pasted")
+    expected = expected.replace('[demo]\naccount = "C"', '[demo-duplicate-2]\naccount = "C"')
+    assert path.read_text() == expected
+    assert list(_profiles.read_profiles()) == ["demo", "other", "demo-duplicate-1", "demo-duplicate-2"]
+    assert _profiles.find_duplicates(path) == {}
+
+
+def test_a_renamed_copy_never_takes_a_name_already_in_use(snowflake_home):
+    path = snowflake_home / "connections.toml"
+    path.write_text('[demo]\nuser = "A"\n[demo-duplicate-1]\nuser = "B"\n[demo]\nuser = "C"\n')
+    _, renames = _profiles.rename_duplicates(path)
+    assert renames == [(5, "demo", "demo-duplicate-2")]
+
+
+def test_duplicates_in_config_toml_and_quoted_names_are_fixed_too(snowflake_home):
+    (snowflake_home / "config.toml").write_text(
+        'default_connection_name = "my demo"\n[connections."my demo"]\nuser = "A"\n[connections."my demo"]\nuser = "B"\n'
+    )
+    with pytest.raises(_profiles.DuplicateProfilesError) as caught:
+        _profiles.profile_file()
+    path = caught.value.path
+    assert path.name == "config.toml" and caught.value.duplicates == {"my demo": [2, 4]}
+    _profiles.rename_duplicates(path)
+    assert list(_profiles.read_profiles()) == ["my demo", "my demo-duplicate-1"]
+
+
+def test_other_broken_files_keep_the_plain_error(snowflake_home):
+    (snowflake_home / "connections.toml").write_text("[demo\nuser = 1\n")
+    with pytest.raises(_profiles.ProfileFileError) as caught:
+        _profiles.read_profiles()
+    assert not isinstance(caught.value, _profiles.DuplicateProfilesError)
+    assert str(caught.value).startswith("could not read ")

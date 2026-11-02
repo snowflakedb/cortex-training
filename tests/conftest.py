@@ -13,6 +13,20 @@ def _isolated_tui_cache(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_connection_files(tmp_path, monkeypatch):
+    """Never read the real Snowflake profiles, saved choice, or login.json.
+
+    ``SNOWFLAKE_HOME`` must exist, or the profile code falls back to ``~/.snowflake``.
+    Tests that need profiles write them under these folders.
+    """
+    snowflake = tmp_path / "isolated-snowflake"
+    snowflake.mkdir(exist_ok=True)
+    monkeypatch.setenv("SNOWFLAKE_HOME", str(snowflake))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "isolated-xdg"))
+    monkeypatch.delenv("SNOWFLAKE_DEFAULT_CONNECTION_NAME", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _one_terminal(monkeypatch):
     """Every test's TUI starts in the same terminal, whatever the run's own (a runner may set no
     TERM, a shell NO_COLOR): one of 24-bit color, without NO_COLOR. The TUI colors its screens by
