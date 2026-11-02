@@ -9,7 +9,7 @@
       "training_config": {
         "n_gpus": 16,
         "max_seq_len": 65536,
-        "train_batch_size": 1,
+        "train_batch_size": 2,
         "sp_size": 8,
         "gradient_clipping": 1.0,
         "attn_implementation": "flash_attention_3",

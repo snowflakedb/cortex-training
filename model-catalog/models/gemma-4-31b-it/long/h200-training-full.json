@@ -7,10 +7,10 @@
       "dtype": "bfloat16",
       "seed": 42,
       "training_config": {
-        "n_gpus": 8,
+        "n_gpus": 16,
         "sp_size": 8,
         "max_seq_len": 262144,
-        "train_batch_size": 1,
+        "train_batch_size": 2,
         "gradient_clipping": 1.0,
         "model_provider": "huggingface",
         "attn_implementation": "sdpa",
