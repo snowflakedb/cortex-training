@@ -1,10 +1,10 @@
 <h3 align="center">
-  <img src="assets/cortex_training_logo.svg" width=400px><br>
+  <img src="https://github.com/snowflakedb/cortex-training/raw/main/assets/cortex_training_logo.svg" width=400px><br>
 </h3>
 
 <div align="center">
 
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](https://github.com/snowflakedb/cortex-training/blob/main/LICENSE)
 [![PyPI](https://img.shields.io/pypi/v/cortex-training)](https://pypi.org/project/cortex-training/)
 
 </div>
@@ -20,11 +20,11 @@ using Cortex Training.
 
 | Area | What it contains | Start here |
 |---|---|---|
-| [`src/cortex_training/`](src/cortex_training/) | Python SDK, `ct` CLI, and terminal UI | [Python SDK](docs/reference/python-sdk.md) or [CLI reference](docs/reference/cli.md) |
-| [`recipes/`](recipes/README.md) | Runnable training loops, framework integrations, evaluations, inference, and deployment workflows | [Recipe index](recipes/README.md) |
-| [`model-catalog/`](model-catalog/README.md) | Job configurations organized by model, context length, GPU type, and training mode | [Model catalog](model-catalog/README.md) |
-| [`docs/`](docs/README.md) | Getting-started guides, concepts, operational guides, and API references | [Documentation index](docs/README.md) |
-| [`tests/`](tests/) | SDK, CLI, model-catalog, and recipe tests | [Development](#development) |
+| [`src/cortex_training/`](https://github.com/snowflakedb/cortex-training/blob/main/src/cortex_training/) | Python SDK, `ct` CLI, and terminal UI | [Python SDK](https://github.com/snowflakedb/cortex-training/blob/main/docs/reference/python-sdk.md) or [CLI reference](https://github.com/snowflakedb/cortex-training/blob/main/docs/reference/cli.md) |
+| [`recipes/`](https://github.com/snowflakedb/cortex-training/blob/main/recipes/README.md) | Runnable training loops, framework integrations, evaluations, inference, and deployment workflows | [Recipe index](https://github.com/snowflakedb/cortex-training/blob/main/recipes/README.md) |
+| [`model-catalog/`](https://github.com/snowflakedb/cortex-training/blob/main/model-catalog/README.md) | Job configurations organized by model, context length, GPU type, and training mode | [Model catalog](https://github.com/snowflakedb/cortex-training/blob/main/model-catalog/README.md) |
+| [`docs/`](https://github.com/snowflakedb/cortex-training/blob/main/docs/README.md) | Getting-started guides, concepts, operational guides, and API references | [Documentation index](https://github.com/snowflakedb/cortex-training/blob/main/docs/README.md) |
+| [`tests/`](https://github.com/snowflakedb/cortex-training/blob/main/tests/) | SDK, CLI, model-catalog, and recipe tests | [Development](#development) |
 
 ## Getting Started
 
@@ -41,8 +41,8 @@ using Cortex Training.
    Alternatively, `uv pip install cortex-training` installs the SDK and CLI
    without the recipes.
 2. **Get access** — you need a Snowflake account with Cortex Training enabled.
-   See [account setup](docs/getting-started/account_setup.md) for the full
-   walkthrough and [authentication](docs/getting-started/authentication.md) for
+   See [account setup](https://github.com/snowflakedb/cortex-training/blob/main/docs/getting-started/account_setup.md) for the full
+   walkthrough and [authentication](https://github.com/snowflakedb/cortex-training/blob/main/docs/getting-started/authentication.md) for
    PAT generation and connection configuration.
 3. **Connect** — Cortex Training signs in with a standard Snowflake
    connection profile, the same kind the Snowflake CLI and Python Connector
@@ -79,7 +79,7 @@ using Cortex Training.
    cortex-training login cortex-training
    ```
    Pass `--connection NAME` (or `connection=NAME` to a recipe) to use another
-   profile for one command. See [authentication](docs/getting-started/authentication.md)
+   profile for one command. See [authentication](https://github.com/snowflakedb/cortex-training/blob/main/docs/getting-started/authentication.md)
    for other sign-in methods, such as key pairs.
 
 ### Already using a JSON connection file?
@@ -108,45 +108,45 @@ python -m recipes.sft_quickstart.conversational.train max_steps=50
 
 It connects with the profile from step 3 and fine-tunes Qwen3-8B
 (full-parameter, four H200 GPUs) on a small bundled dataset. See the
-[SFT recipes](recipes/sft_quickstart/README.md) for other datasets, models, and
+[SFT recipes](https://github.com/snowflakedb/cortex-training/blob/main/recipes/sft_quickstart/README.md) for other datasets, models, and
 training options.
 
 ## Choose a recipe type
 
 | If you want to… | Recipe type | Start here |
 |---|---|---|
-| Fine-tune on conversations, labeled data, or agent traces | Supervised fine-tuning | [SFT recipes](recipes/sft_quickstart/README.md) |
-| Optimize model behavior using rewards | Reinforcement learning | [RL recipes](recipes/rl_quickstart/README.md) |
-| Transfer behavior from a teacher to a student | Distillation | [Distillation recipes](recipes/distillation/README.md) |
-| Train a draft model for faster inference | Speculative decoder training | [DFlash2 recipe](recipes/dflash2/README.md) |
-| Serve checkpoints, generate responses, or evaluate models | Inference and evaluation | [Inference recipes](recipes/inference/README.md) |
-| Create an OpenAI-compatible endpoint | Model deployment | [Deployment recipes](recipes/model_deployment/README.md) |
-| Use SkyRL, Tinker, OpenHands, or another system | Frameworks and agents | [Framework recipes](recipes/README.md) |
-| Learn the API building blocks or construct a custom loop | API requests | [API recipes](recipes/api_quickstart/README.md) |
+| Fine-tune on conversations, labeled data, or agent traces | Supervised fine-tuning | [SFT recipes](https://github.com/snowflakedb/cortex-training/blob/main/recipes/sft_quickstart/README.md) |
+| Optimize model behavior using rewards | Reinforcement learning | [RL recipes](https://github.com/snowflakedb/cortex-training/blob/main/recipes/rl_quickstart/README.md) |
+| Transfer behavior from a teacher to a student | Distillation | [Distillation recipes](https://github.com/snowflakedb/cortex-training/blob/main/recipes/distillation/README.md) |
+| Train a draft model for faster inference | Speculative decoder training | [DFlash2 recipe](https://github.com/snowflakedb/cortex-training/blob/main/recipes/dflash2/README.md) |
+| Serve checkpoints, generate responses, or evaluate models | Inference and evaluation | [Inference recipes](https://github.com/snowflakedb/cortex-training/blob/main/recipes/inference/README.md) |
+| Create an OpenAI-compatible endpoint | Model deployment | [Deployment recipes](https://github.com/snowflakedb/cortex-training/blob/main/recipes/model_deployment/README.md) |
+| Use SkyRL, Tinker, OpenHands, or another system | Frameworks and agents | [Framework recipes](https://github.com/snowflakedb/cortex-training/blob/main/recipes/README.md) |
+| Learn the API building blocks or construct a custom loop | API requests | [API recipes](https://github.com/snowflakedb/cortex-training/blob/main/recipes/api_quickstart/README.md) |
 
-The [complete recipe index](recipes/README.md) lists the individual workflows
+The [complete recipe index](https://github.com/snowflakedb/cortex-training/blob/main/recipes/README.md) lists the individual workflows
 and their entry points.
 
 ## How recipes work
 
 Recipes are runnable, end-to-end workflows that you can use as written or
-adapt. They build jobs from the [model catalog](model-catalog/README.md), which
+adapt. They build jobs from the [model catalog](https://github.com/snowflakedb/cortex-training/blob/main/model-catalog/README.md), which
 contains configurations organized by model, context length, GPU type, and
 training mode. Select those options on the command line instead of writing a
 complete job body.
 
 Each recipe README covers its prerequisites, commands, options, and expected
-results. See [model compatibility](docs/reference/model-compatibility.md) for
+results. See [model compatibility](https://github.com/snowflakedb/cortex-training/blob/main/docs/reference/model-compatibility.md) for
 the currently supported combinations.
 
 ## Build custom workflows
 
 | Interface | Best for | Reference |
 |---|---|---|
-| Complete recipes | Starting with an end-to-end workflow and adapting its task or training loop | [Recipe index](recipes/README.md) |
-| `CortexTrainingClient` | Cortex-specific recipes that create and manage job bodies directly, address operations by `job_id`, or need APIs such as capacity, logs, checkpoints, and model deployment | [Python SDK reference](docs/reference/python-sdk.md) |
-| `ArcticRLClient` | RL recipes that want a model-oriented interface over training, sampling, and log-probability workers, with `fwd_bwd`, `step`, `generate`, `log_probs`, and `sync_weights` operations | [Arctic Platform RL](https://github.com/Snowflake-AI-Research/Arctic-Platform/blob/main/docs/rl.md) · [Framework recipes](recipes/README.md) |
-| CLI and REST API | Controlling individual job and model operations | [CLI reference](docs/reference/cli.md) · [REST API reference](docs/reference/rest-api.md) |
+| Complete recipes | Starting with an end-to-end workflow and adapting its task or training loop | [Recipe index](https://github.com/snowflakedb/cortex-training/blob/main/recipes/README.md) |
+| `CortexTrainingClient` | Cortex-specific recipes that create and manage job bodies directly, address operations by `job_id`, or need APIs such as capacity, logs, checkpoints, and model deployment | [Python SDK reference](https://github.com/snowflakedb/cortex-training/blob/main/docs/reference/python-sdk.md) |
+| `ArcticRLClient` | RL recipes that want a model-oriented interface over training, sampling, and log-probability workers, with `fwd_bwd`, `step`, `generate`, `log_probs`, and `sync_weights` operations | [Arctic Platform RL](https://github.com/Snowflake-AI-Research/Arctic-Platform/blob/main/docs/rl.md) · [Framework recipes](https://github.com/snowflakedb/cortex-training/blob/main/recipes/README.md) |
+| CLI and REST API | Controlling individual job and model operations | [CLI reference](https://github.com/snowflakedb/cortex-training/blob/main/docs/reference/cli.md) · [REST API reference](https://github.com/snowflakedb/cortex-training/blob/main/docs/reference/rest-api.md) |
 
 Recipes can be built on either client. With `CortexTrainingClient`, the recipe
 creates the Cortex Training job and passes its `job_id` to each operation. With
@@ -158,24 +158,24 @@ integrations.
 
 ## Documentation
 
-- **New users:** [account setup and first job](docs/getting-started/README.md)
-- **Recipe users:** [complete recipe index](recipes/README.md)
-- **Model selection:** [model compatibility](docs/reference/model-compatibility.md)
-  and [model catalog](model-catalog/README.md)
+- **New users:** [account setup and first job](https://github.com/snowflakedb/cortex-training/blob/main/docs/getting-started/README.md)
+- **Recipe users:** [complete recipe index](https://github.com/snowflakedb/cortex-training/blob/main/recipes/README.md)
+- **Model selection:** [model compatibility](https://github.com/snowflakedb/cortex-training/blob/main/docs/reference/model-compatibility.md)
+  and [model catalog](https://github.com/snowflakedb/cortex-training/blob/main/model-catalog/README.md)
 - **Core concepts:** [jobs, lifecycle, checkpoints, hardware, and
-  sizing](docs/README.md)
-- **Operations:** [job management](docs/guides/operations/manage-jobs.md),
-  [logs and metrics](docs/guides/operations/logs-and-metrics.md), and
-  [troubleshooting](docs/reference/troubleshooting.md)
-- **API development:** [CLI](docs/reference/cli.md), [Python
-  SDK](docs/reference/python-sdk.md), and [REST API](docs/reference/rest-api.md)
+  sizing](https://github.com/snowflakedb/cortex-training/blob/main/docs/README.md)
+- **Operations:** [job management](https://github.com/snowflakedb/cortex-training/blob/main/docs/guides/operations/manage-jobs.md),
+  [logs and metrics](https://github.com/snowflakedb/cortex-training/blob/main/docs/guides/operations/logs-and-metrics.md), and
+  [troubleshooting](https://github.com/snowflakedb/cortex-training/blob/main/docs/reference/troubleshooting.md)
+- **API development:** [CLI](https://github.com/snowflakedb/cortex-training/blob/main/docs/reference/cli.md), [Python
+  SDK](https://github.com/snowflakedb/cortex-training/blob/main/docs/reference/python-sdk.md), and [REST API](https://github.com/snowflakedb/cortex-training/blob/main/docs/reference/rest-api.md)
 
 ## Development
 
 - **Contributing to the client or recipes** — see the [contributing
-  guides](docs/contributing/) and [recipe
-  template](docs/contributing/example-template.md). Install development
+  guides](https://github.com/snowflakedb/cortex-training/blob/main/docs/contributing/) and [recipe
+  template](https://github.com/snowflakedb/cortex-training/blob/main/docs/contributing/example-template.md). Install development
   dependencies with `uv pip install -e ".[dev]"` and run
   `python3 -m pytest tests/ -q`.
 - **Building a distributable package** — use
-  [`./build_wheel.sh`](build_wheel.sh).
+  [`./build_wheel.sh`](https://github.com/snowflakedb/cortex-training/blob/main/build_wheel.sh).
