@@ -2843,6 +2843,23 @@ tensor[:, i] is the log probability of input_ids[:, i + 1]
 This is an ArcticTraining processing convention, not a REST-level field
 requirement.
 
+### 10.5 Rank assignment
+
+`context.balance_batch` chooses the row order used before data-parallel
+dispatch. The same key is accepted on a flat batch. A missing key balances.
+
+| Value | Behavior |
+|---|---|
+| omitted or `true` | Balance. A request without ZoRRo balances by sample length. A ZoRRo request (`zorro_train_enable` true) balances whole prompt groups and requires `sp_size` of 1. Any other `sp_size` is rejected. |
+| `false` | Keep arrival order. This is the opt-out, including for a ZoRRo request that runs with sequence parallelism. |
+
+`load_balancer`, `zorro_load_balancer`, and `zorro_train_load_balancer` are
+ignored. They do not opt out. Send `balance_batch` false.
+
+When ZoRRo balancing is on, `prompt_group_ids` (one integer per row) names the
+prompt group. The same key is what a prompt-mean loss uses for its counts.
+Omitting the ids leaves grouping to the prompt columns.
+
 ---
 
 ## 11. Result summary
