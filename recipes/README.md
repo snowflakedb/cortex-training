@@ -67,7 +67,7 @@ python -m recipes.sft_quickstart.conversational.train
 python -m recipes.rl_quickstart.math_grpo.train
 python -m recipes.distillation.on_policy.train
 python -m recipes.inference.serve
-python -m recipes.model_deployment.deploy config=/path/to/config.json   # needs a PAT; not deprecated here
+python -m recipes.model_deployment.deploy       # needs a profile that signs in with a PAT
 ```
 
 Every recipe resolves its connection the same way the CLI does:
@@ -84,7 +84,8 @@ Every recipe resolves its connection the same way the CLI does:
   saved is used, then the Snowflake default connection profile.
 
 Each run logs the target it connected to and the source, never the token. The
-`model_deployment` recipe needs a PAT (see its README).
+`model_deployment` recipe needs a profile that signs in with a programmatic
+access token (see its README).
 
 `config=` and `connection=` only choose the connection, never a job body. The SFT, RL and
 inference recipes pick their job with these arguments (distillation uses

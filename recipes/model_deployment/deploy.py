@@ -82,16 +82,17 @@ def _write_delta(text: str) -> None:
 def main(config: Config) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     overrides = {"poll_timeout": config.timeout} if config.timeout is not None else {}
-    # Deployments still need a PAT (config=), since profile sign-ins aren't accepted
-    # there yet, so config= isn't reported as deprecated here.
-    resolved = resolve_example_connection(config.config, config.connection, config_deprecated=False, **overrides)
+    # The chat call sends a PAT, not a session token: a profile that signs in with one
+    # (as `cortex-training login` creates) provides it, like an old JSON config did.
+    resolved = resolve_example_connection(config.config, config.connection, **overrides)
     # Check before create_model_deployment: a run that cannot authenticate its
     # chat call must not start a deployment that holds GPUs.
     if not resolved.pat:
         raise ValueError(
-            "model_deployment calls the inference endpoint with a PAT, and this example "
-            f"only takes one from a JSON config file (you used {resolved.source}). "
-            "Pass config=<JSON file with host and pat>."
+            "model_deployment calls the inference endpoint with a programmatic access token (PAT), "
+            f"and {resolved.source} doesn't sign in with one. Use a profile with "
+            'authenticator = "PROGRAMMATIC_ACCESS_TOKEN" (`cortex-training login` creates one), '
+            "or pass connection=NAME for one."
         )
     client = resolved.client
 

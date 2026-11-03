@@ -41,12 +41,14 @@ cd Arctic-Platform/recipes/rl/skyrl/simple_gsm8k_cortex
 ## Configure
 
 ```bash
-cfg=~/cortex-training-config.json
-export ARCTIC_CORTEX_HOST=$(jq -r .host "$cfg")
-export ARCTIC_CORTEX_DATABASE=$(jq -r .database "$cfg")
-export ARCTIC_CORTEX_SCHEMA=$(jq -r .schema "$cfg")
-export ARCTIC_CORTEX_PAT=$(jq -r .pat "$cfg")
+eval "$(python -m cortex_training.env)"     # fish: python -m cortex_training.env | source
 ```
+
+This sets `ARCTIC_CORTEX_HOST`, `ARCTIC_CORTEX_DATABASE`, `ARCTIC_CORTEX_SCHEMA`
+and `ARCTIC_CORTEX_PAT` from the profile `cortex-training login` saved (add
+`connection=NAME` for another). The profile must sign in with a programmatic
+access token (PAT), as profiles `cortex-training login` creates do. Run it in a
+shell where cortex-training is installed; it works from any folder.
 
 ## Run
 
@@ -92,8 +94,8 @@ bash run_qwen3_0.6b_gsm8k_grpo_cortex.sh trainer.resume_mode=latest
 ```
 
 Arguments are forwarded to the trainer, so this overrides the default. From a
-new terminal, re-export `SKYRL_HOME` and the four `ARCTIC_CORTEX_*` values
-first; the dataset and checkpoints are still on disk.
+new terminal, re-export `SKYRL_HOME` and run the `cortex_training.env` line
+above first; the dataset and checkpoints are still on disk.
 
 ## More detail
 

@@ -64,6 +64,27 @@ These fail with an error that says what's wrong:
 emits a `FutureWarning` and will be removed in a future release. Use
 `from_configs()` instead.
 
+### Export the connection for other tools
+
+Some tools, such as the Arctic Platform launcher used by the OpenHands, SkyRL,
+Harbor and prime-rl recipes, don't use this client. They read
+`ARCTIC_CORTEX_HOST`, `ARCTIC_CORTEX_DATABASE`, `ARCTIC_CORTEX_SCHEMA` and
+`ARCTIC_CORTEX_PAT` from the environment. `cortex_training.env` prints them for
+your shell to set, from the same connection `from_configs()` picks:
+
+```bash
+eval "$(python -m cortex_training.env)"                   # bash, zsh
+python -m cortex_training.env | source                    # fish
+eval "$(python -m cortex_training.env connection=NAME)"   # another profile
+```
+
+The connection must sign in with a programmatic access token (PAT), such as a
+profile with `authenticator = "PROGRAMMATIC_ACCESS_TOKEN"` (as
+`cortex-training login` creates), or `CORTEX_TRAINING_HOST` and
+`CORTEX_TRAINING_PAT`. The host is the form HTTPS calls use: an underscore in
+the account label becomes a dash. It reads only local files, and it never
+writes the PAT to a terminal: run on its own, it prints how to use it instead.
+
 Tuning knobs on the constructor: `endpoint`, `poll_interval` (0.5s),
 `poll_timeout` (1800s), `poll_backoff_multiplier` (1.25), `poll_max_interval`
 (6s), `pool_maxsize` (1024), `max_retries` (10), and `request_timeout`

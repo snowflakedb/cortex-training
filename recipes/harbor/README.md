@@ -81,16 +81,17 @@ The run script installs OpenHands and Harbor itself.
 
 The Arctic Platform launcher reads its connection only from `ARCTIC_CORTEX_*`
 environment variables, so `cortex-training login` alone is not enough. Export
-them from the config JSON you log in with (this uses
-[`jq`](https://jqlang.org/download/)):
+them from your profile:
 
 ```bash
-cfg=~/cortex-training-config.json
-export ARCTIC_CORTEX_HOST=$(jq -r .host "$cfg")
-export ARCTIC_CORTEX_DATABASE=$(jq -r .database "$cfg")
-export ARCTIC_CORTEX_SCHEMA=$(jq -r .schema "$cfg")
-export ARCTIC_CORTEX_PAT=$(jq -r .pat "$cfg")
+eval "$(python -m cortex_training.env)"     # fish: python -m cortex_training.env | source
 ```
+
+This sets `ARCTIC_CORTEX_HOST`, `ARCTIC_CORTEX_DATABASE`, `ARCTIC_CORTEX_SCHEMA`
+and `ARCTIC_CORTEX_PAT` from the profile `cortex-training login` saved (add
+`connection=NAME` for another). The profile must sign in with a programmatic
+access token (PAT), as profiles `cortex-training login` creates do. Run it in a
+shell where cortex-training is installed; it works from any folder.
 
 ## 1. Evaluate on the sandbox training uses
 

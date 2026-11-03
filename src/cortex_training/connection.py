@@ -104,6 +104,36 @@ def resolve_connection(
     examples have always accepted. ``overrides`` takes keys listed in
     ``_OVERRIDABLE``.
     """
+    args = _resolved_args(config, connection, default_database=default_database, strict_config=strict_config, overrides=overrides)
+    client = _cli.build_client(args, CortexTrainingClient)
+    for note in args._deprecations:
+        logger.warning("%s", note)
+    if args.use_connection_profile:
+        resolution = getattr(args, "resolution", None) or _cli._picker_choice(args)
+        # A profile that signs in with a PAT holds the same token an old JSON file did.
+        pat = profile_pat(resolution.profile) if resolution.profile else resolution.pat
+    else:
+        pat = None if args.base_url else args.pat
+    return ResolvedConnection(
+        client=client,
+        source=_source_label(args),
+        host=_host_of(args, client),
+        database=client.database,
+        schema=client.schema,
+        verify_ssl=not args.no_verify_ssl,
+        pat=pat,
+    )
+
+
+def _resolved_args(
+    config: str | None,
+    connection: str | None,
+    *,
+    default_database: str | None,
+    strict_config: bool,
+    overrides: Mapping[str, Any] | None,
+) -> argparse.Namespace:
+    """The CLI's resolution of ``config`` and ``connection``, checked, without signing in."""
     if config and connection:
         raise ValueError("pass either config= or connection=, not both")
     extra = dict(overrides or {})
@@ -144,19 +174,84 @@ def resolve_connection(
             raise ValueError(
                 "connection needs `host` and `pat` (or `base_url` for local use)"
             )
+    return args
 
-    client = _cli.build_client(args, CortexTrainingClient)
-    for note in args._deprecations:
-        logger.warning("%s", note)
-    pat = None if args.use_connection_profile or args.base_url else args.pat
-    return ResolvedConnection(
-        client=client,
-        source=_source_label(args),
-        host=_host_of(args, client),
-        database=client.database,
-        schema=client.schema,
-        verify_ssl=not args.no_verify_ssl,
+
+def profile_pat(profile: str) -> str | None:
+    """The programmatic access token ``profile`` signs in with, or None if it signs in another way."""
+    from cortex_training import _profiles
+
+    values = _profiles.read_profiles().get(profile) or {}
+    token = values.get("token")
+    if str(values.get("authenticator") or "").strip().lower() == "programmatic_access_token" and isinstance(token, str):
+        return token.strip() or None
+    return None
+
+
+@dataclass(frozen=True)
+class PatCredentials:
+    """What a tool that sends a PAT itself needs: where to call, the token, and the database and schema."""
+
+    # The host as HTTPS calls use it: an underscore account label becomes a dash (see rest_host).
+    host: str
+    pat: str = field(repr=False)
+    database: str
+    schema: str
+    # Human-readable origin, e.g. ``connection profile 'training'``.
+    source: str
+    # Deprecation notes for an old connection form, for the caller to show.
+    notes: tuple[str, ...] = ()
+
+
+def pat_credentials(
+    connection: str | None = None,
+    *,
+    default_database: str | None = None,
+) -> PatCredentials:
+    """Resolve a connection like :func:`resolve_connection`, without signing in, and return its PAT.
+
+    Reads only local files. Raises ValueError when the connection doesn't sign in
+    with a PAT (for example, a profile with a key file or browser sign-in), saying
+    how to get one that does.
+    """
+    from cortex_training import _picker
+    from cortex_training.client.auth import rest_host
+
+    args = _resolved_args(
+        None, connection, default_database=default_database or _picker.DEFAULT_DATABASE, strict_config=False, overrides=None
+    )
+    if args.base_url:
+        raise ValueError("a base_url connection (a local or mock server) has no PAT to export")
+    if args.use_connection_profile:
+        resolution = args.resolution = _cli._picker_choice(args)
+        if resolution.profile is None:
+            host, pat = resolution.host, resolution.pat
+        else:
+            from cortex_training import _profiles
+
+            values = _profiles.read_profiles().get(resolution.profile) or {}
+            pat = profile_pat(resolution.profile)
+            account = values.get("account")
+            host = values.get("host") or (f"{account}.snowflakecomputing.com" if account else None)
+        database, schema = resolution.database, resolution.schema
+    else:
+        host, pat, database, schema = args.host, args.pat, args.database, args.schema or "PUBLIC"
+    source = _source_label(args)
+    if not pat:
+        raise ValueError(
+            f"{source} doesn't sign in with a programmatic access token (PAT), and this needs one. "
+            "Use a profile with authenticator = \"PROGRAMMATIC_ACCESS_TOKEN\" (`cortex-training login` "
+            "creates one), or pass connection=NAME for one."
+        )
+    if not host:
+        raise ValueError(f"{source} has no host or account to connect to")
+    return PatCredentials(
+        host=rest_host(_cli._normalize_host(str(host))),
         pat=pat,
+        database=database,
+        schema=schema,
+        source=source,
+        notes=tuple(args._deprecations),
     )
 
 
