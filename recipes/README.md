@@ -14,6 +14,7 @@ type on the command line instead of writing a job file.
 | [Model deployment streaming](model_deployment/README.md) | OpenAI-compatible model deployment, streamed chat | Open weights, checkpoints |
 | [DFlash2 draft](dflash2/README.md) | Speculative-decoding draft training, then serving with the target | Target-written chats (UltraChat prompts) |
 | [SkyRL GRPO](skyrl/gsm8k_grpo/README.md) | SkyRL trainer on CPU driver + Cortex training/sampling sub-jobs | GSM8K |
+| [TRL GRPO](trl/README.md) | TRL `AsyncGRPOTrainer` on a CPU driver + Cortex training/sampling sub-jobs | GSM8K, BIRD |
 | [prime-rl GRPO](prime-rl/README.md) | prime-rl orchestrator on a CPU driver + Cortex training/sampling sub-jobs | i3_math (math), r2e-gym (SWE) |
 | [Tinker Cookbook](tinker/README.md) | Run `tinker-cookbook` recipes or `ServiceClient` on Cortex | GSM8K, MATH, etc. |
 | [Harbor RL](harbor/README.md) | Go from `harbor run` evals to RL on the same tasks, sandbox and verifier | Your Harbor tasks (example: SWE-smith code localization) |
@@ -32,6 +33,7 @@ recipes/
 ├── model_deployment/        # deploy.py, streaming.py, configs/
 ├── api_quickstart/          # raw REST API request bodies
 ├── skyrl/                   # SkyRL GRPO recipe
+├── trl/                     # TRL GRPO (GSM8K and BIRD)
 ├── prime-rl/                # prime-rl GRPO integration
 ├── tinker/                  # tinker-cookbook integration
 ├── harbor/                  # RL post-training on Harbor tasks, from harbor run evals

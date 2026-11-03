@@ -29,6 +29,7 @@ EXAMPLE_FOLDERS = (
     "distillation",
     "dflash2",
     "skyrl/gsm8k_grpo",
+    "trl",
 )
 
 

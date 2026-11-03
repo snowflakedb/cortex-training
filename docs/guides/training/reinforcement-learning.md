@@ -16,6 +16,11 @@ with its trainer on a CPU driver and training and sampling in Cortex sub-jobs.
 Its GSM8K example lives in the Arctic Platform repository and has its own
 install.
 
+[TRL](../../../recipes/trl/README.md) runs GRPO from `AsyncGRPOTrainer` on a
+CPU driver, with training and sampling in Cortex sub-jobs. The GSM8K and BIRD
+drivers live in a `trl_gsm8k/` tree next to Arctic Platform
+`truwase/trl-grpo-rc5`.
+
 [prime-rl](../../../recipes/prime-rl/README.md) runs GRPO from its own orchestrator,
 driven by the Arctic Platform launcher, with training and sampling in Cortex
 sub-jobs. Its math (`i3_math`) and SWE (`r2e-gym`) examples live in the

@@ -92,7 +92,7 @@ customize the job.
 - [Python SDK reference](docs/reference/python-sdk.md): CortexTrainingClient API for programmatic workflows
 - [REST API reference](docs/reference/rest-api.md): HTTP endpoints and wire format
 - [Model compatibility](docs/reference/model-compatibility.md): supported models, methods, and hardware configurations
-- [Framework integrations](recipes/README.md): run SkyRL, tinker-cookbook, or your own agent on Cortex Training
+- [Framework integrations](recipes/README.md): run SkyRL, TRL, tinker-cookbook, or your own agent on Cortex Training
 
 ## Development
 

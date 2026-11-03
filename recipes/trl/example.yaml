@@ -1,0 +1,16 @@
+id: trl-grpo
+title: GRPO with TRL
+status: experimental
+task: rl
+framework: huggingface/trl
+methods:
+  - full-parameter
+models:
+  - Qwen/Qwen3-1.7B
+datasets:
+  - openai/gsm8k
+  - BIRD-SQL
+provenance:
+  project: Snowflake-AI-Research/Arctic-Platform
+  recipe: arctic_platform/integrations/trl/client.py
+last_validated: null
