@@ -18,7 +18,7 @@ install.
 
 [TRL](../../../recipes/trl/gsm8k_grpo/README.md) can also run GRPO against Cortex Training,
 with its trainer on a CPU driver and training and sampling in Cortex sub-jobs.
-Its GSM8K example lives next to an Arctic Platform checkout and has its own
+Its GSM8K example lives in the Arctic Platform repository and has its own
 install.
 
 [prime-rl](../../../recipes/prime-rl/README.md) runs GRPO from its own orchestrator,
