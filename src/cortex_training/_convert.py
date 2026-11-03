@@ -482,15 +482,16 @@ def _without_pat(raw: dict[str, Any]) -> dict[str, Any]:
 class _Snapshot:
     """A file's bytes (or its absence), to put back if a later step fails."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, lock: bool = True) -> None:
         self.path = path
+        self.lock = lock
         self.text = path.read_text(encoding="utf-8") if path.is_file() else None
 
     def restore(self) -> None:
         if self.text is None:
             self.path.unlink(missing_ok=True)
         else:
-            _profiles.write_file(self.path, self.text)
+            _profiles.write_file(self.path, self.text, lock=self.lock)
 
 
 def apply(plan: Plan, old: OldConfig, check: Callable[[], None] | None = None) -> None:
@@ -500,14 +501,16 @@ def apply(plan: Plan, old: OldConfig, check: Callable[[], None] | None = None) -
     ``login.json`` are deleted only if it returns.
     """
     config_file = _picker.config_path()
-    snapshots = [_Snapshot(_profiles.profile_file()), _Snapshot(config_file), _Snapshot(plan.backup)]
+    # The old file, its .bak and login.json sit in the user's folders: written without a lock
+    # file, so none is left behind there.
+    snapshots = [_Snapshot(_profiles.profile_file()), _Snapshot(config_file), _Snapshot(plan.backup, lock=False)]
     removed: list[_Snapshot] = []
     try:
         _profiles.write_profile(plan.profile, plan.values)
         settings = json.dumps(plan.settings, indent=2) + "\n"
         _profiles.write_file(config_file, settings)
         _picker.load_config()  # Refuse settings that commands couldn't read back.
-        _profiles.write_file(plan.backup, json.dumps(_without_pat(old.raw), indent=2) + "\n")
+        _profiles.write_file(plan.backup, json.dumps(_without_pat(old.raw), indent=2) + "\n", lock=False)
         if check is not None:
             try:
                 check()
@@ -515,7 +518,7 @@ def apply(plan: Plan, old: OldConfig, check: Callable[[], None] | None = None) -
                 raise _NewProfileFailed() from exc
         # Delete last, once every write has worked and the new profile signs in.
         for path in [old.path, *([plan.login_file] if plan.login_file else [])]:
-            snapshot = _Snapshot(path)
+            snapshot = _Snapshot(path, lock=False)
             path.unlink()
             removed.append(snapshot)
     except BaseException as exc:
@@ -589,7 +592,7 @@ def run_convert(
     if _dropped_settings(old.settings):
         prompter.say(f"Not kept: {', '.join(_dropped_settings(old.settings))}. Pass them as {_flags_for(old.settings)}.")
     prompter.say()
-    prompter.say(f"Try it:  {style.cyan(f'cortex-training --connection {plan.profile} capacity')}")
+    prompter.say(f"Try it:  {style.cyan('cortex-training capacity')}")
     prompter.say()
     for line in _login.PRIVILEGE_NOTE:
         prompter.say(style.yellow(line))

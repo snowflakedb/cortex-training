@@ -218,7 +218,7 @@ def test_a_working_saved_profile_is_kept_by_default(isolated):
     write_profiles(isolated, PROFILES)
     _picker.save_profile("train")
     world = World(databases={"TRAIN_DB"})
-    code, summary, err = login(world, [""])
+    code, summary, err = login(world, ["", ""])
     assert code == 0
     assert "Cortex Training is set up to use profile train" in err and "It works. Keep using train?" in err
     assert summary["profile"] == "train" and summary["created_profiles"] == []
@@ -1087,7 +1087,7 @@ def test_login_says_what_its_checks_dont_cover(isolated):
     write_profiles(isolated, PROFILES)
     _picker.save_profile("train")
     world = World(databases={"TRAIN_DB"})
-    code, _, err = login(world, [""])
+    code, _, err = login(world, ["", ""])
     assert code == 0, err
     assert "Connected to Cortex Training on this account" in err
     assert "Cortex Training is enabled on this account" not in err
@@ -1107,7 +1107,7 @@ def test_the_note_is_yellow_in_a_terminal(isolated, monkeypatch):
     _picker.save_profile("train")
     world = World(databases={"TRAIN_DB"})
     stderr = Terminal()
-    code = _login.run_login(None, stdin=io.StringIO("\n"), stdout=io.StringIO(), stderr=stderr, interactive=True, open_client=world.open)
+    code = _login.run_login(None, stdin=io.StringIO("\n\n"), stdout=io.StringIO(), stderr=stderr, interactive=True, open_client=world.open)
     assert code == 0
     assert f"\x1b[33m{_login.PRIVILEGE_NOTE[0]}\x1b[0m" in stderr.getvalue()
 
@@ -1121,7 +1121,7 @@ def test_login_offers_to_fix_a_duplicated_profile_then_carries_on(isolated):
     _picker.save_profile("train")
     world = World(databases={"TRAIN_DB"})
     # Fix it now? Enter -> Keep using train? Enter
-    code, summary, err = login(world, ["", ""])
+    code, summary, err = login(world, ["", "", ""])
     assert code == 0, err
     assert f"connections.toml has 2 profiles named train (lines {lines[0]} and {lines[1]})." in err
     assert f"  2. Rename the profile train at line {lines[1]} to train-duplicate-1" in err
@@ -1142,3 +1142,15 @@ def test_declining_the_duplicate_fix_changes_nothing(isolated):
     assert (isolated / "connections.toml").read_text() == textwrap.dedent(text)
     assert not (isolated / "connections.toml.bak").exists()
     assert world.opened == []
+
+
+def test_keeping_the_saved_profile_offers_the_same_database_choice_as_login_name(isolated):
+    # Plain `login` that keeps the saved profile asks what `login NAME` asks.
+    write_profiles(isolated, PROFILES)
+    _picker.save_profile("train")
+    world = World(databases={"TRAIN_DB", "CORTEX_TRAINING_DB"})
+    code, summary, err = login(world, ["", ""])
+    assert code == 0, err
+    assert "It works. Keep using train?" in err
+    assert "Profile train uses database TRAIN_DB." in err and "Which database should Cortex Training use?" in err
+    assert summary["profile"] == "train"
