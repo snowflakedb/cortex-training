@@ -39,6 +39,10 @@ CONNECTION = os.environ.get("CORTEX_TRAINING_E2E_CONNECTION")
 CONFIG = os.environ.get("CORTEX_TRAINING_E2E_CONFIG")
 USE_DEFAULT = os.environ.get("CORTEX_TRAINING_E2E", "").lower() in ("1", "true", "yes")
 DEBUG_IMAGE_TAG = os.environ.get("DEBUG_IMAGE_TAG")
+# The environment the run started with, read at import, before any fixture runs.
+# conftest points SNOWFLAKE_HOME at an empty folder for every test, so the
+# examples get this one instead and find the profiles a customer would.
+RUN_ENV = dict(os.environ)
 # Per example. CI runs all of them within a fixed total budget.
 TIMEOUT_SECONDS = 3600
 
@@ -200,7 +204,7 @@ def test_example_runs(name, tmp_path, request):
         command.append(f"debug_image_tag={DEBUG_IMAGE_TAG}")
 
     try:
-        result = subprocess.run(command, cwd=REPO_ROOT, timeout=TIMEOUT_SECONDS)
+        result = subprocess.run(command, cwd=REPO_ROOT, env=RUN_ENV, timeout=TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
         # The example has usually submitted a job already, which may still be running.
         pytest.fail(f"{name} did not finish within {TIMEOUT_SECONDS}s: {' '.join(command)}")
