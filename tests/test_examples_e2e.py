@@ -1,13 +1,24 @@
 """Run the examples end to end against a live Cortex Training deployment.
 
-Skipped unless CORTEX_TRAINING_E2E_CONFIG names a connection file, the JSON the
-examples take as config= (docs/getting-started/connection.json.template). Each
-case runs one example as its README does, cut to a few steps, and passes when
-it exits cleanly. The DARE-Bench evaluation first builds the setup its README
-describes (a bench checkout, a sandbox venv, and reference predictions), which
-needs network access. These submit real jobs on real GPUs:
+Connects the way a customer does: through the Snowflake connection profile that
+`cortex-training login` saves (in $SNOWFLAKE_HOME, else ~/.snowflake). Examples
+run in a child process that inherits SNOWFLAKE_HOME, so a throwaway folder
+holding one profile works too. Skipped unless you opt in with one of:
 
-    CORTEX_TRAINING_E2E_CONFIG=~/conn.json python -m pytest tests/test_examples_e2e.py -v -s
+- CORTEX_TRAINING_E2E=1: the examples' default connection (the profile saved by
+  `cortex-training login`, else CORTEX_TRAINING_HOST and CORTEX_TRAINING_PAT
+  when no profile exists, as in CI).
+- CORTEX_TRAINING_E2E_CONNECTION=NAME: a named profile, passed to each example
+  as connection=NAME.
+- CORTEX_TRAINING_E2E_CONFIG=FILE: an old JSON connection file, passed as
+  config=FILE. It will be deprecated in a future release.
+
+Each case runs one example as its README does, cut to a few steps, and passes
+when it exits cleanly. The DARE-Bench evaluation first builds the setup its
+README describes (a bench checkout, a sandbox venv, and reference predictions),
+which needs network access. These submit real jobs on real GPUs:
+
+    CORTEX_TRAINING_E2E=1 python -m pytest tests/test_examples_e2e.py -v -s
 
 If DEBUG_IMAGE_TAG is set, every example also gets debug_image_tag=<tag>.
 """
@@ -23,7 +34,9 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+CONNECTION = os.environ.get("CORTEX_TRAINING_E2E_CONNECTION")
 CONFIG = os.environ.get("CORTEX_TRAINING_E2E_CONFIG")
+USE_DEFAULT = os.environ.get("CORTEX_TRAINING_E2E", "").lower() in ("1", "true", "yes")
 DEBUG_IMAGE_TAG = os.environ.get("DEBUG_IMAGE_TAG")
 # Per example. CI runs all of them within a fixed total budget.
 TIMEOUT_SECONDS = 3600
@@ -150,19 +163,34 @@ def dare_bench(tmp_path_factory):
     return {"bench_dir": bench_dir, "sandbox_python": python}
 
 
-@pytest.mark.skipif(CONFIG is None, reason="set CORTEX_TRAINING_E2E_CONFIG to a connection file to run the examples")
+def connection_args() -> list[str]:
+    """The example settings that choose the connection; empty means the examples' default."""
+    chosen = [n for n, v in (("CORTEX_TRAINING_E2E_CONNECTION", CONNECTION), ("CORTEX_TRAINING_E2E_CONFIG", CONFIG)) if v]
+    assert len(chosen) <= 1, f"set only one of CORTEX_TRAINING_E2E_CONNECTION and CORTEX_TRAINING_E2E_CONFIG"
+    if CONNECTION:
+        return [f"connection={CONNECTION}"]
+    if CONFIG:
+        config = Path(CONFIG).expanduser()
+        # Setting the variable opts in, so a value that names no file fails rather than skips.
+        assert config.is_file(), f"CORTEX_TRAINING_E2E_CONFIG is set to {CONFIG!r}, which is not a file"
+        return [f"config={config.resolve()}"]
+    return []
+
+
+@pytest.mark.skipif(
+    not (CONNECTION or CONFIG or USE_DEFAULT),
+    reason="set CORTEX_TRAINING_E2E=1 (or CORTEX_TRAINING_E2E_CONNECTION=NAME) to run the examples against your profile",
+)
 @pytest.mark.parametrize("name", list(EXAMPLES))
 def test_example_runs(name, tmp_path, request):
-    config = Path(CONFIG).expanduser()
-    # Setting the variable opts in, so a value that names no file fails rather than skips.
-    assert config.is_file(), f"CORTEX_TRAINING_E2E_CONFIG is set to {CONFIG!r}, which is not a file"
+    connection = connection_args()
 
     module, settings = EXAMPLES[name]
     values = {"log_path": tmp_path}
     if name == "dare_evaluate":
         # Requested here rather than as an argument, so only this case builds it.
         values.update(request.getfixturevalue("dare_bench"))
-    command = [sys.executable, "-m", module, f"config={config.resolve()}"]
+    command = [sys.executable, "-m", module, *connection]
     for setting in settings:
         # replace, not str.format, so a setting with a literal brace survives.
         for key, value in values.items():
