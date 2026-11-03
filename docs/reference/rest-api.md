@@ -346,11 +346,26 @@ only when the account does not need to limit who can start GPU training:
 GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE PUBLIC;
 ```
 
-A request without a required privilege returns 403 or 404. A job or schema the
-role cannot see is reported as not found, so the response does not reveal
-whether it exists. A missing `USE CORTEX TRAINING` returns 403 with a message
-such as `Your primary role <role> must have USE CORTEX TRAINING granted on
-ACCOUNT <account>`; the error code is `003001`.
+A request without a required privilege is refused with the status below. Where
+the cause is a missing privilege on something that may also not exist, the
+response is the same either way, so it does not reveal whether the object
+exists.
+
+| Cause | Status | Message |
+|---|---|---|
+| No `USE CORTEX TRAINING` (job creation) | 403, code `003001` | `... Your primary role <role> must have USE CORTEX TRAINING granted on ACCOUNT <account>.` |
+| Database or schema in the path not accessible | 400 | `Schema <database>.<schema> is not found or not authorized` |
+| No `CREATE EXPERIMENT` on the schema | 400 | `CREATE EXPERIMENT privilege required on schema <schema>` |
+| Named experiment not accessible | 400 | `Experiment <name> not found or not authorized` |
+| No `MODIFY` on the named experiment | 400 | `MODIFY privilege required on experiment <experiment>` |
+| External stage not accessible, or no `READ` on it | 400 | `Stage <stage> is not found or not authorized` |
+| Job not owned by the role, or not found | 404 | `Training job <job_id> not found in <schema>` |
+| Source checkpoint for a model deployment not accessible | 404 | `Source job was not found or is not authorized for the active roles` |
+| Chat completions: database, schema or deployment not accessible | 404 | `The requested model is not available.` |
+
+Chat completions report an inaccessible database or schema as 404, unlike the
+management API's 400, so that an inference request cannot tell whether a
+namespace exists.
 
 ---
 
