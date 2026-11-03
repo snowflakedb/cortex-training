@@ -892,7 +892,7 @@ def build_parser(
         metavar="PATH",
         help=(
             "Turn an old JSON config (host, PAT, database) into a Snowflake connection profile, "
-            "move its settings to config.json, and remove the old file. Asks before each step."
+            "and move its settings to config.json. The old file is kept. Asks before each step."
         ),
     )
     login.add_argument("--config", dest="login_config_option", help=argparse.SUPPRESS)
@@ -1031,6 +1031,7 @@ def _select_config(args: argparse.Namespace, *, load_login: bool) -> dict[str, A
     args._legacy_config_selected = False
     args._config_origin = None
     args._login_json_ignored = None
+    args._login_json_profile = None
     strict = getattr(args, "_strict_config", True)
     if getattr(args, "connection", None):
         return {}
@@ -1058,9 +1059,11 @@ def _select_config(args: argparse.Namespace, *, load_login: bool) -> dict[str, A
         return {}
     if not Path(login_config).expanduser().is_file():
         return {}
-    if _saved_profile():
+    saved = _saved_profile()
+    if saved:
         # A profile saved by the new `login` wins over the file the old `login` remembered.
         args._login_json_ignored = login_config
+        args._login_json_profile = saved
         return {}
     args.config = login_config
     args._legacy_config_selected = True
@@ -1154,7 +1157,32 @@ def _resolve_args(
         args.schema = "PUBLIC"
     args._typed = typed
     args._deprecations.extend(_old_connection_notes(args, typed))
+    args._terminal_notes = _terminal_notes(args)
     return args
+
+
+def _terminal_notes(args: argparse.Namespace) -> list[str]:
+    """Notes worth showing someone at a terminal, but not scripts or CI logs.
+
+    A ``login.json`` the saved profile overrides is kept on purpose, as the way
+    back to the old config, so it gets a note rather than a warning to convert.
+    """
+    if not args.use_connection_profile or not getattr(args, "_login_json_ignored", None):
+        return []
+    from cortex_training import _picker
+
+    return [
+        f"{_login_state_path()} is ignored because profile {args._login_json_profile} is saved. "
+        f'To use it again, remove "profile" from {_picker.config_path()}.'
+    ]
+
+
+def write_terminal_notes(args: argparse.Namespace, stream: TextIO) -> None:
+    """Write ``args``' terminal notes to ``stream``, only if it is a terminal."""
+    if not getattr(stream, "isatty", lambda: False)():
+        return
+    for note in getattr(args, "_terminal_notes", ()):
+        stream.write(f"note: {note}\n")
 
 
 def _old_connection_notes(args: argparse.Namespace, typed: Mapping[str, Any]) -> list[str]:
@@ -1166,12 +1194,6 @@ def _old_connection_notes(args: argparse.Namespace, typed: Mapping[str, Any]) ->
         return []  # A local or mock server, during development.
     if args.use_connection_profile:
         notes = []
-        ignored = getattr(args, "_login_json_ignored", None)
-        if ignored:
-            notes.append(
-                f"{_login_state_path()} is ignored because a profile is saved; run "
-                f"`cortex-training login --convert-legacy-config {ignored}` to convert and remove it."
-            )
         for name, flag in (("database", "--database"), ("schema", "--schema")):
             variable = f"SNOWFLAKE_{name.upper()}"
             if not typed[name] and not _env(f"CORTEX_TRAINING_{name.upper()}") and _env(variable):
@@ -2339,6 +2361,7 @@ def main(
         args = parse_args(argv, prog=prog, include_tui=include_tui)
         for note in getattr(args, "_deprecations", ()):
             stderr.write(f"warning: {note}\n")
+        write_terminal_notes(args, stderr)
         dry_run = (args.command == "submit" and args.dry_run) or (
             args.command == "model-deployment"
             and args.model_deployment_command == "create"

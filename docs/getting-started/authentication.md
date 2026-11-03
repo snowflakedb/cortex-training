@@ -186,8 +186,8 @@ Then it asks before each step:
    reads. If the database is missing, it shows the `CREATE DATABASE` statement
    and runs it only if you say yes. If a check fails, it says why and changes
    nothing.
-2. **It shows every change and asks once.** No is the default, because the
-   last change deletes the old file. The changes are:
+2. **It shows every change and asks once.** It never deletes or edits the old
+   file. The changes are:
    - adding the profile (named `cortex-training`, or the next free name);
    - saving it as `"profile"` in `cortex-training/config.json` in the Snowflake
      folder.
@@ -195,11 +195,19 @@ Then it asks before each step:
      `poll_interval`, `poll_timeout`, and `verify_ssl` aren't kept; the converter
      lists any that differ from the defaults, with the flags that set them
      (`--no-verify-ssl` for `verify_ssl: false`);
-   - saving a copy of the old file without the PAT, as `<file>.bak`;
-   - signing in with the new profile, to check that it works;
-   - only then, deleting the old file, and `login.json` if it points to that file.
+   - signing in with the new profile, to check that it works.
 
 Either every change happens, or every file is put back as it was.
+
+**Going back.** The old file is kept exactly as it was, and `login.json` is
+left alone. Once a profile is saved, commands use it ahead of the file
+`login.json` remembers. `--config FILE`, `CORTEX_TRAINING_CONFIG`, and a
+recipe's `config=FILE` still win over the profile, with a deprecation warning,
+so pass one of them to use the old file again. To stop using the profile,
+remove `"profile"` from `cortex-training/config.json` in your Snowflake folder
+(`$SNOWFLAKE_HOME`, `~/.snowflake`, or the platform folder; the converter prints
+the exact path), and optionally delete the profile from `connections.toml`.
+The converter prints these steps when it finishes.
 
 Until you convert, the file keeps working the ways it did. See
 [Older Connection Methods](../reference/cli.md#older-connection-methods) if the
