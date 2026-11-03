@@ -873,6 +873,15 @@ class _Login:
         if check.error:
             self.offer_delete(profile, signed_in=check.client is not None)
             raise ProfileFailed(profile, check.error)
+        separate = self.offer_separate_database(profile, check)
+        if separate is not None:
+            return separate
+        if not check.missing:
+            return check
+        return self.fix_database(check)
+
+    def offer_separate_database(self, profile: str, check: Check) -> Check | None:
+        """Offer a separate database when ``profile`` uses its own; return the settled copy, or None to keep it."""
         values = self.profiles()[profile]
         # A profile's own database may be a shared work database, so offer a
         # separate one, unless it already is Cortex Training's default.
@@ -895,9 +904,7 @@ class _Login:
             if choice == 1:
                 self.p.say()
                 return self.settle(self.copy_profile(profile))
-        if not check.missing:
-            return check
-        return self.fix_database(check)
+        return None
 
     def fix_database(self, check: Check) -> Check:
         who = f"role {check.role}" if check.role else "your role"
@@ -1011,7 +1018,9 @@ def run_login(
             prompter.say()
             if existing.usable:
                 if prompter.confirm(f"It works. Keep using {current}?", default=True):
-                    check, profile = existing, current
+                    # The same database choice `login NAME` offers.
+                    check = login.offer_separate_database(current, existing) or existing
+                    profile = check.profile
                 else:
                     prompter.say()
                     profile = login.pick(current)

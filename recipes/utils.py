@@ -108,7 +108,7 @@ def resolve_example_connection(
         raise ValueError("pass either config= or connection=, not both")
     if config and config_deprecated:
         logger.warning(
-            "config=%s (an old JSON config) is deprecated and will stop working in a future release. "
+            "config=%s (an old JSON config) will be deprecated in a future release. "
             "Convert it into a Snowflake connection profile with "
             "`cortex-training login --convert-legacy-config %s`, then pass connection=NAME.",
             config,

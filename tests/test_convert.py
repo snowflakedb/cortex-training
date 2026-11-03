@@ -200,7 +200,7 @@ def test_an_old_config_becomes_a_profile_and_settings(old_file, isolated):
     assert "  ✓ Database MY_DB is ready" in err
     assert "SHOW SCHEMAS LIKE 'RUNS' IN DATABASE MY_DB" in world.statements
     assert "You're all set. Cortex Training will use profile cortex-training." in err
-    assert "Try it:  cortex-training --connection cortex-training capacity" in err
+    assert "Try it:  cortex-training capacity" in err  # already saved as the one to use
     assert summary["profile"] == "cortex-training" and summary["deleted"] == [str(path)]
     assert PAT not in err and PAT not in json.dumps(summary)
 
@@ -425,10 +425,10 @@ def test_a_failed_write_puts_every_file_back(old_file, isolated, monkeypatch):
     path = old_file()
     real_write = _profiles.write_file
 
-    def fail_on_backup(target, text):
+    def fail_on_backup(target, text, **kwargs):
         if target.name.endswith(".bak"):
             raise OSError(28, "No space left on device")
-        real_write(target, text)
+        real_write(target, text, **kwargs)
 
     monkeypatch.setattr(_profiles, "write_file", fail_on_backup)
     code, _, err = convert(World(), path, YES)
@@ -616,3 +616,20 @@ def test_a_conversion_says_what_its_checks_dont_cover(old_file):
     assert code == 0, err
     assert "This profile connects to Cortex Training on this account. Your role may still lack" in err
     assert "USE CORTEX TRAINING" not in err
+
+
+def test_no_lock_file_is_left_next_to_the_old_config(old_file, tmp_path):
+    path = old_file()
+    code, _, err = convert(World(), path, YES)
+    assert code == 0, err
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith(".")) == []
+    assert path.with_name("ct-config.json.bak").exists()
+
+
+def test_a_rollback_leaves_no_lock_file_either(old_file, tmp_path):
+    path = old_file()
+    world = World()
+    world.profile_error = ApiError(403, "390100", "Programmatic access token is invalid")
+    code, _, _ = convert(world, path, YES)
+    assert code == 1 and path.exists()
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith(".")) == []

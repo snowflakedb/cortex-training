@@ -27,12 +27,58 @@ Cortex Training is Snowflake's serverless platform for post-training open-weight
    See [account setup](docs/getting-started/account_setup.md) for the full
    walkthrough and [authentication](docs/getting-started/authentication.md) for
    PAT generation and connection configuration.
-3. **Connect** — configure a standard
-   [Snowflake connection profile](docs/getting-started/setup.md), then:
+3. **Connect** — Cortex Training signs in with a standard Snowflake
+   connection profile, the same kind the Snowflake CLI and Python Connector
+   use. The easiest way to set one up is to run:
    ```bash
-   cortex-training --connection training capacity
-   # With a configured default profile: cortex-training capacity
+   cortex-training login
    ```
+   It creates or picks a profile, checks that it connects to Cortex Training,
+   and saves it as the one to use. Every command, the TUI, and the recipes then
+   use it with no extra arguments:
+   ```bash
+   cortex-training capacity
+   ```
+
+   To write the profile yourself instead, add it to `connections.toml` in your
+   Snowflake folder, usually `~/.snowflake/connections.toml`.
+   `cortex-training login` prints the exact file it uses; if it printed another
+   path, use that one:
+   ```toml
+   [cortex-training]
+   account = "ACCOUNT"
+   host = "ACCOUNT.snowflakecomputing.com"
+   user = "USER"
+   role = "ROLE"
+   authenticator = "PROGRAMMATIC_ACCESS_TOKEN"
+   token = "YOUR_PROGRAMMATIC_ACCESS_TOKEN"
+   database = "CORTEX_TRAINING_DB"
+   schema = "PUBLIC"
+   ```
+   Then protect the file (use the path `login` printed, if different) and
+   check the profile:
+   ```bash
+   chmod 600 ~/.snowflake/connections.toml
+   cortex-training login cortex-training
+   ```
+   Pass `--connection NAME` (or `connection=NAME` to a recipe) to use another
+   profile for one command. See [authentication](docs/getting-started/authentication.md)
+   for other sign-in methods, such as key pairs.
+
+### Already using a JSON connection file?
+
+If you connect with a JSON file (`host`, `pat`, `database`, `schema`), for
+example through `--config`, `CORTEX_TRAINING_CONFIG`, `cortex-training login
+FILE`, or a recipe's `config=`, convert it into a profile with one command:
+
+```bash
+cortex-training login --convert-legacy-config ~/cortex-training-config.json
+```
+
+It shows what it will change and asks first: it checks the token, adds a
+profile, saves it as the one to use, keeps a copy of the file without the
+token, and deletes the original. JSON files still work, and will be deprecated
+in a future release.
 
 ## Quick Example
 
@@ -42,14 +88,10 @@ Fine-tune a chat model in one command:
 
 ```bash
 uv pip install 'tinker-cookbook @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
-python -m recipes.sft_quickstart.conversational.train \
-  config=~/cortex-training-config.json \
-  max_steps=50
+python -m recipes.sft_quickstart.conversational.train max_steps=50
 ```
 
-`config=` is the JSON connection file described in
-[setup](docs/getting-started/setup.md#json-connection-file). This
-fine-tunes Qwen3-8B (full-parameter, four H200 GPUs) on a small bundled
+It connects with the profile from step 3. This fine-tunes Qwen3-8B (full-parameter, four H200 GPUs) on a small bundled
 dataset. See the [Conversational SFT example](recipes/sft_quickstart/README.md) for all
 options.
 

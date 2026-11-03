@@ -379,7 +379,8 @@ still lack privileges that some operations need; if one is refused, its
 error says which.
 
 login never changes your existing profiles, and asks before it creates
-anything. Your choice is saved in ~/.snowflake/cortex-training/config.json.
+anything. Your choice is saved in cortex-training/config.json in your
+Snowflake folder (usually ~/.snowflake); login prints the files it uses.
 
 examples:
   cortex-training login            # set up, or check your current setup
@@ -1067,7 +1068,8 @@ def _select_config(args: argparse.Namespace, *, load_login: bool) -> dict[str, A
     return _load_config(login_config, strict=strict)
 
 
-_FUTURE = "is deprecated and will stop working in a future release."
+# The old ways keep working, as a fallback while the profile path settles in.
+_FUTURE = "will be deprecated in a future release."
 
 
 def _resolve_args(
@@ -1158,7 +1160,7 @@ def _resolve_args(
 def _old_connection_notes(args: argparse.Namespace, typed: Mapping[str, Any]) -> list[str]:
     """Warnings for the old ways this command connects with, each saying what replaces it.
 
-    The old ways still work; they stop working in a later release.
+    The old ways still work, as a fallback; they will be deprecated in a future release.
     """
     if args.base_url:
         return []  # A local or mock server, during development.
@@ -1195,9 +1197,8 @@ def _old_connection_notes(args: argparse.Namespace, typed: Mapping[str, Any]) ->
         ]
     snowflake = [name for name in ("SNOWFLAKE_HOST", "SNOWFLAKE_PAT") if _env(name) and not _env(f"CORTEX_TRAINING_{name[10:]}")]
     if snowflake:
-        future = _FUTURE if len(snowflake) == 1 else _FUTURE.replace("is deprecated", "are deprecated")
         return [
-            f"{' and '.join(snowflake)} {future} Run `cortex-training login` to set up a Snowflake "
+            f"{' and '.join(snowflake)} {_FUTURE} Run `cortex-training login` to set up a Snowflake "
             "connection profile (in CI, use CORTEX_TRAINING_HOST and CORTEX_TRAINING_PAT)."
         ]
     if _snowflake_profiles_exist():
@@ -1311,7 +1312,7 @@ def parse_args(
     if args.use_connection_profile:
         return args
     if not args.database:
-        parser.error("provide --database or set CORTEX_TRAINING_DATABASE/SNOWFLAKE_DATABASE")
+        parser.error("provide --database or set CORTEX_TRAINING_DATABASE")
     if args.base_url is None and (args.host is None or args.pat is None):
         parser.error("provide --base-url for local/mock use, or both --host and --pat")
     return args
