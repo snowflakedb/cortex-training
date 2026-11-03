@@ -76,9 +76,9 @@ cortex-training login --convert-legacy-config ~/cortex-training-config.json
 ```
 
 It shows what it will change and asks first: it checks the token, adds a
-profile, saves it as the one to use, keeps a copy of the file without the
-token, and deletes the original. JSON files still work, and will be deprecated
-in a future release.
+profile, saves it as the one to use, and signs in with it. Your JSON file is
+kept as it was, so you can go back to it with `--config FILE`. JSON files still
+work, and will be deprecated in a future release.
 
 ## Quick Example
 
