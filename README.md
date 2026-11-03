@@ -9,7 +9,13 @@
 
 </div>
 
-Cortex Training, Snowflake's serverless offering for customizing and deploying open-weight LLMs. With Cortex Training, teams can use familiar training frameworks, or build advanced custom training loops with low-level serverless APIs - all without managing the complexities of GPU provisioning, scheduling, checkpointing and distributed execution.
+## Latest News
+
+* [2026/11] [Cortex Training Public Preview blog](https://www.snowflake.com/en/blog/cortex-training-fine-tune-open-weight-llms/)
+
+---
+
+[Cortex Training](https://www.snowflake.com/en/product/features/cortex-training/), Snowflake's serverless offering for customizing and deploying open-weight LLMs. With Cortex Training, teams can use familiar training frameworks, or build advanced custom training loops with low-level serverless APIs - all without managing the complexities of GPU provisioning, scheduling, checkpointing and distributed execution.
 
 Cortex Training is built on top of the highly customizable and optimized open-source [Arctic Platform](https://github.com/Snowflake-AI-Research/Arctic-Platform) backend to bring the flexibility and efficiency of complex, self-managed bare-metal training cluster to a simplified serverless experience. AI teams no longer have to trade simplicity for flexibility or cost efficiency when customizing and deploying models. See our blog for details.
 
