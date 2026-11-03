@@ -2856,6 +2856,9 @@ dispatch. The same key is accepted on a flat batch. A missing key balances.
 `load_balancer`, `zorro_load_balancer`, and `zorro_train_load_balancer` are
 ignored. They do not opt out. Send `balance_batch` false.
 
+A ZoRRo assignment also requires the batch size to be divisible by the number
+of data-parallel ranks. A prompt group larger than one rank is rejected.
+
 When ZoRRo balancing is on, `prompt_group_ids` (one integer per row) names the
 prompt group. The same key is what a prompt-mean loss uses for its counts.
 Omitting the ids leaves grouping to the prompt columns.
