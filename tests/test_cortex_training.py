@@ -148,8 +148,8 @@ def test_success_output_exit_code_and_client_arguments():
     assert '"job_id": "j1"' in stdout
     assert args["command"] == "list"
     assert args["status"] == "running"
-    # list applies --status to the schema's rows itself.
-    assert client.status_filter is None
+    # An active status: the schema route filters on it.
+    assert client.list_job_statuses == ["running"]
 
 
 def _run_invalid_submit(path: Path):

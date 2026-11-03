@@ -41,6 +41,7 @@ class FakeClient:
         self.download_options = None
         self.submitted_body = None
         self.status_filter = None
+        self.list_job_statuses = []  # the status each list_jobs call sent, None for none
         self.cancelled_job_id = None
         self.waited_job_id = None
         self.forward_backward_job_id = None
@@ -98,9 +99,14 @@ class FakeClient:
 
     def list_jobs(self, status=None):
         self.status_filter = status
-        if self.jobs is not None:
+        self.list_job_statuses.append(status)
+        if self.jobs is None:
+            return [{"job_id": "j1", "status": status or "running"}]
+        if status is None:
             return self.jobs
-        return [{"job_id": "j1", "status": status or "running"}]
+        # As the per-schema route filters: one status, its PENDING including PLACING.
+        covered = {"pending": {"pending", "placing"}}.get(status, {status})
+        return [job for job in self.jobs if _status_word(job) in covered]
 
     def list_models(self):
         self.models_requested = True
@@ -458,6 +464,11 @@ def _capacity_with_breakdown(hardware, dimensions):
     }
 
 
+def _status_word(job):
+    word = str(job.get("status") or "").lower().removeprefix("job_state_")
+    return cli._STATUS_ALIASES.get(word, word)
+
+
 def _factory(instances):
     def make_client(_args):
         client = FakeClient()
@@ -729,9 +740,8 @@ def test_list_prints_jobs_with_status_filter():
     )
 
     assert rc == 0
-    # The schema route mishandles comma lists and groups, so the CLI asks it for
-    # every job and filters the rows itself.
-    assert instances[0].status_filter is None
+    # An active status: the schema route filters on it, reading only the jobs in it.
+    assert instances[0].list_job_statuses == ["running"]
     assert json.loads(stdout.getvalue()) == {
         "jobs": [{"job_id": "j1", "status": "running"}],
     }
@@ -785,14 +795,25 @@ def _list_ids(argv, *, jobs=None, account_jobs=()):
 
 
 @pytest.mark.parametrize(
-    ("status", "expected"),
+    ("status", "expected", "requests"),
     [
-        ("pending", {"pending"}),
-        ("placing", {"placing"}),
-        ("active", {"pending", "placing", "initializing", "running"}),
-        ("done", {"cancelled", "terminated"}),
-        (" Running , FAILED ", {"running", "failed"}),
-        ("done,terminated", {"cancelled", "terminated"}),
+        # Every status active: the route filters, one request each. Its PENDING
+        # includes PLACING, which the CLI's pending does not, so its rows are filtered too.
+        ("pending", {"pending"}, ["pending"]),
+        ("placing", {"placing"}, ["pending"]),
+        ("running", {"running"}, ["running"]),
+        ("running,initializing", {"running", "initializing"}, ["initializing", "running"]),
+        (
+            "pending,placing,initializing,running",
+            {"pending", "placing", "initializing", "running"},
+            ["pending", "initializing", "running"],
+        ),
+        ("active", {"pending", "placing", "initializing", "running"}, ["pending", "initializing", "running"]),
+        # Any other status: every job in the schema, filtered here.
+        ("failed", {"failed"}, [None]),
+        (" Running , FAILED ", {"running", "failed"}, [None]),
+        ("cancelled,terminated", {"cancelled", "terminated"}, [None]),
+        ("done", {"cancelled", "terminated"}, [None]),
         (
             "active,failed,done",
             {
@@ -804,14 +825,88 @@ def _list_ids(argv, *, jobs=None, account_jobs=()):
                 "cancelled",
                 "terminated",
             },
+            [None],
         ),
     ],
 )
-def test_list_status_accepts_words_groups_and_comma_lists(status, expected):
+def test_list_status_accepts_words_groups_and_comma_lists(status, expected, requests):
     client, ids = _list_ids(["--status", status], jobs=_STATUS_ROWS)
 
-    assert client.status_filter is None
+    assert client.list_job_statuses == requests
     assert set(ids) == expected
+
+
+def test_list_without_status_reads_every_job_in_the_schema():
+    client, ids = _list_ids([], jobs=_STATUS_ROWS)
+
+    assert client.list_job_statuses == [None]
+    assert set(ids) == {row["job_id"] for row in _STATUS_ROWS}
+
+
+def test_list_of_active_statuses_prints_a_job_two_requests_returned_once():
+    # A job that moved on between two requests is in both answers.
+    class MovingClient(FakeClient):
+        def list_jobs(self, status=None):
+            self.list_job_statuses.append(status)
+            return [{"job_id": "moved", "status": "RUNNING"}, {"job_id": status, "status": status}]
+
+    client = MovingClient()
+    stdout = io.StringIO()
+
+    assert cli.main(_base_args() + ["list", "--status", "initializing,running"],
+                    client_factory=lambda _args: client, stdout=stdout) == 0
+
+    assert client.list_job_statuses == ["initializing", "running"]
+    assert sorted(job["job_id"] for job in json.loads(stdout.getvalue())["jobs"]) == [
+        "initializing", "moved", "running"]
+
+
+class _MovingJobClient(FakeClient):
+    """A schema with one job that moves to the next of ``states`` after each request,
+    filtered as the route filters: its pending includes placing."""
+
+    def __init__(self, states):
+        super().__init__()
+        self.states = list(states)
+
+    def list_jobs(self, status=None):
+        self.list_job_statuses.append(status)
+        now = self.states[0]
+        if len(self.states) > 1:
+            self.states.pop(0)
+        covered = {"pending": {"pending", "placing"}}.get(status, {status})
+        return [{"job_id": "moving", "status": now.upper()}] if now in covered else []
+
+
+@pytest.mark.parametrize(
+    ("status", "states", "requests", "printed"),
+    [
+        # Pending at the first request, initializing from the second on: asked in a
+        # job's own order, a later request still finds it.
+        ("active", ["pending", "initializing"], ["pending", "initializing", "running"], "INITIALIZING"),
+        # Pending at the first request, running at the second: the later copy is
+        # the one filtered, so the job is kept as running.
+        ("placing,running", ["pending", "running"], ["pending", "running"], "RUNNING"),
+    ],
+)
+def test_list_of_active_statuses_follows_a_job_that_moves_between_requests(status, states, requests, printed):
+    client = _MovingJobClient(states)
+    stdout = io.StringIO()
+
+    assert cli.main(_base_args() + ["list", "--status", status],
+                    client_factory=lambda _args: client, stdout=stdout) == 0
+
+    assert client.list_job_statuses == requests
+    assert json.loads(stdout.getvalue())["jobs"] == [{"job_id": "moving", "status": printed}]
+
+
+def test_list_of_an_active_status_still_applies_the_other_filters():
+    rows = [{**row, "status": "RUNNING"} for row in _SUBMITTED_ROWS]
+
+    client, ids = _list_ids(["--status", "running", "--user", "JDOE"], jobs=rows)
+
+    assert client.list_job_statuses == ["running"]
+    assert ids == ["upper"]  # unquoted JDOE is JDOE exactly
 
 
 @pytest.mark.parametrize("scope", [[], ["--all"]])
@@ -1077,6 +1172,44 @@ def test_list_all_sends_every_filter_to_the_server():
         "page_size": 100,
     }
     assert ids == ["a", "b"]
+
+
+def test_list_all_prints_only_the_statuses_asked_for_from_a_wider_answer():
+    # A server whose pending takes in placing, as the schema route's does.
+    rows = [
+        {"job_id": "placing", "status": "PLACING", "created_at": "2026-10-01T02:00:00Z"},
+        {"job_id": "pending", "status": "PENDING", "created_at": "2026-10-01T01:00:00Z"},
+    ]
+
+    client, ids = _list_ids(["--all", "--status", "pending"], account_jobs=rows)
+
+    assert client.iter_jobs_filters["status"] == "pending"
+    assert ids == ["pending"]
+
+
+def test_list_all_asks_the_account_route_for_done_by_its_words():
+    # The account route has no done: it takes cancelled and terminated.
+    rows = [
+        {"job_id": "cancelled", "status": "CANCELLED", "created_at": "2026-10-01T02:00:00Z"},
+        {"job_id": "terminated", "status": "TERMINATED", "created_at": "2026-10-01T01:00:00Z"},
+    ]
+
+    client, ids = _list_ids(["--all", "--status", "done,failed"], account_jobs=rows)
+
+    assert client.iter_jobs_filters["status"] == "cancelled,terminated,failed"
+    assert ids == ["terminated", "cancelled"]
+
+
+def test_list_all_limit_counts_only_the_rows_it_prints():
+    rows = [
+        {"job_id": "placing", "status": "PLACING", "created_at": "2026-10-01T02:00:00Z"},
+        {"job_id": "pending", "status": "PENDING", "created_at": "2026-10-01T01:00:00Z"},
+    ]
+
+    client, ids = _list_ids(["--all", "--status", "pending", "--limit", "1"], account_jobs=rows)
+
+    assert ids == ["pending"]
+    assert client.account_jobs_pulled == 2  # read past the row it dropped
 
 
 def test_list_all_limit_stops_reading_after_the_newest_jobs():

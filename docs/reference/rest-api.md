@@ -566,6 +566,16 @@ REST response:
 `CortexTrainingClient.list_jobs()` returns only the `jobs` list, not the outer object.
 The client forwards the status string without validating an enum.
 
+`status` takes one status. On service versions that support it, a request
+filtered on an active one (`pending`, `placing`, `initializing`, `running`) is
+answered from the jobs in that status alone, where an unfiltered request reads
+every job in the schema; the others take as long as an unfiltered request. Its
+`pending` includes `placing` jobs. `active` and comma lists match nothing, and
+`done` misses every job that has settled: ask for `failed`, `cancelled` or
+`terminated` one at a time instead. `cortex-training list --status` sends one such
+request per active status it names, asking for `pending` for `placing`, and
+filters the rows itself; for any other status it requests every job.
+
 #### Across the account - `GET /api/v2/{endpoint}`
 
 Lists the jobs the caller can see in every database and schema of the account,
