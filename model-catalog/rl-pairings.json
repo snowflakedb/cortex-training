@@ -1,0 +1,367 @@
+{
+  "schema_version": 1,
+  "hardware": "H200",
+  "path_base": ".",
+  "pairings": [
+    {
+      "model": "deepseek-v4.1-flash-1017",
+      "context": "standard",
+      "mode": "lora",
+      "max_seq_len": 65536,
+      "training_config": "models/deepseek-v4.1-flash-1017/standard/h200-training-lora.json",
+      "inference_config": "models/deepseek-v4.1-flash-1017/standard/h200-inference-lora.json"
+    },
+    {
+      "model": "deepseek-v4.1-flash-1017",
+      "context": "long",
+      "mode": "lora",
+      "max_seq_len": 262144,
+      "training_config": "models/deepseek-v4.1-flash-1017/long/h200-training-lora.json",
+      "inference_config": "models/deepseek-v4.1-flash-1017/long/h200-inference-lora.json"
+    },
+    {
+      "model": "gemma-3-4b-it",
+      "context": "standard",
+      "mode": "full",
+      "max_seq_len": 65536,
+      "training_config": "models/gemma-3-4b-it/standard/h200-training-full.json",
+      "inference_config": "models/gemma-3-4b-it/standard/h200-inference-full.json"
+    },
+    {
+      "model": "gemma-3-4b-it",
+      "context": "long",
+      "mode": "full",
+      "max_seq_len": 131072,
+      "training_config": "models/gemma-3-4b-it/long/h200-training-full.json",
+      "inference_config": "models/gemma-3-4b-it/long/h200-inference-full.json"
+    },
+    {
+      "model": "gemma-4-31b-it",
+      "context": "standard",
+      "mode": "full",
+      "max_seq_len": 65536,
+      "training_config": "models/gemma-4-31b-it/standard/h200-training-full.json",
+      "inference_config": "models/gemma-4-31b-it/standard/h200-inference-full.json"
+    },
+    {
+      "model": "gemma-4-31b-it",
+      "context": "long",
+      "mode": "full",
+      "max_seq_len": 262144,
+      "training_config": "models/gemma-4-31b-it/long/h200-training-full.json",
+      "inference_config": "models/gemma-4-31b-it/long/h200-inference-full.json"
+    },
+    {
+      "model": "glm-5.3-flash",
+      "context": "standard",
+      "mode": "lora",
+      "max_seq_len": 65536,
+      "training_config": "models/glm-5.3-flash/standard/h200-training-lora.json",
+      "inference_config": "models/glm-5.3-flash/standard/h200-inference-lora.json"
+    },
+    {
+      "model": "glm-5.3-flash",
+      "context": "long",
+      "mode": "lora",
+      "max_seq_len": 262144,
+      "training_config": "models/glm-5.3-flash/long/h200-training-lora.json",
+      "inference_config": "models/glm-5.3-flash/long/h200-inference-lora.json"
+    },
+    {
+      "model": "glm-5.3-flash-bf16",
+      "context": "standard",
+      "mode": "full",
+      "max_seq_len": 65536,
+      "training_config": "models/glm-5.3-flash-bf16/standard/h200-training-full.json",
+      "inference_config": "models/glm-5.3-flash-bf16/standard/h200-inference-full.json"
+    },
+    {
+      "model": "glm-5.3-flash-bf16",
+      "context": "long",
+      "mode": "full",
+      "max_seq_len": 262144,
+      "training_config": "models/glm-5.3-flash-bf16/long/h200-training-full.json",
+      "inference_config": "models/glm-5.3-flash-bf16/long/h200-inference-full.json"
+    },
+    {
+      "model": "medgemma-1.5-4b-it",
+      "context": "standard",
+      "mode": "full",
+      "max_seq_len": 65536,
+      "training_config": "models/medgemma-1.5-4b-it/standard/h200-training-full.json",
+      "inference_config": "models/medgemma-1.5-4b-it/standard/h200-inference-full.json"
+    },
+    {
+      "model": "medgemma-1.5-4b-it",
+      "context": "long",
+      "mode": "full",
+      "max_seq_len": 131072,
+      "training_config": "models/medgemma-1.5-4b-it/long/h200-training-full.json",
+      "inference_config": "models/medgemma-1.5-4b-it/long/h200-inference-full.json"
+    },
+    {
+      "model": "medgemma-4b-it",
+      "context": "standard",
+      "mode": "full",
+      "max_seq_len": 65536,
+      "training_config": "models/medgemma-4b-it/standard/h200-training-full.json",
+      "inference_config": "models/medgemma-4b-it/standard/h200-inference-full.json"
+    },
+    {
+      "model": "medgemma-4b-it",
+      "context": "long",
+      "mode": "full",
+      "max_seq_len": 131072,
+      "training_config": "models/medgemma-4b-it/long/h200-training-full.json",
+      "inference_config": "models/medgemma-4b-it/long/h200-inference-full.json"
+    },
+    {
+      "model": "nvidia-nemotron-3-nano-30b-a3b-bf16",
+      "context": "standard",
+      "mode": "full",
+      "max_seq_len": 65536,
+      "training_config": "models/nvidia-nemotron-3-nano-30b-a3b-bf16/standard/h200-training-full.json",
+      "inference_config": "models/nvidia-nemotron-3-nano-30b-a3b-bf16/standard/h200-inference-full.json"
+    },
+    {
+      "model": "nvidia-nemotron-3-nano-30b-a3b-bf16",
+      "context": "long",
+      "mode": "full",
+      "max_seq_len": 262144,
+      "training_config": "models/nvidia-nemotron-3-nano-30b-a3b-bf16/long/h200-training-full.json",
+      "inference_config": "models/nvidia-nemotron-3-nano-30b-a3b-bf16/long/h200-inference-full.json"
+    },
+    {
+      "model": "nvidia-nemotron-3.5-lightning-30b-a3b-bf16",
+      "context": "standard",
+      "mode": "full",
+      "max_seq_len": 65536,
+      "training_config": "models/nvidia-nemotron-3.5-lightning-30b-a3b-bf16/standard/h200-training-full.json",
+      "inference_config": "models/nvidia-nemotron-3.5-lightning-30b-a3b-bf16/standard/h200-inference-full.json"
+    },
+    {
+      "model": "nvidia-nemotron-3.5-lightning-30b-a3b-bf16",
+      "context": "long",
+      "mode": "full",
+      "max_seq_len": 262144,
+      "training_config": "models/nvidia-nemotron-3.5-lightning-30b-a3b-bf16/long/h200-training-full.json",
+      "inference_config": "models/nvidia-nemotron-3.5-lightning-30b-a3b-bf16/long/h200-inference-full.json"
+    },
+    {
+      "model": "qwen3-0.6b",
+      "context": "standard",
+      "mode": "full",
+      "max_seq_len": 32768,
+      "training_config": "models/qwen3-0.6b/standard/h200-training-full.json",
+      "inference_config": "models/qwen3-0.6b/standard/h200-inference-full.json"
+    },
+    {
+      "model": "qwen3-0.6b",
+      "context": "standard",
+      "mode": "lora",
+      "max_seq_len": 32768,
+      "training_config": "models/qwen3-0.6b/standard/h200-training-lora.json",
+      "inference_config": "models/qwen3-0.6b/standard/h200-inference-lora.json"
+    },
+    {
+      "model": "qwen3-1.7b",
+      "context": "standard",
+      "mode": "full",
+      "max_seq_len": 32768,
+      "training_config": "models/qwen3-1.7b/standard/h200-training-full.json",
+      "inference_config": "models/qwen3-1.7b/standard/h200-inference-full.json"
+    },
+    {
+      "model": "qwen3-1.7b",
+      "context": "standard",
+      "mode": "lora",
+      "max_seq_len": 32768,
+      "training_config": "models/qwen3-1.7b/standard/h200-training-lora.json",
+      "inference_config": "models/qwen3-1.7b/standard/h200-inference-lora.json"
+    },
+    {
+      "model": "qwen3-30b-a3b",
+      "context": "standard",
+      "mode": "full",
+      "max_seq_len": 40960,
+      "training_config": "models/qwen3-30b-a3b/standard/h200-training-full.json",
+      "inference_config": "models/qwen3-30b-a3b/standard/h200-inference-full.json"
+    },
+    {
+      "model": "qwen3-4b-instruct-2507",
+      "context": "standard",
+      "mode": "full",
+      "max_seq_len": 65536,
+      "training_config": "models/qwen3-4b-instruct-2507/standard/h200-training-full.json",
+      "inference_config": "models/qwen3-4b-instruct-2507/standard/h200-inference-full.json"
+    },
+    {
+      "model": "qwen3-4b-instruct-2507",
+      "context": "long",
+      "mode": "full",
+      "max_seq_len": 262144,
+      "training_config": "models/qwen3-4b-instruct-2507/long/h200-training-full.json",
+      "inference_config": "models/qwen3-4b-instruct-2507/long/h200-inference-full.json"
+    },
+    {
+      "model": "qwen3-8b",
+      "context": "standard",
+      "mode": "full",
+      "max_seq_len": 32768,
+      "training_config": "models/qwen3-8b/standard/h200-training-full.json",
+      "inference_config": "models/qwen3-8b/standard/h200-inference-full.json"
+    },
+    {
+      "model": "qwen3-8b",
+      "context": "standard",
+      "mode": "lora",
+      "max_seq_len": 32768,
+      "training_config": "models/qwen3-8b/standard/h200-training-lora.json",
+      "inference_config": "models/qwen3-8b/standard/h200-inference-lora.json"
+    },
+    {
+      "model": "qwen3.5-4b",
+      "context": "standard",
+      "mode": "full",
+      "max_seq_len": 32768,
+      "training_config": "models/qwen3.5-4b/standard/h200-training-full.json",
+      "inference_config": "models/qwen3.5-4b/standard/h200-inference-full.json"
+    },
+    {
+      "model": "qwen3.5-4b",
+      "context": "standard",
+      "mode": "lora",
+      "max_seq_len": 32768,
+      "training_config": "models/qwen3.5-4b/standard/h200-training-lora.json",
+      "inference_config": "models/qwen3.5-4b/standard/h200-inference-lora.json"
+    },
+    {
+      "model": "qwen3.5-4b",
+      "context": "long",
+      "mode": "full",
+      "max_seq_len": 262144,
+      "training_config": "models/qwen3.5-4b/long/h200-training-full.json",
+      "inference_config": "models/qwen3.5-4b/long/h200-inference-full.json"
+    },
+    {
+      "model": "qwen3.5-4b",
+      "context": "long",
+      "mode": "lora",
+      "max_seq_len": 262144,
+      "training_config": "models/qwen3.5-4b/long/h200-training-lora.json",
+      "inference_config": "models/qwen3.5-4b/long/h200-inference-lora.json"
+    },
+    {
+      "model": "qwen3.5-9b",
+      "context": "standard",
+      "mode": "full",
+      "max_seq_len": 65536,
+      "training_config": "models/qwen3.5-9b/standard/h200-training-full.json",
+      "inference_config": "models/qwen3.5-9b/standard/h200-inference-full.json"
+    },
+    {
+      "model": "qwen3.5-9b",
+      "context": "standard",
+      "mode": "lora",
+      "max_seq_len": 65536,
+      "training_config": "models/qwen3.5-9b/standard/h200-training-lora.json",
+      "inference_config": "models/qwen3.5-9b/standard/h200-inference-lora.json"
+    },
+    {
+      "model": "qwen3.5-9b",
+      "context": "long",
+      "mode": "full",
+      "max_seq_len": 262144,
+      "training_config": "models/qwen3.5-9b/long/h200-training-full.json",
+      "inference_config": "models/qwen3.5-9b/long/h200-inference-full.json"
+    },
+    {
+      "model": "qwen3.6-35b-a3b",
+      "context": "standard",
+      "mode": "full",
+      "max_seq_len": 32768,
+      "training_config": "models/qwen3.6-35b-a3b/standard/h200-training-full.json",
+      "inference_config": "models/qwen3.6-35b-a3b/standard/h200-inference-full.json"
+    },
+    {
+      "model": "qwen3.6-35b-a3b",
+      "context": "standard",
+      "mode": "lora",
+      "max_seq_len": 32768,
+      "training_config": "models/qwen3.6-35b-a3b/standard/h200-training-lora.json",
+      "inference_config": "models/qwen3.6-35b-a3b/standard/h200-inference-lora.json"
+    },
+    {
+      "model": "qwen3.6-35b-a3b",
+      "context": "long",
+      "mode": "full",
+      "max_seq_len": 262144,
+      "training_config": "models/qwen3.6-35b-a3b/long/h200-training-full.json",
+      "inference_config": "models/qwen3.6-35b-a3b/long/h200-inference-full.json"
+    },
+    {
+      "model": "qwen3.6-35b-a3b",
+      "context": "long",
+      "mode": "lora",
+      "max_seq_len": 262144,
+      "training_config": "models/qwen3.6-35b-a3b/long/h200-training-lora.json",
+      "inference_config": "models/qwen3.6-35b-a3b/long/h200-inference-lora.json"
+    },
+    {
+      "model": "qwen3.8-27b",
+      "context": "standard",
+      "mode": "full",
+      "max_seq_len": 65536,
+      "training_config": "models/qwen3.8-27b/standard/h200-training-full.json",
+      "inference_config": "models/qwen3.8-27b/standard/h200-inference-full.json"
+    },
+    {
+      "model": "qwen3.8-27b",
+      "context": "standard",
+      "mode": "lora",
+      "max_seq_len": 65536,
+      "training_config": "models/qwen3.8-27b/standard/h200-training-lora.json",
+      "inference_config": "models/qwen3.8-27b/standard/h200-inference-lora.json"
+    },
+    {
+      "model": "qwen3.8-27b",
+      "context": "long",
+      "mode": "full",
+      "max_seq_len": 262144,
+      "training_config": "models/qwen3.8-27b/long/h200-training-full.json",
+      "inference_config": "models/qwen3.8-27b/long/h200-inference-full.json"
+    },
+    {
+      "model": "qwen3.8-27b",
+      "context": "long",
+      "mode": "lora",
+      "max_seq_len": 262144,
+      "training_config": "models/qwen3.8-27b/long/h200-training-lora.json",
+      "inference_config": "models/qwen3.8-27b/long/h200-inference-lora.json"
+    },
+    {
+      "model": "qwen3.8-flash-next",
+      "context": "standard",
+      "mode": "full",
+      "max_seq_len": 65536,
+      "training_config": "models/qwen3.8-flash-next/standard/h200-training-full.json",
+      "inference_config": "models/qwen3.8-flash-next/standard/h200-inference-full.json"
+    },
+    {
+      "model": "qwen3.8-flash-next",
+      "context": "standard",
+      "mode": "lora",
+      "max_seq_len": 65536,
+      "training_config": "models/qwen3.8-flash-next/standard/h200-training-lora.json",
+      "inference_config": "models/qwen3.8-flash-next/standard/h200-inference-lora.json"
+    },
+    {
+      "model": "qwen3.8-flash-next",
+      "context": "long",
+      "mode": "full",
+      "max_seq_len": 262144,
+      "training_config": "models/qwen3.8-flash-next/long/h200-training-full.json",
+      "inference_config": "models/qwen3.8-flash-next/long/h200-inference-full.json"
+    }
+  ]
+}
