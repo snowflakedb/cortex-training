@@ -206,7 +206,7 @@ Python Connector and Snowflake CLI. The easiest way to set one up is
 Connector and Snowflake CLI:
 
 ```toml
-# ~/.snowflake/connections.toml
+# connections.toml in your Snowflake folder, usually ~/.snowflake/
 [training]
 account = "ORG-ACCOUNT"
 host = "ACCOUNT.snowflakecomputing.com"
@@ -332,7 +332,7 @@ over a saved profile, since you pass them for that command.
 ### Login
 
 `cortex-training login` sets up the Snowflake connection profile Cortex Training
-uses, and remembers it as `"profile"` in `~/.snowflake/cortex-training/config.json`
+uses, and remembers it as `"profile"` in `cortex-training/config.json` in the Snowflake folder (usually `~/.snowflake/`)
 (next to your profiles, so `$SNOWFLAKE_HOME` moves both):
 
 ```bash

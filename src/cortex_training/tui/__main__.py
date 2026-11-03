@@ -212,7 +212,7 @@ def _build_read_only_client(parser: argparse.ArgumentParser, args: argparse.Name
     except ValueError as exc:
         parser.error(str(exc))
     if not args.use_connection_profile and not args.database:
-        parser.error("provide --database or set CORTEX_TRAINING_DATABASE/SNOWFLAKE_DATABASE")
+        parser.error("provide --database or set CORTEX_TRAINING_DATABASE")
     if (
         not args.use_connection_profile
         and args.base_url is None

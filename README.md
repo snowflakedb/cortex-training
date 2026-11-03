@@ -40,8 +40,10 @@ Cortex Training is Snowflake's serverless platform for post-training open-weight
    cortex-training capacity
    ```
 
-   To write the profile yourself instead, add it to
-   `~/.snowflake/connections.toml`:
+   To write the profile yourself instead, add it to `connections.toml` in your
+   Snowflake folder, usually `~/.snowflake/connections.toml`.
+   `cortex-training login` prints the exact file it uses; if it printed another
+   path, use that one:
    ```toml
    [cortex-training]
    account = "ACCOUNT"
@@ -53,7 +55,8 @@ Cortex Training is Snowflake's serverless platform for post-training open-weight
    database = "CORTEX_TRAINING_DB"
    schema = "PUBLIC"
    ```
-   Then protect the file and check the profile:
+   Then protect the file (use the path `login` printed, if different) and
+   check the profile:
    ```bash
    chmod 600 ~/.snowflake/connections.toml
    cortex-training login cortex-training

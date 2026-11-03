@@ -22,41 +22,44 @@ cortex-training login
 It picks one of your Snowflake connection profiles or creates one (account
 host, user, and a programmatic access token), checks the database Cortex
 Training will use, and remembers the profile in
-`~/.snowflake/cortex-training/config.json`. See [login](../reference/cli.md#login).
+`cortex-training/config.json` in your Snowflake folder (usually
+`~/.snowflake/`). It prints the exact files it uses. See [login](../reference/cli.md#login).
 
 To set it up by hand instead, configure a standard Snowflake connection profile
-in `~/.snowflake/connections.toml`:
+in `connections.toml` in your Snowflake folder, usually
+`~/.snowflake/connections.toml` (see
+[the Snowflake folder](authentication.md#the-snowflake-folder)):
 
 ```toml
-[training]
+[cortex-training]
 account = "ORG-ACCOUNT"
 host = "ACCOUNT.snowflakecomputing.com"
 user = "USER"
-authenticator = "programmatic_access_token"
+role = "ROLE"
+authenticator = "PROGRAMMATIC_ACCESS_TOKEN"
 token = "YOUR_PROGRAMMATIC_ACCESS_TOKEN"
 database = "CORTEX_TRAINING_DB"
 schema = "PUBLIC"
 ```
 
-Protect the file and verify the connection:
+Protect the file, then check the profile and save it as the one to use:
 
 ```bash
 chmod 600 ~/.snowflake/connections.toml
-cortex-training --connection training capacity
+cortex-training login cortex-training
 ```
 
-To run commands without `--connection`, save the profile as the one Cortex
-Training uses with `cortex-training login training`. Without a saved profile,
-Cortex Training uses Snowflake's default profile: set
-`SNOWFLAKE_DEFAULT_CONNECTION_NAME=training`, configure
-`default_connection_name = "training"` in Snowflake's `config.toml`, or name
-the profile `[default]`.
+Commands then use it without `--connection`. Pass `--connection NAME` to use
+another profile for one command. Without a saved profile, Cortex Training uses
+Snowflake's default profile: set `SNOWFLAKE_DEFAULT_CONNECTION_NAME`,
+configure `default_connection_name` in Snowflake's `config.toml`, or name the
+profile `[default]`.
 
 ## JSON connection file
 
 Have a JSON connection file from an older setup? Convert it into a profile with
 `cortex-training login --convert-legacy-config FILE` (see
-[authentication](authentication.md#old-users-who-log-in-with-configjson)).
+[authentication](authentication.md#old-users-who-log-in-with-a-json-connection-file)).
 
 `capacity` with no `--hardware` lists every GPU type. See
 [GPU hardware](../concepts/hardware.md).

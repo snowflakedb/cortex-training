@@ -138,7 +138,7 @@ def resolve_connection(
         if not args.database:
             raise ValueError(
                 "connection needs a database: set `database` in the config file, "
-                "or CORTEX_TRAINING_DATABASE / SNOWFLAKE_DATABASE"
+                "or CORTEX_TRAINING_DATABASE"
             )
         if args.base_url is None and (args.host is None or args.pat is None):
             raise ValueError(

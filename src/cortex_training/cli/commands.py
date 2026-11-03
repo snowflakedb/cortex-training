@@ -379,7 +379,8 @@ still lack privileges that some operations need; if one is refused, its
 error says which.
 
 login never changes your existing profiles, and asks before it creates
-anything. Your choice is saved in ~/.snowflake/cortex-training/config.json.
+anything. Your choice is saved in cortex-training/config.json in your
+Snowflake folder (usually ~/.snowflake); login prints the files it uses.
 
 examples:
   cortex-training login            # set up, or check your current setup
@@ -1159,7 +1160,7 @@ def _resolve_args(
 def _old_connection_notes(args: argparse.Namespace, typed: Mapping[str, Any]) -> list[str]:
     """Warnings for the old ways this command connects with, each saying what replaces it.
 
-    The old ways still work; they stop working in a later release.
+    The old ways still work, as a fallback; they will be deprecated in a future release.
     """
     if args.base_url:
         return []  # A local or mock server, during development.
@@ -1311,7 +1312,7 @@ def parse_args(
     if args.use_connection_profile:
         return args
     if not args.database:
-        parser.error("provide --database or set CORTEX_TRAINING_DATABASE/SNOWFLAKE_DATABASE")
+        parser.error("provide --database or set CORTEX_TRAINING_DATABASE")
     if args.base_url is None and (args.host is None or args.pat is None):
         parser.error("provide --base-url for local/mock use, or both --host and --pat")
     return args

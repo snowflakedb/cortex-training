@@ -45,27 +45,53 @@ Cortex Training authenticates through a Snowflake Programmatic Access Token
 Once you have a PAT, pick **one** of the following methods to configure the
 client. We recommend `connections.toml`.
 
-### Option A: connections.toml (recommended)
+### Option A: a connection profile (recommended)
 
-This is Snowflake's standard configuration file, shared across all Snowflake
-tools. Create or edit `~/.snowflake/connections.toml`:
+A Snowflake connection profile is Snowflake's standard configuration, shared
+across all Snowflake tools. The easiest way to set one up is to run:
+
+```bash
+cortex-training login
+```
+
+It asks for the account, user, role and PAT, checks that the profile connects
+to Cortex Training, and saves it as the one to use. It prints the files it
+writes.
+
+To write the profile yourself instead, add it to `connections.toml` in your
+[Snowflake folder](#the-snowflake-folder), usually
+`~/.snowflake/connections.toml`:
 
 ```toml
-[training]
+[cortex-training]
 account = "ORG-ACCOUNT"
 host = "ACCOUNT.snowflakecomputing.com"
 user = "YOUR_USERNAME"
-authenticator = "programmatic_access_token"
+role = "YOUR_ROLE"
+authenticator = "PROGRAMMATIC_ACCESS_TOKEN"
 token = "YOUR_PAT"
 database = "CORTEX_TRAINING_DB"
 schema = "PUBLIC"
 ```
 
-Protect the file:
+Protect the file, then check the profile and save it as the one to use:
 
 ```bash
 chmod 600 ~/.snowflake/connections.toml
+cortex-training login cortex-training
 ```
+
+#### The Snowflake folder
+
+Snowflake tools look for `connections.toml` in `$SNOWFLAKE_HOME` if it's set,
+else in `~/.snowflake` if that folder exists, else in a platform folder:
+`~/Library/Application Support/snowflake` on macOS, `~/.config/snowflake` on
+Linux. `cortex-training login` uses the same rule, and prints the file it uses.
+
+Write a profile by hand to that same file. In particular, if `login` saved your
+profile in the platform folder, don't create `~/.snowflake` afterwards: Snowflake
+tools would then look there instead, and your saved profile would no longer be
+found.
 
 #### Finding your account and host
 
@@ -81,18 +107,18 @@ chmod 600 ~/.snowflake/connections.toml
 
 #### Setting the default connection
 
-To avoid passing `--connection training` on every command, run
-`cortex-training login` and pick the profile. It saves your choice in
-`~/.snowflake/cortex-training/config.json`, and commands, the TUI, and the
-examples use it first. With no saved choice, they use Snowflake's default
-profile, which you can set with any of these methods:
+`cortex-training login NAME` saves the profile as the one Cortex Training uses
+(in `cortex-training/config.json` in the Snowflake folder), so commands, the
+TUI, and the recipes use it without `--connection`. With no saved choice, they
+use Snowflake's default profile, which you can set with any of these methods:
 
-- Name the profile `[default]` instead of `[training]`
+- Name the profile `[default]` instead of `[cortex-training]`
 - Set the environment variable:
   ```bash
-  export SNOWFLAKE_DEFAULT_CONNECTION_NAME=training
+  export SNOWFLAKE_DEFAULT_CONNECTION_NAME=cortex-training
   ```
-- Add `default_connection_name = "training"` to `~/.snowflake/config.toml`
+- Add `default_connection_name = "cortex-training"` to `config.toml` in the
+  Snowflake folder
 
 #### Verify
 
@@ -102,8 +128,10 @@ cortex-training capacity
 
 This should print your available GPU capacity.
 
-Cortex Training keeps your jobs and checkpoints in the profile's database, and
-it never creates that database for you. Create it once, in Snowsight:
+Cortex Training keeps your jobs and checkpoints in the profile's database.
+Commands never create it on their own. `cortex-training login` checks it, and
+if it's missing, shows the `CREATE DATABASE` statement and runs it only if you
+say yes. Or create it once, in Snowsight:
 
 ```sql
 CREATE DATABASE IF NOT EXISTS CORTEX_TRAINING_DB;
@@ -139,7 +167,7 @@ schema with any connection.
 Use the `CORTEX_TRAINING_` names; the older `SNOWFLAKE_`-prefixed ones still
 work for now and will be deprecated in a future release.
 
-## Old users who log in with config.json
+## Old users who log in with a JSON connection file
 
 If you log in with a JSON config file (`host`, `pat`, `database`, `schema`),
 one command turns it into a Snowflake connection profile:
@@ -161,7 +189,8 @@ Then it asks before each step:
 2. **It shows every change and asks once.** No is the default, because the
    last change deletes the old file. The changes are:
    - adding the profile (named `cortex-training`, or the next free name);
-   - saving it as `"profile"` in `~/.snowflake/cortex-training/config.json`.
+   - saving it as `"profile"` in `cortex-training/config.json` in the Snowflake
+     folder.
      That file holds only the profile, so the old file's `endpoint`,
      `poll_interval`, `poll_timeout`, and `verify_ssl` aren't kept; the converter
      lists any that differ from the defaults, with the flags that set them
