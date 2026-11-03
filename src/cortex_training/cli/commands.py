@@ -77,6 +77,9 @@ _LIST_STATUS_FILTERS = {
     "active": {"pending", "placing", "initializing", "running"},
     "done": {"cancelled", "terminated", "done"},
 }
+# The --status words for each name what the account-level route calls them
+# otherwise: it has no done (and so no word for the DONE older jobs show).
+_ACCOUNT_LIST_STATUSES = {"done": "cancelled,terminated"}
 
 # Status words the server can answer with that are not the ones it filters on:
 # older rows, and states a backend ahead of the API layer reports.
@@ -254,23 +257,33 @@ def _same_name(wanted: str, actual: Any) -> bool:
     return isinstance(actual, str) and actual == wanted
 
 
-def _list_filter(args: argparse.Namespace) -> Callable[[dict], bool]:
-    """Build the list filters for the schema's jobs; --all has the server apply them."""
+def _status_filter(args: argparse.Namespace) -> Callable[[dict], bool]:
+    """Whether a job's status is one --status keeps; every job's without it."""
     # Rows can carry an enum name (JOB_STATE_RUNNING) or an alias, so compare
     # on the normalized word rather than the raw field.
     from cortex_training.client import CortexTrainingClient
 
-    def status_of(job: dict) -> str:
-        word = CortexTrainingClient._normalize_job_status(job.get("status"))
-        return _STATUS_ALIASES.get(word, word)
-
     statuses = None if args.status is None else _list_statuses(args.status)
+
+    def keep(job: dict) -> bool:
+        if statuses is None:
+            return True
+        word = CortexTrainingClient._normalize_job_status(job.get("status"))
+        return _STATUS_ALIASES.get(word, word) in statuses
+
+    return keep
+
+
+def _list_filter(args: argparse.Namespace) -> Callable[[dict], bool]:
+    """Build the list filters for the schema's jobs; --all has the server apply
+    them, and checks the status again (see _cmd_list)."""
+    status_kept = _status_filter(args)
     since = None if args.since is None else _utc_midnight(args.since)
     # --until names the last day kept, so the bound is the next midnight.
     until = None if args.until is None else _utc_midnight(args.until + timedelta(days=1))
 
     def keep(job: dict) -> bool:
-        if statuses is not None and status_of(job) not in statuses:
+        if not status_kept(job):
             return False
         if args.user is not None and not _same_name(args.user, job.get("submitted_by")):
             return False
@@ -518,9 +531,7 @@ def build_parser(
         "--all",
         action="store_true",
         help=(
-            "List jobs across every schema in the account that the current user "
-            "can see, not just the configured one. Fails if account-level listing "
-            "is not enabled for the account."
+            "List jobs across every available schema in the current account."
         ),
     )
     list_jobs.add_argument("--user", help="Keep jobs submitted by this user.")
@@ -1526,27 +1537,66 @@ def _job_experiment_name(client, job_id: str, stderr: TextIO) -> str | None:
         return None
 
 
+# The statuses the per-schema route can filter on by itself, reading only the jobs
+# in that status where unfiltered it reads every job in the schema, in the order a
+# job moves through them. Each maps to the status to ask for: the route's PENDING
+# includes PLACING. Other statuses gain nothing from the route's filter, and it
+# mishandles groups, comma lists and done.
+_SERVER_LIST_STATUSES = {
+    "pending": "pending",
+    "placing": "pending",
+    "initializing": "initializing",
+    "running": "running",
+}
+
+
+def _schema_jobs(client, args: argparse.Namespace) -> list:
+    """The configured schema's jobs that --status can keep, for _list_filter to
+    filter: when every status it keeps is active, the jobs the route returns for
+    each (one request per status), else every job."""
+    statuses = None if args.status is None else _list_statuses(args.status)
+    if not statuses or not statuses <= _SERVER_LIST_STATUSES.keys():
+        return client.list_jobs()
+    wanted = {_SERVER_LIST_STATUSES[word] for word in statuses}
+    by_id: dict = {}
+    unnamed = []
+    # Asked in a job's own order, so one that moves on between requests is in a
+    # later answer; a job in two answers keeps the later, so its newer status is
+    # the one filtered.
+    for status in dict.fromkeys(_SERVER_LIST_STATUSES.values()):
+        if status not in wanted:
+            continue
+        for job in client.list_jobs(status=status):
+            job_id = job.get("job_id")
+            if job_id is None:
+                unnamed.append(job)
+            else:
+                by_id[job_id] = job
+    return [*by_id.values(), *unnamed]
+
+
 def _cmd_list(args: argparse.Namespace, client, stdout: TextIO) -> int:
     if args.all:
-        jobs = list(
-            itertools.islice(
-                client.iter_jobs(
-                    status=args.status,
-                    submitted_by=args.user,
-                    created_after=args.since,
-                    # The server's bound is exclusive; --until names the last day kept.
-                    created_before=(
-                        None if args.until is None else args.until + timedelta(days=1)
-                    ),
-                    # No bigger than what gets printed; the server takes 1 to 1000.
-                    page_size=min(args.limit or 100, 1000),
-                ),
-                args.limit,
-            )
+        # The server filters on --status. Its status is checked here too, before
+        # --limit counts the rows, in case an answer is wider than the CLI's
+        # meaning: a pending that takes in placing, as the schema route's does.
+        rows = client.iter_jobs(
+            status=None if args.status is None else ",".join(
+                _ACCOUNT_LIST_STATUSES.get(word, word) for word in args.status.split(",")
+            ),
+            submitted_by=args.user,
+            created_after=args.since,
+            # The server's bound is exclusive; --until names the last day kept.
+            created_before=(
+                None if args.until is None else args.until + timedelta(days=1)
+            ),
+            # No bigger than what gets printed; the server takes 1 to 1000.
+            page_size=min(args.limit or 100, 1000),
         )
+        jobs = list(itertools.islice(filter(_status_filter(args), rows), args.limit))
     else:
         keep = _list_filter(args)
-        jobs = [job for job in client.list_jobs() if keep(job)]
+        jobs = [job for job in _schema_jobs(client, args) if keep(job)]
     if args.limit is not None:
         jobs = _newest_jobs(jobs, args.limit)
     _print_json({"jobs": _jobs_latest_last(jobs)}, stdout, compact=args.compact)
