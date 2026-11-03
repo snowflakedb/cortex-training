@@ -222,6 +222,7 @@ def _build_read_only_client(parser: argparse.ArgumentParser, args: argparse.Name
     # The old ways still work, with the same warnings as the CLI.
     for note in getattr(args, "_deprecations", ()):
         sys.stderr.write(f"warning: {note}\n")
+    cli.write_terminal_notes(args, sys.stderr)
 
     # Every read the TUI makes, the job list's too, is bounded here: the client's own
     # defaults (ten retries, a ten-minute read timeout) left a view silent for

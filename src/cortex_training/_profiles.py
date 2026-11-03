@@ -330,17 +330,12 @@ def rename_duplicates(path: Path) -> tuple[Path, list[tuple[int, str, str]]]:
     return backup, renames
 
 
-def write_file(path: Path, text: str, *, lock: bool = True) -> None:
+def write_file(path: Path, text: str) -> None:
     """Write a small private file, such as Cortex Training's ``config.json``, as profiles are written.
 
     Locked against concurrent writers, replaced atomically and durably, and
-    readable only by the user. A symlinked ``path`` keeps its link. ``lock=False``
-    skips the lock, and so the ``.<name>.lock`` file it leaves next to ``path``:
-    for a file no other writer touches, such as a backup in the user's folder.
+    readable only by the user. A symlinked ``path`` keeps its link.
     """
-    if not lock:
-        _replace(path, text)
-        return
     with _locked(path):
         _replace(path, text)
 

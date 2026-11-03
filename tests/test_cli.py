@@ -3993,12 +3993,36 @@ def test_a_saved_profile_beats_login_json(tmp_path, monkeypatch):
     rc, seen, err = _connect([], monkeypatch, CORTEX_TRAINING_LOGIN_FILE=str(login_state))
     assert rc == 0 and seen["use_connection_profile"] is True and seen["host"] is None
     assert cli._picker_choice(argparse_namespace(seen)).profile == "train"
-    assert (
-        f"warning: {login_state} is ignored because a profile is saved; run "
-        f"`cortex-training login --convert-legacy-config {config}` to convert it."
-    ) in err
+    # Kept on purpose (it is the way back), so scripts and CI logs get no note about it.
+    assert "is ignored because" not in err
     assert "old JSON config" not in err
-    assert login_state.exists()  # Only ignored; converting removes it.
+    assert login_state.exists()
+
+
+def test_a_terminal_is_told_how_to_use_login_json_again(tmp_path, monkeypatch):
+    config = _write_config(tmp_path, {"host": "acme.snowflakecomputing.com", "pat": "tok", "database": "DB"})
+    login_state = tmp_path / "login.json"
+    login_state.write_text(json.dumps({"config_path": str(config)}))
+    _write_profiles("default", "train")
+    _save_choice("train")
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
+    for name in ("CORTEX_TRAINING_CONFIG", "CORTEX_TRAINING_HOST", "CORTEX_TRAINING_PAT", "SNOWFLAKE_HOST", "SNOWFLAKE_PAT"):
+        monkeypatch.delenv(name, raising=False)
+
+    class Terminal(io.StringIO):
+        def isatty(self):
+            return True
+
+    stderr = Terminal()
+    rc = cli.main(["list"], client_factory=lambda args: FakeClient(), stdout=io.StringIO(), stderr=stderr)
+    assert rc == 0
+    config_json = Path(os.environ["SNOWFLAKE_HOME"]) / "cortex-training" / "config.json"
+    assert (
+        f"note: {login_state} is ignored because profile train is saved. "
+        f'To use it again, remove "profile" from {config_json}.'
+    ) in stderr.getvalue()
+    # It doesn't send someone who already converted back to convert again.
+    assert "--convert-legacy-config" not in stderr.getvalue()
 
 
 def test_login_json_still_works_when_the_saved_profile_is_gone(tmp_path, monkeypatch):
@@ -4011,7 +4035,7 @@ def test_login_json_still_works_when_the_saved_profile_is_gone(tmp_path, monkeyp
     rc, seen, err = _connect([], monkeypatch, CORTEX_TRAINING_LOGIN_FILE=str(login_state))
     assert rc == 0 and seen["use_connection_profile"] is False and seen["host"] == "acme.snowflakecomputing.com"
     assert f"Signing in with an old JSON config ({config}, from {login_state}) will be deprecated" in err
-    assert "is ignored because a profile is saved" not in err
+    assert "is ignored because" not in err
 
 
 def test_config_still_beats_a_saved_profile_with_its_warning(tmp_path, monkeypatch):
@@ -4022,7 +4046,7 @@ def test_config_still_beats_a_saved_profile_with_its_warning(tmp_path, monkeypat
         rc, seen, err = _connect(argv, monkeypatch, **env)
         assert rc == 0 and seen["use_connection_profile"] is False and seen["host"] == "acme.snowflakecomputing.com"
         assert f"Signing in with an old JSON config ({config}, from {source}) will be deprecated" in err
-        assert "is ignored because a profile is saved" not in err
+        assert "is ignored because" not in err
 
 
 def test_the_old_login_file_form_says_a_saved_profile_wins(tmp_path, monkeypatch):
