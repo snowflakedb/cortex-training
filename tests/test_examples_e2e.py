@@ -11,7 +11,8 @@ holding one profile works too. Skipped unless you opt in with one of:
 - CORTEX_TRAINING_E2E_CONNECTION=NAME: a named profile, passed to each example
   as connection=NAME.
 - CORTEX_TRAINING_E2E_CONFIG=FILE: an old JSON connection file, passed as
-  config=FILE. It will be deprecated in a future release.
+  config=FILE. It will be deprecated in a future release. If this and
+  CORTEX_TRAINING_E2E_CONNECTION are both set, the profile is used.
 
 Each case runs one example as its README does, cut to a few steps, and passes
 when it exits cleanly. The DARE-Bench evaluation first builds the setup its
@@ -165,8 +166,7 @@ def dare_bench(tmp_path_factory):
 
 def connection_args() -> list[str]:
     """The example settings that choose the connection; empty means the examples' default."""
-    chosen = [n for n, v in (("CORTEX_TRAINING_E2E_CONNECTION", CONNECTION), ("CORTEX_TRAINING_E2E_CONFIG", CONFIG)) if v]
-    assert len(chosen) <= 1, f"set only one of CORTEX_TRAINING_E2E_CONNECTION and CORTEX_TRAINING_E2E_CONFIG"
+    # A profile wins over the old JSON file, so an environment can provide both for old and new clients.
     if CONNECTION:
         return [f"connection={CONNECTION}"]
     if CONFIG:
