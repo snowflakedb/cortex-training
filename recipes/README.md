@@ -58,7 +58,7 @@ To log metrics to Weights & Biases or Snowflake, see
 
 ```bash
 # With no connection argument, the profile `cortex-training login` saved is used.
-# Add connection=<profile> to choose another (config=<file> still works, deprecated).
+# Add connection=<profile> to choose another.
 python -m recipes.sft_quickstart.conversational.train
 python -m recipes.rl_quickstart.math_grpo.train
 python -m recipes.distillation.on_policy.train
@@ -68,8 +68,9 @@ python -m recipes.model_deployment.deploy       # needs a profile that signs in 
 
 Every recipe resolves its connection the same way the CLI does:
 
-- `connection=<name>` uses a profile from `~/.snowflake/connections.toml`
-  (`$SNOWFLAKE_HOME/connections.toml` if `SNOWFLAKE_HOME` is set).
+- `connection=<name>` uses a profile from `connections.toml` in your Snowflake
+  folder, usually `~/.snowflake/` (see
+  [the Snowflake folder](../docs/getting-started/authentication.md#the-snowflake-folder)).
 - With no `connection=`, the profile `cortex-training login` saved is used, then
   the Snowflake default connection profile.
 - The [older connection methods](../docs/reference/cli.md#older-connection-methods),
