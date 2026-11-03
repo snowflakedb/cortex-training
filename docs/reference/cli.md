@@ -63,11 +63,11 @@ See [jobs and sub-jobs](../concepts/jobs-and-subjobs.md) and the
 
 ## Quick Reference
 
-Global flags such as `--config`, `--job`, and `--compact` go **before** the
+Global flags such as `--connection`, `--job`, and `--compact` go **before** the
 subcommand. `--job-id` is an alias for `--job`:
 
 ```bash
-cortex-training --config config.json list
+cortex-training --connection training list
 cortex-training --job JOB_ID step
 cortex-training checkpoints JOB_ID
 ```
@@ -77,14 +77,13 @@ require the global `--job JOB_ID` option. Their `--help` usage lines show its
 placement. Management commands such as `get` and `checkpoints` instead take a
 positional `JOB_ID` after the subcommand.
 
-### [Connection](#legacy-connection-config)
+### [Connection](#connect-with-a-profile)
 
 ```bash
 cortex-training login                         # Set up or check the profile to use
 cortex-training login training                # Use or create the profile "training"
 cortex-training list                          # Use the profile login saved
 cortex-training --connection training list    # Use another profile for one command
-cortex-training --config config.json list     # Deprecated: an old JSON config (warns)
 ```
 
 ### [Submit Jobs](#submit-a-job)
@@ -190,7 +189,7 @@ cortex-training fwd-bwd --help
 
 ## Detailed Reference
 
-- [Connection config](#legacy-connection-config), [login](#legacy-login), and [environment variables](#environment-variables)
+- [Connect with a profile](#connect-with-a-profile), [login](#login), and [environment variables](#environment-variables)
 - [Submit](#submit-a-job), [manage jobs](#manage-existing-jobs), [available models](#list-available-models), and [GPU capacity](#show-current-gpu-capacity)
 - [Forward-backward and optimizer steps](#run-a-forward-backward-smoke-test)
 - [Load checkpoints](#load-a-checkpoint-into-a-running-job) and [initialize sampling](#start-sampling-from-a-training-checkpoint)
@@ -198,13 +197,16 @@ cortex-training fwd-bwd --help
 - [Download logs](#download-execution-logs), [stdout](#download-persisted-stdout), and [metrics](#download-metrics)
 - [Job TUI](#job-tui), [JSON output and help](#json-output-and-help), and [troubleshooting](#troubleshooting)
 
+### Connect With A Profile
+
 `cortex-training` submits and manages Cortex Training jobs through the Cortex
-Training REST endpoint.
-The Snowflake-native workflow uses the same connection profiles as the Python
+Training REST endpoint. It connects with the same connection profiles as the
+Python Connector and Snowflake CLI. The easiest way to set one up is
+`cortex-training login` (see [Login](#login)). The Snowflake-native workflow uses the same connection profiles as the Python
 Connector and Snowflake CLI:
 
 ```toml
-# ~/.snowflake/connections.toml
+# connections.toml in your Snowflake folder, usually ~/.snowflake/
 [training]
 account = "ORG-ACCOUNT"
 host = "ACCOUNT.snowflakecomputing.com"
@@ -243,27 +245,16 @@ database, and schema, and where each came from, unless it's the profile
 
 Scripts and CI (stderr not a terminal) never get this line.
 
-The old ways still work, and each prints a warning that it's deprecated and
-will stop working in a future release: an explicit or remembered JSON config
-(`--config`, `CORTEX_TRAINING_CONFIG`, `login.json`), `--host` / `--pat`,
-`SNOWFLAKE_HOST` / `SNOWFLAKE_PAT` / `SNOWFLAKE_DATABASE` / `SNOWFLAKE_SCHEMA`,
-and `CORTEX_TRAINING_CONNECTION`. They win as before, so existing scripts keep
-working. `CORTEX_TRAINING_HOST` and `CORTEX_TRAINING_PAT` are for CI: when you
-also have a profile they still win, with a warning that the profile will be
-used instead in a future release. `--base-url`, for a local or mock server,
-doesn't warn.
+### Older Connection Methods
 
-One exception: a profile saved by `cortex-training login` wins over
-`login.json` (the file the old `login PATH` remembered), as long as that profile
-still exists. The command uses the profile and says `login.json` is ignored,
-with the command that converts and removes it. If the saved profile is gone,
-`login.json` keeps working, with its deprecation warning. `--config` and `CORTEX_TRAINING_CONFIG` still win over a saved
-profile, since you pass them for that command.
+Use a connection profile (above) for new setups. The older methods below still
+work, as a fallback if the profile setup doesn't work for you, and each prints a
+warning: they will be deprecated in a future release. To move an old JSON config
+to a profile, run `cortex-training login --convert-legacy-config PATH` (see
+[Login](#login)).
 
-### Legacy Connection Config
-
-For Snowflake PAT auth, use `host` for the account hostname. Do not use
-`base_url` for Snowflake PAT auth.
+**A JSON config file** holds the connection. For Snowflake PAT auth, use `host`
+for the account hostname, not `base_url`:
 
 ```json
 {
@@ -278,8 +269,20 @@ For Snowflake PAT auth, use `host` for the account hostname. Do not use
 }
 ```
 
-If you prefer not to store the PAT in the file, omit `pat` and set it in the
-shell instead:
+Use it for one command with `--config`, for every command with
+`CORTEX_TRAINING_CONFIG`, remember it with `cortex-training login config.json`
+(or `login --config config.json`, saved in `login.json`), or pass it to a recipe
+as `config=`:
+
+```bash
+cortex-training --config config.json list
+export CORTEX_TRAINING_CONFIG=/path/to/config.json
+python -m recipes.sft_quickstart.conversational.train config=config.json
+cortex-training tui JOB_ID --config config.json
+```
+
+Explicit CLI flags override config values. If you prefer not to store the PAT
+in the file, omit `pat` and set it in the shell instead:
 
 ```bash
 export CORTEX_TRAINING_PAT='YOUR_PROGRAMMATIC_ACCESS_TOKEN'
@@ -297,10 +300,39 @@ account, use `base_url` with an explicit scheme. This skips PAT auth:
 }
 ```
 
+**Flags and variables.** `--host` and `--pat` (with `--database`, `--schema`
+and `--endpoint`) connect without a profile or file:
+
+```bash
+cortex-training tui JOB_ID --host ACCOUNT.snowflakecomputing.com --pat YOUR_PAT \
+  --database CORTEX_TRAINING_DB --schema PUBLIC --endpoint cortex-training
+```
+
+These variables still work too, each with its replacement:
+
+```bash
+CORTEX_TRAINING_CONNECTION          # use --connection, or cortex-training login
+CORTEX_TRAINING_CONFIG              # convert with login --convert-legacy-config
+SNOWFLAKE_HOST                      # use CORTEX_TRAINING_HOST
+SNOWFLAKE_PAT                       # use CORTEX_TRAINING_PAT
+SNOWFLAKE_DATABASE                  # use CORTEX_TRAINING_DATABASE
+SNOWFLAKE_SCHEMA                    # use CORTEX_TRAINING_SCHEMA
+```
+
+**Which wins.** When one of these is used, it decides the connection as it did
+before, so existing scripts keep working. `CORTEX_TRAINING_HOST` and
+`CORTEX_TRAINING_PAT` are for CI: when you also have a profile they still win,
+with a warning that the profile will be used instead in a future release.
+`--base-url`, for a local or mock server, doesn't warn. One exception: a profile
+saved by `cortex-training login` wins over `login.json`, as long as that profile
+still exists; the command then says `login.json` is ignored, with the command
+that converts and removes it. `--config` and `CORTEX_TRAINING_CONFIG` still win
+over a saved profile, since you pass them for that command.
+
 ### Login
 
 `cortex-training login` sets up the Snowflake connection profile Cortex Training
-uses, and remembers it as `"profile"` in `~/.snowflake/cortex-training/config.json`
+uses, and remembers it as `"profile"` in `cortex-training/config.json` in the Snowflake folder (usually `~/.snowflake/`)
 (next to your profiles, so `$SNOWFLAKE_HOME` moves both):
 
 ```bash
@@ -370,23 +402,8 @@ profiles live there. Prompts and progress go to stderr, in color in a terminal
 is piped. Login needs a terminal; in CI, set `CORTEX_TRAINING_HOST` and
 `CORTEX_TRAINING_PAT` instead.
 
-`cortex-training login config.json` and `login --config config.json`, which
-remember a JSON config in `login.json`, still work, with a deprecation warning.
-A JSON config also still works (with a warning) for one command with:
-
-```bash
-cortex-training --config config.json list
-```
-
-or by setting:
-
-```bash
-export CORTEX_TRAINING_CONFIG=/path/to/config.json
-```
-
-Explicit CLI flags override config values.
-
-To turn a JSON config into a Snowflake connection profile instead:
+To turn an old JSON config into a Snowflake connection profile (see
+[Older Connection Methods](#older-connection-methods)):
 
 ```bash
 cortex-training login --convert-legacy-config PATH
@@ -401,8 +418,7 @@ shows where each value came from. Database and schema names must be Snowflake
 identifiers. It asks before signing in with the PAT to look up its user and
 role, to check that Cortex Training answers for the account, and to check the database. It
 creates a missing database only after showing the SQL and asking. Then it shows
-every change and asks once, with No as the default (`[y/N]`), since it deletes
-the file:
+every change and asks once (`[Y/n]`). The old file is never deleted or edited:
 
 - it adds a profile with `authenticator = "PROGRAMMATIC_ACCESS_TOKEN"`. The
   profile is named `cortex-training`, or the next free name (an existing
@@ -413,11 +429,14 @@ the file:
   `no_verify_ssl`) aren't kept: it lists any that differ from the defaults,
   with the flags that set them (`--endpoint`, `--poll-interval`,
   `--poll-timeout`, `--no-verify-ssl`);
-- it saves a copy of the file without the PAT as `PATH.bak`;
-- it signs in with the new profile, as commands will;
-- only if that works, it deletes the file, and `login.json` if it points to it.
+- it signs in with the new profile, as commands will.
 
-Either every change happens, or every file is put back as it was. If a check
+Either every change happens, or every file is put back as it was. `PATH` and
+`login.json` are left exactly as they were. A saved profile is used ahead of
+`login.json`, but `--config PATH`, `CORTEX_TRAINING_CONFIG`, and a recipe's
+`config=PATH` still win over the profile (with a deprecation warning), so pass
+one to use the old file again. To stop using the profile, remove `"profile"`
+from `config.json`; the command prints the paths when it finishes. If a check
 fails, or there's no `pat` in the file or the environment, or the file has a
 `base_url` instead of a `host`, or the file is the new `config.json` itself, it
 says why and changes nothing. It needs a terminal, and takes no profile name.
@@ -1101,25 +1120,15 @@ cortex-training tui                 # opens the job list of the configured datab
 cortex-training tui JOB_ID          # opens that job's dashboard directly
 ```
 
-Without login state, pass connection details the same way as the CLI:
+The TUI connects the same way as the CLI: the profile `cortex-training login`
+saved, or another one with `--connection`:
 
 ```bash
 cortex-training tui JOB_ID --connection training
-cortex-training tui JOB_ID --config config.json
-cortex-training tui JOB_ID --host ACCOUNT.snowflakecomputing.com --pat YOUR_PAT \
-  --database CORTEX_TRAINING_DB --schema PUBLIC --endpoint cortex-training
 cortex-training tui JOB_ID --base-url http://localhost:8084   # local/mock
 ```
 
-Keep the PAT out of your shell history by exporting it instead (omit `JOB_ID`
-to open the job list):
-
-```bash
-export CORTEX_TRAINING_PAT='YOUR_PROGRAMMATIC_ACCESS_TOKEN'
-cortex-training tui \
-  --host ACCOUNT.snowflakecomputing.com \
-  --database CORTEX_TRAINING_DB --schema PUBLIC
-```
+The [older connection methods](#older-connection-methods) work with the TUI too.
 
 No command, the TUI included, creates the configured database or schema; when
 the service answers that they are not found, the command stops with an error
@@ -2042,20 +2051,16 @@ usage: cortex-training --job JOB_ID fwd-bwd [-h] json_file
 Connection values can also come from:
 
 ```bash
-CORTEX_TRAINING_CONNECTION
-SNOWFLAKE_DEFAULT_CONNECTION_NAME
-CORTEX_TRAINING_CONFIG
-CORTEX_TRAINING_BASE_URL
-CORTEX_TRAINING_HOST
-SNOWFLAKE_HOST
-CORTEX_TRAINING_PAT
-SNOWFLAKE_PAT
+SNOWFLAKE_DEFAULT_CONNECTION_NAME   # Snowflake's default profile
 CORTEX_TRAINING_DATABASE
-SNOWFLAKE_DATABASE
 CORTEX_TRAINING_SCHEMA
-SNOWFLAKE_SCHEMA
+CORTEX_TRAINING_HOST                # CI, with no profile
+CORTEX_TRAINING_PAT                 # CI, with no profile
 CORTEX_TRAINING_ENDPOINT
+CORTEX_TRAINING_BASE_URL            # local or mock server
 ```
+
+Older variables also still work; see [Older Connection Methods](#older-connection-methods).
 
 `CORTEX_TRAINING_DISABLE_LOCAL_TRAINING_METRICS` (truthy) stops the client
 copying each `/fwd-bwd` and `/step` result to the local training-metrics file
@@ -2085,14 +2090,14 @@ minimum 16 KiB). Frames larger than that are split into request chunks.
 
 ### Troubleshooting
 
-If you see `provide --base-url for local/mock use, or both --host and --pat`,
-the CLI found a `host` but no PAT. Add `"pat": "..."` to `config.json` or set
-`CORTEX_TRAINING_PAT`.
+If no profile is found, run `cortex-training login` to set one up, or pass
+`--connection NAME`. With no old connection form in use, the CLI uses the
+profile `cortex-training login` saved, then the Snowflake Connector's default
+profile.
 
-If no legacy config or complete direct connection is present, the CLI falls
-back to the Snowflake Connector's configured default. If your profile is not
-named `default`, pass `--connection NAME` or set
-`SNOWFLAKE_DEFAULT_CONNECTION_NAME`.
+If you see `provide --base-url for local/mock use, or both --host and --pat`,
+the CLI found a `host` but no PAT. Set `CORTEX_TRAINING_PAT`, add `"pat": "..."`
+to an old JSON file, or switch to a profile with `cortex-training login`.
 
 If Snowflake rejects your PAT, the CLI keeps the original error and adds next
 steps: `394400 (08001) ... Programmatic access token is invalid` from a

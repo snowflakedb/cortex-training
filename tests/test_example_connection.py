@@ -425,7 +425,7 @@ def test_an_example_config_still_works_and_warns(env, tmp_path, caplog):
     with caplog.at_level("WARNING"):
         resolved = utils.resolve_example_connection(config=path)
     assert resolved.source == "config file"
-    assert f"config={path} (an old JSON config) is deprecated and will stop working in a future release." in caplog.text
+    assert f"config={path} (an old JSON config) will be deprecated in a future release." in caplog.text
     assert f"`cortex-training login --convert-legacy-config {path}`" in caplog.text
 
 
@@ -442,7 +442,7 @@ def test_an_example_reached_by_cortex_training_config_warns(env, tmp_path, caplo
     env.setenv("CORTEX_TRAINING_CONFIG", pat_config(tmp_path))
     with caplog.at_level("WARNING"):
         utils.resolve_example_connection()
-    assert "from CORTEX_TRAINING_CONFIG) is deprecated and will stop working in a future release." in caplog.text
+    assert "from CORTEX_TRAINING_CONFIG) will be deprecated in a future release." in caplog.text
 
 
 def test_an_example_that_needs_a_pat_doesn_t_call_its_config_deprecated(env, tmp_path, caplog):

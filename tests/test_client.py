@@ -9776,3 +9776,16 @@ def test_execution_log_filenames_keep_their_subdirectories(tmp_path, monkeypatch
     # Resume finds the nested file's record.
     again = c.download_execution_logs("job-1", tmp_path, resume=True)
     assert [r["unchanged"] for r in again] == [True, True]
+
+
+def test_request_retries_back_off_without_tenacity_deprecation_warnings():
+    import warnings
+
+    from tenacity import wait_exponential_jitter
+
+    from cortex_training.client import core
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        wait = wait_exponential_jitter(**{core._JITTER_START: 0.5}, max=10.0)
+    assert getattr(wait, "multiplier", getattr(wait, "initial", None)) == 0.5
