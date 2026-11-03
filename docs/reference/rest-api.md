@@ -566,15 +566,16 @@ REST response:
 `CortexTrainingClient.list_jobs()` returns only the `jobs` list, not the outer object.
 The client forwards the status string without validating an enum.
 
-`status` takes one status. On service versions that support it, a request
-filtered on an active one (`pending`, `placing`, `initializing`, `running`) is
-answered from the jobs in that status alone, where an unfiltered request reads
-every job in the schema; the others take as long as an unfiltered request. Its
-`pending` includes `placing` jobs. `active` and comma lists match nothing, and
-`done` misses every job that has settled: ask for `failed`, `cancelled` or
-`terminated` one at a time instead. `cortex-training list --status` sends one such
-request per active status it names, asking for `pending` for `placing`, and
-filters the rows itself; for any other status it requests every job.
+`status` takes one status. A service that supports it answers a request
+filtered on an active one (`pending`, `placing`, `initializing`, `running`) from
+the jobs in that status alone. On one that doesn't, and for the other statuses,
+a filtered request reads every job in the schema as an unfiltered one does, and
+returns only the matching rows. Its `pending` includes `placing` jobs. `active`
+and comma lists match nothing, and `done` misses every job that has settled: ask
+for `failed`, `cancelled` or `terminated` one at a time instead.
+`cortex-training list --status` sends one such request per active status it
+names, asking for `pending` for `placing`, and filters the rows itself; for any
+other status it requests every job.
 
 #### Across the account - `GET /api/v2/{endpoint}`
 
@@ -590,7 +591,7 @@ Optional query parameters:
 |---|---|
 | `database` | Only jobs in this database. SQL identifier rules apply: an unquoted name is case-insensitive, a `"quoted"` one exact. A database the caller cannot see returns 400. |
 | `schema` | Only jobs in this schema of `database`, by the same rules. Requires `database`: a schema name alone does not name one schema, and sending it without `database` returns 400. A schema the caller cannot see returns 400. |
-| `status` | Comma-separated and case-insensitive: `pending`, `placing`, `initializing`, `running`, `failed`, `cancelled`, `terminated`, and the groups `active` (`pending` through `running`) and `done` (`cancelled`, `terminated`, and the `done` that older jobs show). `pending` does not include `placing`. Any other value returns 400. |
+| `status` | Comma-separated and case-insensitive: `pending`, `placing`, `initializing`, `running`, `failed`, `cancelled`, `terminated`, and the groups `active` (`pending` through `running`) and `terminal` (`failed`, `cancelled`, `terminated`). `pending` does not include `placing`. Any other value returns 400, `done` included: `cortex-training list --all --status done` sends `cancelled,terminated`, so the `done` that older jobs show is not listed. |
 | `submitted_by` | Only jobs submitted by this user, by SQL identifier rules. Jobs with no recorded submitter never match, and an unknown user matches no jobs. |
 | `created_after` | Inclusive lower bound on creation time: an RFC 3339 timestamp, or `YYYY-MM-DD` for midnight UTC. Must be earlier than `created_before`. |
 | `created_before` | Exclusive upper bound on creation time, in the same forms. |

@@ -3736,7 +3736,7 @@ class CortexTrainingClient:
         ``page_size`` is 1 to 1000, and ``schema`` needs ``database`` with it.
         The server applies every filter: ``database`` / ``schema`` narrow the
         scope, ``status`` is one status or a list of them (``active`` and
-        ``done`` name groups), ``submitted_by`` takes a user name, and
+        ``terminal`` name groups), ``submitted_by`` takes a user name, and
         ``created_after`` (inclusive) / ``created_before`` (exclusive) take a
         ``date``, a ``datetime`` (sent in UTC; naive is taken as UTC) or a
         string sent as-is. Rows also carry ``database_name`` and

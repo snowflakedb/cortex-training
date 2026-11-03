@@ -460,7 +460,7 @@ cortex-training wait JOB_ID
 | Flag | Takes | Notes |
 |---|---|---|
 | `--all` | nothing | lists jobs across every schema in the account that you can see, not just the configured one |
-| `--status` | comma list of `pending`, `placing`, `initializing`, `running`, `failed`, `cancelled`, `terminated`, `active`, `done` | `active` is `pending` through `running`; `done` is `cancelled`, `terminated`, and the `done` that older jobs show; `pending` does not include `placing`. Matched against a row's status in any form the server sends, including `JOB_STATE_RUNNING` and aliases such as `canceled`, `completed`, `succeeded`, `error`, `queued`, `creating` |
+| `--status` | comma list of `pending`, `placing`, `initializing`, `running`, `failed`, `cancelled`, `terminated`, `active`, `done` | `active` is `pending` through `running`; `done` is `cancelled`, `terminated`, and the `done` that older jobs show (with `--all`, `cancelled` and `terminated` only: the account-level route has no `done`); `pending` does not include `placing`. Matched against a row's status in any form the server sends, including `JOB_STATE_RUNNING` and aliases such as `canceled`, `completed`, `succeeded`, `error`, `queued`, `creating` |
 | `--user` | user name | SQL name rules: unquoted means its uppercase form, `"quoted"` means exactly that name |
 | `--since` | `YYYY-MM-DD` | a UTC day; keeps jobs created on or after it |
 | `--until` | `YYYY-MM-DD` | a UTC day; keeps jobs created on or before it, so `--since D --until D` means "on day D" |
@@ -469,11 +469,12 @@ cortex-training wait JOB_ID
 Without `--all`, the CLI applies the filters itself. When every status
 `--status` names is active (`pending`, `placing`, `initializing`, `running`, or
 `active`), it reads only those statuses from the configured schema, one request
-each ([REST API reference section 5.3](rest-api.md#53-list-jobs---get-)),
-which current service versions answer without reading the schema's other jobs;
-for any other status, or none, it fetches every job in the schema. Either way it leaves
-out a job with no `created_at` when `--since` or `--until` is set. With `--all`,
-the server applies them across the account
+each ([REST API reference section 5.3](rest-api.md#53-list-jobs---get-)).
+A service that supports it answers those from the jobs in that status alone; one
+that doesn't still reads every job in the schema, and returns only the matching
+rows. For any other status, or none, the CLI fetches every job in the schema.
+Either way it leaves out a job with no `created_at` when `--since` or `--until`
+is set. With `--all`, the server applies them across the account
 ([REST API reference section 5.3](rest-api.md#across-the-account---get-apiv2endpoint)),
 and the CLI checks each row's status again, so an answer wider than `--status`
 (a `pending` that includes `placing`, say) still prints only what it names;
