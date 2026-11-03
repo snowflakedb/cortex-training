@@ -15,7 +15,7 @@
 
 """Public Python API for Cortex Training."""
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from . import wire
 from .client import AccountJobListUnavailable
