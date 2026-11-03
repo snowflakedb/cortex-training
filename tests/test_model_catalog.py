@@ -496,7 +496,7 @@ def test_deepseek_v41_training_meshes_match_the_completed_h200_runs():
         else:
             assert training["optimizer"]["lr"] == 2e-5
             assert "peft_config" not in training
-        if key == "standard/h200-training-lora":
+        if key.endswith("training-lora"):
             assert "offload_optimizer" not in ds_config["zero_optimization"]
         else:
             assert ds_config["zero_optimization"]["offload_optimizer"]["device"] == "cpu"
