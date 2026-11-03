@@ -892,7 +892,7 @@ def build_parser(
         metavar="PATH",
         help=(
             "Turn an old JSON config (host, PAT, database) into a Snowflake connection profile, "
-            "move its settings to config.json, and remove the old file. Asks before each step."
+            "and move its settings to config.json. The old file is kept. Asks before each step."
         ),
     )
     login.add_argument("--config", dest="login_config_option", help=argparse.SUPPRESS)
@@ -1170,7 +1170,7 @@ def _old_connection_notes(args: argparse.Namespace, typed: Mapping[str, Any]) ->
         if ignored:
             notes.append(
                 f"{_login_state_path()} is ignored because a profile is saved; run "
-                f"`cortex-training login --convert-legacy-config {ignored}` to convert and remove it."
+                f"`cortex-training login --convert-legacy-config {ignored}` to convert it."
             )
         for name, flag in (("database", "--database"), ("schema", "--schema")):
             variable = f"SNOWFLAKE_{name.upper()}"

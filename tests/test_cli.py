@@ -3995,7 +3995,7 @@ def test_a_saved_profile_beats_login_json(tmp_path, monkeypatch):
     assert cli._picker_choice(argparse_namespace(seen)).profile == "train"
     assert (
         f"warning: {login_state} is ignored because a profile is saved; run "
-        f"`cortex-training login --convert-legacy-config {config}` to convert and remove it."
+        f"`cortex-training login --convert-legacy-config {config}` to convert it."
     ) in err
     assert "old JSON config" not in err
     assert login_state.exists()  # Only ignored; converting removes it.

@@ -418,8 +418,7 @@ shows where each value came from. Database and schema names must be Snowflake
 identifiers. It asks before signing in with the PAT to look up its user and
 role, to check that Cortex Training answers for the account, and to check the database. It
 creates a missing database only after showing the SQL and asking. Then it shows
-every change and asks once, with No as the default (`[y/N]`), since it deletes
-the file:
+every change and asks once (`[Y/n]`). The old file is never deleted or edited:
 
 - it adds a profile with `authenticator = "PROGRAMMATIC_ACCESS_TOKEN"`. The
   profile is named `cortex-training`, or the next free name (an existing
@@ -430,11 +429,14 @@ the file:
   `no_verify_ssl`) aren't kept: it lists any that differ from the defaults,
   with the flags that set them (`--endpoint`, `--poll-interval`,
   `--poll-timeout`, `--no-verify-ssl`);
-- it saves a copy of the file without the PAT as `PATH.bak`;
-- it signs in with the new profile, as commands will;
-- only if that works, it deletes the file, and `login.json` if it points to it.
+- it signs in with the new profile, as commands will.
 
-Either every change happens, or every file is put back as it was. If a check
+Either every change happens, or every file is put back as it was. `PATH` and
+`login.json` are left exactly as they were. A saved profile is used ahead of
+`login.json`, but `--config PATH`, `CORTEX_TRAINING_CONFIG`, and a recipe's
+`config=PATH` still win over the profile (with a deprecation warning), so pass
+one to use the old file again. To stop using the profile, remove `"profile"`
+from `config.json`; the command prints the paths when it finishes. If a check
 fails, or there's no `pat` in the file or the environment, or the file has a
 `base_url` instead of a `host`, or the file is the new `config.json` itself, it
 says why and changes nothing. It needs a terminal, and takes no profile name.
