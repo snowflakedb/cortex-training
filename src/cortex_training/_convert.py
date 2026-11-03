@@ -24,11 +24,10 @@ database, and settings. Converting it:
    can be created after showing the SQL and asking. Nothing local is written
    if a check fails;
 3. shows every change and asks once;
-4. writes a Snowflake connection profile, sets it in ``config.json``, and
-   saves a copy of the old file without the PAT; then signs in with the new
-   profile, and only if that works deletes the old file (and ``login.json`` if
-   it points to it). Either every change happens, or every file is put back
-   as it was.
+4. writes a Snowflake connection profile and sets it in ``config.json``, then
+   signs in with the new profile. The old file and ``login.json`` are never
+   changed, so ``--config PATH`` still works. Either every change happens, or
+   every file is put back as it was.
 """
 
 from __future__ import annotations
@@ -225,8 +224,6 @@ class Plan:
     profile: str
     values: dict[str, Any] = field(repr=False)
     settings: dict[str, Any]
-    backup: Path
-    login_file: Path | None
 
 
 class _Converter:
@@ -364,8 +361,7 @@ class _Converter:
         _picker.load_config()  # A config.json that can't be read back is an error, not overwritten.
         # config.json holds only "profile"; the old file's other settings aren't kept.
         settings = {"profile": name}
-        login_file = _login_file_for(old.path)
-        return Plan(profile=name, values=values, settings=settings, backup=_backup_path(old.path), login_file=login_file)
+        return Plan(profile=name, values=values, settings=settings)
 
     def confirm(self, plan: Plan) -> None:
         old = self.old
@@ -378,9 +374,8 @@ class _Converter:
             f"database {old.database})"
         )
         self.p.say(f"  2. Set Cortex Training to use it, in {_login._home(_picker.config_path())}")
-        self.p.say(f"  3. Save a copy of the old config without the PAT: {_login._home(plan.backup)}")
-        self.p.say(f"  4. Sign in with profile {plan.profile} to check that it works")
-        self.p.say(f"  5. Only if it works, delete {_kept(plan, old)}")
+        self.p.say(f"  3. Sign in with profile {plan.profile} to check that it works")
+        self.p.say(f"   {_login._home(old.path)} is kept as it is, so you can go back to it.")
         self.p.say("   If anything fails, every file is put back as it was.")
         dropped = _dropped_settings(old.settings)
         if dropped:
@@ -388,10 +383,8 @@ class _Converter:
             self.p.say(f"{self.s.warn('Not kept:')} {', '.join(dropped)}.")
             self.p.say("   config.json holds only the profile now. Pass these when you run a command instead:")
             self.p.say(f"   {_flags_for(old.settings)}")
-        # No by default: this deletes the old file.
-        if not self.p.confirm("Go ahead?", default=False):
+        if not self.p.confirm("Go ahead?", default=True):
             raise ConvertError("Nothing was changed.")
-
 
     def check_new_profile(self, plan: Plan, open_profile: Callable[[str, str, str], Any]) -> None:
         """Sign in with the profile just written, as commands will; raise if it doesn't work."""
@@ -409,11 +402,6 @@ class _Converter:
 
 class _NewProfileFailed(Exception):
     """Signing in with the new profile failed; the cause is chained."""
-
-
-def _kept(plan: Plan, old: OldConfig) -> str:
-    """The old file, and login.json when it points to it: deleted only once the new profile works."""
-    return _login._home(old.path) + (f" and {_login._home(plan.login_file)}" if plan.login_file else "")
 
 
 # The client's defaults. Old files often list these (the 3.1 template does), and
@@ -450,35 +438,6 @@ def _unused_name(base: str, profiles: dict[str, Any]) -> str:
     return f"{base}-{number}"
 
 
-def _backup_path(path: Path) -> Path:
-    backup = path.with_name(f"{path.name}.bak")
-    number = 2
-    while backup.exists():
-        backup = path.with_name(f"{path.name}.bak{number}")
-        number += 1
-    return backup
-
-
-def _login_file_for(path: Path) -> Path | None:
-    """``login.json`` when it points to ``path``; it would point to a deleted file otherwise."""
-    from cortex_training.cli import commands as _cli
-
-    login_file = _cli._login_state_path()
-    try:
-        pointed = json.loads(login_file.read_text(encoding="utf-8")).get("config_path")
-    except (OSError, ValueError, AttributeError):
-        return None
-    if isinstance(pointed, str) and Path(pointed).expanduser().resolve() == path.resolve():
-        return login_file
-    return None
-
-
-def _without_pat(raw: dict[str, Any]) -> dict[str, Any]:
-    if isinstance(raw.get("connection"), dict):
-        return {**raw, "connection": {key: value for key, value in raw["connection"].items() if key != "pat"}}
-    return {key: value for key, value in raw.items() if key != "pat"}
-
-
 class _Snapshot:
     """A file's bytes (or its absence), to put back if a later step fails."""
 
@@ -496,30 +455,23 @@ class _Snapshot:
 def apply(plan: Plan, old: OldConfig, check: Callable[[], None] | None = None) -> None:
     """Make every change in ``plan``, or put every file back as it was and raise.
 
-    ``check`` signs in with the new profile after the writes; the old file and
-    ``login.json`` are deleted only if it returns.
+    ``check`` signs in with the new profile after the writes. The old file and
+    ``login.json`` are never touched.
     """
     config_file = _picker.config_path()
-    snapshots = [_Snapshot(_profiles.profile_file()), _Snapshot(config_file), _Snapshot(plan.backup)]
-    removed: list[_Snapshot] = []
+    snapshots = [_Snapshot(_profiles.profile_file()), _Snapshot(config_file)]
     try:
         _profiles.write_profile(plan.profile, plan.values)
         settings = json.dumps(plan.settings, indent=2) + "\n"
         _profiles.write_file(config_file, settings)
         _picker.load_config()  # Refuse settings that commands couldn't read back.
-        _profiles.write_file(plan.backup, json.dumps(_without_pat(old.raw), indent=2) + "\n")
         if check is not None:
             try:
                 check()
             except Exception as exc:
                 raise _NewProfileFailed() from exc
-        # Delete last, once every write has worked and the new profile signs in.
-        for path in [old.path, *([plan.login_file] if plan.login_file else [])]:
-            snapshot = _Snapshot(path)
-            path.unlink()
-            removed.append(snapshot)
     except BaseException as exc:
-        for snapshot in [*snapshots, *removed]:
+        for snapshot in snapshots:
             try:
                 snapshot.restore()
             except Exception:
@@ -528,7 +480,7 @@ def apply(plan: Plan, old: OldConfig, check: Callable[[], None] | None = None) -
             cause = exc.__cause__
             raise ConvertError(
                 f"Signing in with profile {plan.profile} didn't work: {explain(cause, old)}\n\n"
-                f"Every file was put back as it was; {_kept(plan, old)} {'are' if plan.login_file else 'is'} kept. "
+                f"Every file was put back as it was; {_login._home(old.path)} is unchanged. "
                 "If Cortex Training or the network was briefly unavailable, run the command again in a few minutes."
             ) from cause
         if isinstance(exc, Exception):
@@ -585,11 +537,18 @@ def run_convert(
     if not style.decorate:
         prompter.say()
     prompter.say(style.green(style.bold("You're all set.")) + f" Cortex Training will use profile {style.bold(plan.profile)}.")
-    prompter.say(style.dim(f"(The old config is saved without its PAT in {_login._home(plan.backup)}.)"))
+    kept = _login._home(old.path)
+    prompter.say(style.dim(f"(The old config is kept as it was: {kept}.)"))
     if _dropped_settings(old.settings):
         prompter.say(f"Not kept: {', '.join(_dropped_settings(old.settings))}. Pass them as {_flags_for(old.settings)}.")
     prompter.say()
-    prompter.say(f"Try it:  {style.cyan(f'cortex-training --connection {plan.profile} capacity')}")
+    prompter.say(f"Try it:  {style.cyan('cortex-training capacity')}")
+    prompter.say()
+    prompter.say("To go back to the old config:")
+    prompter.say(f"  - Use it for one command with `--config {kept}` (or `config={kept}` in a recipe, or")
+    prompter.say("    CORTEX_TRAINING_CONFIG). It wins over the profile and prints a deprecation warning.")
+    prompter.say(f"  - To stop using the profile everywhere, remove \"profile\" from {_login._home(_picker.config_path())}.")
+    prompter.say(f"    You can also delete [{plan.profile}] from {_login._home(_profiles.profile_file())}.")
     prompter.say()
     for line in _login.PRIVILEGE_NOTE:
         prompter.say(style.yellow(line))
@@ -605,8 +564,7 @@ def run_convert(
                 "database": old.database,
                 "schema": old.schema,
                 "config": str(_picker.config_path()),
-                "backup": str(plan.backup),
-                "deleted": [str(old.path), *([str(plan.login_file)] if plan.login_file else [])],
+                "kept": str(old.path),
                 "created_database": converter.created_database,
             },
             stdout,

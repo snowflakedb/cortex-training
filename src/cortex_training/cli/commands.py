@@ -379,7 +379,8 @@ still lack privileges that some operations need; if one is refused, its
 error says which.
 
 login never changes your existing profiles, and asks before it creates
-anything. Your choice is saved in ~/.snowflake/cortex-training/config.json.
+anything. Your choice is saved in cortex-training/config.json in your
+Snowflake folder (usually ~/.snowflake); login prints the files it uses.
 
 examples:
   cortex-training login            # set up, or check your current setup
@@ -891,7 +892,7 @@ def build_parser(
         metavar="PATH",
         help=(
             "Turn an old JSON config (host, PAT, database) into a Snowflake connection profile, "
-            "move its settings to config.json, and remove the old file. Asks before each step."
+            "and move its settings to config.json. The old file is kept. Asks before each step."
         ),
     )
     login.add_argument("--config", dest="login_config_option", help=argparse.SUPPRESS)
@@ -1030,6 +1031,7 @@ def _select_config(args: argparse.Namespace, *, load_login: bool) -> dict[str, A
     args._legacy_config_selected = False
     args._config_origin = None
     args._login_json_ignored = None
+    args._login_json_profile = None
     strict = getattr(args, "_strict_config", True)
     if getattr(args, "connection", None):
         return {}
@@ -1057,9 +1059,11 @@ def _select_config(args: argparse.Namespace, *, load_login: bool) -> dict[str, A
         return {}
     if not Path(login_config).expanduser().is_file():
         return {}
-    if _saved_profile():
+    saved = _saved_profile()
+    if saved:
         # A profile saved by the new `login` wins over the file the old `login` remembered.
         args._login_json_ignored = login_config
+        args._login_json_profile = saved
         return {}
     args.config = login_config
     args._legacy_config_selected = True
@@ -1067,7 +1071,8 @@ def _select_config(args: argparse.Namespace, *, load_login: bool) -> dict[str, A
     return _load_config(login_config, strict=strict)
 
 
-_FUTURE = "is deprecated and will stop working in a future release."
+# The old ways keep working, as a fallback while the profile path settles in.
+_FUTURE = "will be deprecated in a future release."
 
 
 def _resolve_args(
@@ -1152,24 +1157,43 @@ def _resolve_args(
         args.schema = "PUBLIC"
     args._typed = typed
     args._deprecations.extend(_old_connection_notes(args, typed))
+    args._terminal_notes = _terminal_notes(args)
     return args
+
+
+def _terminal_notes(args: argparse.Namespace) -> list[str]:
+    """Notes worth showing someone at a terminal, but not scripts or CI logs.
+
+    A ``login.json`` the saved profile overrides is kept on purpose, as the way
+    back to the old config, so it gets a note rather than a warning to convert.
+    """
+    if not args.use_connection_profile or not getattr(args, "_login_json_ignored", None):
+        return []
+    from cortex_training import _picker
+
+    return [
+        f"{_login_state_path()} is ignored because profile {args._login_json_profile} is saved. "
+        f'To use it again, remove "profile" from {_picker.config_path()}.'
+    ]
+
+
+def write_terminal_notes(args: argparse.Namespace, stream: TextIO) -> None:
+    """Write ``args``' terminal notes to ``stream``, only if it is a terminal."""
+    if not getattr(stream, "isatty", lambda: False)():
+        return
+    for note in getattr(args, "_terminal_notes", ()):
+        stream.write(f"note: {note}\n")
 
 
 def _old_connection_notes(args: argparse.Namespace, typed: Mapping[str, Any]) -> list[str]:
     """Warnings for the old ways this command connects with, each saying what replaces it.
 
-    The old ways still work; they stop working in a later release.
+    The old ways still work, as a fallback; they will be deprecated in a future release.
     """
     if args.base_url:
         return []  # A local or mock server, during development.
     if args.use_connection_profile:
         notes = []
-        ignored = getattr(args, "_login_json_ignored", None)
-        if ignored:
-            notes.append(
-                f"{_login_state_path()} is ignored because a profile is saved; run "
-                f"`cortex-training login --convert-legacy-config {ignored}` to convert and remove it."
-            )
         for name, flag in (("database", "--database"), ("schema", "--schema")):
             variable = f"SNOWFLAKE_{name.upper()}"
             if not typed[name] and not _env(f"CORTEX_TRAINING_{name.upper()}") and _env(variable):
@@ -1195,9 +1219,8 @@ def _old_connection_notes(args: argparse.Namespace, typed: Mapping[str, Any]) ->
         ]
     snowflake = [name for name in ("SNOWFLAKE_HOST", "SNOWFLAKE_PAT") if _env(name) and not _env(f"CORTEX_TRAINING_{name[10:]}")]
     if snowflake:
-        future = _FUTURE if len(snowflake) == 1 else _FUTURE.replace("is deprecated", "are deprecated")
         return [
-            f"{' and '.join(snowflake)} {future} Run `cortex-training login` to set up a Snowflake "
+            f"{' and '.join(snowflake)} {_FUTURE} Run `cortex-training login` to set up a Snowflake "
             "connection profile (in CI, use CORTEX_TRAINING_HOST and CORTEX_TRAINING_PAT)."
         ]
     if _snowflake_profiles_exist():
@@ -1311,7 +1334,7 @@ def parse_args(
     if args.use_connection_profile:
         return args
     if not args.database:
-        parser.error("provide --database or set CORTEX_TRAINING_DATABASE/SNOWFLAKE_DATABASE")
+        parser.error("provide --database or set CORTEX_TRAINING_DATABASE")
     if args.base_url is None and (args.host is None or args.pat is None):
         parser.error("provide --base-url for local/mock use, or both --host and --pat")
     return args
@@ -2338,6 +2361,7 @@ def main(
         args = parse_args(argv, prog=prog, include_tui=include_tui)
         for note in getattr(args, "_deprecations", ()):
             stderr.write(f"warning: {note}\n")
+        write_terminal_notes(args, stderr)
         dry_run = (args.command == "submit" and args.dry_run) or (
             args.command == "model-deployment"
             and args.model_deployment_command == "create"

@@ -94,9 +94,7 @@ python -m recipes.sft_quickstart.conversational.train \
 
 The example connects the same way the CLI does: the profile
 `cortex-training login` saved, else your default Snowflake profile. Pass
-`connection=<name>` to use another profile. (A
-[JSON connection file](setup.md#json-connection-file) still works with
-`config=`, but it's deprecated and prints a warning.)
+`connection=<name>` to use another profile.
 
 What happens during this run:
 

@@ -51,12 +51,8 @@ uv pip install 'tinker-cookbook[math-rl] @ git+https://github.com/thinking-machi
 uv pip install chromadb  # distillation only: the wiki-search title index
 ```
 
-Set up a Snowflake connection profile (see
-[Set up the client](../docs/getting-started/setup.md)). A
-[JSON connection file](../docs/getting-started/setup.md#json-connection-file)
-(from [`connection.json.template`](../docs/getting-started/connection.json.template),
-with account host and PAT) also works, through `config=`, but it's deprecated: each run warns,
-and it stops working in a future release.
+Set up a Snowflake connection profile with `cortex-training login` (see
+[Set up the client](../docs/getting-started/setup.md)).
 To log metrics to Weights & Biases or Snowflake, see
 [experiment tracking](../docs/guides/operations/wandb.md).
 
@@ -76,14 +72,11 @@ Every recipe resolves its connection the same way the CLI does:
 
 - `connection=<name>` uses a profile from `~/.snowflake/connections.toml`
   (`$SNOWFLAKE_HOME/connections.toml` if `SNOWFLAKE_HOME` is set).
-- `config=<file>` reads a legacy JSON file with `host`, `pat`, `database`, and
-  `schema`, exactly as before: only the file is used, and environment variables,
-  the saved login and profiles are ignored. Deprecated: it warns.
-- With neither, the old sources still come first, each with a deprecation
-  warning: `CORTEX_TRAINING_CONNECTION`, `CORTEX_TRAINING_CONFIG`, complete
-  credentials in the environment, and `login.json` (from the old
-  `cortex-training login FILE`). Otherwise the profile `cortex-training login`
-  saved is used, then the Snowflake default connection profile.
+- With no `connection=`, the profile `cortex-training login` saved is used, then
+  the Snowflake default connection profile.
+- The [older connection methods](../docs/reference/cli.md#older-connection-methods),
+  such as `config=<file>`, still work as a fallback and will be deprecated in a
+  future release.
 
 Each run logs the target it connected to and the source, never the token. The
 `model_deployment` recipe needs a PAT (see its README).

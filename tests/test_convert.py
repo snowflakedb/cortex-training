@@ -157,18 +157,13 @@ def config():
 
 
 def nothing_written(path, snowflake):
-    """The old file is untouched, and no profile, settings, or backup was written."""
-    return (
-        path.exists()
-        and not (snowflake / "connections.toml").exists()
-        and config() is None
-        and not path.with_name(path.name + ".bak").exists()
-    )
+    """The old file is untouched, and no profile or settings were written."""
+    return path.exists() and not (snowflake / "connections.toml").exists() and config() is None
 
 
 # ─── The happy path ─────────────────────────────────────────────────────────
 
-# Check now? [Y] -> profile name [cortex-training] -> go ahead? y (No is the default)
+# Check now? [Y] -> profile name [cortex-training] -> go ahead? y
 YES = ["", "", "y"]
 
 
@@ -194,14 +189,14 @@ def test_an_old_config_becomes_a_profile_and_settings(old_file, isolated):
     assert config() == {"profile": "cortex-training"}
     assert err.count("Not kept: endpoint ct, poll_timeout 3600.") == 2
     assert "--endpoint ct, --poll-timeout 3600" in err
-    assert not path.exists()
-    backup = json.loads(path.with_name("ct-config.json.bak").read_text())
-    assert backup == {"host": HOST, "database": "MY_DB", "schema": "RUNS", "poll_timeout": 3600, "endpoint": "ct"}
+    assert json.loads(path.read_text())["pat"] == PAT
+    assert not path.with_name("ct-config.json.bak").exists()
     assert "  ✓ Database MY_DB is ready" in err
     assert "SHOW SCHEMAS LIKE 'RUNS' IN DATABASE MY_DB" in world.statements
     assert "You're all set. Cortex Training will use profile cortex-training." in err
-    assert "Try it:  cortex-training --connection cortex-training capacity" in err
-    assert summary["profile"] == "cortex-training" and summary["deleted"] == [str(path)]
+    assert "Try it:  cortex-training capacity" in err  # already saved as the one to use
+    assert summary["profile"] == "cortex-training" and summary["kept"] == str(path)
+    assert "backup" not in summary and "deleted" not in summary
     assert PAT not in err and PAT not in json.dumps(summary)
 
 
@@ -214,7 +209,7 @@ def test_it_shows_the_file_and_asks_before_checking(old_file):
     assert "  ✓ Signed in as ME, role TRAINER" in err
     assert "  ✓ Connected to Cortex Training on this account" in err
     assert "  ✓ Database CORTEX_TRAINING_DB is ready" in err
-    assert "This will:" in err and "Go ahead? [y/N]" in err
+    assert "This will:" in err and "Go ahead? [Y/n]" in err
 
 
 def test_the_connection_wrapper_and_old_spellings_are_read(old_file):
@@ -224,9 +219,6 @@ def test_the_connection_wrapper_and_old_spellings_are_read(old_file):
     assert _profiles.read_profiles()["cortex-training"]["database"] == "CORTEX_TRAINING_DB"
     assert config() == {"profile": "cortex-training"}
     assert "Not kept: verify_ssl False." in err and "--no-verify-ssl" in err
-    assert json.loads(path.with_name("ct-config.json.bak").read_text()) == {
-        "connection": {"host": HOST, "db": "CORTEX_TRAINING_DB", "no_verify_ssl": True}
-    }
 
 
 def test_an_underscore_host_is_kept_as_written(old_file):
@@ -237,15 +229,27 @@ def test_an_underscore_host_is_kept_as_written(old_file):
     assert (profile["host"], profile["account"]) == ("my_acct.us-west-2.snowflakecomputing.com", "my_acct")
 
 
-def test_login_json_is_deleted_only_when_it_points_to_the_old_file(old_file):
+def test_login_json_is_left_alone_even_when_it_points_to_the_old_file(old_file):
     path = old_file()
     login_file = _cli._login_state_path()
     login_file.parent.mkdir(parents=True)
     login_file.write_text(json.dumps({"config_path": str(path)}))
+    before = login_file.read_bytes()
     code, summary, _ = convert(World(), path, YES)
     assert code == 0
-    assert not login_file.exists()
-    assert summary["deleted"] == [str(path), str(login_file)]
+    assert login_file.read_bytes() == before
+    assert summary["kept"] == str(path)
+
+
+def test_the_old_file_keeps_its_bytes_and_mode(old_file):
+    path = old_file()
+    path.chmod(0o640)
+    before, mtime = path.read_bytes(), path.stat().st_mtime_ns
+    code, _, err = convert(World(), path, YES)
+    assert code == 0, err
+    assert path.read_bytes() == before
+    assert path.stat().st_mode & 0o777 == 0o640 and path.stat().st_mtime_ns == mtime
+    assert not path.with_name("ct-config.json.bak").exists()
 
 
 def test_login_json_pointing_elsewhere_is_kept(old_file, tmp_path):
@@ -423,45 +427,23 @@ def test_a_failed_write_puts_every_file_back(old_file, isolated, monkeypatch):
     _picker.config_path().parent.mkdir(parents=True)
     _picker.config_path().write_text(json.dumps({"profile": "other"}))
     path = old_file()
+    login_file = _point_login_json_at(path)
+    login_before = login_file.read_bytes()
+    before = path.read_bytes()
     real_write = _profiles.write_file
 
-    def fail_on_backup(target, text):
-        if target.name.endswith(".bak"):
+    def fail_on_config(target, text, **kwargs):
+        if target == _picker.config_path():
             raise OSError(28, "No space left on device")
-        real_write(target, text)
+        real_write(target, text, **kwargs)
 
-    monkeypatch.setattr(_profiles, "write_file", fail_on_backup)
+    monkeypatch.setattr(_profiles, "write_file", fail_on_config)
     code, _, err = convert(World(), path, YES)
     assert code == 1
     assert "so every file was put back as it was." in err
     assert (isolated / "connections.toml").read_bytes() == profiles_before
     assert config() == {"profile": "other"}
-    assert path.exists() and not path.with_name("ct-config.json.bak").exists()
-
-
-def test_a_failed_delete_puts_every_file_back(old_file, isolated, monkeypatch):
-    path = old_file()
-    login_file = _cli._login_state_path()
-    login_file.parent.mkdir(parents=True)
-    login_file.write_text(json.dumps({"config_path": str(path)}))
-    real_unlink = type(path).unlink
-
-    def fail_on_login_file(self, *args, **kwargs):
-        if self == login_file:
-            raise PermissionError(13, "Permission denied")
-        return real_unlink(self, *args, **kwargs)
-
-    # Only this patch is undone before the checks; monkeypatch.undo() would also undo
-    # the isolated folders, and the checks would then read the real ones.
-    with monkeypatch.context() as patch:
-        patch.setattr(type(path), "unlink", fail_on_login_file)
-        code, _, err = convert(World(), path, YES)
-    assert code == 1
-    assert "so every file was put back as it was." in err
-    assert path.exists() and json.loads(path.read_text())["pat"] == PAT
-    assert login_file.exists()
-    assert "cortex-training" not in _profiles.read_profiles()
-    assert config() is None
+    assert path.read_bytes() == before and login_file.read_bytes() == login_before
 
 
 # ─── The command ────────────────────────────────────────────────────────────
@@ -532,13 +514,12 @@ def test_a_database_name_from_an_env_var_that_isnt_an_identifier_stops(old_file,
     assert world.opened == 0 and nothing_written(path, isolated)
 
 
-def test_enter_at_go_ahead_changes_nothing(old_file, isolated):
-    # Converting deletes the old file, so No is the default.
+def test_enter_at_go_ahead_converts(old_file):
     path = old_file()
     code, _, err = convert(World(), path, ["", "", ""])
-    assert code == 1
-    assert "Go ahead? [y/N]" in err and "Nothing was changed." in err
-    assert nothing_written(path, isolated)
+    assert code == 0, err
+    assert "Go ahead? [Y/n]" in err
+    assert config() == {"profile": "cortex-training"}
 
 
 def test_a_symlinked_config_json_keeps_its_link(old_file, tmp_path):
@@ -575,24 +556,53 @@ def _point_login_json_at(path):
     return login_file
 
 
-def test_the_plan_says_it_signs_in_with_the_new_profile_before_deleting(old_file):
+def test_the_plan_says_it_signs_in_with_the_new_profile_and_keeps_the_old_file(old_file):
     path = old_file()
     _point_login_json_at(path)
     world = World()
     code, _, err = convert(world, path, YES)
     assert code == 0, err
-    assert "  4. Sign in with profile cortex-training to check that it works" in err
-    assert "  5. Only if it works, delete " in err
+    assert "  3. Sign in with profile cortex-training to check that it works" in err
+    assert f"{path} is kept as it is, so you can go back to it." in err
+    assert "delete" not in err.lower().split("you're all set")[0] and "without the PAT" not in err
     assert "  ✓ Signed in with profile cortex-training" in err
     assert world.profiles_opened == [("cortex-training", "CORTEX_TRAINING_DB", "PUBLIC")]
 
 
-def test_old_files_are_removed_only_when_the_new_profile_signs_in(old_file):
+def test_the_ending_says_how_to_go_back(old_file, isolated):
+    path = old_file()
+    code, _, err = convert(World(), path, YES)
+    assert code == 0, err
+    assert f"--config {path}" in err and f"config={path}" in err and "CORTEX_TRAINING_CONFIG" in err
+    assert f'remove "profile" from {_picker.config_path()}' in err
+    assert f"delete [cortex-training] from {isolated / 'connections.toml'}" in err
+
+
+def test_the_old_file_still_signs_in_with_config_after_converting(old_file, monkeypatch):
     path = old_file()
     login_file = _point_login_json_at(path)
     code, _, err = convert(World(), path, YES)
     assert code == 0, err
-    assert not path.exists() and not login_file.exists()
+    seen = {}
+
+    class Client:
+        def list_jobs(self):
+            return []
+
+        def close(self):
+            pass
+
+    stdout, stderr = io.StringIO(), io.StringIO()
+    rc = _cli.main(
+        ["--config", str(path), "list"],
+        client_factory=lambda args: seen.update(host=args.host, pat=args.pat, profile=args.use_connection_profile) or Client(),
+        stdout=stdout,
+        stderr=stderr,
+    )
+    assert rc == 0, stderr.getvalue()
+    assert seen == {"host": HOST, "pat": PAT, "profile": False}
+    assert f"Signing in with an old JSON config ({path}, from --config)" in stderr.getvalue()
+    assert login_file.exists()
 
 
 def test_a_new_profile_that_cant_sign_in_puts_every_file_back(old_file, isolated):
@@ -604,11 +614,10 @@ def test_a_new_profile_that_cant_sign_in_puts_every_file_back(old_file, isolated
     code, _, err = convert(world, path, YES)
     assert code == 1
     assert "Signing in with profile cortex-training didn't work:" in err
-    assert "Every file was put back as it was;" in err and "are kept." in err
+    assert "Every file was put back as it was;" in err and "is unchanged." in err
     assert "run the command again in a few minutes." in err
     assert path.exists() and login_file.read_text() == login_before
     assert not (isolated / "connections.toml").exists() and config() is None
-    assert not path.with_name("ct-config.json.bak").exists()
 
 
 def test_a_conversion_says_what_its_checks_dont_cover(old_file):
@@ -616,3 +625,19 @@ def test_a_conversion_says_what_its_checks_dont_cover(old_file):
     assert code == 0, err
     assert "This profile connects to Cortex Training on this account. Your role may still lack" in err
     assert "USE CORTEX TRAINING" not in err
+
+
+def test_no_lock_file_is_left_next_to_the_old_config(old_file, tmp_path):
+    path = old_file()
+    code, _, err = convert(World(), path, YES)
+    assert code == 0, err
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith(".")) == []
+
+
+def test_a_rollback_leaves_no_lock_file_either(old_file, tmp_path):
+    path = old_file()
+    world = World()
+    world.profile_error = ApiError(403, "390100", "Programmatic access token is invalid")
+    code, _, _ = convert(world, path, YES)
+    assert code == 1 and path.exists()
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith(".")) == []
