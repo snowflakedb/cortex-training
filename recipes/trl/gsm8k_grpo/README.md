@@ -57,3 +57,29 @@ python -u run_qwen3_gsm8k_grpo_trl_cortex.py
 The default model is `Qwen/Qwen3-1.7B`, with 8 samples per prompt, sequence
 length 1024, and completion length 256. Thinking is off. Sampling and training
 each use one GPU. The reward is TRL's `accuracy_reward`.
+
+## Results
+
+A 250-step run finishes in about 28 minutes. The reward below is the mean
+training-batch `accuracy_reward` over the 20 steps ending at that step.
+
+That run used Qwen3-1.7B, 8 samples per prompt, sequence length 1024,
+completion length 256, 4 GPUs for training and 4 for sampling, 32 prompts per
+device, seed 42, and old log probabilities from the trainer. Thinking and
+ZoRRo were off.
+
+| Step | Reward |
+|---|---|
+| 20 | 0.39 |
+| 40 | 0.60 |
+| 60 | 0.61 |
+| 80 | 0.74 |
+| 100 | 0.74 |
+| 120 | 0.75 |
+| 140 | 0.76 |
+| 160 | 0.78 |
+| 180 | 0.83 |
+| 200 | 0.76 |
+| 220 | 0.83 |
+| 240 | 0.81 |
+| 250 | 0.77 |
