@@ -37,16 +37,6 @@ private_key_file = "/keys/me.p8"
 """
 
 
-class Pipe(io.StringIO):
-    def isatty(self):
-        return False
-
-
-class Terminal(io.StringIO):
-    def isatty(self):
-        return True
-
-
 @pytest.fixture
 def home(monkeypatch, tmp_path):
     for name in ("CORTEX_TRAINING_CONFIG", "CORTEX_TRAINING_CONNECTION", "CORTEX_TRAINING_HOST", "CORTEX_TRAINING_PAT",
@@ -61,77 +51,103 @@ def home(monkeypatch, tmp_path):
     return snowflake
 
 
-def run(argv=(), stdout=None):
-    stdout = stdout if stdout is not None else Pipe()
+def run(argv):
+    """Call main with a fake runner; return (code, the command and env it would run, stderr)."""
+    seen = {}
+
+    def fake_run(command, env):
+        seen.update(command=list(command), env=dict(env))
+        return 7
+
     stderr = io.StringIO()
-    code = env.main(list(argv), stdout=stdout, stderr=stderr)
-    return code, stdout.getvalue(), stderr.getvalue()
+    code = env.main(list(argv), stderr=stderr, run=fake_run)
+    return code, seen, stderr.getvalue()
 
 
-def test_the_saved_profile_is_exported_with_the_hyphen_host(home):
-    code, out, err = run()
-    assert code == 0, err
-    assert out == (
-        "export ARCTIC_CORTEX_HOST=my-acct.us-west-2.snowflakecomputing.com\n"
-        "export ARCTIC_CORTEX_DATABASE=TRAIN_DB\n"
-        "export ARCTIC_CORTEX_SCHEMA=RUNS\n"
-        "export ARCTIC_CORTEX_PAT=tok-123\n"
-    )
-    assert "connection profile 'train' (saved by cortex-training login)" in err
+def test_the_command_runs_with_the_saved_profile_and_the_hyphen_host(home):
+    code, seen, err = run(["--", "bash", "launch.sh", "--steps", "10"])
+    assert code == 7  # the command's own exit code
+    assert seen["command"] == ["bash", "launch.sh", "--steps", "10"]
+    assert {k: v for k, v in seen["env"].items() if k.startswith("ARCTIC_CORTEX_")} == {
+        "ARCTIC_CORTEX_HOST": "my-acct.us-west-2.snowflakecomputing.com",
+        "ARCTIC_CORTEX_DATABASE": "TRAIN_DB",
+        "ARCTIC_CORTEX_SCHEMA": "RUNS",
+        "ARCTIC_CORTEX_PAT": "tok-123",
+    }
+    assert seen["env"]["SNOWFLAKE_HOME"] == os.environ["SNOWFLAKE_HOME"]  # the rest of the environment is kept
+    assert "Running bash with ARCTIC_CORTEX_* from connection profile 'train' (saved by cortex-training login)." in err
     assert "tok-123" not in err
 
 
-def test_another_profile_by_name_and_quoting(home):
-    code, out, _ = run(["connection=other"])
-    assert code == 0
-    assert "export ARCTIC_CORTEX_HOST=OTHER.snowflakecomputing.com\n" in out
-    assert "export ARCTIC_CORTEX_DATABASE=CORTEX_TRAINING_DB\n" in out  # the default, like every command
-    assert "export ARCTIC_CORTEX_PAT='it'\"'\"'s-quoted'\n" in out
+def test_another_profile_by_name(home):
+    code, seen, _ = run(["connection=other", "--", "true"])
+    assert code == 7
+    assert seen["env"]["ARCTIC_CORTEX_HOST"] == "OTHER.snowflakecomputing.com"
+    assert seen["env"]["ARCTIC_CORTEX_DATABASE"] == "CORTEX_TRAINING_DB"  # the default, like every command
+    assert seen["env"]["ARCTIC_CORTEX_PAT"] == "it's-quoted"
 
 
-def test_it_never_prints_the_pat_to_a_terminal(home):
-    code, out, err = run(stdout=Terminal())
-    assert code == 2 and out == ""
-    assert "Prints your PAT, so it is not shown here." in err
-    assert 'eval "$(python -m cortex_training.env)"' in err and "| source" in err
-    assert "tok-123" not in err
+@pytest.mark.parametrize("argv", [[], ["connection=train"], ["--"], ["connection=train", "--"]])
+def test_without_a_command_it_shows_how_to_use_it(home, argv):
+    code, seen, err = run(argv)
+    assert code == 2 and seen == {}
+    assert "usage: python -m cortex_training.env [connection=NAME] -- COMMAND" in err
 
 
 def test_a_profile_without_a_pat_says_how_to_get_one(home):
-    code, out, err = run(["connection=keyfile"])
-    assert code == 1 and out == ""
+    code, seen, err = run(["connection=keyfile", "--", "true"])
+    assert code == 1 and seen == {}
     assert "connection profile 'keyfile' doesn't sign in with a programmatic access token (PAT)" in err
     assert "`cortex-training login` creates one" in err
 
 
-def test_ci_variables_are_exported_when_no_profile_exists(home, monkeypatch):
+def test_ci_variables_are_used_when_no_profile_exists(home, monkeypatch):
     (home / "connections.toml").write_text("")
     (home / "cortex-training" / "config.json").unlink()
     monkeypatch.setenv("CORTEX_TRAINING_HOST", "ci_acct.snowflakecomputing.com")
     monkeypatch.setenv("CORTEX_TRAINING_PAT", "ci-tok")
-    code, out, err = run()
-    assert code == 0, err
-    assert "export ARCTIC_CORTEX_HOST=ci-acct.snowflakecomputing.com\n" in out
-    assert "export ARCTIC_CORTEX_PAT=ci-tok\n" in out
+    code, seen, err = run(["--", "true"])
+    assert code == 7, err
+    assert seen["env"]["ARCTIC_CORTEX_HOST"] == "ci-acct.snowflakecomputing.com"
+    assert seen["env"]["ARCTIC_CORTEX_PAT"] == "ci-tok"
 
 
 def test_an_old_json_config_still_works_with_its_warning(home, monkeypatch, tmp_path):
     old = tmp_path / "old.json"
     old.write_text(json.dumps({"host": "acme.snowflakecomputing.com", "pat": "old-tok", "database": "DB"}))
     monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(old))
-    code, out, err = run()
-    assert code == 0, err
-    assert "export ARCTIC_CORTEX_PAT=old-tok\n" in out and "export ARCTIC_CORTEX_SCHEMA=PUBLIC\n" in out
+    code, seen, err = run(["--", "true"])
+    assert code == 7, err
+    assert seen["env"]["ARCTIC_CORTEX_PAT"] == "old-tok" and seen["env"]["ARCTIC_CORTEX_SCHEMA"] == "PUBLIC"
     assert "warning: Signing in with an old JSON config" in err
 
 
-def test_unknown_arguments_are_refused(home):
-    code, out, err = run(["--connection", "train"])
-    assert code == 2 and out == "" and "unknown argument '--connection'" in err
+def test_unknown_options_are_refused(home):
+    code, seen, err = run(["--connection", "train", "--", "true"])
+    assert code == 2 and seen == {} and "unknown argument '--connection'" in err
 
 
-def test_a_shell_can_eval_it(home):
-    # The real use: bash evaluates the lines, and the tool it starts sees the values.
-    script = f'eval "$({sys.executable} -m cortex_training.env connection=other)" && printf %s "$ARCTIC_CORTEX_PAT"'
-    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=os.environ.copy(), check=True)
-    assert result.stdout == "it's-quoted"
+def test_a_missing_command_says_so(home):
+    stderr = io.StringIO()
+    code = env.main(["--", "no-such-command-xyz"], stderr=stderr, run=lambda c, e: subprocess.call(c, env=e))
+    assert code == 127 and "command not found: no-such-command-xyz" in stderr.getvalue()
+
+
+def test_the_child_gets_the_pat_and_the_wrapper_prints_none_of_it(home):
+    # End to end, as the READMEs use it: only the child's own output has the token.
+    child = f"{sys.executable} -c 'import os; print(os.environ[\"ARCTIC_CORTEX_PAT\"])'"
+    result = subprocess.run(
+        [sys.executable, "-m", "cortex_training.env", "connection=other", "--", "sh", "-c", child],
+        capture_output=True, text=True, env=os.environ.copy(), check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "it's-quoted\n"
+    assert "it's-quoted" not in result.stderr
+
+
+def test_the_exit_code_is_the_commands(home):
+    result = subprocess.run(
+        [sys.executable, "-m", "cortex_training.env", "--", "sh", "-c", "exit 3"],
+        capture_output=True, text=True, env=os.environ.copy(), check=False,
+    )
+    assert result.returncode == 3

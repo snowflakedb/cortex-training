@@ -56,15 +56,14 @@ The two recipe files are in the cloned tree under
 
 ## Configure
 
-```bash
-eval "$(python -m cortex_training.env)"     # fish: python -m cortex_training.env | source
-```
-
-This sets `ARCTIC_CORTEX_HOST`, `ARCTIC_CORTEX_DATABASE`, `ARCTIC_CORTEX_SCHEMA`
-and `ARCTIC_CORTEX_PAT` from the profile `cortex-training login` saved (add
-`connection=NAME` for another). The profile must sign in with a programmatic
-access token (PAT), as profiles `cortex-training login` creates do. Run it in a
-shell where cortex-training is installed; it works from any folder.
+Start each launcher command below with `python -m cortex_training.env --`. It
+runs the command with `ARCTIC_CORTEX_HOST`, `ARCTIC_CORTEX_DATABASE`,
+`ARCTIC_CORTEX_SCHEMA` and `ARCTIC_CORTEX_PAT` set from the profile
+`cortex-training login` saved (add `connection=NAME` before `--` for another).
+The token is only in that command's environment: it's never printed or left in
+your shell. The profile must sign in with a programmatic access token (PAT), as
+profiles `cortex-training login` creates do. Run it where cortex-training is
+installed; it works from any folder.
 
 ## Run
 
@@ -72,17 +71,17 @@ shell where cortex-training is installed; it works from any folder.
 cd Arctic-Platform
 
 # Math (Qwen3.5-4B, i3_math — stock subprocess runtime, no sandbox):
-python -m arctic_platform.integrations.prime_rl.rl \
+python -m cortex_training.env -- python -m arctic_platform.integrations.prime_rl.rl \
   @ arctic_platform/integrations/prime_rl/examples/qwen3.5-4b/math-i3.toml \
   --env-package i3-math
 
 # SWE (Qwen3.5-4B, r2e-gym — PrimeIntellect sandbox):
-python -m arctic_platform.integrations.prime_rl.rl \
+python -m cortex_training.env -- python -m arctic_platform.integrations.prime_rl.rl \
   @ arctic_platform/integrations/prime_rl/examples/qwen3.5-4b/swe-grade.toml \
   --env-package r2e-gym
 
 # Resolve-only, writes the Cortex job body and exits:
-python -m arctic_platform.integrations.prime_rl.rl @ <recipe>.toml --dry-run
+python -m cortex_training.env -- python -m arctic_platform.integrations.prime_rl.rl @ <recipe>.toml --dry-run
 ```
 
 `--env-package` installs the verifiers environment the recipe names (`i3-math`

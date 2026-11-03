@@ -83,15 +83,14 @@ The Arctic Platform launcher reads its connection only from `ARCTIC_CORTEX_*`
 environment variables, so `cortex-training login` alone is not enough. Export
 them from your profile:
 
-```bash
-eval "$(python -m cortex_training.env)"     # fish: python -m cortex_training.env | source
-```
-
-This sets `ARCTIC_CORTEX_HOST`, `ARCTIC_CORTEX_DATABASE`, `ARCTIC_CORTEX_SCHEMA`
-and `ARCTIC_CORTEX_PAT` from the profile `cortex-training login` saved (add
-`connection=NAME` for another). The profile must sign in with a programmatic
-access token (PAT), as profiles `cortex-training login` creates do. Run it in a
-shell where cortex-training is installed; it works from any folder.
+Start each launcher command below with `python -m cortex_training.env --`. It
+runs the command with `ARCTIC_CORTEX_HOST`, `ARCTIC_CORTEX_DATABASE`,
+`ARCTIC_CORTEX_SCHEMA` and `ARCTIC_CORTEX_PAT` set from the profile
+`cortex-training login` saved (add `connection=NAME` before `--` for another).
+The token is only in that command's environment: it's never printed or left in
+your shell. The profile must sign in with a programmatic access token (PAT), as
+profiles `cortex-training login` creates do. Run it where cortex-training is
+installed; it works from any folder.
 
 ## 1. Evaluate on the sandbox training uses
 
@@ -101,7 +100,7 @@ that same environment. From the `Arctic-Platform` checkout, `uv run --extra harb
 provides the pinned `harbor` CLI with that environment importable:
 
 ```bash
-uv run --extra harbor harbor run -p /path/to/eval_tasks -a <your agent> -m <your model> \
+python -m cortex_training.env -- uv run --extra harbor harbor run -p /path/to/eval_tasks -a <your agent> -m <your model> \
   --env arctic_platform.integrations.harbor.snowflake_sandbox:SnowflakeSandboxEnvironment \
   --ek base_image=sandbox-base --ek connection=training --ek role=MY_ROLE
 ```
@@ -125,7 +124,7 @@ export HARBOR_ENV_KWARGS='{"base_image": "sandbox-base", "connection": "training
 export HARBOR_SKILL=/path/to/SKILL.md   # optional: ":"-separated SKILL.md paths
 export ARCTIC_CORTEX_JOB_COMMENT="your name, harbor rl"
 
-bash recipes/rl/harbor/run_qwen35_4b.sh trainer.max_training_steps=50
+python -m cortex_training.env -- bash recipes/rl/harbor/run_qwen35_4b.sh trainer.max_training_steps=50
 ```
 
 `HARBOR_ENV_KWARGS` takes the same keys as `--ek`. Add `"egress_eai": "MY_EAI"`
@@ -201,7 +200,7 @@ export EVAL_HARBOR_TASKS=~/data/swe-smith-harbor-tasks/eval
 export HARBOR_ENV_KWARGS='{"base_image": "sandbox-base", "connection": "training", "role": "MY_ROLE", "egress_eai": "MY_GITHUB_EAI"}'
 export ARCTIC_CORTEX_JOB_COMMENT="your name, harbor localization"
 
-bash recipes/rl/harbor/run_qwen35_4b.sh trainer.max_training_steps=100
+python -m cortex_training.env -- bash recipes/rl/harbor/run_qwen35_4b.sh trainer.max_training_steps=100
 ```
 
 Each task clones its repository from GitHub when its sandbox starts, so

@@ -40,15 +40,14 @@ cd Arctic-Platform/recipes/rl/skyrl/simple_gsm8k_cortex
 
 ## Configure
 
-```bash
-eval "$(python -m cortex_training.env)"     # fish: python -m cortex_training.env | source
-```
-
-This sets `ARCTIC_CORTEX_HOST`, `ARCTIC_CORTEX_DATABASE`, `ARCTIC_CORTEX_SCHEMA`
-and `ARCTIC_CORTEX_PAT` from the profile `cortex-training login` saved (add
-`connection=NAME` for another). The profile must sign in with a programmatic
-access token (PAT), as profiles `cortex-training login` creates do. Run it in a
-shell where cortex-training is installed; it works from any folder.
+Start each launcher command below with `python -m cortex_training.env --`. It
+runs the command with `ARCTIC_CORTEX_HOST`, `ARCTIC_CORTEX_DATABASE`,
+`ARCTIC_CORTEX_SCHEMA` and `ARCTIC_CORTEX_PAT` set from the profile
+`cortex-training login` saved (add `connection=NAME` before `--` for another).
+The token is only in that command's environment: it's never printed or left in
+your shell. The profile must sign in with a programmatic access token (PAT), as
+profiles `cortex-training login` creates do. Run it where cortex-training is
+installed; it works from any folder.
 
 ## Run
 
@@ -56,7 +55,7 @@ shell where cortex-training is installed; it works from any folder.
 uv run --isolated --no-project --with datasets \
   python ../simple_gsm8k/download_data.py --output_dir ${HOME}/data/gsm8k-skyrl
 
-bash run_qwen3_0.6b_gsm8k_grpo_cortex.sh
+python -m cortex_training.env -- bash run_qwen3_0.6b_gsm8k_grpo_cortex.sh
 ```
 
 The first training step lands about twenty minutes in on a fresh machine:
@@ -90,12 +89,12 @@ land every ten steps under `~/checkpoints`, but the launcher starts fresh by
 default. To try continuing from the last one:
 
 ```bash
-bash run_qwen3_0.6b_gsm8k_grpo_cortex.sh trainer.resume_mode=latest
+python -m cortex_training.env -- bash run_qwen3_0.6b_gsm8k_grpo_cortex.sh trainer.resume_mode=latest
 ```
 
 Arguments are forwarded to the trainer, so this overrides the default. From a
-new terminal, re-export `SKYRL_HOME` and run the `cortex_training.env` line
-above first; the dataset and checkpoints are still on disk.
+new terminal, re-export `SKYRL_HOME` first; the dataset and checkpoints are
+still on disk.
 
 ## More detail
 

@@ -64,42 +64,27 @@ These fail with an error that says what's wrong:
 emits a `FutureWarning` and will be removed in a future release. Use
 `from_configs()` instead.
 
-### Export the connection for other tools
+### Run other tools with the connection
 
 Some tools, such as the Arctic Platform launcher used by the OpenHands, SkyRL,
 Harbor and prime-rl recipes, don't use this client. They read
 `ARCTIC_CORTEX_HOST`, `ARCTIC_CORTEX_DATABASE`, `ARCTIC_CORTEX_SCHEMA` and
-`ARCTIC_CORTEX_PAT` from the environment. `cortex_training.env` prints them for
-your shell to set, from the same connection `from_configs()` picks:
+`ARCTIC_CORTEX_PAT` from the environment. `cortex_training.env` runs such a
+command with them set, from the same connection `from_configs()` picks:
 
 ```bash
-eval "$(python -m cortex_training.env)"                   # bash, zsh
-python -m cortex_training.env | source                    # fish
-eval "$(python -m cortex_training.env connection=NAME)"   # another profile
+python -m cortex_training.env -- bash run_qwen3_0.6b_gsm8k_grpo_cortex.sh
+python -m cortex_training.env connection=NAME -- <command and its arguments>
 ```
 
 The connection must sign in with a programmatic access token (PAT), such as a
 profile with `authenticator = "PROGRAMMATIC_ACCESS_TOKEN"` (as
 `cortex-training login` creates), or `CORTEX_TRAINING_HOST` and
 `CORTEX_TRAINING_PAT`. The host is the form HTTPS calls use: an underscore in
-the account label becomes a dash. It reads only local files, and it never
-writes the PAT to a terminal: run on its own, it prints how to use it instead.
-
-Tuning knobs on the constructor: `endpoint`, `poll_interval` (0.5s),
-`poll_timeout` (1800s), `poll_backoff_multiplier` (1.25), `poll_max_interval`
-(6s), `pool_maxsize` (1024), `max_retries` (10), and `request_timeout`
-(`(30s connect, 600s read)`). Pass a positive scalar to use the same connect
-and read timeout, or a `(connect, read)` pair. `from_configs` also accepts
-`telemetry_timeout` (3s) for best-effort client metrics.
-
-The client never creates a database. A request that fails because the
-database or schema in its URL can't be found (HTTP 400, code `517602`, message
-`Schema DB.SCHEMA is not found or not authorized`) raises `DatabaseAccessError`
-(see [Exceptions](#exceptions)), which says how to create it, get access to it,
-or use another one. A client from `for_job` raises the plain
-`requests.HTTPError` instead. `client.auto_create_database` is deprecated:
-it is always False. Setting it to True emits a `FutureWarning`; setting it to False
-needs no change.
+the account label becomes a dash. The token is only in the command's
+environment; it isn't printed, logged, or left in your shell. On macOS and
+Linux the command replaces the wrapper process, so it gets signals such as
+Ctrl-C directly, and the exit code is the command's. It reads only local files.
 
 ## Client metrics
 
