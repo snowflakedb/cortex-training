@@ -913,8 +913,8 @@ def test_dare_keeps_a_fitting_mesh_and_rejects_one_that_needs_more_gpus():
     assert not {"train_batch_size", "train_micro_batch_size_per_gpu", "gradient_accumulation_steps"} & set(training["ds_config"])
     assert _server_deepspeed_batch(training) == (8, 1, 1, 8)
 
-    # GLM-5.3-Flash-BF16 trains on a 16-GPU SP16/EP16 mesh, which 8 GPUs cannot hold.
-    with pytest.raises(ValueError, match=r"sp_size 16 must be a positive divisor of n_gpus 8; ep_size 16"):
+    # GLM-5.3-Flash-BF16 trains on a 64-GPU SP16/EP32 mesh, which 8 GPUs cannot hold.
+    with pytest.raises(ValueError, match=r"sp_size 16 must be a positive divisor of n_gpus 8; ep_size 32"):
         _job_body("recipes.sft_quickstart.dare.train", model="zai-org/GLM-5.3-Flash-BF16")
 
 
