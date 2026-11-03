@@ -31,7 +31,9 @@
             "stage": 2
           },
           "bf16": {
-            "enabled": true
+            "enabled": true,
+            "bf16_master_weights_and_grads": true,
+            "bf16_optimizer_states": true
           }
         }
       }
