@@ -339,6 +339,10 @@ the roles that create jobs:
 GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE <role_name>;
 ```
 
+If a role can already create jobs without `USE CORTEX TRAINING`, grant it the
+privilege anyway, so the role keeps working when the requirement applies to
+your account.
+
 To let every role in the account create jobs, grant it to `PUBLIC`. Do this
 only when the account does not need to limit who can start GPU training:
 
@@ -351,17 +355,20 @@ the cause is a missing privilege on something that may also not exist, the
 response is the same either way, so it does not reveal whether the object
 exists.
 
-| Cause | Status | Message |
+| Cause | Status and code | Message |
 |---|---|---|
 | No `USE CORTEX TRAINING` (job creation) | 403, code `003001` | `... Your primary role <role> must have USE CORTEX TRAINING granted on ACCOUNT <account>.` |
-| Database or schema in the path not accessible | 400 | `Schema <database>.<schema> is not found or not authorized` |
-| No `CREATE EXPERIMENT` on the schema | 400 | `CREATE EXPERIMENT privilege required on schema <schema>` |
-| Named experiment not accessible | 400 | `Experiment <name> not found or not authorized` |
-| No `MODIFY` on the named experiment | 400 | `MODIFY privilege required on experiment <experiment>` |
-| External stage not accessible, or no `READ` on it | 400 | `Stage <stage> is not found or not authorized` |
-| Job not owned by the role, or not found | 404 | `Training job <job_id> not found in <schema>` |
-| Source checkpoint for a model deployment not accessible | 404 | `Source job was not found or is not authorized for the active roles` |
+| Database or schema in the path not accessible | 400, code `517602` | `Schema <database>.<schema> is not found or not authorized` |
+| No `CREATE EXPERIMENT` on the schema | 400, code `517602` | `CREATE EXPERIMENT privilege required on schema <schema>` |
+| Named experiment not accessible | 400, code `517602` | `Experiment <name> not found or not authorized` |
+| No `MODIFY` on the named experiment | 400, code `517602` | `MODIFY privilege required on experiment <experiment>` |
+| External stage not accessible, or no `READ` on it | 400, code `517602` | `Stage <stage> is not found or not authorized` |
+| Job not owned by the role, or not found | 404, code `517601` | `Training job <job_id> not found in <schema>` |
+| Source checkpoint for a model deployment not accessible | 404, code `517601` | `Source job was not found or is not authorized for the active roles` |
 | Chat completions: database, schema or deployment not accessible | 404 | `The requested model is not available.` |
+
+Every 400 refusal shares code `517602`, which also covers other invalid
+requests; match the message to tell them apart.
 
 Chat completions report an inaccessible database or schema as 404, unlike the
 management API's 400, so that an inference request cannot tell whether a
@@ -506,7 +513,7 @@ values above `604800`, and non-integers.
 When either field is set, Get job and List jobs echo it back; when omitted it may
 be absent from those responses.
 
-#### Access control
+#### Access control for creating a job
 
 Creating a job needs `USE CORTEX TRAINING` on the account, a privilege on the
 database and schema in the path, and either `CREATE EXPERIMENT` on the schema

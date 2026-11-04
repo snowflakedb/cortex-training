@@ -52,6 +52,10 @@ Creating a job requires the `USE CORTEX TRAINING` privilege on the account.
 GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE <role_name>;
 ```
 
+If a role can already create jobs without `USE CORTEX TRAINING`, grant it the
+privilege anyway, so the role keeps working when the requirement applies to
+your account.
+
 To let every role in the account create jobs, grant it to `PUBLIC` instead. Do
 this only if the account does not need to limit who can start GPU training:
 
