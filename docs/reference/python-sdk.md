@@ -106,6 +106,16 @@ Local or mock clients constructed with an explicit `base_url` treat
 `emit_metric` as a no-op. Set `CORTEX_TRAINING_DISABLE_TELEMETRY=1` to skip
 constructing the emitter.
 
+Separately from these events, the client counts every essential operation,
+successes included, whatever the settings above. Counts are kept in memory per
+operation, outcome (`success`, `failure` or `cancelled`) and `client.surface`,
+and are exported as OTLP metrics about every 30 seconds and when the client is
+closed: `cortex.training.client.operation.count`, `.duration` (a histogram in
+milliseconds), `.retries` and `.requests`. Each export is a few data points
+however many calls were made, so totals and failure rates are available
+without enabling success events. `CORTEX_TRAINING_DISABLE_TELEMETRY=1` turns
+these off too.
+
 Every event carries the `client.surface` record attribute, which names the
 program that made the call:
 
