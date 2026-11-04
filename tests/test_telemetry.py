@@ -17,6 +17,7 @@
 
 import math
 import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -498,7 +499,9 @@ def test_background_worker_exports_counts_after_flush_interval():
         metric_flush_interval_seconds=0.05,
     )
     exported = threading.Event()
-    emitter._emit_metrics_sync = MagicMock(side_effect=lambda _: exported.set())
+    emitter._emit_metrics_sync = MagicMock(
+        side_effect=lambda *_args, **_kwargs: exported.set() or True
+    )
 
     emitter.record_operation("list_jobs", outcome="success", duration_ms=1)
 
@@ -506,3 +509,61 @@ def test_background_worker_exports_counts_after_flush_interval():
     (aggregates,) = emitter._emit_metrics_sync.call_args.args
     assert aggregates[("list_jobs", "success", None)]["count"] == 1
     emitter.close()
+
+
+def test_flush_stays_within_its_timeout_while_the_export_lock_is_busy(monkeypatch):
+    emitter = _metrics_emitter(monkeypatch)
+    emitter.record_operation("list_jobs", outcome="success", duration_ms=1)
+    # Stands in for the worker holding the lock during a slow log POST.
+    assert emitter._export_lock.acquire()
+    try:
+        started = time.monotonic()
+        emitter.flush(timeout=0.1)
+        assert time.monotonic() - started < 1.0
+    finally:
+        emitter._export_lock.release()
+
+    emitter._session.post.assert_not_called()
+    # The skipped counts are kept for the next export.
+    assert emitter.flush()
+    _, metrics = _posted_metrics(emitter)
+    points = metrics["cortex.training.client.operation.count"]["sum"]["dataPoints"]
+    assert [point["asInt"] for point in points] == ["1"]
+
+
+def test_metrics_post_timeout_is_capped_by_the_flush_budget(monkeypatch):
+    emitter = _metrics_emitter(monkeypatch)
+    emitter.record_operation("list_jobs", outcome="success", duration_ms=1)
+
+    emitter.flush(timeout=0.5)
+
+    assert emitter._session.post.call_args.kwargs["timeout"] <= 0.5
+
+
+def test_counts_not_exported_are_merged_into_the_next_export(monkeypatch):
+    emitter = _metrics_emitter(monkeypatch)
+    emitter._session.post.side_effect = [_response(status_code=503), _response()]
+
+    emitter.record_operation(
+        "list_jobs", outcome="success", duration_ms=10, request_count=1
+    )
+    emitter.flush()
+    emitter.record_operation(
+        "list_jobs", outcome="success", duration_ms=300, request_count=2
+    )
+    emitter.flush()
+
+    assert emitter._session.post.call_count == 2
+    _, metrics = _posted_metrics(emitter)
+    (count,) = metrics["cortex.training.client.operation.count"]["sum"]["dataPoints"]
+    assert count["asInt"] == "2"
+    (duration,) = metrics["cortex.training.client.operation.duration"]["histogram"][
+        "dataPoints"
+    ]
+    assert duration["min"] == 10
+    assert duration["max"] == 300
+    assert duration["sum"] == 310
+    (requests_sent,) = metrics["cortex.training.client.operation.requests"]["sum"][
+        "dataPoints"
+    ]
+    assert requests_sent["asInt"] == "3"

@@ -29,12 +29,11 @@ outcome of a caller's training or inference operation.
 from __future__ import annotations
 
 import atexit
+import bisect
 import logging
 import math
 import os
 import queue
-import bisect
-import math
 import threading
 import time
 import weakref
@@ -443,13 +442,23 @@ class OtlpMetricEmitter:
             with self._worker_lock:
                 if self._worker is threading.current_thread():
                     self._worker = None
-            if not self._closed and not self._queue.empty():
+            if not self._closed and (
+                not self._queue.empty() or self._has_metric_aggregates()
+            ):
                 self._ensure_worker()
 
+    def _has_metric_aggregates(self) -> bool:
+        with self._metric_lock:
+            return bool(self._metric_aggregates)
+
     def flush(self, timeout: float = 1.0) -> bool:
-        """Wait briefly for queued metrics, primarily during interpreter exit."""
-        self._flush_metric_aggregates()
+        """Wait briefly for queued metrics, primarily during interpreter exit.
+
+        The whole call, the operation-count export included, stays within
+        ``timeout``.
+        """
         deadline = time.monotonic() + timeout
+        self._flush_metric_aggregates(deadline=deadline)
         with self._pending_condition:
             while self._pending:
                 remaining = deadline - time.monotonic()
@@ -518,6 +527,8 @@ class OtlpMetricEmitter:
                         "bucket_counts": [0] * (len(_DURATION_BUCKET_BOUNDS_MS) + 1),
                         "retry_count": 0,
                         "request_count": 0,
+                        # A delta point covers its first to its last call in
+                        # this export window, not the time since the last export.
                         "start_time_unix_nano": now_ns,
                         "time_unix_nano": now_ns,
                     }
@@ -539,7 +550,15 @@ class OtlpMetricEmitter:
         except Exception:
             logger.debug("client metric aggregation failed", exc_info=True)
 
-    def _flush_metric_aggregates(self) -> None:
+    def _flush_metric_aggregates(self, deadline: float | None = None) -> None:
+        """Export the current aggregates, by ``deadline`` when one is given.
+
+        Counts that are not exported (endpoint failing or cooling down, export
+        lock busy past the deadline) are merged back and go out with the next
+        export, so totals stay usable as a failure-rate denominator.
+        """
+        # In a forked child this replaces locks the parent may have held.
+        self._ensure_process()
         with self._metric_lock:
             if not self._metric_aggregates:
                 self._next_metric_flush = 0.0
@@ -547,8 +566,52 @@ class OtlpMetricEmitter:
             aggregates = self._metric_aggregates
             self._metric_aggregates = {}
             self._next_metric_flush = 0.0
-        with self._export_lock:
-            self._emit_metrics_sync(aggregates)
+        exported = False
+        if deadline is None:
+            acquired = self._export_lock.acquire()
+        else:
+            acquired = self._export_lock.acquire(
+                timeout=max(deadline - time.monotonic(), 0.0)
+            )
+        if acquired:
+            try:
+                timeout = self.timeout
+                if deadline is not None:
+                    timeout = min(timeout, deadline - time.monotonic())
+                if timeout > 0:
+                    exported = self._emit_metrics_sync(aggregates, timeout=timeout)
+            finally:
+                self._export_lock.release()
+        if not exported:
+            self._merge_back_metric_aggregates(aggregates)
+
+    def _merge_back_metric_aggregates(
+        self, aggregates: Mapping[tuple[str, str, str | None], Mapping[str, Any]]
+    ) -> None:
+        # Keys are bounded (operation x outcome x surface), so a failing
+        # endpoint cannot grow this without bound.
+        with self._metric_lock:
+            for key, old in aggregates.items():
+                new = self._metric_aggregates.get(key)
+                if new is None:
+                    self._metric_aggregates[key] = dict(old)
+                    continue
+                new["count"] += old["count"]
+                new["duration_sum"] += old["duration_sum"]
+                new["duration_min"] = min(new["duration_min"], old["duration_min"])
+                new["duration_max"] = max(new["duration_max"], old["duration_max"])
+                new["bucket_counts"] = [
+                    a + b for a, b in zip(new["bucket_counts"], old["bucket_counts"])
+                ]
+                new["retry_count"] += old["retry_count"]
+                new["request_count"] += old["request_count"]
+                new["start_time_unix_nano"] = min(
+                    new["start_time_unix_nano"], old["start_time_unix_nano"]
+                )
+            if self._metric_aggregates and not self._next_metric_flush:
+                self._next_metric_flush = (
+                    time.monotonic() + self._metric_flush_interval_seconds
+                )
 
     def _resource_attributes(self) -> list[dict[str, Any]]:
         attributes = [
@@ -587,11 +650,18 @@ class OtlpMetricEmitter:
     def _emit_metrics_sync(
         self,
         aggregates: Mapping[tuple[str, str, str | None], Mapping[str, Any]],
-    ) -> None:
-        """Export one delta batch to the OTLP HTTP metrics endpoint."""
+        *,
+        timeout: float | None = None,
+    ) -> bool:
+        """Export one delta batch to the OTLP HTTP metrics endpoint.
+
+        Returns whether the batch was accepted.
+        """
         self._ensure_process()
-        if self._is_disabled() or not aggregates:
-            return
+        if not aggregates:
+            return True
+        if self._is_disabled():
+            return False
         try:
             token = self.token_provider.get_token()
             telemetry_base_url = self._get_telemetry_base_url(token)
@@ -685,10 +755,11 @@ class OtlpMetricEmitter:
                         }
                     ]
                 },
-                timeout=self.timeout,
+                timeout=self.timeout if timeout is None else timeout,
             )
             response.raise_for_status()
             self._note_success()
+            return True
         except Exception as exc:
             logger.debug("client metric export failed", exc_info=True)
             response = getattr(exc, "response", None)
@@ -696,6 +767,7 @@ class OtlpMetricEmitter:
             if status in _AUTH_REJECTED_STATUSES:
                 self._invalidate_auth()
             self._note_failure()
+            return False
 
     def emit(
         self,
