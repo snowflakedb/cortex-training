@@ -181,3 +181,91 @@ def test_the_job_is_the_lora_sft_job_with_the_dpo_learning_rate():
     assert training["training_config"]["optimizer"]["lr"] == 1e-5
     training["training_config"]["optimizer"]["lr"] = expected["training_config"]["optimizer"]["lr"]
     assert training == expected
+
+
+@pytest.mark.parametrize("beta", [0.01, 0.1, 0.5])
+def test_loss_metrics_and_gradients_match_tinker_cookbooks_dpo_loss(beta):
+    """Same inputs to our loss and to tinker-cookbook's ``compute_dpo_loss``: same loss, metrics and gradients."""
+    from tinker_cookbook.preference.train_dpo import compute_dpo_loss
+
+    generator = torch.Generator().manual_seed(0)
+    pairs, length = 8, 6
+    mask = torch.tensor([0.0, 0.0, 1.0, 1.0, 1.0, 1.0])  # two prompt predictions, then the answer
+    references = (-12 * torch.rand(2 * pairs, generator=generator)).tolist()
+    data = [
+        {"input_ids": list(range(length + 1)), "loss_mask": mask.tolist(), "chosen": i % 2 == 0, "ref_logp": ref}
+        for i, ref in enumerate(references)
+    ]
+    rows = -3 * torch.rand(2 * pairs, length, generator=generator)
+    ours_leaves = [row.clone().requires_grad_(True) for row in rows]
+    tinker_leaves = [row.clone().requires_grad_(True) for row in rows]
+
+    loss, metrics = task.dpo_loss(beta)(data, ours_leaves)
+    scores = [(leaf * mask).sum() for leaf in tinker_leaves]
+    refs = [torch.tensor(ref) for ref in references]
+    tinker_loss, tinker_metrics = compute_dpo_loss(scores[0::2], scores[1::2], refs[0::2], refs[1::2], beta)
+
+    torch.testing.assert_close(loss, tinker_loss)
+    names = {"dpo_loss": "dpo_loss", "reward_accuracy": "accuracy", "reward_margin": "margin"}
+    names.update(chosen_reward="chosen_reward", rejected_reward="rejected_reward")
+    for ours, theirs in names.items():
+        assert metrics[ours] == pytest.approx(tinker_metrics[theirs], rel=1e-5, abs=1e-7)
+    for ours, theirs in zip(torch.autograd.grad(loss, ours_leaves), torch.autograd.grad(tinker_loss, tinker_leaves)):
+        torch.testing.assert_close(ours, theirs)
+
+
+def _dpo_items_for_the_bigram_trainer():
+    """Two pairs of token ids the custom-loss tests' bigram trainer can score; each prompt is two tokens."""
+    rows = [
+        ([1, 4, 2, 7, 3], True, -6.0),
+        ([1, 4, 9, 6], False, -4.0),
+        ([8, 2, 10, 4], True, -5.0),
+        ([8, 2, 5], False, -3.0),
+    ]
+    return [
+        {"input_ids": ids, "loss_mask": [0.0] + [1.0] * (len(ids) - 2), "chosen": chosen, "ref_logp": ref}
+        for ids, chosen, ref in rows
+    ]
+
+
+def test_forward_backward_custom_sends_the_dpo_weights_per_token():
+    """Chosen answer tokens get +beta*sigmoid(-z)/pairs, rejected ones the negative, prompt and padding 0."""
+    from tests.test_custom_loss import _FakeTrainer
+    from tests.test_custom_loss import _client
+
+    beta = 0.5
+    data = _dpo_items_for_the_bigram_trainer()
+    trainer = _FakeTrainer()
+
+    result = _client(trainer).forward_backward_custom("job", data, task.dpo_loss(beta))
+
+    forward_logprobs = trainer.results["fwd-1"]["logprobs"]
+    scores = [forward_logprobs[i, : len(item["input_ids"]) - 1][1:].sum() for i, item in enumerate(data)]
+    weights = trainer.backward_frames[0]["context"]["logprob_weights_shifted"]
+    pairs = len(data) // 2
+    for pair in range(pairs):
+        chosen, rejected = 2 * pair, 2 * pair + 1
+        z = beta * ((scores[chosen] - data[chosen]["ref_logp"]) - (scores[rejected] - data[rejected]["ref_logp"]))
+        weight = beta * torch.sigmoid(-z) / pairs
+        for row, sign in ((chosen, 1.0), (rejected, -1.0)):
+            length = len(data[row]["input_ids"]) - 1
+            expected = torch.zeros(weights.shape[1])
+            expected[1:length] = sign * weight
+            torch.testing.assert_close(weights[row], expected)
+    assert result["loss"] == pytest.approx(result["metrics"]["dpo_loss"])
+
+
+def test_forward_backward_custom_gives_the_models_dpo_gradient():
+    """The model gradient the server accumulates equals the DPO loss's gradient taken straight through the model."""
+    from tests.test_custom_loss import _FakeTrainer
+    from tests.test_custom_loss import _client
+    from tests.test_custom_loss import _direct_gradient
+
+    data = _dpo_items_for_the_bigram_trainer()
+    trainer = _FakeTrainer()
+    loss_fn = task.dpo_loss(0.5)
+
+    _client(trainer).forward_backward_custom("job", data, loss_fn)
+
+    expected = _direct_gradient(trainer, data, loss_fn, [item["input_ids"] for item in data])
+    torch.testing.assert_close(trainer.weights.grad, expected, rtol=1e-5, atol=1e-6)
