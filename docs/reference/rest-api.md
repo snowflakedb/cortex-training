@@ -2901,6 +2901,56 @@ tensor[:, i] is the log probability of input_ids[:, i + 1]
 This is an ArcticTraining processing convention, not a REST-level field
 requirement.
 
+### 10.5 Rank assignment
+
+`balance_batch` chooses the row order used before data-parallel dispatch. The
+key is accepted on the flat batch and inside `context`. Per-row outputs that
+are a list of rows, including logprobs, are returned in request order. The
+client does not undo the assignment. Other outputs keep the existing merge:
+they concatenate in rank order, which is the assigned order, or take the
+first rank's value.
+
+Only the JSON booleans `true` and `false` are read. `null` and any other type,
+including `0` and `"false"`, are ignored, the same as omitting the key.
+`false` on the flat key or in `context` keeps arrival order even when the
+other is `true`. For every other key, a non-null value on the flat batch wins
+over the same key in `context`. The exception is `zorro_train_enable`: the
+request is a ZoRRo step when either source is exactly `true`, even if the
+other is `false`.
+
+| Value | Behavior |
+|---|---|
+| omitted or `true` | Balance. A request without ZoRRo balances by sample length. A ZoRRo request balances whole prompt groups and requires `sp_size` of 1. Any other `sp_size` is rejected. |
+| `false` | Keep arrival order. This is the opt-out, including for a ZoRRo request that runs with sequence parallelism. |
+
+Cortex measures a non-ZoRRo row by its attention mask. Without one, it uses
+the leading run of position ids that advance by one from the row's first id.
+Without position ids, a request that carries a `processing` object uses its
+loss mask. Otherwise every row counts as the padded width. Every length is at
+least 1.
+
+`load_balancer`, `zorro_load_balancer`, and `zorro_train_load_balancer` are
+ignored. They do not opt out. Send `balance_batch` false.
+
+A request with `zorro_train_enable` true, on the flat batch or in `context`,
+is a ZoRRo step. With balancing on, each prompt group stays on one
+data-parallel rank. That assignment needs `input_ids`, `attention_mask`,
+`max_response_len`, `max_token_len_per_gpu`, and `rollout_n` or
+`zorro_train_max_rollouts`. These keys are accepted on the flat batch and
+inside `context`. A missing one is rejected. `zorro_train_max_rollouts` is the
+group-size cap when it is set; otherwise the cap is `rollout_n`. A group
+longer than the cap is split into contiguous chunks of at most that many rows,
+keeping the group's row order. `max_token_len_per_gpu` must be at least
+`prompt_len + max_response_len * cap`, where `prompt_len` is the sequence
+width minus `max_response_len`. A smaller budget is rejected. The batch size
+must be divisible by the number of data-parallel ranks, and a prompt group
+larger than one rank is rejected.
+
+`prompt_group_ids`, a 1-D vector of one integer per row, names the prompt
+group when ZoRRo balancing is on. The same key is what a prompt-mean loss
+uses for its counts. Omitting the ids, or sending a vector of any other
+shape, groups rows that share the same prompt columns.
+
 ---
 
 ## 11. Result summary
