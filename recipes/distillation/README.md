@@ -70,9 +70,12 @@ covered exactly the scored tokens. Updates are fully on-policy: no
 The default distills Qwen3.8-27B into Qwen3.5-4B, using six H200 GPUs: one
 training and one sampling GPU for the student, two for the teacher, and two for
 the judge. Check capacity first with `cortex-training capacity`. Install the
-dependencies listed in the [examples prerequisites](../README.md#prerequisites).
+dependencies listed in the [examples prerequisites](../README.md#prerequisites),
+including `chromadb`, which only this example needs (for the wiki-search title
+index):
 
 ```bash
+uv pip install chromadb
 python -m recipes.distillation.on_policy.train
 ```
 

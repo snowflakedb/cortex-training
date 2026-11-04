@@ -10,9 +10,8 @@ Install the example dependency:
 uv pip install 'tinker-cookbook @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
 ```
 
-Start with a short run. It uses your default connection profile; pass
-`connection=<name>` for another profile, or `config=<file>` for a
-[JSON connection file](setup.md#json-connection-file):
+Start with a short run. It uses the profile `cortex-training login` saved (or
+your default Snowflake profile); pass `connection=<name>` for another profile.
 
 ```bash
 python -m recipes.sft_quickstart.conversational.train \

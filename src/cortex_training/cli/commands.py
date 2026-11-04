@@ -77,6 +77,9 @@ _LIST_STATUS_FILTERS = {
     "active": {"pending", "placing", "initializing", "running"},
     "done": {"cancelled", "terminated", "done"},
 }
+# The --status words for each name what the account-level route calls them
+# otherwise: it has no done (and so no word for the DONE older jobs show).
+_ACCOUNT_LIST_STATUSES = {"done": "cancelled,terminated"}
 
 # Status words the server can answer with that are not the ones it filters on:
 # older rows, and states a backend ahead of the API layer reports.
@@ -254,23 +257,33 @@ def _same_name(wanted: str, actual: Any) -> bool:
     return isinstance(actual, str) and actual == wanted
 
 
-def _list_filter(args: argparse.Namespace) -> Callable[[dict], bool]:
-    """Build the list filters for the schema's jobs; --all has the server apply them."""
+def _status_filter(args: argparse.Namespace) -> Callable[[dict], bool]:
+    """Whether a job's status is one --status keeps; every job's without it."""
     # Rows can carry an enum name (JOB_STATE_RUNNING) or an alias, so compare
     # on the normalized word rather than the raw field.
     from cortex_training.client import CortexTrainingClient
 
-    def status_of(job: dict) -> str:
-        word = CortexTrainingClient._normalize_job_status(job.get("status"))
-        return _STATUS_ALIASES.get(word, word)
-
     statuses = None if args.status is None else _list_statuses(args.status)
+
+    def keep(job: dict) -> bool:
+        if statuses is None:
+            return True
+        word = CortexTrainingClient._normalize_job_status(job.get("status"))
+        return _STATUS_ALIASES.get(word, word) in statuses
+
+    return keep
+
+
+def _list_filter(args: argparse.Namespace) -> Callable[[dict], bool]:
+    """Build the list filters for the schema's jobs; --all has the server apply
+    them, and checks the status again (see _cmd_list)."""
+    status_kept = _status_filter(args)
     since = None if args.since is None else _utc_midnight(args.since)
     # --until names the last day kept, so the bound is the next midnight.
     until = None if args.until is None else _utc_midnight(args.until + timedelta(days=1))
 
     def keep(job: dict) -> bool:
-        if statuses is not None and status_of(job) not in statuses:
+        if not status_kept(job):
             return False
         if args.user is not None and not _same_name(args.user, job.get("submitted_by")):
             return False
@@ -379,7 +392,8 @@ still lack privileges that some operations need; if one is refused, its
 error says which.
 
 login never changes your existing profiles, and asks before it creates
-anything. Your choice is saved in ~/.snowflake/cortex-training/config.json.
+anything. Your choice is saved in cortex-training/config.json in your
+Snowflake folder (usually ~/.snowflake); login prints the files it uses.
 
 examples:
   cortex-training login            # set up, or check your current setup
@@ -517,9 +531,7 @@ def build_parser(
         "--all",
         action="store_true",
         help=(
-            "List jobs across every schema in the account that the current user "
-            "can see, not just the configured one. Fails if account-level listing "
-            "is not enabled for the account."
+            "List jobs across every available schema in the current account."
         ),
     )
     list_jobs.add_argument("--user", help="Keep jobs submitted by this user.")
@@ -891,7 +903,7 @@ def build_parser(
         metavar="PATH",
         help=(
             "Turn an old JSON config (host, PAT, database) into a Snowflake connection profile, "
-            "move its settings to config.json, and remove the old file. Asks before each step."
+            "and move its settings to config.json. The old file is kept. Asks before each step."
         ),
     )
     login.add_argument("--config", dest="login_config_option", help=argparse.SUPPRESS)
@@ -1030,6 +1042,7 @@ def _select_config(args: argparse.Namespace, *, load_login: bool) -> dict[str, A
     args._legacy_config_selected = False
     args._config_origin = None
     args._login_json_ignored = None
+    args._login_json_profile = None
     strict = getattr(args, "_strict_config", True)
     if getattr(args, "connection", None):
         return {}
@@ -1057,9 +1070,11 @@ def _select_config(args: argparse.Namespace, *, load_login: bool) -> dict[str, A
         return {}
     if not Path(login_config).expanduser().is_file():
         return {}
-    if _saved_profile():
+    saved = _saved_profile()
+    if saved:
         # A profile saved by the new `login` wins over the file the old `login` remembered.
         args._login_json_ignored = login_config
+        args._login_json_profile = saved
         return {}
     args.config = login_config
     args._legacy_config_selected = True
@@ -1067,7 +1082,8 @@ def _select_config(args: argparse.Namespace, *, load_login: bool) -> dict[str, A
     return _load_config(login_config, strict=strict)
 
 
-_FUTURE = "is deprecated and will stop working in a future release."
+# The old ways keep working, as a fallback while the profile path settles in.
+_FUTURE = "will be deprecated in a future release."
 
 
 def _resolve_args(
@@ -1152,24 +1168,43 @@ def _resolve_args(
         args.schema = "PUBLIC"
     args._typed = typed
     args._deprecations.extend(_old_connection_notes(args, typed))
+    args._terminal_notes = _terminal_notes(args)
     return args
+
+
+def _terminal_notes(args: argparse.Namespace) -> list[str]:
+    """Notes worth showing someone at a terminal, but not scripts or CI logs.
+
+    A ``login.json`` the saved profile overrides is kept on purpose, as the way
+    back to the old config, so it gets a note rather than a warning to convert.
+    """
+    if not args.use_connection_profile or not getattr(args, "_login_json_ignored", None):
+        return []
+    from cortex_training import _picker
+
+    return [
+        f"{_login_state_path()} is ignored because profile {args._login_json_profile} is saved. "
+        f'To use it again, remove "profile" from {_picker.config_path()}.'
+    ]
+
+
+def write_terminal_notes(args: argparse.Namespace, stream: TextIO) -> None:
+    """Write ``args``' terminal notes to ``stream``, only if it is a terminal."""
+    if not getattr(stream, "isatty", lambda: False)():
+        return
+    for note in getattr(args, "_terminal_notes", ()):
+        stream.write(f"note: {note}\n")
 
 
 def _old_connection_notes(args: argparse.Namespace, typed: Mapping[str, Any]) -> list[str]:
     """Warnings for the old ways this command connects with, each saying what replaces it.
 
-    The old ways still work; they stop working in a later release.
+    The old ways still work, as a fallback; they will be deprecated in a future release.
     """
     if args.base_url:
         return []  # A local or mock server, during development.
     if args.use_connection_profile:
         notes = []
-        ignored = getattr(args, "_login_json_ignored", None)
-        if ignored:
-            notes.append(
-                f"{_login_state_path()} is ignored because a profile is saved; run "
-                f"`cortex-training login --convert-legacy-config {ignored}` to convert and remove it."
-            )
         for name, flag in (("database", "--database"), ("schema", "--schema")):
             variable = f"SNOWFLAKE_{name.upper()}"
             if not typed[name] and not _env(f"CORTEX_TRAINING_{name.upper()}") and _env(variable):
@@ -1195,9 +1230,8 @@ def _old_connection_notes(args: argparse.Namespace, typed: Mapping[str, Any]) ->
         ]
     snowflake = [name for name in ("SNOWFLAKE_HOST", "SNOWFLAKE_PAT") if _env(name) and not _env(f"CORTEX_TRAINING_{name[10:]}")]
     if snowflake:
-        future = _FUTURE if len(snowflake) == 1 else _FUTURE.replace("is deprecated", "are deprecated")
         return [
-            f"{' and '.join(snowflake)} {future} Run `cortex-training login` to set up a Snowflake "
+            f"{' and '.join(snowflake)} {_FUTURE} Run `cortex-training login` to set up a Snowflake "
             "connection profile (in CI, use CORTEX_TRAINING_HOST and CORTEX_TRAINING_PAT)."
         ]
     if _snowflake_profiles_exist():
@@ -1311,7 +1345,7 @@ def parse_args(
     if args.use_connection_profile:
         return args
     if not args.database:
-        parser.error("provide --database or set CORTEX_TRAINING_DATABASE/SNOWFLAKE_DATABASE")
+        parser.error("provide --database or set CORTEX_TRAINING_DATABASE")
     if args.base_url is None and (args.host is None or args.pat is None):
         parser.error("provide --base-url for local/mock use, or both --host and --pat")
     return args
@@ -1503,27 +1537,66 @@ def _job_experiment_name(client, job_id: str, stderr: TextIO) -> str | None:
         return None
 
 
+# The statuses the per-schema route can filter on by itself, reading only the jobs
+# in that status where unfiltered it reads every job in the schema, in the order a
+# job moves through them. Each maps to the status to ask for: the route's PENDING
+# includes PLACING. Other statuses gain nothing from the route's filter, and it
+# mishandles groups, comma lists and done.
+_SERVER_LIST_STATUSES = {
+    "pending": "pending",
+    "placing": "pending",
+    "initializing": "initializing",
+    "running": "running",
+}
+
+
+def _schema_jobs(client, args: argparse.Namespace) -> list:
+    """The configured schema's jobs that --status can keep, for _list_filter to
+    filter: when every status it keeps is active, the jobs the route returns for
+    each (one request per status), else every job."""
+    statuses = None if args.status is None else _list_statuses(args.status)
+    if not statuses or not statuses <= _SERVER_LIST_STATUSES.keys():
+        return client.list_jobs()
+    wanted = {_SERVER_LIST_STATUSES[word] for word in statuses}
+    by_id: dict = {}
+    unnamed = []
+    # Asked in a job's own order, so one that moves on between requests is in a
+    # later answer; a job in two answers keeps the later, so its newer status is
+    # the one filtered.
+    for status in dict.fromkeys(_SERVER_LIST_STATUSES.values()):
+        if status not in wanted:
+            continue
+        for job in client.list_jobs(status=status):
+            job_id = job.get("job_id")
+            if job_id is None:
+                unnamed.append(job)
+            else:
+                by_id[job_id] = job
+    return [*by_id.values(), *unnamed]
+
+
 def _cmd_list(args: argparse.Namespace, client, stdout: TextIO) -> int:
     if args.all:
-        jobs = list(
-            itertools.islice(
-                client.iter_jobs(
-                    status=args.status,
-                    submitted_by=args.user,
-                    created_after=args.since,
-                    # The server's bound is exclusive; --until names the last day kept.
-                    created_before=(
-                        None if args.until is None else args.until + timedelta(days=1)
-                    ),
-                    # No bigger than what gets printed; the server takes 1 to 1000.
-                    page_size=min(args.limit or 100, 1000),
-                ),
-                args.limit,
-            )
+        # The server filters on --status. Its status is checked here too, before
+        # --limit counts the rows, in case an answer is wider than the CLI's
+        # meaning: a pending that takes in placing, as the schema route's does.
+        rows = client.iter_jobs(
+            status=None if args.status is None else ",".join(
+                _ACCOUNT_LIST_STATUSES.get(word, word) for word in args.status.split(",")
+            ),
+            submitted_by=args.user,
+            created_after=args.since,
+            # The server's bound is exclusive; --until names the last day kept.
+            created_before=(
+                None if args.until is None else args.until + timedelta(days=1)
+            ),
+            # No bigger than what gets printed; the server takes 1 to 1000.
+            page_size=min(args.limit or 100, 1000),
         )
+        jobs = list(itertools.islice(filter(_status_filter(args), rows), args.limit))
     else:
         keep = _list_filter(args)
-        jobs = [job for job in client.list_jobs() if keep(job)]
+        jobs = [job for job in _schema_jobs(client, args) if keep(job)]
     if args.limit is not None:
         jobs = _newest_jobs(jobs, args.limit)
     _print_json({"jobs": _jobs_latest_last(jobs)}, stdout, compact=args.compact)
@@ -2338,6 +2411,7 @@ def main(
         args = parse_args(argv, prog=prog, include_tui=include_tui)
         for note in getattr(args, "_deprecations", ()):
             stderr.write(f"warning: {note}\n")
+        write_terminal_notes(args, stderr)
         dry_run = (args.command == "submit" and args.dry_run) or (
             args.command == "model-deployment"
             and args.model_deployment_command == "create"

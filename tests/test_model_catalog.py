@@ -470,7 +470,7 @@ def test_deepseek_v41_training_meshes_match_the_completed_h200_runs():
         "standard/h200-training-full": (32, 32, 8, 65536, 4),
         "standard/h200-training-lora": (8, 8, 8, 65536, 1),
         "long/h200-training-full": (32, 32, 32, 262144, 1),
-        "long/h200-training-lora": (16, 16, 16, 262144, 1),
+        "long/h200-training-lora": (32, 32, 32, 262144, 1),
     }
     for key, (n_gpus, ep_size, sp_size, seq_len, batch) in expected.items():
         sub_job, training, ds_config = _deepseek_training(model_id, key)
@@ -496,7 +496,7 @@ def test_deepseek_v41_training_meshes_match_the_completed_h200_runs():
         else:
             assert training["optimizer"]["lr"] == 2e-5
             assert "peft_config" not in training
-        if key == "standard/h200-training-lora":
+        if key.endswith("training-lora"):
             assert "offload_optimizer" not in ds_config["zero_optimization"]
         else:
             assert ds_config["zero_optimization"]["offload_optimizer"]["device"] == "cpu"
