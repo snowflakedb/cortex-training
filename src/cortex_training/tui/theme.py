@@ -20,40 +20,60 @@ same in the list, its preview and its dashboard. Colors are hex values rather
 than names: Textual's ``Content`` markup does not know Rich's color names (a
 name it does not know is drawn in the default color), and hex reads the same in
 both. The palette is tuned for dark terminals and stays legible on light ones.
+On a terminal of 256 colors each is drawn as the nearest it has (:class:`Xterm256`).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
+from rich.color import Color as RichColor
+from rich.color import ColorType
+from rich.segment import Segment
+from rich.style import Style
 from textual.content import Content
+from textual.filter import LineFilter
 from textual.theme import Theme
 
 # ─── Palette ──────────────────────────────────────────────────────────────────
-ACCENT = "#29b5e8"  # the brand blue: titles, the selected tab, the focused cursor
-ACCENT_DIM = "#1b6f8f"
-OK = "#3fb950"  # running, healthy
-INFO = "#58a6ff"  # warming up (initializing)
-WARN = "#d29922"  # waiting (pending, placing), warnings, unknown
-ERR = "#f85149"  # failed, errors
-ENDED = "#9e9e9e"  # finished without failing (terminated, cancelled, done)
-MUTED = "#8b949e"  # labels, secondary text
-FAINT = "#6e7681"  # rules, hints, the least important text
-RULE = "#3d444d"  # hairlines drawn across a table (the job list's section rows)
+ACCENT = "#90b5f6"  # titles, the selected tab, links, the footer's keys, a highlighted row's text
+ACCENT_DIM = "#5999f8"  # the accent a step deeper: Textual's secondary, a scrollbar being dragged
+OK = "#88e096"  # running, healthy
+INFO = "#79cce5"  # warming up (initializing)
+WARN = "#ed8d30"  # waiting (pending, placing), warnings, unknown
+ERR = "#ff6c6c"  # failed, errors
+MUTED = "#a2a8b5"  # labels, secondary text
+ENDED = MUTED  # finished without failing (terminated, cancelled, done): as quiet as a label
+FAINT = "#67738c"  # rules, hints, the least important text
+BORDER = "#4a4a4a"  # the borders of cards and boxes
+RULE = BORDER  # hairlines drawn across a table (the job list's section rows)
+GRID = "#30363d"  # a chart's gridline, a meter's empty track: seen, never read as data
 TEXT = "#e6edf3"
 
 # The title bar's mark (its click opens the command palette, as Textual's own icon does).
-BRAND_ICON = "❄"
+# Not U+2744, which is also an emoji: some terminals draw that one in color, two cells wide.
+BRAND_ICON = "❆"
 
 BACKGROUND = "#0d1117"
 SURFACE = "#161b22"
 PANEL = "#21262d"
-# The Logs pane: a warning's and an error's message (WARN and ERR a step lighter, to read
-# as text), a traceback's rows, and the line a jump (e, n) landed on.
-WARN_TEXT = "#e3b341"
-ERR_TEXT = "#ff7b72"
-ERR_SURFACE = "#24161a"
+HIGHLIGHT = "#383c47"  # the band behind a highlighted row (Textual's block cursor), its text in ACCENT
+# The Logs pane: a warning's and an error's message (in the level's own color, light enough
+# to read as text), a traceback's rows, and the line a jump (e, n) landed on.
+WARN_TEXT = WARN
+ERR_TEXT = ERR
+ERR_SURFACE = "#3d1a1a"
 MARK_SURFACE = "#1c2a3a"
+# Each chart's color, by its place in the metrics' order: GPU util % (or CPU util %)
+# green, memory used % cyan, then on round the palette. Hues that read on the
+# background, a step lighter than the status colors, so a chart's line never reads as
+# a status; the same chart keeps its color across windows, units and refreshes.
+CHART_HUES = ("#4ade80", "#22d3ee", "#60a5fa", "#a78bfa", "#fbbf24", "#fb7185", "#2dd4bf", "#f472b6", "#a3e635",
+              "#fb923c")
+# A sub-job's color, by its type: its name on the Resources tab.
+SUB_JOB_COLORS = {"training": "#22d3ee", "sampling": "#c084fc", "log_prob": "#fbbf24", "logprob": "#fbbf24"}
+SUB_JOB_OTHER = "#60a5fa"
 
 CORTEX_THEME = Theme(
     name="cortex",
@@ -69,20 +89,20 @@ CORTEX_THEME = Theme(
     panel=PANEL,
     dark=True,
     variables={
-        "block-cursor-background": "#1f6feb",
-        "block-cursor-foreground": "#ffffff",
+        "block-cursor-background": HIGHLIGHT,
+        "block-cursor-foreground": ACCENT,
         "block-cursor-text-style": "bold",
-        "block-cursor-blurred-background": "#1f6feb40",
+        "block-cursor-blurred-background": f"{HIGHLIGHT}80",
         "block-hover-background": "#ffffff0d",
         "footer-key-foreground": ACCENT,
         "footer-description-foreground": MUTED,
         "footer-background": SURFACE,
-        "input-selection-background": "#1f6feb66",
+        "input-selection-background": "#90b5f666",
         "scrollbar": PANEL,
-        "scrollbar-hover": "#30363d",
+        "scrollbar-hover": BORDER,
         "scrollbar-active": ACCENT_DIM,
         "scrollbar-background": BACKGROUND,
-        "border": "#30363d",
+        "border": BORDER,
         "border-blurred": PANEL,
     },
 )
@@ -104,8 +124,8 @@ _RUNNING = StatusLook("●", OK, bold=True)
 _WARMING = StatusLook("◐", INFO)
 _PLACING = StatusLook("◔", WARN)
 _WAITING = StatusLook("○", WARN)
-_FAILED = StatusLook("✕", ERR, bold=True)
-_CANCELLED = StatusLook("⊘", ENDED)
+_FAILED = StatusLook("×", ERR, bold=True)
+_CANCELLED = StatusLook("−", ENDED)
 _ENDED = StatusLook("✓", ENDED)
 _UNKNOWN = StatusLook("?", WARN)
 
@@ -155,3 +175,59 @@ def status_pill(status, *, word: str | None = None) -> Content:
     look = status_look(status)
     text = (word if word is not None else status_key(status)).upper()
     return Content.styled(f" {look.glyph} {text} ", f"bold {BACKGROUND} on {look.color}")
+
+
+# ─── On a 256-color terminal ──────────────────────────────────────────────────
+# xterm's 256 colors: 16-231 are a 6x6x6 cube of these levels, 232-255 grays from 8 to 238.
+_CUBE_LEVELS = (0x00, 0x5F, 0x87, 0xAF, 0xD7, 0xFF)
+
+
+def _cube_level(value: int) -> int:
+    return 0 if value < 48 else 1 if value < 114 else (value - 35) // 40
+
+
+def xterm256(red: int, green: int, blue: int) -> int:
+    """The nearest of xterm's 256 colors to an RGB color: the cube's or the gray ramp's,
+    whichever is nearer, as tmux chooses."""
+    r, g, b = _cube_level(red), _cube_level(green), _cube_level(blue)
+    cube = 16 + 36 * r + 6 * g + b
+    cube_red, cube_green, cube_blue = _CUBE_LEVELS[r], _CUBE_LEVELS[g], _CUBE_LEVELS[b]
+    if (cube_red, cube_green, cube_blue) == (red, green, blue):
+        return cube
+    average = (red + green + blue) // 3
+    step = 23 if average > 238 else max(0, (average - 3) // 10)
+    gray = 8 + 10 * step
+    to_cube = (cube_red - red) ** 2 + (cube_green - green) ** 2 + (cube_blue - blue) ** 2
+    to_gray = (gray - red) ** 2 + (gray - green) ** 2 + (gray - blue) ** 2
+    return 232 + step if to_gray < to_cube else cube
+
+
+@lru_cache(1024)
+def _xterm256_color(color: RichColor) -> RichColor:
+    if color.type is not ColorType.TRUECOLOR or color.triplet is None:
+        return color
+    return RichColor.from_ansi(xterm256(*color.triplet))
+
+
+@lru_cache(4096)
+def _xterm256_style(style: Style) -> Style:
+    color, bgcolor = style.color, style.bgcolor
+    if color is None and bgcolor is None:
+        return style
+    return style + Style.from_color(color and _xterm256_color(color), bgcolor and _xterm256_color(bgcolor))
+
+
+class Xterm256(LineFilter):
+    """Draws each color as the nearest of a 256-color terminal's (:func:`xterm256`).
+
+    Rich puts a color on the gray ramp only below 15% saturation, else in the cube, whose
+    levels jump from 0 to 0x5f. So the palette's blue-tinted grays (BACKGROUND, SURFACE,
+    PANEL) all came out black, and a card, the header and the footer lost their edges;
+    TEXT came out cyan. The nearer of the two keeps them apart, as grays, and leaves the
+    palette's hues where Rich puts them.
+    """
+
+    def apply(self, segments: list[Segment], background) -> list[Segment]:
+        style_of = _xterm256_style
+        return [Segment(text, None if style is None else style_of(style), control)
+                for text, style, control in segments]

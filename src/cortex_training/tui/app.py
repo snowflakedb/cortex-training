@@ -39,6 +39,8 @@ from textual import events
 from textual import work
 from textual.app import App
 from textual.binding import Binding
+from textual.filter import Monochrome
+from textual.filter import NoColor
 from textual.geometry import Offset
 from textual.css.query import NoMatches
 from textual.notifications import Notification
@@ -52,6 +54,7 @@ from textual.widgets import Input
 from textual.widgets._toast import Toast
 from textual.widgets._toast import ToastRack
 
+from cortex_training.tui import terminal
 from cortex_training.tui import theme
 from cortex_training.tui.cache_cleanup import DEFAULT_CACHE_LIMIT
 from cortex_training.tui.cache_cleanup import enforce_cache_limit
@@ -287,6 +290,8 @@ class CortexTrainingLogTUI(App):
         background: $block-cursor-blurred-background;
         color: $block-cursor-blurred-foreground;
     }
+    /* The selected tab's underline in the accent: Textual draws it in the highlighted row's gray. */
+    Underline > .underline--bar { color: $accent; }
     ToastRack { dock: top; align: right top; margin-bottom: 0; scrollbar-size-vertical: 0; }
     Toast.-information { padding: 0 1; margin-top: 0; width: auto; max-width: 80%; }
     """
@@ -303,6 +308,7 @@ class CortexTrainingLogTUI(App):
         super().__init__()
         self.register_theme(theme.CORTEX_THEME)
         self.theme = theme.CORTEX_THEME.name
+        self.colors = terminal.colors()  # by the environment; `cortex-training tui` sets them by --color too
         client = printable_client(client)
         self._client = client
         self._job_id = job_id
@@ -329,6 +335,26 @@ class CortexTrainingLogTUI(App):
         self._confine_header = False  # and the drag started on that table's header, where it stays
         self._footer_down: tuple | None = None  # (footer key, button) pressed (see _footer_click)
         self.title = "cortex training"
+
+    @property
+    def colors(self) -> terminal.Colors:
+        """How the screens are colored (:mod:`cortex_training.tui.terminal`): from the
+        environment, unless ``cortex-training tui`` sets them from ``--color``, before the app runs."""
+        return self._colors
+
+    @colors.setter
+    def colors(self, colors: terminal.Colors) -> None:
+        self._colors = colors
+        self.no_color = not colors.hues  # Textual's own flag, behind the :nocolor pseudo-class
+        # Made once: a strip keeps what each filter made of it, by the filter.
+        self._color_filters = [] if colors.hues else [Monochrome()]
+        if self.console.color_system == "256":
+            self._color_filters.append(theme.Xterm256())
+
+    def get_line_filters(self):
+        """Textual's line filters, with the TUI's decision on color (:attr:`colors`) in place of
+        Textual's own, which grays the screen for any ``NO_COLOR``, even an empty one."""
+        return [f for f in super().get_line_filters() if not isinstance(f, (Monochrome, NoColor))] + self._color_filters
 
     def check_action(self, action: str, parameters) -> bool | None:
         if action == "quit" and isinstance(self.focused, Input):
@@ -493,7 +519,12 @@ class CortexTrainingLogTUI(App):
             )
         else:
             self.push_screen(self.job_list_screen())
+        # Why the screen can't look as it does elsewhere, once: gray, or approximate in 16 colors.
+        note = terminal.note(self.colors, self.console.color_system)
+        if note:
+            self.notify(note, timeout=self._TERMINAL_NOTE_SECONDS)
 
+    _TERMINAL_NOTE_SECONDS = 10
     _CACHE_CLEANUP_FIRST_SECONDS = 5
     _CACHE_CLEANUP_SECONDS = 10 * 60
     _CACHE_LIMIT = DEFAULT_CACHE_LIMIT  # also what a job screen holds the cache to after keeping a console

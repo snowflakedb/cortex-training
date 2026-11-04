@@ -21,11 +21,14 @@ import argparse
 import math
 import os
 import re
+import sys
 import threading
 from pathlib import Path
 
-_CONNECT_HINT = ("to connect, run 'cortex-training login config.json', set CORTEX_TRAINING_CONFIG, pass "
-                 "--config config.json, --connection NAME, --base-url (local/mock), or --host + --pat")
+from cortex_training.tui import terminal
+
+_CONNECT_HINT = ("to connect, run 'cortex-training login' to set up a Snowflake connection profile, or pass "
+                 "--connection NAME (or --base-url for a local or mock server)")
 # Bounds for every TUI read.
 READ_MAX_RETRIES = 2
 READ_TIMEOUT = (10.0, 45.0)
@@ -103,7 +106,7 @@ def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.Argument
         "--connection",
         "-c",
         default=os.environ.get("CORTEX_TRAINING_CONNECTION"),
-        help="Snowflake connection profile name.",
+        help="Snowflake connection profile to use (default: the one `cortex-training login` saved).",
     )
     p.add_argument("--base-url", help="Direct base URL for a local or otherwise compatible server.")
     p.add_argument("--host", help="Snowflake account host for PAT auth.")
@@ -126,6 +129,11 @@ def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.Argument
     )
     p.add_argument("--no-verify-ssl", action="store_true",
                    help="Disable SSL certificate verification for authenticated requests.")
+    p.add_argument(
+        "--color", choices=terminal.COLOR_CHOICES, default="auto",
+        help=("auto (the default) draws in color unless NO_COLOR is set to a non-empty value, or TERM "
+              "is dumb; always draws in color anyway; never draws every color as its gray."),
+    )
     return p
 
 
@@ -142,6 +150,10 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     problem = textual_problem()
     if problem:
         parser.exit(2, f"{parser.prog}: error: {problem}\n")
+    colors = terminal.colors(args.color)
+    if colors.color_system and "textual.constants" not in sys.modules:
+        # Textual reads its color system once, as it is first imported.
+        os.environ["TEXTUAL_COLOR_SYSTEM"] = colors.color_system
     try:
         from cortex_training.tui.app import CortexTrainingLogTUI
     except ImportError as exc:
@@ -161,6 +173,7 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     # list so the user can choose one.
     app = CortexTrainingLogTUI(client, args.job_id, sub_job_id=args.sub_job_id, poll_interval=log_poll_interval)
     app.sign_in = sign_in  # for the commands the TUI shows to copy
+    app.colors = colors
     try:
         app.run()
     finally:
@@ -199,13 +212,17 @@ def _build_read_only_client(parser: argparse.ArgumentParser, args: argparse.Name
     except ValueError as exc:
         parser.error(str(exc))
     if not args.use_connection_profile and not args.database:
-        parser.error("provide --database or set CORTEX_TRAINING_DATABASE/SNOWFLAKE_DATABASE")
+        parser.error("provide --database or set CORTEX_TRAINING_DATABASE")
     if (
         not args.use_connection_profile
         and args.base_url is None
         and (args.host is None or args.pat is None)
     ):
         parser.error(f"no connection configured: {_CONNECT_HINT}")
+    # The old ways still work, with the same warnings as the CLI.
+    for note in getattr(args, "_deprecations", ()):
+        sys.stderr.write(f"warning: {note}\n")
+    cli.write_terminal_notes(args, sys.stderr)
 
     # Every read the TUI makes, the job list's too, is bounded here: the client's own
     # defaults (ten retries, a ten-minute read timeout) left a view silent for
@@ -224,6 +241,8 @@ def _build_read_only_client(parser: argparse.ArgumentParser, args: argparse.Name
     from cortex_training.client import TUI_SURFACE
 
     client._telemetry_surface = TUI_SURFACE
+    if getattr(args, "resolution", None) is not None:
+        cli.write_target_line(args.resolution, sys.stderr)
     return client, _sign_in(cli, args, from_config)
 
 

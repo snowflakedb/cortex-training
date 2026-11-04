@@ -364,9 +364,9 @@ class CheckpointTab:
             download = (" ■ Stop download ",
                         f"bold {theme.BACKGROUND} on {theme.WARN} @click=screen.checkpoint_download")
         elif elsewhere:
-            download = (" ⬇ Download ", f"{theme.FAINT} on {theme.SURFACE}")
+            download = (" ↓ Download ", f"{theme.FAINT} on {theme.SURFACE}")
         else:
-            download = (" ⬇ Download ", f"bold {theme.BACKGROUND} on {theme.ACCENT} @click=screen.checkpoint_download")
+            download = (" ↓ Download ", f"bold {theme.BACKGROUND} on {theme.ACCENT} @click=screen.checkpoint_download")
         spans = [download, ("   new job from it ", theme.MUTED)]
         reasons = self._checkpoint_use_reasons(row)
         for use, label in (("training", "Training"), ("sampling", "Sampling"), ("both", "Training + sampling")):

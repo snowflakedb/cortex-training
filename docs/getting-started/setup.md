@@ -13,67 +13,53 @@ the installed package), install it in editable mode instead:
 uv pip install -e .
 ```
 
-Configure a standard Snowflake connection profile in
-`~/.snowflake/connections.toml`:
+The quickest setup is interactive:
+
+```bash
+cortex-training login
+```
+
+It picks one of your Snowflake connection profiles or creates one (account
+host, user, and a programmatic access token), checks the database Cortex
+Training will use, and remembers the profile in
+`cortex-training/config.json` in your Snowflake folder (usually
+`~/.snowflake/`). It prints the exact files it uses. See [login](../reference/cli.md#login).
+
+To set it up by hand instead, configure a standard Snowflake connection profile
+in `connections.toml` in your Snowflake folder, usually
+`~/.snowflake/connections.toml` (see
+[the Snowflake folder](authentication.md#the-snowflake-folder)):
 
 ```toml
-[training]
+[cortex-training]
 account = "ORG-ACCOUNT"
 host = "ACCOUNT.snowflakecomputing.com"
 user = "USER"
-authenticator = "programmatic_access_token"
+role = "ROLE"
+authenticator = "PROGRAMMATIC_ACCESS_TOKEN"
 token = "YOUR_PROGRAMMATIC_ACCESS_TOKEN"
 database = "CORTEX_TRAINING_DB"
 schema = "PUBLIC"
 ```
 
-Protect the file and verify the connection:
+Protect the file, then check the profile and save it as the one to use:
 
 ```bash
 chmod 600 ~/.snowflake/connections.toml
-cortex-training --connection training capacity
+cortex-training login cortex-training
 ```
 
-Set `SNOWFLAKE_DEFAULT_CONNECTION_NAME=training`, configure
-`default_connection_name = "training"` in Snowflake's `config.toml`, or name
-the profile `[default]` to run `cortex-training capacity` without
-`--connection`.
+Commands then use it without `--connection`. Pass `--connection NAME` to use
+another profile for one command. Without a saved profile, Cortex Training uses
+Snowflake's default profile: set `SNOWFLAKE_DEFAULT_CONNECTION_NAME`,
+configure `default_connection_name` in Snowflake's `config.toml`, or name the
+profile `[default]`.
 
 ## JSON connection file
 
-The examples read the connection from a JSON file, passed as `config=`, rather
-than from `connections.toml`. From a clone, copy the
-[template](connection.json.template) to a location outside the repository:
-
-```bash
-cp docs/getting-started/connection.json.template ~/cortex-training-config.json
-```
-
-Otherwise create it by hand:
-
-```json
-{
-  "host": "ACCOUNT.snowflakecomputing.com",
-  "pat": "YOUR_PROGRAMMATIC_ACCESS_TOKEN",
-  "database": "CORTEX_TRAINING_DB",
-  "schema": "PUBLIC"
-}
-```
-
-Fill in the account host, programmatic access token, database, and schema. The
-template also lists the optional `endpoint`, `poll_interval`, `poll_timeout`,
-and `verify_ssl` settings with their defaults. Do not commit the file: it holds
-your token.
-
-To use the same file for CLI commands, validate it and store its path:
-
-```bash
-cortex-training login ~/cortex-training-config.json
-cortex-training capacity
-```
-
-Login also accepts `cortex-training login --config ~/cortex-training-config.json`.
-Use either the positional path or `--config`, not both.
+Have a JSON connection file from an older setup? Convert it into a profile with
+`cortex-training login --convert-legacy-config FILE` (see
+[authentication](authentication.md#old-users-who-log-in-with-a-json-connection-file)).
 
 `capacity` with no `--hardware` lists every GPU type. See
 [GPU hardware](../concepts/hardware.md).
