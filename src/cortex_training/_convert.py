@@ -43,6 +43,7 @@ from typing import TextIO
 
 from cortex_training import _database_setup
 from cortex_training import _environment
+from cortex_training import _job_access
 from cortex_training import _login
 from cortex_training import _picker
 from cortex_training import _profiles
@@ -234,6 +235,7 @@ class _Converter:
         self.open_client = open_client
         self.client: Any = None
         self.created_database = False
+        self.job_access: _job_access.JobAccess | None = None
 
     def close(self) -> None:
         if self.client is not None:
@@ -308,6 +310,7 @@ class _Converter:
             return
         if not missing:
             self.p.say(f"  {self.s.ok(f'Database {database} is ready')}")
+            self._check_job_access(identity)
             return
         who = f"role {identity.role}" if identity.role else "your role"
         self.p.say(f"  {self.s.bad(f'Database {database} is missing, or {who} cannot access it')}")
@@ -329,6 +332,11 @@ class _Converter:
         if _database_setup.missing(self.client):
             raise ConvertError(f"Database {database} still isn't visible to {who} after creating it. Nothing else was changed.")
         self.p.say(f"  {self.s.ok(f'Created database {database}')}")
+        self._check_job_access(identity)
+
+    def _check_job_access(self, identity: Identity) -> None:
+        self.job_access = _job_access.check(self.client, identity.role)
+        _login.say_job_access(self.p, self.job_access, f"{self.old.database}.{self.old.schema}")
 
     def plan(self, identity: Identity) -> Plan:
         old = self.old
@@ -536,7 +544,15 @@ def run_convert(
     prompter.rule()
     if not style.decorate:
         prompter.say()
-    prompter.say(style.green(style.bold("You're all set.")) + f" Cortex Training will use profile {style.bold(plan.profile)}.")
+    access = converter.job_access
+    if access is not None and access.missing:
+        prompter.say(
+            style.yellow(style.bold("Saved, but not ready for training.")) + f" Cortex Training will use profile {style.bold(plan.profile)}."
+        )
+        for line in _login.not_ready_lines(access):
+            prompter.say(line)
+    else:
+        prompter.say(style.green(style.bold("You're all set.")) + f" Cortex Training will use profile {style.bold(plan.profile)}.")
     kept = _login._home(old.path)
     prompter.say(style.dim(f"(The old config is kept as it was: {kept}.)"))
     if _dropped_settings(old.settings):
@@ -550,7 +566,7 @@ def run_convert(
     prompter.say(f"  - To stop using the profile everywhere, remove \"profile\" from {_login._home(_picker.config_path())}.")
     prompter.say(f"    You can also delete [{plan.profile}] from {_login._home(_profiles.profile_file())}.")
     prompter.say()
-    for line in _login.PRIVILEGE_NOTE:
+    for line in _login.closing_note(access):
         prompter.say(style.yellow(line))
     _login.remind_environment(prompter, findings, shell)
     if not getattr(stdout, "isatty", lambda: False)():
@@ -566,6 +582,8 @@ def run_convert(
                 "config": str(_picker.config_path()),
                 "kept": str(old.path),
                 "created_database": converter.created_database,
+                "ready_for_training": None if access is None or access.unknown is not None else access.ready,
+                "missing_privileges": [item.privilege for item in access.missing] if access is not None else [],
             },
             stdout,
             indent=2,

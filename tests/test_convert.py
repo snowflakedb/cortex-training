@@ -11,7 +11,9 @@ import cortex_training.cli.commands as _cli
 from cortex_training import _convert
 from cortex_training import _picker
 from cortex_training import _profiles
+from cortex_training import _job_access
 from tests.test_login import ApiError
+from tests.test_login import fake_job_access
 from tests.test_login import write_profiles
 
 HOST = "acme-main.snowflakecomputing.com"
@@ -28,6 +30,7 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     for name in ("SNOWFLAKE_DEFAULT_CONNECTION_NAME", "CORTEX_TRAINING_LOGIN_FILE", *(n for names in _convert._OLD_ENV.values() for n in names)):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(_job_access, "check", fake_job_access)
     return snowflake
 
 
@@ -623,8 +626,19 @@ def test_a_new_profile_that_cant_sign_in_puts_every_file_back(old_file, isolated
 def test_a_conversion_says_what_its_checks_dont_cover(old_file):
     code, _, err = convert(World(), old_file(), YES)
     assert code == 0, err
-    assert "This profile connects to Cortex Training on this account. Your role may still lack" in err
-    assert "USE CORTEX TRAINING" not in err
+    assert "✓ Role TRAINER can create training jobs in CORTEX_TRAINING_DB.PUBLIC" in err
+    assert "Other operations, such as joining an existing experiment, can need more privileges;" in err
+
+
+def test_a_conversion_for_a_role_missing_privileges_is_not_ready(old_file):
+    world = World()
+    world.missing_privileges = (_job_access.CREATE_EXPERIMENT,)
+    code, summary, err = convert(world, old_file(), YES)
+    assert code == 0, err
+    assert "! Role TRAINER can't create training jobs yet. It needs:" in err
+    assert "GRANT CREATE EXPERIMENT ON SCHEMA CORTEX_TRAINING_DB.PUBLIC TO ROLE TRAINER;" in err
+    assert "Saved, but not ready for training." in err and "You're all set." not in err
+    assert summary["ready_for_training"] is False and summary["missing_privileges"] == ["CREATE EXPERIMENT"]
 
 
 def test_no_lock_file_is_left_next_to_the_old_config(old_file, tmp_path):
