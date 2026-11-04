@@ -2845,23 +2845,41 @@ requirement.
 
 ### 10.5 Rank assignment
 
-`context.balance_batch` chooses the row order used before data-parallel
-dispatch. The same key is accepted on a flat batch. A missing key balances.
+`balance_batch` chooses the row order used before data-parallel dispatch. The
+key is accepted on the flat batch and inside `context`. Per-row outputs,
+including logprobs, are returned in request order. The client does not undo
+the assignment.
+
+Only the JSON booleans `true` and `false` are read. `null` and any other type,
+including `0` and `"false"`, are ignored, the same as omitting the key.
+`false` on the flat key or in `context` keeps arrival order even when the
+other is `true`.
 
 | Value | Behavior |
 |---|---|
-| omitted or `true` | Balance. A request without ZoRRo balances by sample length. A ZoRRo request (`zorro_train_enable` true) balances whole prompt groups and requires `sp_size` of 1. Any other `sp_size` is rejected. |
+| omitted or `true` | Balance. A request without ZoRRo balances by sample length. A ZoRRo request balances whole prompt groups and requires `sp_size` of 1. Any other `sp_size` is rejected. |
 | `false` | Keep arrival order. This is the opt-out, including for a ZoRRo request that runs with sequence parallelism. |
 
 `load_balancer`, `zorro_load_balancer`, and `zorro_train_load_balancer` are
 ignored. They do not opt out. Send `balance_batch` false.
 
-A ZoRRo assignment also requires the batch size to be divisible by the number
-of data-parallel ranks. A prompt group larger than one rank is rejected.
+A request with `zorro_train_enable` true, on the flat batch or in `context`,
+is a ZoRRo step. With balancing on, each prompt group stays on one
+data-parallel rank. That assignment needs `input_ids`, `attention_mask`,
+`max_response_len`, `max_token_len_per_gpu`, and `rollout_n` or
+`zorro_train_max_rollouts`. These keys are accepted on the flat batch and
+inside `context`. A missing one is rejected. `zorro_train_max_rollouts` is the
+group-size cap when it is set; otherwise the cap is `rollout_n`. A group
+longer than the cap is split into contiguous chunks of at most that many rows,
+keeping the group's row order. `max_token_len_per_gpu` must be at least
+`prompt_len + max_response_len * cap`, where `prompt_len` is the sequence
+width minus `max_response_len`. A smaller budget is rejected. The batch size
+must be divisible by the number of data-parallel ranks, and a prompt group
+larger than one rank is rejected.
 
-When ZoRRo balancing is on, `prompt_group_ids` (one integer per row) names the
-prompt group. The same key is what a prompt-mean loss uses for its counts.
-Omitting the ids leaves grouping to the prompt columns.
+`prompt_group_ids`, one integer per row, names the prompt group when ZoRRo
+balancing is on. The same key is what a prompt-mean loss uses for its counts.
+Omitting the ids groups rows that share the same prompt columns.
 
 ---
 
