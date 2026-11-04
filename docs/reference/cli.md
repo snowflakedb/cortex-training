@@ -2082,7 +2082,8 @@ and every successful call `cortex-training tui` makes. Each metric names the
 program that made the call in `client.surface`: `cli` for these commands, `tui`
 for the TUI, `sdk` for Python code. `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY`
 set truthy also emits successful outcomes for every other essential operation;
-set falsy, it emits failures only, the TUI's included. See the [Python SDK reference](python-sdk.md#client-metrics).
+set falsy, it emits failures only, the TUI's included. Every call is counted
+either way, and the counts are exported about every 30 seconds. See the [Python SDK reference](python-sdk.md#client-metrics).
 
 `NO_COLOR` (not empty) draws `cortex-training tui` in gray unless it is started
 with `--color always`; `COLORTERM`, `TERM` and `TEXTUAL_COLOR_SYSTEM` say how
