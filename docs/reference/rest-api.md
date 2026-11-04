@@ -2856,15 +2856,20 @@ Only the JSON booleans `true` and `false` are read. `null` and any other type,
 including `0` and `"false"`, are ignored, the same as omitting the key.
 `false` on the flat key or in `context` keeps arrival order even when the
 other is `true`. For every other key, a non-null value on the flat batch wins
-over the same key in `context`.
+over the same key in `context`. The exception is `zorro_train_enable`: the
+request is a ZoRRo step when either source is exactly `true`, even if the
+other is `false`.
 
 | Value | Behavior |
 |---|---|
 | omitted or `true` | Balance. A request without ZoRRo balances by sample length. A ZoRRo request balances whole prompt groups and requires `sp_size` of 1. Any other `sp_size` is rejected. |
 | `false` | Keep arrival order. This is the opt-out, including for a ZoRRo request that runs with sequence parallelism. |
 
-Cortex measures a non-ZoRRo row by its attention mask, otherwise its position
-ids, otherwise its loss mask, otherwise the padded width.
+Cortex measures a non-ZoRRo row by its attention mask. Without one, it uses
+the leading run of position ids that advance by one from the row's first id.
+Without position ids, a request that carries a `processing` object uses its
+loss mask. Otherwise every row counts as the padded width. Every length is at
+least 1.
 
 `load_balancer`, `zorro_load_balancer`, and `zorro_train_load_balancer` are
 ignored. They do not opt out. Send `balance_batch` false.
