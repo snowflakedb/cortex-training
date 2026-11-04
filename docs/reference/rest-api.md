@@ -2846,9 +2846,11 @@ requirement.
 ### 10.5 Rank assignment
 
 `balance_batch` chooses the row order used before data-parallel dispatch. The
-key is accepted on the flat batch and inside `context`. Per-row outputs,
-including logprobs, are returned in request order. The client does not undo
-the assignment.
+key is accepted on the flat batch and inside `context`. Per-row outputs that
+are a list of rows, including logprobs, are returned in request order. The
+client does not undo the assignment. Other outputs keep the existing merge:
+they concatenate in rank order, which is the assigned order, or take the
+first rank's value.
 
 Only the JSON booleans `true` and `false` are read. `null` and any other type,
 including `0` and `"false"`, are ignored, the same as omitting the key.
@@ -2881,9 +2883,10 @@ width minus `max_response_len`. A smaller budget is rejected. The batch size
 must be divisible by the number of data-parallel ranks, and a prompt group
 larger than one rank is rejected.
 
-`prompt_group_ids`, one integer per row, names the prompt group when ZoRRo
-balancing is on. The same key is what a prompt-mean loss uses for its counts.
-Omitting the ids groups rows that share the same prompt columns.
+`prompt_group_ids`, a 1-D vector of one integer per row, names the prompt
+group when ZoRRo balancing is on. The same key is what a prompt-mean loss
+uses for its counts. Omitting the ids, or sending a vector of any other
+shape, groups rows that share the same prompt columns.
 
 ---
 
