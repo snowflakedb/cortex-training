@@ -133,4 +133,4 @@ models:
   - id: Qwen/Qwen3.8-Flash-Next
     training: true
     inference: true
-    last_validated: null
+    last_validated: 2026-11-05
