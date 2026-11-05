@@ -23,11 +23,12 @@ here (the same split SkyRL uses):
 ## Prerequisites
 
 A Cortex account with capacity for 16 GPUs: 8 for training and 8 for sampling.
-Follow [connection setup](../../docs/getting-started/setup.md) to create the connection
-file and log in, then confirm capacity:
+Follow [connection setup](../../docs/getting-started/setup.md), or run
+`cortex-training login` to set up a Snowflake connection profile, then confirm
+capacity:
 
 ```bash
-cortex-training login ~/cortex-training-config.json
+cortex-training login
 cortex-training capacity
 ```
 
@@ -55,13 +56,14 @@ The two recipe files are in the cloned tree under
 
 ## Configure
 
-```bash
-cfg=~/cortex-training-config.json
-export ARCTIC_CORTEX_HOST=$(jq -r .host "$cfg")
-export ARCTIC_CORTEX_DATABASE=$(jq -r .database "$cfg")
-export ARCTIC_CORTEX_SCHEMA=$(jq -r .schema "$cfg")
-export ARCTIC_CORTEX_PAT=$(jq -r .pat "$cfg")
-```
+Start each launcher command below with `python -m cortex_training.env --`. It
+runs the command with `ARCTIC_CORTEX_HOST`, `ARCTIC_CORTEX_DATABASE`,
+`ARCTIC_CORTEX_SCHEMA` and `ARCTIC_CORTEX_PAT` set from the profile
+`cortex-training login` saved (add `connection=NAME` before `--` for another).
+The token is only in that command's environment: it's never printed or left in
+your shell. The profile must sign in with a programmatic access token (PAT), as
+profiles `cortex-training login` creates do. Run it where cortex-training is
+installed; it works from any folder.
 
 ## Run
 
@@ -69,17 +71,17 @@ export ARCTIC_CORTEX_PAT=$(jq -r .pat "$cfg")
 cd Arctic-Platform
 
 # Math (Qwen3.5-4B, i3_math — stock subprocess runtime, no sandbox):
-python -m arctic_platform.integrations.prime_rl.rl \
+python -m cortex_training.env -- python -m arctic_platform.integrations.prime_rl.rl \
   @ arctic_platform/integrations/prime_rl/examples/qwen3.5-4b/math-i3.toml \
   --env-package i3-math
 
 # SWE (Qwen3.5-4B, r2e-gym — PrimeIntellect sandbox):
-python -m arctic_platform.integrations.prime_rl.rl \
+python -m cortex_training.env -- python -m arctic_platform.integrations.prime_rl.rl \
   @ arctic_platform/integrations/prime_rl/examples/qwen3.5-4b/swe-grade.toml \
   --env-package r2e-gym
 
 # Resolve-only, writes the Cortex job body and exits:
-python -m arctic_platform.integrations.prime_rl.rl @ <recipe>.toml --dry-run
+python -m cortex_training.env -- python -m arctic_platform.integrations.prime_rl.rl @ <recipe>.toml --dry-run
 ```
 
 `--env-package` installs the verifiers environment the recipe names (`i3-math`

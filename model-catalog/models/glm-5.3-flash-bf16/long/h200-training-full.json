@@ -38,7 +38,8 @@
         "step_peak_memory_log": true,
         "model_options": {
           "moe": {
-            "comm_backend": "uccl"
+            "comm_backend": "uccl",
+            "comm_token_chunk": 8192
           },
           "lm_head": {
             "cross_entropy": false

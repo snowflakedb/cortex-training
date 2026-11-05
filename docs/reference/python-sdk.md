@@ -64,21 +64,27 @@ These fail with an error that says what's wrong:
 emits a `FutureWarning` and will be removed in a future release. Use
 `from_configs()` instead.
 
-Tuning knobs on the constructor: `endpoint`, `poll_interval` (0.5s),
-`poll_timeout` (1800s), `poll_backoff_multiplier` (1.25), `poll_max_interval`
-(6s), `pool_maxsize` (1024), `max_retries` (10), and `request_timeout`
-(`(30s connect, 600s read)`). Pass a positive scalar to use the same connect
-and read timeout, or a `(connect, read)` pair. `from_configs` also accepts
-`telemetry_timeout` (3s) for best-effort client metrics.
+### Run other tools with the connection
 
-The client never creates a database. A request that fails because the
-database or schema in its URL can't be found (HTTP 400, code `517602`, message
-`Schema DB.SCHEMA is not found or not authorized`) raises `DatabaseAccessError`
-(see [Exceptions](#exceptions)), which says how to create it, get access to it,
-or use another one. A client from `for_job` raises the plain
-`requests.HTTPError` instead. `client.auto_create_database` is deprecated:
-it is always False. Setting it to True emits a `FutureWarning`; setting it to False
-needs no change.
+Some tools, such as the Arctic Platform launcher used by the OpenHands, SkyRL,
+Harbor and prime-rl recipes, don't use this client. They read
+`ARCTIC_CORTEX_HOST`, `ARCTIC_CORTEX_DATABASE`, `ARCTIC_CORTEX_SCHEMA` and
+`ARCTIC_CORTEX_PAT` from the environment. `cortex_training.env` runs such a
+command with them set, from the same connection `from_configs()` picks:
+
+```bash
+python -m cortex_training.env -- bash run_qwen3_0.6b_gsm8k_grpo_cortex.sh
+python -m cortex_training.env connection=NAME -- <command and its arguments>
+```
+
+The connection must sign in with a programmatic access token (PAT), such as a
+profile with `authenticator = "PROGRAMMATIC_ACCESS_TOKEN"` (as
+`cortex-training login` creates), or `CORTEX_TRAINING_HOST` and
+`CORTEX_TRAINING_PAT`. The host is the form HTTPS calls use: an underscore in
+the account label becomes a dash. The token is only in the command's
+environment; it isn't printed, logged, or left in your shell. On macOS and
+Linux the command replaces the wrapper process, so it gets signals such as
+Ctrl-C directly, and the exit code is the command's. It reads only local files.
 
 ## Client metrics
 
@@ -245,7 +251,7 @@ client, including notebooks, CI and containers that never open the TUI.
 
 | Method | Returns | Notes |
 |---|---|---|
-| `create_job(sub_jobs, job_id=None, experiment_name=None, hardware=None)` | `job_id` | Validates each `SubJobConfig` client-side first. Only `training` and `sampling` sub-jobs can be submitted: a job takes zero or one `training` sub-job and any number of `sampling` sub-jobs. `hardware` is `H200`, `B200`, or `B300` (the `Hardware` enum or its string); omitted means `H200` |
+| `create_job(sub_jobs, job_id=None, experiment_name=None, hardware=None)` | `job_id` | Validates each `SubJobConfig` client-side first. Only `training` and `sampling` sub-jobs can be submitted: a job takes zero or one `training` sub-job and any number of `sampling` sub-jobs. `hardware` is `H200`, `B200`, or `B300` (the `Hardware` enum or its string); omitted means `H200`. Needs `USE CORTEX TRAINING` on the account; without it the call raises `requests.HTTPError` (403). See [REST API section 3.7](rest-api.md#37-access-control) |
 | `create_job_from_body(body)` | response dict | For callers that already hold the REST JSON. Enforces the same one-training-sub-job and no-`log_probability` rules before sending |
 | `get_job(job_id)` | job dict | Includes `sub_jobs` with their configs |
 | `list_jobs(status=None)` | list of jobs | Returns the inner list, not the envelope |

@@ -8,7 +8,7 @@
       "seed": 42,
       "training_config": {
         "n_gpus": 8,
-        "max_seq_len": 32768,
+        "max_seq_len": 65536,
         "train_batch_size": 8,
         "gradient_clipping": 1.0,
         "model_provider": "arctic",
@@ -16,6 +16,12 @@
         "ac_config": {
           "mode": "full",
           "freq": 1
+        },
+        "model_options": {
+          "lm_head": {
+            "token_chunk_size": 8192,
+            "cross_entropy": false
+          }
         },
         "ep_size": 4,
         "optimizer": {

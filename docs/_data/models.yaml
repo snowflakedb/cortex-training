@@ -81,7 +81,7 @@ models:
       - conversational-sft
       - inference-endpoint
       - math-grpo
-    last_validated: null
+    last_validated: 2026-11-05
   - id: Qwen/Qwen3-4B-Instruct-2507
     training: true
     inference: true
@@ -121,7 +121,7 @@ models:
       - conversational-sft
       - inference-endpoint
       - math-grpo
-    last_validated: 2026-09-02
+    last_validated: 2026-11-05
   - id: Qwen/Qwen3.8-27B
     training: true
     inference: true
@@ -133,4 +133,4 @@ models:
   - id: Qwen/Qwen3.8-Flash-Next
     training: true
     inference: true
-    last_validated: null
+    last_validated: 2026-11-05

@@ -3459,6 +3459,13 @@ class CortexTrainingClient:
         job may wait for capacity before failing with ``pending_timeout``: between
         300 and 604,800, with no disable value. Omit either to use the server
         default, currently 30 minutes for idle and 24 hours for pending.
+
+        The calling role needs ``USE CORTEX TRAINING`` on the account, plus
+        ``CREATE EXPERIMENT`` on the schema when ``experiment_name`` is omitted
+        or ``MODIFY`` on that experiment when it is given. Without
+        ``USE CORTEX TRAINING`` the service answers 403 and this raises
+        :class:`requests.HTTPError`; an ``ACCOUNTADMIN`` can grant it with
+        ``GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE <role>``.
         """
         if not sub_jobs:
             raise ValueError("create_job requires a non-empty sub_jobs list")

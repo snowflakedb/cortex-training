@@ -450,3 +450,25 @@ def test_an_example_that_needs_a_pat_doesn_t_call_its_config_deprecated(env, tmp
     with caplog.at_level("WARNING"):
         utils.resolve_example_connection(config=pat_config(tmp_path), config_deprecated=False)
     assert "deprecated" not in caplog.text
+
+
+# A profile that signs in with a PAT -------------------------------------------
+
+
+def _add_profile(name, **values):
+    path = Path(os.environ["SNOWFLAKE_HOME"]) / "connections.toml"
+    body = "".join(f'{key} = "{value}"\n' for key, value in values.items())
+    path.write_text(path.read_text() + f"\n[{name}]\n{body}")
+
+
+def test_a_pat_profile_gives_recipes_its_token(env):
+    # Recipes that send the PAT themselves (model deployment) get it from the profile.
+    _add_profile("pat-prof", account="ACME", user="ME", authenticator="PROGRAMMATIC_ACCESS_TOKEN", token="profile-tok")
+    resolved = utils.resolve_example_connection(connection="pat-prof")
+    assert resolved.pat == "profile-tok"
+    assert "profile-tok" not in repr(resolved)
+
+
+def test_a_profile_that_signs_in_another_way_has_no_pat(env):
+    _add_profile("key-prof", account="ACME", user="ME", authenticator="SNOWFLAKE_JWT", private_key_file="/keys/me.p8")
+    assert utils.resolve_example_connection(connection="key-prof").pat is None

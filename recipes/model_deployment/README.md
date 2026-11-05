@@ -28,12 +28,12 @@ uv pip install -e .
 uv pip install chz
 ```
 
-This example needs a PAT, not only a profile: the chat call sends it as a
-Bearer token. Pass `config=` with a JSON file from
-`docs/getting-started/connection.json.template` (`host`, `pat`, `database`,
-`schema`). With `connection=` or the default profile, the example stops before
-it creates a deployment, because profile connections send a session token and
-the endpoint's documented authentication is the PAT.
+The chat call sends a programmatic access token (PAT) as a Bearer token, so
+this example needs a profile that signs in with one
+(`authenticator = "PROGRAMMATIC_ACCESS_TOKEN"`), as `cortex-training login`
+creates. It uses the profile `login` saved; pass `connection=NAME` for another.
+With a profile that signs in another way (a key file, a browser), it stops
+before it creates a deployment and says so.
 Inference is not yet available on all accounts: until it is enabled for yours,
 chat calls return HTTP 403.
 
@@ -51,8 +51,7 @@ cortex-training capacity
 From a base model:
 
 ```bash
-python -m recipes.model_deployment.deploy \
-  config=/path/to/config.json
+python -m recipes.model_deployment.deploy
 ```
 
 From a weights-only checkpoint saved by a training example, copy
@@ -61,7 +60,6 @@ and pass it as `spec=`:
 
 ```bash
 python -m recipes.model_deployment.deploy \
-  config=/path/to/config.json \
   spec=/path/to/checkpoint.json
 ```
 
@@ -101,8 +99,8 @@ minutes; the timings above are only illustrative.
 Keep one deployment and call it repeatedly:
 
 ```bash
-python -m recipes.model_deployment.deploy config=/path/to/config.json keep_deployment=True
-python -m recipes.model_deployment.deploy config=/path/to/config.json \
+python -m recipes.model_deployment.deploy keep_deployment=True
+python -m recipes.model_deployment.deploy \
   deployment=sf-ct-DEPLOYMENT_UUID prompt="Write a haiku about snow."
 cortex-training model-deployment drop sf-ct-DEPLOYMENT_UUID
 ```

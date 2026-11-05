@@ -339,7 +339,7 @@ def test_deploy_is_an_entrypoint():
 
 def test_deploy_without_pat_fails_before_creating_a_deployment(deploy):
     deploy["pat"] = None
-    with pytest.raises(ValueError, match="calls the inference endpoint with a PAT"):
+    with pytest.raises(ValueError, match="calls the inference endpoint with a programmatic access token"):
         deploy["main"](deploy["config"]())
     assert deploy["client"].created == []
     assert deploy["calls"] == []

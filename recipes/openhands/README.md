@@ -62,16 +62,16 @@ The run script installs OpenHands itself.
 
 The Arctic Platform launcher reads its connection only from `ARCTIC_CORTEX_*`
 environment variables, so `cortex-training login` alone is not enough. Export
-them from the config JSON you log in with (this uses
-[`jq`](https://jqlang.org/download/)):
+them from your profile:
 
-```bash
-cfg=~/cortex-training-config.json
-export ARCTIC_CORTEX_HOST=$(jq -r .host "$cfg")
-export ARCTIC_CORTEX_DATABASE=$(jq -r .database "$cfg")
-export ARCTIC_CORTEX_SCHEMA=$(jq -r .schema "$cfg")
-export ARCTIC_CORTEX_PAT=$(jq -r .pat "$cfg")
-```
+Start each launcher command below with `python -m cortex_training.env --`. It
+runs the command with `ARCTIC_CORTEX_HOST`, `ARCTIC_CORTEX_DATABASE`,
+`ARCTIC_CORTEX_SCHEMA` and `ARCTIC_CORTEX_PAT` set from the profile
+`cortex-training login` saved (add `connection=NAME` before `--` for another).
+The token is only in that command's environment: it's never printed or left in
+your shell. The profile must sign in with a programmatic access token (PAT), as
+profiles `cortex-training login` creates do. Run it where cortex-training is
+installed; it works from any folder.
 
 ## Prepare the data
 
@@ -94,7 +94,7 @@ From the `Arctic-Platform` checkout. `LOGGER=console` skips Weights & Biases.
 export LOGGER=console
 export ARCTIC_CORTEX_JOB_COMMENT="your name, openhands localization"
 
-bash recipes/rl/openhands/code_localization/run_qwen35_4b.sh \
+python -m cortex_training.env -- bash recipes/rl/openhands/code_localization/run_qwen35_4b.sh \
   trainer.max_training_steps=100
 ```
 
