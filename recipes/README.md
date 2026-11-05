@@ -26,7 +26,7 @@ type on the command line instead of writing a job file.
 recipes/
 ├── utils.py                 # make_config, build_job and shared helpers
 ├── logging.py               # metrics logging
-├── sft_quickstart/          # runner.py (shared loop), overrides.json, conversational/, custom_loss/, dare/
+├── sft_quickstart/          # runner.py (shared loop), overrides.json, conversational/, dare/
 ├── rl_quickstart/           # runner.py (shared loop), overrides.json, math_grpo/, configs/ (generated)
 ├── distillation/            # runner.py (shared loop), episodes.py, overrides.json, on_policy/, tasks/, configs/ (generated)
 ├── inference/               # serve.py, generate.py, evaluate.py, overrides.json
@@ -63,7 +63,6 @@ To log metrics to Weights & Biases or Snowflake, see
 # With no connection argument, the profile `cortex-training login` saved is used.
 # Add connection=<profile> to choose another (config=<file> still works, deprecated).
 python -m recipes.sft_quickstart.conversational.train
-python -m recipes.sft_quickstart.custom_loss.train
 python -m recipes.rl_quickstart.math_grpo.train
 python -m recipes.distillation.on_policy.train
 python -m recipes.inference.serve

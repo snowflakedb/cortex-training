@@ -1089,10 +1089,10 @@ Typical polled result:
 }
 ```
 
-The exact metrics are backend/loss dependent. When `processing.post` lists
-`compute_logprobs`, `post_process_outputs.logprobs` holds the pass's `[B, S]`
-float32 log-probabilities in the batch's row order; otherwise
-`post_process_outputs` is empty or absent.
+The exact metrics are backend/loss dependent. The current ArcticTraining
+forward/backward response assembler intentionally returns
+`post_process_outputs` as an empty object; callers must not assume that
+`compute_logprobs` appears there.
 
 When the training sub-job sets `router_replay.mode = "best_effort"` (see
 [section 8.2](#82-trainingconfig)), `metrics` of a forward/backward request that
@@ -1570,10 +1570,7 @@ The ceiling is `CORTEX_TRAINING_FORWARD_OPERATION_MAX_JSON_BYTES` (integer
 bytes, default 16 MiB, minimum 16 KiB). Dict payloads stay a single plain
 `/operation` POST.
 
-The frame that returns per-token log-probabilities of token sequences, which
-`forward_backward_custom()` sends for its forward pass, is in
-[section 10.5](#105-custom-losses); other payload shapes are
-backend-specific.
+Do not treat this route as a portable log-probability API.
 
 ### 7.2 Weight sync
 
@@ -3038,8 +3035,7 @@ without this loss fails the request with an error containing
 
 The result's `metrics["weighted_cross_entropy_objective_sum"]` is
 `L_surrogate`, not `L`; read it rather than `avg_loss`, whose scale depends on
-how the server combines its ranks' losses. `post_process_outputs.logprobs`
-holds the backward pass's own `[B, S]` log-probabilities.
+how the server combines its ranks' losses.
 
 ---
 

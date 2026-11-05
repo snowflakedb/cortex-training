@@ -327,9 +327,9 @@ result = client.forward_backward_custom(job_id, data, completion_nll)
 client.poll_request(job_id, client.step(job_id))
 ```
 
-- Each `data` item is a token-id sequence (a list, or a 1-D tensor or array),
-  or a mapping with `"input_ids"` and any other keys the loss needs, with at
-  least two tokens. The loss gets `data` unchanged.
+- Each `data` item is a token-id sequence, or a mapping with `"input_ids"` and
+  any other keys the loss needs, with at least two tokens. The loss gets `data`
+  unchanged.
 - `logprobs[i]` is a float32 tensor of length `len(input_ids) - 1`: element `j`
   is the log-probability of token `j + 1` under the current training weights,
   at temperature 1.
@@ -342,10 +342,6 @@ client.poll_request(job_id, client.step(job_id))
   detached) and `logprob_max_abs_diff` (the largest gap between the two
   passes), and merges your metrics into `metrics`. The server's
   `metrics["weighted_cross_entropy_objective_sum"]` is `L_surrogate`, not `L`.
-- Once the forward/backward request succeeds, the call does not raise: the
-  gradient is already accumulated. If the backward log-probabilities are
-  malformed, `logprob_max_abs_diff` is left out, and a metric of yours named
-  like a server metric replaces it; both log a warning.
 - A call needs at least as many items as the training sub-job has
   data-parallel ranks. Do not run `step` or `load` on the job meanwhile. On
   mixture-of-experts models, check `logprob_max_abs_diff`: the two passes can
