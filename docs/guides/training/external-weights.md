@@ -48,10 +48,10 @@ directory with `PUT`.
 
 ### Before you start
 
-- A working client connection, either a connection profile or a JSON config
-  file, as configured in [Set Up the Client](../../getting-started/setup.md).
-  Confirm it with `cortex-training --connection NAME capacity` (profile) or
-  `cortex-training --config PATH capacity` (JSON config).
+- A working client connection, as set up in
+  [Set Up the Client](../../getting-started/setup.md). Confirm it with
+  `cortex-training capacity` (the profile `cortex-training login` saved), or
+  `cortex-training --connection NAME capacity` for another profile.
 - A role that can upload to the stage, with `USAGE` on the database and schema
   plus one of:
   - `CREATE STAGE` on the schema, to create the stage yourself. The role that

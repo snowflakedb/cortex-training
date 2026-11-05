@@ -9,13 +9,16 @@ type on the command line instead of writing a job file.
 | [Conversational SFT](sft_quickstart/README.md) | LoRA or full-parameter SFT | Hugging Face chat datasets, GSM8K, identity |
 | [DARE-Bench agent SFT](sft_quickstart/dare/README.md) | Full-parameter multi-turn tool SFT + agent eval | DARE-Bench |
 | [Math GRPO](rl_quickstart/README.md) | Reinforcement learning | Hendrycks MATH, MATH-500 |
-| [On-policy distillation](distillation/README.md) | Distillation from a frozen teacher | GSM8K |
+| [On-policy distillation](distillation/README.md) | Multi-turn tool-use distillation from a frozen teacher | Wiki-search trivia |
 | [Inference endpoint](inference/README.md) | Serve, generate, evaluate open weights or a checkpoint | MATH-500, GSM8K, identity |
 | [Model deployment streaming](model_deployment/README.md) | OpenAI-compatible model deployment, streamed chat | Open weights, checkpoints |
 | [DFlash2 draft](dflash2/README.md) | Speculative-decoding draft training, then serving with the target | Target-written chats (UltraChat prompts) |
 | [SkyRL GRPO](skyrl/gsm8k_grpo/README.md) | SkyRL trainer on CPU driver + Cortex training/sampling sub-jobs | GSM8K |
+| [TRL GRPO](trl/gsm8k_grpo/README.md) | TRL trainer on CPU driver + Cortex training/sampling sub-jobs | GSM8K |
+| [prime-rl GRPO](prime-rl/README.md) | prime-rl orchestrator on a CPU driver + Cortex training/sampling sub-jobs | i3_math (math), r2e-gym (SWE) |
 | [Tinker Cookbook](tinker/README.md) | Run `tinker-cookbook` recipes or `ServiceClient` on Cortex | GSM8K, MATH, etc. |
-| [OpenHands & Harbor RL](openhands/README.md) | Train an OpenHands or Harbor agent with online GSPO/GRPO | SWE-smith code localization, Harbor tasks (`Terminal-Bench 2.0`, etc.) |
+| [Harbor RL](harbor/README.md) | Go from `harbor run` evals to RL on the same tasks, sandbox and verifier | Your Harbor tasks (example: SWE-smith code localization) |
+| [OpenHands RL](openhands/README.md) | Train an OpenHands agent with online GSPO | SWE-smith code localization |
 | [Bring your own agent](bring-your-own-agent.md) | Connect any custom agent harness and grader to Cortex RL | Custom agent tasks |
 
 ```text
@@ -24,14 +27,17 @@ recipes/
 ├── logging.py               # metrics logging
 ├── sft_quickstart/          # runner.py (shared loop), overrides.json, conversational/, dare/
 ├── rl_quickstart/           # runner.py (shared loop), overrides.json, math_grpo/, configs/ (generated)
-├── distillation/            # on_policy/, overrides.json, configs/ (generated)
+├── distillation/            # runner.py (shared loop), episodes.py, overrides.json, on_policy/, tasks/, configs/ (generated)
 ├── inference/               # serve.py, generate.py, evaluate.py, overrides.json
 ├── dflash2/                 # generate_data.py, train.py, evaluate.py, overrides.json, drafts/<model>.json
 ├── model_deployment/        # deploy.py, streaming.py, configs/
 ├── api_quickstart/          # raw REST API request bodies
 ├── skyrl/                   # SkyRL GRPO recipe
+├── trl/                     # TRL GSM8K GRPO recipe
+├── prime-rl/                # prime-rl GRPO integration
 ├── tinker/                  # tinker-cookbook integration
-├── openhands/               # OpenHands & Harbor agent RL post-training
+├── harbor/                  # RL post-training on Harbor tasks, from harbor run evals
+├── openhands/               # OpenHands agent RL post-training
 └── bring-your-own-agent.md  # custom agent harness RL guide
 ```
 
@@ -42,38 +48,35 @@ From the repository root:
 ```bash
 uv pip install -e .
 uv pip install 'tinker-cookbook[math-rl] @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
+uv pip install chromadb  # distillation only: the wiki-search title index
 ```
 
-Set up a Snowflake connection profile (see
-[Set up the client](../docs/getting-started/setup.md)). A
-[JSON connection file](../docs/getting-started/setup.md#json-connection-file)
-(from [`connection.json.template`](../docs/getting-started/connection.json.template),
-with account host and PAT) also works, through `config=`.
+Set up a Snowflake connection profile with `cortex-training login` (see
+[Set up the client](../docs/getting-started/setup.md)).
 To log metrics to Weights & Biases or Snowflake, see
 [experiment tracking](../docs/guides/operations/wandb.md).
 
 ## Run a recipe
 
 ```bash
-# Add connection=<profile> or config=<file> to choose a connection; with neither,
-# the default connection is used.
-python -m recipes.sft_quickstart.conversational.train config=/path/to/config.json
-python -m recipes.rl_quickstart.math_grpo.train config=/path/to/config.json
-python -m recipes.distillation.on_policy.train config=/path/to/config.json
-python -m recipes.inference.serve config=/path/to/config.json
-python -m recipes.model_deployment.deploy config=/path/to/config.json
+# With no connection argument, the profile `cortex-training login` saved is used.
+# Add connection=<profile> to choose another (config=<file> still works, deprecated).
+python -m recipes.sft_quickstart.conversational.train
+python -m recipes.rl_quickstart.math_grpo.train
+python -m recipes.distillation.on_policy.train
+python -m recipes.inference.serve
+python -m recipes.model_deployment.deploy config=/path/to/config.json   # needs a PAT; not deprecated here
 ```
 
 Every recipe resolves its connection the same way the CLI does:
 
 - `connection=<name>` uses a profile from `~/.snowflake/connections.toml`
   (`$SNOWFLAKE_HOME/connections.toml` if `SNOWFLAKE_HOME` is set).
-- `config=<file>` reads a legacy JSON file with `host`, `pat`, `database`, and
-  `schema`, exactly as before: only the file is used, and environment variables,
-  the saved login and profiles are ignored.
-- With neither, the sources are tried in order: `CORTEX_TRAINING_CONNECTION`,
-  `CORTEX_TRAINING_CONFIG`, complete credentials in the environment, the saved
-  `cortex-training login`, then the Snowflake default connection profile.
+- With no `connection=`, the profile `cortex-training login` saved is used, then
+  the Snowflake default connection profile.
+- The [older connection methods](../docs/reference/cli.md#older-connection-methods),
+  such as `config=<file>`, still work as a fallback and will be deprecated in a
+  future release.
 
 Each run logs the target it connected to and the source, never the token. The
 `model_deployment` recipe needs a PAT (see its README).
@@ -114,10 +117,10 @@ applies on top of it. Without `job_config=`, an RL job on an MoE model also gets
 [router replay](rl_quickstart/README.md#router-replay) filled in after the merge. The
 final job is logged before it is submitted.
 
-Distillation builds a student and a teacher job instead; see
+Distillation builds a student, a teacher and a judge job instead; see
 [How the jobs are built](distillation/README.md#how-the-jobs-are-built). Its
-`job_config=` and `teacher_job_config=` files are used as is, without its
-sizing arguments.
+`job_config=`, `teacher_job_config=` and `judge_job_config=` files are used as
+is, without its sizing arguments.
 
 Merge rules:
 

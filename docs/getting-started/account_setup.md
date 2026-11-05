@@ -43,6 +43,30 @@ Share these three values with the Snowflake team. They will:
 You cannot proceed until this is complete. Once the team confirms enablement,
 continue to the next step.
 
+### Grant access to other roles
+
+Creating a job requires the `USE CORTEX TRAINING` privilege on the account.
+`ACCOUNTADMIN` has it. To let another role create jobs, an `ACCOUNTADMIN` runs:
+
+```sql
+GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE <role_name>;
+```
+
+If a role can already create jobs without `USE CORTEX TRAINING`, grant it the
+privilege anyway, so the role keeps working when the requirement applies to
+your account.
+
+To let every role in the account create jobs, grant it to `PUBLIC` instead. Do
+this only if the account does not need to limit who can start GPU training:
+
+```sql
+GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE PUBLIC;
+```
+
+Roles also need privileges on the database and schema you use, and
+`CREATE EXPERIMENT` on that schema unless you pass an existing experiment. See
+[Access control](../reference/rest-api.md#37-access-control) for every operation.
+
 ## Step 3: Authenticate
 
 Generate a Programmatic Access Token (PAT) and configure your client connection.
@@ -89,14 +113,12 @@ The conversational SFT example fine-tunes Qwen3-8B on a one-example chat dataset
 
 ```bash
 python -m recipes.sft_quickstart.conversational.train \
-  config=/path/to/your-config.json \
   max_steps=10
 ```
 
-The example uses the same connection resolution as the CLI, so a default
-connection in `connections.toml` is picked up automatically. Pass
-`connection=<name>` for a named profile, or `config=` for a
-[JSON connection file](setup.md#json-connection-file).
+The example connects the same way the CLI does: the profile
+`cortex-training login` saved, else your default Snowflake profile. Pass
+`connection=<name>` to use another profile.
 
 What happens during this run:
 
@@ -117,7 +139,6 @@ expected answer:
 
 ```bash
 python -m recipes.inference.generate \
-  config=/path/to/your-config.json \
   source_job_id=TRAINING_JOB_ID \
   checkpoint_id=CHECKPOINT_ID \
   temperature=0 \

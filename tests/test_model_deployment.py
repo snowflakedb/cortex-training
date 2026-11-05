@@ -1604,6 +1604,45 @@ def test_deployment_errors_keep_server_code_and_message(status_code, body, expec
     assert "http://" not in rendered
 
 
+def test_deployment_errors_cut_a_long_server_message_after_hiding_the_job():
+    error = requests.exceptions.HTTPError(
+        f"409 for url: http://test.local/jobs/{JOB_ID}",
+        response=_server_error_response(409, {"code": "517602", "message": f"job {JOB_ID} " + "x" * 2000}),
+    )
+
+    rendered = str(
+        client_module._sanitized_model_deployment_request_error(
+            error, DEPLOYMENT_ID, job_id=JOB_ID, scope="DB.SCH"
+        )
+    )
+
+    hidden = f"job {DEPLOYMENT_ID} " + "x" * 2000
+    assert rendered == (
+        f"model deployment {DEPLOYMENT_ID} request failed with HTTP 409 (517602): "
+        f"{hidden[:client_module._MAX_SERVER_ERROR_MESSAGE_CHARS]}..."
+    )
+
+
+def test_a_deployment_error_quotes_the_server_message_once():
+    # Transport level: the HTTPError the real _send raises carries the message too.
+    instance = client()
+    instance._session = MagicMock()
+    instance._session.get.return_value = _server_error_response(
+        403, {"code": "517600", "message": "Cortex Training API is not enabled for this account"}
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        instance.describe_model_deployment(DEPLOYMENT_ID)
+
+    assert type(excinfo.value) is RuntimeError
+    assert str(excinfo.value) == (
+        f"model deployment {DEPLOYMENT_ID} request failed with HTTP 403 (517600): "
+        "Cortex Training API is not enabled for this account"
+    )
+    assert str(excinfo.value.__cause__).endswith(" (517600): Cortex Training API is not enabled for this account")
+    assert instance._session.get.call_count == 1
+
+
 def test_create_errors_keep_gs_message_but_not_the_url_or_raw_body():
     instance = client()
     error = requests.exceptions.HTTPError(

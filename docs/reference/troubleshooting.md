@@ -3,6 +3,16 @@
 For authentication, URL, and server error messages, see the
 [CLI troubleshooting section](cli.md#troubleshooting).
 
+## 403 when creating a job
+
+`Insufficient privileges to operate on Account '<account>'. Your primary role
+<role> must have USE CORTEX TRAINING granted on ACCOUNT <account>` means the
+role has no `USE CORTEX TRAINING` privilege. An `ACCOUNTADMIN` fixes it with
+`GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE <role>`; the grant takes effect
+immediately. Other operations on a job are limited to the role that created it,
+so a different role gets 404. See
+[Access control](rest-api.md#37-access-control).
+
 When an example fails, first capture:
 
 - The example command with secrets removed

@@ -29,6 +29,7 @@ EXAMPLE_FOLDERS = (
     "distillation",
     "dflash2",
     "skyrl/gsm8k_grpo",
+    "trl/gsm8k_grpo",
 )
 
 
@@ -436,7 +437,8 @@ def test_every_example_ships_an_overrides_file_with_a_comment():
     (student_training,) = [sub for sub in distillation["sub_job_configs"] if sub["job_type"] == "training"]
     student_config = student_training["training_config"]
     assert student_config["n_gpus"] == 1 and student_config["train_batch_size"] == 1
-    assert student_config["mb_spec"] == {"max_tokens_per_mb": 10240}
+    assert student_config["mb_spec"] == {"max_tokens_per_mb": 16384}
+    assert student_config["optimizer"] == {"lr": 1e-06}
     assert student_config["ds_config"]["zero_optimization"]["reduce_scatter"] is True
 
 
@@ -463,10 +465,21 @@ def test_dare_applies_its_own_overrides_after_the_sft_file():
 
 def test_an_override_that_moves_the_gpu_count_past_the_deepspeed_batch_is_rejected():
     utils = _import_example("recipes.utils")
-    more_gpus = {"sub_job_configs": [{"job_type": "training", "training_config": {"n_gpus": 8}}]}
+    more_gpus = {
+        "sub_job_configs": [{
+            "job_type": "training",
+            "training_config": {
+                "n_gpus": 16,
+                "ds_config": {
+                    "train_batch_size": 8,
+                    "train_micro_batch_size_per_gpu": 1,
+                    "gradient_accumulation_steps": 1,
+                },
+            },
+        }],
+    }
 
-    # Qwen3-30B-A3B's file spells out a DeepSpeed batch of 4 for its 4 GPUs.
-    with pytest.raises(ValueError, match=r"ds_config train_batch_size 4 must equal .* 8 data-parallel ranks"):
+    with pytest.raises(ValueError, match=r"ds_config train_batch_size 8 must equal .* 16 data-parallel ranks"):
         utils.build_job("training", model="Qwen/Qwen3-30B-A3B", context="standard", overrides=[more_gpus])
 
 
@@ -556,6 +569,59 @@ class _FakeJobClient:
 
     def cancel_job(self, job_id: str) -> None:
         self._call("cancel")
+
+
+class _FakeJobsClient:
+    """Records ``running_jobs`` calls with one id per created job; ``fail_wait`` names one that fails to start."""
+
+    def __init__(self, fail_wait: str | None = None, error_log: str | None = None):
+        self.events: list[str] = []
+        self.created = 0
+        self.fail_wait = fail_wait
+        self.error_log = error_log
+
+    def create_job_from_body(self, body: dict) -> dict:
+        self.created += 1
+        job_id = f"job-{self.created}"
+        self.events.append(f"create {job_id}")
+        return {"job_id": job_id}
+
+    def wait_for_job(self, job_id: str) -> None:
+        self.events.append(f"wait {job_id}")
+        if job_id == self.fail_wait:
+            raise RuntimeError(f"job {job_id} failed")
+
+    def fetch_execution_logs(self, job_id: str) -> list[dict]:
+        line = json.dumps({"level": "ERROR", "msg": self.error_log})
+        return [{"content": line}] if self.error_log else []
+
+    def cancel_job(self, job_id: str) -> None:
+        self.events.append(f"cancel {job_id}")
+
+
+def test_running_jobs_creates_every_job_before_waiting_and_cancels_only_its_own():
+    utils = _import_example("recipes.utils")
+    client = _FakeJobsClient()
+    bodies = {"student": {}, "teacher": {}, "judge": {}}
+
+    with utils.running_jobs(client, bodies, {"judge": "attached-1"}) as ids:
+        assert ids == {"student": "job-1", "teacher": "job-2", "judge": "attached-1"}
+        assert client.events == [
+            "create job-1", "create job-2", "wait job-1", "wait job-2", "wait attached-1",
+        ]
+
+    assert client.events[-2:] == ["cancel job-2", "cancel job-1"]
+
+
+def test_running_jobs_reports_the_logged_cause_and_cancels_what_it_created():
+    utils = _import_example("recipes.utils")
+    client = _FakeJobsClient(fail_wait="job-2", error_log="RuntimeError: CUDA out of memory")
+
+    with pytest.raises(RuntimeError, match="job job-2 failed\nRuntimeError: CUDA out of memory"):
+        with utils.running_jobs(client, {"student": {}, "teacher": {}}):
+            pass
+
+    assert client.events[-2:] == ["cancel job-2", "cancel job-1"]
 
 
 class _EmptyTask:
@@ -848,8 +914,8 @@ def test_dare_keeps_a_fitting_mesh_and_rejects_one_that_needs_more_gpus():
     assert not {"train_batch_size", "train_micro_batch_size_per_gpu", "gradient_accumulation_steps"} & set(training["ds_config"])
     assert _server_deepspeed_batch(training) == (8, 1, 1, 8)
 
-    # GLM-5.3-Flash-BF16 trains on a 16-GPU SP16/EP16 mesh, which 8 GPUs cannot hold.
-    with pytest.raises(ValueError, match=r"sp_size 16 must be a positive divisor of n_gpus 8; ep_size 16"):
+    # GLM-5.3-Flash-BF16 trains on a 64-GPU SP16/EP32 mesh, which 8 GPUs cannot hold.
+    with pytest.raises(ValueError, match=r"sp_size 16 must be a positive divisor of n_gpus 8; ep_size 32"):
         _job_body("recipes.sft_quickstart.dare.train", model="zai-org/GLM-5.3-Flash-BF16")
 
 
@@ -1053,7 +1119,7 @@ def test_task_modules_are_entrypoints(relative_path):
     [
         ("recipes/sft_quickstart/runner.py", "recipes.sft_quickstart.conversational"),
         ("recipes/rl_quickstart/runner.py", "recipes.rl_quickstart.math_grpo"),
-        ("recipes/distillation/train.py", ".tasks."),
+        ("recipes/distillation/runner.py", ".tasks."),
     ],
 )
 def test_shared_runners_are_task_agnostic_libraries(relative_path, example_package):
@@ -1465,8 +1531,6 @@ def test_examples_folder_is_renamed_to_recipes():
     assert (REPO_ROOT / "recipes").is_dir()
 
 
-# A catalog job file is picked by model, context, hardware and mode, so nothing
-# outside the model's folder names one by path (tests aside).
 _CATALOG_JOB_FILE = re.compile(r"\b(standard|long)/(h200|b200|b300)-(training|inference)-(lora|full)\.json")
 
 

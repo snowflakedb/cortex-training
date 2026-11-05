@@ -1042,6 +1042,51 @@ class TestOperationMetrics:
         assert c.step("job-1") == "r1"
         c._metric_emitter.emit.assert_not_called()
 
+    def test_success_is_counted_without_a_detailed_record(self, monkeypatch):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c = _make_client(post_json={"request_id": "r1"})
+        c._metric_emitter = MagicMock()
+
+        assert c.step("job-1") == "r1"
+
+        c._metric_emitter.emit.assert_not_called()
+        c._metric_emitter.record_operation.assert_called_once()
+        assert c._metric_emitter.record_operation.call_args.args == ("step",)
+        kwargs = c._metric_emitter.record_operation.call_args.kwargs
+        assert kwargs["outcome"] == "success"
+        assert kwargs["request_count"] == 1
+        assert kwargs["retry_count"] == 0
+        assert kwargs["surface"] == "sdk"
+        assert kwargs["duration_ms"] >= 0
+
+    def test_failure_is_counted_and_recorded(self):
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        c._session.post.return_value = _make_error_response(
+            {"code": "CORTEX_TRAINING_BAD_REQUEST"}, 400
+        )
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.step("job-1")
+
+        c._metric_emitter.emit.assert_called_once()
+        c._metric_emitter.record_operation.assert_called_once()
+        kwargs = c._metric_emitter.record_operation.call_args.kwargs
+        assert kwargs["outcome"] == "failure"
+        assert kwargs["duration_ms"] == (
+            c._metric_emitter.emit.call_args.args[1]["duration_ms"]
+        )
+
+    def test_operation_count_error_does_not_drop_failure_record(self):
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        c._metric_emitter.record_operation.side_effect = RuntimeError("boom")
+
+        with pytest.raises(ValueError, match="checkpoint_type"):
+            c.save("job-1", checkpoint_type="invalid")
+
+        c._metric_emitter.emit.assert_called_once()
+
     def test_success_metric_has_operation_job_and_duration(self, monkeypatch):
         monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "1")
         c = _make_client(post_json={"request_id": "r1"})
@@ -2530,6 +2575,288 @@ class TestTransientHttpRetries:
             c._send("GET", redirect.url)
 
         c._session.get.assert_called_once_with(redirect.url)
+
+
+# ─── CortexTrainingClient — HTTP error messages ──────────────────────────────
+
+
+_CROSS_REGION_MESSAGE = (
+    "Cortex Training runs in AWS US West (Oregon). To use it from this account's region, "
+    "set the account parameter CORTEX_ENABLED_CROSS_REGION to AWS_US, AWS_GLOBAL or ANY_REGION."
+)
+
+
+def _refusal(json_body, status_code=403, *, reason="Forbidden", request_id=None):
+    """An error answer as the API sends it: a JSON body, a reason phrase and maybe a request id."""
+    response = _make_error_response(json_body, status_code)
+    response.reason = reason
+    if request_id is not None:
+        response.headers["x-snowflake-request-id"] = request_id
+    return response
+
+
+def _requests_text(response) -> str:
+    """What ``raise_for_status`` alone says about ``response``."""
+    with pytest.raises(nc.requests.exceptions.HTTPError) as plain:
+        response.raise_for_status()
+    return str(plain.value)
+
+
+class TestHttpErrorMessages:
+    @pytest.fixture(autouse=True)
+    def _no_backoff(self, monkeypatch):
+        monkeypatch.setattr(nc, "wait_exponential_jitter", lambda **kwargs: lambda retry_state: 0)
+
+    @pytest.mark.parametrize(
+        ("status_code", "reason", "code", "message"),
+        [
+            (403, "Forbidden", "517600", _CROSS_REGION_MESSAGE),
+            (403, "Forbidden", "517600", "Cortex Training API is not enabled for this account"),
+            (409, "Conflict", "517604", 'Cortex training createJob failed: unsupported hardware "B200"'),
+        ],
+    )
+    def test_a_refused_create_job_says_the_service_code_and_message(self, status_code, reason, code, message):
+        c = _make_client()
+        response = _refusal(
+            {"code": code, "message": message, "request_id": "sf-req-1", "error_code": code},
+            status_code,
+            reason=reason,
+            request_id="sf-req-1",
+        )
+        response.request = nc.requests.Request("POST", c._prefix).prepare()
+        c._session.post.return_value = response
+
+        with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+            c.create_job_from_body(_SAMPLING_BODY)
+
+        assert type(excinfo.value) is nc.requests.exceptions.HTTPError
+        assert str(excinfo.value) == (
+            f"[snowflake request id: sf-req-1] {_requests_text(response)} ({code}): {message}"
+        )
+        assert excinfo.value.response is response
+        assert excinfo.value.request is response.request
+        assert excinfo.value.response.json()["code"] == code
+        assert c._session.post.call_count == 1
+
+    @pytest.mark.parametrize(
+        ("body", "suffix"),
+        [
+            ({"message": "bad request"}, ": bad request"),
+            ({"code": "517602"}, " (517602)"),
+            ({"error_code": "517602", "message": "bad request"}, " (517602): bad request"),
+            ({"error": {"code": "517602", "message": "bad request"}}, " (517602): bad request"),
+        ],
+    )
+    def test_whichever_of_code_and_message_the_body_has_is_added(self, body, suffix):
+        c = _make_client()
+        c.max_retries = 3
+        response = _refusal(body, 400, reason="Bad Request")
+        c._session.get.return_value = response
+
+        with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+            c.get_job("job-1")
+
+        assert str(excinfo.value) == _requests_text(response) + suffix
+        assert c._session.get.call_count == 1
+
+    @pytest.mark.parametrize(
+        ("content", "content_type"),
+        [
+            pytest.param(b"<html><body>Forbidden</body></html>", "text/html", id="html"),
+            pytest.param(b"", "application/json", id="empty"),
+            pytest.param(b"{}", "application/json", id="no-code-or-message"),
+            pytest.param(b'{"message": "  "}', "application/json", id="blank-message"),
+            pytest.param(
+                b'{"detail": [{"loc": ["body", "field"], "msg": "description", "type": "value_error"}]}',
+                "application/json",
+                id="validation-details",
+            ),
+        ],
+    )
+    def test_a_body_without_a_code_or_message_keeps_requests_text(self, content, content_type):
+        c = _make_client()
+        response = _refusal({}, 403, request_id="sf-req-1")
+        response._content = content
+        response.headers["Content-Type"] = content_type
+        c._session.get.return_value = response
+
+        with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+            c.get_job("job-1")
+
+        assert str(excinfo.value) == f"[snowflake request id: sf-req-1] {_requests_text(response)}"
+
+    def test_the_request_id_stays_first_when_the_message_names_it(self):
+        c = _make_client()
+        response = _refusal(
+            {"code": "517604", "message": "request sf-req-2 failed"}, 409, reason="Conflict", request_id="sf-req-2"
+        )
+        c._session.post.return_value = response
+
+        with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+            c.create_job_from_body(_SAMPLING_BODY)
+
+        message = str(excinfo.value)
+        assert message == (
+            f"[snowflake request id: sf-req-2] {_requests_text(response)} (517604): request sf-req-2 failed"
+        )
+        assert message.count("[snowflake request id:") == 1
+
+    def test_a_long_message_is_cut_as_a_model_deployment_error_cuts_it(self):
+        c = _make_client()
+        response = _refusal(
+            {"code": "517604", "message": "x" * (nc._MAX_SERVER_ERROR_MESSAGE_CHARS + 500)}, 409, reason="Conflict"
+        )
+        c._session.post.return_value = response
+
+        with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+            c.create_job_from_body(_SAMPLING_BODY)
+
+        assert str(excinfo.value) == (
+            f"{_requests_text(response)} (517604): {'x' * nc._MAX_SERVER_ERROR_MESSAGE_CHARS}..."
+        )
+
+    def test_a_credential_in_the_message_is_redacted(self):
+        c = _make_client()
+        response = _refusal({"code": "517602", "message": "token=abc123 was rejected"}, 400, reason="Bad Request")
+        c._session.get.return_value = response
+
+        with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+            c.get_job("job-1")
+
+        assert str(excinfo.value) == f"{_requests_text(response)} (517602): token=<redacted> was rejected"
+
+    def test_a_retried_error_carries_the_last_answer_once(self):
+        c = _make_client()
+        c.max_retries = 2
+        responses = [
+            _refusal(
+                {"code": "TEMPORARY", "message": f"busy {index}"},
+                503,
+                reason="Service Unavailable",
+                request_id=f"sf-{index}",
+            )
+            for index in range(1, 4)
+        ]
+        c._session.get.side_effect = responses
+
+        with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+            c.get_job("job-1")
+
+        assert c._session.get.call_count == 3
+        assert excinfo.value.response is responses[-1]
+        assert str(excinfo.value) == (
+            f"[snowflake request id: sf-3] {_requests_text(responses[-1])} (TEMPORARY): busy 3"
+        )
+
+    def test_an_error_raised_again_gets_the_message_once(self):
+        c = _make_client()
+        c.max_retries = 2
+        response = _make_response({"code": "TEMPORARY", "message": "busy"}, status_code=503)
+        error = nc.requests.exceptions.HTTPError("503 Server Error: Service Unavailable", response=response)
+        response.raise_for_status.side_effect = error
+        c._session.get.return_value = response
+
+        with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+            c.get_job("job-1")
+
+        assert excinfo.value is error
+        assert c._session.get.call_count == 3
+        assert str(error) == "503 Server Error: Service Unavailable (TEMPORARY): busy"
+
+    def test_a_body_that_cannot_be_read_leaves_the_error_as_it_was(self, monkeypatch, caplog):
+        c = _make_client()
+        c.max_retries = 1
+        response = _refusal({"code": "TEMPORARY", "message": "busy"}, 503, reason="Service Unavailable")
+        c._session.get.return_value = response
+
+        def unreadable(_response):
+            raise RecursionError("maximum recursion depth exceeded while decoding a JSON object")
+
+        monkeypatch.setattr(nc, "_server_error_code_and_message", unreadable)
+        with caplog.at_level("DEBUG", logger=nc.logger.name):
+            with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+                c.get_job("job-1")
+
+        assert str(excinfo.value) == _requests_text(response)
+        assert excinfo.value.response is response
+        assert c._session.get.call_count == 2  # still retried as a 503
+        assert "could not add the server's error message" in caplog.text
+
+    def test_a_job_not_found_is_still_final(self):
+        c = _make_client()
+        c.max_retries = 5
+        c._session.get.return_value = _not_found("517601", "Training job missing not found in PUBLIC")
+
+        with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+            c.get_job("missing")
+
+        assert c._session.get.call_count == 1
+        assert str(excinfo.value).endswith(" (517601): Training job missing not found in PUBLIC")
+
+    def test_a_redirect_keeps_its_own_message(self):
+        c = _make_client()
+        c.max_retries = 0
+        c._session.get.return_value = _refusal(
+            {"code": "517604", "message": "moved"}, 302, reason="Found", request_id="sf-redirect"
+        )
+        url = f"{c._prefix}/job-1"
+
+        with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+            c._send("GET", url)
+
+        assert str(excinfo.value) == f"[snowflake request id: sf-redirect] Unexpected redirect 302 for url: {url}"
+
+    def test_the_schema_not_found_explanation_is_unchanged(self):
+        c = _make_client()
+        response = _refusal(_failed_request(c), 400, reason="Bad Request")
+        c._session.get.return_value = response
+
+        with pytest.raises(nc.DatabaseAccessError) as explained:
+            c._send("GET", f"{c.base_url}/test")
+        with pytest.raises(nc.requests.exceptions.HTTPError) as plain:
+            c._send("GET", f"{c.base_url}/test", explain_database=False)
+
+        assert str(explained.value) == str(c._schema_not_found_error(response))
+        assert "517602" not in str(explained.value)
+        assert type(plain.value) is nc.requests.exceptions.HTTPError
+        assert str(plain.value).endswith(" (517602): Schema DB.SCH is not found or not authorized")
+
+    def test_a_chunk_group_error_keeps_its_own_message(self):
+        c = _make_client()
+        c._session.post.return_value = _refusal(
+            {
+                "code": "517604",
+                "message": (
+                    "Cortex training forwardBackward failed: zone returned 409: "
+                    '{"detail":{"message":"request chunk group is missing chunks",'
+                    '"chunk_group_id":"group-a","missing_chunks":[0,1]}}'
+                ),
+            },
+            409,
+            reason="Conflict",
+            request_id="sf-chunk",
+        )
+
+        with pytest.raises(nc.ChunkGroupConflictError) as excinfo:
+            c.forward_backward("j1", b"small")
+
+        assert str(excinfo.value) == "[snowflake request id: sf-chunk] request chunk group is missing chunks"
+        assert str(excinfo.value.__cause__).count("Cortex training forwardBackward failed") == 1
+
+    def test_a_tail_logs_hint_quotes_the_message_once(self):
+        c = _make_client()
+        c._session.post.return_value = _not_found(
+            "517604", "Cortex training operation failed: session s not found"
+        )
+        sub_jobs = [{"sub_job_id": "j1:sampling:0", "job_type": "SAMPLING"}]
+        c._session.get.return_value = _make_response({"job_id": "j1", "status": "CANCELLED", "sub_jobs": sub_jobs})
+
+        with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        message = str(excinfo.value)
+        assert message.count("session s not found") == 1
+        assert " (517604): Cortex training operation failed: session s not found. Job j1 is cancelled" in message
 
 
 # ─── CortexTrainingClient — read & control endpoints ─────────────────────────
@@ -9776,3 +10103,16 @@ def test_execution_log_filenames_keep_their_subdirectories(tmp_path, monkeypatch
     # Resume finds the nested file's record.
     again = c.download_execution_logs("job-1", tmp_path, resume=True)
     assert [r["unchanged"] for r in again] == [True, True]
+
+
+def test_request_retries_back_off_without_tenacity_deprecation_warnings():
+    import warnings
+
+    from tenacity import wait_exponential_jitter
+
+    from cortex_training.client import core
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        wait = wait_exponential_jitter(**{core._JITTER_START: 0.5}, max=10.0)
+    assert getattr(wait, "multiplier", getattr(wait, "initial", None)) == 0.5

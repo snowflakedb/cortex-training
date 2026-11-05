@@ -106,6 +106,16 @@ Local or mock clients constructed with an explicit `base_url` treat
 `emit_metric` as a no-op. Set `CORTEX_TRAINING_DISABLE_TELEMETRY=1` to skip
 constructing the emitter.
 
+Separately from these events, the client counts every essential operation,
+successes included, whatever the settings above. Counts are kept in memory per
+operation, outcome (`success`, `failure` or `cancelled`) and `client.surface`,
+and are exported as OTLP metrics about every 30 seconds and when the client is
+closed: `cortex.training.client.operation.count`, `.duration` (a histogram in
+milliseconds), `.retries` and `.requests`. Each export is a few data points
+however many calls were made, so totals and failure rates are available
+without enabling success events. `CORTEX_TRAINING_DISABLE_TELEMETRY=1` turns
+these off too.
+
 Every event carries the `client.surface` record attribute, which names the
 program that made the call:
 
@@ -235,7 +245,7 @@ client, including notebooks, CI and containers that never open the TUI.
 
 | Method | Returns | Notes |
 |---|---|---|
-| `create_job(sub_jobs, job_id=None, experiment_name=None, hardware=None)` | `job_id` | Validates each `SubJobConfig` client-side first. Only `training` and `sampling` sub-jobs can be submitted: a job takes zero or one `training` sub-job and any number of `sampling` sub-jobs. `hardware` is `H200`, `B200`, or `B300` (the `Hardware` enum or its string); omitted means `H200` |
+| `create_job(sub_jobs, job_id=None, experiment_name=None, hardware=None)` | `job_id` | Validates each `SubJobConfig` client-side first. Only `training` and `sampling` sub-jobs can be submitted: a job takes zero or one `training` sub-job and any number of `sampling` sub-jobs. `hardware` is `H200`, `B200`, or `B300` (the `Hardware` enum or its string); omitted means `H200`. Needs `USE CORTEX TRAINING` on the account; without it the call raises `requests.HTTPError` (403). See [REST API section 3.7](rest-api.md#37-access-control) |
 | `create_job_from_body(body)` | response dict | For callers that already hold the REST JSON. Enforces the same one-training-sub-job and no-`log_probability` rules before sending |
 | `get_job(job_id)` | job dict | Includes `sub_jobs` with their configs |
 | `list_jobs(status=None)` | list of jobs | Returns the inner list, not the envelope |
@@ -404,6 +414,24 @@ current role: it doesn't exist, or the role can't access it. It carries
 `.role` (the session's role, or None when it can't be determined, as for PAT
 clients), and `.statement`, the SQL that would set it up: `CREATE DATABASE IF NOT
 EXISTS ...` and `CREATE SCHEMA IF NOT EXISTS ...`, separated by `; `.
+
+When the service answers with a 4xx or 5xx, the `requests.exceptions.HTTPError`
+that `raise_for_status()` raises keeps the service's answer as `.response`, and
+the client adds to its message: the Snowflake request id first, when the answer
+has the `x-snowflake-request-id` header, and the JSON error body's `code` and
+`message` last, when it has them:
+
+```text
+[snowflake request id: <id>] 403 Client Error: Forbidden for url: <url> (<code>): <message>
+```
+
+With only one of them the message ends in ` (<code>)` or `: <message>`. The
+service's message is cut at 1,000 characters, ending in `...`, and common
+credential patterns in it are redacted. A body that is not JSON, or has neither,
+adds nothing at the end. The errors above keep their own messages, and the model
+deployment methods raise their own; see
+[REST API section 3.6](rest-api.md#36-errors) and
+[section 14.7](rest-api.md#147-errors).
 
 ## Details not covered here
 

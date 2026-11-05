@@ -5,7 +5,7 @@ supported command-line and SDK interfaces for Cortex Training.
 
 `ct` is installed as an alias for `cortex-training` and supports the same
 commands and flags. You can replace `cortex-training` with `ct` in any example
-below, such as `ct login config.json` or `ct --job JOB_ID step`.
+below, such as `ct login` or `ct --job JOB_ID step`.
 
 ## Installation
 
@@ -63,12 +63,11 @@ See [jobs and sub-jobs](../concepts/jobs-and-subjobs.md) and the
 
 ## Quick Reference
 
-Global flags such as `--config`, `--job`, and `--compact` go **before** the
-subcommand. `login` also accepts its own `--config` after the subcommand.
-`--job-id` is an alias for `--job`:
+Global flags such as `--connection`, `--job`, and `--compact` go **before** the
+subcommand. `--job-id` is an alias for `--job`:
 
 ```bash
-cortex-training --config config.json list
+cortex-training --connection training list
 cortex-training --job JOB_ID step
 cortex-training checkpoints JOB_ID
 ```
@@ -78,14 +77,13 @@ require the global `--job JOB_ID` option. Their `--help` usage lines show its
 placement. Management commands such as `get` and `checkpoints` instead take a
 positional `JOB_ID` after the subcommand.
 
-### [Connection](#legacy-connection-config)
+### [Connection](#connect-with-a-profile)
 
 ```bash
-cortex-training --connection training list    # Use a Snowflake profile
-cortex-training list                          # Use the configured default profile
-cortex-training login config.json             # Remember config for future commands
-cortex-training login --config config.json    # Equivalent login syntax
-cortex-training --config config.json list     # Use config for one command
+cortex-training login                         # Set up or check the profile to use
+cortex-training login training                # Use or create the profile "training"
+cortex-training list                          # Use the profile login saved
+cortex-training --connection training list    # Use another profile for one command
 ```
 
 ### [Submit Jobs](#submit-a-job)
@@ -191,7 +189,7 @@ cortex-training fwd-bwd --help
 
 ## Detailed Reference
 
-- [Connection config](#legacy-connection-config), [login](#legacy-login), and [environment variables](#environment-variables)
+- [Connect with a profile](#connect-with-a-profile), [login](#login), and [environment variables](#environment-variables)
 - [Submit](#submit-a-job), [manage jobs](#manage-existing-jobs), [available models](#list-available-models), and [GPU capacity](#show-current-gpu-capacity)
 - [Forward-backward and optimizer steps](#run-a-forward-backward-smoke-test)
 - [Load checkpoints](#load-a-checkpoint-into-a-running-job) and [initialize sampling](#start-sampling-from-a-training-checkpoint)
@@ -199,13 +197,16 @@ cortex-training fwd-bwd --help
 - [Download logs](#download-execution-logs), [stdout](#download-persisted-stdout), and [metrics](#download-metrics)
 - [Job TUI](#job-tui), [JSON output and help](#json-output-and-help), and [troubleshooting](#troubleshooting)
 
+### Connect With A Profile
+
 `cortex-training` submits and manages Cortex Training jobs through the Cortex
-Training REST endpoint.
-The Snowflake-native workflow uses the same connection profiles as the Python
+Training REST endpoint. It connects with the same connection profiles as the
+Python Connector and Snowflake CLI. The easiest way to set one up is
+`cortex-training login` (see [Login](#login)). The Snowflake-native workflow uses the same connection profiles as the Python
 Connector and Snowflake CLI:
 
 ```toml
-# ~/.snowflake/connections.toml
+# connections.toml in your Snowflake folder, usually ~/.snowflake/
 [training]
 account = "ORG-ACCOUNT"
 host = "ACCOUNT.snowflakecomputing.com"
@@ -223,20 +224,37 @@ chmod 600 ~/.snowflake/connections.toml
 cortex-training --connection training list
 ```
 
-`cortex-training list` with no connection arguments uses the
-Connector-configured default profile. Set
-`SNOWFLAKE_DEFAULT_CONNECTION_NAME=training`, configure
-`default_connection_name = "training"` in Snowflake's `config.toml`, or name
-the connection `[default]`.
+`cortex-training list` with no connection arguments uses the profile
+`cortex-training login` saved, else the Connector-configured default profile
+(`SNOWFLAKE_DEFAULT_CONNECTION_NAME`, `default_connection_name` in Snowflake's
+`config.toml`, or a profile named `[default]`). The database is `--database`,
+else `CORTEX_TRAINING_DATABASE`, else the profile's, else `CORTEX_TRAINING_DB`;
+the schema follows the same order and defaults to `PUBLIC`.
 
-Profile lookup is a fallback. An explicit or remembered legacy JSON config, or
-a complete direct `--base-url` / `--host` + `--pat` connection, continues to
-win. This preserves existing scripts.
+**Changed:** a profile with no `database` used to be an error ("must set
+database"). It now uses `CORTEX_TRAINING_DB`. Set `database` in the profile, or
+pass `--database`, to use another.
 
-### Legacy Connection Config
+In a terminal, a command prints one line on stderr naming the profile,
+database, and schema, and where each came from, unless it's the profile
+`cortex-training login` saved with its own database and schema:
 
-For Snowflake PAT auth, use `host` for the account hostname. Do not use
-`base_url` for Snowflake PAT auth.
+```text
+→ profile train (from --connection) · database CORTEX_TRAINING_DB (default) · schema PUBLIC (default)
+```
+
+Scripts and CI (stderr not a terminal) never get this line.
+
+### Older Connection Methods
+
+Use a connection profile (above) for new setups. The older methods below still
+work, as a fallback if the profile setup doesn't work for you, and each prints a
+warning: they will be deprecated in a future release. To move an old JSON config
+to a profile, run `cortex-training login --convert-legacy-config PATH` (see
+[Login](#login)).
+
+**A JSON config file** holds the connection. For Snowflake PAT auth, use `host`
+for the account hostname, not `base_url`:
 
 ```json
 {
@@ -251,8 +269,20 @@ For Snowflake PAT auth, use `host` for the account hostname. Do not use
 }
 ```
 
-If you prefer not to store the PAT in the file, omit `pat` and set it in the
-shell instead:
+Use it for one command with `--config`, for every command with
+`CORTEX_TRAINING_CONFIG`, remember it with `cortex-training login config.json`
+(or `login --config config.json`, saved in `login.json`), or pass it to a recipe
+as `config=`:
+
+```bash
+cortex-training --config config.json list
+export CORTEX_TRAINING_CONFIG=/path/to/config.json
+python -m recipes.sft_quickstart.conversational.train config=config.json
+cortex-training tui JOB_ID --config config.json
+```
+
+Explicit CLI flags override config values. If you prefer not to store the PAT
+in the file, omit `pat` and set it in the shell instead:
 
 ```bash
 export CORTEX_TRAINING_PAT='YOUR_PROGRAMMATIC_ACCESS_TOKEN'
@@ -270,37 +300,146 @@ account, use `base_url` with an explicit scheme. This skips PAT auth:
 }
 ```
 
-### Legacy Login
-
-Login validates the config and stores only the config path, not the config
-contents:
+**Flags and variables.** `--host` and `--pat` (with `--database`, `--schema`
+and `--endpoint`) connect without a profile or file:
 
 ```bash
-cortex-training login config.json
-cortex-training login --config config.json
+cortex-training tui JOB_ID --host ACCOUNT.snowflakecomputing.com --pat YOUR_PAT \
+  --database CORTEX_TRAINING_DB --schema PUBLIC --endpoint cortex-training
 ```
 
-Provide exactly one config path, either positionally or with `--config` after
-`login`. Both forms validate and remember the same file. Login requires an
-explicit path even when a global `--config`, `CORTEX_TRAINING_CONFIG`, or a
-previous login is available.
-
-The login state is written to `~/.config/cortex-training/login.json` by default,
-or `$XDG_CONFIG_HOME/cortex-training/login.json` when `XDG_CONFIG_HOME` is set.
-
-You can bypass login for one command with:
+These variables still work too, each with its replacement:
 
 ```bash
-cortex-training --config config.json list
+CORTEX_TRAINING_CONNECTION          # use --connection, or cortex-training login
+CORTEX_TRAINING_CONFIG              # convert with login --convert-legacy-config
+SNOWFLAKE_HOST                      # use CORTEX_TRAINING_HOST
+SNOWFLAKE_PAT                       # use CORTEX_TRAINING_PAT
+SNOWFLAKE_DATABASE                  # use CORTEX_TRAINING_DATABASE
+SNOWFLAKE_SCHEMA                    # use CORTEX_TRAINING_SCHEMA
 ```
 
-or by setting:
+**Which wins.** When one of these is used, it decides the connection as it did
+before, so existing scripts keep working. `CORTEX_TRAINING_HOST` and
+`CORTEX_TRAINING_PAT` are for CI: when you also have a profile they still win,
+with a warning that the profile will be used instead in a future release.
+`--base-url`, for a local or mock server, doesn't warn. One exception: a profile
+saved by `cortex-training login` wins over `login.json`, as long as that profile
+still exists; the command then says `login.json` is ignored, with the command
+that converts and removes it. `--config` and `CORTEX_TRAINING_CONFIG` still win
+over a saved profile, since you pass them for that command.
+
+### Login
+
+`cortex-training login` sets up the Snowflake connection profile Cortex Training
+uses, and remembers it as `"profile"` in `cortex-training/config.json` in the Snowflake folder (usually `~/.snowflake/`)
+(next to your profiles, so `$SNOWFLAKE_HOME` moves both):
 
 ```bash
-export CORTEX_TRAINING_CONFIG=/path/to/config.json
+cortex-training login            # check the current setup, or pick a profile
+cortex-training login training   # use or create the profile "training"
 ```
 
-Explicit CLI flags override config values.
+1. It first checks your shell for environment variables that would override
+   this setup or change its defaults (such as `CORTEX_TRAINING_CONFIG`,
+   `CORTEX_TRAINING_HOST`, `SNOWFLAKE_PAT`, `SNOWFLAKE_HOME`, or
+   `XDG_CONFIG_HOME`), says what each does, and shows the command that clears
+   it in your shell. Secret values are never shown. It only reads your
+   environment, and it reminds you at the end if an override is still set.
+   If `config.json` already names a profile, login checks it and offers to
+   keep it.
+2. Otherwise it lists your Snowflake connection profiles to pick from, each
+   with a verdict and hints read from its settings (nothing signs in yet): how
+   it signs in (a token or key pair signs in without prompts; browser and MFA
+   sign-ins stop to ask), its database, and its role. A profile without an
+   account or user can't be picked. You can also create one from an account
+   host (a Snowsight URL also works), a user, an optional role, a
+   programmatic access token (typed hidden), a database, and a schema (Enter
+   keeps `PUBLIC`); new profiles default to the name `cortex-training`. Pick a profile on an account where Cortex Training is
+   enabled. Before listing, login offers to check which accounts have it by
+   signing in once to each account (read-only), using only profiles that sign
+   in without prompts; it lists the accounts it would contact and asks first.
+   Each profile then shows whether it connects to Cortex Training on its
+   account (✓), whether the account doesn't have Cortex Training access (✗,
+   can't be picked), or not checked yet (?). A ✓ means the profile connects,
+   not that its role has every privilege an operation needs.
+   After you pick, login signs in and asks Cortex Training right away. If the
+   profile can't sign in, or Cortex Training isn't enabled on its account,
+   login says why and returns to the list before anything is created.
+   A profile you create is saved first, and login asks before signing in to
+   check it. If you say no, login uses it unchecked and says so. If the check
+   fails, login says why and offers to delete the new profile; it never
+   offers to delete a profile it didn't create.
+3. It shows the database Cortex Training will keep jobs and checkpoints in (the
+   profile's) and offers a separate one; `CORTEX_TRAINING_DB` is recommended.
+4. If that database is missing or the role can't access it, login offers
+   another profile with the same account, user, and role whose database works.
+   Otherwise it offers a new profile with the same sign-in and its own database,
+   and creates the database only after showing the SQL and asking.
+5. It checks the result with one more capacity request, then saves the profile
+   name. The name is saved only when a profile passes, or when you chose not
+   to check a new one.
+
+A passing check (`✓ Connected to Cortex Training on this account`) means the
+profile connects to Cortex Training on that account. It doesn't test every
+privilege an operation can need, so login and `--convert-legacy-config` end by
+saying so: if your role lacks one, that operation's error says which.
+
+If your profile file names a profile more than once (for example, a profile
+pasted in twice), Snowflake can't read the file, so no profile in it works.
+Login says which name and lines, shows the fix, and asks first: it saves a copy
+of the file as `connections.toml.bak` (or `config.toml.bak`), keeps the first
+profile of each name, and renames the others `NAME-duplicate-1`,
+`NAME-duplicate-2`, and so on. Nothing else in the file changes, and login then
+carries on. Other commands say the same thing and point to `cortex-training
+login`.
+
+Login never changes an existing profile, except to rename a duplicated one as
+above, after asking. New profiles go to the file the
+Snowflake Connector reads: `connections.toml`, or `config.toml` when your
+profiles live there. Prompts and progress go to stderr, in color in a terminal
+(set `NO_COLOR` to turn color off); a JSON summary goes to stdout only when it
+is piped. Login needs a terminal; in CI, set `CORTEX_TRAINING_HOST` and
+`CORTEX_TRAINING_PAT` instead.
+
+To turn an old JSON config into a Snowflake connection profile (see
+[Older Connection Methods](#older-connection-methods)):
+
+```bash
+cortex-training login --convert-legacy-config PATH
+```
+
+It reads the file's `host`, `pat`, `database`, and `schema` (also inside a
+`"connection"` object, and spelled `db`). A value the file leaves out comes from
+where the old CLI looked next: `CORTEX_TRAINING_HOST`, `CORTEX_TRAINING_PAT`,
+`CORTEX_TRAINING_DATABASE`, or `CORTEX_TRAINING_SCHEMA`, then the matching
+`SNOWFLAKE_*` variable, then the defaults (`CORTEX_TRAINING_DB`, `PUBLIC`). It
+shows where each value came from. Database and schema names must be Snowflake
+identifiers. It asks before signing in with the PAT to look up its user and
+role, to check that Cortex Training answers for the account, and to check the database. It
+creates a missing database only after showing the SQL and asking. Then it shows
+every change and asks once (`[Y/n]`). The old file is never deleted or edited:
+
+- it adds a profile with `authenticator = "PROGRAMMATIC_ACCESS_TOKEN"`. The
+  profile is named `cortex-training`, or the next free name (an existing
+  profile is never replaced). Its host is kept as written, and its account is
+  the host's first part;
+- it saves the profile name in `config.json`, which holds only the profile. The
+  file's `endpoint`, `poll_interval`, `poll_timeout`, and `verify_ssl` (or
+  `no_verify_ssl`) aren't kept: it lists any that differ from the defaults,
+  with the flags that set them (`--endpoint`, `--poll-interval`,
+  `--poll-timeout`, `--no-verify-ssl`);
+- it signs in with the new profile, as commands will.
+
+Either every change happens, or every file is put back as it was. `PATH` and
+`login.json` are left exactly as they were. A saved profile is used ahead of
+`login.json`, but `--config PATH`, `CORTEX_TRAINING_CONFIG`, and a recipe's
+`config=PATH` still win over the profile (with a deprecation warning), so pass
+one to use the old file again. To stop using the profile, remove `"profile"`
+from `config.json`; the command prints the paths when it finishes. If a check
+fails, or there's no `pat` in the file or the environment, or the file has a
+`base_url` instead of a `host`, or the file is the new `config.json` itself, it
+says why and changes nothing. It needs a terminal, and takes no profile name.
 
 ### Manage Existing Jobs
 
@@ -321,16 +460,24 @@ cortex-training wait JOB_ID
 | Flag | Takes | Notes |
 |---|---|---|
 | `--all` | nothing | lists jobs across every schema in the account that you can see, not just the configured one |
-| `--status` | comma list of `pending`, `placing`, `initializing`, `running`, `failed`, `cancelled`, `terminated`, `active`, `done` | `active` is `pending` through `running`; `done` is `cancelled`, `terminated`, and the `done` that older jobs show; `pending` does not include `placing`. Matched against a row's status in any form the server sends, including `JOB_STATE_RUNNING` and aliases such as `canceled`, `completed`, `succeeded`, `error`, `queued`, `creating` |
+| `--status` | comma list of `pending`, `placing`, `initializing`, `running`, `failed`, `cancelled`, `terminated`, `active`, `done` | `active` is `pending` through `running`; `done` is `cancelled`, `terminated`, and the `done` that older jobs show (with `--all`, `cancelled` and `terminated` only: the account-level route has no `done`); `pending` does not include `placing`. Matched against a row's status in any form the server sends, including `JOB_STATE_RUNNING` and aliases such as `canceled`, `completed`, `succeeded`, `error`, `queued`, `creating` |
 | `--user` | user name | SQL name rules: unquoted means its uppercase form, `"quoted"` means exactly that name |
 | `--since` | `YYYY-MM-DD` | a UTC day; keeps jobs created on or after it |
 | `--until` | `YYYY-MM-DD` | a UTC day; keeps jobs created on or before it, so `--since D --until D` means "on day D" |
 | `--limit` | number | prints at most this many of the newest matching jobs by `created_at`; a job listed without one counts as oldest |
 
-Without `--all`, the CLI fetches the configured schema's jobs and applies the
-filters itself, leaving out a job with no `created_at` when `--since` or
-`--until` is set. With `--all`, the server applies them across the account
-([REST API reference section 5.3](rest-api.md#across-the-account---get-apiv2endpoint));
+Without `--all`, the CLI applies the filters itself. When every status
+`--status` names is active (`pending`, `placing`, `initializing`, `running`, or
+`active`), it reads only those statuses from the configured schema, one request
+each ([REST API reference section 5.3](rest-api.md#53-list-jobs---get-)).
+A service that supports it answers those from the jobs in that status alone; one
+that doesn't still reads every job in the schema, and returns only the matching
+rows. For any other status, or none, the CLI fetches every job in the schema.
+Either way it leaves out a job with no `created_at` when `--since` or `--until`
+is set. With `--all`, the server applies them across the account
+([REST API reference section 5.3](rest-api.md#across-the-account---get-apiv2endpoint)),
+and the CLI checks each row's status again, so an answer wider than `--status`
+(a `pending` that includes `placing`, say) still prints only what it names;
 where account-level listing is not enabled for the account, the command fails
 with `account-level job listing is not enabled for this account`. A bad
 `--status`, `--since`, `--until`, or `--limit`, or an empty `--user`, exits
@@ -981,25 +1128,15 @@ cortex-training tui                 # opens the job list of the configured datab
 cortex-training tui JOB_ID          # opens that job's dashboard directly
 ```
 
-Without login state, pass connection details the same way as the CLI:
+The TUI connects the same way as the CLI: the profile `cortex-training login`
+saved, or another one with `--connection`:
 
 ```bash
 cortex-training tui JOB_ID --connection training
-cortex-training tui JOB_ID --config config.json
-cortex-training tui JOB_ID --host ACCOUNT.snowflakecomputing.com --pat YOUR_PAT \
-  --database CORTEX_TRAINING_DB --schema PUBLIC --endpoint cortex-training
 cortex-training tui JOB_ID --base-url http://localhost:8084   # local/mock
 ```
 
-Keep the PAT out of your shell history by exporting it instead (omit `JOB_ID`
-to open the job list):
-
-```bash
-export CORTEX_TRAINING_PAT='YOUR_PROGRAMMATIC_ACCESS_TOKEN'
-cortex-training tui \
-  --host ACCOUNT.snowflakecomputing.com \
-  --database CORTEX_TRAINING_DB --schema PUBLIC
-```
+The [older connection methods](#older-connection-methods) work with the TUI too.
 
 No command, the TUI included, creates the configured database or schema; when
 the service answers that they are not found, the command stops with an error
@@ -1922,20 +2059,16 @@ usage: cortex-training --job JOB_ID fwd-bwd [-h] json_file
 Connection values can also come from:
 
 ```bash
-CORTEX_TRAINING_CONNECTION
-SNOWFLAKE_DEFAULT_CONNECTION_NAME
-CORTEX_TRAINING_CONFIG
-CORTEX_TRAINING_BASE_URL
-CORTEX_TRAINING_HOST
-SNOWFLAKE_HOST
-CORTEX_TRAINING_PAT
-SNOWFLAKE_PAT
+SNOWFLAKE_DEFAULT_CONNECTION_NAME   # Snowflake's default profile
 CORTEX_TRAINING_DATABASE
-SNOWFLAKE_DATABASE
 CORTEX_TRAINING_SCHEMA
-SNOWFLAKE_SCHEMA
+CORTEX_TRAINING_HOST                # CI, with no profile
+CORTEX_TRAINING_PAT                 # CI, with no profile
 CORTEX_TRAINING_ENDPOINT
+CORTEX_TRAINING_BASE_URL            # local or mock server
 ```
+
+Older variables also still work; see [Older Connection Methods](#older-connection-methods).
 
 `CORTEX_TRAINING_DISABLE_LOCAL_TRAINING_METRICS` (truthy) stops the client
 copying each `/fwd-bwd` and `/step` result to the local training-metrics file
@@ -1949,7 +2082,8 @@ and every successful call `cortex-training tui` makes. Each metric names the
 program that made the call in `client.surface`: `cli` for these commands, `tui`
 for the TUI, `sdk` for Python code. `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY`
 set truthy also emits successful outcomes for every other essential operation;
-set falsy, it emits failures only, the TUI's included. See the [Python SDK reference](python-sdk.md#client-metrics).
+set falsy, it emits failures only, the TUI's included. Every call is counted
+either way, and the counts are exported about every 30 seconds. See the [Python SDK reference](python-sdk.md#client-metrics).
 
 `NO_COLOR` (not empty) draws `cortex-training tui` in gray unless it is started
 with `--color always`; `COLORTERM`, `TERM` and `TEXTUAL_COLOR_SYSTEM` say how
@@ -1965,14 +2099,14 @@ minimum 16 KiB). Frames larger than that are split into request chunks.
 
 ### Troubleshooting
 
-If you see `provide --base-url for local/mock use, or both --host and --pat`,
-the CLI found a `host` but no PAT. Add `"pat": "..."` to `config.json` or set
-`CORTEX_TRAINING_PAT`.
+If no profile is found, run `cortex-training login` to set one up, or pass
+`--connection NAME`. With no old connection form in use, the CLI uses the
+profile `cortex-training login` saved, then the Snowflake Connector's default
+profile.
 
-If no legacy config or complete direct connection is present, the CLI falls
-back to the Snowflake Connector's configured default. If your profile is not
-named `default`, pass `--connection NAME` or set
-`SNOWFLAKE_DEFAULT_CONNECTION_NAME`.
+If you see `provide --base-url for local/mock use, or both --host and --pat`,
+the CLI found a `host` but no PAT. Set `CORTEX_TRAINING_PAT`, add `"pat": "..."`
+to an old JSON file, or switch to a profile with `cortex-training login`.
 
 If Snowflake rejects your PAT, the CLI keeps the original error and adds next
 steps: `394400 (08001) ... Programmatic access token is invalid` from a
@@ -1987,5 +2121,11 @@ If you see `Invalid URL ... No scheme supplied`, the config is using a bare
 Snowflake hostname as `base_url`. Use `host` for Snowflake PAT auth, or use a
 full local/mock URL such as `http://localhost:8084` for `base_url`.
 
-For server errors, the CLI prints any Snowflake request id and response body
-returned by the service. Include those details when debugging a `500`.
+For server errors, the CLI prints the error with the service's error code and
+message, and any Snowflake request id. A message over 1,000 characters is cut,
+common credential patterns in it are redacted, and the body's other fields are
+not printed. The CLI also prints the raw response body when the error line
+shows no code or message from it: for a body that is not JSON or has neither,
+such as a validation `detail` list, and for errors the client explains in its
+own words, such as a missing database or schema. Include those details when
+debugging a `500`.

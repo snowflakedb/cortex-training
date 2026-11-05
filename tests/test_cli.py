@@ -20,6 +20,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import threading
 import time
 from datetime import date
@@ -40,6 +41,7 @@ class FakeClient:
         self.download_options = None
         self.submitted_body = None
         self.status_filter = None
+        self.list_job_statuses = []  # the status each list_jobs call sent, None for none
         self.cancelled_job_id = None
         self.waited_job_id = None
         self.forward_backward_job_id = None
@@ -97,9 +99,14 @@ class FakeClient:
 
     def list_jobs(self, status=None):
         self.status_filter = status
-        if self.jobs is not None:
+        self.list_job_statuses.append(status)
+        if self.jobs is None:
+            return [{"job_id": "j1", "status": status or "running"}]
+        if status is None:
             return self.jobs
-        return [{"job_id": "j1", "status": status or "running"}]
+        # As the per-schema route filters: one status, its PENDING including PLACING.
+        covered = {"pending": {"pending", "placing"}}.get(status, {status})
+        return [job for job in self.jobs if _status_word(job) in covered]
 
     def list_models(self):
         self.models_requested = True
@@ -457,6 +464,11 @@ def _capacity_with_breakdown(hardware, dimensions):
     }
 
 
+def _status_word(job):
+    word = str(job.get("status") or "").lower().removeprefix("job_state_")
+    return cli._STATUS_ALIASES.get(word, word)
+
+
 def _factory(instances):
     def make_client(_args):
         client = FakeClient()
@@ -728,9 +740,8 @@ def test_list_prints_jobs_with_status_filter():
     )
 
     assert rc == 0
-    # The schema route mishandles comma lists and groups, so the CLI asks it for
-    # every job and filters the rows itself.
-    assert instances[0].status_filter is None
+    # An active status: the schema route filters on it, reading only the jobs in it.
+    assert instances[0].list_job_statuses == ["running"]
     assert json.loads(stdout.getvalue()) == {
         "jobs": [{"job_id": "j1", "status": "running"}],
     }
@@ -784,14 +795,25 @@ def _list_ids(argv, *, jobs=None, account_jobs=()):
 
 
 @pytest.mark.parametrize(
-    ("status", "expected"),
+    ("status", "expected", "requests"),
     [
-        ("pending", {"pending"}),
-        ("placing", {"placing"}),
-        ("active", {"pending", "placing", "initializing", "running"}),
-        ("done", {"cancelled", "terminated"}),
-        (" Running , FAILED ", {"running", "failed"}),
-        ("done,terminated", {"cancelled", "terminated"}),
+        # Every status active: the route filters, one request each. Its PENDING
+        # includes PLACING, which the CLI's pending does not, so its rows are filtered too.
+        ("pending", {"pending"}, ["pending"]),
+        ("placing", {"placing"}, ["pending"]),
+        ("running", {"running"}, ["running"]),
+        ("running,initializing", {"running", "initializing"}, ["initializing", "running"]),
+        (
+            "pending,placing,initializing,running",
+            {"pending", "placing", "initializing", "running"},
+            ["pending", "initializing", "running"],
+        ),
+        ("active", {"pending", "placing", "initializing", "running"}, ["pending", "initializing", "running"]),
+        # Any other status: every job in the schema, filtered here.
+        ("failed", {"failed"}, [None]),
+        (" Running , FAILED ", {"running", "failed"}, [None]),
+        ("cancelled,terminated", {"cancelled", "terminated"}, [None]),
+        ("done", {"cancelled", "terminated"}, [None]),
         (
             "active,failed,done",
             {
@@ -803,14 +825,88 @@ def _list_ids(argv, *, jobs=None, account_jobs=()):
                 "cancelled",
                 "terminated",
             },
+            [None],
         ),
     ],
 )
-def test_list_status_accepts_words_groups_and_comma_lists(status, expected):
+def test_list_status_accepts_words_groups_and_comma_lists(status, expected, requests):
     client, ids = _list_ids(["--status", status], jobs=_STATUS_ROWS)
 
-    assert client.status_filter is None
+    assert client.list_job_statuses == requests
     assert set(ids) == expected
+
+
+def test_list_without_status_reads_every_job_in_the_schema():
+    client, ids = _list_ids([], jobs=_STATUS_ROWS)
+
+    assert client.list_job_statuses == [None]
+    assert set(ids) == {row["job_id"] for row in _STATUS_ROWS}
+
+
+def test_list_of_active_statuses_prints_a_job_two_requests_returned_once():
+    # A job that moved on between two requests is in both answers.
+    class MovingClient(FakeClient):
+        def list_jobs(self, status=None):
+            self.list_job_statuses.append(status)
+            return [{"job_id": "moved", "status": "RUNNING"}, {"job_id": status, "status": status}]
+
+    client = MovingClient()
+    stdout = io.StringIO()
+
+    assert cli.main(_base_args() + ["list", "--status", "initializing,running"],
+                    client_factory=lambda _args: client, stdout=stdout) == 0
+
+    assert client.list_job_statuses == ["initializing", "running"]
+    assert sorted(job["job_id"] for job in json.loads(stdout.getvalue())["jobs"]) == [
+        "initializing", "moved", "running"]
+
+
+class _MovingJobClient(FakeClient):
+    """A schema with one job that moves to the next of ``states`` after each request,
+    filtered as the route filters: its pending includes placing."""
+
+    def __init__(self, states):
+        super().__init__()
+        self.states = list(states)
+
+    def list_jobs(self, status=None):
+        self.list_job_statuses.append(status)
+        now = self.states[0]
+        if len(self.states) > 1:
+            self.states.pop(0)
+        covered = {"pending": {"pending", "placing"}}.get(status, {status})
+        return [{"job_id": "moving", "status": now.upper()}] if now in covered else []
+
+
+@pytest.mark.parametrize(
+    ("status", "states", "requests", "printed"),
+    [
+        # Pending at the first request, initializing from the second on: asked in a
+        # job's own order, a later request still finds it.
+        ("active", ["pending", "initializing"], ["pending", "initializing", "running"], "INITIALIZING"),
+        # Pending at the first request, running at the second: the later copy is
+        # the one filtered, so the job is kept as running.
+        ("placing,running", ["pending", "running"], ["pending", "running"], "RUNNING"),
+    ],
+)
+def test_list_of_active_statuses_follows_a_job_that_moves_between_requests(status, states, requests, printed):
+    client = _MovingJobClient(states)
+    stdout = io.StringIO()
+
+    assert cli.main(_base_args() + ["list", "--status", status],
+                    client_factory=lambda _args: client, stdout=stdout) == 0
+
+    assert client.list_job_statuses == requests
+    assert json.loads(stdout.getvalue())["jobs"] == [{"job_id": "moving", "status": printed}]
+
+
+def test_list_of_an_active_status_still_applies_the_other_filters():
+    rows = [{**row, "status": "RUNNING"} for row in _SUBMITTED_ROWS]
+
+    client, ids = _list_ids(["--status", "running", "--user", "JDOE"], jobs=rows)
+
+    assert client.list_job_statuses == ["running"]
+    assert ids == ["upper"]  # unquoted JDOE is JDOE exactly
 
 
 @pytest.mark.parametrize("scope", [[], ["--all"]])
@@ -1076,6 +1172,44 @@ def test_list_all_sends_every_filter_to_the_server():
         "page_size": 100,
     }
     assert ids == ["a", "b"]
+
+
+def test_list_all_prints_only_the_statuses_asked_for_from_a_wider_answer():
+    # A server whose pending takes in placing, as the schema route's does.
+    rows = [
+        {"job_id": "placing", "status": "PLACING", "created_at": "2026-10-01T02:00:00Z"},
+        {"job_id": "pending", "status": "PENDING", "created_at": "2026-10-01T01:00:00Z"},
+    ]
+
+    client, ids = _list_ids(["--all", "--status", "pending"], account_jobs=rows)
+
+    assert client.iter_jobs_filters["status"] == "pending"
+    assert ids == ["pending"]
+
+
+def test_list_all_asks_the_account_route_for_done_by_its_words():
+    # The account route has no done: it takes cancelled and terminated.
+    rows = [
+        {"job_id": "cancelled", "status": "CANCELLED", "created_at": "2026-10-01T02:00:00Z"},
+        {"job_id": "terminated", "status": "TERMINATED", "created_at": "2026-10-01T01:00:00Z"},
+    ]
+
+    client, ids = _list_ids(["--all", "--status", "done,failed"], account_jobs=rows)
+
+    assert client.iter_jobs_filters["status"] == "cancelled,terminated,failed"
+    assert ids == ["terminated", "cancelled"]
+
+
+def test_list_all_limit_counts_only_the_rows_it_prints():
+    rows = [
+        {"job_id": "placing", "status": "PLACING", "created_at": "2026-10-01T02:00:00Z"},
+        {"job_id": "pending", "status": "PENDING", "created_at": "2026-10-01T01:00:00Z"},
+    ]
+
+    client, ids = _list_ids(["--all", "--status", "pending", "--limit", "1"], account_jobs=rows)
+
+    assert ids == ["pending"]
+    assert client.account_jobs_pulled == 2  # read past the row it dropped
 
 
 def test_list_all_limit_stops_reading_after_the_newest_jobs():
@@ -3251,6 +3385,184 @@ def test_a_schema_not_found_error_shows_the_server_message_once():
     assert err.count(message) == 1
 
 
+_CROSS_REGION_MESSAGE = (
+    "Cortex Training runs in AWS US West (Oregon). To use it from this account's region, "
+    "set the account parameter CORTEX_ENABLED_CROSS_REGION to AWS_US, AWS_GLOBAL or ANY_REGION."
+)
+
+
+def _refusing_client(
+    content: bytes,
+    content_type: str = "application/json",
+    *,
+    status_code: int = 403,
+    reason: str = "Forbidden",
+    request_headers: dict[str, str] | None = None,
+):
+    """A client whose every GET the service refuses with ``status_code`` and ``content``."""
+    import requests
+
+    from cortex_training import CortexTrainingClient
+
+    client = CortexTrainingClient(
+        base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="PUBLIC", max_retries=0
+    )
+    response = requests.Response()
+    response.status_code = status_code
+    response.reason = reason
+    response.url = f"{client._prefix}/job-1"
+    response.headers["Content-Type"] = content_type
+    response.headers["x-snowflake-request-id"] = "sf-req-1"
+    response._content = content
+    response._content_consumed = True
+    if request_headers is not None:
+        response.request = requests.Request("GET", response.url, headers=request_headers).prepare()
+    client._session = MagicMock()
+    client._session.get.return_value = response
+    return client
+
+
+def _get_output(client) -> tuple[int, str]:
+    """The exit code and the whole output, stdout then stderr, of ``get job-1`` on ``client``."""
+    stdout, stderr = io.StringIO(), io.StringIO()
+    rc = cli.main(["get", "job-1"], client_factory=lambda _args: client, stdout=stdout, stderr=stderr)
+    return rc, stdout.getvalue() + stderr.getvalue()
+
+
+def test_an_http_error_shows_the_server_message_once():
+    body = {"code": "517600", "message": _CROSS_REGION_MESSAGE, "request_id": "sf-req-1", "error_code": "517600"}
+    client = _refusing_client(json.dumps(body).encode())
+    stderr = io.StringIO()
+
+    rc = cli.main(["get", "job-1"], client_factory=lambda _args: client, stderr=stderr)
+
+    assert rc == 1
+    assert stderr.getvalue() == (
+        "error: [snowflake request id: sf-req-1] 403 Client Error: Forbidden for url: "
+        f"{client._prefix}/job-1 (517600): {_CROSS_REGION_MESSAGE}\n"
+    )
+
+
+_PLAIN_ERROR_BODY = {
+    "code": "517600",
+    "message": _CROSS_REGION_MESSAGE,
+    "request_id": "sf-req-1",
+    "error_code": "517600",
+}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(_PLAIN_ERROR_BODY, id="code-message-request-id"),
+        pytest.param({**_PLAIN_ERROR_BODY, "sqlState": "42501"}, id="one-more-field"),
+        pytest.param({**_PLAIN_ERROR_BODY, "details": {"field": "x"}}, id="a-details-object"),
+        pytest.param({"error": {"code": "517600", "message": _CROSS_REGION_MESSAGE}}, id="nested-under-error"),
+        pytest.param({**_PLAIN_ERROR_BODY, "request_id": "sf-other"}, id="another-request-id"),
+    ],
+)
+def test_an_http_error_shows_the_server_message_once_and_not_its_body(body):
+    rc, output = _get_output(_refusing_client(json.dumps(body).encode()))
+
+    assert rc == 1
+    assert output.count(_CROSS_REGION_MESSAGE) == 1
+    assert "response body:" not in output
+
+
+def test_an_http_error_shows_a_long_message_once_cut_to_1000_characters():
+    message = _CROSS_REGION_MESSAGE + " Details:" + " the rest of the message" * 50
+    rc, output = _get_output(_refusing_client(json.dumps({"code": "517604", "message": message}).encode()))
+
+    assert rc == 1
+    assert output.count(message[:1000] + "...") == 1
+    assert message not in output
+    assert "response body:" not in output
+
+
+def test_an_http_error_shows_a_message_once_with_its_credential_redacted():
+    body = {"code": "517604", "message": "token=abc123 was rejected"}
+    rc, output = _get_output(_refusing_client(json.dumps(body).encode()))
+
+    assert rc == 1
+    assert output.count("token=<redacted> was rejected") == 1
+    assert "abc123" not in output
+
+
+def test_an_http_error_with_a_code_and_no_message_leaves_out_the_rest_of_its_body():
+    body = {"code": "517602", "detail": [{"loc": ["body", "hardware"], "msg": "unsupported value"}]}
+    client = _refusing_client(json.dumps(body).encode())
+
+    rc, output = _get_output(client)
+
+    assert rc == 1
+    assert output == (
+        "error: [snowflake request id: sf-req-1] 403 Client Error: Forbidden for url: "
+        f"{client._prefix}/job-1 (517602)\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("content", "content_type"),
+    [
+        pytest.param(b"<html><body>Forbidden</body></html>", "text/html", id="not-json"),
+        pytest.param(b'{"detail": [{"loc": ["body"], "msg": "bad"}]}', "application/json", id="a-detail-list"),
+        pytest.param(b"{}", "application/json", id="an-empty-object"),
+    ],
+)
+def test_an_http_error_prints_a_body_with_no_code_or_message(content, content_type):
+    rc, output = _get_output(_refusing_client(content, content_type))
+
+    assert rc == 1
+    assert output.endswith(f"\nresponse body: {content.decode()}\n")
+    assert output.count(content.decode()) == 1
+
+
+def test_an_http_error_with_an_empty_body_prints_no_body_line():
+    client = _refusing_client(b"")
+
+    rc, output = _get_output(client)
+
+    assert rc == 1
+    assert output == (
+        f"error: [snowflake request id: sf-req-1] 403 Client Error: Forbidden for url: {client._prefix}/job-1\n"
+    )
+
+
+def test_a_redirect_prints_its_body_so_the_server_message_shows_once():
+    body = {"code": "517604", "message": "the job moved"}
+    rc, output = _get_output(_refusing_client(json.dumps(body).encode(), status_code=302, reason="Found"))
+
+    assert rc == 1
+    assert output.count("the job moved") == 1
+    assert output.endswith(f"\nresponse body: {json.dumps(body)}\n")
+
+
+def test_a_rejected_pat_shows_the_server_message_once_and_the_hint():
+    body = {"code": "390303", "message": "Invalid OAuth access token."}
+    client = _refusing_client(
+        json.dumps(body).encode(), status_code=401, reason="Unauthorized", request_headers=_PAT_HEADERS
+    )
+
+    rc, output = _get_output(client)
+
+    assert rc == 1
+    assert output.count("Invalid OAuth access token.") == 1
+    assert "response body:" not in output
+    assert "Snowflake rejected your credentials (HTTP 401)." in output
+
+
+def test_an_http_error_prints_a_body_the_client_cannot_parse(caplog):
+    # A string nested deeper than the JSON decoder recurses.
+    content = json.dumps({"detail": "[" * 100_000}).encode()
+
+    with caplog.at_level("DEBUG", logger=cli.logger.name):
+        rc, output = _get_output(_refusing_client(content))
+
+    assert rc == 1
+    assert output.endswith(f"\nresponse body: {content.decode()[:4000]}...<truncated>\n")
+    assert "could not read the service's error from the response body" in caplog.text
+
+
 def test_invalid_job_json_returns_error(tmp_path):
     path = tmp_path / "job.json"
     path.write_text("[]", encoding="utf-8")
@@ -3430,24 +3742,23 @@ def test_invalid_config_value_type_returns_error(tmp_path):
 
 
 @pytest.mark.parametrize("config_flags", [[], ["--config"]])
-def test_login_persists_config_path(tmp_path, monkeypatch, config_flags):
+def test_the_old_login_form_still_saves_the_config_with_a_warning(tmp_path, monkeypatch, config_flags):
     login_state = tmp_path / "login.json"
     config = _write_config(
         tmp_path,
         {"base_url": "http://login.local", "database": "LOGIN_DB"},
     )
     monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
-    stdout = io.StringIO()
+    stdout, stderr = io.StringIO(), io.StringIO()
 
-    rc = cli.main(["login"] + config_flags + [str(config)], stdout=stdout)
+    rc = cli.main(["login"] + config_flags + [str(config)], stdout=stdout, stderr=stderr)
 
     assert rc == 0
-    saved = json.loads(login_state.read_text(encoding="utf-8"))
-    assert saved == {"config_path": str(config.resolve())}
-    assert json.loads(stdout.getvalue()) == {
-        "config_path": str(config.resolve()),
-        "logged_in": True,
-    }
+    assert json.loads(login_state.read_text())["config_path"] == str(config.resolve())
+    assert json.loads(stdout.getvalue()) == {"config_path": str(config.resolve()), "logged_in": True}
+    warning = stderr.getvalue()
+    assert "will be deprecated in a future release." in warning
+    assert f"cortex-training login --convert-legacy-config {config}" in warning
 
 
 def test_logged_in_config_is_used_without_config_arg(tmp_path, monkeypatch):
@@ -3519,20 +3830,6 @@ def test_direct_connection_flags_do_not_read_login_state(tmp_path, monkeypatch):
     )
 
     assert rc == 0
-
-
-@pytest.mark.parametrize("config_flags", [[], ["--config"]])
-def test_login_rejects_invalid_config(tmp_path, monkeypatch, config_flags):
-    login_state = tmp_path / "login.json"
-    config = _write_config(tmp_path, {"typo": "value"})
-    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
-    stderr = io.StringIO()
-
-    rc = cli.main(["login"] + config_flags + [str(config)], stderr=stderr)
-
-    assert rc == 1
-    assert not login_state.exists()
-    assert "unknown config key" in stderr.getvalue()
 
 
 def test_no_legacy_config_falls_back_to_default_snowflake_profile(
@@ -3672,25 +3969,29 @@ def test_named_connection_conflicts_with_direct_flags():
     assert "--connection cannot be combined" in stderr.getvalue()
 
 
+def _write_profiles(*names: str) -> None:
+    """Write minimal profiles to the temporary Snowflake folder (see conftest)."""
+    text = "".join(f'[{name}]\naccount = "ACME"\nuser = "ME"\n' for name in names)
+    (Path(os.environ["SNOWFLAKE_HOME"]) / "connections.toml").write_text(text)
+
+
 def test_build_client_uses_named_snowflake_connection(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "missing.json")
     )
+    _write_profiles("training-profile")
     args = cli.parse_args(["--connection", "training-profile", "list"])
     client_cls = MagicMock()
     connected = object()
-    client_cls._from_profile.return_value = connected
+    client_cls._from_resolution.return_value = connected
 
+    # A profile command connects through the picker, as from_configs() does.
     assert cli.build_client(args, client_cls) is connected
-    client_cls._from_profile.assert_called_once_with(
-        connection_name="training-profile",
-        database=None,
-        schema=None,
-        endpoint="cortex-training",
-        poll_interval=0.5,
-        poll_timeout=1800.0,
-        verify_ssl=True,
+    client_cls._from_resolution.assert_called_once_with(
+        args.resolution, verify_ssl=True, endpoint="cortex-training", poll_interval=0.5, poll_timeout=1800.0
     )
+    assert args.resolution.profile == "training-profile"
+    assert args.resolution.sources["profile"] == "passed in"
 
 
 def test_build_client_forwards_read_bounds_only_when_set(tmp_path, monkeypatch):
@@ -3699,12 +4000,13 @@ def test_build_client_forwards_read_bounds_only_when_set(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "missing.json")
     )
+    _write_profiles("training-profile")
     args = cli.parse_args(["--connection", "training-profile", "list"])
     args.max_retries, args.request_timeout = 2, (10.0, 45.0)
     client_cls = MagicMock()
 
     cli.build_client(args, client_cls)
-    kwargs = client_cls._from_profile.call_args.kwargs
+    kwargs = client_cls._from_resolution.call_args.kwargs
     assert (kwargs["max_retries"], kwargs["request_timeout"]) == (2, (10.0, 45.0))
 
 
@@ -3880,3 +4182,238 @@ def test_download_lock_paths_are_resolved(tmp_path, monkeypatch):
     root.release()
     with cli._output_dir_lock(Path("/")):
         pass
+
+
+# ─── Both ways work; the old ones warn (release 1) ──────────────────────────
+
+
+def _connect(argv, monkeypatch, **env):
+    """Run `list` with a fake client; return what it connected with and its stderr."""
+    for name in ("CORTEX_TRAINING_CONFIG", "CORTEX_TRAINING_CONNECTION", "CORTEX_TRAINING_HOST", "CORTEX_TRAINING_PAT",
+                 "CORTEX_TRAINING_DATABASE", "CORTEX_TRAINING_SCHEMA", "SNOWFLAKE_HOST", "SNOWFLAKE_PAT",
+                 "SNOWFLAKE_DATABASE", "SNOWFLAKE_SCHEMA", "CORTEX_TRAINING_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(Path(os.environ["SNOWFLAKE_HOME"]) / "no-login.json"))
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    seen = {}
+    stderr = io.StringIO()
+    rc = cli.main(argv + ["list"], client_factory=lambda args: seen.update(vars(args)) or FakeClient(),
+                  stdout=io.StringIO(), stderr=stderr)
+    return rc, seen, stderr.getvalue()
+
+
+def _save_choice(profile):
+    path = Path(os.environ["SNOWFLAKE_HOME"]) / "cortex-training" / "config.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"profile": profile}))
+
+
+def test_a_json_config_still_works_and_warns(tmp_path, monkeypatch):
+    config = _write_config(tmp_path, {"host": "acme.snowflakecomputing.com", "pat": "tok", "database": "DB"})
+    rc, seen, err = _connect(["--config", str(config)], monkeypatch)
+    assert rc == 0
+    assert (seen["use_connection_profile"], seen["host"], seen["pat"], seen["database"]) == (False, "acme.snowflakecomputing.com", "tok", "DB")
+    assert f"warning: Signing in with an old JSON config ({config}, from --config) will be deprecated in a future release." in err
+    assert f"`cortex-training login --convert-legacy-config {config}`" in err
+    assert "tok" not in err
+
+
+def test_cortex_training_config_and_login_json_still_work_and_say_where_from(tmp_path, monkeypatch):
+    config = _write_config(tmp_path, {"host": "acme.snowflakecomputing.com", "pat": "tok", "database": "DB"})
+    _, seen, err = _connect([], monkeypatch, CORTEX_TRAINING_CONFIG=str(config))
+    assert seen["host"] == "acme.snowflakecomputing.com" and "from CORTEX_TRAINING_CONFIG)" in err
+    login_state = tmp_path / "login.json"
+    login_state.write_text(json.dumps({"config_path": str(config)}))
+    monkeypatch.delenv("CORTEX_TRAINING_CONFIG")
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
+    seen.clear()
+    stderr = io.StringIO()
+    cli.main(["list"], client_factory=lambda args: seen.update(vars(args)) or FakeClient(), stdout=io.StringIO(), stderr=stderr)
+    assert seen["host"] == "acme.snowflakecomputing.com" and f"from {login_state})" in stderr.getvalue()
+
+
+def test_host_and_pat_flags_still_work_and_warn(monkeypatch):
+    rc, seen, err = _connect(["--host", "acme.snowflakecomputing.com", "--pat", "tok", "--database", "DB"], monkeypatch)
+    assert rc == 0 and (seen["host"], seen["pat"]) == ("acme.snowflakecomputing.com", "tok")
+    assert "warning: Signing in with --host and --pat will be deprecated" in err
+
+
+def test_snowflake_credentials_still_work_and_warn(monkeypatch):
+    rc, seen, err = _connect([], monkeypatch, SNOWFLAKE_HOST="acme.snowflakecomputing.com", SNOWFLAKE_PAT="tok",
+                             SNOWFLAKE_DATABASE="DB")
+    assert rc == 0 and seen["use_connection_profile"] is False and seen["database"] == "DB"
+    assert "warning: SNOWFLAKE_HOST and SNOWFLAKE_PAT will be deprecated in a future release." in err
+
+
+def test_ci_credentials_warn_only_when_a_profile_exists(monkeypatch):
+    creds = dict(CORTEX_TRAINING_HOST="acme.snowflakecomputing.com", CORTEX_TRAINING_PAT="tok", CORTEX_TRAINING_DATABASE="DB")
+    _, seen, err = _connect([], monkeypatch, **creds)
+    assert seen["host"] == "acme.snowflakecomputing.com" and "warning" not in err
+    _write_profiles("prod")
+    _, seen, err = _connect([], monkeypatch, **creds)
+    assert seen["host"] == "acme.snowflakecomputing.com"  # still used, as before
+    assert "warning: CORTEX_TRAINING_HOST and CORTEX_TRAINING_PAT are used while you have a Snowflake connection profile." in err
+
+
+def test_without_an_old_form_the_saved_profile_is_used(monkeypatch):
+    _write_profiles("default", "train")
+    _save_choice("train")
+    rc, seen, err = _connect([], monkeypatch)
+    assert rc == 0 and seen["use_connection_profile"] is True and "warning" not in err
+    # The fake client factory skips build_client; the picker's choice is what build_client would use.
+    assert cli._picker_choice(argparse_namespace(seen)).profile == "train"
+
+
+def test_the_target_line_names_the_saved_profile(monkeypatch):
+    # A saved profile with no database of its own: the fallback is worth showing.
+    _write_profiles("default", "train")
+    _save_choice("train")
+    monkeypatch.setattr(cli, "_load_cortex_training_client_class", lambda: _ResolutionClient)
+    _, _, err = _connect_real(monkeypatch, tty=True)
+    assert "→ profile train (saved by cortex-training login) · database CORTEX_TRAINING_DB (default) · schema PUBLIC (default)" in err
+
+
+def test_the_target_line_is_only_for_a_terminal(monkeypatch):
+    _write_profiles("default", "train")
+    _save_choice("train")
+    monkeypatch.setattr(cli, "_load_cortex_training_client_class", lambda: _ResolutionClient)
+    _, _, err = _connect_real(monkeypatch)
+    assert "→" not in err
+
+
+def test_the_target_line_is_left_out_for_a_saved_profile_with_its_own_database(monkeypatch):
+    (Path(os.environ["SNOWFLAKE_HOME"]) / "connections.toml").write_text(
+        '[train]\naccount = "ACME"\nuser = "ME"\ndatabase = "TEAM_DB"\nschema = "RUNS"\n'
+    )
+    _save_choice("train")
+    monkeypatch.setattr(cli, "_load_cortex_training_client_class", lambda: _ResolutionClient)
+    _, _, err = _connect_real(monkeypatch, tty=True)
+    assert "→" not in err
+    # Any other choice is shown: here --connection, though it names the same profile.
+    _, _, err = _connect_real(monkeypatch, tty=True, argv=["--connection", "train"])
+    assert "→ profile train (from --connection) · database TEAM_DB (from profile train) · schema RUNS (from profile train)" in err
+
+
+def test_a_saved_profile_beats_login_json(tmp_path, monkeypatch):
+    config = _write_config(tmp_path, {"host": "acme.snowflakecomputing.com", "pat": "tok", "database": "DB"})
+    login_state = tmp_path / "login.json"
+    login_state.write_text(json.dumps({"config_path": str(config)}))
+    _write_profiles("default", "train")
+    _save_choice("train")
+    rc, seen, err = _connect([], monkeypatch, CORTEX_TRAINING_LOGIN_FILE=str(login_state))
+    assert rc == 0 and seen["use_connection_profile"] is True and seen["host"] is None
+    assert cli._picker_choice(argparse_namespace(seen)).profile == "train"
+    # Kept on purpose (it is the way back), so scripts and CI logs get no note about it.
+    assert "is ignored because" not in err
+    assert "old JSON config" not in err
+    assert login_state.exists()
+
+
+def test_a_terminal_is_told_how_to_use_login_json_again(tmp_path, monkeypatch):
+    config = _write_config(tmp_path, {"host": "acme.snowflakecomputing.com", "pat": "tok", "database": "DB"})
+    login_state = tmp_path / "login.json"
+    login_state.write_text(json.dumps({"config_path": str(config)}))
+    _write_profiles("default", "train")
+    _save_choice("train")
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
+    for name in ("CORTEX_TRAINING_CONFIG", "CORTEX_TRAINING_HOST", "CORTEX_TRAINING_PAT", "SNOWFLAKE_HOST", "SNOWFLAKE_PAT"):
+        monkeypatch.delenv(name, raising=False)
+
+    class Terminal(io.StringIO):
+        def isatty(self):
+            return True
+
+    stderr = Terminal()
+    rc = cli.main(["list"], client_factory=lambda args: FakeClient(), stdout=io.StringIO(), stderr=stderr)
+    assert rc == 0
+    config_json = Path(os.environ["SNOWFLAKE_HOME"]) / "cortex-training" / "config.json"
+    assert (
+        f"note: {login_state} is ignored because profile train is saved. "
+        f'To use it again, remove "profile" from {config_json}.'
+    ) in stderr.getvalue()
+    # It doesn't send someone who already converted back to convert again.
+    assert "--convert-legacy-config" not in stderr.getvalue()
+
+
+def test_login_json_still_works_when_the_saved_profile_is_gone(tmp_path, monkeypatch):
+    # Only a saved profile that exists replaces the file login.json remembers.
+    config = _write_config(tmp_path, {"host": "acme.snowflakecomputing.com", "pat": "tok", "database": "DB"})
+    login_state = tmp_path / "login.json"
+    login_state.write_text(json.dumps({"config_path": str(config)}))
+    _write_profiles("default", "train")
+    _save_choice("gone")
+    rc, seen, err = _connect([], monkeypatch, CORTEX_TRAINING_LOGIN_FILE=str(login_state))
+    assert rc == 0 and seen["use_connection_profile"] is False and seen["host"] == "acme.snowflakecomputing.com"
+    assert f"Signing in with an old JSON config ({config}, from {login_state}) will be deprecated" in err
+    assert "is ignored because" not in err
+
+
+def test_config_still_beats_a_saved_profile_with_its_warning(tmp_path, monkeypatch):
+    config = _write_config(tmp_path, {"host": "acme.snowflakecomputing.com", "pat": "tok", "database": "DB"})
+    _write_profiles("default", "train")
+    _save_choice("train")
+    for argv, env, source in (([ "--config", str(config)], {}, "--config"), ([], {"CORTEX_TRAINING_CONFIG": str(config)}, "CORTEX_TRAINING_CONFIG")):
+        rc, seen, err = _connect(argv, monkeypatch, **env)
+        assert rc == 0 and seen["use_connection_profile"] is False and seen["host"] == "acme.snowflakecomputing.com"
+        assert f"Signing in with an old JSON config ({config}, from {source}) will be deprecated" in err
+        assert "is ignored because" not in err
+
+
+def test_the_old_login_file_form_says_a_saved_profile_wins(tmp_path, monkeypatch):
+    config = _write_config(tmp_path, {"host": "acme.snowflakecomputing.com", "pat": "tok", "database": "DB"})
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "login.json"))
+    _write_profiles("train")
+    _save_choice("train")
+    stderr = io.StringIO()
+    assert cli.main(["login", str(config)], stdout=io.StringIO(), stderr=stderr) == 0
+    assert f"warning: profile train is saved by `cortex-training login`, so commands use it and ignore {config}." in stderr.getvalue()
+
+
+def test_cortex_training_connection_still_works_and_warns(monkeypatch):
+    _write_profiles("default", "train")
+    rc, seen, err = _connect([], monkeypatch, CORTEX_TRAINING_CONNECTION="train")
+    assert rc == 0 and seen["connection"] == "train"
+    assert "warning: CORTEX_TRAINING_CONNECTION will be deprecated" in err
+
+
+def test_snowflake_database_is_still_honored_with_a_warning(monkeypatch):
+    _write_profiles("default")
+    rc, seen, err = _connect([], monkeypatch, SNOWFLAKE_DATABASE="OLD_DB")
+    assert rc == 0
+    assert "warning: SNOWFLAKE_DATABASE will be deprecated in a future release. Use --database or CORTEX_TRAINING_DATABASE." in err
+    assert cli._picker_choice(argparse_namespace(seen)).database == "OLD_DB"
+
+
+def test_base_url_does_not_warn(monkeypatch):
+    rc, seen, err = _connect(_base_args(), monkeypatch)
+    assert rc == 0 and seen["base_url"] == "http://test.local" and "warning" not in err
+
+
+class _ResolutionClient:
+    """Stands in for CortexTrainingClient: builds from a picker resolution without connecting."""
+
+    @classmethod
+    def _from_resolution(cls, resolution, **kwargs):
+        return FakeClient()
+
+
+class _Terminal(io.StringIO):
+    def isatty(self):
+        return True
+
+
+def _connect_real(monkeypatch, *, tty=False, argv=()):
+    """Run `list` through the real build_client (with _ResolutionClient); return rc, args, stderr."""
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(Path(os.environ["SNOWFLAKE_HOME"]) / "no-login.json"))
+    for name in ("CORTEX_TRAINING_CONNECTION", "CORTEX_TRAINING_DATABASE", "CORTEX_TRAINING_SCHEMA"):
+        monkeypatch.delenv(name, raising=False)
+    stderr = _Terminal() if tty else io.StringIO()
+    rc = cli.main([*argv, "list"], stdout=io.StringIO(), stderr=stderr)
+    return rc, None, stderr.getvalue()
+
+
+def argparse_namespace(values):
+    import argparse
+
+    return argparse.Namespace(**values)

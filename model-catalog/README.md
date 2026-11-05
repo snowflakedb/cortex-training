@@ -111,3 +111,50 @@ context-length claim takes the full-context flags:
 | `--memory-telemetry` | Report peak GPU and CPU memory per step |
 | `--training-sp-size N` | Try a sequence-parallel size before changing a file. Adjusts `train_batch_size` to `n_gpus / N` |
 | `--debug-image-tag TAG` | Use a specific backend build |
+
+## Checkpoint restart suite
+
+Run the same lifecycle checks for any training/inference config pair:
+
+```bash
+python model-catalog/job_lifecycle_suite.py \
+  --training-config /path/to/training.json \
+  --inference-config /path/to/inference.json \
+  --connection-config /path/to/connection.json --submit
+```
+
+Without `--submit`, this prints the derived RL request without allocating GPUs.
+The suite probes sampling, runs two forward-backward/step pairs, syncs weights,
+probes sampling again, runs two more training steps, and saves resumable and
+weights-only checkpoints. It cancels the original job, creates a restored
+training/sampling job, probes sampling, checks two more steps continue at 5 and
+6, and cancels the restored job.
+
+Training rows use the full configured `max_seq_len` and `train_batch_size`.
+Sampling uses `max_seq_len - 1` prompt tokens and exactly one generated token.
+Every training loss must be finite before its optimizer step.
+
+MoE jobs enable strict router replay, bootstrap it on both jobs, and capture
+fresh full-length rollouts before every training step. Training uses the
+captured tokens, sample IDs, and sampling sub-job metadata. Unused standalone
+sampling captures are discarded. Matching training/sampling context limits
+are required.
+
+The base files are not edited. The derived MoE RL request disables scalar-only
+fused cross-entropy so GRPO can obtain per-token logprobs: with EP > 1 it sets
+`model_options.lm_head.cross_entropy=false` and aligns existing legacy flags;
+with EP1 it uses `prime_rl.fused_cross_entropy=false`.
+
+On success or failure, jobs are stopped before the suite deletes its recorded
+checkpoints and verifies their absence. Checkpoints are retained if a job cannot
+be stopped; cleanup errors fail the run without hiding the original error.
+Reports and failure execution logs are stored under `results/<timestamp>/`;
+`--output-dir` selects a new report directory. `--poll-timeout` overrides the
+operation/startup timeout, and `--weight-sync-bucket-size` sets transfer bucket
+bytes.
+
+Local regression tests create no jobs:
+
+```bash
+python -m pytest tests/test_job_lifecycle.py -q
+```

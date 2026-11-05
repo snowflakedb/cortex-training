@@ -146,8 +146,8 @@ def describe_error(exc: BaseException) -> str:
     """A failed call for display, on one printable line: the HTTP status and the
     service's message, not the URL.
 
-    requests' own text ("500 Server Error: ... for url: <full URL>") repeats the
-    host, database and schema and never includes the service's explanation.
+    An HTTP error's own text ("500 Server Error: ... for url: <full URL>") repeats
+    the host, database and schema.
     """
     response = getattr(exc, "response", None)
     status = getattr(response, "status_code", None)
@@ -189,9 +189,10 @@ _ASK = "ask for access to the Experiment, or use the role that created the job"
 def experiment_access_hint(exc: BaseException) -> str | None:
     """The one-line explanation when ``exc`` means this role can't read the job's Experiment, else None.
 
-    The service's message is in the HTTP reply, not in ``str(exc)``, so both are
-    read. A refusal about another object (a warehouse, a schema) is None even
-    when its message names the Experiment.
+    The HTTP reply holds the service's whole message; ``str(exc)`` holds a refused
+    SQL statement's, and an HTTP error's only when the client added it, cut at
+    1,000 characters. So both are read. A refusal about another object (a
+    warehouse, a schema) is None even when its message names the Experiment.
     """
     text = f"{exc}\n{_reply_text(exc)}"
     if EXPERIMENT_ACCESS_MARKER in text:

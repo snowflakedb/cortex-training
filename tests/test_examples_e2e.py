@@ -1,13 +1,25 @@
 """Run the examples end to end against a live Cortex Training deployment.
 
-Skipped unless CORTEX_TRAINING_E2E_CONFIG names a connection file, the JSON the
-examples take as config= (docs/getting-started/connection.json.template). Each
-case runs one example as its README does, cut to a few steps, and passes when
-it exits cleanly. The DARE-Bench evaluation first builds the setup its README
-describes (a bench checkout, a sandbox venv, and reference predictions), which
-needs network access. These submit real jobs on real GPUs:
+Connects the way a customer does: through the Snowflake connection profile that
+`cortex-training login` saves (in $SNOWFLAKE_HOME, else ~/.snowflake). Examples
+run in a child process that inherits SNOWFLAKE_HOME, so a throwaway folder
+holding one profile works too. Skipped unless you opt in with one of:
 
-    CORTEX_TRAINING_E2E_CONFIG=~/conn.json python -m pytest tests/test_examples_e2e.py -v -s
+- CORTEX_TRAINING_E2E=1: the examples' default connection (the profile saved by
+  `cortex-training login`, else CORTEX_TRAINING_HOST and CORTEX_TRAINING_PAT
+  when no profile exists, as in CI).
+- CORTEX_TRAINING_E2E_CONNECTION=NAME: a named profile, passed to each example
+  as connection=NAME.
+- CORTEX_TRAINING_E2E_CONFIG=FILE: an old JSON connection file, passed as
+  config=FILE. It will be deprecated in a future release. If this and
+  CORTEX_TRAINING_E2E_CONNECTION are both set, the profile is used.
+
+Each case runs one example as its README does, cut to a few steps, and passes
+when it exits cleanly. The DARE-Bench evaluation first builds the setup its
+README describes (a bench checkout, a sandbox venv, and reference predictions),
+which needs network access. These submit real jobs on real GPUs:
+
+    CORTEX_TRAINING_E2E=1 python -m pytest tests/test_examples_e2e.py -v -s
 
 If DEBUG_IMAGE_TAG is set, every example also gets debug_image_tag=<tag>.
 """
@@ -23,8 +35,14 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+CONNECTION = os.environ.get("CORTEX_TRAINING_E2E_CONNECTION")
 CONFIG = os.environ.get("CORTEX_TRAINING_E2E_CONFIG")
+USE_DEFAULT = os.environ.get("CORTEX_TRAINING_E2E", "").lower() in ("1", "true", "yes")
 DEBUG_IMAGE_TAG = os.environ.get("DEBUG_IMAGE_TAG")
+# The environment the run started with, read at import, before any fixture runs.
+# conftest points SNOWFLAKE_HOME at an empty folder for every test, so the
+# examples get this one instead and find the profiles a customer would.
+RUN_ENV = dict(os.environ)
 # Per example. CI runs all of them within a fixed total budget.
 TIMEOUT_SECONDS = 3600
 
@@ -71,9 +89,8 @@ EXAMPLES = {
     ),
     "distillation": (
         "recipes.distillation.on_policy.train",
-        ["max_steps=2", "problems_per_batch=4", "group_size=2", "max_tokens=256",
-         "eval_max_tokens=256", "eval_every=1", "n_val=16", "n_test=32",
-         "n_kl_eval=8", "warmup_steps=0", "log_path={log_path}"],
+        ["max_steps=2", "questions_per_step=4", "group_size=2", "n_eval=10",
+         "eval_samples=1", "eval_every=1", "warmup_steps=0", "log_path={log_path}"],
     ),
     # Two steps, with valid_nll before and after. DARE trains on 8 data-parallel
     # GPUs, and the server rejects a batch smaller than that.
@@ -151,19 +168,33 @@ def dare_bench(tmp_path_factory):
     return {"bench_dir": bench_dir, "sandbox_python": python}
 
 
-@pytest.mark.skipif(CONFIG is None, reason="set CORTEX_TRAINING_E2E_CONFIG to a connection file to run the examples")
+def connection_args() -> list[str]:
+    """The example settings that choose the connection; empty means the examples' default."""
+    # A profile wins over the old JSON file, so an environment can provide both for old and new clients.
+    if CONNECTION:
+        return [f"connection={CONNECTION}"]
+    if CONFIG:
+        config = Path(CONFIG).expanduser()
+        # Setting the variable opts in, so a value that names no file fails rather than skips.
+        assert config.is_file(), f"CORTEX_TRAINING_E2E_CONFIG is set to {CONFIG!r}, which is not a file"
+        return [f"config={config.resolve()}"]
+    return []
+
+
+@pytest.mark.skipif(
+    not (CONNECTION or CONFIG or USE_DEFAULT),
+    reason="set CORTEX_TRAINING_E2E=1 (or CORTEX_TRAINING_E2E_CONNECTION=NAME) to run the examples against your profile",
+)
 @pytest.mark.parametrize("name", list(EXAMPLES))
 def test_example_runs(name, tmp_path, request):
-    config = Path(CONFIG).expanduser()
-    # Setting the variable opts in, so a value that names no file fails rather than skips.
-    assert config.is_file(), f"CORTEX_TRAINING_E2E_CONFIG is set to {CONFIG!r}, which is not a file"
+    connection = connection_args()
 
     module, settings = EXAMPLES[name]
     values = {"log_path": tmp_path}
     if name == "dare_evaluate":
         # Requested here rather than as an argument, so only this case builds it.
         values.update(request.getfixturevalue("dare_bench"))
-    command = [sys.executable, "-m", module, f"config={config.resolve()}"]
+    command = [sys.executable, "-m", module, *connection]
     for setting in settings:
         # replace, not str.format, so a setting with a literal brace survives.
         for key, value in values.items():
@@ -173,7 +204,7 @@ def test_example_runs(name, tmp_path, request):
         command.append(f"debug_image_tag={DEBUG_IMAGE_TAG}")
 
     try:
-        result = subprocess.run(command, cwd=REPO_ROOT, timeout=TIMEOUT_SECONDS)
+        result = subprocess.run(command, cwd=REPO_ROOT, env=RUN_ENV, timeout=TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
         # The example has usually submitted a job already, which may still be running.
         pytest.fail(f"{name} did not finish within {TIMEOUT_SECONDS}s: {' '.join(command)}")

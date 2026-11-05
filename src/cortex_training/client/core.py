@@ -175,6 +175,10 @@ from cortex_training.model_deployment import WIRE_SOURCE_JOB_ID
 from cortex_training.model_deployment import WIRE_TENSOR_PARALLEL_SIZE
 from cortex_training.model_deployment import WIRE_VLLM_CONFIG
 
+# tenacity renamed wait_exponential_jitter's `initial` to `multiplier` (and warns on
+# `initial`); the oldest supported tenacity has only `initial`.
+_JITTER_START = "multiplier" if "multiplier" in inspect.signature(wait_exponential_jitter).parameters else "initial"
+
 logger = logging.getLogger(__name__)
 
 _STDOUT_CHUNK_RE = re.compile(
@@ -725,10 +729,15 @@ _SECRET_IN_ERROR_RE = re.compile(
 )
 
 
+def _redact_secrets(text: str) -> str:
+    """Return ``text`` with the obvious secrets ``_SECRET_IN_ERROR_RE`` finds redacted."""
+    return _SECRET_IN_ERROR_RE.sub(r"\1<redacted>", text)
+
+
 def _safe_metric_error_message(exc: BaseException) -> str:
     """Return a bounded, single-line error message with obvious secrets redacted."""
     message = " ".join(str(exc).split())
-    message = _SECRET_IN_ERROR_RE.sub(r"\1<redacted>", message)
+    message = _redact_secrets(message)
     return message[:_METRIC_ERROR_MESSAGE_LIMIT]
 
 
@@ -1956,7 +1965,7 @@ def _model_deployment_description(
     return result
 
 
-# Longest server error message kept in a model deployment error.
+# Longest server error message kept in an error the client raises.
 _MAX_SERVER_ERROR_MESSAGE_CHARS = 1000
 
 
@@ -1979,6 +1988,48 @@ def _server_error_code_and_message(
                 message if isinstance(message, str) and message.strip() else None,
             )
     return None, None
+
+
+def _bounded_server_message(message: str) -> str:
+    """Return ``message`` cut to ``_MAX_SERVER_ERROR_MESSAGE_CHARS``, ending in ``...`` when cut."""
+    if len(message) > _MAX_SERVER_ERROR_MESSAGE_CHARS:
+        return message[:_MAX_SERVER_ERROR_MESSAGE_CHARS] + "..."
+    return message
+
+
+def _server_message_suffix(response: requests.Response | None) -> str:
+    """The text an HTTP error's message gains from ``response``'s JSON error body.
+
+    `` (<code>): <message>``, or the half the body has, with the message
+    redacted and cut; ``""`` when the body is not JSON or has neither.
+    """
+    code, detail = _server_error_code_and_message(response)
+    suffix = f" ({code})" if code else ""
+    if detail:
+        suffix += f": {_bounded_server_message(_redact_secrets(detail))}"
+    return suffix
+
+
+def _add_server_message_to_error(
+    exc: BaseException, response: requests.Response | None
+) -> None:
+    """Append the ``code`` and ``message`` of ``response``'s JSON error body to ``exc``'s message.
+
+    requests' own text ("403 Client Error: Forbidden for url: ...") leaves them
+    out, and the message is often the only place that says what to change, such
+    as an account parameter. A body that is not JSON, or has neither, leaves the
+    message as it is, and so does a message that already carries them. Never
+    raises, so it cannot replace the error it explains.
+    """
+    try:
+        if not exc.args or not isinstance(exc.args[0], str):
+            return
+        suffix = _server_message_suffix(response)
+        if not suffix or suffix in exc.args[0]:
+            return
+        exc.args = (exc.args[0] + suffix, *exc.args[1:])
+    except Exception:
+        logger.debug("could not add the server's error message to an HTTP error", exc_info=True)
 
 
 def _sanitized_model_deployment_request_error(
@@ -2011,9 +2062,7 @@ def _sanitized_model_deployment_request_error(
         if detail:
             if job_id and deployment_id:
                 detail = detail.replace(job_id, deployment_id)
-            if len(detail) > _MAX_SERVER_ERROR_MESSAGE_CHARS:
-                detail = detail[:_MAX_SERVER_ERROR_MESSAGE_CHARS] + "..."
-            message += f": {detail}"
+            message += f": {_bounded_server_message(detail)}"
     request_id = _response_snowflake_request_id(response)
     if request_id:
         message += f" (snowflake request id: {request_id})"
@@ -2737,6 +2786,16 @@ class CortexTrainingClient:
 
         resolution = _picker.resolve(connection=connection, database=database, schema=schema)
         logger.info("Cortex Training target: %s", resolution.describe())
+        return cls._from_resolution(resolution, **kwargs)
+
+    @classmethod
+    def _from_resolution(cls, resolution: Any, **kwargs: Any) -> "CortexTrainingClient":
+        """Create the client a :class:`~cortex_training._picker.Resolution` describes.
+
+        For callers that resolve first and show the target, such as the CLI.
+        """
+        from cortex_training import _picker
+
         if resolution.profile is None:
             return cls._from_pat(
                 host=resolution.host,
@@ -2964,10 +3023,8 @@ class CortexTrainingClient:
         """
         if self._metric_emitter is None:
             return
-        if error is None and not _success_telemetry_enabled(
-            operation, getattr(self, "_telemetry_surface", SDK_SURFACE)
-        ):
-            return
+        surface = getattr(self, "_telemetry_surface", SDK_SURFACE)
+        duration_ms = round((time.monotonic() - started) * 1000, 3)
         try:
             attempt_count = int(
                 getattr(self._operation_metric_state, "attempt_count", 0)
@@ -2975,13 +3032,35 @@ class CortexTrainingClient:
             request_count = int(
                 getattr(self._operation_metric_state, "request_count", 0)
             )
+        except Exception:
+            attempt_count = request_count = 0
+        # Every outcome is counted, so failure rates have a denominator even
+        # though only failures emit a detailed record by default.
+        try:
+            record_operation = getattr(self._metric_emitter, "record_operation", None)
+            if record_operation is not None:
+                record_operation(
+                    operation,
+                    outcome="cancelled"
+                    if cancelled
+                    else ("success" if error is None else "failure"),
+                    duration_ms=duration_ms,
+                    retry_count=max(attempt_count - request_count, 0),
+                    request_count=request_count,
+                    surface=surface,
+                )
+        except Exception:
+            logger.debug("client operation count failed", exc_info=True)
+        if error is None and not _success_telemetry_enabled(operation, surface):
+            return
+        try:
             value: dict[str, Any] = dict(
                 getattr(self._operation_metric_state, "values", None) or {}
             )
             value.update(values or {})
             value |= {
                 "attempt_count": attempt_count,
-                "duration_ms": round((time.monotonic() - started) * 1000, 3),
+                "duration_ms": duration_ms,
                 "request_count": request_count,
                 "retry_count": max(attempt_count - request_count, 0),
                 "success": error is None and not cancelled,
@@ -3144,7 +3223,9 @@ class CortexTrainingClient:
         "Schema ... is not found or not authorized") raises
         :class:`DatabaseAccessError`. ``explain_database=False`` leaves that
         answer as it is, for routes whose path names no database; a
-        client from :meth:`for_job` always leaves it.
+        client from :meth:`for_job` always leaves it. Any other 4xx or 5xx
+        raises ``requests.HTTPError``; when the answer's JSON body has an
+        error ``code`` or ``message``, the error's message ends with them.
         """
         explain_database = explain_database and self._explain_database_errors
         fn = getattr(self._session, method.lower())
@@ -3289,6 +3370,8 @@ class CortexTrainingClient:
                     resp.raise_for_status()
                 except requests.exceptions.HTTPError as exc:
                     _add_snowflake_request_id_to_error(exc, sf_request_id)
+                    if resp.status_code >= 400:
+                        _add_server_message_to_error(exc, resp)
                     raise
                 return resp
 
@@ -3298,7 +3381,7 @@ class CortexTrainingClient:
         retryer = Retrying(
             retry=retry_if_exception(should_retry),
             stop=stop_after_attempt(max_attempts),
-            wait=wait_exponential_jitter(initial=0.5, max=10.0),
+            wait=wait_exponential_jitter(**{_JITTER_START: 0.5}, max=10.0),
             reraise=True,
         )
         return retryer(attempt)
@@ -3376,6 +3459,13 @@ class CortexTrainingClient:
         job may wait for capacity before failing with ``pending_timeout``: between
         300 and 604,800, with no disable value. Omit either to use the server
         default, currently 30 minutes for idle and 24 hours for pending.
+
+        The calling role needs ``USE CORTEX TRAINING`` on the account, plus
+        ``CREATE EXPERIMENT`` on the schema when ``experiment_name`` is omitted
+        or ``MODIFY`` on that experiment when it is given. Without
+        ``USE CORTEX TRAINING`` the service answers 403 and this raises
+        :class:`requests.HTTPError`; an ``ACCOUNTADMIN`` can grant it with
+        ``GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE <role>``.
         """
         if not sub_jobs:
             raise ValueError("create_job requires a non-empty sub_jobs list")
@@ -3722,7 +3812,7 @@ class CortexTrainingClient:
         ``page_size`` is 1 to 1000, and ``schema`` needs ``database`` with it.
         The server applies every filter: ``database`` / ``schema`` narrow the
         scope, ``status`` is one status or a list of them (``active`` and
-        ``done`` name groups), ``submitted_by`` takes a user name, and
+        ``terminal`` name groups), ``submitted_by`` takes a user name, and
         ``created_after`` (inclusive) / ``created_before`` (exclusive) take a
         ``date``, a ``datetime`` (sent in UTC; naive is taken as UTC) or a
         string sent as-is. Rows also carry ``database_name`` and

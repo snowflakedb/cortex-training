@@ -138,8 +138,12 @@ Authorization: Snowflake Token="<session-token>"
 ```
 
 The client reconnects once and replays the request when Snowflake explicitly
-reports that the session token expired. Named profiles and the configured
-default profile are supported.
+reports that the session token expired. The profile is `connection=` if given,
+else the one `cortex-training login` saved (`"profile"` in
+`<Snowflake folder>/cortex-training/config.json`), else the Snowflake Connector's
+default profile. The database is `database=`, else `CORTEX_TRAINING_DATABASE`,
+else the profile's, else `CORTEX_TRAINING_DB`; the schema follows the same
+order and defaults to `PUBLIC`.
 
 When no profile exists, `from_configs()` uses `CORTEX_TRAINING_HOST` and
 `CORTEX_TRAINING_PAT` (for CI), and sends:
@@ -303,8 +307,87 @@ or validation details:
 }
 ```
 
+When a 4xx or 5xx body is a JSON error with a `code` or a `message`, the Python
+client adds them to the end of the `requests.HTTPError` message that
+`raise_for_status()` gives:
+
+```text
+[snowflake request id: <id>] 403 Client Error: Forbidden for url: <url> (<code>): <message>
+```
+
+A message longer than 1,000 characters is cut and ends in `...`, and common
+credential patterns in it are redacted. The error's `.response` is still the
+service's answer. A 3xx keeps its `Unexpected redirect` text, and a body that
+is not JSON, or has neither field, leaves the message as `raise_for_status()`
+gives it. An error the client raises with its own explanation instead, such as
+`DatabaseAccessError` or a chunk-group error, keeps its own message.
+
 Most data-plane calls and request polls require a `running` job. `tail-logs` is
 the exception allowed during `placing`.
+
+### 3.7 Access control
+
+Each call runs as the role of the credential that signs it. A role needs a
+privilege on the database and on the schema in the request path, for example
+`USAGE` on both, and these further privileges for each operation:
+
+| Operation | Required privileges |
+|---|---|
+| Create a job ([5.1](#51-create-job---post-)), including a model deployment | `USE CORTEX TRAINING` on the account. `CREATE EXPERIMENT` on the schema when `experiment_name` is omitted, or `MODIFY` on that experiment when it is named. |
+| Create a job that imports from `external_stage_path` | The privileges above, plus `READ` on that stage. |
+| Create a model deployment from another job's checkpoint | The privileges above. The role must also be the source job's owner role (the role that created it) and have a privilege on the source job's database and schema. |
+| Get, cancel, list checkpoints, export or delete a checkpoint, experiment run, request status, and every training or generation call | The job's owner role (the role that created it). |
+| List jobs ([5.3](#53-list-jobs---get-)) | Returns the jobs the role owns. |
+| Capacity ([5.5](#55-capacity---get-capacity)) | None beyond the database and schema. The per-submitter breakdown counts only jobs the role can list. |
+| List models ([5.4](#54-list-models---get-apiv2cortex-trainingmodels)) | None. |
+| Chat completions on a deployment ([14](#14-model-deployments)) | The deployment's owner role. |
+
+The owner role counts when it is the session's primary role, an active
+secondary role, or inherited by one of them. A job belongs to the role that
+created it, and that ownership cannot be granted to another role. To share
+access, run the workload under one role.
+
+`USE CORTEX TRAINING` is held by `ACCOUNTADMIN`. An `ACCOUNTADMIN` grants it to
+the roles that create jobs:
+
+```sql
+GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE <role_name>;
+```
+
+If a role can already create jobs without `USE CORTEX TRAINING`, grant it the
+privilege anyway, so the role keeps working when the requirement applies to
+your account.
+
+To let every role in the account create jobs, grant it to `PUBLIC`. Do this
+only when the account does not need to limit who can start GPU training:
+
+```sql
+GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE PUBLIC;
+```
+
+A request without a required privilege is refused with the status below. Where
+the cause is a missing privilege on something that may also not exist, the
+response is the same either way, so it does not reveal whether the object
+exists.
+
+| Cause | Status and code | Message |
+|---|---|---|
+| No `USE CORTEX TRAINING` (job creation) | 403, code `003001` | `... Your primary role <role> must have USE CORTEX TRAINING granted on ACCOUNT <account>.` |
+| Database or schema in the path not accessible | 400, code `517602` | `Schema <database>.<schema> is not found or not authorized` |
+| No `CREATE EXPERIMENT` on the schema | 400, code `517602` | `CREATE EXPERIMENT privilege required on schema <schema>` |
+| Named experiment not accessible | 400, code `517602` | `Experiment <name> not found or not authorized` |
+| No `MODIFY` on the named experiment | 400, code `517602` | `MODIFY privilege required on experiment <experiment>` |
+| External stage not accessible, or no `READ` on it | 400, code `517602` | `Stage <stage> is not found or not authorized` |
+| Job not owned by the role, or not found | 404, code `517601` | `Training job <job_id> not found in <schema>` |
+| Source checkpoint for a model deployment not accessible | 404, code `517601` | `Source job was not found or is not authorized for the active roles` |
+| Chat completions: database, schema or deployment not accessible | 404 | `The requested model is not available.` |
+
+Every 400 refusal shares code `517602`, which also covers other invalid
+requests; match the message to tell them apart.
+
+Chat completions report an inaccessible database or schema as 404, unlike the
+management API's 400, so that an inference request cannot tell whether a
+namespace exists.
 
 ---
 
@@ -346,6 +429,7 @@ These calls are outside the Cortex Training prefix:
 |---|---|---|---|
 | `/api/v2/{endpoint}` | `GET` | `iter_jobs` | List jobs across the account ([section 5.3](#across-the-account---get-apiv2endpoint)) |
 | `/api/v2/statements` | `POST` | artifact download methods | Resolve the current Snowflake identity |
+| `/api/v2/statements` | `POST` | `cortex-training login --convert-legacy-config` | With the old config's PAT: look up its user and role (`SELECT CURRENT_USER(), CURRENT_ROLE()`), check the database with `SHOW DATABASES` / `SHOW SCHEMAS`, and, only after showing the SQL and asking, `CREATE DATABASE IF NOT EXISTS` |
 
 ---
 
@@ -443,6 +527,14 @@ values above `604800`, and non-integers.
 
 When either field is set, Get job and List jobs echo it back; when omitted it may
 be absent from those responses.
+
+#### Access control for creating a job
+
+Creating a job needs `USE CORTEX TRAINING` on the account, a privilege on the
+database and schema in the path, and either `CREATE EXPERIMENT` on the schema
+(`experiment_name` omitted) or `MODIFY` on the named experiment. See
+[section 3.7](#37-access-control). Without `USE CORTEX TRAINING` the request is
+refused with 403 before the body is checked.
 
 Response:
 
@@ -561,6 +653,17 @@ REST response:
 `CortexTrainingClient.list_jobs()` returns only the `jobs` list, not the outer object.
 The client forwards the status string without validating an enum.
 
+`status` takes one status. A service that supports it answers a request
+filtered on an active one (`pending`, `placing`, `initializing`, `running`) from
+the jobs in that status alone. On one that doesn't, and for the other statuses,
+a filtered request reads every job in the schema as an unfiltered one does, and
+returns only the matching rows. Its `pending` includes `placing` jobs. `active`
+and comma lists match nothing, and `done` misses every job that has settled: ask
+for `failed`, `cancelled` or `terminated` one at a time instead.
+`cortex-training list --status` sends one such request per active status it
+names, asking for `pending` for `placing`, and filters the rows itself; for any
+other status it requests every job.
+
 #### Across the account - `GET /api/v2/{endpoint}`
 
 Lists the jobs the caller can see in every database and schema of the account,
@@ -575,7 +678,7 @@ Optional query parameters:
 |---|---|
 | `database` | Only jobs in this database. SQL identifier rules apply: an unquoted name is case-insensitive, a `"quoted"` one exact. A database the caller cannot see returns 400. |
 | `schema` | Only jobs in this schema of `database`, by the same rules. Requires `database`: a schema name alone does not name one schema, and sending it without `database` returns 400. A schema the caller cannot see returns 400. |
-| `status` | Comma-separated and case-insensitive: `pending`, `placing`, `initializing`, `running`, `failed`, `cancelled`, `terminated`, and the groups `active` (`pending` through `running`) and `done` (`cancelled`, `terminated`, and the `done` that older jobs show). `pending` does not include `placing`. Any other value returns 400. |
+| `status` | Comma-separated and case-insensitive: `pending`, `placing`, `initializing`, `running`, `failed`, `cancelled`, `terminated`, and the groups `active` (`pending` through `running`) and `terminal` (`failed`, `cancelled`, `terminated`). `pending` does not include `placing`. Any other value returns 400, `done` included: `cortex-training list --all --status done` sends `cancelled,terminated`, so the `done` that older jobs show is not listed. |
 | `submitted_by` | Only jobs submitted by this user, by SQL identifier rules. Jobs with no recorded submitter never match, and an unknown user matches no jobs. |
 | `created_after` | Inclusive lower bound on creation time: an RFC 3339 timestamp, or `YYYY-MM-DD` for midnight UTC. Must be earlier than `created_before`. |
 | `created_before` | Exclusive upper bound on creation time, in the same forms. |
@@ -972,6 +1075,8 @@ caller-generated identity for idempotent replay. Frames larger than 60 MiB are
 split across several chunks. Each chunk is posted to the same path; only the
 last response may carry the `request_id`. See
 [section 9.3](#93-request-chunking).
+
+**Router replay coordination belongs in frame operation metadata.** For requests that replay sampler routing, encode `router_replay` with `wire.dumps(..., metadata=...)` and use the sampling zone ID returned by bootstrap, not the public sampling sub-job ID. See [section 7.4](#74-bootstrap-router-replay) for the source/target mapping and encoding example.
 
 Typical polled result:
 
@@ -1459,6 +1564,8 @@ split with `wire.encode_byte_chunks` (`kind="request"`, `operation="forward"`)
 and each chunk is its own POST whose `payload_b64` is that request chunk. Only
 the last POST returns the pollable `request_id`.
 
+**Forward-only replay uses the same metadata contract as forward/backward.** Put `router_replay` in the DSSST1 frame's operation metadata and use the bootstrap-returned sampling zone ID; see [section 7.4](#74-bootstrap-router-replay). Do not put replay coordination in the outer `/operation` JSON envelope or the model batch.
+
 The ceiling is `CORTEX_TRAINING_FORWARD_OPERATION_MAX_JSON_BYTES` (integer
 bytes, default 16 MiB, minimum 16 KiB). Dict payloads stay a single plain
 `/operation` POST.
@@ -1569,6 +1676,32 @@ replay target/operation receiver. `max_cache_bytes` is optional.
 For a mixed training/sampling job, pass `sub_job_id=target_sub_job_id` (or the
 matching `sub_job_type`) because the low-level client does not infer the
 operation receiver.
+
+**Successful bootstrap returns the sampling zone ID to use for replay coordination.** Read `sampling_job_id` from the completed `bootstrap-router-replay` result. If the deployment initially returns a `request_id`, poll that request before reading the result. The returned ID identifies the sampling backend paired with the training backend; it is not necessarily the public sampling sub-job ID supplied as `source_sub_job_id`. Retain the mapping for that specific source/target pair, and use the returned ID for subsequent `forward` and `forward-backward` replay requests. Do not reuse the mapping for a different pair.
+
+**Replay coordination belongs in DSSST1 operation metadata, not the model batch.** Pass the pair-level `router_replay` descriptor through `wire.dumps(..., metadata=...)`. The frame stores the descriptor in the safetensors `__metadata__.op` field, and `wire.read_metadata(frame)` returns it. The server selects the bootstrapped pair using `metadata["router_replay"]["sampling_job_id"]`; a descriptor inside `batch` or model `kwargs` does not supply operation metadata.
+
+`router_replay.identity_version` is an integer that may be omitted for legacy replay IDs but must be `1` for `rr1:` sample IDs, where `1` denotes the version-1 exact replay identity protocol.
+
+```python
+from cortex_training import wire
+
+# bootstrap_result is the completed bootstrap result for this source/target pair.
+frame = wire.dumps(
+    batch,
+    metadata={
+        "response_options": {"format": "dssst1", "delivery": "chunked"},
+        "router_replay": {
+            "sampling_job_id": bootstrap_result["sampling_job_id"],
+            "identity_version": 1,
+        },
+    },
+)
+```
+
+**Per-row replay inputs remain in the model payload.** Keep `rr_sample_ids`, `rr_replay_meta`, and `rr_discard` in the batch or model arguments expected by the training backend; only the pair-level `router_replay` descriptor belongs in operation metadata. Both forward endpoints use this placement. Request chunking wraps the completed frame and preserves its replay metadata when the frame is reassembled.
+
+**The low-level client sends the caller's encoded sampler ID unchanged.** `forward()` and `forward_backward()` do not translate public sampling sub-job IDs to sampling zone IDs. Callers must encode the ID returned by bootstrap, or use a higher-level transport that retains the source/target mapping and rewrites the ID before frame serialization.
 
 ### 7.5 Router replay discard
 
@@ -2497,6 +2630,8 @@ Safetensors metadata contains:
 - `dss`: the nested structure skeleton and wire version `DSSST1`.
 - `op`: optional operation metadata such as response options, router replay,
   and request/result chunk descriptors.
+
+**Router replay uses the `op` metadata object for both forward endpoints.** See [section 7.4](#74-bootstrap-router-replay) for the `router_replay` descriptor, the bootstrap-returned sampling zone ID, and an encoding example. Per-row replay inputs remain in the model payload, not operation metadata.
 
 Encode/decode:
 
