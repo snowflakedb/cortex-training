@@ -61,6 +61,7 @@ using Cortex Training.
    use it with no extra arguments:
    ```bash
    cortex-training capacity
+   cortex-training status      # which profile, account and database commands use, and why
    ```
 
    To write the profile yourself instead, add it to `connections.toml` in your

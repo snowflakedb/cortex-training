@@ -414,6 +414,9 @@ def build_parser(
         prog=prog,
         description="Manage Cortex Training jobs through the Cortex Training REST endpoint.",
     )
+    from cortex_training import __version__
+
+    parser.add_argument("--version", action="version", version=f"cortex-training {__version__}")
     parser.add_argument(
         "--config",
         default=_env("CORTEX_TRAINING_CONFIG"),
@@ -559,6 +562,17 @@ def build_parser(
         "models",
         help="List active models configured for new jobs.",
         description="List active models configured for new jobs.",
+    )
+
+    subparsers.add_parser(
+        "status",
+        help="Show where commands connect (profile, account, database) and why, without signing in.",
+        description=(
+            "Show where commands connect and why: the profile (or other connection) a command would use, "
+            "its account, user, role and how it signs in, and the database and schema, each with where it "
+            "came from. Reads only local files and the environment; it doesn't sign in. To check that a "
+            "profile works, run `cortex-training login NAME`."
+        ),
     )
 
     capacity = subparsers.add_parser(
@@ -1287,15 +1301,20 @@ def write_target_line(resolution: Any, stream: TextIO) -> None:
     stream.write(target_line(resolution))
 
 
+def _source_text(resolution: Any, key: str, flag: str) -> str:
+    """Where the picker's ``key`` came from, in the words the target line and ``status`` use."""
+    text = resolution.sources[key]
+    if text == "passed in":
+        return f"from {flag}"
+    if text.startswith("saved in "):
+        return "saved by cortex-training login"
+    return text
+
+
 def target_line(resolution: Any) -> str:
     """One line naming the profile (or CI host), database, and schema, and where each came from."""
     def source(key: str, flag: str) -> str:
-        text = resolution.sources[key]
-        if text == "passed in":
-            return f"from {flag}"
-        if text.startswith("saved in "):
-            return "saved by cortex-training login"
-        return text
+        return _source_text(resolution, key, flag)
 
     who = (
         f"profile {resolution.profile} ({source('profile', '--connection')})"
@@ -1619,6 +1638,76 @@ def _cmd_list(args: argparse.Namespace, client, stdout: TextIO) -> int:
     if args.limit is not None:
         jobs = _newest_jobs(jobs, args.limit)
     _print_json({"jobs": _jobs_latest_last(jobs)}, stdout, compact=args.compact)
+    return 0
+
+
+def _cmd_status(args: argparse.Namespace, stdout: TextIO, stderr: TextIO) -> int:
+    """Report where a command would connect and why, the way commands resolve it, without signing in."""
+    from cortex_training import __version__
+    from cortex_training import _login
+    from cortex_training import _picker
+    from cortex_training import _profiles
+
+    report: dict[str, Any] = {"version": __version__}
+    if args.base_url:
+        report.update(connection="base_url", base_url=args.base_url, database=args.database, schema=args.schema)
+        line = f"→ base URL {args.base_url} · database {args.database} · schema {args.schema}\n"
+    elif args.use_connection_profile:
+        try:
+            resolution = _picker_choice(args)
+        except _picker.PickerError as exc:
+            stderr.write(f"error: {exc}\n")
+            return 2
+        if resolution.profile is None:
+            # No profile exists: CORTEX_TRAINING_HOST and CORTEX_TRAINING_PAT (CI).
+            report.update(
+                connection="environment",
+                host=resolution.host,
+                host_source=resolution.sources["host"],
+                signs_in_with="a programmatic access token (CORTEX_TRAINING_PAT)",
+            )
+        else:
+            values = _profiles.read_profiles().get(resolution.profile, {})
+            report.update(
+                connection="profile",
+                profile=resolution.profile,
+                profile_source=_source_text(resolution, "profile", "--connection"),
+                account=values.get("account"),
+                host=values.get("host"),
+                user=values.get("user"),
+                role=values.get("role"),
+                signs_in_with=_login.describe_profile(values).sign_in or None,
+            )
+        report.update(
+            database=resolution.database,
+            database_source=_source_text(resolution, "database", "--database"),
+            schema=resolution.schema,
+            schema_source=_source_text(resolution, "schema", "--schema"),
+        )
+        line = target_line(resolution)
+    else:
+        # An older connection method, which still decides as it did (with its warning above).
+        legacy = bool(getattr(args, "_legacy_config_selected", False))
+        report["connection"] = "config file" if legacy else "flags or environment"
+        if legacy:
+            report["config_file"] = args.config
+        report.update(
+            host=_normalize_host(args.host) if args.host else None,
+            signs_in_with="a programmatic access token",
+            database=args.database,
+            schema=args.schema,
+        )
+        what = f"old JSON config {args.config}" if legacy else f"host {report['host']} (flags or environment)"
+        line = f"→ {what} · database {args.database} · schema {args.schema}\n"
+    try:
+        report["profile_file"] = str(_profiles.profile_file())
+    except _profiles.ProfileFileError:
+        report["profile_file"] = None
+    report["config_json"] = str(_picker.config_path())
+    report["warnings"] = list(getattr(args, "_deprecations", ()))
+    if getattr(stderr, "isatty", lambda: False)():
+        stderr.write(line)
+    _print_json(report, stdout, compact=args.compact, sort_keys=False)
     return 0
 
 
@@ -2342,6 +2431,8 @@ def _run(
     stderr = stderr or sys.stderr
     if args.command == "login":
         return _cmd_login(args, stdin, stdout, stderr)
+    if args.command == "status":
+        return _cmd_status(args, stdout, stderr)
 
     if args.command == "submit" and args.dry_run:
         return _cmd_submit(args, None, stdout, stdin)
@@ -2436,7 +2527,7 @@ def main(
             and args.model_deployment_command == "create"
             and args.dry_run
         )
-        no_client = dry_run or args.command == "login"
+        no_client = dry_run or args.command in ("login", "status")
         if client_factory is None and not no_client:
             cortex_training_client_cls = _load_cortex_training_client_class()
 

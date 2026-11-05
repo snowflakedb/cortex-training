@@ -84,6 +84,8 @@ cortex-training login                         # Set up or check the profile to u
 cortex-training login training                # Use or create the profile "training"
 cortex-training list                          # Use the profile login saved
 cortex-training --connection training list    # Use another profile for one command
+cortex-training status                        # Show where commands connect, and why
+cortex-training --version                     # Show the installed version
 ```
 
 ### [Submit Jobs](#submit-a-job)
@@ -440,6 +442,27 @@ from `config.json`; the command prints the paths when it finishes. If a check
 fails, or there's no `pat` in the file or the environment, or the file has a
 `base_url` instead of a `host`, or the file is the new `config.json` itself, it
 says why and changes nothing. It needs a terminal, and takes no profile name.
+
+### Status
+
+```bash
+cortex-training status
+cortex-training --connection other status
+```
+
+`status` shows where a command would connect, and why, without signing in. It
+resolves the connection exactly as other commands do, including `--connection`,
+`--database` and `--schema`, then prints JSON: `connection` (`profile`, or
+`config file` / `flags or environment` / `base_url` for the older methods), the
+profile and where it came from, its `account`, `host`, `user`, `role` and how it
+signs in (`signs_in_with`), the `database` and `schema` with their sources, the
+`profile_file` and `config_json` paths, and any `warnings`. It never shows a
+token or password. In a terminal it also prints the one-line summary commands
+print. With nothing set up, it says how to start and exits with code 2.
+
+It reads only local files and the environment. To check that a profile works,
+run `cortex-training login NAME`. `cortex-training --version` prints the
+installed version.
 
 ### Manage Existing Jobs
 
