@@ -36,6 +36,7 @@ import os
 import queue
 import threading
 import time
+import uuid
 import weakref
 from collections.abc import Mapping
 from typing import Any
@@ -57,6 +58,8 @@ _AUTH_REJECTED_STATUSES = {401, 403}
 _DEFAULT_QUEUE_SIZE = 1024
 _WORKER_IDLE_SECONDS = 30.0
 _DEFAULT_METRIC_FLUSH_INTERVAL_SECONDS = 30.0
+# The bounds past a minute are for downloads and waits, and the slow-call
+# budgets of 2, 10 and 15 minutes; 30 minutes is wait_for_job's default timeout.
 _DURATION_BUCKET_BOUNDS_MS = (
     10.0,
     50.0,
@@ -69,13 +72,34 @@ _DURATION_BUCKET_BOUNDS_MS = (
     10_000.0,
     30_000.0,
     60_000.0,
+    120_000.0,
+    300_000.0,
+    600_000.0,
+    900_000.0,
+    1_800_000.0,
 )
+# A call that failed the way its callers expect (see the client's
+# ``_expected_failure``) is counted apart from real failures.
+_OUTCOMES = frozenset({"success", "failure", "expected_failure", "cancelled"})
 _OPERATION_COUNT = "cortex.training.client.operation.count"
 _OPERATION_DURATION = "cortex.training.client.operation.duration"
 _OPERATION_RETRIES = "cortex.training.client.operation.retries"
 _OPERATION_REQUESTS = "cortex.training.client.operation.requests"
 _STOP = object()
 _EMITTERS: weakref.WeakSet["OtlpMetricEmitter"] = weakref.WeakSet()
+# One id per process (an SDK script, a CLI command, a TUI session), sent as
+# ``service.instance.id`` so its records and metrics can be grouped and counted.
+_INSTANCE_ID = str(uuid.uuid4())
+
+
+def _new_instance_id() -> None:
+    """A forked child is another process: it gets its own id."""
+    global _INSTANCE_ID
+    _INSTANCE_ID = str(uuid.uuid4())
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_new_instance_id)
 
 
 class SessionTokenProvider(Protocol):
@@ -380,6 +404,21 @@ class OtlpMetricEmitter:
             self._telemetry_base_url = _telemetry_base_url(hostname)
             return self._telemetry_base_url
 
+    def _resolve_collector(self) -> None:
+        """Worker thread: get a session token and the collector's URL before an
+        export needs them, so a flush at exit, bounded by its timeout, has only
+        its posts left to send. A failure counts like a failed export."""
+        if self._telemetry_base_url is not None or self._is_disabled():
+            return
+        try:
+            self._get_telemetry_base_url(self.token_provider.get_token())
+        except Exception as exc:
+            logger.debug("client telemetry collector lookup failed", exc_info=True)
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status in _AUTH_REJECTED_STATUSES:
+                self._invalidate_auth()
+            self._note_failure()
+
     def _ensure_worker(self) -> None:
         worker = self._worker
         if worker is not None and worker.is_alive():
@@ -399,6 +438,7 @@ class OtlpMetricEmitter:
 
     def _run(self) -> None:
         try:
+            self._resolve_collector()
             while True:
                 with self._metric_lock:
                     next_flush = self._next_metric_flush
@@ -468,13 +508,19 @@ class OtlpMetricEmitter:
             return True
 
     def close(self, timeout: float = 1.0) -> None:
-        """Flush queued events and release this emitter's worker and sessions."""
+        """Flush queued events and release this emitter's worker and sessions.
+
+        Closing is final: interpreter exit doesn't wait on an emitter that is
+        closed or being closed (on another thread, as the TUI's quit does), so
+        ``timeout`` bounds how long its telemetry can hold up exit, even while
+        an export it gave up on is still in flight.
+        """
         self._ensure_process()
+        _EMITTERS.discard(self)
         worker = self._worker
         if self._closed and (worker is None or not worker.is_alive()):
             self._session.close()
             self.token_provider.close()
-            _EMITTERS.discard(self)
             return
         self._closed = True
         deadline = time.monotonic() + timeout
@@ -489,7 +535,6 @@ class OtlpMetricEmitter:
         if worker is None or not worker.is_alive():
             self._session.close()
             self.token_provider.close()
-            _EMITTERS.discard(self)
 
     def record_operation(
         self,
@@ -504,11 +549,12 @@ class OtlpMetricEmitter:
         """Add one operation to a bounded, in-process metric aggregate.
 
         Every call is counted, successes and failures alike, so the exported
-        totals are a denominator for failure rates.
+        totals are a denominator for failure rates. ``outcome`` is ``success``,
+        ``failure``, ``expected_failure`` or ``cancelled``.
         """
         try:
             self._ensure_process()
-            if self._closed or outcome not in {"success", "failure", "cancelled"}:
+            if self._closed or outcome not in _OUTCOMES:
                 return
             duration = max(float(duration_ms), 0.0)
             if not math.isfinite(duration):
@@ -631,6 +677,9 @@ class OtlpMetricEmitter:
                     "value": {"stringValue": self.service_version},
                 }
             )
+        attributes.append(
+            {"key": "service.instance.id", "value": {"stringValue": _INSTANCE_ID}}
+        )
         return attributes
 
     @staticmethod

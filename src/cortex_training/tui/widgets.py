@@ -64,7 +64,9 @@ from cortex_training.tui.log_style import MARK_BACKGROUND
 from cortex_training.tui.log_style import TRACE_KIND
 from cortex_training.tui.log_style import TRACEBACK_BACKGROUND
 from cortex_training.tui.log_style import TRACEBACK_KIND
+from cortex_training.tui.telemetry import code_location
 import os
+import sys
 import traceback
 
 
@@ -859,14 +861,33 @@ class _ResourceList(_SourceList):
 
 # Where an unexpected error's traceback goes, so the UI can stay one line.
 _ERROR_LOG = "~/.cortex-training-errors.log"
+# Told of each error log_traceback logs, with where it was logged, while
+# `cortex-training tui` runs (a telemetry.ErrorReporter); None otherwise.
+_error_reporter = None
+
+
+def set_error_reporter(reporter) -> None:
+    """Have ``reporter(error, where)`` told of each error :func:`log_traceback` logs, or no one (None)."""
+    global _error_reporter
+    _error_reporter = reporter
 
 
 def log_traceback(label: str) -> None:
     """Worker thread, inside an ``except``: append the traceback to the error log (rotated
-    past a few megabytes, see :func:`~cortex_training.tui.log_cache.append_error_log`)."""
+    past a few megabytes, see :func:`~cortex_training.tui.log_cache.append_error_log`), and
+    tell the error reporter (see :func:`set_error_reporter`) where it was logged."""
     try:
         append_error_log(f"{label}:\n{traceback.format_exc()}\n", path=os.path.expanduser(_ERROR_LOG))
     except Exception:  # noqa: BLE001 - reporting an error must not raise one
+        pass
+    reporter, error = _error_reporter, sys.exc_info()[1]
+    if reporter is None or error is None:
+        return
+    try:
+        caller = sys._getframe(1)
+        where = code_location(caller.f_code.co_filename, caller.f_lineno, caller.f_code.co_name)
+        reporter(error, where or "unknown")
+    except Exception:  # noqa: BLE001
         pass
 
 

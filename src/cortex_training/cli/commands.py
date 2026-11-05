@@ -2484,6 +2484,35 @@ def _run(
                 raise ValueError(f"{flag} applies to --log-type stdout, not execution logs")
 
     client = client_factory(args)
+    try:
+        return _run_command(args, client, stdout, stdin, stderr)
+    finally:
+        _close_telemetry(client)
+
+
+# A command sends its telemetry as it finishes, waiting at most this long: more
+# than the second interpreter exit allows, which a first export (it looks the
+# collector up, then posts) can need on a slow network.
+CLI_TELEMETRY_CLOSE_SECONDS = 2.0
+
+
+def _close_telemetry(client: Any) -> None:
+    close = getattr(client, "close_telemetry", None)
+    if close is None:
+        return
+    try:
+        close(timeout=CLI_TELEMETRY_CLOSE_SECONDS)
+    except Exception:  # noqa: BLE001 - telemetry must never change a command's outcome
+        pass
+
+
+def _run_command(
+    args: argparse.Namespace,
+    client: Any,
+    stdout: TextIO,
+    stdin: TextIO,
+    stderr: TextIO,
+) -> int:
     if args.command == "submit":
         return _cmd_submit(args, client, stdout, stdin)
     if args.command == "get":

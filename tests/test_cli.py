@@ -4564,3 +4564,41 @@ def test_status_includes_the_pickers_own_notes(monkeypatch):
     code, report, _ = _status(monkeypatch, CORTEX_TRAINING_DATABASE="ENV_DB")
     assert code == 0 and report["database"] == "ENV_DB"
     assert "Using database ENV_DB from CORTEX_TRAINING_DATABASE." in report["warnings"]
+
+
+class _TelemetryClient(FakeClient):
+    def __init__(self):
+        super().__init__()
+        self.telemetry_closes = []
+
+    def close_telemetry(self, timeout):
+        self.telemetry_closes.append(timeout)
+
+    def cancel_job(self, job_id):
+        raise ValueError("no such job")
+
+
+def test_a_command_sends_its_telemetry_as_it_finishes_even_when_it_fails():
+    clients = []
+
+    def make_client(_args):
+        clients.append(_TelemetryClient())
+        return clients[-1]
+
+    stdout, stderr = io.StringIO(), io.StringIO()
+    assert cli.main(_base_args() + ["models"], client_factory=make_client, stdout=stdout, stderr=stderr) == 0
+    assert cli.main(_base_args() + ["cancel", "job-1"], client_factory=make_client, stdout=stdout, stderr=stderr) == 1
+
+    # More than the second interpreter exit allows: a first export looks the collector up.
+    assert [client.telemetry_closes for client in clients] == [[cli.CLI_TELEMETRY_CLOSE_SECONDS]] * 2
+    assert cli.CLI_TELEMETRY_CLOSE_SECONDS > 1
+
+
+def test_a_telemetry_close_that_raises_does_not_change_the_commands_outcome():
+    class Broken(FakeClient):
+        def close_telemetry(self, timeout):
+            raise RuntimeError("telemetry is broken")
+
+    stdout = io.StringIO()
+    assert cli.main(_base_args() + ["models"], client_factory=lambda _args: Broken(), stdout=stdout) == 0
+    assert json.loads(stdout.getvalue())["models"]

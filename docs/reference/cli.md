@@ -1187,8 +1187,12 @@ client metric with its outcome and duration, successes included, tagged
 `client.surface = tui` so the TUI's use can be told from the CLI's and the
 SDK's. The downloads behind the Logs, Resources and Training metrics tabs also
 say how long the first page or graph of a first download took (`preview_ms`,
-`first_commit_ms`), not only the whole download. `CORTEX_TRAINING_DISABLE_TELEMETRY` turns them
-off; see [Client metrics](python-sdk.md#client-metrics).
+`first_commit_ms`), not only the whole download. The TUI also says how long it
+took to show its first screen (`tui_startup`), and reports the errors it writes
+to its error log (`tui_error`) by where they happened and their type, never
+their text. Quitting sends what is left, waiting at most a second.
+`CORTEX_TRAINING_DISABLE_TELEMETRY` turns them off; see
+[Client metrics](python-sdk.md#client-metrics).
 
 The TUI explains a refused read in one line on the view that needed it, worded
 the same on every view: the Logs tab's saved console and execution log, and the
@@ -2118,7 +2122,8 @@ program that made the call in `client.surface`: `cli` for these commands, `tui`
 for the TUI, `sdk` for Python code. `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY`
 set truthy also emits successful outcomes for every other essential operation;
 set falsy, it emits failures only, the TUI's included. Every call is counted
-either way, and the counts are exported about every 30 seconds. See the [Python SDK reference](python-sdk.md#client-metrics).
+either way, and the counts are exported about every 30 seconds and as each
+command finishes, which waits at most 2 seconds for them. See the [Python SDK reference](python-sdk.md#client-metrics).
 
 `NO_COLOR` (not empty) draws `cortex-training tui` in gray unless it is started
 with `--color always`; `COLORTERM`, `TERM` and `TEXTUAL_COLOR_SYSTEM` say how

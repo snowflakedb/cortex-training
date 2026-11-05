@@ -322,3 +322,81 @@ def test_a_profile_file_naming_a_profile_twice_is_explained(tmp_path, monkeypatc
     assert "could not open Snowflake connection 'demo':" in message
     assert "has 2 profiles named demo (lines 1 and 3)." in message
     assert "Run `cortex-training login` to fix it" in message
+
+
+def test_each_login_is_reported_with_why_it_ran() -> None:
+    connections = iter(
+        (FakeConnection(token="old-token"), FakeConnection(token="artifact"), FakeConnection(token="new-token"))
+    )
+    auth = SnowflakeProfileAuth("training-profile", connect_factory=lambda **_kwargs: next(connections))
+    reports = []
+
+    # The startup login ran before anyone listened: it is reported once a listener is set.
+    auth.set_connect_listener(lambda reason, ms, error: reports.append((reason, ms, error)))
+    auth.open_artifact_connection()
+    auth.refresh("old-token")
+    auth.get_token()  # no login: nothing more
+
+    assert [(reason, error) for reason, _ms, error in reports] == [
+        ("startup", None),
+        ("artifact", None),
+        ("refresh", None),
+    ]
+    assert all(isinstance(ms, float) and ms >= 0 for _reason, ms, _error in reports)
+
+
+def test_a_failed_login_is_reported_with_the_connectors_error() -> None:
+    rejected = _ConnectorError("394400 (08001): Failed to connect to DB.", errno=394400)
+    connections = iter((FakeConnection(), rejected))
+
+    def connect(**_kwargs):
+        item = next(connections)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    auth = SnowflakeProfileAuth("training-profile", connect_factory=connect)
+    reports = []
+    auth.set_connect_listener(lambda reason, ms, error: reports.append((reason, error)))
+
+    with pytest.raises(SnowflakeProfileError):
+        auth.open_artifact_connection()
+    assert reports == [("startup", None), ("artifact", rejected)]
+
+
+def test_a_listener_that_raises_does_not_change_the_login() -> None:
+    connections = iter((FakeConnection(), FakeConnection(token="artifact")))
+    auth = SnowflakeProfileAuth("training-profile", connect_factory=lambda **_kwargs: next(connections))
+
+    def listener(*_args):
+        raise RuntimeError("telemetry is broken")
+
+    auth.set_connect_listener(listener)
+    assert auth.open_artifact_connection().rest.token == "artifact"
+
+
+def test_logins_without_a_listener_are_kept_only_a_few_at_a_time() -> None:
+    auth = SnowflakeProfileAuth("training-profile", connect_factory=lambda **_kwargs: FakeConnection())
+    for _ in range(10):
+        auth.open_artifact_connection()
+    reports = []
+    auth.set_connect_listener(lambda reason, ms, error: reports.append(reason))
+    assert reports == ["artifact"] * 4
+
+
+def test_the_listener_hears_a_refresh_after_the_lock_is_released() -> None:
+    # A listener can send telemetry, whose token comes from this auth: it must not deadlock.
+    connections = iter((FakeConnection(token="old-token"), FakeConnection(token="new-token")))
+    auth = SnowflakeProfileAuth("training-profile", connect_factory=lambda **_kwargs: next(connections))
+    tokens = []
+
+    def listener(reason, _ms, _error):
+        if reason == "refresh":
+            reader = threading.Thread(target=lambda: tokens.append(auth.get_token()))
+            reader.start()
+            reader.join(5)
+
+    auth.set_connect_listener(listener)
+    auth.invalidate()
+    assert auth.get_token() == "new-token"
+    assert tokens == ["new-token"]

@@ -3199,6 +3199,8 @@ to those sub-jobs and raises `cortex_training.NoChunksError` (a `ValueError`
 with `sub_job_ids` and `available` attributes) before any `GET` if one has no
 chunks. `available` names every other sub-job of the job that has chunks: a
 download that listed one sub-job alone then lists both roots whole to find them.
+Client telemetry counts a `NoChunksError` as an expected failure, not a failed
+one: nothing has been uploaded yet.
 Two downloads of the same output directory at once are unsupported.
 
 ### 12.4 GPU metrics download

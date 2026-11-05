@@ -285,6 +285,37 @@ def _success_telemetry_enabled(
     )
 
 
+def _expected_failure(
+    operation: str, error: BaseException, values: Mapping[str, Any]
+) -> bool:
+    """True when a failed call failed the way its callers expect, not as a fault.
+
+    Two do: a download with nothing uploaded yet (``NoChunksError``), and a log
+    tail of a job that has ended or isn't running yet (the ``job_ended`` and
+    ``job_status`` values :meth:`CortexTrainingClient.tail_logs` records). A tail
+    that fails while its job runs is a real failure. Expected failures still
+    report ``success`` false, with ``expected`` true, and are counted under the
+    ``expected_failure`` outcome, so failure rates leave them out.
+    """
+    if isinstance(error, NoChunksError):
+        return True
+    if operation != "tail_logs":
+        return False
+    status = values.get("job_status")
+    return bool(values.get("job_ended")) or (
+        isinstance(status, str) and bool(status) and status != "running"
+    )
+
+
+def _package_version() -> str | None:
+    """This package's version, which telemetry sends as ``service.version``."""
+    try:
+        from cortex_training import __version__
+    except Exception:  # noqa: BLE001 - a version must never stop a client
+        return None
+    return __version__
+
+
 # HTTP statuses worth retrying: the request was well-formed, so the same call
 # may succeed once transient load/infra conditions clear.
 #   429 Too Many Requests   - rate limited; back off and retry
@@ -2869,6 +2900,7 @@ class CortexTrainingClient:
             client._metric_emitter = OtlpMetricEmitter(
                 client.base_url,
                 token_provider,
+                service_version=_package_version(),
                 verify_ssl=verify_ssl,
                 timeout=telemetry_timeout,
             )
@@ -2919,9 +2951,12 @@ class CortexTrainingClient:
             client._metric_emitter = OtlpMetricEmitter(
                 client.base_url,
                 SnowflakeTelemetryTokenProvider(auth),
+                service_version=_package_version(),
                 verify_ssl=verify_ssl,
                 timeout=telemetry_timeout,
             )
+            # Its logins, the one it was just built with included (see _record_connect).
+            auth.set_connect_listener(client._record_connect)
         return client
 
     @property
@@ -2990,6 +3025,24 @@ class CortexTrainingClient:
                 if self._auth_provider is not None:
                     self._auth_provider.close()
 
+    def close_telemetry(self, timeout: float = 1.0) -> None:
+        """Send the telemetry this client still holds, waiting at most ``timeout``
+        seconds, then send no more.
+
+        :meth:`close` does this with one second, and so does interpreter exit
+        for a client nobody closed; exit doesn't wait again on telemetry closed
+        here. The ``cortex-training`` CLI calls it as each command finishes, with
+        two seconds, and the TUI as it quits, with one, without closing the
+        client's sessions. A client from :meth:`for_job` borrows its telemetry,
+        so this is a no-op.
+        """
+        if not self._owns_session or self._metric_emitter is None:
+            return
+        try:
+            self._metric_emitter.close(timeout=timeout)
+        except Exception:
+            logger.debug("client telemetry close failed", exc_info=True)
+
     def __enter__(self) -> "CortexTrainingClient":
         return self
 
@@ -3020,6 +3073,11 @@ class CortexTrainingClient:
         ``error_message`` replaces the error's own text when that could quote a
         credential, such as a presigned link. Its request counts are this
         thread's REST calls, so none.
+
+        A failure its callers expect (see :func:`_expected_failure`) is counted
+        under the ``expected_failure`` outcome, and its record says
+        ``expected``. A reported error is marked with the operation's name, for
+        the TUI's error reports to say which call it came from.
         """
         if self._metric_emitter is None:
             return
@@ -3034,6 +3092,22 @@ class CortexTrainingClient:
             )
         except Exception:
             attempt_count = request_count = 0
+        recorded: dict[str, Any] = {}
+        expected = False
+        try:
+            recorded.update(getattr(self._operation_metric_state, "values", None) or {})
+            recorded.update(values or {})
+            if error is not None and not cancelled:
+                expected = _expected_failure(operation, error, recorded)
+                error._telemetry_operation = operation  # type: ignore[attr-defined]
+        except Exception:
+            logger.debug("client operation outcome classification failed", exc_info=True)
+        if cancelled:
+            outcome = "cancelled"
+        elif error is None:
+            outcome = "success"
+        else:
+            outcome = "expected_failure" if expected else "failure"
         # Every outcome is counted, so failure rates have a denominator even
         # though only failures emit a detailed record by default.
         try:
@@ -3041,9 +3115,7 @@ class CortexTrainingClient:
             if record_operation is not None:
                 record_operation(
                     operation,
-                    outcome="cancelled"
-                    if cancelled
-                    else ("success" if error is None else "failure"),
+                    outcome=outcome,
                     duration_ms=duration_ms,
                     retry_count=max(attempt_count - request_count, 0),
                     request_count=request_count,
@@ -3054,10 +3126,7 @@ class CortexTrainingClient:
         if error is None and not _success_telemetry_enabled(operation, surface):
             return
         try:
-            value: dict[str, Any] = dict(
-                getattr(self._operation_metric_state, "values", None) or {}
-            )
-            value.update(values or {})
+            value: dict[str, Any] = dict(recorded)
             value |= {
                 "attempt_count": attempt_count,
                 "duration_ms": duration_ms,
@@ -3067,6 +3136,8 @@ class CortexTrainingClient:
             }
             if cancelled:
                 value["cancelled"] = True
+            if expected:
+                value["expected"] = True
             attributes = _metric_identity(operation, arguments, result)
             if error is not None:
                 value["error_message"] = (
@@ -3098,6 +3169,59 @@ class CortexTrainingClient:
         if not isinstance(values, dict) or not getattr(state, "active", None):
             return {}
         return values
+
+    def _record_connect(
+        self, reason: str, duration_ms: float, error: BaseException | None
+    ) -> None:
+        """Report one Snowflake Connector login as a ``connect`` outcome.
+
+        ``reason`` is ``startup`` (the profile login a client is built with),
+        ``refresh`` (a new session after one expired), ``artifact`` (a session
+        for artifact LIST and GET) or ``fork``. Logins run before telemetry
+        exists or inside other operations, so they are reported here rather
+        than by :func:`_track_operation`; one inside an operation also adds to
+        that operation's ``connect_count`` and ``connect_ms`` values.
+        """
+        if self._metric_emitter is None:
+            return
+        surface = getattr(self, "_telemetry_surface", SDK_SURFACE)
+        duration_ms = round(float(duration_ms), 3)
+        try:
+            values = self._operation_values()
+            values["connect_count"] = int(values.get("connect_count", 0)) + 1
+            values["connect_ms"] = round(float(values.get("connect_ms", 0.0)) + duration_ms, 3)
+        except Exception:
+            logger.debug("client connect values failed", exc_info=True)
+        try:
+            record_operation = getattr(self._metric_emitter, "record_operation", None)
+            if record_operation is not None:
+                record_operation(
+                    "connect",
+                    outcome="success" if error is None else "failure",
+                    duration_ms=duration_ms,
+                    surface=surface,
+                )
+        except Exception:
+            logger.debug("client connect count failed", exc_info=True)
+        if error is None and not _success_telemetry_enabled("connect", surface):
+            return
+        try:
+            value: dict[str, Any] = {
+                "duration_ms": duration_ms,
+                "reason": reason,
+                "success": error is None,
+            }
+            attributes: dict[str, Any] = {}
+            if error is not None:
+                value["error_message"] = _safe_metric_error_message(error)
+                attributes.update(_metric_error_attributes(error))
+                errno = getattr(error, "errno", None)
+                if "error.code" not in attributes and isinstance(errno, int):
+                    # The Connector's error number, such as 394400 for a rejected PAT.
+                    attributes["error.code"] = str(errno)
+            self.emit_metric("connect", value, attributes=attributes)
+        except Exception:
+            logger.debug("client connect metric construction failed", exc_info=True)
 
     @staticmethod
     def _debug_json_summary(value: Any, *, limit: int = 2000) -> str:
@@ -4192,7 +4316,12 @@ class CortexTrainingClient:
         return kwargs
 
     def _open_experiment_artifact_connection(self) -> Any:
-        """Open a connector session for Snowflake experiment artifact LIST/GET."""
+        """Open a connector session for Snowflake experiment artifact LIST/GET.
+
+        A PAT client's login is reported here as a ``connect`` outcome; a
+        profile client's factory is its :class:`SnowflakeProfileAuth`, which
+        reports its own (see :meth:`_record_connect`).
+        """
         if self._artifact_connection_factory is not None:
             return self._artifact_connection_factory()
         if self._artifact_connection_config is None:
@@ -4201,9 +4330,15 @@ class CortexTrainingClient:
             )
         import snowflake.connector
 
-        return snowflake.connector.connect(
-            **self._snowflake_connection_kwargs(), **_artifact_login_options()
-        )
+        kwargs = self._snowflake_connection_kwargs()
+        started = time.monotonic()
+        try:
+            connection = snowflake.connector.connect(**kwargs, **_artifact_login_options())
+        except Exception as exc:
+            self._record_connect("artifact", (time.monotonic() - started) * 1000, exc)
+            raise
+        self._record_connect("artifact", (time.monotonic() - started) * 1000, None)
+        return connection
 
     def _artifact_session_key(self) -> tuple[str, str]:
         """What a kept download session is kept under: it was opened for this schema."""

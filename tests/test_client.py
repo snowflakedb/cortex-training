@@ -9189,9 +9189,11 @@ class TestTailOnEndedJobs:
         assert operation == "tail_logs"
         assert value["success"] is False and value["job_ended"] is True
         assert value["job_status"] == job_status
+        assert value["expected"] is True  # the job ended: not a fault
         assert value["request_count"] == 2  # the tail, and the job lookup that explains it
         assert (attributes["job_id"], attributes["sub_job_id"]) == ("j1", "j1:sampling:0")
         assert (attributes["error.type"], attributes["error.http_status"]) == ("HTTPError", status_code)
+        assert c._metric_emitter.record_operation.call_args.kwargs["outcome"] == "expected_failure"
 
     def test_other_tail_failures_are_not_marked_job_ended(self):
         c = _make_client()
@@ -9204,6 +9206,8 @@ class TestTailOnEndedJobs:
 
         value = c._metric_emitter.emit.call_args.args[1]
         assert value["success"] is False and "job_ended" not in value and "job_status" not in value
+        assert "expected" not in value
+        assert c._metric_emitter.record_operation.call_args.kwargs["outcome"] == "failure"
 
     def test_a_tail_failing_while_the_job_is_placed_says_so(self):
         # The service answers 409 until the job's session exists: expected while placing.
@@ -9219,6 +9223,8 @@ class TestTailOnEndedJobs:
         value = c._metric_emitter.emit.call_args.args[1]
         assert (value["success"], value["job_status"]) == (False, "placing")
         assert "job_ended" not in value
+        assert value["expected"] is True  # not running yet
+        assert c._metric_emitter.record_operation.call_args.kwargs["outcome"] == "expected_failure"
 
     def test_a_status_the_server_makes_up_is_cut_short_in_the_metric(self):
         c = _make_client()
@@ -9249,6 +9255,8 @@ class TestTailOnEndedJobs:
         value = c._metric_emitter.emit.call_args.args[1]
         assert (value["success"], value["job_status"]) == (False, "running")
         assert "job_ended" not in value
+        assert "expected" not in value  # it failed while the job ran
+        assert c._metric_emitter.record_operation.call_args.kwargs["outcome"] == "failure"
 
     def test_a_410_while_the_job_still_runs_has_its_status_but_is_not_marked_job_ended(self):
         # A 410 is not retried, so only the failure's own lookup reads the status.
@@ -10116,3 +10124,141 @@ def test_request_retries_back_off_without_tenacity_deprecation_warnings():
         warnings.simplefilter("error")
         wait = wait_exponential_jitter(**{core._JITTER_START: 0.5}, max=10.0)
     assert getattr(wait, "multiplier", getattr(wait, "initial", None)) == 0.5
+
+
+# ─── Telemetry: version, expected failures, logins, closing ─────────────
+
+
+class _ConnectorError(Exception):
+    def __init__(self, msg: str, errno: int | None = None) -> None:
+        super().__init__(msg)
+        self.errno = errno
+
+
+def _fake_connection(token="session-token"):
+    return SimpleNamespace(
+        rest=SimpleNamespace(token=token, server_url="https://profile.example"),
+        database="DB",
+        schema="SCH",
+        role="TRAINER",
+        close=lambda: None,
+    )
+
+
+class TestTelemetryOutcomesAndLogins:
+    def _profile_client(self, monkeypatch, connect):
+        emitter = MagicMock()
+        emitter_type = MagicMock(return_value=emitter)
+        monkeypatch.setattr(nc, "OtlpMetricEmitter", emitter_type)
+        monkeypatch.setattr("snowflake.connector.connect", connect)
+        return CortexTrainingClient._from_profile("training-profile"), emitter, emitter_type
+
+    def test_both_kinds_of_client_send_the_package_version(self, monkeypatch):
+        import cortex_training
+
+        pat = CortexTrainingClient._from_pat(host="x.test", pat="tok", database="DB", schema="SCH")
+        assert pat._metric_emitter.service_version == cortex_training.__version__
+        _client, _emitter, emitter_type = self._profile_client(monkeypatch, lambda **_kw: _fake_connection())
+        assert emitter_type.call_args.kwargs["service_version"] == cortex_training.__version__
+
+    @pytest.mark.parametrize(
+        ("operation", "error", "values", "expected"),
+        [
+            ("download_metrics", nc.NoChunksError("no chunks yet", sub_job_ids=["j1:training:0"], available=[]), {}, True),
+            ("tail_logs", RuntimeError("410"), {"job_ended": True, "job_status": "failed"}, True),
+            ("tail_logs", RuntimeError("409"), {"job_status": "placing"}, True),
+            ("tail_logs", RuntimeError("404"), {"job_status": "running"}, False),
+            ("tail_logs", RuntimeError("reset"), {}, False),
+            ("get_job", RuntimeError("409"), {"job_status": "placing"}, False),
+        ],
+        ids=["no-chunks", "ended", "not-running-yet", "while-running", "no-status", "other-operation"],
+    )
+    def test_which_failures_are_expected(self, operation, error, values, expected):
+        assert nc._expected_failure(operation, error, values) is expected
+
+    def test_a_download_with_nothing_uploaded_is_an_expected_failure(self):
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        error = nc.NoChunksError("no chunks yet", sub_job_ids=["j1:training:0"], available=[])
+
+        c._emit_operation_outcome("download_metrics", time.monotonic(), {"job_id": "j1"}, error=error)
+
+        assert c._metric_emitter.record_operation.call_args.kwargs["outcome"] == "expected_failure"
+        value = c._metric_emitter.emit.call_args.args[1]
+        assert (value["success"], value["expected"]) == (False, True)
+        assert c._metric_emitter.emit.call_args.kwargs["attributes"]["error.type"] == "NoChunksError"
+        assert error._telemetry_operation == "download_metrics"  # for the TUI's error reports
+
+    def test_a_profile_clients_startup_login_is_counted_once_telemetry_exists(self, monkeypatch):
+        c, emitter, _ = self._profile_client(monkeypatch, lambda **_kw: _fake_connection())
+
+        (call,) = emitter.record_operation.call_args_list
+        assert call.args == ("connect",)
+        assert call.kwargs["outcome"] == "success" and call.kwargs["surface"] == "sdk"
+        assert call.kwargs["duration_ms"] >= 0
+        emitter.emit.assert_not_called()  # an SDK client's successes are counted only
+
+        # A download's own login is counted too; a TUI client also sends its record.
+        c._telemetry_surface = nc.TUI_SURFACE
+        c._open_experiment_artifact_connection()
+        assert [call.args for call in emitter.record_operation.call_args_list] == [("connect",)] * 2
+        operation, value = emitter.emit.call_args.args
+        assert operation == "connect"
+        assert (value["reason"], value["success"]) == ("artifact", True)
+
+    def test_a_failed_artifact_login_is_reported_with_the_connectors_error_code(self, monkeypatch):
+        connections = iter((_fake_connection(), _ConnectorError("394400 (08001): Failed to connect", 394400)))
+
+        def connect(**_kwargs):
+            item = next(connections)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        c, emitter, _ = self._profile_client(monkeypatch, connect)
+        with pytest.raises(nc.SnowflakeProfileError):
+            c._open_experiment_artifact_connection()
+
+        assert emitter.record_operation.call_args.kwargs["outcome"] == "failure"
+        operation, value = emitter.emit.call_args.args
+        attributes = emitter.emit.call_args.kwargs["attributes"]
+        assert operation == "connect"
+        assert (value["reason"], value["success"]) == ("artifact", False)
+        assert (attributes["error.type"], attributes["error.code"]) == ("_ConnectorError", "394400")
+
+    def test_a_pat_clients_artifact_login_is_reported(self, monkeypatch):
+        c = CortexTrainingClient._from_pat(host="x.test", pat="tok", database="DB", schema="SCH")
+        c._metric_emitter = MagicMock()
+        monkeypatch.setattr(c, "_snowflake_connection_kwargs", lambda: {"host": "x.test"})
+        monkeypatch.setattr("snowflake.connector.connect", lambda **_kw: _fake_connection())
+
+        c._open_experiment_artifact_connection()
+
+        call = c._metric_emitter.record_operation.call_args
+        assert call.args == ("connect",) and call.kwargs["outcome"] == "success"
+
+    def test_a_login_inside_an_operation_adds_to_its_values(self, monkeypatch):
+        monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "1")
+
+        class Probe(CortexTrainingClient):
+            @nc._track_operation("probe")
+            def probe(self):
+                self._record_connect("artifact", 12.5, None)
+                self._record_connect("artifact", 7.5, None)
+
+        c = Probe(base_url="http://test.local", database="DB", schema="SCH")
+        c._metric_emitter = MagicMock()
+        c.probe()
+
+        (value,) = [call.args[1] for call in c._metric_emitter.emit.call_args_list if call.args[0] == "probe"]
+        assert (value["connect_count"], value["connect_ms"]) == (2, 20.0)
+
+    def test_close_telemetry_sends_what_is_left_and_leaves_a_borrowed_emitter_alone(self):
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+
+        c.for_job({"job_id": "j1", "database_name": "ML", "schema_name": "EXP"}).close_telemetry(timeout=5)
+        c._metric_emitter.close.assert_not_called()
+        c.close_telemetry(timeout=2.5)
+        c._metric_emitter.close.assert_called_once_with(timeout=2.5)
+        c._session.close.assert_not_called()  # its sessions stay open
