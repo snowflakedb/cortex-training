@@ -7,6 +7,9 @@ Before running a training example, you need:
 - Access to a Snowflake account with the Cortex Training endpoint enabled
 - A programmatic access token
 - A database and schema containing the endpoint
+- A role with the `USE CORTEX TRAINING` privilege on the account. `ACCOUNTADMIN` has
+  it; see [Grant access](account_setup.md#grant-access-to-other-roles) for the other
+  roles
 - Sufficient reserved GPU capacity for the selected example
 
 Check current capacity after installing and authenticating:

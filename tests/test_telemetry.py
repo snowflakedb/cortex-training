@@ -17,6 +17,7 @@
 
 import math
 import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -344,3 +345,225 @@ def test_second_interrupt_during_exit_flush_is_quiet(monkeypatch):
 
     monkeypatch.setattr(telemetry, "_EMITTERS", {Interrupted()})
     telemetry._flush_emitters_at_exit()  # returns instead of raising
+
+
+def _metrics_emitter(monkeypatch, **kwargs):
+    token_provider = MagicMock()
+    token_provider.get_token.return_value = "session"
+    emitter = OtlpMetricEmitter(
+        "https://account.test",
+        token_provider,
+        service_version="0.0.2",
+        background=False,
+        **kwargs,
+    )
+    emitter._session = MagicMock()
+    emitter._session.get.return_value = _response({"hostname": f"{COLLECTOR}/system"})
+    emitter._session.post.return_value = _response()
+    now = iter(range(100, 10_000, 100))
+    monkeypatch.setattr(
+        "cortex_training.client.telemetry.time.time_ns", lambda: next(now)
+    )
+    return emitter
+
+
+def _posted_metrics(emitter):
+    payload = emitter._session.post.call_args.kwargs["json"]
+    resource = payload["resourceMetrics"][0]
+    metrics = {
+        metric["name"]: metric for metric in resource["scopeMetrics"][0]["metrics"]
+    }
+    return resource, metrics
+
+
+def test_operation_counts_are_aggregated_and_posted_to_metrics_endpoint(monkeypatch):
+    emitter = _metrics_emitter(monkeypatch)
+
+    emitter.record_operation(
+        "generate", outcome="success", duration_ms=10, request_count=1, surface="sdk"
+    )
+    emitter.record_operation(
+        "generate",
+        outcome="success",
+        duration_ms=50,
+        retry_count=1,
+        request_count=2,
+        surface="sdk",
+    )
+    emitter.record_operation(
+        "generate", outcome="failure", duration_ms=250, request_count=1, surface="sdk"
+    )
+    # Aggregation sends nothing until a flush.
+    emitter._session.post.assert_not_called()
+    assert emitter.flush()
+
+    emitter._session.post.assert_called_once()
+    assert (
+        emitter._session.post.call_args.args[0]
+        == f"https://{COLLECTOR}/system/v1/metrics"
+    )
+    resource, metrics = _posted_metrics(emitter)
+    assert resource["resource"]["attributes"] == [
+        {"key": "service.name", "value": {"stringValue": "cortex-training"}},
+        {"key": "snowflake.account_host", "value": {"stringValue": "account.test"}},
+        {"key": "service.version", "value": {"stringValue": "0.0.2"}},
+    ]
+    count = metrics["cortex.training.client.operation.count"]["sum"]
+    assert count["aggregationTemporality"] == 1
+    failure, success = count["dataPoints"]
+    assert success["attributes"] == [
+        {"key": "operation", "value": {"stringValue": "generate"}},
+        {"key": "outcome", "value": {"stringValue": "success"}},
+        {"key": "client.surface", "value": {"stringValue": "sdk"}},
+    ]
+    assert success["asInt"] == "2"
+    assert failure["asInt"] == "1"
+    duration = metrics["cortex.training.client.operation.duration"]["histogram"][
+        "dataPoints"
+    ][1]
+    assert duration["count"] == "2"
+    assert duration["sum"] == 60
+    assert duration["min"] == 10
+    assert duration["max"] == 50
+    assert duration["bucketCounts"][:2] == ["1", "1"]
+    retries = metrics["cortex.training.client.operation.retries"]["sum"]
+    requests_sent = metrics["cortex.training.client.operation.requests"]["sum"]
+    assert retries["dataPoints"][1]["asInt"] == "1"
+    assert requests_sent["dataPoints"][1]["asInt"] == "3"
+
+
+def test_operation_counts_are_exported_once_then_reset(monkeypatch):
+    emitter = _metrics_emitter(monkeypatch)
+
+    emitter.record_operation("list_jobs", outcome="success", duration_ms=5)
+    assert emitter.flush()
+    assert emitter.flush()  # nothing new: no second export
+    emitter.record_operation("list_jobs", outcome="success", duration_ms=5)
+    assert emitter.flush()
+
+    assert emitter._session.post.call_count == 2
+    _, metrics = _posted_metrics(emitter)
+    points = metrics["cortex.training.client.operation.count"]["sum"]["dataPoints"]
+    assert [point["asInt"] for point in points] == ["1"]
+
+
+def test_operation_counts_keep_surfaces_and_cancelled_apart(monkeypatch):
+    emitter = _metrics_emitter(monkeypatch)
+
+    emitter.record_operation("get_job", outcome="success", duration_ms=1, surface="cli")
+    emitter.record_operation("get_job", outcome="success", duration_ms=1, surface="tui")
+    emitter.record_operation("get_job", outcome="cancelled", duration_ms=1)
+    emitter.record_operation("get_job", outcome="bogus", duration_ms=1)
+    emitter.record_operation("get_job", outcome="success", duration_ms=math.nan)
+    assert emitter.flush()
+
+    _, metrics = _posted_metrics(emitter)
+    points = metrics["cortex.training.client.operation.count"]["sum"]["dataPoints"]
+    assert [
+        {a["key"]: a["value"]["stringValue"] for a in point["attributes"]}
+        for point in points
+    ] == [
+        {"operation": "get_job", "outcome": "cancelled"},
+        {"operation": "get_job", "outcome": "success", "client.surface": "cli"},
+        {"operation": "get_job", "outcome": "success", "client.surface": "tui"},
+    ]
+
+
+def test_closed_emitter_flushes_counts_and_ignores_later_ones(monkeypatch):
+    emitter = _metrics_emitter(monkeypatch)
+
+    emitter.record_operation("create_job", outcome="success", duration_ms=1)
+    emitter.close()
+    emitter.record_operation("create_job", outcome="success", duration_ms=1)
+    emitter.flush()
+
+    emitter._session.post.assert_called_once()
+
+
+def test_operation_count_export_errors_are_swallowed(monkeypatch):
+    emitter = _metrics_emitter(monkeypatch)
+    emitter._session.post.return_value = _response(status_code=503)
+
+    emitter.record_operation("list_jobs", outcome="failure", duration_ms=1)
+    emitter.flush()
+
+    emitter._session.post.assert_called_once()
+
+
+def test_background_worker_exports_counts_after_flush_interval():
+    token_provider = MagicMock()
+    token_provider.get_token.return_value = "session"
+    emitter = OtlpMetricEmitter(
+        "https://account.test",
+        token_provider,
+        metric_flush_interval_seconds=0.05,
+    )
+    exported = threading.Event()
+    emitter._emit_metrics_sync = MagicMock(
+        side_effect=lambda *_args, **_kwargs: exported.set() or True
+    )
+
+    emitter.record_operation("list_jobs", outcome="success", duration_ms=1)
+
+    assert exported.wait(timeout=5)
+    (aggregates,) = emitter._emit_metrics_sync.call_args.args
+    assert aggregates[("list_jobs", "success", None)]["count"] == 1
+    emitter.close()
+
+
+def test_flush_stays_within_its_timeout_while_the_export_lock_is_busy(monkeypatch):
+    emitter = _metrics_emitter(monkeypatch)
+    emitter.record_operation("list_jobs", outcome="success", duration_ms=1)
+    # Stands in for the worker holding the lock during a slow log POST.
+    assert emitter._export_lock.acquire()
+    try:
+        started = time.monotonic()
+        emitter.flush(timeout=0.1)
+        assert time.monotonic() - started < 1.0
+    finally:
+        emitter._export_lock.release()
+
+    emitter._session.post.assert_not_called()
+    # The skipped counts are kept for the next export.
+    assert emitter.flush()
+    _, metrics = _posted_metrics(emitter)
+    points = metrics["cortex.training.client.operation.count"]["sum"]["dataPoints"]
+    assert [point["asInt"] for point in points] == ["1"]
+
+
+def test_metrics_post_timeout_is_capped_by_the_flush_budget(monkeypatch):
+    emitter = _metrics_emitter(monkeypatch)
+    emitter.record_operation("list_jobs", outcome="success", duration_ms=1)
+
+    emitter.flush(timeout=0.5)
+
+    assert emitter._session.post.call_args.kwargs["timeout"] <= 0.5
+
+
+def test_counts_not_exported_are_merged_into_the_next_export(monkeypatch):
+    emitter = _metrics_emitter(monkeypatch)
+    emitter._session.post.side_effect = [_response(status_code=503), _response()]
+
+    emitter.record_operation(
+        "list_jobs", outcome="success", duration_ms=10, request_count=1
+    )
+    emitter.flush()
+    emitter.record_operation(
+        "list_jobs", outcome="success", duration_ms=300, request_count=2
+    )
+    emitter.flush()
+
+    assert emitter._session.post.call_count == 2
+    _, metrics = _posted_metrics(emitter)
+    (count,) = metrics["cortex.training.client.operation.count"]["sum"]["dataPoints"]
+    assert count["asInt"] == "2"
+    (duration,) = metrics["cortex.training.client.operation.duration"]["histogram"][
+        "dataPoints"
+    ]
+    assert duration["min"] == 10
+    assert duration["max"] == 300
+    assert duration["sum"] == 310
+    (requests_sent,) = metrics["cortex.training.client.operation.requests"]["sum"][
+        "dataPoints"
+    ]
+    assert requests_sent["asInt"] == "3"

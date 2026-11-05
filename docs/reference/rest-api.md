@@ -325,6 +325,70 @@ gives it. An error the client raises with its own explanation instead, such as
 Most data-plane calls and request polls require a `running` job. `tail-logs` is
 the exception allowed during `placing`.
 
+### 3.7 Access control
+
+Each call runs as the role of the credential that signs it. A role needs a
+privilege on the database and on the schema in the request path, for example
+`USAGE` on both, and these further privileges for each operation:
+
+| Operation | Required privileges |
+|---|---|
+| Create a job ([5.1](#51-create-job---post-)), including a model deployment | `USE CORTEX TRAINING` on the account. `CREATE EXPERIMENT` on the schema when `experiment_name` is omitted, or `MODIFY` on that experiment when it is named. |
+| Create a job that imports from `external_stage_path` | The privileges above, plus `READ` on that stage. |
+| Create a model deployment from another job's checkpoint | The privileges above. The role must also be the source job's owner role (the role that created it) and have a privilege on the source job's database and schema. |
+| Get, cancel, list checkpoints, export or delete a checkpoint, experiment run, request status, and every training or generation call | The job's owner role (the role that created it). |
+| List jobs ([5.3](#53-list-jobs---get-)) | Returns the jobs the role owns. |
+| Capacity ([5.5](#55-capacity---get-capacity)) | None beyond the database and schema. The per-submitter breakdown counts only jobs the role can list. |
+| List models ([5.4](#54-list-models---get-apiv2cortex-trainingmodels)) | None. |
+| Chat completions on a deployment ([14](#14-model-deployments)) | The deployment's owner role. |
+
+The owner role counts when it is the session's primary role, an active
+secondary role, or inherited by one of them. A job belongs to the role that
+created it, and that ownership cannot be granted to another role. To share
+access, run the workload under one role.
+
+`USE CORTEX TRAINING` is held by `ACCOUNTADMIN`. An `ACCOUNTADMIN` grants it to
+the roles that create jobs:
+
+```sql
+GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE <role_name>;
+```
+
+If a role can already create jobs without `USE CORTEX TRAINING`, grant it the
+privilege anyway, so the role keeps working when the requirement applies to
+your account.
+
+To let every role in the account create jobs, grant it to `PUBLIC`. Do this
+only when the account does not need to limit who can start GPU training:
+
+```sql
+GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE PUBLIC;
+```
+
+A request without a required privilege is refused with the status below. Where
+the cause is a missing privilege on something that may also not exist, the
+response is the same either way, so it does not reveal whether the object
+exists.
+
+| Cause | Status and code | Message |
+|---|---|---|
+| No `USE CORTEX TRAINING` (job creation) | 403, code `003001` | `... Your primary role <role> must have USE CORTEX TRAINING granted on ACCOUNT <account>.` |
+| Database or schema in the path not accessible | 400, code `517602` | `Schema <database>.<schema> is not found or not authorized` |
+| No `CREATE EXPERIMENT` on the schema | 400, code `517602` | `CREATE EXPERIMENT privilege required on schema <schema>` |
+| Named experiment not accessible | 400, code `517602` | `Experiment <name> not found or not authorized` |
+| No `MODIFY` on the named experiment | 400, code `517602` | `MODIFY privilege required on experiment <experiment>` |
+| External stage not accessible, or no `READ` on it | 400, code `517602` | `Stage <stage> is not found or not authorized` |
+| Job not owned by the role, or not found | 404, code `517601` | `Training job <job_id> not found in <schema>` |
+| Source checkpoint for a model deployment not accessible | 404, code `517601` | `Source job was not found or is not authorized for the active roles` |
+| Chat completions: database, schema or deployment not accessible | 404 | `The requested model is not available.` |
+
+Every 400 refusal shares code `517602`, which also covers other invalid
+requests; match the message to tell them apart.
+
+Chat completions report an inaccessible database or schema as 404, unlike the
+management API's 400, so that an inference request cannot tell whether a
+namespace exists.
+
 ---
 
 ## 4. Endpoint index
@@ -463,6 +527,14 @@ values above `604800`, and non-integers.
 
 When either field is set, Get job and List jobs echo it back; when omitted it may
 be absent from those responses.
+
+#### Access control for creating a job
+
+Creating a job needs `USE CORTEX TRAINING` on the account, a privilege on the
+database and schema in the path, and either `CREATE EXPERIMENT` on the schema
+(`experiment_name` omitted) or `MODIFY` on the named experiment. See
+[section 3.7](#37-access-control). Without `USE CORTEX TRAINING` the request is
+refused with 403 before the body is checked.
 
 Response:
 

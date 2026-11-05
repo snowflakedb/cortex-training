@@ -3023,10 +3023,8 @@ class CortexTrainingClient:
         """
         if self._metric_emitter is None:
             return
-        if error is None and not _success_telemetry_enabled(
-            operation, getattr(self, "_telemetry_surface", SDK_SURFACE)
-        ):
-            return
+        surface = getattr(self, "_telemetry_surface", SDK_SURFACE)
+        duration_ms = round((time.monotonic() - started) * 1000, 3)
         try:
             attempt_count = int(
                 getattr(self._operation_metric_state, "attempt_count", 0)
@@ -3034,13 +3032,35 @@ class CortexTrainingClient:
             request_count = int(
                 getattr(self._operation_metric_state, "request_count", 0)
             )
+        except Exception:
+            attempt_count = request_count = 0
+        # Every outcome is counted, so failure rates have a denominator even
+        # though only failures emit a detailed record by default.
+        try:
+            record_operation = getattr(self._metric_emitter, "record_operation", None)
+            if record_operation is not None:
+                record_operation(
+                    operation,
+                    outcome="cancelled"
+                    if cancelled
+                    else ("success" if error is None else "failure"),
+                    duration_ms=duration_ms,
+                    retry_count=max(attempt_count - request_count, 0),
+                    request_count=request_count,
+                    surface=surface,
+                )
+        except Exception:
+            logger.debug("client operation count failed", exc_info=True)
+        if error is None and not _success_telemetry_enabled(operation, surface):
+            return
+        try:
             value: dict[str, Any] = dict(
                 getattr(self._operation_metric_state, "values", None) or {}
             )
             value.update(values or {})
             value |= {
                 "attempt_count": attempt_count,
-                "duration_ms": round((time.monotonic() - started) * 1000, 3),
+                "duration_ms": duration_ms,
                 "request_count": request_count,
                 "retry_count": max(attempt_count - request_count, 0),
                 "success": error is None and not cancelled,
@@ -3439,6 +3459,13 @@ class CortexTrainingClient:
         job may wait for capacity before failing with ``pending_timeout``: between
         300 and 604,800, with no disable value. Omit either to use the server
         default, currently 30 minutes for idle and 24 hours for pending.
+
+        The calling role needs ``USE CORTEX TRAINING`` on the account, plus
+        ``CREATE EXPERIMENT`` on the schema when ``experiment_name`` is omitted
+        or ``MODIFY`` on that experiment when it is given. Without
+        ``USE CORTEX TRAINING`` the service answers 403 and this raises
+        :class:`requests.HTTPError`; an ``ACCOUNTADMIN`` can grant it with
+        ``GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE <role>``.
         """
         if not sub_jobs:
             raise ValueError("create_job requires a non-empty sub_jobs list")

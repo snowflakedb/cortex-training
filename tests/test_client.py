@@ -1042,6 +1042,51 @@ class TestOperationMetrics:
         assert c.step("job-1") == "r1"
         c._metric_emitter.emit.assert_not_called()
 
+    def test_success_is_counted_without_a_detailed_record(self, monkeypatch):
+        monkeypatch.delenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, raising=False)
+        c = _make_client(post_json={"request_id": "r1"})
+        c._metric_emitter = MagicMock()
+
+        assert c.step("job-1") == "r1"
+
+        c._metric_emitter.emit.assert_not_called()
+        c._metric_emitter.record_operation.assert_called_once()
+        assert c._metric_emitter.record_operation.call_args.args == ("step",)
+        kwargs = c._metric_emitter.record_operation.call_args.kwargs
+        assert kwargs["outcome"] == "success"
+        assert kwargs["request_count"] == 1
+        assert kwargs["retry_count"] == 0
+        assert kwargs["surface"] == "sdk"
+        assert kwargs["duration_ms"] >= 0
+
+    def test_failure_is_counted_and_recorded(self):
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        c._session.post.return_value = _make_error_response(
+            {"code": "CORTEX_TRAINING_BAD_REQUEST"}, 400
+        )
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.step("job-1")
+
+        c._metric_emitter.emit.assert_called_once()
+        c._metric_emitter.record_operation.assert_called_once()
+        kwargs = c._metric_emitter.record_operation.call_args.kwargs
+        assert kwargs["outcome"] == "failure"
+        assert kwargs["duration_ms"] == (
+            c._metric_emitter.emit.call_args.args[1]["duration_ms"]
+        )
+
+    def test_operation_count_error_does_not_drop_failure_record(self):
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        c._metric_emitter.record_operation.side_effect = RuntimeError("boom")
+
+        with pytest.raises(ValueError, match="checkpoint_type"):
+            c.save("job-1", checkpoint_type="invalid")
+
+        c._metric_emitter.emit.assert_called_once()
+
     def test_success_metric_has_operation_job_and_duration(self, monkeypatch):
         monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "1")
         c = _make_client(post_json={"request_id": "r1"})

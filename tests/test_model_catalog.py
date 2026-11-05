@@ -242,20 +242,20 @@ def test_files_keep_their_source_sequence_lengths():
         ("Qwen/Qwen3-8B", "standard", "training"): 32768,
         ("Qwen/Qwen3.5-2B", "long", "inference"): 262144,
         ("Qwen/Qwen3.5-2B", "long", "training"): 262144,
-        ("Qwen/Qwen3.5-2B", "standard", "inference"): 32768,
-        ("Qwen/Qwen3.5-2B", "standard", "training"): 32768,
+        ("Qwen/Qwen3.5-2B", "standard", "inference"): 65536,
+        ("Qwen/Qwen3.5-2B", "standard", "training"): 65536,
         ("Qwen/Qwen3.5-4B", "long", "inference"): 262144,
         ("Qwen/Qwen3.5-4B", "long", "training"): 262144,
-        ("Qwen/Qwen3.5-4B", "standard", "inference"): 32768,
-        ("Qwen/Qwen3.5-4B", "standard", "training"): 32768,
+        ("Qwen/Qwen3.5-4B", "standard", "inference"): 65536,
+        ("Qwen/Qwen3.5-4B", "standard", "training"): 65536,
         ("Qwen/Qwen3.5-9B", "long", "inference"): 262144,
         ("Qwen/Qwen3.5-9B", "long", "training"): 262144,
         ("Qwen/Qwen3.5-9B", "standard", "inference"): 65536,
         ("Qwen/Qwen3.5-9B", "standard", "training"): 65536,
         ("Qwen/Qwen3.6-35B-A3B", "long", "inference"): 262144,
         ("Qwen/Qwen3.6-35B-A3B", "long", "training"): 262144,
-        ("Qwen/Qwen3.6-35B-A3B", "standard", "inference"): 32768,
-        ("Qwen/Qwen3.6-35B-A3B", "standard", "training"): 32768,
+        ("Qwen/Qwen3.6-35B-A3B", "standard", "inference"): 65536,
+        ("Qwen/Qwen3.6-35B-A3B", "standard", "training"): 65536,
         ("Qwen/Qwen3.8-27B", "long", "inference"): 262144,
         ("Qwen/Qwen3.8-27B", "long", "training"): 262144,
         ("Qwen/Qwen3.8-27B", "standard", "inference"): 65536,
@@ -818,12 +818,12 @@ def test_sequence_parallel_size_must_divide_the_gpu_count(catalog):
 def test_long_context_must_be_longer_than_standard(catalog):
     _edit_config(
         catalog / "qwen3.6-35b-a3b/long/h200-inference-full.json",
-        lambda config: config.update(max_seq_len=32768),
+        lambda config: config.update(max_seq_len=65536),
     )
 
     _invalid(
         catalog,
-        r"long-context files need a larger max_seq_len than standard ones \(long 32768 <= standard 32768\)",
+        r"long-context files need a larger max_seq_len than standard ones \(long 65536 <= standard 65536\)",
     )
 
 

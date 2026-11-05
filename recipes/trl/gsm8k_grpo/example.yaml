@@ -1,0 +1,15 @@
+id: trl-gsm8k-grpo
+title: GSM8K GRPO with TRL
+status: runnable
+task: rl
+framework: huggingface/trl
+methods:
+  - full-parameter
+models:
+  - Qwen/Qwen3-1.7B
+datasets:
+  - openai/gsm8k
+provenance:
+  project: Snowflake-AI-Research/Arctic-Platform
+  recipe: recipes/rl/trl/gsm8k_cortex/run_qwen3_1.7b_gsm8k_grpo_cortex.sh
+last_validated: 2026-11-03
