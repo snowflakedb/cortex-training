@@ -71,13 +71,15 @@ CustomLossFn = Callable[[Any, list["torch.Tensor"]], tuple["torch.Tensor", Mappi
 
 _BACKWARD_PROCESSING = {"loss_fn": "weighted_cross_entropy", "post": ["compute_logprobs"]}
 # Text in the failure of a server whose loss registry has no weighted_cross_entropy.
-_UNSUPPORTED_SERVER_MARKER = "is not a registered"
+_UNSUPPORTED_SERVER_MARKER = "'weighted_cross_entropy' is not a registered"
 
 _RESPONSE_OPTIONS = {"response_options": {"format": "dssst1", "delivery": "chunked"}}
 _IGNORE_INDEX = -100
 
 
 def _token_ids(value: Any, where: str) -> list[int]:
+    if hasattr(value, "tolist"):
+        value = value.tolist()
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
         raise TypeError(f"{where} must be a sequence of token ids, got {type(value).__name__}")
     if len(value) < 2:

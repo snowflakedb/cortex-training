@@ -6985,9 +6985,10 @@ class CortexTrainingClient:
     ) -> dict:
         """Accumulate the gradient of a loss computed in this process. Blocks until done.
 
-        Each item of ``data`` is a token-id sequence or a mapping with
-        ``"input_ids"`` and any other keys. ``loss_fn(data, logprobs)`` gets
-        ``data`` unchanged and one differentiable float32 tensor per item, of length
+        Each item of ``data`` is a token-id sequence (a list, or a 1-D tensor or
+        array) or a mapping with ``"input_ids"`` and any other keys.
+        ``loss_fn(data, logprobs)`` gets ``data`` unchanged and one
+        differentiable float32 tensor per item, of length
         ``len(input_ids) - 1``, whose element ``j`` is the log-probability of
         token ``j + 1`` given the tokens before it. It returns
         ``(loss, metrics)`` with ``loss``, the custom loss ``L``, a scalar tensor.
@@ -7008,10 +7009,13 @@ class CortexTrainingClient:
         support custom losses yet.
 
         Returns the forward/backward result with ``loss`` (the value of ``L``),
-        ``metrics`` updated with ``loss_fn``'s metrics, ``logprobs`` (what
-        ``loss_fn`` saw, detached), and, when the server returns the backward
-        pass's own log-probabilities, ``logprob_max_abs_diff``: the largest gap
-        between the two passes over all predicted tokens. The server's
+        ``metrics`` updated with ``loss_fn``'s metrics (a name the server also
+        reports is replaced, with a warning), ``logprobs`` (what ``loss_fn``
+        saw, detached), and, when the server returns the backward pass's own
+        log-probabilities, ``logprob_max_abs_diff``: the largest gap between the
+        two passes over all predicted tokens. If those log-probabilities are
+        malformed, it is omitted with a warning, since the gradient has already
+        been accumulated. The server's
         ``metrics["weighted_cross_entropy_objective_sum"]`` is ``L_surrogate``,
         not ``L``.
         """
@@ -7028,9 +7032,18 @@ class CortexTrainingClient:
                 raise
             raise unsupported from exc
         result["loss"] = loss
-        result["metrics"] = {**(result.get("metrics") or {}), **metrics}
+        server_metrics = result.get("metrics") or {}
+        replaced = sorted(set(server_metrics) & set(metrics))
+        if replaced:
+            logger.warning("forward_backward_custom: loss_fn metrics replace the server's metrics %s", replaced)
+        result["metrics"] = {**server_metrics, **metrics}
         result["logprobs"] = logprobs
-        backward_logprobs = custom_loss.logprobs_from_backward_result(result, tokens)
+        try:
+            backward_logprobs = custom_loss.logprobs_from_backward_result(result, tokens)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            # The gradient is already accumulated; raising would invite a retry that applies it twice.
+            logger.warning("forward_backward_custom: omitting logprob_max_abs_diff: %s", exc)
+            backward_logprobs = None
         if backward_logprobs is not None:
             result["logprob_max_abs_diff"] = max(
                 float((before - after).abs().max()) for before, after in zip(logprobs, backward_logprobs)

@@ -53,6 +53,18 @@ def test_focal_loss_counts_well_predicted_tokens_less():
     assert abs(logprobs[0].grad[0]) < 0.001 * abs(logprobs[0].grad[1])
 
 
+@pytest.mark.parametrize(("gamma", "certain_token_grad"), [(0.0, -0.5), (0.5, 0.0), (2.0, 0.0)])
+def test_a_token_predicted_with_certainty_gets_a_finite_gradient(gamma, certain_token_grad):
+    data = [{"input_ids": [1, 2, 3], "loss_mask": [1.0, 1.0]}]
+    logprobs = [torch.tensor([0.0, -1.0], requires_grad=True)]
+
+    loss, _ = task.focal_loss(gamma)(data, logprobs)
+    loss.backward()
+
+    assert torch.isfinite(logprobs[0].grad).all()
+    assert logprobs[0].grad[0].item() == pytest.approx(certain_token_grad)
+
+
 def test_loss_item_aligns_the_mask_with_the_logprobs():
     sequence = TrainSequence(input_ids=[1, 2, 3, 4], loss_mask=[0.0, 1.0, 1.0, 0.0])
 

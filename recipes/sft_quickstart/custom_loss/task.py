@@ -39,7 +39,13 @@ def focal_loss(gamma: float):
             if selected.numel() == 0:
                 continue
             # 1 - p, computed as -expm1(log p) to stay accurate when p is close to 1.
-            sequence_losses.append((-((-torch.expm1(selected)) ** gamma) * selected).mean())
+            one_minus_p = -torch.expm1(selected)
+            # For 0 < gamma < 1, (1 - p) ** gamma has an infinite derivative at p = 1, which
+            # makes the gradient NaN; take the power only where 1 - p > 0 and use 0 ** gamma there.
+            positive = one_minus_p > 0
+            safe = torch.where(positive, one_minus_p, torch.ones_like(one_minus_p))
+            modulator = torch.where(positive, safe**gamma, torch.full_like(one_minus_p, 0.0**gamma))
+            sequence_losses.append((-modulator * selected).mean())
             nll_sum -= float(selected.detach().sum())
             token_count += selected.numel()
         if not sequence_losses:

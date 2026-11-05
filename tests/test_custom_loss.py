@@ -230,6 +230,7 @@ class TestData:
             ([[1, True]], TypeError, "integer token ids"),
             ([[1, -1]], TypeError, "integer token ids"),
             ([[1, 2.0]], TypeError, "integer token ids"),
+            ([torch.tensor([1.0, 2.0])], TypeError, "integer token ids"),
             (["ab"], TypeError, "data\\[0\\] must be a sequence of token ids"),
             ([5], TypeError, "data\\[0\\] must be a sequence of token ids"),
             ([{"tokens": [1, 2]}], ValueError, "without 'input_ids'"),
@@ -242,6 +243,19 @@ class TestData:
         with pytest.raises(error, match=match):
             _client(trainer).forward_backward_custom("job-1", data, _pairwise_loss)
         assert trainer.forward_frames == [] and trainer.backward_frames == []
+
+    def test_tensor_and_array_token_ids_are_read_like_lists(self):
+        np = pytest.importorskip("numpy")
+        trainer = _FakeTrainer()
+        data = [torch.tensor(SEQUENCES[0]), {"input_ids": np.array(SEQUENCES[1])}, SEQUENCES[2]]
+
+        _client(trainer).forward_backward_custom("job-1", data, _pairwise_loss)
+
+        assert trainer.forward_frames[0]["kwargs"]["input_ids"].tolist() == [
+            [1, 4, 2, 7, 3],
+            [5, 9, 6, 0, 0],
+            [8, 2, 10, 4, 0],
+        ]
 
 
 class TestBackwardPass:
@@ -371,6 +385,26 @@ class TestResult:
         result = client.forward_backward_custom("job-1", SEQUENCES, _pairwise_loss)
         assert "logprob_max_abs_diff" not in result
 
+    def test_malformed_backward_logprobs_are_logged_and_the_call_still_returns(self, caplog):
+        trainer = _FakeTrainer()
+        trainer.drift = math.nan
+
+        with caplog.at_level("WARNING", logger="cortex_training.client.core"):
+            result = _client(trainer).forward_backward_custom("job-1", SEQUENCES, _pairwise_loss)
+
+        assert "logprob_max_abs_diff" not in result
+        assert "non-finite logprob" in caplog.text
+        assert len(trainer.backward_frames) == 1
+
+    def test_a_metric_named_like_a_server_metric_replaces_it_with_a_warning(self, caplog):
+        trainer = _FakeTrainer()
+
+        with caplog.at_level("WARNING", logger="cortex_training.client.core"):
+            result = _client(trainer).forward_backward_custom("job-1", SEQUENCES, _pairwise_loss)
+
+        assert result["metrics"]["shared"] == 7.0
+        assert "['shared']" in caplog.text
+
 
 class TestServerWithoutTheLoss:
     def _client_failing_backward(self, error: Exception) -> tuple[_FakeTrainer, CortexTrainingClient]:
@@ -401,6 +435,10 @@ class TestServerWithoutTheLoss:
         "server_error",
         [
             RuntimeError("Request r-1 ended with state 'failed': CUDA out of memory"),
+            RuntimeError(
+                "Request r-1 ended with state 'failed': RegistryError: 'compute_logprobs' is not a registered "
+                "BasePostProcessor"
+            ),
             RuntimeError("Request r-1 ended with state 'cancelled': "),
             TimeoutError("Request r-1 did not complete within 60s"),
         ],
