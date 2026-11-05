@@ -20,23 +20,26 @@ def grant(privilege, grantee, granted_to="ROLE", on="SCHEMA"):
 class Snowflake:
     """Answers the statements the check runs; records them."""
 
-    def __init__(self, schema=(), account=(), session=("TRAINER",), database_roles=(), secondary=None):
+    def __init__(self, schema=(), account=(), session=("TRAINER",), database_roles=(), secondary=None, secondary_roles=()):
         self.schema, self.account = list(schema), list(account)
         self.session, self.database_roles = set(session), set(database_roles)
         self.secondary = secondary or {"roles": "", "value": ""}
+        # Roles active as secondary roles, until USE SECONDARY ROLES NONE turns them off.
+        self.secondary_roles, self.secondary_on = set(secondary_roles), True
         self.statements = []
         self.fail = {}
 
-    def run(self, client, statement):
+    def run(self, client, statement, timeout=None):
         self.statements.append(statement)
         for pattern, error in self.fail.items():
             if pattern in statement:
                 raise RuntimeError(error)
         if statement.startswith("SELECT CURRENT_SECONDARY_ROLES()"):
-            return [{"roles": json.dumps(self.secondary)}]
+            return [{"roles": json.dumps(self.secondary if self.secondary_on else {"roles": "", "value": ""})}]
         if statement.startswith("SELECT CURRENT_ROLE()"):
             return [{"role": "TRAINER"}]
         if statement.startswith("USE SECONDARY ROLES"):
+            self.secondary_on = not statement.endswith("NONE")
             return []
         if statement.startswith("SHOW GRANTS ON SCHEMA"):
             return self.schema
@@ -45,7 +48,8 @@ class Snowflake:
         if statement.startswith("SELECT IS_"):
             roles = re.findall(r"IS_ROLE_IN_SESSION\('([^']*)'\)", statement)
             database_roles = re.findall(r"IS_DATABASE_ROLE_IN_SESSION\('([^']*)'\)", statement)
-            held = any(role in self.session for role in roles) or any(role in self.database_roles for role in database_roles)
+            active = self.session | (self.secondary_roles if self.secondary_on else set())
+            held = any(role in active for role in roles) or any(role in self.database_roles for role in database_roles)
             return [{"held": held}]
         raise AssertionError(f"unexpected statement: {statement}")
 
@@ -171,7 +175,7 @@ class SqlApiSnowflake(Snowflake):
         self.granted_to = granted_to or {}  # role -> roles it's granted to
         self.invisible = set(invisible)
 
-    def run(self, client, statement):
+    def run(self, client, statement, timeout=None):
         for pattern, error in self.fail.items():
             if pattern in statement:
                 self.statements.append(statement)
@@ -222,3 +226,59 @@ def test_through_the_sql_api_another_error_is_couldnt_check(sql_api):
     world.fail = {"SHOW GRANTS OF ROLE": "390114: authentication token has expired"}
     access = _job_access.check(CLIENT, "TRAINER")
     assert access.unknown and "expired" in access.unknown and access.missing == ()
+
+
+# Which roles count depends on the privilege (as the service decides it) ------
+
+
+def test_use_cortex_training_held_through_a_secondary_role_counts(snowflake):
+    # Not a create privilege: active secondary roles count, so it's checked with them on.
+    snowflake.secondary = {"roles": "ANALYST", "value": "ALL"}
+    snowflake.secondary_roles = {"ANALYST"}
+    snowflake.schema = [grant("CREATE EXPERIMENT", "TRAINER")]
+    snowflake.account = [*ENABLED, grant("USE CORTEX TRAINING", "ANALYST", on="ACCOUNT")]
+    assert _job_access.check(CLIENT, "TRAINER").ready
+    # And secondary roles are on again by the time it's checked.
+    assert snowflake.statements.index("USE SECONDARY ROLES ALL") < snowflake.statements.index("SHOW GRANTS ON ACCOUNT")
+
+
+def test_create_experiment_held_only_through_a_secondary_role_doesnt_count(snowflake):
+    # A create privilege: only the primary role's hierarchy counts.
+    snowflake.secondary = {"roles": "ANALYST", "value": "ALL"}
+    snowflake.secondary_roles = {"ANALYST"}
+    snowflake.schema = [grant("CREATE EXPERIMENT", "ANALYST")]
+    snowflake.account = [*ENABLED, grant("USE CORTEX TRAINING", "PUBLIC", on="ACCOUNT")]
+    access = _job_access.check(CLIENT, "TRAINER")
+    assert [m.privilege for m in access.missing] == ["CREATE EXPERIMENT"]
+
+
+def test_with_secondary_roles_and_no_warehouse_use_cortex_training_is_couldnt_check(sql_api):
+    # The walk follows only the primary role, so it can't stand in for secondary roles.
+    world = sql_api()
+    world.secondary = {"roles": "ANALYST", "value": "ALL"}
+    world.schema = [grant("CREATE EXPERIMENT", "TRAINER")]
+    world.account = [*ENABLED, grant("USE CORTEX TRAINING", "ANALYST", on="ACCOUNT")]
+    access = _job_access.check(CLIENT, "TRAINER")
+    assert access.unknown and "warehouse" in access.unknown and access.missing == ()
+
+
+def test_the_walk_is_bounded_and_quick(sql_api):
+    # A long chain of roles: it stops at the cap with "couldn't check", each step with a short timeout.
+    chain = {f"R{i}": [f"R{i + 1}"] for i in range(40)}
+    world = sql_api(granted_to=chain)
+    world.schema = [grant("CREATE EXPERIMENT", "R0")]
+    world.account = ENABLED
+    seen_timeouts = []
+    original = world.run
+
+    def run(client, statement, timeout=None):
+        if statement.startswith("SHOW GRANTS OF ROLE"):
+            seen_timeouts.append(timeout)
+        return original(client, statement, timeout)
+
+    import cortex_training._database_setup as setup
+
+    setup.run_statement = run
+    access = _job_access.check(CLIENT, "TRAINER")
+    assert access.unknown == "the role hierarchy is too large to check"
+    assert len(seen_timeouts) <= _job_access._MAX_WALK and set(seen_timeouts) == {_job_access._WALK_TIMEOUT_SECONDS}

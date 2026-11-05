@@ -384,8 +384,11 @@ A passing check (`✓ Connected to Cortex Training on this account`) means the
 profile connects to Cortex Training on that account. Login, and
 `--convert-legacy-config`, then check whether the role can **create training
 jobs**: it needs `CREATE EXPERIMENT` on the schema (each job creates its own
-experiment) and `USE CORTEX TRAINING` on the account. Both are read-only checks
-of the role's grants, including ones it inherits.
+experiment) and `USE CORTEX TRAINING` on the account (see
+[Access control](rest-api.md#37-access-control)). Both are read-only checks of
+the role's grants, including ones it inherits. As when a job is created, only
+the primary role counts for `CREATE EXPERIMENT`, and active secondary roles
+count too for `USE CORTEX TRAINING`.
 
 - `✓ Role R can create training jobs in DB.SCHEMA`: ready.
 - `! Role R can't create training jobs yet`: it lists what's missing and the

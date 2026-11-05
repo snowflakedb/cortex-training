@@ -172,3 +172,26 @@ def test_sql_is_never_built_from_a_name_that_is_not_an_identifier(monkeypatch):
     with pytest.raises(ValueError, match="isn't a valid database name"):
         _database_setup.is_listed(client, "database", "a b")
     assert client.sent == []
+
+
+def test_a_sql_api_result_in_several_partitions_is_read_in_full(monkeypatch):
+    # Large results (SHOW GRANTS ON ACCOUNT on a big account) come in partitions; every one is read.
+    first = {
+        "statementHandle": "01b2-handle",
+        "resultSetMetaData": {"rowType": [{"name": "NAME"}], "partitionInfo": [{"rowCount": 2}, {"rowCount": 1}, {"rowCount": 1}]},
+        "data": [["A"], ["B"]],
+    }
+    client = pat_client(monkeypatch, first, {"data": [["C"]]}, {"data": [["D"]]})
+    assert [row["name"] for row in _database_setup.run_statement(client, "SHOW GRANTS ON ACCOUNT")] == ["A", "B", "C", "D"]
+    gets = [(method, url, kwargs.get("params")) for method, url, kwargs in client.sent[1:]]
+    assert gets == [
+        ("GET", "https://acme-main.snowflakecomputing.com/api/v2/statements/01b2-handle", {"partition": 1}),
+        ("GET", "https://acme-main.snowflakecomputing.com/api/v2/statements/01b2-handle", {"partition": 2}),
+    ]
+
+
+def test_a_partitioned_result_without_a_handle_is_an_error_not_a_short_list(monkeypatch):
+    first = {"resultSetMetaData": {"rowType": [{"name": "NAME"}], "partitionInfo": [{}, {}]}, "data": [["A"]]}
+    client = pat_client(monkeypatch, first)
+    with pytest.raises(RuntimeError, match="2 partitions but no statement handle"):
+        _database_setup.run_statement(client, "SHOW GRANTS ON ACCOUNT")

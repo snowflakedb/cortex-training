@@ -26,9 +26,13 @@ Each is checked in two read-only steps: ``SHOW GRANTS ON SCHEMA`` / ``ON ACCOUNT
 lists the roles that hold it, then ``IS_ROLE_IN_SESSION`` asks whether the
 session's role is one of them or inherits one. Through the SQL API (a PAT
 client) that function needs a warehouse, so there the check walks up from each
-holder with ``SHOW GRANTS OF ROLE`` instead, which needs none. Creating an object uses only
-the primary role and the roles it inherits, so active secondary roles are
-turned off for the check and turned back on afterwards. Anything unexpected
+holder with ``SHOW GRANTS OF ROLE`` instead, which needs none.
+
+Which roles count depends on the privilege, as the service decides it:
+``CREATE EXPERIMENT`` is a create privilege, so only the primary role and the
+roles it inherits count, and active secondary roles are turned off for that
+check (and back on afterwards). ``USE CORTEX TRAINING`` isn't, so active
+secondary roles count too, and it's checked with them on. Anything unexpected
 gives "couldn't check", never a false warning.
 """
 
@@ -49,8 +53,10 @@ USE_CORTEX_TRAINING = "USE CORTEX TRAINING"
 _OWNERSHIP = "OWNERSHIP"
 # More holders than this would make one very long query; say "couldn't check" instead.
 _MAX_HOLDERS = 200
-# The walk up the role hierarchy asks about at most this many roles.
-_MAX_WALK = 50
+# The walk up the role hierarchy asks about at most this many roles, each with a
+# short timeout, so a large hierarchy can't stall login.
+_MAX_WALK = 20
+_WALK_TIMEOUT_SECONDS = 15
 # Snowflake's "does not exist or not authorized": a role the session can't see isn't one it inherits.
 _NOT_VISIBLE = "002003"
 
@@ -87,20 +93,24 @@ def check(client: Any, role: str | None) -> JobAccess:
         schema = f"{client.database}.{client.schema}"
         _database_setup.check_identifier("database", client.database)
         _database_setup.check_identifier("schema", client.schema)
+        missing = []
+        secondary = _active_secondary_roles(client)
+        # Create privileges count only the primary role's hierarchy: secondary roles off.
         with _primary_role_only(client):
-            missing = []
             holders = _holders(client, f"SHOW GRANTS ON SCHEMA {schema}", CREATE_EXPERIMENT)
             if not _held(client, holders, role):
                 missing.append(
                     Missing(CREATE_EXPERIMENT, f"schema {schema}", f"GRANT CREATE EXPERIMENT ON SCHEMA {schema} TO ROLE {_quoted(role)};")
                 )
-            holders = _holders(client, "SHOW GRANTS ON ACCOUNT", USE_CORTEX_TRAINING)
-            # An account where the privilege doesn't exist yet lists no holder at all,
-            # not even ACCOUNTADMIN, which holds it wherever it exists.
-            if holders and not _held(client, holders, role):
-                missing.append(
-                    Missing(USE_CORTEX_TRAINING, "the account", f"GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE {_quoted(role)};")
-                )
+        # USE CORTEX TRAINING also counts active secondary roles: checked as the session is.
+        holders = _holders(client, "SHOW GRANTS ON ACCOUNT", USE_CORTEX_TRAINING)
+        # An account where the privilege doesn't exist yet lists no holder at all,
+        # not even ACCOUNTADMIN, which holds it wherever it exists.
+        # The walk follows only the primary role, so it can't stand in for secondary roles.
+        if holders and not _held(client, holders, role, walk=not secondary):
+            missing.append(
+                Missing(USE_CORTEX_TRAINING, "the account", f"GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE {_quoted(role)};")
+            )
         return JobAccess(role=role, missing=tuple(missing))
     except Exception as exc:  # Never a false warning: anything unexpected is "couldn't check".
         logger.debug("Could not check job-creation privileges.", exc_info=True)
@@ -120,9 +130,8 @@ class _primary_role_only:
         self.restore: str | None = None
 
     def __enter__(self) -> None:
-        rows = _database_setup.run_statement(self.client, "SELECT CURRENT_SECONDARY_ROLES() AS roles")
-        active = json.loads(rows[0]["roles"]) if rows and rows[0].get("roles") else {}
-        if not (active.get("roles") or active.get("value")):
+        active = _active_secondary_roles(self.client)
+        if not active:
             return
         _database_setup.run_statement(self.client, "USE SECONDARY ROLES NONE")
         value = str(active.get("value") or "").upper()
@@ -136,6 +145,13 @@ class _primary_role_only:
                 logger.debug("Could not turn secondary roles back on.", exc_info=True)
 
 
+def _active_secondary_roles(client: Any) -> dict[str, Any]:
+    """The session's active secondary roles, as CURRENT_SECONDARY_ROLES() reports them; empty when none."""
+    rows = _database_setup.run_statement(client, "SELECT CURRENT_SECONDARY_ROLES() AS roles")
+    active = json.loads(rows[0]["roles"]) if rows and rows[0].get("roles") else {}
+    return active if active.get("roles") or active.get("value") else {}
+
+
 def _holders(client: Any, statement: str, privilege: str) -> list[tuple[str, str]]:
     """``(granted_to, grantee_name)`` for each grant of ``privilege`` (or ownership) in ``statement``."""
     found = []
@@ -145,8 +161,12 @@ def _holders(client: Any, statement: str, privilege: str) -> list[tuple[str, str
     return found
 
 
-def _held(client: Any, holders: list[tuple[str, str]], role: str) -> bool:
-    """Whether the session's role is, or inherits, one of ``holders``."""
+def _held(client: Any, holders: list[tuple[str, str]], role: str, *, walk: bool = True) -> bool:
+    """Whether the session's roles are, or inherit, one of ``holders``.
+
+    ``walk=False`` refuses the warehouse-free fallback, which follows only the
+    primary role: for a privilege that secondary roles also count for.
+    """
     if any(kind == "ROLE" and name.upper() == "PUBLIC" for kind, name in holders):
         return True  # Every role has PUBLIC.
     tests = []
@@ -162,7 +182,7 @@ def _held(client: Any, holders: list[tuple[str, str]], role: str) -> bool:
     try:
         rows = _database_setup.run_statement(client, f"SELECT {' OR '.join(tests)} AS held")
     except Exception as exc:
-        if "warehouse" not in str(exc).lower():
+        if "warehouse" not in str(exc).lower() or not walk:
             raise
         return _inherits(client, holders, role)  # The SQL API runs functions only with a warehouse.
     return bool(rows and rows[0].get("held"))
@@ -183,7 +203,9 @@ def _inherits(client: Any, holders: list[tuple[str, str]], role: str) -> bool:
             raise RuntimeError("the role hierarchy is too large to check")
         what = "ROLE" if kind == "ROLE" else "DATABASE ROLE"
         try:
-            rows = _database_setup.run_statement(client, f"SHOW GRANTS OF {what} {_quoted_name(name)}")
+            rows = _database_setup.run_statement(
+                client, f"SHOW GRANTS OF {what} {_quoted_name(name)}", timeout=_WALK_TIMEOUT_SECONDS
+            )
         except Exception as exc:
             if _NOT_VISIBLE in str(exc):
                 continue  # Not visible to the session, so not inherited by it.
