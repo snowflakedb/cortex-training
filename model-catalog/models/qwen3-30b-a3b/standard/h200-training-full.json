@@ -17,6 +17,12 @@
           "mode": "full",
           "freq": 1
         },
+        "model_options": {
+          "lm_head": {
+            "token_chunk_size": 8192,
+            "cross_entropy": false
+          }
+        },
         "ep_size": 4,
         "optimizer": {
           "name": "AdamW",

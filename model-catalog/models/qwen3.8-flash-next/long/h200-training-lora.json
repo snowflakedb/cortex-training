@@ -37,6 +37,7 @@
         "step_peak_memory_log": true,
         "model_options": {
           "lm_head": {
+            "token_chunk_size": 8192,
             "cross_entropy": false
           }
         },

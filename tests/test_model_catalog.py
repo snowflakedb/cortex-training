@@ -197,6 +197,7 @@ def test_validation_dates_match_completed_live_smokes():
     }
 
     assert validated == {
+        ("Qwen/Qwen3-30B-A3B", "standard/h200-training-full"): "2026-11-05",
         ("Qwen/Qwen3-4B-Instruct-2507", "long/h200-inference-full"): "2026-10-14",
         ("Qwen/Qwen3-4B-Instruct-2507", "long/h200-training-full"): "2026-10-14",
         ("Qwen/Qwen3.5-4B", "standard/h200-training-full"): "2026-09-02",
@@ -208,6 +209,7 @@ def test_validation_dates_match_completed_live_smokes():
         ("Qwen/Qwen3.8-27B", "long/h200-training-full"): "2026-09-02",
         ("Qwen/Qwen3.8-27B", "long/h200-training-lora"): "2026-09-02",
         ("Qwen/Qwen3.8-Flash-Next", "long/h200-training-full"): "2026-11-05",
+        ("Qwen/Qwen3.8-Flash-Next", "long/h200-training-lora"): "2026-11-05",
         ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "long/h200-training-full"): "2026-10-23",
         ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "long/h200-training-lora"): "2026-10-26",
         ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "standard/h200-training-full"): "2026-10-23",
