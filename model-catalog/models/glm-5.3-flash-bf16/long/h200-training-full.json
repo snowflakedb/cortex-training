@@ -9,13 +9,13 @@
       "training_config": {
         "n_gpus": 64,
         "max_seq_len": 262144,
-        "train_batch_size": 4,
+        "train_batch_size": 2,
         "gradient_clipping": 1.0,
         "model_provider": "arctic",
         "attn_implementation": "sparse_mla",
         "cuda_allocator_conf": "expandable_segments:True",
         "activation_checkpointing": true,
-        "sp_size": 16,
+        "sp_size": 32,
         "ep_size": 32,
         "ep_group_layout": "auto",
         "mb_spec": {
@@ -38,8 +38,7 @@
         "step_peak_memory_log": true,
         "model_options": {
           "moe": {
-            "comm_backend": "uccl",
-            "comm_token_chunk": 8192
+            "comm_backend": "uccl"
           },
           "lm_head": {
             "cross_entropy": false
