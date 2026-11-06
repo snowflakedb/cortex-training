@@ -39,6 +39,9 @@ The reference documents in this repository are the contract to code against:
   frames.
 - Assertions on serialized payloads should decode them (`wire.loads`) rather
   than only checking `isinstance(payload, bytes)`, which any encoding satisfies.
+- When CLI commands, their output, or their error messages change, update the
+  agent skill in `src/cortex_training/skills/` that describes them
+  (`tests/test_skills.py` checks its commands still parse).
 - When you change a default, a flag, or a field, update the docs that quote it in
   the same change: `docs/reference/cli.md`, `docs/reference/rest-api.md`, and the
   example READMEs plus `example.yaml`.

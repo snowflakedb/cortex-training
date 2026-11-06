@@ -166,6 +166,9 @@ integrations.
 ## Documentation
 
 - **New users:** [account setup and first job](https://github.com/snowflakedb/cortex-training/blob/main/docs/getting-started/README.md)
+- **Coding agents:** `cortex-training skills install` gives your agent a
+  [setup skill](https://github.com/snowflakedb/cortex-training/blob/main/docs/reference/cli.md#agent-skill)
+  to check and fix your Cortex Training connection
 - **Recipe users:** [complete recipe index](https://github.com/snowflakedb/cortex-training/blob/main/recipes/README.md)
 - **Model selection:** [model compatibility](https://github.com/snowflakedb/cortex-training/blob/main/docs/reference/model-compatibility.md)
   and [model catalog](https://github.com/snowflakedb/cortex-training/blob/main/model-catalog/README.md)
