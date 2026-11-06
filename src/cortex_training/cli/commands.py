@@ -564,6 +564,27 @@ def build_parser(
         description="List active models configured for new jobs.",
     )
 
+    skills = subparsers.add_parser(
+        "skills",
+        help="Install the agent skill that helps coding agents check your Cortex Training setup.",
+        description="Manage the cortex-training-setup agent skill that ships with this package.",
+    )
+    skills_commands = skills.add_subparsers(dest="skills_command", required=True)
+    skills_install = skills_commands.add_parser(
+        "install",
+        help="Copy the skill into an agent's skills folder (default ~/.claude/skills).",
+        description=(
+            "Copy the cortex-training-setup skill into an agent's skills folder, replacing an earlier copy "
+            "of it. Anything else in that folder is left alone."
+        ),
+    )
+    skills_install.add_argument(
+        "--dir",
+        dest="skills_dir",
+        default=None,
+        help="Skills folder to install into (default ~/.claude/skills, where Claude Code loads skills).",
+    )
+
     subparsers.add_parser(
         "status",
         help="Show where commands connect (profile, account, database) and why, without signing in.",
@@ -1352,7 +1373,7 @@ def parse_args(
             parser.error(f"--until must be earlier than {date.max}")
         if args.user is not None and not args.user.strip():
             parser.error("--user must not be empty")
-    if args.command == "login":
+    if args.command in ("login", "skills"):
         return args
 
     dry_run = args.command == "submit" and args.dry_run
@@ -1656,6 +1677,35 @@ class _CapturedNotes(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         self.notes.append(record.getMessage())
+
+
+def _cmd_skills_install(args: argparse.Namespace, stdout: TextIO, stderr: TextIO) -> int:
+    """Copy the packaged agent skill into an agent's skills folder, and say where."""
+    from cortex_training import __version__
+    from cortex_training import _skills
+
+    root = Path(args.skills_dir).expanduser() if args.skills_dir else None
+    try:
+        target, replaced = _skills.install(root)
+    except _skills.SkillsError as exc:
+        stderr.write(f"error: {exc}\n")
+        return 1
+    done = "Updated" if replaced else "Installed"
+    stderr.write(f"{done} the {_skills.SKILL_NAME} agent skill (cortex-training {__version__}) in {target}.\n")
+    stderr.write('Ask your agent something like "check my Cortex Training setup".\n')
+    _print_json({"skill": _skills.SKILL_NAME, "path": str(target), "version": __version__, "replaced": replaced}, stdout, compact=args.compact)
+    return 0
+
+
+def _write_skill_update_note(stderr: TextIO) -> None:
+    """Say, in a terminal, when the installed agent skill no longer matches this version."""
+    if not getattr(stderr, "isatty", lambda: False)():
+        return
+    from cortex_training import _skills
+
+    note = _skills.update_note()
+    if note:
+        stderr.write(note + "\n")
 
 
 def _cmd_status(args: argparse.Namespace, stdout: TextIO, stderr: TextIO) -> int:
@@ -2466,9 +2516,15 @@ def _run(
 ) -> int:
     stderr = stderr or sys.stderr
     if args.command == "login":
-        return _cmd_login(args, stdin, stdout, stderr)
+        code = _cmd_login(args, stdin, stdout, stderr)
+        _write_skill_update_note(stderr)
+        return code
     if args.command == "status":
-        return _cmd_status(args, stdout, stderr)
+        code = _cmd_status(args, stdout, stderr)
+        _write_skill_update_note(stderr)
+        return code
+    if args.command == "skills":
+        return _cmd_skills_install(args, stdout, stderr)
 
     if args.command == "submit" and args.dry_run:
         return _cmd_submit(args, None, stdout, stdin)
@@ -2563,7 +2619,7 @@ def main(
             and args.model_deployment_command == "create"
             and args.dry_run
         )
-        no_client = dry_run or args.command in ("login", "status")
+        no_client = dry_run or args.command in ("login", "status", "skills")
         if client_factory is None and not no_client:
             cortex_training_client_cls = _load_cortex_training_client_class()
 

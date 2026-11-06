@@ -86,6 +86,7 @@ cortex-training list                          # Use the profile login saved
 cortex-training --connection training list    # Use another profile for one command
 cortex-training status                        # Show where commands connect, and why
 cortex-training --version                     # Show the installed version
+cortex-training skills install                # Give your coding agent the setup skill
 ```
 
 ### [Submit Jobs](#submit-a-job)
@@ -475,6 +476,27 @@ with code 2.
 It reads only local files and the environment. To check that a profile works,
 run `cortex-training login NAME`. `cortex-training --version` prints the
 installed version.
+
+### Agent Skill
+
+```bash
+cortex-training skills install                    # into ~/.claude/skills (Claude Code)
+cortex-training skills install --dir PATH         # into another agent's skills folder
+```
+
+The package ships an agent skill, `cortex-training-setup`, for coding agents
+that load `SKILL.md` folders. With it, an agent checks which profile, account
+and database Cortex Training uses (`cortex-training status`), confirms the
+connection (`cortex-training capacity`), and explains how to fix what doesn't
+work. It runs only read-only commands, never asks for or shows a token, and
+asks you to run `cortex-training login` yourself.
+
+`skills install` copies the skill to `PATH/cortex-training-setup` and records
+the cortex-training version it came from. Running it again replaces only that
+folder, and only if it holds this skill. After you upgrade cortex-training,
+`status` and `login` say (in a terminal) when the skill installed in
+`~/.claude/skills` differs from the new version's; run `skills install` again
+to update it.
 
 ### Manage Existing Jobs
 
