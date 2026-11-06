@@ -396,6 +396,9 @@ count too for `USE CORTEX TRAINING`.
   reaches Cortex Training, so it's saved, and login ends with "Saved, but not
   ready for training" instead of "You're all set". Run `cortex-training login`
   again once the privileges are granted.
+- `! Role R doesn't have USE CORTEX TRAINING yet`: until Snowflake enforces
+  that privilege, jobs still start without it, so this is a heads-up with the
+  `GRANT` to ask for, and login still ends with "You're all set".
 - `? Could not check whether role R can create training jobs`: the check
   couldn't run; login carries on.
 

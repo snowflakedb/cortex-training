@@ -1213,3 +1213,18 @@ def test_keeping_the_saved_profile_offers_the_same_database_choice_as_login_name
     assert "It works. Keep using train?" in err
     assert "Profile train uses database TRAIN_DB." in err and "Which database should Cortex Training use?" in err
     assert summary["profile"] == "train"
+
+
+def test_only_use_cortex_training_missing_is_a_heads_up_until_enforced(isolated):
+    # Snowflake doesn't enforce it yet, so jobs still start: ready, with the GRANT to ask for.
+    write_profiles(isolated, PROFILES)
+    _picker.save_profile("train")
+    world = World(databases={"TRAIN_DB"})
+    world.missing_privileges = (_job_access.USE_CORTEX_TRAINING,)
+    code, summary, err = login(world, ["", ""])
+    assert code == 0, err
+    assert "✓ Role TRAINER can create training jobs in TRAIN_DB.PUBLIC" in err
+    assert "! Role TRAINER doesn't have USE CORTEX TRAINING yet. Creating training jobs will need it once Snowflake enforces it." in err
+    assert "GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE TRAINER;" in err
+    assert "You're all set." in err and "not ready for training" not in err
+    assert summary["ready_for_training"] is True and summary["missing_privileges"] == ["USE CORTEX TRAINING"]

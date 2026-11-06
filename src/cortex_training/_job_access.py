@@ -49,6 +49,9 @@ logger = logging.getLogger(__name__)
 
 CREATE_EXPERIMENT = "CREATE EXPERIMENT"
 USE_CORTEX_TRAINING = "USE CORTEX TRAINING"
+# Privileges Snowflake doesn't enforce yet: without one, jobs still start today, so it's a
+# heads-up rather than "can't create jobs". Empty this once enforcement starts.
+NOT_ENFORCED_YET = frozenset({USE_CORTEX_TRAINING})
 # An owner holds every privilege on the object it owns.
 _OWNERSHIP = "OWNERSHIP"
 # More holders than this would make one very long query; say "couldn't check" instead.
@@ -79,8 +82,14 @@ class JobAccess:
     unknown: str | None = None
 
     @property
+    def blocking(self) -> tuple[Missing, ...]:
+        """The missing privileges that stop job creation today."""
+        return tuple(item for item in self.missing if item.privilege not in NOT_ENFORCED_YET)
+
+    @property
     def ready(self) -> bool:
-        return self.unknown is None and not self.missing
+        """Whether the role can create jobs today (a privilege not enforced yet doesn't count)."""
+        return self.unknown is None and not self.blocking
 
 
 def check(client: Any, role: str | None) -> JobAccess:

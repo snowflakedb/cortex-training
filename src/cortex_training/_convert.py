@@ -545,7 +545,7 @@ def run_convert(
     if not style.decorate:
         prompter.say()
     access = converter.job_access
-    if access is not None and access.missing:
+    if access is not None and access.blocking:
         prompter.say(
             style.yellow(style.bold("Saved, but not ready for training.")) + f" Cortex Training will use profile {style.bold(plan.profile)}."
         )

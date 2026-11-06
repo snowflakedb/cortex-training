@@ -282,3 +282,11 @@ def test_the_walk_is_bounded_and_quick(sql_api):
     access = _job_access.check(CLIENT, "TRAINER")
     assert access.unknown == "the role hierarchy is too large to check"
     assert len(seen_timeouts) <= _job_access._MAX_WALK and set(seen_timeouts) == {_job_access._WALK_TIMEOUT_SECONDS}
+
+
+def test_a_privilege_not_enforced_yet_doesnt_make_the_role_not_ready(snowflake):
+    snowflake.schema = [grant("CREATE EXPERIMENT", "TRAINER")]
+    snowflake.account = ENABLED
+    access = _job_access.check(CLIENT, "TRAINER")
+    assert [m.privilege for m in access.missing] == ["USE CORTEX TRAINING"]
+    assert access.blocking == () and access.ready

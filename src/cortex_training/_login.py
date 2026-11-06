@@ -298,6 +298,18 @@ def say_job_access(prompter: Any, access: Any, schema: str) -> None:
         prompter.say(f"  {s.unknown(f'Could not check whether role {access.role} can create training jobs ({access.unknown}); continuing')}")
     elif not access.missing:
         prompter.say(f"  {s.ok(f'Role {access.role} can create training jobs in {schema}')}")
+    elif not access.blocking:
+        # Only privileges Snowflake doesn't enforce yet: jobs still start, so a heads-up.
+        prompter.say(f"  {s.ok(f'Role {access.role} can create training jobs in {schema}')}")
+        for item in access.missing:
+            heads_up = (
+                f"Role {access.role} doesn't have {item.privilege} yet. Creating training jobs will need it "
+                "once Snowflake enforces it."
+            )
+            prompter.say(f"  {s.warn(heads_up)}")
+        prompter.say("    Ask an account admin to run:")
+        for item in access.missing:
+            prompter.say(f"      {s.cyan(item.grant)}")
     else:
         # The profile still signs in and reaches Cortex Training: a warning, not a failure.
         heading = f"Role {access.role} can't create training jobs yet. It needs:"
@@ -1121,7 +1133,7 @@ def run_login(
         prompter.say(style.dim(f"(Saved in {_home(saved)}.)"))
         prompter.say()
         prompter.say(f"To check it later, run:  {style.cyan('cortex-training login')}")
-    elif access is not None and access.missing:
+    elif access is not None and access.blocking:
         prompter.say(style.yellow(style.bold("Saved, but not ready for training.")) + f" Cortex Training will use profile {style.bold(chosen)}.")
         for line in not_ready_lines(access):
             prompter.say(line)
