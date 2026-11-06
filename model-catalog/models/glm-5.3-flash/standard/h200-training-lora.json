@@ -36,7 +36,7 @@
         },
         "tiled_mlp_token_chunk_size": 1024,
         "step_peak_memory_log": true,
-	"model_options": {
+        "model_options": {
           "moe": {
             "comm_backend": "deepep",
             "comm_token_chunk": 8192
