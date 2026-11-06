@@ -52,7 +52,7 @@ class Config:
     job_id: str | None = None
 
     # The job comes from model-catalog/models/; job_config= replaces it with a file.
-    model: str = "Qwen/Qwen3-8B"
+    model: str = "Qwen/Qwen3.5-9B"
     context: str = "standard"
     hardware: str = "h200"
     lora: bool = True

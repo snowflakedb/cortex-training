@@ -178,7 +178,7 @@ def test_the_job_is_the_lora_sft_job_with_the_dpo_learning_rate():
     body = job_body(train.Config(config="unused"))
     (training,) = [sub for sub in body["sub_job_configs"] if sub["job_type"] == "training"]
     (expected,) = [
-        sub for sub in make_config("Qwen/Qwen3-8B", "standard", lora=True)["sub_job_configs"]
+        sub for sub in make_config("Qwen/Qwen3.5-9B", "standard", lora=True)["sub_job_configs"]
         if sub["job_type"] == "training"
     ]
 
