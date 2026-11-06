@@ -225,7 +225,6 @@ def test_validation_dates_match_completed_live_smokes():
         ("zai-org/GLM-5.3-Flash", "long/h200-inference-lora"): "2026-10-20",
         ("zai-org/GLM-5.3-Flash", "long/h200-training-lora"): "2026-10-20",
         ("zai-org/GLM-5.3-Flash-BF16", "long/h200-inference-full"): "2026-10-20",
-        ("zai-org/GLM-5.3-Flash-BF16", "long/h200-training-full"): "2026-10-20",
     }
 
 
