@@ -1313,17 +1313,14 @@ def _source_text(resolution: Any, key: str, flag: str) -> str:
 
 def target_line(resolution: Any) -> str:
     """One line naming the profile (or CI host), database, and schema, and where each came from."""
-    def source(key: str, flag: str) -> str:
-        return _source_text(resolution, key, flag)
-
     who = (
-        f"profile {resolution.profile} ({source('profile', '--connection')})"
+        f"profile {resolution.profile} ({_source_text(resolution, 'profile', '--connection')})"
         if resolution.profile is not None
         else f"host {resolution.host} ({resolution.sources['host']})"
     )
     return (
-        f"→ {who} · database {resolution.database} ({source('database', '--database')}) · "
-        f"schema {resolution.schema} ({source('schema', '--schema')})\n"
+        f"→ {who} · database {resolution.database} ({_source_text(resolution, 'database', '--database')}) · "
+        f"schema {resolution.schema} ({_source_text(resolution, 'schema', '--schema')})\n"
     )
 
 
@@ -1641,6 +1638,26 @@ def _cmd_list(args: argparse.Namespace, client, stdout: TextIO) -> int:
     return 0
 
 
+# Every key `status` prints, in order, so scripts (and the TUI) always get the same shape.
+_STATUS_KEYS = (
+    "version", "connection", "profile", "profile_source", "config_file", "base_url",
+    "account", "host", "user", "role", "signs_in_with", "usable",
+    "database", "database_source", "schema", "schema_source",
+    "profile_file", "config_json", "warnings",
+)
+
+
+class _CapturedNotes(logging.Handler):
+    """Collects the picker's notes (such as "Using database X from …") while they still reach stderr."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.notes: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.notes.append(record.getMessage())
+
+
 def _cmd_status(args: argparse.Namespace, stdout: TextIO, stderr: TextIO) -> int:
     """Report where a command would connect and why, the way commands resolve it, without signing in."""
     from cortex_training import __version__
@@ -1648,63 +1665,82 @@ def _cmd_status(args: argparse.Namespace, stdout: TextIO, stderr: TextIO) -> int
     from cortex_training import _picker
     from cortex_training import _profiles
 
-    report: dict[str, Any] = {"version": __version__}
-    if args.base_url:
-        report.update(connection="base_url", base_url=args.base_url, database=args.database, schema=args.schema)
-        line = f"→ base URL {args.base_url} · database {args.database} · schema {args.schema}\n"
-    elif args.use_connection_profile:
+    report: dict[str, Any] = dict.fromkeys(_STATUS_KEYS)
+    report["version"] = __version__
+    warnings = list(getattr(args, "_deprecations", ()))
+    if args.use_connection_profile and not args.base_url:
+        captured = _CapturedNotes()
+        picker_logger = logging.getLogger(_picker.__name__)
+        picker_logger.addHandler(captured)
         try:
             resolution = _picker_choice(args)
         except _picker.PickerError as exc:
             stderr.write(f"error: {exc}\n")
             return 2
-        if resolution.profile is None:
-            # No profile exists: CORTEX_TRAINING_HOST and CORTEX_TRAINING_PAT (CI).
-            report.update(
-                connection="environment",
-                host=resolution.host,
-                host_source=resolution.sources["host"],
-                signs_in_with="a programmatic access token (CORTEX_TRAINING_PAT)",
-            )
-        else:
-            values = _profiles.read_profiles().get(resolution.profile, {})
-            report.update(
-                connection="profile",
-                profile=resolution.profile,
-                profile_source=_source_text(resolution, "profile", "--connection"),
-                account=values.get("account"),
-                host=values.get("host"),
-                user=values.get("user"),
-                role=values.get("role"),
-                signs_in_with=_login.describe_profile(values).sign_in or None,
-            )
+        finally:
+            picker_logger.removeHandler(captured)
+        warnings.extend(captured.notes)
+        # The profile's own settings; the Connector may derive what's missing (a host from the account).
+        values = _profiles.read_profiles().get(resolution.profile, {})
+        hint = _login.describe_profile(values)
         report.update(
+            connection="profile",
+            profile=resolution.profile,
+            profile_source=_source_text(resolution, "profile", "--connection"),
+            account=values.get("account"),
+            host=values.get("host"),
+            user=values.get("user"),
+            role=values.get("role"),
+            signs_in_with=hint.sign_in or None,
+            usable=hint.usable and hint.verdict != _login.WONT_SIGN_IN,
             database=resolution.database,
             database_source=_source_text(resolution, "database", "--database"),
             schema=resolution.schema,
             schema_source=_source_text(resolution, "schema", "--schema"),
         )
+        # What commands would fail on, in the words login uses.
+        if not hint.usable:
+            warnings.append(f"Profile {resolution.profile} can't be used: {hint.summary}.")
+        elif hint.verdict == _login.WONT_SIGN_IN:
+            warnings.append(f"Profile {resolution.profile} likely won't sign in: it has {hint.sign_in}.")
         line = target_line(resolution)
     else:
-        # An older connection method, which still decides as it did (with its warning above).
+        # A base URL, or an older connection method, which still decides as it did (with its warning).
         legacy = bool(getattr(args, "_legacy_config_selected", False))
-        report["connection"] = "config file" if legacy else "flags or environment"
-        if legacy:
-            report["config_file"] = args.config
+        config = _load_config(args.config, strict=False) if legacy else {}
+        typed = getattr(args, "_typed", {})
+
+        def source(name: str, flag: str, env_names: tuple[str, ...], default: str = "default") -> str:
+            if typed.get(name):
+                return f"from {flag}"
+            if _config_str(config, name):
+                return "from the config file"
+            env = next((env for env in env_names if _env(env)), None)
+            return f"from {env}" if env else default
+
         report.update(
-            host=_normalize_host(args.host) if args.host else None,
-            signs_in_with="a programmatic access token",
+            connection="base_url" if args.base_url else ("config file" if legacy else "flags or environment"),
+            config_file=args.config if legacy else None,
+            base_url=args.base_url,
+            host=_normalize_host(args.host) if args.host and not args.base_url else None,
+            signs_in_with=None if args.base_url else "a programmatic access token",
+            usable=True,
             database=args.database,
+            database_source=source("database", "--database", ("CORTEX_TRAINING_DATABASE", "SNOWFLAKE_DATABASE")),
             schema=args.schema,
+            schema_source=source("schema", "--schema", ("CORTEX_TRAINING_SCHEMA", "SNOWFLAKE_SCHEMA")),
         )
-        what = f"old JSON config {args.config}" if legacy else f"host {report['host']} (flags or environment)"
+        if args.base_url:
+            what = f"base URL {args.base_url}"
+        else:
+            what = f"old JSON config {args.config}" if legacy else f"host {report['host']} (flags or environment)"
         line = f"→ {what} · database {args.database} · schema {args.schema}\n"
     try:
         report["profile_file"] = str(_profiles.profile_file())
     except _profiles.ProfileFileError:
         report["profile_file"] = None
     report["config_json"] = str(_picker.config_path())
-    report["warnings"] = list(getattr(args, "_deprecations", ()))
+    report["warnings"] = warnings
     if getattr(stderr, "isatty", lambda: False)():
         stderr.write(line)
     _print_json(report, stdout, compact=args.compact, sort_keys=False)

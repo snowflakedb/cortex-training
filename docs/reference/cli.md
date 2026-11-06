@@ -452,13 +452,25 @@ cortex-training --connection other status
 
 `status` shows where a command would connect, and why, without signing in. It
 resolves the connection exactly as other commands do, including `--connection`,
-`--database` and `--schema`, then prints JSON: `connection` (`profile`, or
-`config file` / `flags or environment` / `base_url` for the older methods), the
-profile and where it came from, its `account`, `host`, `user`, `role` and how it
-signs in (`signs_in_with`), the `database` and `schema` with their sources, the
-`profile_file` and `config_json` paths, and any `warnings`. It never shows a
-token or password. In a terminal it also prints the one-line summary commands
-print. With nothing set up, it says how to start and exits with code 2.
+`--database` and `--schema`, then prints JSON with the same keys every time
+(`null` where one doesn't apply):
+
+- `connection`: `profile`, or for the older methods `config file`,
+  `flags or environment`, or `base_url`; with `profile` and `profile_source`,
+  or `config_file`, or `base_url`;
+- `account`, `host`, `user`, `role`: the profile's own settings. The Connector
+  may fill in what's missing (a host from the account), and HTTPS calls use the
+  hyphen form of an underscore account host;
+- `signs_in_with`, and `usable`: `false` when commands would fail on the
+  profile, for example one with no `user`, with the reason in `warnings`;
+- `database` and `schema`, each with its `_source`;
+- `profile_file` and `config_json` paths;
+- `warnings`: deprecation notes for an older method, notes such as "Using
+  database X from CORTEX_TRAINING_DATABASE.", and why a profile isn't usable.
+
+It never shows a token or password. In a terminal it also prints the one-line
+summary commands print. With nothing set up, it says how to start and exits
+with code 2.
 
 It reads only local files and the environment. To check that a profile works,
 run `cortex-training login NAME`. `cortex-training --version` prints the

@@ -4468,11 +4468,14 @@ def test_status_reports_the_saved_profile_and_where_each_value_came_from(monkeyp
         "connection": "profile",
         "profile": "train",
         "profile_source": "saved by cortex-training login",
+        "config_file": None,
+        "base_url": None,
         "account": "ACME",
         "host": "acme.snowflakecomputing.com",
         "user": "ME",
         "role": "TRAINER",
         "signs_in_with": "a programmatic access token (no prompts)",
+        "usable": True,
         "database": "TRAIN_DB",
         "database_source": "from profile train",
         "schema": "PUBLIC",
@@ -4509,8 +4512,8 @@ def test_status_with_ci_variables_and_no_profile(monkeypatch):
         monkeypatch, CORTEX_TRAINING_HOST="ci.snowflakecomputing.com", CORTEX_TRAINING_PAT="ci-tok", CORTEX_TRAINING_DATABASE="CI_DB"
     )
     assert code == 0
-    assert report["connection"] == "flags or environment" and "config_file" not in report
-    assert (report["host"], report["database"]) == ("ci.snowflakecomputing.com", "CI_DB")
+    assert report["connection"] == "flags or environment" and report["config_file"] is None
+    assert (report["host"], report["database"], report["database_source"]) == ("ci.snowflakecomputing.com", "CI_DB", "from CORTEX_TRAINING_DATABASE")
     assert "ci-tok" not in json.dumps(report)
 
 
@@ -4528,3 +4531,36 @@ def test_status_with_nothing_set_up_says_how_to_start(monkeypatch):
     code, report, err = _status(monkeypatch)
     assert code == 2 and report is None
     assert "Run `cortex-training login` to set one up" in err
+
+
+
+def test_status_always_has_the_same_keys(monkeypatch, tmp_path):
+    # Scripts and the TUI read it: every connection kind gives the same keys, null where they don't apply.
+    _token_profile("train")
+    _save_choice("train")
+    _, from_profile, _ = _status(monkeypatch)
+    config = _write_config(tmp_path, {"host": "old.snowflakecomputing.com", "pat": "old-tok", "database": "OLD_DB"})
+    _, from_file, _ = _status(monkeypatch, ["--config", str(config)])
+    assert list(from_profile) == list(from_file) == list(cli._STATUS_KEYS)
+    assert (from_file["profile"], from_file["user"], from_file["role"]) == (None, None, None)
+    assert (from_file["database_source"], from_file["schema_source"]) == ("from the config file", "default")
+
+
+def test_status_warns_about_a_profile_commands_cant_use(monkeypatch):
+    path = Path(os.environ["SNOWFLAKE_HOME"]) / "connections.toml"
+    path.write_text('[nouser]\naccount = "ACME"\n\n[badtoken]\naccount = "ACME"\nuser = "ME"\ntoken = "tok"\n')
+    code, report, _ = _status(monkeypatch, ["--connection", "nouser"])
+    assert code == 0 and report["usable"] is False
+    assert "Profile nouser can't be used: no user set." in report["warnings"]
+    code, report, _ = _status(monkeypatch, ["--connection", "badtoken"])
+    assert report["usable"] is False
+    assert any(w.startswith("Profile badtoken likely won't sign in: it has a token, but Snowflake will ignore it") for w in report["warnings"])
+
+
+def test_status_includes_the_pickers_own_notes(monkeypatch):
+    # They reach stderr as before, and now the JSON too, where jq can see them.
+    _token_profile("train")
+    _save_choice("train")
+    code, report, _ = _status(monkeypatch, CORTEX_TRAINING_DATABASE="ENV_DB")
+    assert code == 0 and report["database"] == "ENV_DB"
+    assert "Using database ENV_DB from CORTEX_TRAINING_DATABASE." in report["warnings"]
