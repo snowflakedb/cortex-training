@@ -1385,6 +1385,12 @@ def build_client(args: argparse.Namespace, cortex_training_client_cls):
             kwargs[option] = value
     if args.base_url:
         return cortex_training_client_cls(base_url=args.base_url, **kwargs)
+    # The program making the calls (client.surface), which the CLI and the TUI set on
+    # their args: a profile client reports the login it is built with, so it must know
+    # the surface before then. A --base-url client has no telemetry.
+    surface = getattr(args, "telemetry_surface", None)
+    if surface:
+        kwargs["telemetry_surface"] = surface
     if args.use_connection_profile:
         args.resolution = _picker_choice(args)
         options = {key: kwargs[key] for key in kwargs if key not in ("database", "schema")}
@@ -2599,8 +2605,10 @@ def main(
             def default_client_factory(parsed_args: argparse.Namespace) -> Any:
                 from cortex_training.client import CLI_SURFACE
 
+                # Its metrics say a command made the call (client.surface), its
+                # sign-in's included (see build_client).
+                parsed_args.telemetry_surface = CLI_SURFACE
                 client = build_client(parsed_args, cortex_training_client_cls)
-                # Its metrics say a command made the call (client.surface).
                 client._telemetry_surface = CLI_SURFACE
                 if getattr(parsed_args, "resolution", None) is not None:
                     write_target_line(parsed_args.resolution, stderr)

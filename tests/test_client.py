@@ -10146,12 +10146,12 @@ def _fake_connection(token="session-token"):
 
 
 class TestTelemetryOutcomesAndLogins:
-    def _profile_client(self, monkeypatch, connect):
+    def _profile_client(self, monkeypatch, connect, **kwargs):
         emitter = MagicMock()
         emitter_type = MagicMock(return_value=emitter)
         monkeypatch.setattr(nc, "OtlpMetricEmitter", emitter_type)
         monkeypatch.setattr("snowflake.connector.connect", connect)
-        return CortexTrainingClient._from_profile("training-profile"), emitter, emitter_type
+        return CortexTrainingClient._from_profile("training-profile", **kwargs), emitter, emitter_type
 
     def test_both_kinds_of_client_send_the_package_version(self, monkeypatch):
         import cortex_training
@@ -10187,7 +10187,33 @@ class TestTelemetryOutcomesAndLogins:
         value = c._metric_emitter.emit.call_args.args[1]
         assert (value["success"], value["expected"]) == (False, True)
         assert c._metric_emitter.emit.call_args.kwargs["attributes"]["error.type"] == "NoChunksError"
-        assert error._telemetry_operation == "download_metrics"  # for the TUI's error reports
+        # For the TUI's error reports: which call it came from, and that it's no fault.
+        assert (error._telemetry_operation, error._telemetry_expected) == ("download_metrics", True)
+
+        other = RuntimeError("boom")
+        c._emit_operation_outcome("get_job", time.monotonic(), {"job_id": "j1"}, error=other)
+        assert (other._telemetry_operation, other._telemetry_expected) == ("get_job", False)
+
+    @pytest.mark.parametrize("surface", [nc.CLI_SURFACE, nc.TUI_SURFACE])
+    def test_the_login_a_cli_or_tui_client_is_built_with_has_its_surface(self, monkeypatch, surface):
+        c, emitter, _ = self._profile_client(
+            monkeypatch, lambda **_kw: _fake_connection(), telemetry_surface=surface
+        )
+
+        assert c._telemetry_surface == surface
+        (call,) = emitter.record_operation.call_args_list
+        assert (call.args, call.kwargs["surface"]) == (("connect",), surface)
+        if surface == nc.TUI_SURFACE:  # a TUI client sends its successes' records too
+            operation, value = emitter.emit.call_args.args
+            assert (operation, value["reason"]) == ("connect", "startup")
+            assert emitter.emit.call_args.kwargs["attributes"]["client.surface"] == "tui"
+        else:
+            emitter.emit.assert_not_called()
+
+    def test_a_pat_resolution_takes_the_surface_too(self):
+        resolution = SimpleNamespace(profile=None, host="x.test", pat="tok", database="DB", schema="SCH")
+        c = CortexTrainingClient._from_resolution(resolution, telemetry_surface=nc.CLI_SURFACE)
+        assert c._telemetry_surface == nc.CLI_SURFACE
 
     def test_a_profile_clients_startup_login_is_counted_once_telemetry_exists(self, monkeypatch):
         c, emitter, _ = self._profile_client(monkeypatch, lambda **_kw: _fake_connection())

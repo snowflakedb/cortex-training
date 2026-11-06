@@ -326,3 +326,34 @@ def test_quitting_while_the_collector_hangs_waits_only_the_telemetry_budget(monk
 
 def test_the_tui_waits_no_longer_on_telemetry_than_on_its_sessions():
     assert tui_main.TELEMETRY_CLOSE_SECONDS <= tui_main.SESSION_CLOSE_SECONDS
+
+
+def test_an_expected_failure_is_not_reported_and_leaves_the_minute_to_real_ones():
+    client = MagicMock()
+    reporter = telemetry.ErrorReporter(client, clock=lambda: 100.0)
+    waiting = requests.exceptions.HTTPError("409 job j-1 is pending placement")
+    waiting._telemetry_operation, waiting._telemetry_expected = "tail_logs", True  # as the client marks it
+
+    reporter(waiting, "tui/logs.py:2607 _tail")  # a tail waiting for its job to start
+    client.emit_metric.assert_not_called()
+
+    failed = requests.exceptions.HTTPError("409 session gone")
+    failed._telemetry_operation, failed._telemetry_expected = "tail_logs", False
+    reporter(failed, "tui/logs.py:2607 _tail")  # same kind, a real failure: still reported
+    assert client.emit_metric.call_args.args[1]["occurrences"] == 1
+
+
+def test_the_tui_builds_its_client_as_the_tui(monkeypatch):
+    # Set before building: a profile client reports the login it is built with.
+    seen = []
+    monkeypatch.delenv("CORTEX_TRAINING_CONNECTION", raising=False)
+    monkeypatch.setattr(
+        "cortex_training.cli.commands.build_client",
+        lambda args, cls: seen.append(args.telemetry_surface) or MagicMock(),
+    )
+    parser = tui_main._build_arg_parser()
+    args = parser.parse_args(["--base-url", "http://localhost:1", "--database", "DB"])
+
+    client, _sign_in = tui_main._build_read_only_client(parser, args)
+    assert seen == ["tui"]
+    assert client._telemetry_surface == "tui"

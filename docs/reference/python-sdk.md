@@ -176,7 +176,7 @@ operation's event.
 | Event | Sent | Body |
 |---|---|---|
 | `tui_startup` | Once, when the screen it opened with first shows its data: the job list, or the job it was opened on | `view` (`job_list` or `job`), `duration_ms` from launch, and `client_build_ms`, the part spent reading the config, importing the Connector and signing in. Also counted as an operation |
-| `tui_error` | For each error the TUI writes to its error log, at most once a minute per kind | `where` it was logged and `raised_at` (both `path:line function` inside the package), the `operation` that failed with it when one did, and `occurrences` since its kind was last sent; `error.type`, with `error.http_status` and `error.code` for an HTTP error. Never the error's text or the log's label, which can quote job IDs, schemas and paths |
+| `tui_error` | For each error the TUI writes to its error log, at most once a minute per kind, except a failure already counted as `expected_failure` (a log tail waiting for its job, a download with nothing uploaded yet) | `where` it was logged and `raised_at` (both `path:line function` inside the package), the `operation` that failed with it when one did, and `occurrences` since its kind was last sent; `error.type`, with `error.http_status` and `error.code` for an HTTP error. Never the error's text or the log's label, which can quote job IDs, schemas and paths |
 
 Each emitted event body contains `success`, `duration_ms`, `request_count`,
 `attempt_count`, and `retry_count`. Failures also include a bounded

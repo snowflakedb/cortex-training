@@ -2871,13 +2871,15 @@ class CortexTrainingClient:
         verify_ssl: bool = True,
         *,
         telemetry_timeout: float = 3.0,
+        telemetry_surface: str | None = None,
         **kwargs: Any,
     ) -> "CortexTrainingClient":
         """Authenticate with a Programmatic Access Token (PAT).
 
         Sends ``Authorization: Bearer <pat>`` plus the
         ``X-Snowflake-Authorization-Token-Type: PROGRAMMATIC_ACCESS_TOKEN`` header
-        on every request. No login round-trip.
+        on every request. No login round-trip. ``telemetry_surface`` is the
+        program making the calls (``client.surface``), when it isn't the SDK.
         """
         client = cls(
             base_url=f"https://{rest_host(host)}",
@@ -2886,6 +2888,8 @@ class CortexTrainingClient:
             endpoint=endpoint,
             **kwargs,
         )
+        if telemetry_surface:
+            client._telemetry_surface = telemetry_surface
         client._session.headers["Authorization"] = f"Bearer {pat}"
         client._session.headers["X-Snowflake-Authorization-Token-Type"] = "PROGRAMMATIC_ACCESS_TOKEN"
         client._session.verify = verify_ssl
@@ -2916,6 +2920,7 @@ class CortexTrainingClient:
         endpoint: str = "cortex-training",
         verify_ssl: bool = True,
         telemetry_timeout: float = 3.0,
+        telemetry_surface: str | None = None,
         **kwargs: Any,
     ) -> "CortexTrainingClient":
         """Authenticate through a named or configured-default Snowflake profile.
@@ -2923,7 +2928,9 @@ class CortexTrainingClient:
         Profile discovery and authentication are delegated to
         ``snowflake-connector-python``. The live Connector session token is sent
         to the Cortex Training API, and the Connector session is recreated once
-        if the API reports token expiry.
+        if the API reports token expiry. ``telemetry_surface`` is the program
+        making the calls (``client.surface``), when it isn't the SDK; it is set
+        here so the login the client is built with is reported with it.
         """
         auth = SnowflakeProfileAuth(connection_name)
         resolved_database = database or auth.database
@@ -2947,6 +2954,8 @@ class CortexTrainingClient:
         client._auth_provider = auth
         client._artifact_connection_factory = auth.open_artifact_connection
         client._session.verify = verify_ssl
+        if telemetry_surface:
+            client._telemetry_surface = telemetry_surface
         if not _telemetry_disabled():
             client._metric_emitter = OtlpMetricEmitter(
                 client.base_url,
@@ -2955,7 +2964,8 @@ class CortexTrainingClient:
                 verify_ssl=verify_ssl,
                 timeout=telemetry_timeout,
             )
-            # Its logins, the one it was just built with included (see _record_connect).
+            # Its logins, the one it was just built with included (see _record_connect):
+            # that one is reported now, so the surface is set above, not by the caller later.
             auth.set_connect_listener(client._record_connect)
         return client
 
@@ -3076,8 +3086,9 @@ class CortexTrainingClient:
 
         A failure its callers expect (see :func:`_expected_failure`) is counted
         under the ``expected_failure`` outcome, and its record says
-        ``expected``. A reported error is marked with the operation's name, for
-        the TUI's error reports to say which call it came from.
+        ``expected``. A reported error is marked with the operation's name and
+        whether it was expected, for the TUI's error reports: they say which
+        call an error came from, and skip the expected ones.
         """
         if self._metric_emitter is None:
             return
@@ -3100,6 +3111,7 @@ class CortexTrainingClient:
             if error is not None and not cancelled:
                 expected = _expected_failure(operation, error, recorded)
                 error._telemetry_operation = operation  # type: ignore[attr-defined]
+                error._telemetry_expected = expected  # type: ignore[attr-defined]
         except Exception:
             logger.debug("client operation outcome classification failed", exc_info=True)
         if cancelled:

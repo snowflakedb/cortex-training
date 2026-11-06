@@ -4602,3 +4602,31 @@ def test_a_telemetry_close_that_raises_does_not_change_the_commands_outcome():
     stdout = io.StringIO()
     assert cli.main(_base_args() + ["models"], client_factory=lambda _args: Broken(), stdout=stdout) == 0
     assert json.loads(stdout.getvalue())["models"]
+
+
+def test_build_client_passes_its_surface_into_construction(tmp_path, monkeypatch):
+    # A profile client reports the login it is built with, so it must know its
+    # surface then, not only once build_client returns.
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "missing.json"))
+    _write_profiles("training-profile")
+    args = cli.parse_args(["--connection", "training-profile", "list"])
+    args.telemetry_surface = "cli"
+    client_cls = MagicMock()
+
+    cli.build_client(args, client_cls)
+    assert client_cls._from_resolution.call_args.kwargs["telemetry_surface"] == "cli"
+
+    pat_args = cli.parse_args(["--host", "x.test", "--pat", "p", "--database", "DB", "list"])
+    pat_args.telemetry_surface = "cli"
+    cli.build_client(pat_args, client_cls)
+    assert client_cls._from_pat.call_args.kwargs["telemetry_surface"] == "cli"
+
+
+def test_the_commands_build_their_client_as_the_cli(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        cli, "build_client", lambda args, cls: seen.append(args.telemetry_surface) or FakeClient()
+    )
+
+    assert cli.main(_base_args() + ["list"], stdout=io.StringIO()) == 0
+    assert seen == ["cli"]

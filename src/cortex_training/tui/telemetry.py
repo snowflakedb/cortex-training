@@ -68,6 +68,10 @@ class ErrorReporter:
     ``path:line function`` in this package), the client ``operation`` that failed with
     it when one did, and the ``occurrences`` since its kind was last reported. Not its
     text, nor the log's label.
+
+    An error the client already counted as an expected failure (a log tail waiting
+    for its job to start, a download with nothing uploaded yet) isn't reported: its
+    operation's ``expected_failure`` outcome says so already.
     """
 
     def __init__(self, client: Any, *, clock=time.monotonic) -> None:
@@ -78,6 +82,8 @@ class ErrorReporter:
         self._kinds: dict[tuple[str, str], list] = {}
 
     def __call__(self, error: BaseException, where: str) -> None:
+        if getattr(error, "_telemetry_expected", False):
+            return
         kind = (where, type(error).__name__)
         now = self._clock()
         with self._lock:

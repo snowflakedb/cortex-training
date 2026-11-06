@@ -240,18 +240,19 @@ def _build_read_only_client(parser: argparse.ArgumentParser, args: argparse.Name
     # defaults (ten retries, a ten-minute read timeout) left a view silent for
     # about a minute on a 404 or a failing service.
     args.max_retries, args.request_timeout = READ_MAX_RETRIES, READ_TIMEOUT
+    from cortex_training.client import TUI_SURFACE
     from cortex_training.client.auth import SnowflakeProfileError
 
+    # Its metrics, and its for_job clients', say the TUI made the call (client.surface),
+    # and so also report successes and their timings; the sign-in it is built with too
+    # (see cli.build_client).
+    args.telemetry_surface = TUI_SURFACE
     try:
         client = cli.build_client(args, cli._load_cortex_training_client_class())
     except (SnowflakeProfileError, ValueError) as exc:
         # With no config, login state or flags, the TUI tries the configured-default
         # Snowflake connection, which a first run doesn't have: say how to connect.
         parser.exit(2, f"{parser.prog}: error: {exc}\n{_CONNECT_HINT}\n")
-    # Its metrics, and its for_job clients', say the TUI made the call (client.surface),
-    # and so also report successes and their timings.
-    from cortex_training.client import TUI_SURFACE
-
     client._telemetry_surface = TUI_SURFACE
     if getattr(args, "resolution", None) is not None:
         cli.write_target_line(args.resolution, sys.stderr)
