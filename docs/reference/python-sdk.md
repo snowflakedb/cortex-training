@@ -192,12 +192,14 @@ also has the `job_status` it read, such as `placing` for a job whose logs are
 not there yet; a call that succeeded on a retry has none.
 
 Two failures are ones their callers expect rather than faults: a `tail_logs`
-of a job that has ended or isn't running yet (`job_ended`, or a `job_status`
-other than `running`), and a download with nothing uploaded yet
-(`NoChunksError`). Their events still have `success: false`, with
-`expected: true`, and they are counted under the `expected_failure` outcome, so
-failure rates can leave them out. A `tail_logs` that fails while its job runs
-is a failure.
+answered that its session isn't there (404, 409 or 410) for a job that has
+ended or isn't running yet (`job_ended`, or a `job_status` other than
+`running`), and a download with nothing uploaded yet (`NoChunksError`). Their
+events still have `success: false`, with `expected: true`, and they are counted
+under the `expected_failure` outcome, so failure rates can leave them out. A
+`tail_logs` that fails while its job runs, fails another way after such an
+answer (a reset, a timeout, no token, a 429 or 5xx), or names a sub-job its job
+doesn't have, is a failure.
 
 Download events add these body fields:
 
@@ -239,10 +241,11 @@ Two attributes carry Snowflake request IDs:
 `snowflake.request_id` is a deprecated alias of `error.snowflake_request_id`,
 emitted for one release. Records and metrics use OTLP resource attributes
 `service.name = cortex-training`,
-`snowflake.account_host = <normalized connection hostname>`,
-`service.version = <this package's version>`, and
+`snowflake.account_host = <normalized connection hostname>`, and
+`service.version = <this package's version>`. Records also carry
 `service.instance.id = <a random id per process>`, which groups one SDK
-script's, CLI command's or TUI session's records and metrics.
+script's, CLI command's or TUI session's records; metrics leave it out, so a
+process doesn't add series of its own.
 
 Applications can emit additional events through the same helper. They carry
 `client.surface` too, unless `attributes` gives one:

@@ -291,15 +291,21 @@ def _expected_failure(
     """True when a failed call failed the way its callers expect, not as a fault.
 
     Two do: a download with nothing uploaded yet (``NoChunksError``), and a log
-    tail of a job that has ended or isn't running yet (the ``job_ended`` and
-    ``job_status`` values :meth:`CortexTrainingClient.tail_logs` records). A tail
-    that fails while its job runs is a real failure. Expected failures still
-    report ``success`` false, with ``expected`` true, and are counted under the
-    ``expected_failure`` outcome, so failure rates leave them out.
+    tail answered that its session isn't there (404, 409 or 410) for a job that
+    has ended or isn't running yet (the ``job_ended`` and ``job_status`` values
+    :meth:`CortexTrainingClient.tail_logs` records). A tail that fails while its
+    job runs, fails another way after such an answer (a reset, a timeout, no
+    token, a 429 or 5xx), or names a sub-job its job doesn't have, is a real
+    failure. Expected failures still report ``success`` false, with ``expected``
+    true, and are counted under the ``expected_failure`` outcome, so failure
+    rates leave them out.
     """
     if isinstance(error, NoChunksError):
         return True
-    if operation != "tail_logs":
+    if operation != "tail_logs" or getattr(error, "sub_job_missing", False):
+        return False
+    response = getattr(error, "response", None)
+    if getattr(response, "status_code", None) not in _TAIL_SESSION_GONE_STATUSES:
         return False
     status = values.get("job_status")
     return bool(values.get("job_ended")) or (
@@ -337,6 +343,8 @@ def _package_version() -> str | None:
 # won't fix itself.
 _TRANSIENT_STATUSES = {429, 500, 502, 503, 504, 404, 409, 307, 308}
 _JOB_NOT_FOUND_CODE = "517601"
+# A tail-logs answer that says the sub-job's session isn't there (see _tail_hint).
+_TAIL_SESSION_GONE_STATUSES = frozenset({404, 409, 410})
 # Job states after which nothing more runs, and a sub-job's pods (and so its
 # live logs) are gone. The API reports `cancelled`, `terminated` and `failed`;
 # the other spellings are accepted for robustness.
@@ -7602,6 +7610,9 @@ class CortexTrainingClient:
             )
             # Lets stream_logs end a tail cleanly when the job ends under it.
             error.job_ended = bool(checked.get("ended"))  # type: ignore[attr-defined]
+            # A sub-job the job doesn't have is the caller's mistake, whatever the job's
+            # status: never an expected failure (see _expected_failure).
+            error.sub_job_missing = bool(checked.get("sub_job_missing"))  # type: ignore[attr-defined]
             if error.job_ended:  # type: ignore[attr-defined]
                 # Still a failed call, but an expected one: the metric says so.
                 self._operation_values()["job_ended"] = True
@@ -7631,7 +7642,7 @@ class CortexTrainingClient:
         if not isinstance(exc, requests.exceptions.HTTPError):
             return None
         response = exc.response
-        if response is None or response.status_code not in (404, 409, 410):
+        if response is None or response.status_code not in _TAIL_SESSION_GONE_STATUSES:
             return None
         if _response_error_code(response) == _JOB_NOT_FOUND_CODE:
             return None
@@ -7660,6 +7671,7 @@ class CortexTrainingClient:
             if isinstance(sub, dict) and (sub.get("sub_job_id") or sub.get("id"))
         ]
         if sub_job_id and known and sub_job_id not in known:
+            checked["sub_job_missing"] = True
             return f"Sub-job {sub_job_id} is not part of job {job_id}; its sub-jobs are: {', '.join(known)}"
         return None
 

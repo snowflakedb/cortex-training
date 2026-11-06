@@ -405,11 +405,11 @@ def test_operation_counts_are_aggregated_and_posted_to_metrics_endpoint(monkeypa
         == f"https://{COLLECTOR}/system/v1/metrics"
     )
     resource, metrics = _posted_metrics(emitter)
+    # No service.instance.id: a process would add series of its own (records carry it).
     assert resource["resource"]["attributes"] == [
         {"key": "service.name", "value": {"stringValue": "cortex-training"}},
         {"key": "snowflake.account_host", "value": {"stringValue": "account.test"}},
         {"key": "service.version", "value": {"stringValue": "0.0.2"}},
-        {"key": "service.instance.id", "value": {"stringValue": telemetry._INSTANCE_ID}},
     ]
     count = metrics["cortex.training.client.operation.count"]["sum"]
     assert count["aggregationTemporality"] == 1
@@ -603,13 +603,17 @@ def test_expected_failures_are_counted_apart_from_failures(monkeypatch):
     assert by_outcome == {"failure": "1", "expected_failure": "2"}
 
 
-def test_every_record_and_metric_names_its_process(monkeypatch):
+def test_every_record_names_its_process_and_metrics_leave_it_out(monkeypatch):
     emitter = _metrics_emitter(monkeypatch)
     first = dict(
         (a["key"], a["value"]["stringValue"]) for a in emitter._resource_attributes()
     )["service.instance.id"]
     assert first == telemetry._INSTANCE_ID
     assert len(first) == 36  # a UUID
+    emitter.record_operation("list_jobs", outcome="success", duration_ms=1)
+    assert emitter.flush()
+    resource, _ = _posted_metrics(emitter)
+    assert "service.instance.id" not in {a["key"] for a in resource["resource"]["attributes"]}
 
     # A forked child is another process, with an id of its own.
     monkeypatch.setattr(telemetry, "_INSTANCE_ID", telemetry._INSTANCE_ID)

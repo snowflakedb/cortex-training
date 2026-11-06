@@ -9380,6 +9380,9 @@ class TestTailOnEndedJobs:
         assert (value["success"], value.get("job_status")) == (False, job_status)
         assert attributes["error.type"] == type(error).__name__
         assert "job_ended" not in value
+        # A status read for an earlier attempt doesn't make the call's own failure an expected one.
+        assert "expected" not in value
+        assert c._metric_emitter.record_operation.call_args.kwargs["outcome"] == "failure"
 
     def test_a_tail_whose_retry_cannot_get_a_token_has_the_job_status_too(self):
         # Not every later attempt fails off the wire: one that gets no token fails the call too.
@@ -9406,6 +9409,45 @@ class TestTailOnEndedJobs:
         assert (value["success"], value["job_status"]) == (False, "placing")
         assert attributes["error.type"] == "SnowflakeProfileError"
         assert "job_ended" not in value
+        assert "expected" not in value
+        assert c._metric_emitter.record_operation.call_args.kwargs["outcome"] == "failure"
+
+    def test_a_tail_whose_retries_then_get_a_5xx_is_a_failure_though_its_job_is_placing(self):
+        # The first attempt's 409 had the job looked up; the service then failed outright.
+        c = _make_client()
+        c.max_retries = 2  # as the TUI reads
+        c._metric_emitter = MagicMock()
+        c._session.post.side_effect = [
+            _not_found("517604", "job j1 is pending placement", status=409),
+            _make_error_response({"message": "unavailable"}, 503),
+            _make_error_response({"message": "unavailable"}, 503),
+        ]
+        c._session.get.return_value = self._job("JOB_STATE_PLACING")
+
+        with pytest.raises(nc.requests.exceptions.HTTPError) as raised:
+            c.tail_logs("j1", sub_job_id="j1:sampling:0")
+
+        assert raised.value.response.status_code == 503
+        value = c._metric_emitter.emit.call_args.args[1]
+        assert (value["success"], value["job_status"]) == (False, "placing")
+        assert "expected" not in value
+        assert c._metric_emitter.record_operation.call_args.kwargs["outcome"] == "failure"
+
+    def test_a_tail_of_a_sub_job_its_placing_job_lacks_is_a_failure(self):
+        # A sub-job the job doesn't have is the caller's mistake, not a job yet to start.
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        c._session.post.return_value = _not_found("517604", "session s not found")
+        c._session.get.return_value = self._job("JOB_STATE_PLACING")
+
+        with pytest.raises(nc.requests.exceptions.HTTPError, match="is not part of job j1") as raised:
+            c.tail_logs("j1", sub_job_id="j1:training:0")
+
+        assert raised.value.sub_job_missing is True and raised.value.job_ended is False
+        value = c._metric_emitter.emit.call_args.args[1]
+        assert (value["success"], value["job_status"]) == (False, "placing")
+        assert "expected" not in value
+        assert c._metric_emitter.record_operation.call_args.kwargs["outcome"] == "failure"
 
     def test_a_tail_that_never_got_an_answer_sends_no_job_status(self):
         c = _make_client()
@@ -10145,6 +10187,16 @@ def _fake_connection(token="session-token"):
     )
 
 
+def _http_error(status_code, **marks):
+    """An HTTPError with a response of ``status_code``, and ``marks`` set on it as tail_logs sets them."""
+    error = nc.requests.exceptions.HTTPError(
+        f"{status_code} error", response=_make_response(status_code=status_code)
+    )
+    for name, value in marks.items():
+        setattr(error, name, value)
+    return error
+
+
 class TestTelemetryOutcomesAndLogins:
     def _profile_client(self, monkeypatch, connect, **kwargs):
         emitter = MagicMock()
@@ -10165,13 +10217,18 @@ class TestTelemetryOutcomesAndLogins:
         ("operation", "error", "values", "expected"),
         [
             ("download_metrics", nc.NoChunksError("no chunks yet", sub_job_ids=["j1:training:0"], available=[]), {}, True),
-            ("tail_logs", RuntimeError("410"), {"job_ended": True, "job_status": "failed"}, True),
-            ("tail_logs", RuntimeError("409"), {"job_status": "placing"}, True),
-            ("tail_logs", RuntimeError("404"), {"job_status": "running"}, False),
-            ("tail_logs", RuntimeError("reset"), {}, False),
-            ("get_job", RuntimeError("409"), {"job_status": "placing"}, False),
+            ("tail_logs", _http_error(410), {"job_ended": True, "job_status": "failed"}, True),
+            ("tail_logs", _http_error(409), {"job_status": "placing"}, True),
+            ("tail_logs", _http_error(404), {"job_status": "running"}, False),
+            ("tail_logs", _http_error(409), {}, False),
+            # A status read for an earlier attempt explains only a session-not-there answer.
+            ("tail_logs", nc.requests.exceptions.ConnectionError("reset"), {"job_status": "placing"}, False),
+            ("tail_logs", _http_error(503), {"job_status": "placing"}, False),
+            ("tail_logs", _http_error(404, sub_job_missing=True), {"job_status": "placing"}, False),
+            ("get_job", _http_error(409), {"job_status": "placing"}, False),
         ],
-        ids=["no-chunks", "ended", "not-running-yet", "while-running", "no-status", "other-operation"],
+        ids=["no-chunks", "ended", "not-running-yet", "while-running", "no-status", "reset-after-409",
+             "5xx-after-409", "wrong-sub-job", "other-operation"],
     )
     def test_which_failures_are_expected(self, operation, error, values, expected):
         assert nc._expected_failure(operation, error, values) is expected

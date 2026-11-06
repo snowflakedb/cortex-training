@@ -87,8 +87,10 @@ _OPERATION_RETRIES = "cortex.training.client.operation.retries"
 _OPERATION_REQUESTS = "cortex.training.client.operation.requests"
 _STOP = object()
 _EMITTERS: weakref.WeakSet["OtlpMetricEmitter"] = weakref.WeakSet()
-# One id per process (an SDK script, a CLI command, a TUI session), sent as
-# ``service.instance.id`` so its records and metrics can be grouped and counted.
+# One id per process (an SDK script, a CLI command, a TUI session), sent on its
+# records as ``service.instance.id`` so they can be grouped and counted. Metrics
+# leave it out: on a backend that keeps a series per attribute set, every process
+# would add its own, and the call totals don't need it.
 _INSTANCE_ID = str(uuid.uuid4())
 
 
@@ -659,7 +661,9 @@ class OtlpMetricEmitter:
                     time.monotonic() + self._metric_flush_interval_seconds
                 )
 
-    def _resource_attributes(self) -> list[dict[str, Any]]:
+    def _resource_attributes(self, *, instance_id: bool = True) -> list[dict[str, Any]]:
+        """The resource attributes of an export; ``service.instance.id`` only for
+        records (see ``_INSTANCE_ID``)."""
         attributes = [
             {
                 "key": "service.name",
@@ -677,9 +681,10 @@ class OtlpMetricEmitter:
                     "value": {"stringValue": self.service_version},
                 }
             )
-        attributes.append(
-            {"key": "service.instance.id", "value": {"stringValue": _INSTANCE_ID}}
-        )
+        if instance_id:
+            attributes.append(
+                {"key": "service.instance.id", "value": {"stringValue": _INSTANCE_ID}}
+            )
         return attributes
 
     @staticmethod
@@ -794,7 +799,9 @@ class OtlpMetricEmitter:
                 json={
                     "resourceMetrics": [
                         {
-                            "resource": {"attributes": self._resource_attributes()},
+                            "resource": {
+                                "attributes": self._resource_attributes(instance_id=False)
+                            },
                             "scopeMetrics": [
                                 {
                                     "scope": {"name": self.service_name},
