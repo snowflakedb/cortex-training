@@ -156,10 +156,8 @@ def forward_logprobs(client: Any, job_id: str, data: Sequence[dict], *, batch_it
     bounds = list(zip(starts, starts[1:] + [len(data)]))
     out: list[torch.Tensor] = []
     for start, end in bounds:
-        tokens = custom_loss.item_tokens(data[start:end])
-        body = client.forward(job_id, custom_loss.build_forward_logprobs_payload(tokens), sub_job_type="training")
-        result = client.poll_request(job_id, body["request_id"])
-        out.extend(custom_loss.logprobs_from_forward_result(result, tokens))
+        # The same no-gradient forward pass forward_backward_custom runs before its backward.
+        out.extend(client._forward_logprobs(job_id, custom_loss.item_tokens(data[start:end])))
     return out
 
 

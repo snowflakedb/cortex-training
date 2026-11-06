@@ -10,6 +10,7 @@ torch = pytest.importorskip("torch")
 for _dependency in ("chz", "datasets", "tinker_cookbook"):
     pytest.importorskip(_dependency)
 
+from cortex_training.client import CortexTrainingClient  # noqa: E402
 from recipes.dpo_quickstart import task  # noqa: E402
 from recipes.dpo_quickstart import train  # noqa: E402
 from recipes.sft_quickstart.runner import job_body  # noqa: E402
@@ -127,6 +128,9 @@ def test_pair_items_put_chosen_first_and_mask_only_the_answer():
 
 class _Client:
     """Returns logprob -1 for every predicted token and records each forward's row count."""
+
+    # The real client's forward-logprobs pass, over this fake's forward and poll_request.
+    _forward_logprobs = CortexTrainingClient._forward_logprobs
 
     def __init__(self):
         self.rows = []
