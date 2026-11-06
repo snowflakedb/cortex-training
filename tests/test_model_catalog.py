@@ -130,6 +130,19 @@ def test_checked_in_catalog_is_valid():
     }
 
 
+def test_rl_pairings_name_existing_training_and_inference_files():
+    index = json.loads((REPO_ROOT / "model-catalog" / "rl-pairings.json").read_text())
+    hardware = index["hardware"].lower()
+    missing = []
+    for pair_id in index["pairings"]:
+        model, context, mode = pair_id.split("--")
+        for kind in ("training", "inference"):
+            if not (CATALOG_DIR / model / context / f"{hardware}-{kind}-{mode}.json").is_file():
+                missing.append(f"{pair_id}: {kind}")
+    assert len(set(index["pairings"])) == len(index["pairings"])
+    assert missing == []
+
+
 def test_catalog_holds_every_model_and_its_files():
     assert {model_id: _files(folder) for model_id, (folder, _) in _models().items()} == {
         model_id: sorted(files) for model_id, files in EXPECTED_FILES.items()
