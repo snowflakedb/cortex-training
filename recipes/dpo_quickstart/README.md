@@ -30,29 +30,31 @@ This example computes the DPO loss in this process with
 
 ## Run
 
-The default is Qwen3-8B with LoRA at standard context on H200, on the small
+The default is Qwen3.5-9B with LoRA at standard context on H200, on the small
 built-in `smoke` set:
 
 ```bash
 python -m recipes.dpo_quickstart.train connection=NAME
 ```
 
-On UltraFeedback, with a larger learning rate and batch than the smoke defaults:
+On 10,000 UltraFeedback pairs, with a larger learning rate and batch than the
+smoke defaults:
 
 ```bash
 python -m recipes.dpo_quickstart.train connection=NAME \
-  dataset=ultrafeedback max_steps=50 pairs_per_step=16 lr=5e-5 eval_pairs=32 eval_every=10
+  dataset=ultrafeedback max_steps=313 pairs_per_step=32 lr=5e-5 eval_pairs=500 eval_every=50
 ```
 
-On Qwen3-8B LoRA this took held-out loss from 0.693 to about 0.56 and held-out
-accuracy to about 0.72 in 50 steps. With `lr=1e-5` and 8 pairs per step,
-learning was weak and noisy.
+On Qwen3.5-9B LoRA this took held-out loss from 0.693 to 0.53 and held-out
+accuracy to 0.73 on 497 held-out pairs. Qwen3-8B (`model=Qwen/Qwen3-8B`) with the
+same settings reached 0.54 and 0.71. On Qwen3-8B, `lr=1e-5` with 8 pairs per step
+learned weakly and noisily.
 
 ## Options
 
 | Argument | Default | Meaning |
 |---|---|---|
-| `model=`, `context=`, `hardware=`, `lora=` | `Qwen/Qwen3-8B`, `standard`, `h200`, `true` | Which catalog file to use |
+| `model=`, `context=`, `hardware=`, `lora=` | `Qwen/Qwen3.5-9B`, `standard`, `h200`, `true` | Which catalog file to use |
 | `lr=` | `1e-5` | Learning rate; `lr=None` keeps the job's |
 | `dataset=` | `smoke` | `smoke` (12 training and 4 held-out pairs) or `ultrafeedback` (`HuggingFaceH4/ultrafeedback_binarized`) |
 | `beta=` | `0.1` | How far the policy may move from the reference |
