@@ -7,6 +7,7 @@ type on the command line instead of writing a job file.
 | Recipe | Method | Dataset / Environment |
 |---|---|---|
 | [Conversational SFT](sft_quickstart/README.md) | LoRA or full-parameter SFT | Hugging Face chat datasets, GSM8K, identity |
+| [Custom-loss SFT](sft_quickstart/custom_loss/README.md) | SFT with a loss written in PyTorch (focal loss) | The conversational SFT datasets |
 | [DARE-Bench agent SFT](sft_quickstart/dare/README.md) | Full-parameter multi-turn tool SFT + agent eval | DARE-Bench |
 | [Math GRPO](rl_quickstart/README.md) | Reinforcement learning | Hendrycks MATH, MATH-500 |
 | [On-policy distillation](distillation/README.md) | Multi-turn tool-use distillation from a frozen teacher | Wiki-search trivia |

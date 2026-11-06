@@ -22,6 +22,7 @@ DARE_OVERRIDES = EXAMPLES / "sft_quickstart" / "dare" / "overrides.json"
 # metadata and data.
 EXAMPLE_FOLDERS = (
     "sft_quickstart/conversational",
+    "sft_quickstart/custom_loss",
     "sft_quickstart/dare",
     "rl_quickstart/math_grpo",
     "inference",
@@ -147,6 +148,7 @@ def test_examples_build_their_default_jobs_from_the_catalog():
         "recipes.inference.generate",
         "recipes.inference.evaluate",
         "recipes.sft_quickstart.conversational.train",
+        "recipes.sft_quickstart.custom_loss.train",
         "recipes.rl_quickstart.math_grpo.train",
     ],
 )
@@ -159,7 +161,14 @@ def test_examples_pick_their_job_by_model_context_hardware_and_lora(module_name)
     assert config.max_seq_len is None
 
 
-@pytest.mark.parametrize("module_name", ["recipes.sft_quickstart.conversational.train", "recipes.rl_quickstart.math_grpo.train"])
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "recipes.sft_quickstart.conversational.train",
+        "recipes.sft_quickstart.custom_loss.train",
+        "recipes.rl_quickstart.math_grpo.train",
+    ],
+)
 def test_training_settings_default_to_the_catalog_values(module_name):
     config = _import_example(module_name).Config(config="unused")
 
@@ -1103,6 +1112,7 @@ def test_deepseek_v4_trainer_and_vllm_module_names_are_the_same_adapter():
     "relative_path",
     [
         "recipes/sft_quickstart/conversational/train.py",
+        "recipes/sft_quickstart/custom_loss/train.py",
         "recipes/rl_quickstart/math_grpo/train.py",
         "recipes/distillation/on_policy/train.py",
     ],
