@@ -25,7 +25,7 @@ from typing import Sequence
 import torch
 import torch.nn.functional as F
 from cortex_training.client import custom_loss
-from examples.utils import sequence_from_conversation
+from recipes.utils import sequence_from_conversation
 from tinker_cookbook import renderers
 
 _DATA_DIR = Path(__file__).resolve().parent / "data"

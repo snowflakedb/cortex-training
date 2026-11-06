@@ -6,7 +6,7 @@ one, measured against a frozen reference model, with no reward model and no
 sampling.
 
 This example computes the DPO loss in this process with
-[`forward_backward_custom`](../../../docs/reference/python-sdk.md#custom-losses).
+[`forward_backward_custom`](../../docs/reference/python-sdk.md#custom-losses).
 `train.py` is the entry point, and `task.py` holds the data and the loss.
 
 ## How it works
@@ -34,13 +34,13 @@ The default is Qwen3-8B with LoRA at standard context on H200, on the small
 built-in `smoke` set:
 
 ```bash
-python -m examples.alignment.dpo.train connection=NAME
+python -m recipes.dpo_quickstart.train connection=NAME
 ```
 
 On UltraFeedback, with a larger learning rate and batch than the smoke defaults:
 
 ```bash
-python -m examples.alignment.dpo.train connection=NAME \
+python -m recipes.dpo_quickstart.train connection=NAME \
   dataset=ultrafeedback max_steps=50 pairs_per_step=16 lr=5e-5 eval_pairs=32 eval_every=10
 ```
 
@@ -61,7 +61,7 @@ learning was weak and noisy.
 | `eval_pairs=`, `eval_every=` | `8`, `5` | Held-out pairs, and how often to evaluate them |
 | `max_pair_tokens=` | `2048` | Skip pairs with a longer chosen or rejected conversation |
 | `job_config=` | none | Use this job file instead of the catalog |
-| `wandb_project=`, `sf_tracking=` | off | [Experiment tracking](../../../docs/guides/operations/wandb.md) |
+| `wandb_project=`, `sf_tracking=` | off | [Experiment tracking](../../docs/guides/operations/wandb.md) |
 
 ## Expected results
 
