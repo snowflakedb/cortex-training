@@ -46,6 +46,7 @@ from typing import TextIO
 
 from cortex_training import _database_setup
 from cortex_training import _environment
+from cortex_training import _job_access
 from cortex_training import _picker
 from cortex_training import _profiles
 
@@ -259,6 +260,8 @@ class Check:
     missing: list[tuple[str, str]] | None = None
     error: str | None = None
     client: Any = None
+    # Whether the role can create training jobs; None when it wasn't checked.
+    job_access: Any = None
 
     @property
     def usable(self) -> bool:
@@ -281,6 +284,55 @@ PRIVILEGE_NOTE = [
     "This profile connects to Cortex Training on this account. Your role may still lack",
     "privileges that some operations need; if one is refused, its error says which.",
 ]
+# Once job creation itself was checked: what the checks still don't cover.
+CHECKED_NOTE = [
+    "Other operations, such as joining an existing experiment, can need more privileges;",
+    "if one is refused, its error says which.",
+]
+
+
+def say_job_access(prompter: Any, access: Any, schema: str) -> None:
+    """Show whether the role can create training jobs in ``schema``, and the GRANTs it's missing."""
+    s = prompter.style
+    if access.unknown is not None:
+        prompter.say(f"  {s.unknown(f'Could not check whether role {access.role} can create training jobs ({access.unknown}); continuing')}")
+    elif not access.missing:
+        prompter.say(f"  {s.ok(f'Role {access.role} can create training jobs in {schema}')}")
+    elif not access.blocking:
+        # Only privileges Snowflake doesn't enforce yet: jobs still start, so a heads-up.
+        prompter.say(f"  {s.ok(f'Role {access.role} can create training jobs in {schema}')}")
+        for item in access.missing:
+            heads_up = (
+                f"Role {access.role} doesn't have {item.privilege} yet. Creating training jobs will need it "
+                "once Snowflake enforces it."
+            )
+            prompter.say(f"  {s.warn(heads_up)}")
+        prompter.say("    Ask an account admin to run:")
+        for item in access.missing:
+            prompter.say(f"      {s.cyan(item.grant)}")
+    else:
+        # The profile still signs in and reaches Cortex Training: a warning, not a failure.
+        heading = f"Role {access.role} can't create training jobs yet. It needs:"
+        prompter.say(f"  {s.warn(heading)}")
+        for item in access.missing:
+            prompter.say(f"      - {item.privilege} on {item.on}")
+        prompter.say("    Ask an account admin to run:")
+        for item in access.missing:
+            prompter.say(f"      {s.cyan(item.grant)}")
+
+
+def closing_note(access: Any) -> list[str]:
+    """The note that ends login: narrower once job creation was checked."""
+    return CHECKED_NOTE if access is not None and access.unknown is None else PRIVILEGE_NOTE
+
+
+def not_ready_lines(access: Any) -> list[str]:
+    """Why a saved profile isn't ready for training yet, when the role misses a privilege."""
+    return [
+        f"It signs in, and the account has Cortex Training, but role {access.role} can't create",
+        "training jobs until the privileges above are granted. Run `cortex-training login`",
+        "again once they are.",
+    ]
 
 
 def open_profile_client(profile: str, database: str, schema: str) -> Any:
@@ -628,6 +680,8 @@ class _Login:
             self.p.say(f"  {self.s.bad(f'Database {database} is missing, or {who} cannot access it')}")
         else:
             self.p.say(f"  {self.s.ok(f'Database {database} is ready')}")
+            result.job_access = _job_access.check(result.client, result.role)
+            say_job_access(self.p, result.job_access, f"{database}.{result.schema}")
         return result
 
     @staticmethod
@@ -1073,18 +1127,24 @@ def run_login(
     prompter.rule()
     if not style.decorate:
         prompter.say()
+    access = None if unchecked or check is None else check.job_access
     if unchecked:
         prompter.say(f"Saved, but not checked. Cortex Training will use profile {style.bold(chosen)}.")
         prompter.say(style.dim(f"(Saved in {_home(saved)}.)"))
         prompter.say()
         prompter.say(f"To check it later, run:  {style.cyan('cortex-training login')}")
+    elif access is not None and access.blocking:
+        prompter.say(style.yellow(style.bold("Saved, but not ready for training.")) + f" Cortex Training will use profile {style.bold(chosen)}.")
+        for line in not_ready_lines(access):
+            prompter.say(line)
+        prompter.say(style.dim(f"(Saved in {_home(saved)}.)"))
     else:
         prompter.say(style.green(style.bold("You're all set.")) + f" Cortex Training will use profile {style.bold(chosen)}.")
         prompter.say(style.dim(f"(Saved in {_home(saved)}.)"))
         prompter.say()
         prompter.say(f"Try it:  {style.cyan('cortex-training capacity')}")
     prompter.say()
-    for line in PRIVILEGE_NOTE:
+    for line in closing_note(access):
         prompter.say(style.yellow(line))
     remind_environment(prompter, findings, shell)
     if not getattr(stdout, "isatty", lambda: False)():
@@ -1098,6 +1158,9 @@ def run_login(
                 "role": check.role if check else values.get("role"),
                 "database": check.database if check else values.get("database", DEFAULT_DATABASE),
                 "schema": check.schema if check else values.get("schema", DEFAULT_SCHEMA),
+                # True or False once job creation was checked; None when it couldn't be.
+                "ready_for_training": None if access is None or access.unknown is not None else access.ready,
+                "missing_privileges": [item.privilege for item in access.missing] if access is not None else [],
                 "checked": unchecked is None,
                 "config": str(saved),
                 "created_profiles": login.created_profiles,
