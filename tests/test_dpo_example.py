@@ -10,10 +10,10 @@ torch = pytest.importorskip("torch")
 for _dependency in ("chz", "datasets", "tinker_cookbook"):
     pytest.importorskip(_dependency)
 
-from examples.alignment.dpo import task  # noqa: E402
-from examples.alignment.dpo import train  # noqa: E402
-from examples.sft.runner import job_body  # noqa: E402
-from examples.utils import make_config  # noqa: E402
+from recipes.dpo_quickstart import task  # noqa: E402
+from recipes.dpo_quickstart import train  # noqa: E402
+from recipes.sft_quickstart.runner import job_body  # noqa: E402
+from recipes.utils import make_config  # noqa: E402
 
 
 def _pair_batch(ref=(-3.0, -5.0, -2.0, -2.0)):

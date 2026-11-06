@@ -23,22 +23,22 @@ from typing import Any
 
 import chz
 from cortex_training.client import DEBUG_OPTIONS_ENV
-from examples.alignment.dpo.task import dpo_loss
-from examples.alignment.dpo.task import evaluate
-from examples.alignment.dpo.task import load_pairs
-from examples.alignment.dpo.task import pair_items
-from examples.alignment.dpo.task import score_reference
-from examples.logging import setup_logging
-from examples.sft.runner import job_body
-from examples.sft.runner import lr_multiplier
-from examples.utils import build_renderer
-from examples.utils import example_connection_args
-from examples.utils import inference_job_args
-from examples.utils import log_saved_checkpoints
-from examples.utils import make_client
-from examples.utils import optimizer_step
-from examples.utils import running_job
-from examples.utils import save_example_checkpoints
+from recipes.dpo_quickstart.task import dpo_loss
+from recipes.dpo_quickstart.task import evaluate
+from recipes.dpo_quickstart.task import load_pairs
+from recipes.dpo_quickstart.task import pair_items
+from recipes.dpo_quickstart.task import score_reference
+from recipes.logging import setup_logging
+from recipes.sft_quickstart.runner import job_body
+from recipes.sft_quickstart.runner import lr_multiplier
+from recipes.utils import build_renderer
+from recipes.utils import example_connection_args
+from recipes.utils import inference_job_args
+from recipes.utils import log_saved_checkpoints
+from recipes.utils import make_client
+from recipes.utils import optimizer_step
+from recipes.utils import running_job
+from recipes.utils import save_example_checkpoints
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +76,7 @@ class Config:
     beta: float = 0.1
 
     debug_image_tag: str | None = None
-    log_path: str = "/tmp/cortex-training-examples/dpo"
+    log_path: str = "/tmp/cortex-training-recipes/dpo"
     wandb_project: str | None = None
     wandb_name: str | None = None
     sf_tracking: bool = False
