@@ -31,7 +31,7 @@ for a specific workload.
 | `zai-org/GLM-5.3-Flash-BF16` | MoE | standard, long | standard, long | 262,144 |
 | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` | MoE | standard, long | standard, long | 262,144 |
 | `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16` | MoE | standard, long | standard, long | 262,144 |
-| `thinkingmachines/Inkling-Small` | MoE | — | standard | — |
+| `thinkingmachines/Inkling-Small` | MoE | standard | standard | — |
 
 `standard` and `long` are each model's smaller and larger `max_seq_len` tiers,
 so the boundary differs between models. Most trainable models have LoRA and full
@@ -80,3 +80,13 @@ renderers, so with a thinking-off default pass `enable_thinking=true` or
 - **Qwen3.6-35B-A3B:** LoRA training and checkpoint save/load require the
   `arctic` model provider, and LoRA is limited to `q_proj`, `k_proj`,
   `v_proj`, and `o_proj`. Routed-expert LoRA is not yet supported.
+- **Inkling Small:** text LoRA SFT uses the `arctic` provider, eight H200s,
+  expert parallelism of eight, and ZeRO-2. The initial training preset targets
+  `q_proj` and `v_proj` with rank four, and supports 1,024 tokens. Eager attention
+  preserves Inkling's relative-position bias; sequence parallelism and fused
+  LM-head loss are not supported. This preset requires the Inkling training
+  loader in the `arctic` provider. Four eight-GPU nodes can use expert parallelism
+  of eight with `n_gpus`, `train_batch_size`, and `ds_config.train_batch_size` set
+  to 32.
+  The four-node configuration awaits a live smoke test. The native vision,
+  audio, and multi-token prediction heads are omitted from text SFT.

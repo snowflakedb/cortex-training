@@ -44,7 +44,7 @@ _FULL_STANDARD_LONG = [
     "long/h200-training-full",
 ]
 EXPECTED_FILES = {
-    "thinkingmachines/Inkling-Small": ["standard/h200-inference-full"],
+    "thinkingmachines/Inkling-Small": ["standard/h200-inference-full", "standard/h200-training-lora"],
     "Qwen/Qwen3-0.6B": _TRAINABLE_STANDARD,
     "Qwen/Qwen3-1.7B": _TRAINABLE_STANDARD,
     "Qwen/Qwen3-4B-Instruct-2507": _FULL_STANDARD_LONG,
@@ -123,8 +123,8 @@ def _config(body: dict) -> dict:
 def test_checked_in_catalog_is_valid():
     assert validate_catalog() == {
         "models": 23,
-        "files": 107,
-        "training": 52,
+        "files": 108,
+        "training": 53,
         "inference": 55,
         "rl": 49,
         "distillation": 1,
@@ -241,6 +241,7 @@ def test_files_keep_their_source_sequence_lengths():
 
     assert lengths == {
         ("thinkingmachines/Inkling-Small", "standard", "inference"): 32768,
+        ("thinkingmachines/Inkling-Small", "standard", "training"): 1024,
         ("Qwen/Qwen3-0.6B", "standard", "inference"): 32768,
         ("Qwen/Qwen3-0.6B", "standard", "training"): 32768,
         ("Qwen/Qwen3-1.7B", "standard", "inference"): 32768,
