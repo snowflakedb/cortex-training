@@ -31,6 +31,7 @@ for a specific workload.
 | `zai-org/GLM-5.3-Flash-BF16` | MoE | standard, long | standard, long | 262,144 |
 | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` | MoE | standard, long | standard, long | 262,144 |
 | `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16` | MoE | standard, long | standard, long | 262,144 |
+| `thinkingmachines/Inkling-Small` | MoE | — | standard | — |
 
 `standard` and `long` are each model's smaller and larger `max_seq_len` tiers,
 so the boundary differs between models. Most trainable models have LoRA and full
@@ -58,11 +59,15 @@ renderer from tinker-cookbook's
 [renderer list](https://tinker-docs.thinkingmachines.ai/tutorials/core-concepts/rendering/#available-renderers)
 whose chat template matches the model's own (its `tokenizer_config.json` on
 Hugging Face); a mismatched template trains and samples on the wrong format.
-Qwen3-4B-Instruct, GLM 5.3, GLM 5.3 Flash and gpt-oss have only thinking
+Qwen3-4B-Instruct, GLM 5.3, GLM 5.3 Flash, gpt-oss and Inkling Small have only thinking
 renderers, so with a thinking-off default pass `enable_thinking=true` or
 `renderer_name=`.
 
 ## Model notes
+
+- **Inkling Small:** text inference uses the official BF16 checkpoint on eight
+  H200 GPUs, with a 32,768-token context. Prompts use vLLM's native `inkling`
+  tokenizer mode and renderer.
 
 - **Gemma 4 31B:** both training tiers use SDPA. Full-attention layers have head
   dimension 512, which FlashAttention 3 rejects. Gemma 3 and MedGemma keep

@@ -44,6 +44,7 @@ _FULL_STANDARD_LONG = [
     "long/h200-training-full",
 ]
 EXPECTED_FILES = {
+    "thinkingmachines/Inkling-Small": ["standard/h200-inference-full"],
     "Qwen/Qwen3-0.6B": _TRAINABLE_STANDARD,
     "Qwen/Qwen3-1.7B": _TRAINABLE_STANDARD,
     "Qwen/Qwen3-4B-Instruct-2507": _FULL_STANDARD_LONG,
@@ -121,10 +122,10 @@ def _config(body: dict) -> dict:
 
 def test_checked_in_catalog_is_valid():
     assert validate_catalog() == {
-        "models": 22,
-        "files": 106,
+        "models": 23,
+        "files": 107,
         "training": 52,
-        "inference": 54,
+        "inference": 55,
         "rl": 49,
         "distillation": 1,
     }
@@ -140,6 +141,7 @@ def test_catalog_models_include_license_links():
     licenses = {model_id: info["license"] for model_id, (_, info) in _models().items()}
 
     assert {model_id: license["name"] for model_id, license in licenses.items()} == {
+        "thinkingmachines/Inkling-Small": "Apache 2.0",
         "Qwen/Qwen3-0.6B": "Apache 2.0",
         "Qwen/Qwen3-1.7B": "Apache 2.0",
         "Qwen/Qwen3-8B": "Apache 2.0",
@@ -174,6 +176,7 @@ def test_moe_models_record_router_replay_geometry():
     }
 
     assert {model_id: moe for model_id, (architecture, moe) in geometry.items() if architecture == "moe"} == {
+        "thinkingmachines/Inkling-Small": {"num_moe_layers": 40, "topk": 6, "num_experts": 256},
         "Qwen/Qwen3-30B-A3B": {"num_moe_layers": 48, "topk": 8, "num_experts": 128},
         "Qwen/Qwen3.6-35B-A3B": {"num_moe_layers": 40, "topk": 8, "num_experts": 256},
         "Qwen/Qwen3.8-Flash-Next": {"num_moe_layers": 48, "topk": 10, "num_experts": 512},
@@ -237,6 +240,7 @@ def test_files_keep_their_source_sequence_lengths():
     }
 
     assert lengths == {
+        ("thinkingmachines/Inkling-Small", "standard", "inference"): 32768,
         ("Qwen/Qwen3-0.6B", "standard", "inference"): 32768,
         ("Qwen/Qwen3-0.6B", "standard", "training"): 32768,
         ("Qwen/Qwen3-1.7B", "standard", "inference"): 32768,
@@ -661,7 +665,7 @@ def _invalid(catalog_dir: Path, match: str) -> str:
 
 
 def test_copied_catalog_is_valid(catalog):
-    assert validate_catalog(catalog)["models"] == 22
+    assert validate_catalog(catalog)["models"] == 23
 
 
 def test_distillation_jobs_build_with_make_distillation_config(catalog):
