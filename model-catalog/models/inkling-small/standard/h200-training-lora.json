@@ -1,0 +1,72 @@
+{
+  "hardware": "H200",
+  "sub_job_configs": [
+    {
+      "job_type": "training",
+      "model_name": "thinkingmachines/Inkling-Small",
+      "dtype": "bfloat16",
+      "seed": 42,
+      "training_config": {
+        "n_gpus": 8,
+        "max_seq_len": 1024,
+        "train_batch_size": 8,
+        "gradient_clipping": 1.0,
+        "model_provider": "arctic",
+        "attn_implementation": "eager",
+        "activation_checkpointing": true,
+        "ep_size": 8,
+        "sp_size": 1,
+        "ac_config": {
+          "mode": "full",
+          "freq": 1,
+          "router_replay_recompute": false
+        },
+        "model_options": {
+          "lm_head": {
+            "cross_entropy": false
+          },
+          "moe": {
+            "comm_backend": "deepep",
+            "grouped_mm": true
+          }
+        },
+        "optimizer": {
+          "name": "AdamW",
+          "lr": 0.0001,
+          "weight_decay": 0.0,
+          "betas": [
+            0.9,
+            0.999
+          ],
+          "eps": 1e-08
+        },
+        "ds_config": {
+          "train_batch_size": 8,
+          "train_micro_batch_size_per_gpu": 1,
+          "gradient_accumulation_steps": 1,
+          "zero_optimization": {
+            "stage": 2
+          },
+          "bf16": {
+            "enabled": true
+          },
+          "data_types": {
+            "grad_accum_dtype": "fp32"
+          }
+        },
+        "peft_config": {
+          "peft_type": "Lora",
+          "task_type": "CAUSAL_LM",
+          "r": 4,
+          "lora_alpha": 8,
+          "lora_dropout": 0.0,
+          "bias": "none",
+          "target_modules": [
+            "q_proj",
+            "v_proj"
+          ]
+        }
+      }
+    }
+  ]
+}
