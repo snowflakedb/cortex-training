@@ -21,15 +21,6 @@
           "freq": 1,
           "router_replay_recompute": false
         },
-        "model_options": {
-          "lm_head": {
-            "cross_entropy": false
-          },
-          "moe": {
-            "comm_backend": "deepep",
-            "grouped_mm": true
-          }
-        },
         "optimizer": {
           "name": "AdamW",
           "lr": 0.0001,
@@ -65,6 +56,14 @@
             "q_proj",
             "v_proj"
           ]
+        },
+        "router_replay": {
+          "enabled": false
+        },
+        "prime_rl": {
+          "fused_cross_entropy": false,
+          "ep_comm_backend": "deepep",
+          "moe_use_grouped_mm": true
         }
       }
     }

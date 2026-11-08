@@ -67,7 +67,10 @@ renderers, so with a thinking-off default pass `enable_thinking=true` or
 
 - **Inkling Small:** text inference uses the official BF16 checkpoint on eight
   H200 GPUs, with a 32,768-token context. Prompts use vLLM's native `inkling`
-  tokenizer mode and renderer.
+  tokenizer mode and renderer. The LoRA sampling preset uses 1,024 tokens to
+  match training, with served projections `wq_du` and `wv_dv`. It sets
+  `INKLING_MULTIMEM_AR=0` so fused decode collectives preserve LoRA. Router replay
+  is disabled in both LoRA presets.
 
 - **Gemma 4 31B:** both training tiers use SDPA. Full-attention layers have head
   dimension 512, which FlashAttention 3 rejects. Gemma 3 and MedGemma keep
@@ -88,5 +91,9 @@ renderers, so with a thinking-off default pass `enable_thinking=true` or
   loader in the `arctic` provider. Four eight-GPU nodes can use expert parallelism
   of eight with `n_gpus`, `train_batch_size`, and `ds_config.train_batch_size` set
   to 32.
-  The four-node configuration awaits a live smoke test. The native vision,
-  audio, and multi-token prediction heads are omitted from text SFT.
+  A local four-node run completed three SFT steps and exported matching updated
+  adapters on all 32 ranks. A local gateway run completed three GRPO iterations
+  with 24 training GPUs and eight sampling GPUs, including LoRA synchronization
+  after each update and changed sampler logprobs. These are local validations;
+  hosted validation timestamps remain unset. The native vision, audio, and
+  multi-token prediction heads are omitted from text SFT.

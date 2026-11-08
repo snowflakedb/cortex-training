@@ -44,7 +44,11 @@ _FULL_STANDARD_LONG = [
     "long/h200-training-full",
 ]
 EXPECTED_FILES = {
-    "thinkingmachines/Inkling-Small": ["standard/h200-inference-full", "standard/h200-training-lora"],
+    "thinkingmachines/Inkling-Small": [
+        "standard/h200-inference-full",
+        "standard/h200-inference-lora",
+        "standard/h200-training-lora",
+    ],
     "Qwen/Qwen3-0.6B": _TRAINABLE_STANDARD,
     "Qwen/Qwen3-1.7B": _TRAINABLE_STANDARD,
     "Qwen/Qwen3-4B-Instruct-2507": _FULL_STANDARD_LONG,
@@ -123,10 +127,10 @@ def _config(body: dict) -> dict:
 def test_checked_in_catalog_is_valid():
     assert validate_catalog() == {
         "models": 23,
-        "files": 108,
+        "files": 109,
         "training": 53,
-        "inference": 55,
-        "rl": 49,
+        "inference": 56,
+        "rl": 50,
         "distillation": 1,
     }
 
@@ -237,6 +241,7 @@ def test_files_keep_their_source_sequence_lengths():
         (model_id, key.split("/")[0], key.split("-")[1]): _config(_body(model_id, key))["max_seq_len"]
         for model_id, files in EXPECTED_FILES.items()
         for key in files
+        if (model_id, key) != ("thinkingmachines/Inkling-Small", "standard/h200-inference-lora")
     }
 
     assert lengths == {
@@ -387,6 +392,32 @@ def test_gemma4_31b_training_uses_sdpa():
     for key in ("standard/h200-training-full", "long/h200-training-full"):
         training = _config(_body("google/gemma-4-31B-it", key))
         assert training["attn_implementation"] == "sdpa"
+
+
+def test_inkling_lora_rl_uses_matching_context_and_sampling_projections():
+    from recipes.utils import make_config
+
+    body = make_config("thinkingmachines/Inkling-Small", "standard", lora=True, rl=True)
+    configs = {
+        sub["job_type"]: sub.get("training_config") or sub["inference_config"]
+        for sub in body["sub_job_configs"]
+    }
+    training, sampling = configs["training"], configs["sampling"]
+    assert training["max_seq_len"] == sampling["max_seq_len"] == 1024
+    assert training["router_replay"]["enabled"] is False
+    assert sampling["router_replay"]["enabled"] is False
+    assert training["peft_config"] == sampling["peft_config"]
+    assert training["peft_config"]["target_modules"] == ["q_proj", "v_proj"]
+    assert training["prime_rl"]["fused_cross_entropy"] is False
+    assert training["prime_rl"]["ep_comm_backend"] == "deepep"
+    extra = sampling["vllm_config"]["extra_engine_kwargs"]
+    assert extra["lora_target_modules"] == ["wq_du", "wv_dv"]
+    assert extra["tokenizer_mode"] == "inkling"
+    assert extra["dtype"] == "bfloat16"
+    assert extra["kernel_config"] == {"enable_flashinfer_autotune": False}
+    assert sampling["vllm_config"]["extra_env"]["INKLING_MULTIMEM_AR"] == "0"
+    assert sampling["vllm_config"]["extra_env"]["VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY"] == "INKLING_"
+    assert not {"tokenizer_mode", "dtype", "kernel_config"} & sampling["vllm_config"].keys()
 
 
 @pytest.mark.parametrize(
