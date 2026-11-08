@@ -47,6 +47,7 @@ EXPECTED_FILES = {
     "thinkingmachines/Inkling-Small": [
         "standard/h200-inference-full",
         "standard/h200-inference-lora",
+        "standard/h200-training-full",
         "standard/h200-training-lora",
     ],
     "Qwen/Qwen3-0.6B": _TRAINABLE_STANDARD,
@@ -127,8 +128,8 @@ def _config(body: dict) -> dict:
 def test_checked_in_catalog_is_valid():
     assert validate_catalog() == {
         "models": 23,
-        "files": 109,
-        "training": 53,
+        "files": 110,
+        "training": 54,
         "inference": 56,
         "rl": 50,
         "distillation": 1,
