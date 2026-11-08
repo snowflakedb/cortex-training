@@ -108,6 +108,11 @@ renderers, so with a thinking-off default pass `enable_thinking=true` or
   requires matching context overrides. Full sync preserved every stored
   sampler tensor exactly against a fresh official checkpoint load on all
   eight sampling ranks.
+  Cold full resume restored every parameter and optimizer tensor exactly on
+  all 24 ranks; the next loss, gradient norm and updated parameters also matched
+  uninterrupted training exactly.
+  Trained full-weight sync matched sender checksums on all eight sampling
+  ranks, with no skipped source tensors.
   These are local validations; hosted validation timestamps remain unset.
   The native vision, audio, and
   multi-token prediction heads are omitted from text SFT.
