@@ -395,7 +395,7 @@ def test_gemma4_31b_training_uses_sdpa():
         assert training["attn_implementation"] == "sdpa"
 
 
-def test_inkling_full_sft_builds_consistent_ep16_batches_without_offload():
+def test_inkling_full_sft_builds_consistent_ep16_batches_without_optimizer_offload():
     from recipes.utils import make_config
 
     body = make_config("thinkingmachines/Inkling-Small", "standard")

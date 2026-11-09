@@ -116,7 +116,13 @@ renderers, so with a thinking-off default pass `enable_thinking=true` or
   Cross-node DeepEP requires a supported GPU RDMA transport. On EFA, use
   `prime_rl.ep_comm_backend="uccl"` with an EFA-enabled UCCL runtime. A two-node,
   16-rank UCCL dispatch/combine probe matched reference outputs, input gradients,
-  and routing-score gradients exactly; this does not validate a complete EP16 job.
+  and routing-score gradients exactly. A four-node, 32-GPU EP16/UCCL LoRA SFT
+  run completed correctly aligned updates at 1,024 and 65,536 tokens with
+  activation offload and no optimizer offload. Its first 262,144-token batch
+  ran out of GPU memory during expert backward recomputation at 134.4 GiB
+  allocated. Chunked expert combines now release their queued communication
+  buffers between chunks; the follow-up run exactly reproduced both shorter
+  losses and gradient norms. End-to-end 262,144-token validation is pending.
   H200 component validation completed 262,144-token BF16 forward/backward for both
   global and sliding-window attention with the checkpoint's head geometry and
   nonzero learned-bias gradients. Global attention peaked at 16.3 GiB allocated
