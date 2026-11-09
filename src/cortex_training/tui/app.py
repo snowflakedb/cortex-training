@@ -65,6 +65,7 @@ from cortex_training.tui.job_list import JobListScreen
 from cortex_training.tui.logs import LogScreen
 from cortex_training.tui.account import JobLister
 from cortex_training.tui.format import one_line
+from cortex_training.tui.identity import Identity
 from cortex_training.tui.clipboard import copied_note
 from cortex_training.tui.clipboard import copy_local
 from cortex_training.tui.clipboard import screen_dump
@@ -231,8 +232,11 @@ class CortexTrainingLogTUI(App):
     Header { background: $surface; color: $text-muted; }
     Header HeaderIcon { color: $accent; }
     Header HeaderTitle { color: $text; }
+    /* One row, clicked or not: Textual's header toggles a three-row "tall" mode on a click, which
+       here adds only empty rows (the title is one line, cut to fit, either way). */
+    Header.-tall { height: 1; }
     #jobs { height: 1fr; }
-    #listinfo { padding: 0 1; height: auto; }
+    #listwho, #listinfo { padding: 0 1; height: auto; }
     #nomatch-box { height: 1fr; scrollbar-gutter: stable; }
     #nomatch { padding: 1 2; color: $warning; height: auto; }
     #jobs > .datatable--fixed { background: $surface; }
@@ -302,6 +306,10 @@ class CortexTrainingLogTUI(App):
     # the commands the TUI shows to copy connect the same way; None when unknown
     # (a test's client). See views.sign_in_options.
     sign_in: dict | None = None
+    # Who the client signs in as (tui/identity.py), asked once the job list first shows jobs or fails;
+    # None until then.
+    identity: Identity | None = None
+    identity_asked = False
     # When `cortex-training tui` started and when its client was ready (time.monotonic()),
     # for the startup report (see first_view_drawn); None when it didn't start the app.
     launched_at: float | None = None
@@ -600,8 +608,8 @@ class CortexTrainingLogTUI(App):
         kept = self.screen.selections
         if isinstance(event, events.MouseUp) and self._dragged:
             # A drag isn't a click: Textual makes one of any press and release on one
-            # widget, which toggled the header, picked a list item, switched a tab,
-            # or opened or folded the job on a table's row; and it drops the highlight
+            # widget, which picked a list item, switched a tab, or opened or folded
+            # the job on a table's row; and it drops the highlight
             # when the button comes up where it went down, as a drag let go straight
             # out past the edge of its area does (see above).
             self._mouse_down_widget = None

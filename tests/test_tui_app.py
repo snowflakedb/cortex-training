@@ -39,6 +39,7 @@ pytest.importorskip("textual")
 
 from textual.widgets import Input  # noqa: E402
 from textual.widgets import DataTable  # noqa: E402
+from textual.widgets import Header  # noqa: E402
 from textual.widgets import Label  # noqa: E402
 from textual.widgets import Static  # noqa: E402
 from textual.widgets import TabbedContent  # noqa: E402
@@ -56,6 +57,7 @@ from cortex_training.tui.account import scope_text  # noqa: E402
 from cortex_training.tui.app import CortexTrainingLogTUI  # noqa: E402
 from cortex_training.tui.job_list import JobListScreen  # noqa: E402
 from cortex_training.tui.logs import LogScreen  # noqa: E402
+from cortex_training.tui.screens import JobSummaryScreen  # noqa: E402
 from tests.tui_fake import FakeClient  # noqa: E402
 from cortex_training.tui.resource_view import ResourceTab  # noqa: E402
 from cortex_training.tui.theme import ACCENT  # noqa: E402
@@ -2961,6 +2963,37 @@ async def _run_a_double_click_that_opens_a_job_leaves_the_list_unhighlighted():
 
 def test_a_double_click_that_opens_a_job_leaves_the_list_unhighlighted():
     asyncio.run(_run_a_double_click_that_opens_a_job_leaves_the_list_unhighlighted())
+
+
+async def _run_a_click_on_the_title_bar_leaves_it_one_row():
+    # Textual's header grows to three rows on a click (its "tall" mode), two of them empty here.
+    client = FakeClient()
+    job = next(j for j in client.list_jobs() if j["status"] == "RUNNING")
+    for job_id in (None, job["job_id"]):  # the job list and a job's preview; a job's details
+        app = CortexTrainingLogTUI(client, job_id, poll_interval=0.01)
+        async with app.run_test(size=(130, 40)) as pilot:
+            if job_id is None:
+                await _demo_list(app, pilot)
+                shown = [JobListScreen, JobSummaryScreen]
+            else:
+                assert await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen), tries=400)
+                shown = [LogScreen]
+            mouse = _pointer(app, pilot)
+            for kind in shown:
+                if kind is JobSummaryScreen:
+                    app.push_screen(JobSummaryScreen(client, job["job_id"], job=job))
+                    assert await _wait(pilot, app, lambda: isinstance(app.screen, JobSummaryScreen))
+                header = app.screen.query_one(Header)
+                for _ in range(2):  # and a second click doesn't either
+                    await _click(mouse, 40, 0)
+                    await pilot.pause()
+                    assert header.region.height == 1, kind.__name__
+                    assert _screen_lines(app)[1].strip(), f"{kind.__name__}: an empty row under the title bar"
+            await _settle(app, pilot)
+
+
+def test_a_click_on_the_title_bar_leaves_it_one_row():
+    asyncio.run(_run_a_click_on_the_title_bar_leaves_it_one_row())
 
 
 async def _run_a_click_on_the_sort_s_name_or_arrow_changes_it():

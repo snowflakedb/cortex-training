@@ -429,6 +429,7 @@ These calls are outside the Cortex Training prefix:
 |---|---|---|---|
 | `/api/v2/{endpoint}` | `GET` | `iter_jobs` | List jobs across the account ([section 5.3](#across-the-account---get-apiv2endpoint)) |
 | `/api/v2/statements` | `POST` | artifact download methods | Resolve the current Snowflake identity |
+| `/api/v2/statements` | `POST` | `cortex-training tui` | With a PAT, once the job list first shows jobs: the user and role it signs in as (`SELECT CURRENT_USER(), CURRENT_ROLE()`), for the line under the header. A profile asks on its Connector session instead |
 | `/api/v2/statements` | `POST` | `cortex-training login --convert-legacy-config` | With the old config's PAT: look up its user and role (`SELECT CURRENT_USER(), CURRENT_ROLE()`), check the database with `SHOW DATABASES` / `SHOW SCHEMAS`, and, only after showing the SQL and asking, `CREATE DATABASE IF NOT EXISTS` |
 
 ---

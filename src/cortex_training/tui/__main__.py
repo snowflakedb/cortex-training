@@ -294,10 +294,12 @@ def _close_sessions(client) -> None:
 
 def _sign_in(cli, args, from_config: dict) -> dict:
     """How the TUI's client connects, for the commands it shows to copy (read by
-    ``views.sign_in_options``). It never holds the PAT; ``config`` is the config
-    file as an absolute path, so a copied command finds it from any directory."""
+    ``views.sign_in_options``) and the job list's line naming it (``identity.line_parts``).
+    It never holds the PAT; ``config`` is the config file as an absolute path, so a
+    copied command finds it from any directory."""
     if args.use_connection_profile:
-        return {"kind": "profile"}
+        resolution = getattr(args, "resolution", None)
+        return {"kind": "profile", "profile": getattr(resolution, "profile", None)}
     config = None
     if getattr(args, "_legacy_config_selected", False) and args.config:
         config = str(Path(args.config).expanduser().resolve())

@@ -48,6 +48,7 @@ from textual.widgets import Header
 from textual.widgets import Input
 from textual.widgets import Static
 from textual.worker import get_current_worker
+from cortex_training import __version__
 from cortex_training.tui import theme
 from cortex_training.tui import views
 from cortex_training.tui.account import ACCOUNT
@@ -69,6 +70,12 @@ from cortex_training.tui.account import unavailable_text
 from cortex_training.tui.format import cut_cells
 from cortex_training.tui.format import format_created_at
 from cortex_training.tui.format import one_line
+from cortex_training.tui.identity import ASKING
+from cortex_training.tui.identity import UNKNOWN
+from cortex_training.tui.identity import Identity
+from cortex_training.tui.identity import caller_identity
+from cortex_training.tui.identity import line_parts
+from cortex_training.tui.identity import signs_in
 from cortex_training.tui.widgets import FollowsPointer
 from cortex_training.tui.widgets import _BLANK
 from cortex_training.tui.widgets import _ERROR_LOG
@@ -615,6 +622,7 @@ class JobListScreen(FollowsPointer, Screen):
 
     def compose(self) -> ComposeResult:
         yield _ListHeader(icon=theme.BRAND_ICON)
+        yield Static("", id="listwho")
         yield Static("", id="listinfo")
         yield Static("", id="listnotice")
         yield _JobTable(id="jobs", cursor_type="row", zebra_stripes=False, fixed_columns=self._FIXED_COLUMNS)
@@ -634,12 +642,14 @@ class JobListScreen(FollowsPointer, Screen):
         self.query_one("#listnotice", Static).display = False
         self._set_columns(self.query_one("#jobs", DataTable), self._layout_for(0))
         self._paint_help()
+        self._paint_who()
         self._refresh_jobs()
         # DOMNode reserves _auto_refresh, so this timer has another name.
         self.set_interval(self._REFRESH_SECONDS, self._refresh_tick)
 
     def on_screen_resume(self) -> None:
         self._update_subtitle()
+        self._paint_who()  # the user and role may have been read while a job's screen was on top
         self._render_jobs()  # with a status the preview read; a list as it was isn't drawn again
         if self._loaded_at is not None and time.monotonic() - self._loaded_at >= self._REFRESH_SECONDS:
             self._refresh_jobs()
@@ -649,6 +659,7 @@ class JobListScreen(FollowsPointer, Screen):
 
     def _fit_to_width(self) -> None:
         """After a resize: re-wrap the lines around the list, and re-render if the columns change."""
+        self._paint_who()
         self._paint_info()
         self._paint_notice()
         self._paint_nomatch()
@@ -1297,6 +1308,7 @@ class JobListScreen(FollowsPointer, Screen):
         self._hay = {key: hay for key, hay in self._hay.items() if key in self._jobs_by_key}
         self._update_subtitle()
         self._render_jobs(steady=steady, fresh=not steady)
+        self._ask_identity()  # once the first jobs show, which can be the first of many pages
 
     def _on_jobs(self, listing, error: JobListError | None, account: bool = False, gen: int | None = None) -> None:
         """A load's answer: ``listing``, or ``error``; ``account``: it read the account-wide list."""
@@ -1304,6 +1316,7 @@ class JobListScreen(FollowsPointer, Screen):
             return  # superseded: the load that replaced it answers in its place
         self._refreshing = False
         self._load_worker = None
+        self._ask_identity()  # a first load that failed, too
         shown = self._partial_gen is not None and self._partial_gen == gen  # its first pages show
         self._partial_gen = None
         if shown and error is not None:
@@ -1630,6 +1643,35 @@ class JobListScreen(FollowsPointer, Screen):
         widget = self.query_one("#listnotice", Static)
         # Wrapped lines continue under the message ("   × " is five cells), not at the edge.
         widget.update(hanging(self._notice, widget.size.width or self.size.width or self.app.size.width, 5))
+
+    def _paint_who(self) -> None:
+        """The line under the header: how the TUI connects, the user and role it signs in as,
+        and its version (see :func:`cortex_training.tui.identity.line_parts`)."""
+        widget = self.query_one("#listwho", Static)
+        width = widget.content_size.width or (self.size.width or self.app.size.width) - 2
+        parts = line_parts(getattr(self.app, "sign_in", None), getattr(self.app, "identity", None),
+                           __version__, asks=signs_in(self._client))
+        drawn = [Content.assemble((f"{label} ", theme.MUTED),
+                                  (one_line(value), theme.FAINT if value in (ASKING, UNKNOWN) else theme.TEXT))
+                 for label, value in parts]
+        widget.update(wrapped_parts(drawn, width, 2, _DOT))
+
+    def _ask_identity(self) -> None:
+        """Once the list first shows jobs or fails, so the first jobs don't wait on it: ask
+        who the TUI signs in as, once for the app."""
+        if getattr(self.app, "identity_asked", True) or not signs_in(self._client):
+            return
+        self.app.identity_asked = True
+        self._read_identity()
+
+    @work(thread=True, group="identity")
+    def _read_identity(self) -> None:
+        identity = caller_identity(self._client)
+        call_on_screen(self, self._on_identity, identity)
+
+    def _on_identity(self, identity: Identity) -> None:
+        self.app.identity = identity
+        self._paint_who()
 
     def _paint_info(self) -> None:
         """The line above the list: the counts (and a search's matches) at its start, the

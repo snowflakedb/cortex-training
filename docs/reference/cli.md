@@ -1229,6 +1229,16 @@ so it comes a page at a time; where that route is unavailable for the account,
 fails, or answers with no job at all, it reads `list_jobs`, which answers in one
 call and shows no pages.
 
+The line under the header says how the TUI signs in and as whom:
+`profile NAME` (or `config FILE`, `host HOST` or `base URL URL` for the older
+ways), the `user` and `role` Snowflake says it signs in as, and the
+`cortex-training` version (`profile train · user ME · role TRAINER ·
+cortex-training 0.1.1`). The user is the name the Owner column shows, which can
+differ from the login name a profile sets. The user and role are asked for once,
+with `SELECT CURRENT_USER(), CURRENT_ROLE()`, after the first jobs show; they
+read `…` until then and `—` where Snowflake doesn't answer (a profile still shows
+the role its session signed in with). A `--base-url` server has no user or role.
+
 The list has two views of the same jobs: **Jobs** (training and sampling, where
 `ct tui` opens) and **Deployments** (the jobs `ct` lists as model deployments; see
 [Model Deployments](#model-deployments)). `d` switches between them; the title
