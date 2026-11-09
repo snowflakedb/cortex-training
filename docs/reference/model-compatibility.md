@@ -121,8 +121,19 @@ renderers, so with a thinking-off default pass `enable_thinking=true` or
   activation offload and no optimizer offload. Its first 262,144-token batch
   ran out of GPU memory during expert backward recomputation at 134.4 GiB
   allocated. Chunked expert combines now release their queued communication
-  buffers between chunks; the follow-up run exactly reproduced both shorter
-  losses and gradient norms. End-to-end 262,144-token validation is pending.
+  buffers between chunks. A second attempt still ran out of memory during
+  expert recomputation, so complete dispatch/compute/combine chunks now have
+  their own checkpoints. The next 32-GPU EP16/UCCL LoRA run completed a
+  correctly aligned 262,144-token SFT update in 1,307.84 seconds with loss
+  0.00265848, gradient norm 0.00256097, and optimizer success. Peak PyTorch
+  allocation was 98.90 GiB. All 32 ranks reached step three with byte-identical
+  adapters and empty UCCL handle/event caches; optimizer offload was disabled.
+  Its 1,024- and 65,536-token losses and gradient norms exactly matched the
+  earlier implementation. A separate 16-rank probe verified chunk checkpoints
+  nested inside full-block checkpoints, with exact outputs and input/routing-score
+  gradients, empty handle/event caches, and clean launcher exits.
+  This validates 262,144-token LoRA SFT on four nodes; the eight-node
+  full-parameter preset still requires a live fit check.
   H200 component validation completed 262,144-token BF16 forward/backward for both
   global and sliding-window attention with the checkpoint's head geometry and
   nonzero learned-bias gradients. Global attention peaked at 16.3 GiB allocated
