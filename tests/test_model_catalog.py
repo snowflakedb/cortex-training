@@ -242,12 +242,11 @@ def test_files_keep_their_source_sequence_lengths():
         (model_id, key.split("/")[0], key.split("-")[1]): _config(_body(model_id, key))["max_seq_len"]
         for model_id, files in EXPECTED_FILES.items()
         for key in files
-        if (model_id, key) != ("thinkingmachines/Inkling-Small", "standard/h200-inference-lora")
     }
 
     assert lengths == {
         ("thinkingmachines/Inkling-Small", "standard", "inference"): 262144,
-        ("thinkingmachines/Inkling-Small", "standard", "training"): 65536,
+        ("thinkingmachines/Inkling-Small", "standard", "training"): 262144,
         ("Qwen/Qwen3-0.6B", "standard", "inference"): 32768,
         ("Qwen/Qwen3-0.6B", "standard", "training"): 32768,
         ("Qwen/Qwen3-1.7B", "standard", "inference"): 32768,
@@ -419,7 +418,7 @@ def test_inkling_full_sft_builds_consistent_ep16_batches_without_optimizer_offlo
     assert "peft_config" not in training
 
 
-@pytest.mark.parametrize(("lora", "context"), [(True, 65536), (False, 262144)])
+@pytest.mark.parametrize(("lora", "context"), [(True, 262144), (False, 262144)])
 def test_inkling_rl_composes_matching_context_limits_with_chunked_prefill(lora, context):
     from recipes.utils import make_config
 
@@ -443,7 +442,11 @@ def test_inkling_lora_rl_uses_matching_context_and_sampling_projections():
         for sub in body["sub_job_configs"]
     }
     training, sampling = configs["training"], configs["sampling"]
-    assert training["max_seq_len"] == sampling["max_seq_len"] == 65536
+    assert training["max_seq_len"] == sampling["max_seq_len"] == 262144
+    assert (training["n_gpus"], training["ep_size"], training["sp_size"]) == (16, 16, 2)
+    assert training["train_batch_size"] == training["ds_config"]["train_batch_size"] == 8
+    assert training["ac_config"]["offload_config"]["enabled"] is True
+    assert not {"offload_optimizer", "offload_param"} & training["ds_config"]["zero_optimization"].keys()
     assert training["router_replay"]["enabled"] is False
     assert sampling["router_replay"]["enabled"] is False
     assert training["peft_config"] == sampling["peft_config"]
