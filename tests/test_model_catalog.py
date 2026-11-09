@@ -405,6 +405,11 @@ def test_inkling_full_sft_builds_consistent_ep16_batches_without_offload():
     assert (training["n_gpus"], training["ep_size"], training["sp_size"]) == (64, 16, 1)
     assert training["n_gpus"] // training["ep_size"] == 4
     assert training["max_seq_len"] == 262144
+    assert training["attn_implementation"] == "flex_attention"
+    assert training["ac_config"]["offload_config"]["enabled"] is True
+    assert training["prime_rl"]["fused_lm_head_token_chunk_size"] == 512
+    assert training["prime_rl"]["deepep_token_chunk_size"] == 4096
+    assert training["tiled_mlp_token_chunk_size"] == 2048
     assert ds_config["train_micro_batch_size_per_gpu"] == ds_config["gradient_accumulation_steps"] == 1
     batch = training["n_gpus"] // training["sp_size"]
     assert training["train_batch_size"] == ds_config["train_batch_size"] == batch
@@ -423,6 +428,7 @@ def test_inkling_rl_composes_matching_context_limits_with_chunked_prefill(lora, 
     assert job_errors(body) == []
     assert training["training_config"]["max_seq_len"] == sampling["inference_config"]["max_seq_len"] == context
     assert training["training_config"]["router_replay"]["enabled"] is False
+    assert training["training_config"]["attn_implementation"] == "flex_attention"
     assert sampling["inference_config"]["router_replay"]["enabled"] is False
     assert sampling["inference_config"]["vllm_config"]["enable_chunked_prefill"] is True
     assert sampling["inference_config"]["max_num_batched_tokens"] == 8192 < context

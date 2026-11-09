@@ -12,7 +12,7 @@
         "train_batch_size": 8,
         "gradient_clipping": 1.0,
         "model_provider": "arctic",
-        "attn_implementation": "eager",
+        "attn_implementation": "flex_attention",
         "activation_checkpointing": true,
         "ep_size": 8,
         "sp_size": 1,
@@ -63,8 +63,11 @@
         "prime_rl": {
           "fused_cross_entropy": false,
           "ep_comm_backend": "deepep",
-          "moe_use_grouped_mm": true
-        }
+          "moe_use_grouped_mm": true,
+          "fused_lm_head_token_chunk_size": 512,
+          "deepep_token_chunk_size": 4096
+        },
+        "tiled_mlp_token_chunk_size": 2048
       }
     }
   ]
