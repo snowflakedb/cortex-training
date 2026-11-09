@@ -131,7 +131,7 @@ def test_checked_in_catalog_is_valid():
         "files": 110,
         "training": 54,
         "inference": 56,
-        "rl": 50,
+        "rl": 51,
         "distillation": 1,
     }
 
@@ -246,8 +246,8 @@ def test_files_keep_their_source_sequence_lengths():
     }
 
     assert lengths == {
-        ("thinkingmachines/Inkling-Small", "standard", "inference"): 32768,
-        ("thinkingmachines/Inkling-Small", "standard", "training"): 1024,
+        ("thinkingmachines/Inkling-Small", "standard", "inference"): 262144,
+        ("thinkingmachines/Inkling-Small", "standard", "training"): 65536,
         ("Qwen/Qwen3-0.6B", "standard", "inference"): 32768,
         ("Qwen/Qwen3-0.6B", "standard", "training"): 32768,
         ("Qwen/Qwen3-1.7B", "standard", "inference"): 32768,
@@ -404,7 +404,7 @@ def test_inkling_full_sft_builds_consistent_ep16_batches_without_offload():
     assert job_errors(body) == []
     assert (training["n_gpus"], training["ep_size"], training["sp_size"]) == (64, 16, 1)
     assert training["n_gpus"] // training["ep_size"] == 4
-    assert training["max_seq_len"] == 1024
+    assert training["max_seq_len"] == 262144
     assert ds_config["train_micro_batch_size_per_gpu"] == ds_config["gradient_accumulation_steps"] == 1
     batch = training["n_gpus"] // training["sp_size"]
     assert training["train_batch_size"] == ds_config["train_batch_size"] == batch
@@ -412,6 +412,20 @@ def test_inkling_full_sft_builds_consistent_ep16_batches_without_offload():
     assert not {"offload_optimizer", "offload_param"} & ds_config["zero_optimization"].keys()
     assert ds_config["data_types"]["grad_accum_dtype"] == "fp32"
     assert "peft_config" not in training
+
+
+@pytest.mark.parametrize(("lora", "context"), [(True, 65536), (False, 262144)])
+def test_inkling_rl_composes_matching_context_limits_with_chunked_prefill(lora, context):
+    from recipes.utils import make_config
+
+    body = make_config("thinkingmachines/Inkling-Small", "standard", lora=lora, rl=True)
+    training, sampling = body["sub_job_configs"]
+    assert job_errors(body) == []
+    assert training["training_config"]["max_seq_len"] == sampling["inference_config"]["max_seq_len"] == context
+    assert training["training_config"]["router_replay"]["enabled"] is False
+    assert sampling["inference_config"]["router_replay"]["enabled"] is False
+    assert sampling["inference_config"]["vllm_config"]["enable_chunked_prefill"] is True
+    assert sampling["inference_config"]["max_num_batched_tokens"] == 8192 < context
 
 
 def test_inkling_lora_rl_uses_matching_context_and_sampling_projections():
@@ -423,7 +437,7 @@ def test_inkling_lora_rl_uses_matching_context_and_sampling_projections():
         for sub in body["sub_job_configs"]
     }
     training, sampling = configs["training"], configs["sampling"]
-    assert training["max_seq_len"] == sampling["max_seq_len"] == 1024
+    assert training["max_seq_len"] == sampling["max_seq_len"] == 65536
     assert training["router_replay"]["enabled"] is False
     assert sampling["router_replay"]["enabled"] is False
     assert training["peft_config"] == sampling["peft_config"]

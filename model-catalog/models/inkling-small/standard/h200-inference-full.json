@@ -3,12 +3,17 @@
   "sub_job_configs": [
     {
       "inference_config": {
-        "max_seq_len": 32768,
+        "max_seq_len": 262144,
         "n_gpus": 8,
+        "max_num_batched_tokens": 8192,
+        "router_replay": {
+          "enabled": false
+        },
         "vllm_config": {
           "tensor_parallel_size": 8,
           "max_num_seqs": 64,
           "gpu_memory_utilization": 0.9,
+          "enable_chunked_prefill": true,
           "reasoning_parser": "inkling",
           "tool_call_parser": "inkling",
           "extra_env": {

@@ -3,12 +3,13 @@
   "sub_job_configs": [
     {
       "inference_config": {
-        "max_seq_len": 1024,
+        "max_seq_len": 65536,
         "n_gpus": 8,
         "vllm_config": {
           "tensor_parallel_size": 8,
           "max_num_seqs": 8,
           "gpu_memory_utilization": 0.8,
+          "enable_chunked_prefill": true,
           "reasoning_parser": "inkling",
           "tool_call_parser": "inkling",
           "extra_env": {
@@ -45,7 +46,7 @@
         "router_replay": {
           "enabled": false
         },
-        "max_num_batched_tokens": 1024
+        "max_num_batched_tokens": 8192
       },
       "job_type": "sampling",
       "model_name": "thinkingmachines/Inkling-Small"

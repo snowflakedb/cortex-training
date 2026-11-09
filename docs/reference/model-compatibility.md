@@ -66,11 +66,13 @@ renderers, so with a thinking-off default pass `enable_thinking=true` or
 ## Model notes
 
 - **Inkling Small:** text inference uses the official BF16 checkpoint on eight
-  H200 GPUs, with a 32,768-token context. Prompts use vLLM's native `inkling`
-  tokenizer mode and renderer. The LoRA sampling preset uses 1,024 tokens to
-  match training, with served projections `wq_du` and `wv_dv`. It sets
+  H200 GPUs, configured for 262,144 tokens in full mode and 65,536 in LoRA mode.
+  These context lengths have not been live validated. Prompts use vLLM's native
+  `inkling` tokenizer mode and renderer. The LoRA sampling preset matches the
+  training window, with served projections `wq_du` and `wv_dv`. It sets
   `INKLING_MULTIMEM_AR=0` so fused decode collectives preserve LoRA. Router replay
-  is disabled in both LoRA presets.
+  is disabled in both training/sampling pairs. Sampling uses chunked prefill
+  with an 8,192-token scheduling budget, independent of the context limit.
 
 - **Gemma 4 31B:** both training tiers use SDPA. Full-attention layers have head
   dimension 512, which FlashAttention 3 rejects. Gemma 3 and MedGemma keep
@@ -84,35 +86,41 @@ renderers, so with a thinking-off default pass `enable_thinking=true` or
   `arctic` model provider, and LoRA is limited to `q_proj`, `k_proj`,
   `v_proj`, and `o_proj`. Routed-expert LoRA is not yet supported.
 - **Inkling Small:** text LoRA SFT uses the `arctic` provider, eight H200s,
-  expert parallelism of eight, and ZeRO-2. The initial training preset targets
-  `q_proj` and `v_proj` with rank four, and supports 1,024 tokens. Eager attention
+  expert parallelism of eight, and ZeRO-2. The LoRA preset uses rank four for
+  `q_proj` and `v_proj` and a configured window of 65,536 tokens. Eager attention
   preserves Inkling's relative-position bias; sequence parallelism and fused
   LM-head loss are not supported. This preset requires the Inkling training
   loader in the `arctic` provider. Four eight-GPU nodes can use expert parallelism
   of eight with `n_gpus`, `train_batch_size`, and `ds_config.train_batch_size` set
   to 32.
-  A local four-node run completed three SFT steps and exported matching updated
-  adapters on all 32 ranks. A local gateway run completed three GRPO iterations
-  with 24 training GPUs and eight sampling GPUs, including LoRA synchronization
+  Earlier local validation at 1,024 tokens completed three SFT steps and
+  exported matching updated adapters on all 32 ranks. A local gateway run
+  completed three GRPO iterations with 24 training GPUs and eight sampling
+  GPUs, including LoRA synchronization
   after each update and changed sampler logprobs. A cold LoRA resume restored
   every saved optimizer field and tensor exactly on all 24 ranks, with the same
   next-step loss, gradient norm and adapters as uninterrupted training.
   Trainer/sampler logprob parity remains a failing check at `atol=1e-3`, `rtol=0`.
   The full-parameter SFT preset uses 64 H200s across eight eight-GPU nodes,
-  EP16/SP1, a global batch of 64, microbatch one, 1,024 tokens, and ZeRO-2
+  EP16/SP1, a global batch of 64, microbatch one, 262,144 tokens, and ZeRO-2
   without optimizer offload. Adam state and gradient accumulation stay in
   FP32. EP16 places 16 of the 256 experts on each GPU, with four replicas of
   each expert shard. Checkpoint-based memory accounting estimates about
-  104 GiB per GPU before activations and communication workspace. This
-  eight-node configuration has not been live validated.
+  104 GiB per GPU before activations and communication workspace; this estimate
+  does not establish that 262,144-token training fits. This eight-node
+  configuration has not been live validated.
+  Both configured training windows are targets blocked by the current eager
+  attention path: one FP32 attention matrix with 32 heads requires 512 GiB at
+  65,536 tokens and 8 TiB at 262,144 tokens, before the remaining model state.
+  Full-length training requires memory-efficient attention that preserves the
+  relative-position bias, plus activation and LM-head memory planning. Sequence
+  parallelism is currently rejected by the Inkling loader.
   Earlier local full SFT validation used 24 H200s with EP8/SP1 and CPU
   optimizer offload. It completed three short updates and a 1,024-token update;
   dense weights matched across all 24 ranks and expert weights across their
-  three replicas. The full SFT preset's context is smaller than the full
-  inference preset's 32,768-token context, so composing them for RL requires
-  matching context overrides. Initial full sync preserved every stored sampler
-  tensor exactly against a fresh official checkpoint load on all eight
-  sampling ranks.
+  three replicas. Both full-mode presets now have matching 262,144-token limits
+  for RL composition. Initial full sync preserved every stored sampler tensor
+  exactly against a fresh official checkpoint load on all eight sampling ranks.
   Cold full resume restored every parameter and optimizer tensor exactly on
   all 24 ranks; the next loss, gradient norm and updated parameters also matched
   uninterrupted training exactly.
