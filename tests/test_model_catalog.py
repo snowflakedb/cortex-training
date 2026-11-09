@@ -44,7 +44,12 @@ _FULL_STANDARD_LONG = [
     "long/h200-training-full",
 ]
 EXPECTED_FILES = {
-    "thinkingmachines/Inkling-Small": ["standard/h200-inference-full"],
+    "thinkingmachines/Inkling-Small": [
+        "standard/h200-inference-full",
+        "standard/h200-inference-lora",
+        "standard/h200-training-full",
+        "standard/h200-training-lora",
+    ],
     "Qwen/Qwen3-0.6B": _TRAINABLE_STANDARD,
     "Qwen/Qwen3-1.7B": _TRAINABLE_STANDARD,
     "Qwen/Qwen3-4B-Instruct-2507": _FULL_STANDARD_LONG,
@@ -123,10 +128,10 @@ def _config(body: dict) -> dict:
 def test_checked_in_catalog_is_valid():
     assert validate_catalog() == {
         "models": 23,
-        "files": 107,
-        "training": 52,
-        "inference": 55,
-        "rl": 49,
+        "files": 110,
+        "training": 54,
+        "inference": 56,
+        "rl": 51,
         "distillation": 1,
     }
 
@@ -237,10 +242,12 @@ def test_files_keep_their_source_sequence_lengths():
         (model_id, key.split("/")[0], key.split("-")[1]): _config(_body(model_id, key))["max_seq_len"]
         for model_id, files in EXPECTED_FILES.items()
         for key in files
+        if (model_id, key) != ("thinkingmachines/Inkling-Small", "standard/h200-inference-lora")
     }
 
     assert lengths == {
-        ("thinkingmachines/Inkling-Small", "standard", "inference"): 32768,
+        ("thinkingmachines/Inkling-Small", "standard", "inference"): 262144,
+        ("thinkingmachines/Inkling-Small", "standard", "training"): 65536,
         ("Qwen/Qwen3-0.6B", "standard", "inference"): 32768,
         ("Qwen/Qwen3-0.6B", "standard", "training"): 32768,
         ("Qwen/Qwen3-1.7B", "standard", "inference"): 32768,
@@ -386,6 +393,71 @@ def test_gemma4_31b_training_uses_sdpa():
     for key in ("standard/h200-training-full", "long/h200-training-full"):
         training = _config(_body("google/gemma-4-31B-it", key))
         assert training["attn_implementation"] == "sdpa"
+
+
+def test_inkling_full_sft_builds_consistent_ep16_batches_without_optimizer_offload():
+    from recipes.utils import make_config
+
+    body = make_config("thinkingmachines/Inkling-Small", "standard")
+    training = _config(body)
+    ds_config = training["ds_config"]
+    assert job_errors(body) == []
+    assert (training["n_gpus"], training["ep_size"], training["sp_size"]) == (64, 16, 1)
+    assert training["n_gpus"] // training["ep_size"] == 4
+    assert training["max_seq_len"] == 262144
+    assert training["attn_implementation"] == "flex_attention"
+    assert training["ac_config"]["offload_config"]["enabled"] is True
+    assert training["prime_rl"]["fused_lm_head_token_chunk_size"] == 512
+    assert training["prime_rl"]["deepep_token_chunk_size"] == 4096
+    assert training["tiled_mlp_token_chunk_size"] == 2048
+    assert ds_config["train_micro_batch_size_per_gpu"] == ds_config["gradient_accumulation_steps"] == 1
+    batch = training["n_gpus"] // training["sp_size"]
+    assert training["train_batch_size"] == ds_config["train_batch_size"] == batch
+    assert ds_config["zero_optimization"]["stage"] == 2
+    assert not {"offload_optimizer", "offload_param"} & ds_config["zero_optimization"].keys()
+    assert ds_config["data_types"]["grad_accum_dtype"] == "fp32"
+    assert "peft_config" not in training
+
+
+@pytest.mark.parametrize(("lora", "context"), [(True, 65536), (False, 262144)])
+def test_inkling_rl_composes_matching_context_limits_with_chunked_prefill(lora, context):
+    from recipes.utils import make_config
+
+    body = make_config("thinkingmachines/Inkling-Small", "standard", lora=lora, rl=True)
+    training, sampling = body["sub_job_configs"]
+    assert job_errors(body) == []
+    assert training["training_config"]["max_seq_len"] == sampling["inference_config"]["max_seq_len"] == context
+    assert training["training_config"]["router_replay"]["enabled"] is False
+    assert training["training_config"]["attn_implementation"] == "flex_attention"
+    assert sampling["inference_config"]["router_replay"]["enabled"] is False
+    assert sampling["inference_config"]["vllm_config"]["enable_chunked_prefill"] is True
+    assert sampling["inference_config"]["max_num_batched_tokens"] == 8192 < context
+
+
+def test_inkling_lora_rl_uses_matching_context_and_sampling_projections():
+    from recipes.utils import make_config
+
+    body = make_config("thinkingmachines/Inkling-Small", "standard", lora=True, rl=True)
+    configs = {
+        sub["job_type"]: sub.get("training_config") or sub["inference_config"]
+        for sub in body["sub_job_configs"]
+    }
+    training, sampling = configs["training"], configs["sampling"]
+    assert training["max_seq_len"] == sampling["max_seq_len"] == 65536
+    assert training["router_replay"]["enabled"] is False
+    assert sampling["router_replay"]["enabled"] is False
+    assert training["peft_config"] == sampling["peft_config"]
+    assert training["peft_config"]["target_modules"] == ["q_proj", "v_proj"]
+    assert training["prime_rl"]["fused_cross_entropy"] is False
+    assert training["prime_rl"]["ep_comm_backend"] == "deepep"
+    extra = sampling["vllm_config"]["extra_engine_kwargs"]
+    assert extra["lora_target_modules"] == ["wq_du", "wv_dv"]
+    assert extra["tokenizer_mode"] == "inkling"
+    assert extra["dtype"] == "bfloat16"
+    assert extra["kernel_config"] == {"enable_flashinfer_autotune": False}
+    assert sampling["vllm_config"]["extra_env"]["INKLING_MULTIMEM_AR"] == "0"
+    assert sampling["vllm_config"]["extra_env"]["VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY"] == "INKLING_"
+    assert not {"tokenizer_mode", "dtype", "kernel_config"} & sampling["vllm_config"].keys()
 
 
 @pytest.mark.parametrize(

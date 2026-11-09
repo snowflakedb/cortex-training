@@ -1,0 +1,69 @@
+{
+  "hardware": "H200",
+  "sub_job_configs": [
+    {
+      "job_type": "training",
+      "model_name": "thinkingmachines/Inkling-Small",
+      "dtype": "bfloat16",
+      "seed": 42,
+      "training_config": {
+        "n_gpus": 64,
+        "max_seq_len": 262144,
+        "train_batch_size": 64,
+        "gradient_clipping": 1.0,
+        "model_provider": "arctic",
+        "attn_implementation": "flex_attention",
+        "activation_checkpointing": true,
+        "ep_size": 16,
+        "sp_size": 1,
+        "ac_config": {
+          "mode": "full",
+          "freq": 1,
+          "router_replay_recompute": false,
+          "offload_config": {
+            "enabled": true,
+            "keep_last_n": 1
+          }
+        },
+        "optimizer": {
+          "name": "AdamW",
+          "lr": 0.0001,
+          "weight_decay": 0.0,
+          "betas": [
+            0.9,
+            0.999
+          ],
+          "eps": 1e-08
+        },
+        "ds_config": {
+          "train_batch_size": 64,
+          "train_micro_batch_size_per_gpu": 1,
+          "gradient_accumulation_steps": 1,
+          "zero_optimization": {
+            "stage": 2,
+            "reduce_bucket_size": 50000000,
+            "allgather_bucket_size": 50000000,
+            "overlap_comm": false
+          },
+          "bf16": {
+            "enabled": true
+          },
+          "data_types": {
+            "grad_accum_dtype": "fp32"
+          }
+        },
+        "router_replay": {
+          "enabled": false
+        },
+        "prime_rl": {
+          "fused_cross_entropy": false,
+          "ep_comm_backend": "deepep",
+          "moe_use_grouped_mm": true,
+          "fused_lm_head_token_chunk_size": 512,
+          "deepep_token_chunk_size": 4096
+        },
+        "tiled_mlp_token_chunk_size": 2048
+      }
+    }
+  ]
+}

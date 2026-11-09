@@ -1,0 +1,55 @@
+{
+  "hardware": "H200",
+  "sub_job_configs": [
+    {
+      "inference_config": {
+        "max_seq_len": 65536,
+        "n_gpus": 8,
+        "vllm_config": {
+          "tensor_parallel_size": 8,
+          "max_num_seqs": 8,
+          "gpu_memory_utilization": 0.8,
+          "enable_chunked_prefill": true,
+          "reasoning_parser": "inkling",
+          "tool_call_parser": "inkling",
+          "extra_env": {
+            "VLLM_USE_V2_MODEL_RUNNER": "1",
+            "INKLING_MULTIMEM_AR": "0",
+            "VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY": "INKLING_"
+          },
+          "extra_engine_kwargs": {
+            "lora_target_modules": [
+              "wq_du",
+              "wv_dv"
+            ],
+            "tokenizer_mode": "inkling",
+            "dtype": "bfloat16",
+            "kernel_config": {
+              "enable_flashinfer_autotune": false
+            },
+            "enforce_eager": true,
+            "distributed_executor_backend": "ray"
+          }
+        },
+        "peft_config": {
+          "peft_type": "Lora",
+          "task_type": "CAUSAL_LM",
+          "r": 4,
+          "lora_alpha": 8,
+          "lora_dropout": 0.0,
+          "bias": "none",
+          "target_modules": [
+            "q_proj",
+            "v_proj"
+          ]
+        },
+        "router_replay": {
+          "enabled": false
+        },
+        "max_num_batched_tokens": 8192
+      },
+      "job_type": "sampling",
+      "model_name": "thinkingmachines/Inkling-Small"
+    }
+  ]
+}
