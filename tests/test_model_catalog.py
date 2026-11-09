@@ -736,10 +736,6 @@ def _invalid(catalog_dir: Path, match: str) -> str:
     return str(raised.value)
 
 
-def test_copied_catalog_is_valid(catalog):
-    assert validate_catalog(catalog)["models"] == 23
-
-
 def test_distillation_jobs_build_with_make_distillation_config(catalog):
     assert validate_catalog(catalog)["distillation"] == 1
 

@@ -16,9 +16,6 @@
           "enable_chunked_prefill": true,
           "reasoning_parser": "inkling",
           "tool_call_parser": "inkling",
-          "extra_env": {
-            "VLLM_USE_V2_MODEL_RUNNER": "1"
-          },
           "extra_engine_kwargs": {
             "tokenizer_mode": "inkling",
             "dtype": "bfloat16",

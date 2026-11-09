@@ -65,15 +65,15 @@ renderers, so with a thinking-off default pass `enable_thinking=true` or
 
 ## Model notes
 
-- **Inkling Small:** text inference uses the official BF16 checkpoint on eight
-  H200 GPUs, configured for 262,144 tokens in full mode and 65,536 in LoRA mode.
-  These context lengths have not been live validated. Prompts use vLLM's native
-  `inkling` tokenizer mode and renderer. The LoRA sampling preset matches the
-  training window, with served projections `wq_du` and `wv_dv`. It sets
-  `INKLING_MULTIMEM_AR=0` so fused decode collectives preserve LoRA. Router replay
-  is disabled in both training/sampling pairs. Sampling uses chunked prefill
-  with an 8,192-token scheduling budget, independent of the context limit.
-
+- **Inkling Small:** text training requires the `arctic` provider,
+  FlexAttention (PyTorch 2.13+), and SP1. LoRA uses eight H200s with EP8,
+  rank-four `q_proj`/`v_proj` adapters, and 65,536 tokens. Full-parameter
+  training uses 64 H200s across eight nodes with EP16 and 262,144 tokens.
+  Both use ZeRO-2 with GPU optimizer state; full-parameter training offloads
+  activations to CPU. Sampling uses BF16/TP8 on eight H200s and the native
+  `inkling` tokenizer. Served LoRA targets are `wq_du`/`wv_dv`, with
+  `INKLING_MULTIMEM_AR=0`. Router replay is disabled. On EFA, cross-node
+  training uses `prime_rl.ep_comm_backend="uccl"` with an EFA-enabled runtime.
 - **Gemma 4 31B:** both training tiers use SDPA. Full-attention layers have head
   dimension 512, which FlashAttention 3 rejects. Gemma 3 and MedGemma keep
   FlashAttention 3; every one of their layers is 256.
@@ -85,78 +85,3 @@ renderers, so with a thinking-off default pass `enable_thinking=true` or
 - **Qwen3.6-35B-A3B:** LoRA training and checkpoint save/load require the
   `arctic` model provider, and LoRA is limited to `q_proj`, `k_proj`,
   `v_proj`, and `o_proj`. Routed-expert LoRA is not yet supported.
-- **Inkling Small:** text LoRA SFT uses the `arctic` provider, eight H200s,
-  expert parallelism of eight, and ZeRO-2. The LoRA preset uses rank four for
-  `q_proj` and `v_proj` and a configured window of 65,536 tokens. Training uses
-  FlexAttention with Triton and query chunks of 2,048 tokens, preserving Inkling's
-  learned relative-position bias and its gradients. The native LM-head weights
-  are scored in 512-token chunks; dense/shared MLPs use 2,048-token chunks and
-  expert dispatch uses 4,096-token chunks. Sequence parallelism remains unsupported.
-  This preset requires the updated Inkling training loader and PyTorch 2.13 or
-  newer with differentiable FlexAttention score-mod buffers. Four eight-GPU nodes
-  can use expert parallelism of eight with `n_gpus`, `train_batch_size`, and
-  `ds_config.train_batch_size` set to 32.
-  Earlier local validation at 1,024 tokens completed three SFT steps and
-  exported matching updated adapters on all 32 ranks. A local gateway run
-  completed three GRPO iterations with 24 training GPUs and eight sampling
-  GPUs, including LoRA synchronization
-  after each update and changed sampler logprobs. A cold LoRA resume restored
-  every saved optimizer field and tensor exactly on all 24 ranks, with the same
-  next-step loss, gradient norm and adapters as uninterrupted training.
-  Trainer/sampler logprob parity remains a failing check at `atol=1e-3`, `rtol=0`.
-  The full-parameter SFT preset uses 64 H200s across eight eight-GPU nodes,
-  EP16/SP1, a global batch of 64, microbatch one, 262,144 tokens, and ZeRO-2
-  without optimizer offload. Full block checkpoints offload activations to CPU,
-  requiring substantial host-memory capacity. Adam state and gradient accumulation
-  stay in FP32. EP16 places 16 of the 256 experts on each GPU, with four replicas of
-  each expert shard. Checkpoint-based memory accounting estimates about
-  104 GiB per GPU before activations and communication workspace; this estimate
-  does not establish that 262,144-token training fits. This eight-node
-  configuration has not been live validated.
-  Cross-node DeepEP requires a supported GPU RDMA transport. On EFA, use
-  `prime_rl.ep_comm_backend="uccl"` with an EFA-enabled UCCL runtime. A two-node,
-  16-rank UCCL dispatch/combine probe matched reference outputs, input gradients,
-  and routing-score gradients exactly. A four-node, 32-GPU EP16/UCCL LoRA SFT
-  run completed correctly aligned updates at 1,024 and 65,536 tokens with
-  activation offload and no optimizer offload. Its first 262,144-token batch
-  ran out of GPU memory during expert backward recomputation at 134.4 GiB
-  allocated. Chunked expert combines now release their queued communication
-  buffers between chunks. A second attempt still ran out of memory during
-  expert recomputation, so complete dispatch/compute/combine chunks now have
-  their own checkpoints. The next 32-GPU EP16/UCCL LoRA run completed a
-  correctly aligned 262,144-token SFT update in 1,307.84 seconds with loss
-  0.00265848, gradient norm 0.00256097, and optimizer success. Peak PyTorch
-  allocation was 98.90 GiB. All 32 ranks reached step three with byte-identical
-  adapters and empty UCCL handle/event caches; optimizer offload was disabled.
-  Its 1,024- and 65,536-token losses and gradient norms exactly matched the
-  earlier implementation. A separate 16-rank probe verified chunk checkpoints
-  nested inside full-block checkpoints, with exact outputs and input/routing-score
-  gradients, empty handle/event caches, and clean launcher exits.
-  This validates 262,144-token LoRA SFT on four nodes; the eight-node
-  full-parameter preset still requires a live fit check.
-  H200 component validation completed 262,144-token BF16 forward/backward for both
-  global and sliding-window attention with the checkpoint's head geometry and
-  nonzero learned-bias gradients. Global attention peaked at 16.3 GiB allocated
-  (22.2 GiB reserved). The real-width, real-vocabulary chunked LM head also
-  completed 262,144-token forward/backward, peaking at 16.2 GiB allocated.
-  These are component measurements, not a full-model memory bound. Reduced-model
-  full and LoRA steps with activation offload matched eager loss, gradient norm
-  and gradients at `atol=1e-6`, `rtol=0`. BF16 left-padding, right-padding, and
-  packed-sequence checks matched eager loss, gradient norm, and every trainable
-  gradient at `atol=1e-3`, `rtol=0`. Full and LoRA checkpoint/resume reproduced the
-  next update with the chunked backend. The eight-node full configuration still
-  needs end-to-end validation at its configured context.
-  Earlier local full SFT validation used 24 H200s with EP8/SP1 and CPU
-  optimizer offload. It completed three short updates and a 1,024-token update;
-  dense weights matched across all 24 ranks and expert weights across their
-  three replicas. Both full-mode presets now have matching 262,144-token limits
-  for RL composition. Initial full sync preserved every stored sampler tensor
-  exactly against a fresh official checkpoint load on all eight sampling ranks.
-  Cold full resume restored every parameter and optimizer tensor exactly on
-  all 24 ranks; the next loss, gradient norm and updated parameters also matched
-  uninterrupted training exactly.
-  Trained full-weight sync matched sender checksums on all eight sampling
-  ranks, with no skipped source tensors.
-  These are local validations; hosted validation timestamps remain unset.
-  The native vision, audio, and
-  multi-token prediction heads are omitted from text SFT.

@@ -13,7 +13,6 @@
           "reasoning_parser": "inkling",
           "tool_call_parser": "inkling",
           "extra_env": {
-            "VLLM_USE_V2_MODEL_RUNNER": "1",
             "INKLING_MULTIMEM_AR": "0",
             "VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY": "INKLING_"
           },
