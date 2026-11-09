@@ -9,13 +9,13 @@
       "training_config": {
         "n_gpus": 64,
         "max_seq_len": 262144,
-        "train_batch_size": 64,
+        "train_batch_size": 16,
         "gradient_clipping": 1.0,
         "model_provider": "arctic",
         "attn_implementation": "flex_attention",
         "activation_checkpointing": true,
         "ep_size": 16,
-        "sp_size": 1,
+        "sp_size": 4,
         "ac_config": {
           "mode": "full",
           "freq": 1,
@@ -36,7 +36,7 @@
           "eps": 1e-08
         },
         "ds_config": {
-          "train_batch_size": 64,
+          "train_batch_size": 16,
           "train_micro_batch_size_per_gpu": 1,
           "gradient_accumulation_steps": 1,
           "zero_optimization": {

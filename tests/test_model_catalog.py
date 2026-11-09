@@ -402,7 +402,7 @@ def test_inkling_full_sft_builds_consistent_ep16_batches_without_optimizer_offlo
     training = _config(body)
     ds_config = training["ds_config"]
     assert job_errors(body) == []
-    assert (training["n_gpus"], training["ep_size"], training["sp_size"]) == (64, 16, 1)
+    assert (training["n_gpus"], training["ep_size"], training["sp_size"]) == (64, 16, 4)
     assert training["n_gpus"] // training["ep_size"] == 4
     assert training["max_seq_len"] == 262144
     assert training["attn_implementation"] == "flex_attention"
