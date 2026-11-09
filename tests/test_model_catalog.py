@@ -395,6 +395,25 @@ def test_gemma4_31b_training_uses_sdpa():
         assert training["attn_implementation"] == "sdpa"
 
 
+def test_inkling_full_sft_builds_consistent_ep16_batches_without_offload():
+    from recipes.utils import make_config
+
+    body = make_config("thinkingmachines/Inkling-Small", "standard")
+    training = _config(body)
+    ds_config = training["ds_config"]
+    assert job_errors(body) == []
+    assert (training["n_gpus"], training["ep_size"], training["sp_size"]) == (64, 16, 1)
+    assert training["n_gpus"] // training["ep_size"] == 4
+    assert training["max_seq_len"] == 1024
+    assert ds_config["train_micro_batch_size_per_gpu"] == ds_config["gradient_accumulation_steps"] == 1
+    batch = training["n_gpus"] // training["sp_size"]
+    assert training["train_batch_size"] == ds_config["train_batch_size"] == batch
+    assert ds_config["zero_optimization"]["stage"] == 2
+    assert not {"offload_optimizer", "offload_param"} & ds_config["zero_optimization"].keys()
+    assert ds_config["data_types"]["grad_accum_dtype"] == "fp32"
+    assert "peft_config" not in training
+
+
 def test_inkling_lora_rl_uses_matching_context_and_sampling_projections():
     from recipes.utils import make_config
 

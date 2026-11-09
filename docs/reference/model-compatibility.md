@@ -98,16 +98,21 @@ renderers, so with a thinking-off default pass `enable_thinking=true` or
   every saved optimizer field and tensor exactly on all 24 ranks, with the same
   next-step loss, gradient norm and adapters as uninterrupted training.
   Trainer/sampler logprob parity remains a failing check at `atol=1e-3`, `rtol=0`.
-  The full-parameter SFT preset uses 24 H200s, EP8/SP1, a global batch of 24,
-  1,024 tokens, and ZeRO-2 with CPU optimizer offload. A local run completed
-  three short updates and a 1,024-token update; dense weights matched across
-  all 24 ranks and expert weights across their three replicas. Allow about
-  1.6 TB of anonymous host memory per eight-GPU training node, with additional
-  headroom for checkpoint I/O. The full SFT preset's context is smaller than
-  the full inference preset's 32,768-token context, so composing them for RL
-  requires matching context overrides. Full sync preserved every stored
-  sampler tensor exactly against a fresh official checkpoint load on all
-  eight sampling ranks.
+  The full-parameter SFT preset uses 64 H200s across eight eight-GPU nodes,
+  EP16/SP1, a global batch of 64, microbatch one, 1,024 tokens, and ZeRO-2
+  without optimizer offload. Adam state and gradient accumulation stay in
+  FP32. EP16 places 16 of the 256 experts on each GPU, with four replicas of
+  each expert shard. Checkpoint-based memory accounting estimates about
+  104 GiB per GPU before activations and communication workspace. This
+  eight-node configuration has not been live validated.
+  Earlier local full SFT validation used 24 H200s with EP8/SP1 and CPU
+  optimizer offload. It completed three short updates and a 1,024-token update;
+  dense weights matched across all 24 ranks and expert weights across their
+  three replicas. The full SFT preset's context is smaller than the full
+  inference preset's 32,768-token context, so composing them for RL requires
+  matching context overrides. Initial full sync preserved every stored sampler
+  tensor exactly against a fresh official checkpoint load on all eight
+  sampling ranks.
   Cold full resume restored every parameter and optimizer tensor exactly on
   all 24 ranks; the next loss, gradient norm and updated parameters also matched
   uninterrupted training exactly.
