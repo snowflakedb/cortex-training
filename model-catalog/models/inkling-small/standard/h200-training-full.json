@@ -8,7 +8,7 @@
       "seed": 42,
       "training_config": {
         "n_gpus": 32,
-        "max_seq_len": 262144,
+        "max_seq_len": 65536,
         "train_batch_size": 4,
         "gradient_clipping": 1.0,
         "model_provider": "arctic",
@@ -74,7 +74,7 @@
         "ep_group_layout": "auto",
         "cuda_allocator_conf": "expandable_segments:True",
         "mb_spec": {
-          "max_tokens_per_mb": 262144
+          "max_tokens_per_mb": 65536
         },
         "step_peak_memory_log": true
       }

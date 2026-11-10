@@ -3,7 +3,7 @@
   "sub_job_configs": [
     {
       "inference_config": {
-        "max_seq_len": 262144,
+        "max_seq_len": 65536,
         "n_gpus": 8,
         "vllm_config": {
           "tensor_parallel_size": 8,
