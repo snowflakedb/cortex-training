@@ -813,6 +813,14 @@ class _ColoredLinks(Static):
         return self.styles.link_style
 
 
+class TextBox(Input):
+    """A one-line text box (the job list's search, the log's filter) whose select-all keys select
+    its text: ``ctrl+a`` (Textual's goes to the start, as ``Home`` still does), and ``super+a``, which
+    is Cmd-A where the terminal passes it on. A terminal that keeps Cmd-A selects its whole screen."""
+
+    BINDINGS = [Binding("ctrl+a,super+a", "select_all", "Select all", show=False)]
+
+
 class FittedFooter(Footer):
     """A footer that hides rightmost keys instead of clipping one."""
 

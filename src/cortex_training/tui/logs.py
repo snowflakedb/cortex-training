@@ -115,6 +115,7 @@ from cortex_training.tui.widgets import FittedFooter
 from cortex_training.tui.widgets import FollowsPointer
 from cortex_training.tui.widgets import JobTabs
 from cortex_training.tui.widgets import KEYS_BINDING
+from cortex_training.tui.widgets import TextBox
 from cortex_training.tui.widgets import _ColoredLinks
 from cortex_training.tui.widgets import _LogPane
 from cortex_training.tui.widgets import _ResourceList
@@ -319,7 +320,7 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
                 # box, and what a jump (e, n), the level and the filter found (see _log_chips).
                 with Horizontal(id="log-bar"):
                     yield Static("", id="log-live")
-                    yield Input(placeholder="/ filter   Esc clears", id="logfilter")
+                    yield TextBox(placeholder="/ filter   Esc clears", id="logfilter")
                     yield Static("", id="log-chips")
             with TabPane("Resources", id="resource"):
                 with Horizontal(id="resource-body"):

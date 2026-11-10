@@ -595,6 +595,8 @@ class CortexTrainingLogTUI(App):
         if event.button == 3 and isinstance(event, (events.MouseDown, events.MouseUp)):
             # A right-click does nothing. Textual would take it for a click:
             # one clears the highlight, and moves a table's cursor or picks an item.
+            if isinstance(event, events.MouseUp):
+                self._renew_mouse_reporting()
             return
         self._footer_wander(event)
         if self._footer_click(event):
@@ -629,6 +631,24 @@ class CortexTrainingLogTUI(App):
                 del screen.ALLOW_SELECT
         if keep and kept and not self.screen.selections:
             self.screen.selections = kept  # a click on a note or the footer: the highlight stays
+
+    def _renew_mouse_reporting(self) -> None:
+        """Turn the terminal's mouse reporting off and on, as a right-click ends. VS Code's terminal
+        (Cursor's too) opens its own menu on one, which keeps the release, and from then on it sent no
+        release and no held button for a press: no drag highlighted anything. Textual makes up the
+        release when the pointer next moves, and setting the modes again then brings the reports back.
+        Any other terminal ends as Textual left it: pixel positions, which Textual asks for where the
+        terminal reports its size in-band, are a way of encoding positions as the others are, and the
+        terminal keeps the one set last, so they are set again after the others."""
+        driver = self._driver
+        off = getattr(driver, "_disable_mouse_support", None)
+        on = getattr(driver, "_enable_mouse_support", None)
+        if callable(off) and callable(on):  # not a headless driver's
+            off()
+            on()
+            if getattr(driver, "_mouse_pixels", False):
+                driver._enable_mouse_pixels()
+                driver.flush()
 
     def _footer_wander(self, event: events.MouseEvent) -> None:
         """A press on a footer key that moves two cells along it, or off its row, is a drag:

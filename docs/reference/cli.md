@@ -1491,7 +1491,9 @@ on a list cut short that nothing narrowed, that `db=NAME` reads that whole
 database from the service rather than only the jobs loaded.
 Long messages scroll. The header gives the match count and query. The search
 box is one row at the bottom of the screen; the help for its fields and
-operators shows under it only while it has focus.
+operators shows under it only while it has focus. In the box, `ctrl+a` (or
+Cmd-A where the terminal passes it on; see [Terminals](#terminals)) selects
+what is typed, and `Home` goes to its start.
 
 | Key | Action |
 |-----|--------|
@@ -1860,7 +1862,8 @@ keeps to the newest line; `‖ PAUSED · 12 new lines · p resumes` once you pau
 job's saved console; `↓ DOWNLOADING training #0`, a bar and `8/12 chunks`
 while that console downloads; `○ WAITING` while the job or sub-job waits to
 start (the status line says why); and `× STOPPED · r retries` when the tail
-stopped on an error. In the middle is the filter box (`/` focuses it). At its
+stopped on an error. In the middle is the filter box (`/` focuses it; there
+`ctrl+a`, or Cmd-A where the terminal passes it on, selects what is typed). At its
 right end are chips for what is found or set, in this order: where the last
 jump landed (`error 2/5` or `no errors` for `e` / `E`, `problem 2/5` or
 `no problems` for `n` / `N`), the level (`≥ WARNING`), and the filter's count
@@ -1969,8 +1972,8 @@ where the terminal passes it through). A drag on a `┃` bar between the job
 list's column names resizes a column instead (see above). Drags stay in their log, list, pane, or
 table region and scroll it at an edge; table selection follows characters
 across rows and hidden horizontal columns. Small row movements remain clicks,
-while a drag never activates the row. Changing the shown tab, source, unit,
-window, or rows clears the highlight.
+while a drag never activates the row. A right-click does nothing and keeps the
+highlight. Changing the shown tab, source, unit, window, or rows clears the highlight.
 
 The TUI owns the mouse selection and copies safe text both locally (`pbcopy`,
 `wl-copy`, `xclip` or `xsel`) and through OSC 52; a note reports the result.
@@ -2093,6 +2096,21 @@ width (iTerm2's "Ambiguous characters are double-width", some CJK setups),
 every border breaks, as in any Textual app. Every view works at 80×24; a
 smaller terminal cuts columns, long values and the footer's keys, and `?`
 still lists every key.
+
+VS Code's and Cursor's terminals open their own menu on a right-click, even
+over the TUI. The menu keeps the button's release, and the terminal then reports
+no release and no held button for later presses, so a drag would highlight
+nothing. The TUI sets the terminal's mouse modes again as the pointer next
+moves, which brings the reports back. To keep the menu away, set
+`"terminal.integrated.rightClickBehavior": "nothing"` (Shift+right-click still
+opens it).
+
+Cmd-A in VS Code, Cursor and macOS Terminal selects the terminal's whole screen,
+and the TUI never sees it: in its text boxes, use `ctrl+a`. VS Code and Cursor
+pass Cmd-A on to a program that asks for every key (as the TUI does) once their
+own binding is removed, with this in `keybindings.json`:
+`{ "key": "cmd+a", "command": "-workbench.action.terminal.selectAll" }`. A shell
+prompt keeps the terminal's select-all.
 
 Over SSH the TUI copies through OSC 52 alone, since this machine's clipboard
 tools would copy on the remote host. The terminal has to accept OSC 52 (some ask

@@ -82,6 +82,7 @@ from cortex_training.tui.widgets import _ERROR_LOG
 from cortex_training.tui.widgets import log_traceback
 from cortex_training.tui.widgets import KEYS_BINDING
 from cortex_training.tui.widgets import SelectableTable
+from cortex_training.tui.widgets import TextBox
 from cortex_training.tui.widgets import _FixedCell
 from cortex_training.tui.widgets import _cell
 from cortex_training.tui.widgets import after_refresh
@@ -629,7 +630,7 @@ class JobListScreen(FollowsPointer, Screen):
         with VerticalScroll(id="nomatch-box"):
             yield Static("", id="nomatch")
         # One row; its help shows under it while it has focus, so the rows are the list's otherwise.
-        yield Input(
+        yield TextBox(
             placeholder="/ search  ids, owners, models, locations · status:running gpus>=8 gpu:H200 · Esc clears",
             id="jobfilter",
         )

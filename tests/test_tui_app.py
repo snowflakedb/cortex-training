@@ -2816,6 +2816,101 @@ def test_highlighting_copies_nothing_until_ctrl_c():
     asyncio.run(_run_highlighting_copies_nothing_until_ctrl_c())
 
 
+async def _run_a_right_click_turns_mouse_reporting_off_and_on():
+    from textual import events
+
+    from cortex_training.tui.clipboard import selected_text
+
+    app = CortexTrainingLogTUI(_client(), poll_interval=0.01)
+    modes: list[str] = []
+
+    async def terminal(cls, x, button=1):  # through the driver, as a terminal's input comes
+        app._driver.process_message(cls(None, x, 1, 0, 0, button, False, False, False, screen_x=x, screen_y=1))
+        await pilot.pause()
+
+    async with app.run_test() as pilot:
+        assert await _wait(pilot, app, lambda: len(getattr(app.screen, "_job_by_item", {})) >= 2)
+        app._driver._disable_mouse_support = lambda: modes.append("off")
+        app._driver._enable_mouse_support = lambda: modes.append("on")
+        for cls, x in ((events.MouseDown, 4), (events.MouseMove, 20), (events.MouseUp, 20)):
+            await terminal(cls, x)
+        highlighted = selected_text(app.screen)
+        assert highlighted and modes == []
+        # VS Code opens its menu on the press and keeps the release: Textual makes one up as the
+        # pointer next moves, and only then are the modes set again.
+        await terminal(events.MouseDown, 30, button=3)
+        assert modes == []
+        await terminal(events.MouseMove, 31, button=0)
+        assert modes == ["off", "on"]
+        await terminal(events.MouseMove, 32, button=0)
+        assert modes == ["off", "on"]  # once for the click
+        # A terminal that sends the release: the same, as it comes.
+        await terminal(events.MouseDown, 30, button=3)
+        await terminal(events.MouseUp, 30, button=3)
+        assert modes == ["off", "on", "off", "on"]
+        assert selected_text(app.screen) == highlighted  # neither click took the highlight
+        # Where Textual asked for pixel positions, they are set again last: the terminal reports
+        # positions in the encoding set last, and the cells' 1006 would otherwise replace them.
+        app._driver._mouse_pixels = True
+        app._driver._enable_mouse_pixels = lambda: modes.append("pixels")
+        modes.clear()
+        await terminal(events.MouseDown, 30, button=3)
+        await terminal(events.MouseUp, 30, button=3)
+        assert modes == ["off", "on", "pixels"]
+        await _settle(app, pilot)
+
+
+def test_a_right_click_turns_mouse_reporting_off_and_on():
+    asyncio.run(_run_a_right_click_turns_mouse_reporting_off_and_on())
+
+
+async def _select_all_in(pilot, box):
+    """In ``box``: ctrl+a, super+a (Cmd-A where the terminal passes it on) and ctrl+shift+a
+    each select its text, a key typed then replaces it, and Home goes to the start."""
+    for key in ("ctrl+a", "super+a", "ctrl+shift+a"):
+        box.value = "qwen h200"
+        box.cursor_position = 3
+        await pilot.press(key)
+        assert box.selected_text == "qwen h200", key
+    await pilot.press("x")
+    assert box.value == "x"
+    box.value = "qwen"
+    await pilot.press("home")
+    assert box.cursor_position == 0 and not box.selected_text
+
+
+async def _run_select_all_keys_select_the_search_box_s_text():
+    app = CortexTrainingLogTUI(_client(), poll_interval=0.01)
+    async with app.run_test() as pilot:
+        assert await _wait(pilot, app, lambda: len(getattr(app.screen, "_job_by_item", {})) >= 2)
+        await pilot.press("slash")
+        box = app.screen.query_one("#jobfilter", Input)
+        assert app.focused is box
+        await _select_all_in(pilot, box)
+        assert not app.screen.selections  # the box's text, not the screen's
+        await _settle(app, pilot)
+
+
+def test_select_all_keys_select_the_search_box_s_text():
+    asyncio.run(_run_select_all_keys_select_the_search_box_s_text())
+
+
+async def _run_select_all_keys_select_the_log_filter_s_text():
+    app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
+    async with app.run_test() as pilot:
+        await _open_live_tail(app, pilot)
+        await pilot.press("slash")
+        box = app.screen.query_one("#logfilter", Input)
+        assert app.focused is box
+        await _select_all_in(pilot, box)
+        assert not app.screen.selections
+        await _settle(app, pilot)
+
+
+def test_select_all_keys_select_the_log_filter_s_text():
+    asyncio.run(_run_select_all_keys_select_the_log_filter_s_text())
+
+
 # ─── text selection in tables ─────────────────────────────────────────────────
 
 
