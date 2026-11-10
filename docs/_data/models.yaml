@@ -134,3 +134,7 @@ models:
     training: true
     inference: true
     last_validated: 2026-11-05
+  - id: thinkingmachines/Inkling-Small
+    training: true
+    inference: true
+    last_validated: null

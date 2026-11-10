@@ -31,6 +31,7 @@ for a specific workload.
 | `zai-org/GLM-5.3-Flash-BF16` | MoE | standard, long | standard, long | 262,144 |
 | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` | MoE | standard, long | standard, long | 262,144 |
 | `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16` | MoE | standard, long | standard, long | 262,144 |
+| `thinkingmachines/Inkling-Small` | MoE | standard, long | standard, long | 262,144 |
 
 `standard` and `long` are each model's smaller and larger `max_seq_len` tiers,
 so the boundary differs between models. Most trainable models have LoRA and full
@@ -58,12 +59,22 @@ renderer from tinker-cookbook's
 [renderer list](https://tinker-docs.thinkingmachines.ai/tutorials/core-concepts/rendering/#available-renderers)
 whose chat template matches the model's own (its `tokenizer_config.json` on
 Hugging Face); a mismatched template trains and samples on the wrong format.
-Qwen3-4B-Instruct, GLM 5.3, GLM 5.3 Flash and gpt-oss have only thinking
+Qwen3-4B-Instruct, GLM 5.3, GLM 5.3 Flash, gpt-oss and Inkling Small have only thinking
 renderers, so with a thinking-off default pass `enable_thinking=true` or
 `renderer_name=`.
 
 ## Model notes
 
+- **Inkling Small:** text training requires the `arctic` provider,
+  FlexAttention (PyTorch 2.13+). LoRA uses 16 H200s across two nodes with EP16/SP2,
+  rank-four `q_proj`/`v_proj` adapters. Full-parameter training uses 32 H200s
+  across four nodes with EP32/SP8 and BF16 master weights, gradients, and Adam
+  states. Both offer 65,536-token `standard` and 262,144-token `long` tiers,
+  use ZeRO-2 with GPU optimizer state, and offload activations to CPU.
+  Sampling uses BF16/TP8 on eight H200s and the native
+  `inkling` tokenizer. Served LoRA targets are `wq_du`/`wv_dv`, with
+  `INKLING_MULTIMEM_AR=0`. Router replay is disabled. Full-parameter training
+  uses NCCL; LoRA on EFA uses `prime_rl.ep_comm_backend="uccl"` with an EFA-enabled runtime.
 - **Gemma 4 31B:** both training tiers use SDPA. Full-attention layers have head
   dimension 512, which FlashAttention 3 rejects. Gemma 3 and MedGemma keep
   FlashAttention 3; every one of their layers is 256.

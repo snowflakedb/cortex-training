@@ -2311,6 +2311,12 @@ Notes on single keys:
 - Qwen3.5-MoE models with `ep_size` > 1 take `sdpa` (and `eager`, which they
   run as `sdpa`), `flash_attention_3` and `flash_attention_4` as the attention
   backend.
+- Inkling Small training uses `flex_attention` with the `arctic` loader to
+  preserve gradients through its learned relative-position bias. Its native
+  LM head supports `lm_head.token_chunk_size`; `lm_head.cross_entropy` remains
+  `false`.
+  See the [model compatibility notes](model-compatibility.md) for context limits
+  and activation-offload requirements.
 
 **Not accepted.** Any key that is not in the table is rejected, including
 `peft` (LoRA is a training mode; set `peft_config` instead) and

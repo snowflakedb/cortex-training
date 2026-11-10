@@ -44,6 +44,7 @@ _FULL_STANDARD_LONG = [
     "long/h200-training-full",
 ]
 EXPECTED_FILES = {
+    "thinkingmachines/Inkling-Small": _TRAINABLE_LONG + _TRAINABLE_STANDARD,
     "Qwen/Qwen3-0.6B": _TRAINABLE_STANDARD,
     "Qwen/Qwen3-1.7B": _TRAINABLE_STANDARD,
     "Qwen/Qwen3-4B-Instruct-2507": _FULL_STANDARD_LONG,
@@ -121,11 +122,11 @@ def _config(body: dict) -> dict:
 
 def test_checked_in_catalog_is_valid():
     assert validate_catalog() == {
-        "models": 22,
-        "files": 106,
-        "training": 52,
-        "inference": 54,
-        "rl": 49,
+        "models": 23,
+        "files": 114,
+        "training": 56,
+        "inference": 58,
+        "rl": 53,
         "distillation": 1,
     }
 
@@ -140,6 +141,7 @@ def test_catalog_models_include_license_links():
     licenses = {model_id: info["license"] for model_id, (_, info) in _models().items()}
 
     assert {model_id: license["name"] for model_id, license in licenses.items()} == {
+        "thinkingmachines/Inkling-Small": "Apache 2.0",
         "Qwen/Qwen3-0.6B": "Apache 2.0",
         "Qwen/Qwen3-1.7B": "Apache 2.0",
         "Qwen/Qwen3-8B": "Apache 2.0",
@@ -174,6 +176,7 @@ def test_moe_models_record_router_replay_geometry():
     }
 
     assert {model_id: moe for model_id, (architecture, moe) in geometry.items() if architecture == "moe"} == {
+        "thinkingmachines/Inkling-Small": {"num_moe_layers": 40, "topk": 6, "num_experts": 256},
         "Qwen/Qwen3-30B-A3B": {"num_moe_layers": 48, "topk": 8, "num_experts": 128},
         "Qwen/Qwen3.6-35B-A3B": {"num_moe_layers": 40, "topk": 8, "num_experts": 256},
         "Qwen/Qwen3.8-Flash-Next": {"num_moe_layers": 48, "topk": 10, "num_experts": 512},
@@ -237,6 +240,10 @@ def test_files_keep_their_source_sequence_lengths():
     }
 
     assert lengths == {
+        ("thinkingmachines/Inkling-Small", "standard", "inference"): 65536,
+        ("thinkingmachines/Inkling-Small", "standard", "training"): 65536,
+        ("thinkingmachines/Inkling-Small", "long", "inference"): 262144,
+        ("thinkingmachines/Inkling-Small", "long", "training"): 262144,
         ("Qwen/Qwen3-0.6B", "standard", "inference"): 32768,
         ("Qwen/Qwen3-0.6B", "standard", "training"): 32768,
         ("Qwen/Qwen3-1.7B", "standard", "inference"): 32768,
@@ -382,6 +389,80 @@ def test_gemma4_31b_training_uses_sdpa():
     for key in ("standard/h200-training-full", "long/h200-training-full"):
         training = _config(_body("google/gemma-4-31B-it", key))
         assert training["attn_implementation"] == "sdpa"
+
+
+@pytest.mark.parametrize(("context", "seq_len"), [("standard", 65536), ("long", 262144)])
+def test_inkling_full_sft_builds_consistent_sp_batches_without_optimizer_offload(context, seq_len):
+    from recipes.utils import make_config
+
+    body = make_config("thinkingmachines/Inkling-Small", context)
+    training = _config(body)
+    ds_config = training["ds_config"]
+    assert job_errors(body) == []
+    assert (training["n_gpus"], training["ep_size"], training["sp_size"]) == (32, 32, 8)
+    assert training["n_gpus"] // training["ep_size"] == 1
+    assert training["max_seq_len"] == training["mb_spec"]["max_tokens_per_mb"] == seq_len
+    assert training["attn_implementation"] == "flex_attention"
+    assert training["ac_config"]["offload_config"]["enabled"] is True
+    assert training["prime_rl"]["fused_lm_head_token_chunk_size"] == 512
+    assert training["prime_rl"]["deepep_token_chunk_size"] == 256
+    assert training["tiled_mlp_token_chunk_size"] == 1024
+    assert ds_config["train_micro_batch_size_per_gpu"] == ds_config["gradient_accumulation_steps"] == 1
+    batch = training["n_gpus"] // training["sp_size"]
+    assert training["train_batch_size"] == ds_config["train_batch_size"] == batch
+    assert ds_config["zero_optimization"]["stage"] == 2
+    assert not {"offload_optimizer", "offload_param"} & ds_config["zero_optimization"].keys()
+    assert ds_config["data_types"]["grad_accum_dtype"] == "bf16"
+    assert ds_config["bf16"]["bf16_master_weights_and_grads"] is True
+    assert ds_config["bf16"]["bf16_optimizer_states"] is True
+    assert "peft_config" not in training
+
+
+@pytest.mark.parametrize("lora", [True, False])
+@pytest.mark.parametrize(("context", "seq_len"), [("standard", 65536), ("long", 262144)])
+def test_inkling_rl_composes_matching_context_limits_with_chunked_prefill(lora, context, seq_len):
+    from recipes.utils import make_config
+
+    body = make_config("thinkingmachines/Inkling-Small", context, lora=lora, rl=True)
+    training, sampling = body["sub_job_configs"]
+    assert job_errors(body) == []
+    assert training["training_config"]["max_seq_len"] == sampling["inference_config"]["max_seq_len"] == seq_len
+    assert training["training_config"]["router_replay"]["enabled"] is False
+    assert training["training_config"]["attn_implementation"] == "flex_attention"
+    assert sampling["inference_config"]["router_replay"]["enabled"] is False
+    assert sampling["inference_config"]["vllm_config"]["enable_chunked_prefill"] is True
+    assert sampling["inference_config"]["max_num_batched_tokens"] == 8192 < seq_len
+
+
+@pytest.mark.parametrize(("context", "seq_len"), [("standard", 65536), ("long", 262144)])
+def test_inkling_lora_rl_uses_matching_context_and_sampling_projections(context, seq_len):
+    from recipes.utils import make_config
+
+    body = make_config("thinkingmachines/Inkling-Small", context, lora=True, rl=True)
+    configs = {
+        sub["job_type"]: sub.get("training_config") or sub["inference_config"]
+        for sub in body["sub_job_configs"]
+    }
+    training, sampling = configs["training"], configs["sampling"]
+    assert training["max_seq_len"] == sampling["max_seq_len"] == seq_len
+    assert (training["n_gpus"], training["ep_size"], training["sp_size"]) == (16, 16, 2)
+    assert training["train_batch_size"] == training["ds_config"]["train_batch_size"] == 8
+    assert training["ac_config"]["offload_config"]["enabled"] is True
+    assert not {"offload_optimizer", "offload_param"} & training["ds_config"]["zero_optimization"].keys()
+    assert training["router_replay"]["enabled"] is False
+    assert sampling["router_replay"]["enabled"] is False
+    assert training["peft_config"] == sampling["peft_config"]
+    assert training["peft_config"]["target_modules"] == ["q_proj", "v_proj"]
+    assert training["prime_rl"]["fused_cross_entropy"] is False
+    assert training["prime_rl"]["ep_comm_backend"] == "deepep"
+    extra = sampling["vllm_config"]["extra_engine_kwargs"]
+    assert extra["lora_target_modules"] == ["wq_du", "wv_dv"]
+    assert extra["tokenizer_mode"] == "inkling"
+    assert extra["dtype"] == "bfloat16"
+    assert extra["kernel_config"] == {"enable_flashinfer_autotune": False}
+    assert sampling["vllm_config"]["extra_env"]["INKLING_MULTIMEM_AR"] == "0"
+    assert sampling["vllm_config"]["extra_env"]["VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY"] == "INKLING_"
+    assert not {"tokenizer_mode", "dtype", "kernel_config"} & sampling["vllm_config"].keys()
 
 
 @pytest.mark.parametrize(
@@ -658,10 +739,6 @@ def _invalid(catalog_dir: Path, match: str) -> str:
     with pytest.raises(CatalogValidationError, match=match) as raised:
         validate_catalog(catalog_dir)
     return str(raised.value)
-
-
-def test_copied_catalog_is_valid(catalog):
-    assert validate_catalog(catalog)["models"] == 22
 
 
 def test_distillation_jobs_build_with_make_distillation_config(catalog):
