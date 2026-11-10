@@ -2917,8 +2917,9 @@ such as TRL send it on requests without ZoRRo. Its effect depends on the request
   not one entry per row), when there are no more rows than ranks, when the batch
   size is not divisible by the rank count, when a group has more rows than one
   rank holds, or when the groups cannot be packed into equal bins. These cases
-  are not errors for a request without ZoRRo. Ids that are not a tensor are
-  ignored, and rows balance by sample length.
+  are not errors for a request without ZoRRo. For now only tensor
+  `prompt_group_ids` are supported. A value that is not a tensor is ignored, and
+  rows balance by sample length.
 
 ---
 
