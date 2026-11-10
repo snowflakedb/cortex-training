@@ -2905,21 +2905,22 @@ group. The same key is what a prompt-mean loss uses for its counts, and clients
 such as TRL send it on requests without ZoRRo. Its effect depends on the request:
 
 - ZoRRo: the ids name the groups that stay on one data-parallel rank. Omitting
-  them, or sending a vector of any other shape, groups rows that share the same
-  prompt columns.
+  them, or sending a vector of any other shape or of non-integer values, groups
+  rows that share the same prompt columns.
 - Without ZoRRo, with balancing on: when the ids are a 1-D vector with one entry
   per row, whole groups are balanced instead of single rows, so each prompt stays
   on one rank. A group's cost is the sum of its rows' squared lengths. Groups
   are packed into rank bins of equal row count and are never split. Rows keep
   their relative order within a group. Groups are placed by size and cost, not
   by arrival order.
-- Without ZoRRo, arrival order is kept when the ids are malformed (not 1-D, or
-  not one entry per row), when there are no more rows than ranks, when the batch
+- Without ZoRRo, arrival order is kept when the ids are malformed (not 1-D, not
+  integers, or not one entry per row), when there are no more rows than ranks, when the batch
   size is not divisible by the rank count, when a group has more rows than one
   rank holds, or when the groups cannot be packed into equal bins. These cases
   are not errors for a request without ZoRRo. For now only tensor
   `prompt_group_ids` are supported. A value that is not a tensor is ignored, and
-  rows balance by sample length.
+  rows balance by sample length. When the batch and its `context` both carry
+  `prompt_group_ids`, the batch value is the one used.
 
 ---
 
