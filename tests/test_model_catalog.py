@@ -394,27 +394,29 @@ def test_gemma4_31b_training_uses_sdpa():
         assert training["attn_implementation"] == "sdpa"
 
 
-def test_inkling_full_sft_builds_consistent_ep16_batches_without_optimizer_offload():
+def test_inkling_full_sft_builds_consistent_sp_batches_without_optimizer_offload():
     from recipes.utils import make_config
 
     body = make_config("thinkingmachines/Inkling-Small", "standard")
     training = _config(body)
     ds_config = training["ds_config"]
     assert job_errors(body) == []
-    assert (training["n_gpus"], training["ep_size"], training["sp_size"]) == (64, 16, 4)
-    assert training["n_gpus"] // training["ep_size"] == 4
+    assert (training["n_gpus"], training["ep_size"], training["sp_size"]) == (32, 32, 8)
+    assert training["n_gpus"] // training["ep_size"] == 1
     assert training["max_seq_len"] == 262144
     assert training["attn_implementation"] == "flex_attention"
     assert training["ac_config"]["offload_config"]["enabled"] is True
     assert training["prime_rl"]["fused_lm_head_token_chunk_size"] == 512
-    assert training["prime_rl"]["deepep_token_chunk_size"] == 4096
-    assert training["tiled_mlp_token_chunk_size"] == 2048
+    assert training["prime_rl"]["deepep_token_chunk_size"] == 256
+    assert training["tiled_mlp_token_chunk_size"] == 1024
     assert ds_config["train_micro_batch_size_per_gpu"] == ds_config["gradient_accumulation_steps"] == 1
     batch = training["n_gpus"] // training["sp_size"]
     assert training["train_batch_size"] == ds_config["train_batch_size"] == batch
     assert ds_config["zero_optimization"]["stage"] == 2
     assert not {"offload_optimizer", "offload_param"} & ds_config["zero_optimization"].keys()
-    assert ds_config["data_types"]["grad_accum_dtype"] == "fp32"
+    assert ds_config["data_types"]["grad_accum_dtype"] == "bf16"
+    assert ds_config["bf16"]["bf16_master_weights_and_grads"] is True
+    assert ds_config["bf16"]["bf16_optimizer_states"] is True
     assert "peft_config" not in training
 
 

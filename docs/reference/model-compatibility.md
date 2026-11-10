@@ -68,8 +68,9 @@ renderers, so with a thinking-off default pass `enable_thinking=true` or
 - **Inkling Small:** text training requires the `arctic` provider,
   FlexAttention (PyTorch 2.13+). LoRA uses 16 H200s across two nodes with EP16/SP2,
   rank-four `q_proj`/`v_proj` adapters, and 262,144 tokens. Full-parameter
-  training uses 64 H200s across eight nodes with EP16/SP4 and 262,144 tokens.
-  Both use ZeRO-2 with GPU optimizer state and offload activations to CPU.
+  training uses 32 H200s across four nodes with EP32/SP8, 262,144 tokens,
+  and BF16 master weights, gradients, and Adam states. Both use ZeRO-2 with
+  GPU optimizer state and offload activations to CPU.
   Sampling uses BF16/TP8 on eight H200s and the native
   `inkling` tokenizer. Served LoRA targets are `wq_du`/`wv_dv`, with
   `INKLING_MULTIMEM_AR=0`. Router replay is disabled. On EFA, cross-node
