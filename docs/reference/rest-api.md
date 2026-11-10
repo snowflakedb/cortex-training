@@ -2019,7 +2019,9 @@ The long-context/memory knobs:
 
 - `sp_size`: Ulysses sequence-parallel degree, sharding each sample's sequence
   across `sp_size` ranks. `1` (default) disables it; the server requires
-  `world_size % sp_size == 0`.
+  `world_size % sp_size == 0`. A ZoRRo step with balancing on requires
+  `sp_size` of 1 and is rejected when it runs with any other value (see
+  [section 10.5](#105-rank-assignment)).
 - `mb_spec`: `{"max_tokens_per_mb": N}`, the most real tokens whose rows are
   packed into one model call (default `10240`). It counts whole rows before
   sequence parallelism splits them, and a row longer than N runs in a call of
@@ -3059,6 +3061,76 @@ tensor[:, i] is the log probability of input_ids[:, i + 1]
 
 This is an ArcticTraining processing convention, not a REST-level field
 requirement.
+
+### 10.5 Rank assignment
+
+`balance_batch` chooses the row order used before data-parallel dispatch. The
+key is accepted on the flat batch and inside `context`. Per-row outputs that
+are a list of rows, including logprobs, are returned in request order. The
+client does not undo the assignment. Other outputs keep the existing merge:
+they concatenate in rank order, which is the assigned order, or take the
+first rank's value.
+
+Only the JSON booleans `true` and `false` are read. `null` and any other type,
+including `0` and `"false"`, are ignored, the same as omitting the key.
+`false` on the flat key or in `context` keeps arrival order even when the
+other is `true`. For every other key, a non-null value on the flat batch wins
+over the same key in `context`. The exception is `zorro_train_enable`: the
+request is a ZoRRo step when either source is exactly `true`, even if the
+other is `false`.
+
+| Value | Behavior |
+|---|---|
+| omitted or `true` | Balance. A request without ZoRRo balances by sample length, or by whole prompt group when valid `prompt_group_ids` are sent (see below). A ZoRRo request balances whole prompt groups and requires `sp_size` of 1. Any other `sp_size` is rejected. |
+| `false` | Keep arrival order. This is the opt-out, including for a ZoRRo request that runs with sequence parallelism. |
+
+Cortex measures a non-ZoRRo row by its attention mask. Without one, it uses
+the leading run of position ids that advance by one from the row's first id.
+Without position ids, a request that carries a `processing` object uses its
+loss mask. Otherwise every row counts as the padded width. Every length is at
+least 1.
+
+`load_balancer`, `zorro_load_balancer`, and `zorro_train_load_balancer` are
+ignored. They do not opt out. Send `balance_batch` false.
+
+A request with `zorro_train_enable` true, on the flat batch or in `context`,
+is a ZoRRo step. With balancing on, each prompt group stays on one
+data-parallel rank. That assignment needs `input_ids`, `attention_mask`,
+`max_response_len`, `max_token_len_per_gpu`, and `rollout_n` or
+`zorro_train_max_rollouts`. These keys are accepted on the flat batch and
+inside `context`. A missing one is rejected. `zorro_train_max_rollouts` is the
+group-size cap when it is set; otherwise the cap is `rollout_n`. A group
+longer than the cap is split into contiguous chunks of at most that many rows,
+keeping the group's row order. `max_token_len_per_gpu` must be at least
+`prompt_len + max_response_len * cap`, where `prompt_len` is the sequence
+width minus `max_response_len`. A smaller budget is rejected. The batch size
+must be divisible by the number of data-parallel ranks, and a prompt group
+larger than one rank is rejected. When the batch has no more rows than ranks,
+each rank would get one row, so a request with a prompt group of more than one
+row is rejected rather than split. A request whose groups all have one row is
+accepted.
+
+`prompt_group_ids`, a 1-D vector of one integer per row, names each row's prompt
+group. The same key is what a prompt-mean loss uses for its counts, and clients
+such as TRL send it on requests without ZoRRo. Its effect depends on the request:
+
+- ZoRRo: the ids name the groups that stay on one data-parallel rank. Omitting
+  them, or sending a vector of any other shape or of non-integer values, groups
+  rows that share the same prompt columns.
+- Without ZoRRo, with balancing on: when the ids are a 1-D vector with one entry
+  per row, whole groups are balanced instead of single rows, so each prompt stays
+  on one rank. A group's cost is the sum of its rows' squared lengths. Groups
+  are packed into rank bins of equal row count and are never split. Rows keep
+  their relative order within a group. Groups are placed by size and cost, not
+  by arrival order.
+- Without ZoRRo, arrival order is kept when the ids are malformed (not 1-D, not
+  integers, or not one entry per row), when there are no more rows than ranks, when the batch
+  size is not divisible by the rank count, when a group has more rows than one
+  rank holds, or when the groups cannot be packed into equal bins. These cases
+  are not errors for a request without ZoRRo. For now only tensor
+  `prompt_group_ids` are supported. A value that is not a tensor is ignored, and
+  rows balance by sample length. When the batch and its `context` both carry
+  `prompt_group_ids`, the batch value is the one used.
 
 ---
 
