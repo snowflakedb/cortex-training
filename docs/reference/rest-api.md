@@ -1811,8 +1811,8 @@ The long-context/memory knobs:
   `zorro_train_enable` true and `sp_size` greater than 1 is rejected when it is
   created. The declaration does not change how a step is balanced. A step is a
   ZoRRo step only when its request sends `zorro_train_enable` true (see
-  [section 10.5](#105-rank-assignment)). A ZoRRo step with `sp_size` greater than
-  1 is still rejected when it runs, so a job that does not declare the field
+  [section 10.5](#105-rank-assignment)). A ZoRRo step with balancing on and `sp_size`
+  greater than 1 is still rejected when it runs, so a job that does not declare the field
   fails on its first such step.
 - `mb_spec`: `{"max_tokens_per_mb": N}`, the most real tokens whose rows are
   packed into one model call (default `10240`). It counts whole rows before
