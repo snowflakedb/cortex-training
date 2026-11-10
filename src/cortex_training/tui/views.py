@@ -56,9 +56,6 @@ from cortex_training.tui.format import parse_ts  # noqa: F401 - views.parse_ts f
 from cortex_training.tui.format import printable
 from cortex_training.tui.format import source_label
 
-RETENTION_DAYS = 183  # six months of job history
-
-
 def fmt_duration(seconds: Optional[float]) -> str:
     if seconds is None or seconds < 0:
         return "—"
@@ -544,11 +541,6 @@ def job_elapsed(job: dict, now: datetime) -> Optional[float]:
         return None
     end = now if is_live(job) else parse_ts(job.get("state_changed_at") or job.get("updated_at")) or now
     return max(0.0, (end - start).total_seconds())
-
-
-def within_retention(job: dict, now: datetime, days: int = RETENTION_DAYS) -> bool:
-    created = parse_ts(job.get("created_at"))
-    return created is None or (now - created).total_seconds() <= days * 86400
 
 
 def job_config_json(job: dict, sub_job: Optional[dict] = None, *, experiment_name: Optional[str] = None) -> list:
@@ -1230,24 +1222,19 @@ def narrowable_name(name: str) -> bool:
     return name == identifier_name(name) or _QUOTED_IDENTIFIER.fullmatch(name) is not None
 
 
-def no_match_message(text: str, query: Query, searched: int, *, cut: str = "", older: Iterable[str] = (),
+def no_match_message(text: str, query: Query, searched: int, *, cut: str = "",
                      location: str = "", widen: bool = False, narrow: bool = False, everything: int = 0,
                      elsewhere: str = "", noun: str = "job") -> str:
-    """Explain an empty search, including truncated, old, or wider matches; ``elsewhere`` says
+    """Explain an empty search, including truncated or wider matches; ``elsewhere`` says
     where the other view's matches are, and ``noun`` what the view on screen lists."""
-    older = list(older)
     if cut:
         lines = [f"No {noun}s match “{text}” among the {searched:,} {noun}(s) loaded: {cut}.",
                  "  Search covers only the loaded jobs."]
     else:
         where = f" in {location}" if location else ""
-        lines = [f"No {noun}s match “{text}” among {searched:,} {noun}(s){where} in the last 6 months."]
+        lines = [f"No {noun}s match “{text}” among {searched:,} {noun}(s){where}."]
     if everything:
         lines.append(f"  f searches all {everything:,} jobs of the schema.")
-    if older:
-        many = len(older) > 1
-        lines.append(f"  {len(older):,} older job{'s' if many else ''} match{'' if many else 'es'} (the list hides "
-                     f"jobs older than 6 months): cortex-training tui {older[0]} opens {'the newest' if many else 'it'}.")
     if elsewhere:
         lines.append(f"  {elsewhere}")
     if widen:

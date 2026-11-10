@@ -703,7 +703,14 @@ def parse_ts(raw: Any) -> datetime | None:
     """
     if not raw:
         return None
-    s = str(raw).strip()
+    return _parse_ts_text(str(raw))
+
+
+# A list of thousands of jobs parses the same few times over and again (each row's ages, the
+# pages' bounds, a search's sort): remembered by text, a datetime being immutable.
+@functools.lru_cache(maxsize=65_536)
+def _parse_ts_text(raw: str) -> datetime | None:
+    s = raw.strip()
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
     # Python's fromisoformat takes at most 6 fractional digits.

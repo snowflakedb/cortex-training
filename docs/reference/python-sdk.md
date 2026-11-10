@@ -97,9 +97,13 @@ every operation of a client that `cortex-training tui` builds: its calls are
 the waits its user sees, and their timing is the point. While a running job's
 Logs tab is shown, its tail sends up to about one event a second while the log
 moves, one every 6 seconds once it is quiet, and a few a second while it catches
-up. The job list sends one per page of 100 jobs each time it refreshes (every 60
-seconds while it is shown), and a live job's preview or details screen one
-`get_job` every 60 seconds. A live job's Resources or Training metrics tab
+up. The job list sends one per 100 jobs of the page it shows each time it
+refreshes (every 60 seconds while it is shown), and once, after its first page,
+one per 100 jobs of the rest of the list, back to its first job (up to 25,000
+jobs), one at a time,
+for search; a live job's preview or
+details screen one `get_job` every 60 seconds. A live job's Resources or
+Training metrics tab
 downloads every 30 seconds while shown (after its first download, only the
 sub-job it shows; a Training metrics tab with more than one sub-job, all of
 them), and so does its Checkpoints tab's list, with one export per

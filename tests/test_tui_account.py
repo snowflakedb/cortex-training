@@ -45,10 +45,12 @@ from cortex_training.tui.account import SCHEMA
 from cortex_training.tui.account import JobLister
 from cortex_training.tui.account import JobListError
 from cortex_training.tui.account import Listing
+from cortex_training.tui.account import Rest
 from cortex_training.tui.account import ListScope
 from cortex_training.tui.account import _page
 from cortex_training.tui.account import empty_text
 from cortex_training.tui.account import loaded_text
+from cortex_training.tui.account import page_text
 from cortex_training.tui.account import scope_text
 from cortex_training.tui.account import stopped_scope
 
@@ -118,32 +120,35 @@ def test_the_configured_schemas_list_reads_the_account_route_scoped_to_it():
     # whichever route read them, so its records match when a refresh reads the other one.
     assert listing.jobs == [{"job_id": "account-job"}]
     assert client.account_asks == 1 and client.schema_asks == 0  # list_jobs is not read at all
-    assert client.filters == [{"created_after": NOW - timedelta(days=views.RETENTION_DAYS),
-                               "database": "DB", "schema": "S",
+    # Every job ever made: no lower bound on creation time.
+    assert client.filters == [{"database": "DB", "schema": "S",
                                "page_size": 100, "page_token": None}]  # 100 a page, as asked for
 
 
 def test_a_schema_list_read_in_parts_says_what_it_holds_after_naming_the_schema():
+    # The header names the list; the line under it says which page shows, and how far it is read.
     loading = ListScope(SCHEMA, walked=300, loading=OLDER)
-    assert scope_text(loading, location="DB.S") == "Current schema: DB.S, loading older jobs… 300 so far"
+    assert scope_text(loading, location="DB.S") == "Current schema: DB.S"
+    assert page_text(loading) == "page 1 · loading… 300 so far"
     stopped = ListScope(SCHEMA, stopped=CAPPED, walked=ACCOUNT_LIST_CAP)
-    assert scope_text(stopped, location="DB.S") == (
-        f"Current schema: DB.S, newest {ACCOUNT_LIST_CAP:,} + every active job (more exist)")
-    # After a declined a, the header still says the list was cut, after saying why it is shown.
+    assert scope_text(stopped, location="DB.S") == "Current schema: DB.S"
+    assert page_text(stopped) == "page 1 + active jobs"
+    # After a declined a, the header says why the list is shown; the page line is the same.
     assert scope_text(stopped, location="DB.S", declined="no account-wide list yet") == (
-        f"Current schema only: DB.S (no account-wide list yet), newest {ACCOUNT_LIST_CAP:,} "
-        "+ every active job (more exist)")
+        "Current schema only: DB.S (no account-wide list yet)")
     # Its first page can be empty and carry a token, so it shows nothing yet while it loads.
     assert empty_text(ListScope(SCHEMA, loading=OLDER)) == (
         "This schema's list has no jobs to show among its newest 0 yet; older jobs are still loading.")
     whole = ListScope(SCHEMA)
     assert scope_text(whole, location="DB.S") == "Current schema: DB.S"  # as it always read
+    assert page_text(whole) == ""  # one page, read whole: no line
 
 
 def test_a_short_page_still_lets_a_walk_reach_the_cap():
-    # An empty page with a token on the way: at 100 jobs a page the newest 2,000 take 21 pages,
-    # so a page limit of 20 would stop the walk early and report "first 20 pages" instead.
-    listing = JobLister(_Paged(ACCOUNT_LIST_CAP + ACCOUNT_PAGE_SIZE, empty_at=3), account_wide=True).load(NOW)
+    # An empty page with a token on the way: at 100 jobs a page the newest 1,000 take 11 pages,
+    # so a page limit of 10 would stop the walk early and report "first 10 pages" instead.
+    listing = JobLister(_Paged(ACCOUNT_LIST_CAP + ACCOUNT_PAGE_SIZE, empty_at=3, active_every=0),
+                        account_wide=True).load(NOW)
     assert listing.scope.stopped == CAPPED and listing.scope.walked == ACCOUNT_LIST_CAP
 
 
@@ -314,7 +319,7 @@ def test_a_403_without_the_services_message_asks_the_configured_schema_once():
 
 class _Paged:
     """The account-level list of ``total`` jobs, newest first; every ``active_every``-th job is
-    running (the active walk lists those). Pages hold ``rows`` jobs (the size asked for when
+    running (the active walk lists those; none when 0, so its rows and its jobs in history agree). Pages hold ``rows`` jobs (the size asked for when
     None), each starting with the last job of the page before when ``repeat`` (as a service
     examining a bounded number of jobs per call may answer), and the ``empty_at``-th page of the
     newest jobs is empty but carries a token. ``fail_at``: the page of the newest jobs' walk (1
@@ -327,7 +332,7 @@ class _Paged:
                  bad_token_at=None, bad_active_token_at=None, active_fail=False):
         start = datetime(2026, 9, 30, tzinfo=timezone.utc)
         self.jobs = [{"job_id": f"job-{i:05d}", "database_name": "DB", "schema_name": f"S{i % 3}",
-                      "status": "RUNNING" if i % active_every == 0 else "DONE",
+                      "status": "RUNNING" if active_every and i % active_every == 0 else "DONE",
                       "created_at": (start - timedelta(minutes=i)).isoformat()} for i in range(total)]
         self.rows, self.repeat, self.empty_at, self.fail_at = rows, repeat, empty_at, fail_at
         self.bad = {"newest": bad_token_at, "active": bad_active_token_at}
@@ -337,10 +342,13 @@ class _Paged:
         # The (database, schema) of each page asked for, kept apart from ``calls`` so the
         # walk-and-token assertions that compare ``calls`` for equality stay as they were.
         self.filters = []
+        self.bounds = []  # the created_before of each page asked for, as (walk, bound)
         self.bad_location = None  # raised instead of a page when a narrowing is asked for
+        # job id -> how far the time the service records (and bounds by) is off its created_at
+        self.skew: dict = {}
 
-    def list_jobs_page(self, *, created_after, page_size, page_token=None, status=None,
-                       database=None, schema=None):
+    def list_jobs_page(self, *, page_size, created_after=None, page_token=None, status=None,
+                       database=None, schema=None, created_before=None):
         if self.unavailable is not None:
             raise self.unavailable
         if schema is not None and database is None:
@@ -348,12 +356,16 @@ class _Paged:
         walk = "active" if status else "newest"
         self.calls.append((walk, page_token))
         self.filters.append((walk, database, schema))
+        self.bounds.append((walk, created_before))
         if self.bad_location is not None and database is not None:
             raise self.bad_location
         rows = [job for job in self.jobs if not status or job["status"] == "RUNNING"]
         if database is not None:
             rows = [job for job in rows if job.get("database_name") == database
                     and (schema is None or job.get("schema_name") == schema)]
+        if created_before is not None:
+            rows = [job for job in rows if datetime.fromisoformat(job["created_at"])
+                    + self.skew.get(job["job_id"], timedelta(0)) < created_before]
         start, page = map(int, (page_token or "0:0").split(":"))
         page += 1
         if page == self.bad[walk]:
@@ -372,14 +384,34 @@ class _Paged:
         return [{"job_id": "schema-job"}]
 
 
+def _in_history(job) -> bool:
+    """A job the job list files under history: what a page counts toward its 1,000."""
+    return not views.is_deployment(job) and not views.is_live(job)
+
+
+def _held(jobs) -> int:
+    """The jobs in history among ``jobs``."""
+    return sum(1 for job in jobs if _in_history(job))
+
+
+def _rows_to_cap(jobs) -> int:
+    """How many of ``jobs`` (newest first) a page takes to hold ACCOUNT_LIST_CAP in history: all
+    of them where they hold fewer."""
+    held = [at for at, job in enumerate(jobs) if _in_history(job)]
+    return held[ACCOUNT_LIST_CAP - 1] + 1 if len(held) >= ACCOUNT_LIST_CAP else len(jobs)
+
+
 def _old_walk(client) -> Listing:
     """The account-level list as the job list read it all at once, before it showed its pages
     (the walk as it was, step for step): the newest jobs' walk, then (when it stopped short)
-    the active jobs not among them."""
-    created_after = NOW - timedelta(days=views.RETENTION_DAYS)
+    the active jobs not among them. Its ``next_page`` is where the page after it starts, as the
+    walk now says (the walk as it was had no pages past the first). The newest jobs' walk stops at
+    its 1,000th job in history, its live jobs and deployments beside them; the active one at its
+    1,000th job."""
 
     def read_pages(status):
-        filters = {"created_after": created_after, **({"status": status} if status else {})}
+        counts = _in_history if status is None else (lambda _job: True)
+        filters = {"status": status} if status else {}
         jobs, seen, token = [], set(), None
         for _ in range(ACCOUNT_LIST_MAX_PAGES):
             rows, token = _page(client.list_jobs_page(**filters, page_size=ACCOUNT_PAGE_SIZE, page_token=token))
@@ -389,9 +421,11 @@ def _old_walk(client) -> Listing:
                     continue
                 seen.add(key)
                 jobs.append(job)
-            if len(jobs) >= ACCOUNT_LIST_CAP:
-                more = token is not None or len(jobs) > ACCOUNT_LIST_CAP
-                return jobs[:ACCOUNT_LIST_CAP], CAPPED if more else None
+            held = [at for at, job in enumerate(jobs) if counts(job)]
+            if len(held) >= ACCOUNT_LIST_CAP:
+                cut = held[ACCOUNT_LIST_CAP - 1] + 1
+                more = token is not None or len(jobs) > cut
+                return jobs[:cut], CAPPED if more else None
             if token is None:
                 return jobs, None
         return jobs, PAGE_LIMIT
@@ -412,18 +446,18 @@ def _old_walk(client) -> Listing:
     rows, active_stopped = active
     listed = {views.job_key(job) for job in jobs}
     added = [job for job in rows if views.job_key(job) not in listed]
-    scope = ListScope(ACCOUNT, stopped=stopped, walked=len(jobs),
+    scope = ListScope(ACCOUNT, stopped=stopped, walked=_held(jobs),
                       pages=ACCOUNT_LIST_MAX_PAGES if stopped == PAGE_LIMIT else 0,
                       active_missing=active_stopped is not None)
-    return Listing(jobs + added, scope)
+    return Listing(jobs + added, scope, next_page=account._next_bound(jobs, None))
 
 
 _SHAPES = {
     "capped": dict(total=ACCOUNT_LIST_CAP + 300),
-    "whole in 3 pages": dict(total=1_200),
+    "whole in 8 pages": dict(total=800),
     "whole in 1 page": dict(total=400),
-    "page limit": dict(total=3_000, rows=50),
-    "page limit, pages repeating a job": dict(total=3_000, rows=50, repeat=True),
+    "page limit": dict(total=3_000, rows=20),
+    "page limit, pages repeating a job": dict(total=3_000, rows=20, repeat=True),
     "capped, an empty page with a token": dict(total=ACCOUNT_LIST_CAP + 300, empty_at=2),
     "capped, the active walk fails": dict(total=ACCOUNT_LIST_CAP + 300, active_every=2, active_fail=True),
     "capped, a bad token in the active walk": dict(total=ACCOUNT_LIST_CAP + 300, active_every=2,
@@ -475,20 +509,22 @@ def test_the_walk_shows_each_page_and_ends_with_the_list_it_read_all_at_once(sha
 def _active_calls(shape: str) -> list:
     """The requests a whole active jobs' walk of ``shape`` makes."""
     client = _Paged(**_SHAPES[shape])
-    JobLister(client)._active(NOW - timedelta(days=views.RETENTION_DAYS), lambda: False)
+    JobLister(client)._active(lambda: False)
     return client.calls
 
 
-@pytest.mark.parametrize("total", [ACCOUNT_LIST_CAP + 300, 1_200, 400])
+@pytest.mark.parametrize("total", [ACCOUNT_LIST_CAP + 300, 800, 400])
 def test_the_walk_shows_one_list_after_each_page_but_the_last(total):
-    partials = []
-    JobLister(_Paged(total), account_wide=True).load(NOW, on_partial=partials.append)
-    capped = total > ACCOUNT_LIST_CAP
-    pages = -(-min(total, ACCOUNT_LIST_CAP) // ACCOUNT_PAGE_SIZE)
+    client, partials = _Paged(total), []
+    JobLister(client, account_wide=True).load(NOW, on_partial=partials.append)
+    rows = _rows_to_cap(client.jobs)
+    capped = rows < total
+    pages = -(-rows // ACCOUNT_PAGE_SIZE)
     # A page that makes the list whole is the result; the active jobs, once read, may come between pages,
-    # and the newest 2,000 of more show while the active jobs are still being read, if they are.
+    # and the newest 1,000 of more show while the active jobs are still being read, if they are.
     walked = {p.scope.walked for p in partials}
-    assert sorted(walked - {ACCOUNT_LIST_CAP} if capped else walked) == [ACCOUNT_PAGE_SIZE * n for n in range(1, pages)]
+    assert sorted(walked - {ACCOUNT_LIST_CAP} if capped else walked) == [
+        _held(client.jobs[:ACCOUNT_PAGE_SIZE * n]) for n in range(1, pages)]
 
 
 class _PagedLocated(_Paged):
@@ -499,7 +535,7 @@ class _PagedLocated(_Paged):
 
 
 def test_the_configured_schemas_walk_scopes_every_page_including_the_active_jobs():
-    client = _PagedLocated(3 * (ACCOUNT_LIST_CAP + ACCOUNT_PAGE_SIZE))  # more of S0 than one walk holds
+    client = _PagedLocated(3 * (ACCOUNT_LIST_CAP + 300))  # more of S0 than one walk holds
     listing = JobLister(client).load(NOW)
     assert listing.scope.kind == SCHEMA and listing.scope.stopped == CAPPED
     assert len(client.calls) > 1  # it pages, which list_jobs cannot
@@ -552,7 +588,8 @@ def _load_in_thread(lister, **kwargs) -> tuple:
 
 @pytest.mark.parametrize("fails", [False, True], ids=["read", "failed"])
 def test_the_active_jobs_read_beside_the_newest_show_before_the_newest_are_read(fails):
-    client, partials = _Held(ACCOUNT_LIST_CAP + 300, active_every=2, active_fail=fails), []
+    # 1,200 in history, past the cap, and 600 running: within the active jobs' walk's own cap.
+    client, partials = _Held(1_800, active_every=3, active_fail=fails), []
     client.hold["newest"].set()
     client.rows = None
     held_page = threading.Event()
@@ -570,24 +607,24 @@ def test_the_active_jobs_read_beside_the_newest_show_before_the_newest_are_read(
     assert _until(lambda: len(partials) == 3), [p.scope for p in partials]
     shown = partials[-1]
     two_pages = 2 * ACCOUNT_PAGE_SIZE
-    assert shown.scope == ListScope(ACCOUNT, walked=two_pages, loading=OLDER, active_read=True,
+    held = _held(client.jobs[:two_pages])  # its jobs in history, so far
+    assert shown.scope == ListScope(ACCOUNT, walked=held, loading=OLDER, active_read=True,
                                     active_missing=fails)
     assert shown.scope.active_whole is not fails
     if fails:
         assert len(shown.jobs) == two_pages
-        assert scope_text(shown.scope, location="") == (
-            f"loading older jobs… {two_pages:,} so far (older active jobs may be missing)")
+        assert page_text(shown.scope) == f"page 1 · loading… {held:,} so far (older active jobs may be missing)"
     else:  # the active jobs older than the first two pages are listed now, with them
         assert len(shown.jobs) > two_pages
-        assert scope_text(shown.scope, location="") == (
-            f"loading older jobs… {two_pages:,} so far + every active job")
+        assert page_text(shown.scope) == f"page 1 · loading… {held:,} so far + active jobs"
     held_page.set()
     thread.join(10)
-    assert answer["listing"] == _old_walk(_Paged(ACCOUNT_LIST_CAP + 300, active_every=2, active_fail=fails))
+    assert answer["listing"] == _old_walk(_Paged(1_800, active_every=3, active_fail=fails))
     assert answer["listing"].scope.active_missing is fails
     # Every page after the held one shows, up to the page that reaches the cap: that is the result.
-    assert [p.scope.walked for p in partials[3:]] == list(
-        range(3 * ACCOUNT_PAGE_SIZE, ACCOUNT_LIST_CAP, ACCOUNT_PAGE_SIZE))
+    pages = -(-_rows_to_cap(client.jobs) // ACCOUNT_PAGE_SIZE)
+    assert [p.scope.walked for p in partials[3:]] == [
+        _held(client.jobs[:ACCOUNT_PAGE_SIZE * n]) for n in range(3, pages)]
 
 
 def test_a_walk_cancelled_while_it_waits_for_the_active_jobs_answers_at_once():
@@ -606,11 +643,11 @@ def test_a_walk_cancelled_while_it_waits_for_the_active_jobs_answers_at_once():
 
 
 def test_a_list_whole_before_the_active_jobs_are_read_answers_without_them():
-    client, partials = _Held(1_200), []
+    client, partials = _Held(800), []
     client.hold["newest"].set()
     thread, answer = _load_in_thread(JobLister(client, account_wide=True), on_partial=partials.append)
     thread.join(2.0)
-    assert not thread.is_alive() and answer["listing"] == _old_walk(_Paged(1_200))  # no wait for the active jobs
+    assert not thread.is_alive() and answer["listing"] == _old_walk(_Paged(800))  # no wait for the active jobs
     shown = len(partials)
     client.hold["active"].set()
     time.sleep(0.2)
@@ -619,7 +656,7 @@ def test_a_list_whole_before_the_active_jobs_are_read_answers_without_them():
 
 
 def test_a_cancelled_load_whose_page_was_refused_leaves_the_fallback_to_the_load_after_it():
-    clock, client = _Clock(), _Paged(1_200)
+    clock, client = _Clock(), _Paged(800)
     lister = JobLister(client, account_wide=True, clock=clock)
     cancelled = []
     client.unavailable = _unavailable(NOT_DEPLOYED)
@@ -642,9 +679,10 @@ def test_a_page_that_fails_after_the_first_raises_after_showing_the_pages_before
     assert str(failed.value).startswith("the account-wide job list failed:")
     assert [len(p.jobs) for p in partials] == [ACCOUNT_PAGE_SIZE, 2 * ACCOUNT_PAGE_SIZE]
     stopped = stopped_scope(partials[-1].scope)
-    assert stopped == ListScope(ACCOUNT, stopped=FAILED, walked=2 * ACCOUNT_PAGE_SIZE, active_missing=True)
-    assert scope_text(stopped, location="") == (
-        f"newest {2 * ACCOUNT_PAGE_SIZE:,} (the rest didn't load; r retries; older active jobs may be missing)")
+    held = _held(client.jobs[:2 * ACCOUNT_PAGE_SIZE])
+    assert stopped == ListScope(ACCOUNT, stopped=FAILED, walked=held, active_missing=True)
+    assert page_text(stopped) == (
+        f"page 1: {held:,} jobs (older active jobs may be missing) · the rest didn't load; r retries")
 
 
 def test_a_walk_read_again_from_its_start_shows_no_fewer_jobs_than_before():
@@ -654,10 +692,11 @@ def test_a_walk_read_again_from_its_start_shows_no_fewer_jobs_than_before():
     # Pages 1 and 2, then from the first page again: one page's worth is not shown again,
     # two pages' worth is, and no list ever shows fewer jobs than the one before it.
     sizes = [p.scope.walked for p in partials]
+    marks = [_held(client.jobs[:ACCOUNT_PAGE_SIZE * n]) for n in range(1, ACCOUNT_LIST_MAX_PAGES + 1)]
     assert sizes == sorted(sizes)
-    assert sizes[:2] == [ACCOUNT_PAGE_SIZE, 2 * ACCOUNT_PAGE_SIZE]
-    assert sizes.count(2 * ACCOUNT_PAGE_SIZE) == 2  # the mark the restart reached again
-    assert {size % ACCOUNT_PAGE_SIZE for size in sizes} == {0}
+    assert sizes[:2] == marks[:2]
+    assert sizes.count(marks[1]) == 2  # the mark the restart reached again
+    assert set(sizes) <= set(marks) | {ACCOUNT_LIST_CAP}  # only ever whole pages' worth
 
 
 def test_a_cancelled_walk_stops_before_its_next_page():
@@ -753,7 +792,7 @@ def test_a_failure_reading_the_active_jobs_beside_goes_to_the_log_not_the_thread
 
 
 def test_asking_again_in_fallback_shows_no_pages():
-    clock, client = _Clock(), _Paged(1_200)
+    clock, client = _Clock(), _Paged(800)
     client.unavailable = _unavailable(NOT_DEPLOYED)
     lister = JobLister(client, account_wide=True, clock=clock)
     assert lister.load(NOW).scope.kind == FALLBACK
@@ -761,20 +800,20 @@ def test_asking_again_in_fallback_shows_no_pages():
     clock.now += ACCOUNT_REPROBE_SECONDS
     partials = []
     listing = lister.load(NOW, on_partial=partials.append)
-    assert listing.scope == ListScope(ACCOUNT) and len(listing.jobs) == 1_200
+    assert listing.scope == ListScope(ACCOUNT) and len(listing.jobs) == 800
     assert partials == []  # the configured schema's list stands until the account-wide one is whole
 
 
 def test_a_loading_list_says_how_far_it_is():
     older = ListScope(ACCOUNT, walked=1_000, loading=OLDER)
-    assert scope_text(older, location="") == "loading older jobs… 1,000 so far"
+    assert scope_text(older, location="") == "all schemas"
+    assert page_text(older) == "page 1 · loading… 1,000 so far"
     assert loaded_text(older) == "the newest 1,000 so far; older jobs are still loading"
     assert "older jobs are still loading" in empty_text(older)
-    active = ListScope(ACCOUNT, stopped=CAPPED, walked=2_000, loading=ACTIVE_NEXT)
-    assert scope_text(active, location="") == "newest 2,000; loading older active jobs…"
-    # Superseded while it read the active jobs: the newest 2,000 stand, saying what may be missing.
-    assert scope_text(stopped_scope(active), location="") == (
-        "newest 2,000 (more exist; older active jobs may be missing)")
+    active = ListScope(ACCOUNT, stopped=CAPPED, walked=1_000, loading=ACTIVE_NEXT)
+    assert page_text(active) == "page 1 · loading active jobs…"
+    # Superseded while it read the active jobs: the newest 1,000 stand, saying what may be missing.
+    assert page_text(stopped_scope(active)) == "page 1 (older active jobs may be missing)"
     assert stopped_scope(ListScope(ACCOUNT)) == ListScope(ACCOUNT)
 
 
@@ -783,7 +822,7 @@ def test_a_loading_list_says_how_far_it_is():
 
 
 def test_a_narrowed_walk_asks_the_service_for_that_location_on_every_page():
-    client = _Paged(total=1_200)
+    client = _Paged(total=800)
     listing = JobLister(client, account_wide=True).load(NOW, location=("DB", "S1"))
     assert {(job["database_name"], job["schema_name"]) for job in listing.jobs} == {("DB", "S1")}
     # Every page of the walk carries the pair: the service refuses a token sent with other filters.
@@ -795,14 +834,14 @@ def test_a_narrowed_walk_reads_its_active_jobs_in_the_same_location():
     # Large enough that one of the three schemas is itself past the cap, so the walk stops short
     # and reads the active jobs beside the newest: both walks must cover one scope, or _merge
     # would union two differently-scoped sets.
-    client = _Paged(total=ACCOUNT_LIST_CAP * 3 + 300, active_every=2)
+    client = _Paged(total=ACCOUNT_LIST_CAP * 7, active_every=2)
     JobLister(client, account_wide=True).load(NOW, location=("DB", "S2"))
     assert _walk_calls(client.filters, "active"), "the active jobs were not read"
     assert {(db, sch) for _walk, db, sch in client.filters} == {("DB", "S2")}
 
 
 def test_a_database_alone_narrows_and_sends_no_schema():
-    client = _Paged(total=1_200)
+    client = _Paged(total=800)
     listing = JobLister(client, account_wide=True).load(NOW, location=("DB", None))
     assert {(db, sch) for _walk, db, sch in client.filters} == {("DB", None)}
     assert listing.scope.narrowed == "DB"
@@ -810,7 +849,7 @@ def test_a_database_alone_narrows_and_sends_no_schema():
 
 
 def test_an_unnarrowed_walk_sends_neither_name():
-    client = _Paged(total=1_200)
+    client = _Paged(total=800)
     listing = JobLister(client, account_wide=True).load(NOW)
     assert {(db, sch) for _walk, db, sch in client.filters} == {(None, None)}
     assert listing.scope.narrowed == ""
@@ -822,14 +861,15 @@ def test_a_narrowed_list_says_what_it_was_narrowed_to():
     # A sole location the walk asked for must not read as "all in …", which claims it read every schema.
     assert scope_text(whole, location="", only="TEAM_DB.EXPERIMENTS") == (
         "all schemas, narrowed to TEAM_DB.EXPERIMENTS")
-    capped = ListScope(ACCOUNT, stopped=CAPPED, walked=2_000, narrowed="TEAM_DB.EXPERIMENTS")
-    assert scope_text(capped, location="") == (
-        "narrowed to TEAM_DB.EXPERIMENTS: newest 2,000 + every active job (more exist)")
+    capped = ListScope(ACCOUNT, stopped=CAPPED, walked=1_000, narrowed="TEAM_DB.EXPERIMENTS")
+    assert scope_text(capped, location="") == "all schemas, narrowed to TEAM_DB.EXPERIMENTS"
+    assert page_text(capped) == "page 1 + active jobs"
     assert loaded_text(capped) == (
-        "the newest 2,000 of the last 6 months in TEAM_DB.EXPERIMENTS and every active job; more exist")
+        "the newest 1,000 in TEAM_DB.EXPERIMENTS and every active job; more exist")
     assert "in TEAM_DB.EXPERIMENTS" in empty_text(capped)
     loading = ListScope(ACCOUNT, walked=500, loading=OLDER, narrowed="TEAM_DB")
-    assert scope_text(loading, location="") == "narrowed to TEAM_DB: loading older jobs… 500 so far"
+    assert scope_text(loading, location="") == "all schemas, narrowed to TEAM_DB"
+    assert page_text(loading) == "page 1 · loading… 500 so far"
     assert "in TEAM_DB" in empty_text(loading)
     # The narrowing survives a walk cut short by a load that superseded it.
     assert stopped_scope(loading).narrowed == "TEAM_DB"
@@ -839,20 +879,23 @@ def test_an_unnarrowed_list_reads_exactly_as_it_did_before():
     # The new field defaults to "", so every scope the walk made before says what it said before.
     assert scope_text(ListScope(ACCOUNT), location="") == "all schemas"
     assert scope_text(ListScope(ACCOUNT), location="", only="DB.S1") == "all schemas (all in DB.S1)"
-    capped = ListScope(ACCOUNT, stopped=CAPPED, walked=2_000)
-    assert scope_text(capped, location="") == "newest 2,000 + every active job (more exist)"
-    assert loaded_text(capped) == "the newest 2,000 of the last 6 months and every active job; more exist"
+    capped = ListScope(ACCOUNT, stopped=CAPPED, walked=1_000)
+    assert scope_text(capped, location="") == "all schemas"
+    # A page of the list sharing one location doesn't make it the account's only one.
+    assert scope_text(capped, location="", only="DB.S1") == "all schemas"
+    assert page_text(capped) == "page 1 + active jobs"
+    assert loaded_text(capped) == "the newest 1,000 and every active job; more exist"
 
 
 def test_a_narrowing_the_service_refuses_reads_every_schema_instead():
     # A database or schema this role can't see is answered 400, which names no typed reason, so
     # without the retry the whole list would fail rather than the search saying nothing matches.
-    client = _Paged(total=1_200)
+    client = _Paged(total=800)
     client.bad_location = requests.exceptions.HTTPError("400 Client Error", response=_response(400))
     lister = JobLister(client, account_wide=True)
     listing = lister.load(NOW, location=("NOPE", "NOPE"))
     assert listing.scope.kind == ACCOUNT and listing.scope.narrowed == ""
-    assert len(listing.jobs) == 1_200  # every schema, for the search to filter
+    assert len(listing.jobs) == 800  # every schema, for the search to filter
     assert lister._fallback is None  # the refusal is about the filter, not the route
 
 
@@ -887,7 +930,7 @@ class _Clustered:
                        "status": "DONE",
                        "created_at": (start - timedelta(days=30, minutes=i)).isoformat()} for i in range(5)]
 
-    def list_jobs_page(self, *, created_after, page_size, page_token=None, status=None,
+    def list_jobs_page(self, *, page_size, created_after=None, page_token=None, status=None,
                        database=None, schema=None):
         rows = [job for job in self.jobs if not status or job["status"] == "RUNNING"]
         if database is not None:
@@ -930,11 +973,297 @@ def test_a_whole_schema_list_past_the_cap_is_held_as_a_walk_holds_one():
     assert f"j{ACCOUNT_LIST_CAP + 499}" in ids, "an active job older than the newest went"
     assert "no-time" not in ids
     assert cut.everything is jobs
-    assert account.scope_text(cut.scope, location="DB.SCHEMA", only="") == (
-        "Current schema: DB.SCHEMA, newest 2,000 + every active job (more exist)")
+    assert account.scope_text(cut.scope, location="DB.SCHEMA", only="") == "Current schema: DB.SCHEMA"
+    assert page_text(cut.scope) == "page 1 + active jobs"
 
 
 def test_a_whole_schema_list_within_the_cap_is_left_whole():
     listing = account.Listing([{"job_id": f"j{i}", "status": "SUCCEEDED"} for i in range(10)],
                               account.ListScope(account.SCHEMA))
     assert account.cut_whole_listing(listing) is listing
+
+
+# ─── pages past the first ─────────────────────────────────────────────────────
+
+
+def _ids(jobs) -> list:
+    return [job["job_id"] for job in jobs]
+
+
+def _newest_of(listing) -> list:
+    """The ids of a page's own jobs, the newest jobs' walk's, ahead of the active jobs merged in after them."""
+    return _ids(listing.jobs[:listing.scope.walked])
+
+
+def test_the_page_after_the_newest_holds_the_next_jobs_and_every_active_one():
+    client = _Paged(ACCOUNT_LIST_CAP + 300)
+    cut = _rows_to_cap(client.jobs)  # 1,000 in history, and the running jobs among them
+    lister = JobLister(client, account_wide=True)
+    first = lister.load(NOW)
+    bound = first.next_page
+    oldest = datetime.fromisoformat(client.jobs[cut - 1]["created_at"])
+    assert bound.page == 2 and bound.before == oldest
+
+    client.bounds.clear()
+    second = lister.load(NOW, before=bound)
+    rest = client.jobs[cut:]
+    assert second.scope.page == 2 and second.scope.stopped is None and second.scope.walked == _held(rest)
+    # The rest, then every active job, the ones on the first page's span included.
+    assert _ids(second.jobs[:len(rest)]) == _ids(rest)
+    running = {job["job_id"] for job in client.jobs if job["status"] == "RUNNING"}
+    assert running <= set(_ids(second.jobs))
+    assert second.next_page is None  # the last page
+    # Only the newest jobs' walk is bounded, a second past the boundary job.
+    assert {bound_sent for walk, bound_sent in client.bounds if walk == "newest"} == {oldest + timedelta(seconds=1)}
+    assert {bound_sent for walk, bound_sent in client.bounds if walk == "active"} == {None}
+    assert page_text(second.scope) == "page 2 + active jobs"
+
+
+def test_a_page_past_the_first_is_capped_and_leads_to_the_next():
+    client = _Paged(2 * ACCOUNT_LIST_CAP + 50, active_every=0)
+    lister = JobLister(client, account_wide=True)
+    second = lister.load(NOW, before=lister.load(NOW).next_page)
+    assert second.scope.stopped == CAPPED and second.scope.walked == ACCOUNT_LIST_CAP
+    assert page_text(second.scope) == "page 2 + active jobs"
+    third = lister.load(NOW, before=second.next_page)
+    assert second.next_page.page == 3 and third.scope.page == 3
+    assert _newest_of(third) == _ids(client.jobs[2 * ACCOUNT_LIST_CAP:])
+    assert third.next_page is None
+
+
+def test_jobs_sharing_the_boundary_second_are_neither_lost_nor_listed_twice():
+    client = _Paged(ACCOUNT_LIST_CAP + 50, active_every=0)
+    boundary = client.jobs[ACCOUNT_LIST_CAP - 5]["created_at"]
+    for job in client.jobs[ACCOUNT_LIST_CAP - 5:ACCOUNT_LIST_CAP + 10]:
+        job["created_at"] = boundary  # 15 jobs in one second, 5 on the first page and 10 after it
+    lister = JobLister(client, account_wide=True)
+    first = lister.load(NOW)
+    second = lister.load(NOW, before=first.next_page)
+    one, two = _newest_of(first), _newest_of(second)
+    assert len(one) == ACCOUNT_LIST_CAP and not set(one) & set(two)
+    assert one + two == _ids(client.jobs)
+
+
+def test_the_configured_schemas_list_pages_the_same_way():
+    client = _PagedLocated(3 * (ACCOUNT_LIST_CAP + 300), active_every=0)  # a third of them in S0: 1,300 there
+    lister = JobLister(client)
+    first = lister.load(NOW)
+    assert first.scope.kind == SCHEMA and first.next_page is not None
+    second = lister.load(NOW, before=first.next_page)
+    assert second.scope.kind == SCHEMA and second.scope.page == 2 and second.scope.walked == 300
+    assert not set(_ids(first.jobs[:ACCOUNT_LIST_CAP])) & set(_ids(second.jobs[:300]))
+    assert scope_text(second.scope, location="DB.S0") == "Current schema: DB.S0"
+    assert page_text(second.scope) == "page 2 + active jobs"
+
+
+def test_a_page_past_the_first_shows_its_jobs_as_they_come_and_ends_as_read_at_once():
+    bound = JobLister(_Paged(2 * ACCOUNT_LIST_CAP + 300), account_wide=True).load(NOW).next_page
+    partials = []
+    progressive = JobLister(_Paged(2 * ACCOUNT_LIST_CAP + 300), account_wide=True).load(
+        NOW, on_partial=partials.append, before=bound)
+    at_once = JobLister(_Paged(2 * ACCOUNT_LIST_CAP + 300), account_wide=True).load(NOW, before=bound)
+    assert partials and all(partial.scope.page == 2 for partial in partials)
+    assert page_text(partials[0].scope).startswith("page 2 · loading… ")
+    assert progressive == at_once
+
+
+def test_a_whole_schema_list_cut_to_a_page_past_the_first():
+    jobs = [{"job_id": f"j{i}", "status": "RUNNING" if i % 500 == 0 else "SUCCEEDED",
+             "created_at": (NOW - timedelta(minutes=i)).isoformat()} for i in range(2 * ACCOUNT_LIST_CAP + 10)]
+    first = account.cut_whole_listing(Listing(jobs, ListScope(SCHEMA)))
+    second = account.cut_whole_listing(Listing(jobs, ListScope(SCHEMA)), first.next_page)
+    assert second.scope.page == 2 and second.scope.stopped == CAPPED and second.scope.walked == ACCOUNT_LIST_CAP
+    rest = jobs[_rows_to_cap(jobs):]  # past page 1's 1,000 in history, and its running jobs
+    page = rest[:_rows_to_cap(rest)]
+    assert _ids(second.jobs[:len(page)]) == _ids(page)
+    assert {job["job_id"] for job in jobs if job["status"] == "RUNNING"} <= set(_ids(second.jobs))
+    assert second.everything is jobs  # f still has every job
+    third = account.cut_whole_listing(Listing(jobs, ListScope(SCHEMA)), second.next_page)
+    assert third.scope.stopped is None and third.next_page is None
+    assert third.scope.walked == _held(rest[len(page):])
+
+
+def _as_deployment(job: dict) -> dict:
+    """``job`` as the list holds a model deployment, which the job list shows apart (its d)."""
+    job["sub_jobs"] = [{"sub_job_id": f"{job['job_id']}:sampling:0", "job_type": "sampling",
+                        "inference_config": {"deployment_class": "EVALUATION"}}]
+    return job
+
+
+def test_a_page_holds_1000_jobs_its_deployments_aside():
+    # Every tenth row a deployment and every seventh job running: page 1 counted both, and showed
+    # 1,000 in history as fewer. Each comes with the page, beside its 1,000.
+    client = _Paged(ACCOUNT_LIST_CAP + 300)
+    for job in client.jobs[5::10]:
+        _as_deployment(job)
+    cut = _rows_to_cap(client.jobs)
+    lister = JobLister(client, account_wide=True)
+    first = lister.load(NOW)
+    assert first.scope.walked == ACCOUNT_LIST_CAP == _held(first.jobs) and first.scope.stopped == CAPPED
+    assert _ids(first.jobs[:cut]) == _ids(client.jobs[:cut]), "the page's deployments or live jobs went"
+    second = lister.load(NOW, before=first.next_page)
+    assert second.scope.walked == _held(client.jobs) - ACCOUNT_LIST_CAP
+    assert _ids(second.jobs[:len(client.jobs) - cut]) == _ids(client.jobs[cut:])
+
+
+def test_a_whole_schema_list_is_cut_at_its_1000th_job_its_deployments_aside():
+    jobs = [{"job_id": f"j{i}", "status": "SUCCEEDED", "created_at": (NOW - timedelta(minutes=i)).isoformat()}
+            for i in range(ACCOUNT_LIST_CAP + 300)]
+    for job in jobs[5::10]:
+        _as_deployment(job)
+    held = sum(not views.is_deployment(job) for job in jobs)
+    first = account.cut_whole_listing(Listing(jobs, ListScope(SCHEMA)))
+    assert sum(not views.is_deployment(job) for job in first.jobs) == ACCOUNT_LIST_CAP == first.scope.walked
+    second = account.cut_whole_listing(Listing(jobs, ListScope(SCHEMA)), first.next_page)
+    assert _ids(first.jobs) + _ids(second.jobs) == _ids(jobs)
+    assert second.scope.walked == held - ACCOUNT_LIST_CAP and second.next_page is None
+    # Under the cap, its deployments aside, a list stays whole.
+    few = jobs[:ACCOUNT_LIST_CAP + 50]
+    assert sum(not views.is_deployment(job) for job in few) <= ACCOUNT_LIST_CAP
+    assert account.cut_whole_listing(Listing(few, ListScope(SCHEMA))).jobs is few
+
+
+def test_a_page_past_the_first_names_itself_in_every_message():
+    capped = ListScope(SCHEMA, page=2, walked=1_000, stopped=CAPPED, active_read=True)
+    last = ListScope(ACCOUNT, page=3, walked=412)
+    loading = ListScope(ACCOUNT, page=2, walked=300, loading=OLDER, active_read=True)
+    assert scope_text(capped, location="DB.S") == "Current schema: DB.S"
+    assert page_text(capped) == "page 2 + active jobs"
+    assert page_text(last) == "page 3 + active jobs"
+    assert page_text(loading) == "page 2 · loading… 300 so far + active jobs"
+    short = ListScope(ACCOUNT, page=2, walked=412, stopped=PAGE_LIMIT, pages=40)
+    assert page_text(short) == "page 2: 412 jobs + active jobs · more may exist"
+    assert loaded_text(capped) == "the 1,000 jobs of page 2 and every active job; more exist"
+    assert loaded_text(last) == "the 412 jobs of page 3 and every active job"
+    assert empty_text(last) == "Page 3 of the account-wide list has no jobs to show. [ shows the newer jobs."
+    # A list read whole on one page needs no page line.
+    assert scope_text(ListScope(ACCOUNT), location="") == "all schemas"
+    assert page_text(ListScope(ACCOUNT)) == ""
+    assert loaded_text(ListScope(ACCOUNT)) == ""
+
+
+def test_jobs_the_service_bounds_by_a_time_off_their_created_at_are_not_listed_twice():
+    # The service bounds by the time it records, which can be a second off the created_at it
+    # reports: three of page 1's last jobs reported a second past its oldest one came back on page 2.
+    client = _Paged(ACCOUNT_LIST_CAP + 50, active_every=0)
+    oldest = datetime.fromisoformat(client.jobs[ACCOUNT_LIST_CAP - 1]["created_at"])
+    for job in client.jobs[ACCOUNT_LIST_CAP - 4:ACCOUNT_LIST_CAP - 1]:
+        job["created_at"] = (oldest + timedelta(seconds=1)).isoformat()
+        client.skew[job["job_id"]] = timedelta(seconds=-0.6)
+    lister = JobLister(client, account_wide=True)
+    first = lister.load(NOW)
+    second = lister.load(NOW, before=first.next_page)
+    one, two = _newest_of(first), _newest_of(second)
+    assert len(one) == ACCOUNT_LIST_CAP and not set(one) & set(two)
+    assert one + two == _ids(client.jobs)
+
+
+def _rest_of(lister, first, **kwargs) -> list:
+    rests = []
+    lister.read_rest(first, is_cancelled=kwargs.pop("is_cancelled", lambda: False), on_rest=rests.append)
+    return rests
+
+
+def test_the_rest_of_a_list_is_read_behind_its_first_page_to_its_end():
+    client = _Paged(2 * ACCOUNT_LIST_CAP + 300)
+    lister = JobLister(client, account_wide=True)
+    first = lister.load(NOW)
+    calls = len(client.calls)
+    rests = _rest_of(lister, first)
+    assert rests and rests[-1].done and not rests[-1].capped and not rests[-1].failed
+    assert not any(rest.done for rest in rests[:-1])
+    # Every job of the list, page 1's and the rest's, a request at a time, unbounded by the page cap;
+    # none of page 1's own again (its active jobs, older ones merged in, the rest reads where they are).
+    rest = [job["job_id"] for rest in rests for job in rest.jobs]
+    assert sorted(set(_ids(first.jobs) + rest)) == sorted(_ids(client.jobs)) and len(rest) == len(set(rest))
+    assert not set(_ids(first.jobs[:_rows_to_cap(client.jobs)])) & set(rest)
+    asked = client.calls[calls:]
+    assert {walk for walk, _token in asked} == {"newest"} and len(asked) == len(rests)
+    bounds = {bound for walk, bound in client.bounds[calls:]}
+    assert bounds == {first.next_page.created_before}  # from where page 1 ends, its walk carried on by token
+
+
+def test_the_rest_stops_at_the_archive_cap_and_says_so(monkeypatch):
+    client = _Paged(3 * ACCOUNT_LIST_CAP)
+    lister = JobLister(client, account_wide=True)
+    first = lister.load(NOW)
+    monkeypatch.setattr(account, "ARCHIVE_CAP", len(first.jobs) + 250)
+    rests = _rest_of(lister, first)
+    assert rests[-1].done and rests[-1].capped
+    assert sum(len(rest.jobs) for rest in rests) == 250
+
+
+def test_a_rest_that_fails_keeps_what_it_read_and_says_why():
+    client = _Paged(3 * ACCOUNT_LIST_CAP)
+    lister = JobLister(client, account_wide=True)
+    first = lister.load(NOW)
+    client.fail_at = 3  # the rest's own third request
+    rests = _rest_of(lister, first)
+    assert rests[-1].done and "connection reset" in rests[-1].failed
+    # Its two requests' jobs, from page 1's oldest (a second past which the rest starts, so skipped) on.
+    cut = _rows_to_cap(client.jobs)
+    assert [job["job_id"] for rest in rests for job in rest.jobs] == _ids(client.jobs[cut:cut + 2 * ACCOUNT_PAGE_SIZE - 1])
+
+
+def test_the_configured_schemas_rest_is_read_in_that_schema():
+    client = _PagedLocated(3 * (ACCOUNT_LIST_CAP + 300))
+    lister = JobLister(client)
+    first = lister.load(NOW)
+    asked = len(client.filters)
+    rests = _rest_of(lister, first)
+    assert rests[-1].done and {(db, sch) for _walk, db, sch in client.filters[asked:]} == {("DB", "S0")}
+    read = _ids(first.jobs) + [job["job_id"] for rest in rests for job in rest.jobs]
+    assert sorted(set(read)) == sorted(job["job_id"] for job in client.jobs if job["schema_name"] == "S0")
+
+
+def test_a_list_read_whole_has_no_rest_to_read():
+    whole = JobLister(_Paged(300), account_wide=True).load(NOW)
+    assert whole.next_page is None
+    assert _rest_of(JobLister(_Paged(300), account_wide=True), whole) == [Rest([], done=True)]
+    jobs = [{"job_id": f"j{i}", "status": "SUCCEEDED", "created_at": (NOW - timedelta(minutes=i)).isoformat()}
+            for i in range(ACCOUNT_LIST_CAP + 10)]
+    cut = account.cut_whole_listing(Listing(jobs, ListScope(SCHEMA)))
+    rests = _rest_of(JobLister(_Paged(1)), cut)
+    assert rests == [Rest(jobs, done=True)]  # list_jobs answered every job: they are all at hand
+
+
+def test_a_cancelled_rest_reports_nothing_more():
+    client = _Paged(3 * ACCOUNT_LIST_CAP)
+    lister = JobLister(client, account_wide=True)
+    first = lister.load(NOW)
+    rests = []
+    lister.read_rest(first, is_cancelled=lambda: len(rests) >= 2, on_rest=rests.append)
+    assert len(rests) == 2 and not rests[-1].done
+
+
+def test_a_whole_list_pages_every_job_however_old():
+    # list_jobs answers every job of the schema, years old ones too: they are listed, and paged.
+    jobs = [{"job_id": f"r{i}", "status": "SUCCEEDED", "created_at": (NOW - timedelta(minutes=i)).isoformat()}
+            for i in range(700)]
+    jobs += [{"job_id": f"o{i}", "status": "SUCCEEDED",
+              "created_at": (NOW - timedelta(days=3 * 365, minutes=i)).isoformat()} for i in range(500)]
+    first = account.cut_whole_listing(Listing(jobs, ListScope(SCHEMA)))
+    second = account.cut_whole_listing(Listing(jobs, ListScope(SCHEMA)), first.next_page)
+    assert first.scope.walked == ACCOUNT_LIST_CAP and second.scope.walked == 200
+    assert _ids(first.jobs) + _ids(second.jobs) == _ids(jobs) and second.next_page is None
+
+
+def test_a_page_cut_from_sorted_jobs_is_the_page_a_whole_list_cut_gives():
+    # Running jobs, deployments, jobs sharing a second at page boundaries, and an undated job.
+    jobs = [{"job_id": f"j{i}", "status": "RUNNING" if i % 9 == 0 else "SUCCEEDED",
+             "created_at": (NOW - timedelta(seconds=30 * (i // 3))).isoformat()} for i in range(3 * ACCOUNT_LIST_CAP + 77)]
+    for job in jobs[4::11]:
+        _as_deployment(job)
+    jobs.append({"job_id": "undated", "status": "SUCCEEDED"})
+    scope = ListScope(ACCOUNT)
+    ordered, keys = account.sorted_for_pages(jobs)
+    whole = account.cut_whole_listing(Listing(jobs, scope))
+    bound, pages = whole.next_page, 1
+    while bound is not None:
+        expected = account.cut_whole_listing(Listing(jobs, scope), bound)
+        cut = account.cut_sorted(ordered, keys, bound, scope)
+        assert _ids(cut.jobs) == _ids(expected.jobs), f"page {bound.page}"
+        assert cut.scope == expected.scope and cut.next_page == expected.next_page, f"page {bound.page}"
+        bound, pages = cut.next_page, pages + 1
+    assert pages == -(-_held(jobs) // ACCOUNT_LIST_CAP) == 3
+

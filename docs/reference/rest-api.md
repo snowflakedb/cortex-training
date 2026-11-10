@@ -754,10 +754,17 @@ at once as `AccountJobListUnavailable`, whose `reason` is `forbidden`,
 `for_job(job)` returns a client bound to a listed job's `database_name` and
 `schema_name`; it borrows the parent's session and creates no database either.
 
-The TUI's job list sends `database` (and `schema` with it) when a search names a
+The TUI's job list sends no `created_after`: it reads every job, back to the
+first one made. It sends `database` (and `schema` with it) when a search names a
 whole one, so that location's jobs are read whole rather than filtered out of
 the newest jobs the walk reads; see the job list in `docs/reference/cli.md`. A
-page token is only sent back with the filters it was made under, as above.
+page of that list past the first (its `]`) adds `created_before`, one second
+after the oldest job of the page before it, to the walk of its newest jobs, and
+skips the jobs that page held, as the service bounds by a time it records that
+can be a second off the `created_at` it returns. The read behind the list for
+search walks from the end of page 1 the same way, by page token, to the end of
+the list. A page token is only sent back with the filters it was made under, as
+above.
 
 ### 5.4 List models - `GET /api/v2/cortex-training/models`
 

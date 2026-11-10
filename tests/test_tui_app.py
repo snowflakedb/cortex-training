@@ -50,6 +50,8 @@ from cortex_training import InvalidPageToken  # noqa: E402
 from cortex_training.client import DownloadCancelled  # noqa: E402
 from cortex_training.tui import __main__ as tui_main  # noqa: E402
 from cortex_training.tui.account import ACCOUNT  # noqa: E402
+from cortex_training.tui.account import ACCOUNT_LIST_CAP  # noqa: E402
+from cortex_training.tui.account import CAPPED  # noqa: E402
 from cortex_training.tui.account import SCHEMA  # noqa: E402
 from cortex_training.tui.account import JobLister  # noqa: E402
 from cortex_training.tui.account import Listing  # noqa: E402
@@ -1163,10 +1165,9 @@ def test_picker_filter():
     asyncio.run(_run_picker_filter())
 
 
-def test_a_search_builds_each_hidden_older_job_s_search_text_once(monkeypatch):
-    # A search that matches no job of the last six months names the older jobs it
-    # matches. Their search text is kept as the shown jobs' is, not built again on
-    # every keystroke.
+def test_a_search_builds_each_job_s_search_text_once_however_old(monkeypatch):
+    # Jobs of any age are listed and searched, a year old ones too. Their search text is
+    # kept as every job's is, not built again on every keystroke.
     from collections import Counter
 
     from cortex_training.tui import views
@@ -1195,8 +1196,9 @@ def test_a_search_builds_each_hidden_older_job_s_search_text_once(monkeypatch):
             screen = app.screen
             for text in ("o", "ol", "old", "old-"):
                 screen.query_one("#jobfilter", Input).value = text
-                ok = await _wait(pilot, app, lambda: f"“{text}”" in (screen._nomatch or ""))
-                assert ok, f"no message for {text!r}: {screen._nomatch!r}"
+                ok = await _wait(pilot, app, lambda: screen._filter == text and screen._match_count == 3
+                                 and screen._nomatch is None)
+                assert ok, f"{text!r} matched {screen._match_count}: {screen._nomatch!r}"
             assert {jid: built[jid] for jid in ("old-0", "old-1", "old-2")} == {"old-0": 1, "old-1": 1, "old-2": 1}
             await _settle(app, pilot)
 
@@ -4552,6 +4554,11 @@ class _PagedFake(FakeClient):
         return answer
 
 
+def _history_shown(screen) -> int:
+    """The jobs in history the list holds, the counts line's ``in history``: what its page line counts."""
+    return sum(1 for job in screen._all_jobs if not views.is_deployment(job) and not views.is_live(job))
+
+
 def _info_text(screen) -> str:
     """The line above the list, as text."""
     info = screen._info
@@ -4582,8 +4589,10 @@ async def _run_all_schemas_shows_each_page_as_it_comes(refill):
         # The active jobs, read beside the newest (at once, here): the active statuses' counts are whole;
         # the history, the unknown count and the LIVE row (an unknown job may still come) are not.
         assert await _pause_until(pilot, lambda: screen._scope.active_read, seconds=10.0)
-        assert app.sub_title == f"all schemas  ·  loading older jobs… {rows} so far + every active job", (
-            app.sub_title)
+        # The header names the list; the line under it says how far its page is read.
+        assert app.sub_title == "all schemas", app.sub_title
+        assert screen._page_line_text() == f"page 1 · loading… {_history_shown(screen)} so far + active jobs"
+        assert _history_shown(screen) == screen._scope.walked
         live_part, history_part = _info_text(screen).split("│")
         assert "running so far" not in live_part and "in history so far" in history_part, _info_text(screen)
         assert all(row.endswith("…") for row in _group_rows(table).values()), _group_rows(table)
@@ -4889,7 +4898,8 @@ async def _run_a_slow_active_jobs_walk_after_the_newest_are_in(monkeypatch, then
         assert await _pause_until(pilot, lambda: screen._scope.loading == "active", seconds=10.0), app.sub_title
         await pilot.pause(0.2)
         # The history is whole; only the live jobs may grow, and the header says what is still read.
-        assert app.sub_title == f"all schemas  ·  newest {newest}; loading older active jobs…", app.sub_title
+        assert app.sub_title == "all schemas", app.sub_title
+        assert screen._page_line_text() == "page 1 · loading active jobs…"
         live_part, history_part = _info_text(screen).split("│")
         assert "so far" in live_part and "so far" not in history_part, _info_text(screen)
         groups = _group_rows(table)
@@ -4900,8 +4910,8 @@ async def _run_a_slow_active_jobs_walk_after_the_newest_are_in(monkeypatch, then
         if then == "wait":
             client.active_gate.set()
             assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
-            assert app.sub_title.endswith(f"first 2 pages: {newest} jobs + every active job (more may exist)"), (
-                app.sub_title)
+            assert app.sub_title.endswith("all schemas"), app.sub_title
+            assert screen._page_line_text() == f"page 1: {_history_shown(screen)} jobs + active jobs · more may exist"
         else:  # a, while the load waits for the active jobs: it stops, and nothing of it comes after
             await pilot.press("a")
             assert await _pause_until(pilot, lambda: screen._scope.kind == SCHEMA, seconds=10.0), app.sub_title
@@ -4911,8 +4921,8 @@ async def _run_a_slow_active_jobs_walk_after_the_newest_are_in(monkeypatch, then
             # too, so it stops short as well and says what it holds after naming the schema.
             assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
             assert screen._scope.kind == SCHEMA
-            assert app.sub_title.endswith(f"Current schema: {screen._schema_label()}, first 2 pages: "
-                                          f"{newest} jobs + every active job (more may exist)"), app.sub_title
+            assert app.sub_title.endswith(f"Current schema: {screen._schema_label()}"), app.sub_title
+            assert screen._page_line_text() == f"page 1: {_history_shown(screen)} jobs + active jobs · more may exist"
             assert client.active_pages == 1  # the walk asked for no page after the one in flight
         await _settle(app, pilot)
 
@@ -4954,7 +4964,8 @@ async def _run_a_fresh_list_of_pages_shows_no_earlier_failure(how):
         await pilot.pause(0.2)
         assert not notice.display and screen._list_error is None
         assert not screen.query_one("#listinfo", Static).has_class("error")
-        assert app.sub_title.startswith("all schemas  ·  loading older jobs…"), app.sub_title
+        assert app.sub_title == "all schemas" and screen._page_line_text().startswith("page 1 · loading… "), (
+            app.sub_title)
         client.release(10)
         assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
         assert not notice.display and "failed" not in app.sub_title
@@ -5001,11 +5012,11 @@ async def _run_an_account_list_unavailable_after_its_first_pages_says_so():
         assert await _pause_until(pilot, lambda: "Current schema only: " in app.sub_title, seconds=10.0), (
             app.sub_title)
         assert "no account-wide list yet" in app.sub_title
-        # The fallback lists exactly list_jobs' jobs. That route sends no created_after, so it
-        # also holds the schema's jobs older than six months, which the scoped walk leaves out.
+        # The fallback lists exactly list_jobs' jobs: every one of the schema's, however old, as the
+        # scoped walk does too (neither has a lower bound on creation time).
         listed = {views.job_id_of(job) for job in client.list_jobs()}
         assert screen._scope.kind == SCHEMA and {views.job_id_of(job) for job in screen._all_jobs} == listed
-        assert len(listed) > schema_jobs
+        assert len(listed) == schema_jobs
         assert screen.check_action("show_list", ("account",)) is True
         assert any("Can't show all schemas" in str(n.message) for n in app._notifications)
         await _settle(app, pilot)
@@ -5033,8 +5044,9 @@ async def _run_the_configured_schemas_list_shows_its_pages_as_they_come():
         # The first page shows while the rest are read, and the header says how far it is.
         assert screen._refreshing and screen._scope.kind == SCHEMA and screen._scope.loading
         assert len(screen._all_jobs) == client._ACCOUNT_PAGE_ROWS
-        assert app.sub_title == (f"Current schema: {screen._schema_label()}, "
-                                 f"loading older jobs… {client._ACCOUNT_PAGE_ROWS} so far"), app.sub_title
+        assert app.sub_title == f"Current schema: {screen._schema_label()}", app.sub_title
+        assert screen._page_line_text() == f"page 1 · loading… {_history_shown(screen)} so far"
+        assert _history_shown(screen) == screen._scope.walked
         client.release_schema(20)
         assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
         assert app.sub_title.endswith(f"Current schema: {screen._schema_label()}"), app.sub_title
@@ -5161,8 +5173,9 @@ async def _run_a_page_that_fails_keeps_the_pages_read_and_r_reads_them_again():
         assert len(screen._all_jobs) == 2 * rows  # the two pages read stay
         assert app.sub_title.startswith("load failed "), app.sub_title
         # The active jobs, read beside the newest pages, stay listed: none is missing.
-        assert app.sub_title.endswith(f"newest {2 * rows} + every active job (the rest didn't load; r retries)"), (
-            app.sub_title)
+        assert app.sub_title.endswith("all schemas"), app.sub_title
+        assert screen._page_line_text() == (
+            f"page 1: {_history_shown(screen)} jobs + active jobs · the rest didn't load; r retries")
         notice = screen.query_one("#listnotice", Static)
         assert notice.display and f"showing the {2 * rows} jobs read before it" in screen._notice.plain
         client.fail_at = None
@@ -5748,12 +5761,13 @@ async def _run_the_header_draws_which_list_is_shown_as_a_chip():
         screen._refreshing = screen._switching = False
         screen, _table = await _account_list(app, pilot)
         assert chips() == [(" all schemas ", _ACCOUNT_CHIP)]
-        # Cut short, the subtitle says only how far the list got: the chip comes first.
-        screen._scope = replace(screen._scope, walked=2000, stopped=CAPPED)
+        # Cut short, the header names the list as ever: the page is the line under it's to say.
+        screen._scope = replace(screen._scope, walked=1_000, stopped=CAPPED)
         screen._update_subtitle()
-        assert app.sub_title.startswith("last refreshed ") and "all schemas" not in app.sub_title
-        assert header.format_title().plain.startswith("cortex training —  all schemas   ·  last refreshed ")
+        assert app.sub_title.startswith("last refreshed ") and app.sub_title.endswith("all schemas")
+        assert header.format_title().plain.startswith("cortex training — last refreshed ")
         assert chips() == [(" all schemas ", _ACCOUNT_CHIP)]
+        assert screen._page_line_text() == "page 1 + active jobs"
         await _settle(app, pilot)
 
 
@@ -5830,7 +5844,10 @@ async def _run_a_whole_location_in_the_search_is_read_from_the_service():
         await _settle(app, pilot)
 
 
-def test_a_whole_location_in_the_search_is_read_from_the_service():
+def test_a_whole_location_in_the_search_is_read_from_the_service(monkeypatch):
+    # Until a search holds every job (the rest is still being read, or the account is past the
+    # most it reads), a whole location is read from the service.
+    monkeypatch.setattr(JobLister, "read_rest", lambda self, first, **kwargs: None)
     asyncio.run(_run_a_whole_location_in_the_search_is_read_from_the_service())
 
 
@@ -5870,7 +5887,8 @@ async def _run_a_narrowing_with_no_jobs_says_so_rather_than_failing():
         await _settle(app, pilot)
 
 
-def test_a_narrowing_with_no_jobs_says_so_rather_than_failing():
+def test_a_narrowing_with_no_jobs_says_so_rather_than_failing(monkeypatch):
+    monkeypatch.setattr(JobLister, "read_rest", lambda self, first, **kwargs: None)  # still reading the rest
     asyncio.run(_run_a_narrowing_with_no_jobs_says_so_rather_than_failing())
 
 
@@ -6126,17 +6144,700 @@ async def _run_a_schema_list_past_the_cap(c):
                            tries=400)
         screen = app.screen
         drawn = lambda: len(screen._job_by_item)  # noqa: E731
-        assert drawn() == 2_001, "not the newest 2,000 and every active job"
-        assert "newest 2,000 + every active job (more exist)" in screen._scope_text()
+        assert drawn() == 1_001, "not the newest 1,000 and every active job"
+        assert screen._page_line_text() == "page 1 + active jobs"
         await pilot.press("f")
         assert await _wait(pilot, app, lambda: drawn() == 2_500, tries=400), "f drew no more"
-        assert "newest 2,000" not in screen._scope_text()
+        assert screen._page_line_text() == "", "every job is no page"
         calls = c.list_jobs.call_count
         await pilot.press("r")  # a refresh keeps what f asked for
         assert await _wait(pilot, app, lambda: c.list_jobs.call_count > calls and drawn() == 2_500, tries=400)
         await pilot.press("f")
-        assert await _wait(pilot, app, lambda: drawn() == 2_001, tries=400), "f did not go back"
+        assert await _wait(pilot, app, lambda: drawn() == 1_001, tries=400), "f did not go back"
         await _settle(app, pilot)
+
+
+async def _run_pages_of_a_schema_list(c):
+    app = CortexTrainingLogTUI(c, poll_interval=0.01)
+    async with app.run_test(size=(160, 40)) as pilot:
+        assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._job_by_item,
+                           tries=400)
+        screen = app.screen
+        drawn = lambda: len(screen._job_by_item)  # noqa: E731
+        first = "page 1 + active jobs"
+        # 1,000 in history and j0 among them, running; j2499 runs too, older than page 1.
+        assert drawn() == 1_002 and screen._page_line_text() == first
+        assert "1,000 in history" in _info_text(screen), _info_text(screen)
+        assert screen.check_action("page", ("older",)) and not screen.check_action("page", ("newer",))
+
+        async def flip(key, page):
+            await pilot.press(key)
+            assert await _wait(pilot, app, lambda: screen._scope.page == page and not screen._refreshing,
+                               tries=400), f"{key} showed no page {page}"
+
+        await flip("]", 2)
+        # j1001 to j2000, and j0 and j2499, running, which every page lists.
+        assert drawn() == 1_002 and "1,000 in history" in _info_text(screen)
+        assert screen._page_line_text() == "page 2 + active jobs"
+        highlighted = screen._jobs_by_key.get(screen._highlighted()[1])
+        assert highlighted and highlighted["job_id"] == "j0", "page 2 not drawn from its first job"
+        assert screen.check_action("page", ("older",)) and screen.check_action("page", ("newer",))
+        assert not screen.check_action("full_list", ("all",)), "f is the first page's"
+        await flip("]", 3)
+        assert drawn() == 500  # j2001 to j2499 (j2499 among them), and j0
+        assert screen._page_line_text() == "page 3 + active jobs"
+        assert not screen.check_action("page", ("older",))
+        calls = c.list_jobs.call_count
+        await pilot.press("r")  # a refresh reads the page shown
+        assert await _wait(pilot, app, lambda: c.list_jobs.call_count > calls and not screen._refreshing, tries=400)
+        assert screen._scope.page == 3 and drawn() == 500, "r left page 3"
+
+        # Back and forth: a page read before shows at once, read again only once a refresh is due.
+        calls = c.list_jobs.call_count
+        for key, page, rows in (("[", 2, 1_002), ("[", 1, 1_002), ("]", 2, 1_002), ("]", 3, 500)):
+            await pilot.press(key)
+            await pilot.pause()
+            assert (screen._scope.page, drawn(), screen._refreshing) == (page, rows, False), f"{key} to page {page}"
+        assert c.list_jobs.call_count == calls, "a page read before was read again"
+
+        await pilot.press("a")  # another list: its first page (all schemas aren't there, so the schema's)
+        assert await _wait(pilot, app, lambda: screen._declined and not screen._refreshing, tries=400)
+        assert screen._scope.page == 1 and not screen._pages and drawn() == 1_002
+        assert set(screen._page_cache) == {1}, "the other list kept the pages read of this one"
+        await _settle(app, pilot)
+
+
+def test_the_job_list_pages_by_1000_keeps_each_page_and_lists_every_active_job_on_each():
+    now = datetime.now(timezone.utc)
+    c = _client()
+    c.list_jobs.return_value = [{"job_id": f"j{i}", "status": "SUCCEEDED",
+                                 "created_at": (now - timedelta(minutes=i)).isoformat()} for i in range(2_500)]
+    for job in (c.list_jobs.return_value[0], c.list_jobs.return_value[-1]):
+        job["status"] = "RUNNING"  # the newest and the oldest: on every page
+    asyncio.run(_run_pages_of_a_schema_list(c))
+
+
+async def _run_pages_of_1000_jobs_beside_their_deployments(c):
+    app = CortexTrainingLogTUI(c, poll_interval=0.01)
+    async with app.run_test(size=(160, 40)) as pilot:
+        assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._job_by_item,
+                           tries=400)
+        screen = app.screen
+        line = screen.query_one("#pageline", Static)
+        # The page under the header, on a line of its own; the header names the list alone.
+        assert line.display and str(line.render()).strip() == "◂ newer   page 1 + active jobs   older ▸"
+        assert app.sub_title.endswith(f"Current schema: {screen._schema_label()}"), app.sub_title
+        assert "1,000 in history" in _info_text(screen), _info_text(screen)  # 900 before, as 1,000
+        for page, held in ((2, "1,000"), (3, "250")):
+            await pilot.press("]")
+            assert await _wait(pilot, app, lambda: screen._scope.page == page and not screen._refreshing,
+                               tries=400)
+            assert str(line.render()).strip() == f"◂ newer   page {page} + active jobs   older ▸"
+            assert f"{held} in history" in _info_text(screen), _info_text(screen)
+        await pilot.press("[", "[")
+        await pilot.pause()
+        await pilot.press("f")  # every job of the schema: no page, no line
+        assert await _wait(pilot, app, lambda: len(screen._all_jobs) == 2_500, tries=400)
+        await pilot.pause()
+        assert not line.display and screen._page_line_text() == ""
+        await _settle(app, pilot)
+
+
+_PAGE_ARROWS = {"newer": "◂ newer", "older": "older ▸"}
+
+
+def _page_links(screen) -> set:
+    """The page line's arrows that are links now: "newer", "older"."""
+    content = screen.query_one("#pageline", Static).content
+    return {which for which in _PAGE_ARROWS for span in content.spans
+            if f"@click=screen.page('{which}')" in str(span.style)}
+
+
+def _link_column(screen, widget, action) -> int:
+    """The first column of ``widget``'s first line where a click runs ``action``."""
+    region = widget.region
+    for column in range(region.width):
+        if (screen.get_style_at(region.x + column, region.y).meta or {}).get("@click") == action:
+            return column
+    raise AssertionError(f"no link to {action} on #{widget.id}")
+
+
+def _page_arrow_offset(screen, which) -> tuple:
+    """Where ``which``'s arrow is drawn on the page line, which is centered, for a click or a hover."""
+    line = screen.query_one("#pageline", Static)
+    plain = line.content.plain
+    left = (line.content_region.width - views.cell_width(plain)) // 2
+    return left + views.cell_width(plain[:plain.index(_PAGE_ARROWS[which])]) + 1, 0
+
+
+async def _run_the_page_line_arrows_page_as_the_keys_do(c):
+    app = CortexTrainingLogTUI(c, poll_interval=0.01)
+    async with app.run_test(size=(160, 40)) as pilot:
+        assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._job_by_item,
+                           tries=400)
+        screen = app.screen
+        line = screen.query_one("#pageline", Static)
+
+        async def click(which):
+            await pilot.click(line, offset=_page_arrow_offset(screen, which))
+
+        # A link where there is a page that way, as every clickable word is; plain and dim where not.
+        assert line.display and _page_links(screen) == {"older"}
+        await click("newer")  # page 1 has no newer page: a click does nothing
+        await pilot.pause()
+        assert screen._scope.page == 1 and not screen._refreshing
+        # Lit under the pointer, as the sort's word on the line below is: both are links, drawn one way.
+        older = _link_column(screen, line, "screen.page('older')")
+        assert _page_arrow_offset(screen, "older")[0] == older + 1  # where the tests click it
+        await pilot.hover(line, offset=(older, 0))
+        await pilot.pause()
+        assert line.highlight_link_id, "the older arrow wasn't lit under the pointer"
+        info = screen.query_one("#listinfo", Static)
+        await pilot.hover(info, offset=(_link_column(screen, info, "screen.cycle_sort"), 0))
+        await pilot.pause()
+        assert info.highlight_link_id and not line.highlight_link_id, "the arrow stayed lit off the pointer"
+        for page in (2, 3):
+            await click("older")
+            assert await _wait(pilot, app, lambda: screen._scope.page == page and not screen._refreshing,
+                               tries=400), f"the arrow showed no page {page}"
+        assert _page_links(screen) == {"newer"}, "the last page has no older one"
+        await click("older")
+        await pilot.pause()
+        assert screen._scope.page == 3
+        await click("newer")  # a page read before: at once, as [ shows it
+        await pilot.pause()
+        assert screen._scope.page == 2 and not screen._refreshing and _page_links(screen) == {"newer", "older"}
+        await _settle(app, pilot)
+
+
+def test_the_page_line_arrows_page_as_the_keys_do():
+    now = datetime.now(timezone.utc)
+    c = _client()
+    c.list_jobs.return_value = [{"job_id": f"j{i}", "status": "SUCCEEDED",
+                                 "created_at": (now - timedelta(minutes=i)).isoformat()} for i in range(2_500)]
+    asyncio.run(_run_the_page_line_arrows_page_as_the_keys_do(c))
+
+
+def test_a_page_holds_1000_jobs_and_says_which_page_on_its_own_line():
+    from tests.test_tui_account import _as_deployment
+
+    now = datetime.now(timezone.utc)
+    c = _client()
+    c.list_jobs.return_value = [{"job_id": f"j{i}", "status": "SUCCEEDED",
+                                 "created_at": (now - timedelta(minutes=i)).isoformat()} for i in range(2_500)]
+    for job in c.list_jobs.return_value[5::10]:
+        _as_deployment(job)  # 250 deployments, shown apart (d): no page counts them
+    asyncio.run(_run_pages_of_1000_jobs_beside_their_deployments(c))
+
+
+async def _run_a_page_read_before_read_again_when_due(c, jobs, gate, faults):
+    app = CortexTrainingLogTUI(c, poll_interval=0.01)
+    async with app.run_test(size=(160, 40)) as pilot:
+        assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._job_by_item,
+                           tries=400)
+        screen = app.screen
+        ids = lambda: {job["job_id"] for job in screen._all_jobs}  # noqa: E731
+        live = {"j0", "j2499"}
+
+        async def flip(key, page):
+            await pilot.press(key)
+            assert await _wait(pilot, app, lambda: screen._scope.page == page and not screen._refreshing,
+                               tries=400), f"{key} showed no page {page}"
+
+        await flip("]", 2)
+        await flip("[", 1)
+        # A minute on, page 2 shows at once as it was read, and is read again behind it.
+        bound, listing, read_at, clock = screen._page_cache[2]
+        screen._page_cache[2] = (bound, listing, read_at - screen._REFRESH_SECONDS, clock)
+        calls = c.list_jobs.call_count
+        gate.clear()
+        await pilot.press("]")
+        await pilot.pause()
+        assert screen._scope.page == 2 and screen._refreshing, "a page a minute old was not read again"
+        assert ids() == {f"j{i}" for i in range(1_001, 2_001)} | live
+        assert screen._last_refreshed == clock, "the header times page 2 from page 1's read"
+        gate.set()
+        assert await _wait(pilot, app, lambda: not screen._refreshing, tries=400)
+        assert c.list_jobs.call_count > calls and screen._scope.page == 2
+
+        # Jobs newer than page 1's push its oldest ones to page 2: the page kept starts elsewhere now.
+        await flip("[", 1)
+        newer = (datetime.fromisoformat(jobs[0]["created_at"]) + timedelta(minutes=1)).isoformat()
+        jobs[:0] = [{"job_id": f"n{i}", "status": "SUCCEEDED", "created_at": newer} for i in range(10)]
+        calls = c.list_jobs.call_count
+        await pilot.press("r")
+        assert await _wait(pilot, app, lambda: c.list_jobs.call_count > calls and not screen._refreshing, tries=400)
+        gate.clear()
+        await pilot.press("]")
+        await pilot.pause()
+        assert screen._scope.page == 2 and screen._refreshing, "a page whose start moved was not read again"
+        assert ids() == {f"j{i}" for i in range(1_001, 2_001)} | live  # as it was, until the read lands
+        gate.set()
+        assert await _wait(pilot, app, lambda: not screen._refreshing, tries=400)
+        assert screen._scope.page == 2 and ids() == {f"j{i}" for i in range(991, 1_991)} | live
+
+        # A page whose read fails says so and leaves the list on the page on screen, ] offered again;
+        # the page read before it, shown again, doesn't say so.
+        faults.append(RuntimeError("the service went away"))
+        await pilot.press("]")
+        assert await _wait(pilot, app, lambda: screen._list_error and not screen._refreshing, tries=400)
+        assert screen._scope.page == 2 and len(screen._pages) == 1, "the failed page change moved the list"
+        assert screen.check_action("page", ("older",)) and screen._load_page == screen._page_bound()
+        await pilot.press("[")
+        await pilot.pause()
+        assert screen._scope.page == 1 and screen._list_error is None
+        assert "failed" not in str(app.sub_title), app.sub_title
+        await _settle(app, pilot)
+
+
+def test_a_page_read_before_is_read_again_once_a_minute_old_or_moved(monkeypatch):
+    # Pages the service reads: nothing read behind the list (see the tests of pages cut from it).
+    monkeypatch.setattr(JobLister, "read_rest", lambda self, first, **kwargs: None)
+    now = datetime.now(timezone.utc)
+    jobs = [{"job_id": f"j{i}", "status": "SUCCEEDED", "created_at": (now - timedelta(minutes=i)).isoformat()}
+            for i in range(2_500)]
+    for job in (jobs[0], jobs[-1]):
+        job["status"] = "RUNNING"
+    gate = threading.Event()
+    gate.set()
+    faults = []
+
+    def list_jobs(*_args, **_kwargs):
+        assert gate.wait(30), "the test never let the read through"
+        if faults:
+            raise faults.pop()
+        return list(jobs)
+
+    c = _client()
+    c.list_jobs.side_effect = list_jobs
+    asyncio.run(_run_a_page_read_before_read_again_when_due(c, jobs, gate, faults))
+
+
+async def _run_pages_of_the_account_list(c, pager):
+    from tests.test_tui_account import _rows_to_cap
+
+    app = CortexTrainingLogTUI(c, poll_interval=0.01)
+    async with app.run_test(size=(160, 40)) as pilot:
+        assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._loaded_at,
+                           tries=400)
+        screen = app.screen
+        drawn = lambda: len(screen._job_by_item)  # noqa: E731
+        running = {job["job_id"] for job in pager.jobs if job["status"] == "RUNNING"}
+        await pilot.press("a")
+        assert await _wait(pilot, app, lambda: screen._scope.kind == ACCOUNT and not screen._refreshing, tries=400)
+        cut = _rows_to_cap(pager.jobs)  # 1,000 in history, and the running jobs among them
+        newest = {job["job_id"] for job in pager.jobs[:cut]}
+        assert drawn() == len(newest | running) and screen._scope.stopped == CAPPED
+        pager.bounds.clear()
+        await pilot.press("]")
+        assert await _wait(pilot, app, lambda: screen._scope.page == 2 and not screen._refreshing, tries=400)
+        older = {job["job_id"] for job in pager.jobs[cut:]}
+        assert {job["job_id"] for job in screen._all_jobs} == older | running
+        assert screen._page_line_text() == "page 2 + active jobs"
+        assert any(walk == "newest" and bound is not None for walk, bound in pager.bounds)
+        asked = len(pager.bounds)
+        await pilot.press("[")  # page 1 was read: it shows at once, with no page asked for
+        await pilot.pause()
+        assert screen._scope.page == 1 and not screen._refreshing and len(pager.bounds) == asked
+        await pilot.press("]")
+        await pilot.pause()
+        assert screen._scope.page == 2 and not screen._refreshing and len(pager.bounds) == asked
+        # A search narrowing to one location reads its first page.
+        await pilot.press("/", *"db=DB")
+        assert await _wait(pilot, app, lambda: screen._scope.narrowed and not screen._refreshing, tries=400)
+        assert screen._scope.page == 1 and not screen._pages
+        assert set(screen._page_cache) == {1}, "the narrowing kept the pages of every location"
+        await _settle(app, pilot)
+
+
+def _footer_actions(app) -> set:
+    """The actions the footer offers now."""
+    from textual.widgets._footer import FooterKey
+
+    return {key.action for key in app.screen.query(FooterKey)}
+
+
+async def _run_a_page_failing_partway(c, pager, gate):
+    app = CortexTrainingLogTUI(c, poll_interval=0.01)
+    async with app.run_test(size=(160, 40)) as pilot:
+        assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._loaded_at,
+                           tries=400)
+        screen = app.screen
+        await pilot.press("a")
+        assert await _wait(pilot, app, lambda: screen._scope.kind == ACCOUNT and not screen._refreshing, tries=400)
+        pager.fail_at = 3  # page 2's third request, held until its first jobs show
+        gate.clear()
+        await pilot.press("]")
+        assert await _wait(pilot, app, lambda: screen._scope.page == 2 and screen._scope.loading, tries=400)
+        await pilot.pause()
+        assert "page('older')" not in _footer_actions(app), "] offered while the page is read"
+        gate.set()
+        assert await _wait(pilot, app, lambda: screen._pages_failed and not screen._refreshing, tries=400)
+        await pilot.pause()
+        assert screen._scope.page == 2 and len(screen._all_jobs) < ACCOUNT_LIST_CAP
+        # Its first jobs stay, and the footer offers ] on from them, as it does [ back.
+        assert {"page('older')", "page('newer')"} <= _footer_actions(app), _footer_actions(app)
+        await _settle(app, pilot)
+
+
+def test_a_page_failing_partway_keeps_its_jobs_and_offers_the_next(monkeypatch):
+    from tests.test_tui_account import _Paged
+
+    monkeypatch.setattr(JobLister, "read_rest", lambda self, first, **kwargs: None)  # the service reads ]
+
+    pager = _Paged(3 * ACCOUNT_LIST_CAP)
+    gate = threading.Event()
+    gate.set()
+
+    def list_jobs_page(**kwargs):
+        if kwargs.get("created_before") and not kwargs.get("status") and (kwargs.get("page_token") or "").endswith(":2"):
+            assert gate.wait(30), "the test never let the read through"
+        return pager.list_jobs_page(**kwargs)
+
+    c = _client()
+    c.list_jobs_page.side_effect = list_jobs_page
+    asyncio.run(_run_a_page_failing_partway(c, pager, gate))
+
+
+def test_the_all_schemas_list_pages_as_it_is_read(monkeypatch):
+    from cortex_training.tui import account
+    from tests.test_tui_account import _Paged
+
+    # No read behind the list (see the search tests): the requests counted are the pages', and
+    # a whole location in the search is read from the service.
+    monkeypatch.setattr(account, "ARCHIVE_CAP", 1)
+    pager = _Paged(ACCOUNT_LIST_CAP + 300)
+    c = _client()
+    c.list_jobs_page.side_effect = pager.list_jobs_page
+    asyncio.run(_run_pages_of_the_account_list(c, pager))
+
+
+async def _account_pages(app, pilot):
+    """The account-wide list (a), its first page whole."""
+    assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._loaded_at,
+                       tries=400)
+    screen = app.screen
+    await pilot.press("a")
+    assert await _wait(pilot, app, lambda: screen._scope.kind == ACCOUNT and not screen._refreshing
+                       and screen._scope.page == 1 and screen._archive is not None, tries=400)
+    return screen
+
+
+def _searched(screen, text):
+    screen.query_one("#jobfilter", Input).value = text  # the list keeps the focus, so ] and [ are keys
+
+
+async def _run_a_search_covers_every_job_read_behind_the_list(c, pager):
+    app = CortexTrainingLogTUI(c, poll_interval=0.01)
+    async with app.run_test(size=(160, 40)) as pilot:
+        screen = await _account_pages(app, pilot)
+        assert await _wait(pilot, app, lambda: screen._archive.done, tries=600), "the rest was never read"
+        jobs = len(pager.jobs)
+        assert {key[2] for key in screen._archive.jobs} == {job["job_id"] for job in pager.jobs}
+        oldest = pager.jobs[-1]["job_id"]
+        assert oldest not in {job["job_id"] for job in screen._all_jobs}, "the test's job is on page 1"
+
+        _searched(screen, oldest)  # a job no page on screen holds
+        assert await _wait(pilot, app, lambda: screen._match_count == 1, tries=200), screen._match_count
+        assert any(key[2] == oldest for key in screen._job_by_item.values())
+        assert screen._page_line_text() == f"1 match in all {jobs:,} jobs"
+
+        # A search matching every job shows them 1,000 in history a page, and ] and [ step through
+        # those pages without asking the service anything.
+        _searched(screen, "job-")
+        assert await _wait(pilot, app, lambda: screen._match_count == jobs, tries=200), screen._match_count
+        live = sum(1 for job in pager.jobs if job["status"] == "RUNNING")
+        pages = -(-(jobs - live) // ACCOUNT_LIST_CAP)
+        assert screen._page_line_text() == f"page 1 of {pages} · {jobs:,} matches in all {jobs:,} jobs"
+        asked = len(pager.calls)
+        await pilot.press("]")
+        await pilot.pause()
+        assert screen._match_page == 2 and screen._page_line_text().startswith(f"page 2 of {pages} · ")
+        assert screen._scope.page == 1, "] paged the list, not the matches"
+        assert screen.check_action("page", ("newer",)) and "newer" in _page_links(screen)
+        await pilot.press("[")
+        await pilot.pause()
+        assert screen._match_page == 1 and len(pager.calls) == asked, "a page of matches asked the service"
+
+        # Every job at hand: a whole database is searched here, not asked of the service.
+        filters = len(pager.filters)
+        _searched(screen, "db=DB")
+        await pilot.pause(0.3)
+        assert await _wait(pilot, app, lambda: screen._match_count == jobs and not screen._refreshing, tries=200)
+        assert screen._pushdown is None and not screen._scope.narrowed
+        assert not any(db for _walk, db, _schema in pager.filters[filters:]), "the search narrowed the list"
+        _searched(screen, "")  # cleared: the list's own page again
+        await pilot.pause(0.3)
+        assert screen._page_line_text() == "page 1 + active jobs" and screen._match_page == 1
+        await _settle(app, pilot)
+
+
+def test_a_search_covers_every_job_read_behind_the_list():
+    from tests.test_tui_account import _Paged
+
+    pager = _Paged(3 * ACCOUNT_LIST_CAP + 300)
+    c = _client()
+    c.list_jobs_page.side_effect = pager.list_jobs_page
+    asyncio.run(_run_a_search_covers_every_job_read_behind_the_list(c, pager))
+
+
+def _rest_held(pager, gate, faults):
+    """``pager``'s list_jobs_page, the read behind the list waiting at its second request for
+    ``gate`` (and raising the first of ``faults`` there)."""
+
+    def list_jobs_page(**kwargs):
+        if kwargs.get("created_before") is not None and not kwargs.get("status") \
+                and (kwargs.get("page_token") or "").endswith(":1"):
+            assert gate.wait(30), "the test never let the read through"
+            if faults:
+                raise faults.pop()
+        return pager.list_jobs_page(**kwargs)
+
+    return list_jobs_page
+
+
+async def _run_a_search_says_what_it_covered(c, pager, gate, faults):
+    app = CortexTrainingLogTUI(c, poll_interval=0.01)
+    async with app.run_test(size=(160, 40)) as pilot:
+        screen = await _account_pages(app, pilot)
+        assert await _wait(pilot, app, lambda: len(screen._archive.jobs) > len(screen._all_jobs), tries=400)
+        _searched(screen, "job-")
+        await pilot.pause(0.3)
+        # While the rest is read: what matched so far, and that more is coming.
+        read = screen._match_searched
+        assert screen._page_line_text().endswith(f"so far · {read:,} jobs read, reading the rest"), (
+            screen._page_line_text())
+        assert "so far for job-" in _info_text(screen), _info_text(screen)
+        faults.append(RuntimeError("the service went away"))
+        gate.set()
+        assert await _wait(pilot, app, lambda: screen._archive.done, tries=400)
+        await pilot.pause()
+        assert screen._archive.failed and screen._page_line_text().endswith("· the rest didn't load"), (
+            screen._page_line_text())
+        # r reads page 1 again, and the rest after it, this time to its end.
+        await pilot.press("r")
+        assert await _wait(pilot, app, lambda: screen._archive.complete and not screen._refreshing, tries=600)
+        await pilot.pause()
+        jobs = len(pager.jobs)
+        assert screen._page_line_text().endswith(f"{jobs:,} matches in all {jobs:,} jobs"), screen._page_line_text()
+        await _settle(app, pilot)
+
+
+def test_a_search_says_what_it_covered_while_the_rest_is_read_and_after_it_fails():
+    from tests.test_tui_account import _Paged
+
+    pager = _Paged(3 * ACCOUNT_LIST_CAP)
+    gate, faults = threading.Event(), []
+    c = _client()
+    c.list_jobs_page.side_effect = _rest_held(pager, gate, faults)
+    asyncio.run(_run_a_search_says_what_it_covered(c, pager, gate, faults))
+
+
+async def _run_a_search_past_the_most_it_reads(c, pager):
+    app = CortexTrainingLogTUI(c, poll_interval=0.01)
+    async with app.run_test(size=(160, 40)) as pilot:
+        screen = await _account_pages(app, pilot)
+        assert await _wait(pilot, app, lambda: screen._archive.done, tries=600)
+        assert screen._archive.capped and not screen._archive.complete
+        _searched(screen, "job-")
+        await pilot.pause(0.3)
+        held = len(screen._archive.jobs)
+        assert screen._page_line_text().endswith(f"in the newest {held:,} jobs, the most a search reads"), (
+            screen._page_line_text())
+        # Past the most a search holds, a whole location is still asked of the service.
+        _searched(screen, "db=DB schema=S1")
+        assert await _wait(pilot, app, lambda: screen._pushdown == ("DB", "S1") and not screen._refreshing,
+                           tries=400), screen._pushdown
+        await _settle(app, pilot)
+
+
+def test_a_search_past_the_most_it_reads_says_so_and_still_narrows(monkeypatch):
+    from cortex_training.tui import account
+    from tests.test_tui_account import _Paged
+
+    pager = _Paged(3 * ACCOUNT_LIST_CAP)
+    monkeypatch.setattr(account, "ARCHIVE_CAP", ACCOUNT_LIST_CAP + 500)
+    c = _client()
+    c.list_jobs_page.side_effect = pager.list_jobs_page
+    asyncio.run(_run_a_search_past_the_most_it_reads(c, pager))
+
+
+async def _run_pages_cut_from_the_read_behind_the_list(c, pager):
+    app = CortexTrainingLogTUI(c, poll_interval=0.01)
+    async with app.run_test(size=(160, 40)) as pilot:
+        screen = await _account_pages(app, pilot)
+        assert await _wait(pilot, app, lambda: screen._archive.done, tries=600), "the rest was never read"
+        asked = len(pager.calls)
+        history = lambda: {job["job_id"] for job in screen._all_jobs if not views.is_live(job)}  # noqa: E731
+        pages, page = [history()], 1
+        while screen.check_action("page", ("older",)):
+            page += 1
+            await pilot.press("]")
+            await pilot.pause()
+            assert screen._scope.page == page and not screen._refreshing, f"page {page} didn't show at once"
+            pages.append(history())
+        assert len(pager.calls) == asked, "a page was asked of the service though it was read"
+        # Each history job on one page, 1,000 a page but the last, and every active job on each.
+        every = {job["job_id"] for job in pager.jobs if job["status"] != "RUNNING"}
+        assert set().union(*pages) == every and sum(map(len, pages)) == len(every)
+        assert [len(held) for held in pages[:-1]] == [ACCOUNT_LIST_CAP] * (len(pages) - 1)
+        running = {job["job_id"] for job in pager.jobs if job["status"] == "RUNNING"}
+        assert running <= {job["job_id"] for job in screen._all_jobs}, "the last page lacks the active jobs"
+        assert screen._page_line_text() == f"page {page} + active jobs"
+        await pilot.press("[")
+        await pilot.pause()
+        assert screen._scope.page == page - 1 and len(pager.calls) == asked
+        await _settle(app, pilot)
+
+
+def test_pages_past_the_first_are_cut_from_the_read_behind_the_list_at_once():
+    from tests.test_tui_account import _Paged
+
+    pager = _Paged(4 * ACCOUNT_LIST_CAP)
+    c = _client()
+    c.list_jobs_page.side_effect = pager.list_jobs_page
+    asyncio.run(_run_pages_cut_from_the_read_behind_the_list(c, pager))
+
+
+async def _run_the_next_pages_rows_built_ahead(c, built):
+    app = CortexTrainingLogTUI(c, poll_interval=0.01)
+    async with app.run_test(size=(160, 40)) as pilot:
+        screen = await _account_pages(app, pilot)
+        assert await _wait(pilot, app, lambda: screen._archive.done and screen._prebuilt
+                           and not screen._prebuilding, tries=600), "page 2's rows were never built ahead"
+        built.clear()
+        screen.action_page("older")  # ], drawn before anything else runs (page 3's rows are built after)
+        assert screen._scope.page == 2 and not screen._refreshing
+        assert not built, f"page 2 built {len(built)} rows on ] though they were built ahead"
+        # And page 3's rows are built behind page 2 in turn.
+        assert await _wait(pilot, app, lambda: screen._prebuilt and not screen._prebuilding
+                           and screen._prebuild_for == screen._next_page, tries=600)
+        await _settle(app, pilot)
+
+
+def test_the_rows_of_the_page_after_the_one_shown_are_built_ahead(monkeypatch):
+    from tests.test_tui_account import _Paged
+
+    built = []
+    real = JobListScreen._job_cells
+    monkeypatch.setattr(JobListScreen, "_job_cells", lambda self, job, now: built.append(1) or real(self, job, now))
+    pager = _Paged(4 * ACCOUNT_LIST_CAP)
+    c = _client()
+    c.list_jobs_page.side_effect = pager.list_jobs_page
+    asyncio.run(_run_the_next_pages_rows_built_ahead(c, built))
+
+
+def _rest_held_at(pager, gate, stop_at):
+    """``pager``'s list_jobs_page, the read behind the list (the walk bounded where page 1 ends)
+    waiting for ``gate`` at its ``stop_at``-th request; and the count of its requests."""
+    seen = {"bound": None, "asked": 0}
+
+    def list_jobs_page(**kwargs):
+        bound = kwargs.get("created_before")
+        if bound is not None and not kwargs.get("status"):
+            seen["bound"] = seen["bound"] or bound
+            if bound == seen["bound"]:
+                seen["asked"] += 1
+                if seen["asked"] == stop_at:
+                    assert gate.wait(30), "the test never let the read through"
+        return pager.list_jobs_page(**kwargs)
+
+    return list_jobs_page, seen
+
+
+async def _run_a_page_past_what_the_read_reached(c, pager, gate, seen):
+    app = CortexTrainingLogTUI(c, poll_interval=0.01)
+    async with app.run_test(size=(160, 40)) as pilot:
+        screen = await _account_pages(app, pilot)
+        assert await _wait(pilot, app, lambda: seen["asked"] >= 14, tries=600)  # held at its 14th request
+        await pilot.pause(0.3)
+        assert not screen._archive.done
+        # Jobs held past a gap in what the read reached, as a later page the service read leaves them:
+        # page 3 cut from these would skip the jobs between.
+        screen._archive.add([dict(job) for job in pager.jobs[2_700:]], screen._job_key, fresher=True)
+        asked = len(pager.calls)
+        await pilot.press("]")  # read past page 2's end already: at once
+        await pilot.pause()
+        assert screen._scope.page == 2 and not screen._refreshing and len(pager.calls) == asked
+        await pilot.press("]")  # page 3 runs past what was read: the service reads it
+        assert await _wait(pilot, app, lambda: screen._scope.page == 3 and not screen._refreshing, tries=400)
+        assert len(pager.calls) > asked, "page 3 was cut from jobs not read yet"
+        gate.set()
+        await _settle(app, pilot)
+
+
+def test_a_page_past_what_the_read_behind_the_list_reached_is_read_from_the_service():
+    from tests.test_tui_account import _Paged
+
+    pager = _Paged(4 * ACCOUNT_LIST_CAP)
+    gate = threading.Event()
+    c = _client()
+    c.list_jobs_page.side_effect, seen = _rest_held_at(pager, gate, 14)
+    asyncio.run(_run_a_page_past_what_the_read_reached(c, pager, gate, seen))
+
+
+async def _run_a_page_change_taken_back_before_it_loads(c, gate):
+    app = CortexTrainingLogTUI(c, poll_interval=0.01)
+    async with app.run_test(size=(160, 40)) as pilot:
+        assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._job_by_item,
+                           tries=400)
+        screen = app.screen
+        gate.clear()
+        await pilot.press("]")  # page 2, read but not answered yet
+        await pilot.pause()
+        await pilot.press("[")  # back to page 1, read before: at once
+        await pilot.pause()
+        assert screen._scope.page == 1 and not screen._paging, "the page change outlived its [ back"
+        gate.set()
+        await pilot.press("r")  # a plain refresh: the whole list stays until the next is whole
+        await pilot.pause()
+        assert not screen._progressive, "the refresh read page 1 as a page change, from its first 100 rows"
+        assert await _wait(pilot, app, lambda: not screen._refreshing, tries=400)
+        assert screen._scope.page == 1
+        await _settle(app, pilot)
+
+
+def test_a_page_change_taken_back_before_it_loads_leaves_a_plain_refresh():
+    now = datetime.now(timezone.utc)
+    jobs = [{"job_id": f"j{i}", "status": "SUCCEEDED", "created_at": (now - timedelta(minutes=i)).isoformat()}
+            for i in range(2_500)]
+    gate = threading.Event()
+    gate.set()
+
+    def list_jobs(*_args, **_kwargs):
+        assert gate.wait(30), "the test never let the read through"
+        return list(jobs)
+
+    c = _client()
+    c.list_jobs.side_effect = list_jobs
+    asyncio.run(_run_a_page_change_taken_back_before_it_loads(c, gate))
+
+
+async def _run_an_empty_view_on_a_later_page(c):
+    app = CortexTrainingLogTUI(c, poll_interval=0.01)
+    async with app.run_test(size=(160, 40)) as pilot:
+        assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._job_by_item,
+                           tries=400)
+        screen = app.screen
+        for page in (2, 3):
+            await pilot.press("]")
+            assert await _wait(pilot, app, lambda: screen._scope.page == page and not screen._refreshing, tries=400)
+        await pilot.press("d")  # page 3 holds no deployment, though page 1 does
+        await pilot.pause()
+        assert screen._nomatch.startswith("Page 3 of this schema's list has no deployments to show."), screen._nomatch
+        await _settle(app, pilot)
+
+
+def test_an_empty_view_on_a_later_page_names_the_page():
+    from tests.test_tui_account import _as_deployment
+
+    now = datetime.now(timezone.utc)
+    c = _client()
+    c.list_jobs.return_value = [{"job_id": f"j{i}", "status": "SUCCEEDED",
+                                 "created_at": (now - timedelta(minutes=i)).isoformat()} for i in range(2_500)]
+    for job in c.list_jobs.return_value[5:50:10]:
+        _as_deployment(job)
+    asyncio.run(_run_an_empty_view_on_a_later_page(c))
 
 
 def test_a_schema_list_past_the_cap_draws_its_newest_and_f_draws_every_job():
@@ -6157,7 +6858,7 @@ async def _run_a_on_a_schema_list_past_the_cap(c):
                            tries=400)
         screen = app.screen
         drawn = lambda: len(screen._job_by_item)  # noqa: E731
-        cut = "newest 2,000 + every active job (more exist)"
+        cut = "page 1 + active jobs"
 
         async def press_a():
             calls = c.list_jobs.call_count
@@ -6165,18 +6866,18 @@ async def _run_a_on_a_schema_list_past_the_cap(c):
             assert await _wait(pilot, app, lambda: screen._declined and c.list_jobs.call_count > calls
                                and not screen._refreshing, tries=400), "a never came back to the schema"
 
-        assert drawn() == 2_001 and cut in screen._scope_text()
+        assert drawn() == 1_001 and screen._page_line_text() == cut
         await press_a()  # all schemas aren't there: the list stays the schema's, cut as it was
-        assert drawn() == 2_001, "a drew a different list"
-        assert cut in screen._scope_text(), f"the header lost the cut: {screen._scope_text()!r}"
+        assert drawn() == 1_001, "a drew a different list"
+        assert screen._page_line_text() == cut, f"the page line lost the cut: {screen._page_line_text()!r}"
         assert screen.check_action("full_list", ("all",)), "a hid f"
         await pilot.press("f")
         assert await _wait(pilot, app, lambda: drawn() == 2_500, tries=400), "f drew no more after a"
         await press_a()  # with every job drawn, they stay drawn: it is the same list
         assert drawn() == 2_500 and screen.check_action("full_list", ("newest",))
         await pilot.press("f")
-        assert await _wait(pilot, app, lambda: drawn() == 2_001, tries=400), "f did not go back"
-        assert cut in screen._scope_text()
+        assert await _wait(pilot, app, lambda: drawn() == 1_001, tries=400), "f did not go back"
+        assert screen._page_line_text() == cut
         await _settle(app, pilot)
 
 
@@ -6199,7 +6900,7 @@ async def _run_f_just_as_a_refresh_lands(c):
         screen = app.screen
         drawn = lambda: len(screen._job_by_item)  # noqa: E731
         older = screen._cut_listing
-        assert older is not None and drawn() == 2_001
+        assert older is not None and drawn() == 1_001
         created = datetime.now(timezone.utc).isoformat()
         job = {"job_id": "j-new", "status": "SUCCEEDED", "created_at": created}
         newer = Listing([job, *older.jobs], older.scope, everything=[job, *older.everything])
@@ -6211,11 +6912,11 @@ async def _run_f_just_as_a_refresh_lands(c):
         assert "j-new" in {row.get("job_id") for row in screen._all_jobs}
         # f twice before its draw: the newest stay drawn.
         screen.action_full_list("newest")
-        assert await _wait(pilot, app, lambda: drawn() == 2_002, tries=400)
+        assert await _wait(pilot, app, lambda: drawn() == 1_002, tries=400)
         screen.action_full_list("all")
         screen.action_full_list("newest")
         await pilot.pause(0.5)
-        assert drawn() == 2_002 and not screen._full_list, "a draw f no longer asked for was made"
+        assert drawn() == 1_002 and not screen._full_list, "a draw f no longer asked for was made"
         await _settle(app, pilot)
 
 
@@ -6414,11 +7115,14 @@ async def _run_a_search_with_no_match_on_a_cut_list(c):
                            tries=400)
         await pilot.press("slash", *"zzz-no-such-job", "enter")
         assert await _wait(pilot, app, lambda: app.screen._nomatch, tries=200)
-        assert "f searches all 2,500 jobs of the schema." in app.screen._nomatch, app.screen._nomatch
+        # Every one of the schema's jobs was searched, not only page 1's: nothing for f to add.
+        message = app.screen._nomatch
+        assert "among 2,500 job(s) in the configured schema." in message, message
+        assert "f searches" not in message and "loaded" not in message, message
         await _settle(app, pilot)
 
 
-def test_a_search_with_no_match_on_a_cut_list_says_f_searches_them_all():
+def test_a_search_with_no_match_on_a_cut_list_says_it_searched_every_job():
     now = datetime.now(timezone.utc)
     c = _client()
     c.list_jobs.return_value = [{"job_id": f"j{i}", "status": "SUCCEEDED",

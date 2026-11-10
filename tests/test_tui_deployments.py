@@ -421,7 +421,7 @@ def test_an_empty_view_keeps_the_scope_s_words_and_the_widen_hint():
             screen._scope = ListScope(SCHEMA)
             screen._render_jobs()
             said = screen._nomatch
-            assert said.startswith("No training or sampling jobs created in the last 6 months in "), said
+            assert said.startswith("No training or sampling jobs in "), said
             assert "that this role can see." in said and "\n  a lists every database and schema." in said, said
             assert said.endswith("\n  d shows the 1 deployment."), said
             screen._scope = ListScope(ACCOUNT)

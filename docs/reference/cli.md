@@ -1234,15 +1234,16 @@ that sub-job's job.
 
 #### Job list
 
-The job list shows the jobs created in the last six months (183 days) that the
-current role can see in the configured database and schema. It reads the
+The job list shows every job the current role can see, however long ago it
+was created, in the configured database and schema. It reads the
 account-level list scoped to that one schema
 ([REST API reference section 5.3](rest-api.md#across-the-account---get-apiv2endpoint)),
 so it comes a page at a time; where that route is unavailable for the account,
 fails, or answers with no job at all, it reads `list_jobs`, which answers in one
 call and shows no pages.
 
-The line under the header says how the TUI signs in and as whom:
+A line under the header (under the page line, where the list has pages; see
+below) says how the TUI signs in and as whom:
 `profile NAME` (or `config FILE`, `host HOST` or `base URL URL` for the older
 ways), the `user` and `role` Snowflake says it signs in as, and the
 `cortex-training` version (`profile train · user ME · role TRAINER ·
@@ -1269,50 +1270,60 @@ the footer then offers `a Current schema`, which goes back. The
 header line starts with when the list was last refreshed (`refreshing…` while
 a refresh reads), then which list is shown. The words naming the list stand out
 as a chip, bold and filled: `Current schema: DB.SCHEMA` in white, `all schemas`
-in blue. Where the header doesn't otherwise name the list (the all-schemas list
-cut short, below), its chip comes first. Until the list `a` asked for
-answers, the header reads `loading all schemas…` (or `loading the current
-schema, DB.SCHEMA…`) and the previous list stays on screen. Either list shows
-its first page (the newest 100 jobs) as soon as it answers, and adds each later
-page as it comes: the highlighted row stays where it is on screen, and folds and
-a search stay as they are. From its second page on, it also reads the active
-jobs (see below) beside the newest ones, at most two requests at a time. Until
-the last page, the header reads `all schemas · loading older jobs… N so far`
-(`Current schema: DB.SCHEMA, loading older jobs… N so far` for the configured
-schema's list; `+ every active job` once the active jobs are listed, `(older active
-jobs may be missing)` if reading them failed or stopped short), the counts above
-the list and a search's matches end in `so far`, and the LIVE and HISTORY rows'
-counts in `…`. Once the active jobs are listed, the active statuses' counts drop
-their `so far`; the `unknown` count and the LIVE row keep theirs until the last
-page, as no status filter lists an `unknown` job. If the newest jobs are all in
-while the active jobs are still being read, the header reads `newest 2,000;
-loading older active jobs…`: the history count and the HISTORY row drop their
-marks, and the live counts and the LIVE row keep theirs.
-A list shows its pages as they come when it is first shown: as the TUI opens,
+in blue. Until the list `a` asked for answers, the header reads `loading all
+schemas…` (or `loading the current schema, DB.SCHEMA…`) and the previous list
+stays on screen. Where the list holds more than one page (see the pages below),
+a line right under the header, drawn as part of it, says which page shows,
+`page 1 + active jobs`, between `◂ newer` and `older ▸`: links, underlined and lit
+under the pointer as every clickable word of the TUI is, that do what `[` or `]`
+does; plain and dim where there is no page that way. A list that
+fits on one page has no such line. Either list shows its first 100 jobs as
+soon as they answer, and adds each later 100 as they come: the highlighted row
+stays where it is on screen, and folds and a search stay as they are. From its
+second request on, it also reads the active jobs (see below) beside the newest
+ones, at most two requests at a time. Until the last request, the page line
+reads `page 1 · loading… N so far` (`+ active jobs` once the active jobs are
+listed, `(older active jobs may be missing)` if reading them failed or stopped
+short), the counts above the list and a search's matches end in `so far`, and
+the LIVE and HISTORY rows' counts in `…`. Once the active jobs are listed, the
+active statuses' counts drop their `so far`; the `unknown` count and the LIVE
+row keep theirs until the last request, as no status filter lists an `unknown`
+job. If the newest jobs are all in while the active jobs are still being read,
+the page line reads `page 1 · loading active jobs…`: the history count and the
+HISTORY row drop their marks, and the live counts and the LIVE row keep theirs.
+A list shows its jobs as they come when it is first shown: as the TUI opens,
 and after `a`. A refresh of a whole list keeps showing it until the next one is
-whole. `a` while the pages are read stops reading them: the pages read stay, no
+whole. `a` while the jobs are read stops reading them: the jobs read stay, no
 longer marked, under `loading the current schema, DB.SCHEMA… · showing the
 partial all-schemas list` (or `loading all schemas… · showing the partial
 current-schema list`) until that list answers. An `a` back before then stops
-that list's pages the same way, and the pages start again from the first. `r` meanwhile does nothing (and
+that list's reads the same way, and they start again from the newest. `r` meanwhile does nothing (and
 nothing is read again after): it says so, `Still loading older jobs (Ns); r
-works once it's done.` (`older active jobs` while the header says so). Once the
-list is whole, the header names it:
+works once it's done.` (`older active jobs` while the page line says so). Once
+the list is whole, the header names it:
 
 | Header | The list holds |
 |---|---|
 | `Current schema: DB.SCHEMA` | the jobs of the configured database and schema, as the list opens |
-| `Current schema: DB.SCHEMA, newest 2,000 + every active job (more exist)` | the same, cut short as the all-schemas list can be (below, `first 40 pages: …` included): that one schema holds more jobs than one refresh reads; and where the account-level list is unavailable, so the schema's list comes whole, when it holds more than 2,000 jobs: `f` shows every one of them, and again the newest 2,000 |
-| `all schemas` | after `a`: the jobs in every database and schema the role can see, from the account-level list; `all schemas (all in DB.SCHEMA)` when every one of them is in the same location |
-| `all schemas, narrowed to DB.SCHEMA` | after a whole `db=` search (see below): the jobs of that one location, asked of the service rather than filtered out of the newest 2,000. A narrowed list cut short reads `narrowed to DB.SCHEMA: newest 2,000 + every active job (more exist)`, and `narrowing to DB.SCHEMA…` while it is read |
-| `newest 2,000 + every active job (more exist)` | the same, cut at the newest 2,000 because more exist, plus the active jobs created before those |
-| `first 40 pages: N jobs + every active job (more may exist)` | the same, cut after 40 pages (see below), plus the active jobs |
-| `Current schema only: DB.SCHEMA (reason)` | the jobs of the configured database and schema, in place of the all-schemas list: `a` found it unavailable, or it turned unavailable while shown (see below). Followed by what it holds when that list is cut short, as above |
+| `all schemas` | after `a`: the jobs in every database and schema the role can see, from the account-level list; `all schemas (all in DB.SCHEMA)` when every one of them is in the same location and the list fits on one page |
+| `all schemas, narrowed to DB.SCHEMA` | after a whole `db=` search (see below): the jobs of that one location, asked of the service rather than filtered out of the page shown; `narrowing to DB.SCHEMA…` while it is read |
+| `Current schema only: DB.SCHEMA (reason)` | the jobs of the configured database and schema, in place of the all-schemas list: `a` found it unavailable, or it turned unavailable while shown (see below) |
+
+and the line under it, the page:
+
+| Page line | The page holds |
+|---|---|
+| none | the whole list: it fits on one page |
+| `page 1 + active jobs` | the newest 1,000 jobs in history (see below), plus the active jobs: older jobs exist, and `]` shows them. On the configured schema's list where the account-level list is unavailable, so the schema's list comes whole, `f` shows every one of its jobs, and again page 1 |
+| `page 2 + active jobs` | after `]` (see below): the 1,000 jobs in history created before page 1's, plus every active job; the jobs left on the last page |
+| `page 1: N jobs + active jobs · more may exist` | a page cut short after 40 requests (see below), plus the active jobs |
+| `page 1: N jobs + active jobs · the rest didn't load; r retries` | a page whose read failed partway: the jobs read before it stay |
+| `page 2 · loading…` | after `]`, until the first of its jobs answer; `page 2 · loading… N so far` after |
 
 Each refresh reads the account-level list newest first, 100 jobs a
-page. It stops after 2,000 jobs, or after 40 pages, because the service examines
-a bounded number of jobs per call, so a page can be short or empty and still
-have more after it: a refresh never walks the whole history. It asks for no
+request. It stops after 1,000 jobs, or after 40 requests, because the service
+examines a bounded number of jobs per call, so an answer can be short or empty
+and still have more after it: a refresh never walks the whole history. It asks for no
 status, so jobs whose status the service can't read (`unknown`) are listed too.
 When it stops with jobs left, it also reads the active jobs (`pending`,
 `placing`, `initializing` and `running`) and adds those created before the
@@ -1324,20 +1335,63 @@ walk may have read all of its pages by then, one or two in the usual case) and
 its jobs are dropped. While an earlier load's active jobs' request is still in
 flight (after `a` pressed again), a new load reads them after the newest jobs
 instead. An `unknown` job older than
-the newest 2,000 is not listed, as a status filter leaves those out, and if
+the newest 1,000 is not listed, as a status filter leaves those out, and if
 reading the active jobs fails or is cut short too, the header says `older active
-jobs may be missing`. A walk that stops at 40 pages with no job to show says
+jobs may be missing`. A walk that stops at 40 requests with no job to show says
 that more may exist and how to list one schema, rather than that there are none.
 
-Search filters the jobs the list holds: when more exist, a search can't reach
-the older ones, and the message for a search without results says so. A search
-naming a whole database is the exception: `db=TEAM_DB`, on its own or together
-with a whole `schema=EXPERIMENTS`, has the account-level list read again asking
-the service for that location, so its jobs come whole instead of being filtered
-out of the newest 2,000. The header reads `narrowing to DB.SCHEMA…` while that
-is read and `narrowed to DB.SCHEMA` after; clearing the search reads every
-schema again. The Schema column is hidden on a narrowed list, as every job it
-holds is then in one location.
+`]` shows the page of older jobs after the one on screen, and `[` the page
+before it. Page 1 is the newest 1,000 jobs, page 2 the 1,000 created before
+those, and so on, back to the first job ever made. A page counts the jobs
+it files under history: the live jobs and the deployments (shown by `d`) created
+in its span come with it, but not among its 1,000, so every page but the last
+reads `1,000 in history`. Every page also lists every active job (`pending`, `placing`,
+`initializing` and `running`), so a long-running job stays under live whichever
+page shows. The page line under the header names the page, and `]` is offered while
+older jobs exist. A refresh, `r` included, reads
+the page shown again. A page read before shows again at once, as it was read
+(the header's `last refreshed` is when), and is read again behind it only when
+it is a minute old, or when the page before it moved since it was read (newer
+jobs on page 1 push its oldest ones onto page 2). `a`, a `db=` search that
+narrows the list, and opening the list again from a job's details go back to
+page 1, dropping the pages read, and `f` works on page 1 only.
+Pages past the first don't wait for `]`: once page 1 is whole, the rest of the
+list is read behind it (see the search below), and `]` and `[` cut each page from
+those jobs at once, with no request. A page past what that read has reached so
+far is read from the service: 100 jobs a request as above, starting at the
+creation time where the page before it ended. On the all-schemas list such a page
+takes longer to read, as the service still scans from the newest job to reach it.
+A refresh of a later page, `r` or every 60 seconds, reads it from the service
+too, and keeps the jobs the read behind the list holds current.
+
+Search covers every job of the list, not only the page shown. Once page 1 is
+whole, the TUI reads the rest of the list behind it, back to its first job, one request of
+100 jobs at a time, up to 25,000 jobs in all. That read goes on while you page,
+open a job, or search, and refreshes keep its jobs current. A search matches
+every job read so far, and shows its matches a page at a time, as the list
+does: 1,000 in history and every live one, with `]` and `[` (or the arrows) for
+the next and previous page of matches. The page line then says what the search
+covered:
+
+| Page line during a search | The search covered |
+|---|---|
+| `page 1 of 3 · 2,333 matches in all 2,558 jobs` | every job of the list |
+| `412 matches so far · 1,800 jobs read, reading the rest` | the jobs read so far; the matches grow as the rest comes |
+| `… in the newest 25,000 jobs, the most a search reads` | a very large account, where the read stopped at 25,000 |
+| `… in the 1,800 jobs read · the rest didn't load` | the jobs read before a request failed; the next read of page 1 (`r`) reads the rest again |
+
+Clearing the search goes back to the page of the list it started from. A search
+without results says what it covered in the same way.
+
+A search naming a whole database works on every job too: `db=TEAM_DB`, on its
+own or together with a whole `schema=EXPERIMENTS`, filters every job read once
+the whole list is read. Until then (and past 25,000 jobs), it has the
+account-level list read again asking the service for that location, so its jobs
+come whole instead of being filtered out of the ones read. The header reads
+`narrowing to DB.SCHEMA…` while that is read and `narrowed to DB.SCHEMA` after,
+and a search of a narrowed list covers that location's jobs alone; clearing the
+search reads every schema again. The Schema column is hidden on a narrowed list,
+as every job it holds is then in one location.
 
 Only that form narrows at the service, which takes a database with an optional
 schema and no other location filter. A partial match (`db:team`), a negation
@@ -1467,7 +1521,7 @@ location of their own. Quote text containing `:` (for example `"training:0"`).
 | `gpu`, `gpus` | GPU type (`H200`, `B200`, `B300`), requested GPU count |
 | `optimizer`, `lr`, `batch`, `seq` | optimizer name, learning rate, train batch size, max sequence length |
 | `lora_r`, `lora_alpha` | LoRA rank and alpha |
-| `db`, `schema` | database and schema name; a job of the configured schema's own list is in the configured ones. Either field also takes a whole `DB.SCHEMA` exactly as the Schema column shows it, with any operator: `schema=TEAM_DB.EXPERIMENTS` asks for both names whole, `schema:team_db.exper` for part of each, and `schema!=TEAM_DB.EXPERIMENTS` for jobs elsewhere. Only a dot outside quotes divides the two, so a quoted name holding one (`db='"my.db"'`) stays one name. `:` matches part of the name in any case (`db:team`). `=` and `!=` take the name as stored or as SQL resolves it, a bare name being its uppercase form: `db=team_db` and `db=TEAM_DB` match `TEAM_DB`, `db=ml` and `db='"ml"'` match a lowercase `"ml"`, and `db=ML` doesn't. A whole `db=` (with an optional whole `schema=`) is also asked of the service rather than filtered here, so it reaches jobs past the newest 2,000 — see the account-level list above |
+| `db`, `schema` | database and schema name; a job of the configured schema's own list is in the configured ones. Either field also takes a whole `DB.SCHEMA` exactly as the Schema column shows it, with any operator: `schema=TEAM_DB.EXPERIMENTS` asks for both names whole, `schema:team_db.exper` for part of each, and `schema!=TEAM_DB.EXPERIMENTS` for jobs elsewhere. Only a dot outside quotes divides the two, so a quoted name holding one (`db='"my.db"'`) stays one name. `:` matches part of the name in any case (`db:team`). `=` and `!=` take the name as stored or as SQL resolves it, a bare name being its uppercase form: `db=team_db` and `db=TEAM_DB` match `TEAM_DB`, `db=ml` and `db='"ml"'` match a lowercase `"ml"`, and `db=ML` doesn't. Until every job is read, a whole `db=` (with an optional whole `schema=`) is also asked of the service rather than filtered here, so it reaches every job of that location — see the account-level list above |
 
 Operators are `:` (contains, or numeric equality), `=`, `!=`, `>`, `>=`, `<`,
 and `<=`. Unknown keys read job, sub-job, or config members; dotted keys read
@@ -1505,7 +1559,8 @@ operators shows under it only while it has focus.
 | `e` | Expand or collapse the sub-jobs of every job in the view on screen (Jobs or Deployments; each keeps its own choice), also those of jobs that later pages of the list being read bring (jobs a later refresh adds start as usual) |
 | `a` | All schemas / current schema: switch to the account-level list of every database and schema the role can see (the footer's `a All schemas`), or back to the configured one (`a Current schema`) |
 | `d` | Deployments / Jobs: show the deployments, or the training and sampling jobs again |
-| `f` | All jobs / newest 2,000: when the configured schema's list came whole (the account-level list is unavailable) and holds more than 2,000 jobs, the list shows the newest 2,000 and every active job, as the account-level list does, and search covers those (one that matches none of them says `f searches all N jobs of the schema.`); `f` shows every job of it (drawing tens of thousands takes a few seconds), and again the newest 2,000. Refreshes keep the choice until another list is shown |
+| `f` | All jobs / page 1: when the configured schema's list came whole (the account-level list is unavailable) and holds more than 1,000 jobs, the list shows page 1, its newest 1,000 jobs and every active job, as the account-level list does, and search covers those (one that matches none of them says `f searches all N jobs of the schema.`); `f` shows every job of it (drawing tens of thousands takes a few seconds), with no page line, and again page 1. Refreshes keep the choice until another list is shown |
+| `]` / `[` | Older jobs / newer jobs: the next page of the list (the 1,000 jobs in history created before the page shown, plus every active job), or the page before it (see above). A click on `older ▸` or `◂ newer` beside the page line does the same. A page read before shows at once. Sort, `d` and the status counts cover the page shown; during a search, `]` and `[` show the next and previous page of its matches, which cover every job read (see above) |
 | `ctrl+c` | Copy what is highlighted, else every row in the list with a `Whole ID` column (see above for what each cell copies as); in the preview, the highlight, else the whole preview |
 | `r` | Refresh (the list also refreshes every 60 seconds while it is showing); while it shows the configured schema in place of the account-level list (`Current schema only: DB.SCHEMA (reason)`), `r` asks that list again once a minute has passed since the last ask |
 | `?` | Show or close the keys panel |

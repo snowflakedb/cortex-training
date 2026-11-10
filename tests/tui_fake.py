@@ -123,9 +123,9 @@ _SPECS = [
     ("CANCELLED", "cancelled_by_client", timedelta(days=171), timedelta(minutes=25), "H200",
      [_training("Qwen/Qwen3-8B", 4, lr=2e-5, bs=4, seq=32768)], None),
     ("CANCELLED", "cancelled_by_client", timedelta(days=201), timedelta(hours=1), "H200",
-     [_training("Qwen/Qwen3-8B", 4)], None),  # older than six months: hidden
+     [_training("Qwen/Qwen3-8B", 4)], None),  # older than six months: listed too, as every job is
     ("FAILED", "sub_job_readiness", timedelta(days=230), timedelta(minutes=12), "H200",
-     [_sampling("Qwen/Qwen3-8B", 2)], None),  # older than six months: hidden
+     [_sampling("Qwen/Qwen3-8B", 2)], None),  # older than six months: listed too, as every job is
     ("RUNNING", "", timedelta(minutes=25), None, "H200",
      [_training("Qwen/Qwen3-8B", 8, lr=1e-4, bs=8, seq=4096, lora=8)], None,
      {"multiplex_onto": 0}),
@@ -390,8 +390,9 @@ class FakeClient:
                        max_retries: Optional[int] = None, request_timeout: Any = None) -> dict:
         """One page of the account-wide list, newest first, a few rows per page.
 
-        Only what the job list sends applies: ``created_after``; ``status`` as the active group (a
-        job whose status can't be read never matches a status filter); and ``database`` with an
+        Only what the job list sends applies: ``created_after`` and ``created_before`` (a page past
+        the first); ``status`` as the active group (a job whose status can't be read never matches
+        a status filter); and ``database`` with an
         optional ``schema``, read by SQL identifier rules as the service reads them, so a narrowed
         list narrows here too. A ``schema`` without a ``database`` is refused, as the real client
         refuses it.
@@ -406,6 +407,7 @@ class FakeClient:
         newest = sorted(self._jobs, key=lambda j: j["created_at"], reverse=True)
         rows = [row for row in map(self._account_row, newest)
                 if (created_after is None or views.parse_ts(row["created_at"]) >= created_after)
+                and (created_before is None or views.parse_ts(row["created_at"]) < created_before)
                 and (not status or views.status_word(row.get("status")) in _ACTIVE)
                 and _in_location(row, wanted)]
         start = int(page_token or 0)

@@ -24,6 +24,7 @@ import asyncio
 import math
 import time
 from collections import Counter
+from collections import deque
 from dataclasses import dataclass
 from dataclasses import replace
 from datetime import datetime
@@ -52,6 +53,7 @@ from cortex_training import __version__
 from cortex_training.tui import theme
 from cortex_training.tui import views
 from cortex_training.tui.account import ACCOUNT
+from cortex_training.tui.account import ACCOUNT_LIST_CAP
 from cortex_training.tui.account import ACTIVE_NEXT
 from cortex_training.tui.account import OLDER
 from cortex_training.tui.logs import LogScreen
@@ -61,10 +63,15 @@ from cortex_training.tui.account import JobLister
 from cortex_training.tui.account import JobListError
 from cortex_training.tui.account import Listing
 from cortex_training.tui.account import ListScope
+from cortex_training.tui.account import PageBound
+from cortex_training.tui.account import Rest
+from cortex_training.tui.account import cut_sorted
 from cortex_training.tui.account import empty_text
 from cortex_training.tui.account import loaded_text
+from cortex_training.tui.account import page_text
 from cortex_training.tui.account import scope_name
 from cortex_training.tui.account import scope_text
+from cortex_training.tui.account import sorted_for_pages
 from cortex_training.tui.account import stopped_scope
 from cortex_training.tui.account import unavailable_text
 from cortex_training.tui.format import cut_cells
@@ -275,6 +282,40 @@ class _JobRows:
         self.expanded: bool | None = None  # whether row and subs are for the job unfolded
         self.row: tuple = ()
         self.subs: tuple = ()  # ((row key suffix, cells), ...); none while folded
+
+
+class _Archive:
+    """Every job a search covers on one list (``kind``: the account-wide one, not narrowed to a
+    location, or the configured schema's): its first page, then the rest of the list read
+    behind it (see :meth:`JobLister.read_rest`), by job key. ``version`` counts its changes."""
+
+    __slots__ = ("kind", "jobs", "done", "capped", "failed", "version", "reached")
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+        self.jobs: dict[tuple, dict] = {}
+        self.done = False  # the read behind the list has ended (read to its end, capped, or failed)
+        self.capped = False  # it stopped at ARCHIVE_CAP with more left
+        self.failed = ""  # why it stopped short
+        self.version = 0
+        # The creation time the read behind the list has reached, newest first: every job created
+        # since is held (the jobs of later pages a refresh read can be held past it, with gaps).
+        self.reached: datetime | None = None
+
+    def add(self, jobs, key, *, fresher: bool = False) -> None:
+        """Hold ``jobs`` (``key`` gives a job's key); ``fresher``: they replace the records held,
+        as a refresh's do. The read behind the list adds only jobs it doesn't hold yet."""
+        held = self.jobs
+        for job in jobs:
+            job_key = key(job)
+            if fresher or job_key not in held:
+                held[job_key] = job
+        self.version += 1
+
+    @property
+    def complete(self) -> bool:
+        """Every job of the list is held, its first ever made included."""
+        return self.done and not self.capped and not self.failed
 
 
 class _JobTable(SelectableTable):
@@ -520,7 +561,9 @@ class JobListScreen(FollowsPointer, Screen):
         Binding("a", "show_list('account')", "All schemas"),
         Binding("a", "show_list('schema')", "Current schema"),
         Binding("f", "full_list('all')", "All jobs"),
-        Binding("f", "full_list('newest')", "Newest 2,000"),
+        Binding("f", "full_list('newest')", "Page 1"),
+        Binding("[", "page('newer')", "Newer jobs"),
+        Binding("]", "page('older')", "Older jobs"),
         Binding("d", "show_view('deployments')", "Deployments"),
         Binding("d", "show_view('jobs')", "Jobs"),
         ("s", "cycle_sort", "Sort"),
@@ -599,6 +642,42 @@ class JobListScreen(FollowsPointer, Screen):
         self._pushdown: tuple | None = None
         self._load_location: tuple | None = None
         self._narrowing = False
+        # ] and [: the pages past the first that ] went to, the last one shown (empty on the
+        # first page); where the page after the one on screen starts (None on the last); the page
+        # the load in flight reads; and whether that load is a page change (its jobs show as they
+        # come).
+        self._pages: list[PageBound] = []
+        self._next_page: PageBound | None = None
+        self._load_page: PageBound | None = None
+        self._paging = False
+        # Each page of this list read whole so far, by its number: (the bound it was read under, its
+        # listing, the monotonic time it was read, and that time as the header says it), so ] and [
+        # show a page read before at once.
+        self._page_cache: dict[int, tuple[PageBound | None, Listing, float, str]] = {}
+        # What ] put back if its page fails before any of its jobs show: (the pages, the next page).
+        self._page_undo: tuple | None = None
+        # The jobs a search covers (see _Archive): the list's first page and the rest of its 6
+        # months, read behind it a request at a time once that page is whole; the read's number,
+        # so the read of another list is dropped; when a search last drew what it had read so
+        # far; and the search's corpus as last built, (archive version, list on screen, jobs).
+        self._archive: _Archive | None = None
+        self._archive_gen = 0
+        self._archive_reading = False
+        self._archive_drawn_at = 0.0
+        self._corpus_cache: tuple | None = None
+        self._sorted_cache: tuple | None = None  # (archive, its version, sorted_for_pages of its jobs)
+        # The rows of the page ] shows next, built ahead while nothing else happens: the jobs left to
+        # build, the ones built (kept with the pages' own), and the page they are for.
+        self._prebuild: deque = deque()
+        self._prebuilt: set = set()
+        self._prebuild_for: PageBound | None = None
+        self._prebuilding = False
+        # The page of a search's matches shown (1,000 in history each), of how many; how many
+        # jobs matched, and how many the search covered.
+        self._match_page = 1
+        self._match_pages = 1
+        self._match_count = 0
+        self._match_searched = 0
         self._search_timer = None
         self._layout: _ListLayout | None = None  # the table's columns, once they exist
         # The widths the reader dragged columns to (label -> cells): kept over every list,
@@ -622,6 +701,7 @@ class JobListScreen(FollowsPointer, Screen):
 
     def compose(self) -> ComposeResult:
         yield _ListHeader(icon=theme.BRAND_ICON)
+        yield Static("", id="pageline")
         yield Static("", id="listwho")
         yield Static("", id="listinfo")
         yield Static("", id="listnotice")
@@ -640,6 +720,7 @@ class JobListScreen(FollowsPointer, Screen):
         self.query_one("#nomatch", Static).display = False
         self.query_one("#nomatch-box", VerticalScroll).display = False
         self.query_one("#listnotice", Static).display = False
+        self.query_one("#pageline", Static).display = False
         self._set_columns(self.query_one("#jobs", DataTable), self._layout_for(0))
         self._paint_help()
         self._paint_who()
@@ -668,7 +749,7 @@ class JobListScreen(FollowsPointer, Screen):
 
     def _fit_columns(self) -> None:
         """Draw the list again if its columns would change: the terminal's width, or a column's, did."""
-        if self._layout != self._layout_for(self._location_column_width(self._in_view(self._recent()))):
+        if self._layout != self._layout_for(self._location_column_width(self._in_view(self._all_jobs))):
             self._render_jobs()
 
     def resize_column(self, label: str, width: int) -> None:
@@ -770,12 +851,6 @@ class JobListScreen(FollowsPointer, Screen):
         for label, width in layout.columns:
             table.add_column(label, width=width, key=label)
 
-    def _recent(self) -> list:
-        """The jobs of the retention window (``list_jobs``, which the configured schema's list
-        reads where the account-wide route refuses, fails or answers no job, returns older ones too)."""
-        now = self._clock()
-        return [j for j in self._all_jobs if views.within_retention(j, now)]
-
     def _in_view(self, jobs: list) -> list:
         """The jobs of the view on screen: deployments (d) or every other job."""
         return [job for job in jobs if views.is_deployment(job) == self._deployments]
@@ -800,6 +875,7 @@ class JobListScreen(FollowsPointer, Screen):
         return self._now or datetime.now(timezone.utc)
 
     def _update_subtitle(self) -> None:
+        self._paint_page_line()  # this screen's own, so drawn while another is on top too
         if self.app.screen is not self:
             return  # a late refresh must not retitle the screen on top
         switching = self._switching_text()
@@ -816,10 +892,9 @@ class JobListScreen(FollowsPointer, Screen):
             self.app.sub_title = "  ·  ".join(bit for bit in bits if bit)
             return
         if self._scope is not None and self._scope.loading:
-            # The list's first pages: how far it is, in place of when it was refreshed.
-            # Only the account-wide list names itself here; the schema's own text already does.
-            bits = ("deployments" if self._deployments else "", "all schemas" if self._scope.kind == ACCOUNT else "",
-                    self._scope_text())
+            # The list's first pages: the line under the header says how far it is, in place of
+            # when it was refreshed.
+            bits = ("deployments" if self._deployments else "", self._scope_text())
             self.app.sub_title = "  ·  ".join(bit for bit in bits if bit)
             return
         if self._refreshing:
@@ -863,6 +938,40 @@ class JobListScreen(FollowsPointer, Screen):
         words = one_line(scope_name(self._scope, location=self._schema_label(), declined=declined))
         return words, _ACCOUNT_CHIP if self._scope.kind == ACCOUNT else _SCHEMA_CHIP
 
+    def _page_line_text(self) -> str:
+        """The line under the header: the page on screen (see :func:`page_text`), or the one ] or [
+        asked for while nothing of it shows yet; "" for a list read whole on one page."""
+        if self._paging and self._refreshing and not (self._switching or self._narrowing):
+            return f"page {len(self._pages) + 1} · loading…"
+        line = page_text(self._scope) if self._scope is not None else ""
+        if (line or self._match_pages > 1) and self._searching() and self._search_archive() is not None:
+            return self._match_line()  # what the search covered, rather than the page it searched from
+        return line
+
+    _PAGE_ARROWS = {"newer": "◂ newer", "older": "older ▸"}
+
+    def _page_arrow(self, which: str) -> tuple:
+        """``◂ newer`` or ``older ▸`` (``which``) beside the page line: a link that pages as ``[`` or
+        ``]`` does, drawn as every clickable word of the TUI is (underlined, lit under the pointer);
+        dim, and no link, where there is no page that way."""
+        label = self._PAGE_ARROWS[which]
+        if self.check_action("page", (which,)):
+            return label, f"{theme.TEXT} @click=screen.page('{which}')"
+        return label, theme.FAINT
+
+    def _paint_page_line(self) -> None:
+        try:
+            widget = self.query_one("#pageline", Static)
+        except NoMatches:  # not composed yet
+            return
+        text = self._page_line_text()
+        widget.display = bool(text)
+        if text:
+            # "page N" stands out; what the page holds stays as quiet as the header.
+            head = " ".join(text.split(" ", 2)[:2]).rstrip(":")
+            widget.update(Content.assemble(self._page_arrow("newer"), "   ", (head, f"bold {theme.TEXT}"),
+                                           text[len(head):], "   ", self._page_arrow("older")))
+
     def _scope_text(self) -> str:
         """What the list on screen covers ("all schemas", ...); "" before the first list."""
         if self._scope is None:
@@ -897,15 +1006,18 @@ class JobListScreen(FollowsPointer, Screen):
         account = self._account_wanted()
         # Set before the header is drawn: it names the location this load asks for.
         self._load_location = self._pushdown_for() if account else None
+        self._load_page = self._page_bound()
         self._update_subtitle()
         # Pages show as they come only where no list of this kind shows yet (the first
         # load, or after a), or where this load narrows to a location the list on screen
         # wasn't read under: a refresh keeps the whole list it has until the next is whole.
         # Both lists are read a page at a time; only the account-wide one narrows.
-        self._progressive = self._loaded_at is None or self._switching or (account and self._narrowing)
+        # So does a page that ] or [ asked for.
+        self._progressive = (self._loaded_at is None or self._switching or self._paging
+                             or (account and self._narrowing))
         self._load_gen += 1
         self._load_worker = self._load_jobs(manual, account, account and self._asked, self._load_gen,
-                                            self._progressive, self._load_location)
+                                            self._progressive, self._load_location, self._load_page)
 
     def _supersede(self) -> None:
         """Drop the load in flight (its pages come no more; what it answers is dropped), so another can start."""
@@ -914,6 +1026,7 @@ class JobListScreen(FollowsPointer, Screen):
             self._load_worker.cancel()  # it stops before its next page
         self._load_worker = None
         self._refreshing = False
+        self._paging = False  # a page change it was is over: the next load is a plain refresh
         if self._scope is not None and self._scope.loading:
             # Its first pages stay until the next list answers, no longer marked as still loading.
             self._scope = stopped_scope(self._scope)
@@ -926,7 +1039,7 @@ class JobListScreen(FollowsPointer, Screen):
 
     def action_full_list(self, which: str) -> None:
         """``f``: every job of a schema list that came whole (``which`` "all"), or again its
-        newest 2,000 and every active job ("newest"). Drawing tens of thousands of rows takes
+        newest :data:`ACCOUNT_LIST_CAP` and every active job ("newest"). Drawing tens of thousands of rows takes
         seconds, so the header says so first."""
         listing = self._cut_listing
         if listing is None or (which == "all") == self._full_list:
@@ -947,11 +1060,276 @@ class JobListScreen(FollowsPointer, Screen):
         if self._cut_listing is listing and self._full_list:
             self._show_listing(listing)
 
+    def _page_bound(self) -> PageBound | None:
+        """The page asked for: the last one ] went to, or None for the first."""
+        return self._pages[-1] if self._pages else None
+
+    def _first_page(self) -> None:
+        """Back to the first page, for another list (a) or another location (a narrowing): the pages
+        read of this one are not that one's."""
+        self._pages.clear()
+        self._next_page = None
+        self._page_cache.clear()
+
+    def _cache_page(self, listing: Listing) -> None:
+        """Keep ``listing``, a page read whole, for ] and [ to show again at once. A list of another
+        kind (the configured schema's in place of the account-wide one) drops the pages of the other."""
+        if any(kept.scope.kind != listing.scope.kind for _bound, kept, _at, _clock in self._page_cache.values()):
+            self._page_cache.clear()
+        self._page_cache[listing.scope.page] = (self._load_page, listing, time.monotonic(),
+                                                self._last_refreshed or "")
+
+    def _cached_keys(self) -> set:
+        """The jobs of the pages kept, whose rows stay drawn for ] and [."""
+        return {self._job_key(job) for _bound, kept, _at, _clock in self._page_cache.values() for job in kept.jobs}
+
+    # ─── every job, for search ───────────────────────────────────────────────
+
+    _ARCHIVE_DRAW_SECONDS = 2.0  # how often a search shows the jobs read behind the list as they come
+
+    def _list_kind(self) -> str | None:
+        """Which list is on screen, for its archive: ACCOUNT, or SCHEMA (the configured schema's,
+        however it was read); None before the first list."""
+        if self._scope is None:
+            return None
+        return ACCOUNT if self._scope.kind == ACCOUNT else SCHEMA
+
+    def _search_archive(self) -> _Archive | None:
+        """The archive of the list on screen; None before its first page is whole, and while the
+        list is narrowed to a location (the service's answer for it, which a search covers alone)."""
+        archive = self._archive
+        if archive is None or archive.kind != self._list_kind() or self._pushdown is not None:
+            return None
+        return archive
+
+    def _searching(self) -> bool:
+        """Whether a search is on: its matches come from every job read, a page of them at a time."""
+        if not self._filter:
+            return False
+        query = self._query()
+        return not (query.empty and not query.errors)
+
+    def _corpus(self) -> list:
+        """The jobs a search covers: the list on screen's (their records the freshest) and every
+        one read behind it (see _Archive)."""
+        archive = self._search_archive()
+        if archive is None:
+            return self._all_jobs
+        kept = self._corpus_cache
+        if kept is not None and kept[0] == archive.version and kept[1] is self._all_jobs:
+            return kept[2]
+        jobs = dict(archive.jobs)
+        jobs.update((self._job_key(job), job) for job in self._all_jobs)
+        corpus = list(jobs.values())
+        self._corpus_cache = (archive.version, self._all_jobs, corpus)
+        return corpus
+
+    def _keep_archive(self, listing: Listing) -> None:
+        """After ``listing`` shows, read whole: hold its jobs, the freshest records, in its list's
+        archive. A first page of the list not narrowed to a location starts the read behind it,
+        a request at a time (see JobLister.read_rest); so it does again once that read failed, or
+        stopped for the other list (a)."""
+        kind = self._list_kind()
+        archive = self._archive
+        same = archive is not None and archive.kind == kind
+        if same:
+            archive.add(self._all_jobs, self._job_key, fresher=True)
+        if listing.scope.page != 1 or self._pushdown is not None:
+            return
+        if same and not archive.failed and (archive.done or self._archive_reading):
+            return
+        if not same:
+            archive = _Archive(kind)
+            archive.add(self._all_jobs, self._job_key, fresher=True)
+            self._archive = archive
+        archive.done, archive.capped, archive.failed = False, False, ""
+        self._archive_gen += 1
+        self._archive_reading = True
+        self._read_rest(self._archive_gen, listing)
+
+    def _stop_archive(self) -> None:
+        """Stop the read behind the list (a asked for the other list): what it read stays, and it
+        reads on when that list shows again."""
+        if self._archive_reading:
+            self.workers.cancel_group(self, "archive")
+            self._archive_reading = False
+            self._archive_gen += 1
+
+    @work(thread=True, group="archive", exclusive=True)
+    def _read_rest(self, gen: int, listing: Listing) -> None:
+        """Read the rest of ``listing``'s list behind it, for search (see JobLister.read_rest)."""
+        worker = get_current_worker()
+
+        def on_rest(rest: Rest) -> None:
+            if not worker.is_cancelled:
+                call_on_screen(self, self._on_rest, gen, rest)
+
+        self._lister.read_rest(listing, is_cancelled=lambda: worker.is_cancelled, on_rest=on_rest)
+
+    def _on_rest(self, gen: int, rest: Rest) -> None:
+        """One request's jobs of the read behind the list. A search on screen shows them every
+        few seconds as they come, and at once when the read ends."""
+        archive = self._archive
+        if gen != self._archive_gen or archive is None:
+            return  # the read of another list, or one stopped since
+        archive.add(rest.jobs, self._job_key)
+        stamps = [stamp for stamp in (views.parse_ts(job.get("created_at")) for job in rest.jobs) if stamp]
+        if stamps:
+            oldest = min(stamps)
+            archive.reached = oldest if archive.reached is None else min(archive.reached, oldest)
+        if rest.done:
+            archive.done, archive.capped, archive.failed = True, rest.capped, rest.failed
+            self._archive_reading = False
+        if not self._prebuilding and not self._prebuilt:
+            self._prebuild_next()  # the page ] shows next may be held now
+        if self._searching() and archive.kind == self._list_kind():
+            now = time.monotonic()
+            if rest.done or now - self._archive_drawn_at >= self._ARCHIVE_DRAW_SECONDS:
+                self._archive_drawn_at = now
+                self._render_jobs(steady=True)
+
+    def _archive_page(self, bound: PageBound | None) -> Listing | None:
+        """The page past the first that ``bound`` starts, cut from the jobs read behind the list as
+        a whole list is cut (see cut_whole_listing): its 1,000 in history and every active job. None
+        for page 1 (a refresh reads what is new), on a narrowed list, and where the read hasn't
+        passed that page's end yet, so the service reads it."""
+        archive = self._search_archive()
+        if bound is None or archive is None:
+            return None
+        kept = self._sorted_cache
+        if kept is None or kept[0] is not archive or kept[1] != archive.version:
+            kept = self._sorted_cache = (archive, archive.version, sorted_for_pages(archive.jobs.values()))
+        ordered, keys = kept[2]
+        listing = cut_sorted(ordered, keys, bound, ListScope(self._scope.kind, reason=self._scope.reason))
+        if not archive.complete:
+            ends = listing.next_page.before if listing.next_page is not None else None
+            if listing.scope.stopped is None or ends is None or archive.reached is None or ends <= archive.reached:
+                return None  # the page may run past the jobs read so far
+        return listing
+
+    _PREBUILD_SLICE_SECONDS = 0.025  # how long one slice of building the next page's rows may take
+
+    def _prebuild_next(self) -> None:
+        """Build the rows of the page ] shows next, cut from the jobs read behind the list, while
+        nothing else happens, so that page shows at once too: a slice at a time, the list staying
+        responsive between them."""
+        if self._next_page is None or self._searching():
+            return
+        if self._prebuild_for == self._next_page and (self._prebuilding or self._prebuilt):
+            return  # building, or built, for that page already
+        listing = self._archive_page(self._next_page)
+        if listing is None:
+            return  # not read yet: tried again as the read behind the list comes in
+        self._prebuild_for = self._next_page
+        self._prebuilt = set()
+        self._prebuild = deque(self._in_view(listing.jobs))
+        if not self._prebuilding:
+            self._prebuilding = True
+            self.set_timer(0.05, self._prebuild_slice)
+
+    def _prebuild_slice(self) -> None:
+        layout = self._layout
+        if not self._prebuild or layout is None:
+            self._prebuilding = False
+            return
+        ends = time.monotonic() + self._PREBUILD_SLICE_SECONDS
+        while self._prebuild and time.monotonic() < ends:
+            job = self._prebuild.popleft()
+            self._job_rows(job, layout)
+            self._prebuilt.add(self._job_key(job))
+        if self._prebuild:
+            self.set_timer(0.01, self._prebuild_slice)  # the next slice, after whatever waits
+        else:
+            self._prebuilding = False
+
+    def _match_line(self) -> str:
+        """The page line during a search: which page of its matches shows, and what it covered."""
+        count, searched = self._match_count, self._match_searched
+        head = f"page {self._match_page} of {self._match_pages} · " if self._match_pages > 1 else ""
+        matches = f"{head}{count:,} match{'' if count == 1 else 'es'}"
+        noun = "deployments" if self._deployments else "jobs"
+        archive = self._search_archive()
+        if archive is not None and archive.failed:
+            return f"{matches} in the {searched:,} {noun} read · the rest didn't load"
+        if archive is not None and archive.capped:
+            return f"{matches} in the newest {searched:,} {noun}, the most a search reads"
+        if archive is None or not archive.done:
+            return f"{matches} so far · {searched:,} {noun} read, reading the rest"
+        return f"{matches} in all {searched:,} {noun}"
+
+    def action_page(self, which: str) -> None:
+        """``]``: the page of older jobs after the one shown (``which`` "older"); ``[``: the page
+        before it ("newer"). Each lists every active job; refreshes keep the page.
+
+        A page read before shows at once, as it was read, and is read again behind it (the rows
+        stay until the new read is whole) only when it is as old as a refresh, or the page before
+        it moved since, so that it starts elsewhere now.
+
+        During a search, ] and [ show the next and the previous page of its matches instead."""
+        if self._searching():
+            page = self._match_page + (1 if which == "older" else -1)
+            if 1 <= page <= self._match_pages:
+                self._match_page = page
+                self._render_jobs(top=True)
+            return
+        undo = (list(self._pages), self._next_page)
+        if which == "older":
+            if self._next_page is None:
+                return
+            self._pages.append(self._next_page)
+        elif self._pages:
+            self._pages.pop()
+        else:
+            return
+        bound = self._page_bound()
+        self._next_page = None  # where the page after starts is the new page's to say
+        self._settle_folds()  # another page: e's choice was for the one before
+        if self._refreshing:
+            self._supersede()  # the load in flight read another page
+        page = len(self._pages) + 1
+        local = self._archive_page(bound)
+        if local is not None:
+            # Read already, behind the list: shown at once, with no request, as fresh as what was read.
+            self._page_undo = None
+            self._load_page = bound
+            self._list_error, self._list_refused, self._failed_at = None, False, None
+            self._pages_failed = False
+            self._show_listing(local, top=True)
+            self._cache_page(local)
+            return
+        kept = self._page_cache.get(page)
+        if kept is not None:
+            self._page_undo = None
+            read_under, listing, read_at, self._last_refreshed = kept
+            self._load_page = bound  # the rows shown are this page's
+            # Read whole when kept: a failure since was another load's, not this page's.
+            self._list_error, self._list_refused, self._failed_at = None, False, None
+            self._pages_failed = False
+            self._show_listing(listing, top=True)
+            self._loaded_at = read_at  # as old as its read, for the refresh on coming back to the list
+            if read_under != bound:
+                # The page before moved since this one was read, so it starts elsewhere now: ] waits
+                # for the read again, and the pages kept after it are no longer the ones after it.
+                self._next_page = None
+                for later in [number for number in self._page_cache if number > page]:
+                    del self._page_cache[later]
+            self.refresh_bindings()
+            if read_under != bound or time.monotonic() - read_at >= self._REFRESH_SECONDS:
+                self._refresh_jobs(manual=True, quiet=True)
+            return
+        self._page_undo = undo  # put back should this page fail before any of its jobs show
+        self._paging = True
+        self.refresh_bindings()
+        self._refresh_jobs(manual=True, quiet=True)
+        self._update_subtitle()
+
     def action_show_list(self, which: str) -> None:
         """``a``: show the account-wide list (``which`` "account") or the configured schema's ("schema")."""
         account = which == "account"
         if account == self._lister.account_wide:
             return
+        self._first_page()  # another list: its pages are its own
+        self._stop_archive()  # and so is what a search reads behind it
         self._lister.account_wide = account
         self._asked = account
         self._declined = None
@@ -972,6 +1350,7 @@ class JobListScreen(FollowsPointer, Screen):
         if deployments == self._deployments:
             return
         self._deployments = deployments
+        self._match_page = 1  # a search's matches in the other view start from their first page
         self.refresh_bindings()  # the footer's d names the other view now
         self._render_jobs(top=True)
         self._update_subtitle()
@@ -999,8 +1378,18 @@ class JobListScreen(FollowsPointer, Screen):
             return (parameters[:1] == ("account",)) != self._lister.account_wide
         if action == "full_list":
             # Only a list cut short with every job at hand has them to show; of f's two
-            # bindings, the one for the other way.
-            return self._cut_listing is not None and (parameters[:1] == ("all",)) != self._full_list
+            # bindings, the one for the other way. On the first page only: f's every job is
+            # every page's.
+            return (self._cut_listing is not None and not self._pages
+                    and (parameters[:1] == ("all",)) != self._full_list)
+        if action == "page":
+            if self._searching():  # the pages of the search's matches
+                return self._match_page > 1 if parameters[:1] == ("newer",) else self._match_page < self._match_pages
+            if parameters[:1] == ("newer",):
+                return bool(self._pages)
+            # Older jobs exist past the page on screen, which is whole (f's every job has them all).
+            return (self._next_page is not None and not self._full_list
+                    and not (self._scope is not None and self._scope.loading))
         if action == "show_view":
             # One of d's two bindings, the one for the other view.
             return (parameters[:1] == ("deployments",)) != self._deployments
@@ -1050,10 +1439,12 @@ class JobListScreen(FollowsPointer, Screen):
     def action_cycle_sort(self) -> None:
         keys = views.SORT_KEYS
         self._sort = keys[(keys.index(self._sort) + 1) % len(keys)]
+        self._match_page = 1  # a search's matches in the new order start from their first page
         self._render_jobs(top=True)  # a new order: show its start, not the old row wherever it went
 
     def action_toggle_order(self) -> None:
         self._descending = not self._descending
+        self._match_page = 1
         self._render_jobs(top=True)
 
     def whole_id(self, key) -> str | None:
@@ -1203,6 +1594,7 @@ class JobListScreen(FollowsPointer, Screen):
         if text == self._filter and self._search_timer is None:
             return  # the list shows this search already (Enter or Esc applied it, or a space was typed)
         self._filter = text
+        self._match_page = 1  # another search: its matches from their first page
         # Rebuild once typing pauses; a rebuild per keystroke lagged with ~900 jobs.
         if self._search_timer is not None:
             self._search_timer.stop()
@@ -1224,6 +1616,9 @@ class JobListScreen(FollowsPointer, Screen):
         """
         if not self._account_wanted():
             return None
+        archive = self._archive
+        if archive is not None and archive.kind == ACCOUNT and archive.complete:
+            return None  # every job of every schema is at hand: the search filters them here
         return views.pushdown_location(self._query())
 
     def _renarrow(self) -> None:
@@ -1242,16 +1637,19 @@ class JobListScreen(FollowsPointer, Screen):
             # have it read again on every edit.
             return
         self._narrowing = True
+        self._first_page()  # another location: its pages are its own
         self._supersede()  # the load in flight read another scope; its pages are not these
         self._refresh_jobs(manual=True, quiet=True)
 
     @work(thread=True, group="jobs")
     def _load_jobs(self, manual: bool = False, account: bool = False, asked: bool = False, gen: int = 0,
-                   progressive: bool = False, location: tuple | None = None) -> None:
+                   progressive: bool = False, location: tuple | None = None,
+                   before: PageBound | None = None) -> None:
         """Read one schema or account-wide listing off the UI thread (``progressive``: showing its pages).
 
         ``location`` narrows the account-wide walk at the service (see
-        :func:`cortex_training.tui.views.pushdown_location`)."""
+        :func:`cortex_training.tui.views.pushdown_location`); ``before``: the page past the first
+        it reads (see :class:`PageBound`)."""
         worker = get_current_worker()
 
         def on_partial(listing: Listing) -> None:
@@ -1261,7 +1659,7 @@ class JobListScreen(FollowsPointer, Screen):
         try:
             listing = self._lister.load(self._clock(), is_cancelled=lambda: worker.is_cancelled, manual=manual,
                                         account=account, asked=asked, on_partial=on_partial if progressive else None,
-                                        location=location)
+                                        location=location, before=before)
             error = None
         except JobListError as exc:
             listing, error = None, exc
@@ -1278,18 +1676,22 @@ class JobListScreen(FollowsPointer, Screen):
             return  # superseded (by a, or a load since): its pages are not the list asked for
         steady = self._partial_gen == gen  # its earlier pages show: the user may be reading them
         self._partial_gen = gen
+        top = self._paging and not steady  # the page ] or [ asked for, drawn first from its first job
         self._switching = False  # the list a asked for shows now
         self._narrowing = False  # so does the narrowing, if this load was one
+        self._paging = False  # and the page, if this load was a page change
         self._asked = False  # its last answer is handled as a's, though (see _on_jobs)
         # A fresh list shows: an earlier failure no longer stands over it.
         self._list_error, self._list_refused, self._failed_at = None, False, None
         self._pages_failed = False
         self._last_refreshed = time.strftime("%H:%M:%S")
-        self._show_listing(listing, steady=steady)
+        self._show_listing(listing, steady=steady, top=top)
 
-    def _show_listing(self, listing: Listing, *, steady: bool = False) -> None:
-        """Show ``listing`` as the list; ``steady``: it grows the list on screen, which stays where it is."""
+    def _show_listing(self, listing: Listing, *, steady: bool = False, top: bool = False) -> None:
+        """Show ``listing`` as the list; ``steady``: it grows the list on screen, which stays where it is;
+        ``top``: a page that ] or [ asked for, drawn from its first job."""
         self._partial_stays = False
+        self._next_page = listing.next_page
         if listing.everything is None:
             self._cut_listing, self._full_list = None, False
         else:
@@ -1304,10 +1706,20 @@ class JobListScreen(FollowsPointer, Screen):
         self._loaded_at = time.monotonic()
         self._all_jobs = self._merged(listing.jobs)
         self._jobs_by_key = {self._job_key(job): job for job in self._all_jobs}
-        self._rows = {key: rows for key, rows in self._rows.items() if key in self._jobs_by_key}
-        self._hay = {key: hay for key, hay in self._hay.items() if key in self._jobs_by_key}
+        # The rows of the pages kept stay too, so [ and ] draw them again without building them, and
+        # so do the rows on screen (a search's matches); and every job's search text a search covers.
+        keep = self._jobs_by_key.keys() | self._cached_keys()
+        on_screen = set(self._job_by_item.values())
+        held = self._archive.jobs if self._archive is not None else {}
+        self._rows = {key: rows for key, rows in self._rows.items()
+                      if key in keep or key in on_screen or key in self._prebuilt}
+        self._hay = {key: hay for key, hay in self._hay.items() if key in keep or key in held}
         self._update_subtitle()
-        self._render_jobs(steady=steady, fresh=not steady)
+        if top:
+            self._render_jobs(top=True)
+        else:
+            self._render_jobs(steady=steady, fresh=not steady)
+        self._prebuild_next()  # the page ] shows next, if the read behind the list holds it
         self._ask_identity()  # once the first jobs show, which can be the first of many pages
 
     def _on_jobs(self, listing, error: JobListError | None, account: bool = False, gen: int | None = None) -> None:
@@ -1321,11 +1733,13 @@ class JobListScreen(FollowsPointer, Screen):
         self._partial_gen = None
         if shown and error is not None:
             # A later page failed: the pages read stay, saying so, and r reads them all again.
+            self._page_undo = None  # a page change's first jobs show: that page is the one on screen
             self._scope = stopped_scope(self._scope)
             self._list_error = str(error) or "the job list failed"
             self._list_refused = error.refused
             self._failed_at = time.strftime("%H:%M:%S")
             self._pages_failed = True
+            self.refresh_bindings()  # read no more: ] goes on from the jobs read
             self._update_subtitle()
             self._render_jobs(steady=True)
             return
@@ -1337,8 +1751,15 @@ class JobListScreen(FollowsPointer, Screen):
             # The search pinned another location while this one was read: read that one now.
             self._refresh_jobs(manual=True, quiet=True)
             return
+        if self._load_page != self._page_bound():
+            # ] or [ asked for another page while this one was read: read that one now.
+            self._refresh_jobs(manual=True, quiet=True)
+            return
+        top = self._paging and not shown  # a page change whose jobs show now, from its first
+        paging = self._paging and not shown
         self._switching = False
         self._narrowing = False
+        self._paging = False
         if account and (self._asked or shown):
             # a's answer, also after its first pages showed: an account-wide list
             # unavailable now keeps the configured schema, saying why, as at once.
@@ -1349,6 +1770,13 @@ class JobListScreen(FollowsPointer, Screen):
                     return
                 error = None
         if error is not None:
+            if paging and self._page_undo is not None:
+                # The page ] or [ asked for failed before any of its jobs showed: the list stays on
+                # the page on screen, and so do ], [, r and the refreshes.
+                self._pages, self._next_page = self._page_undo
+                self._load_page = self._page_bound()
+                self.refresh_bindings()
+            self._page_undo = None
             # Keep the last good list on screen, saying so, until a load succeeds.
             self._list_error = str(error) or "the job list failed"
             self._list_refused = error.refused
@@ -1365,7 +1793,10 @@ class JobListScreen(FollowsPointer, Screen):
         self._last_refreshed = time.strftime("%H:%M:%S")
         if not shown:
             self._settle_folds()  # a refresh: the jobs new in it start as every job does
-        self._show_listing(listing, steady=shown)
+        self._page_undo = None
+        self._cache_page(listing)
+        self._show_listing(listing, steady=shown, top=top)
+        self._keep_archive(listing)
         self.app.job_list_drawn(self)
 
     def _stay_on_schema(self, listing: Listing | None, error: JobListError | None) -> Listing | None:
@@ -1416,6 +1847,8 @@ class JobListScreen(FollowsPointer, Screen):
             return
         self._all_jobs = [fresh if j is current else j for j in self._all_jobs]
         self._jobs_by_key[key] = fresh
+        if self._archive is not None and key in self._archive.jobs:
+            self._archive.add([fresh], self._job_key, fresher=True)
 
     # ─── rows ────────────────────────────────────────────────────────────────
 
@@ -1600,11 +2033,12 @@ class JobListScreen(FollowsPointer, Screen):
 
     def _query(self) -> views.Query:
         """The resolved search query, cached with its input and job records."""
+        corpus = self._corpus()
         kept = self._resolved
-        if kept is not None and kept[0] == self._filter and kept[1] is self._all_jobs:
+        if kept is not None and kept[0] == self._filter and kept[1] is corpus:
             return kept[2]
-        query = views.resolve_query(views.parse_query(self._filter), self._all_jobs)
-        self._resolved = (self._filter, self._all_jobs, query)
+        query = views.resolve_query(views.parse_query(self._filter), corpus)
+        self._resolved = (self._filter, corpus, query)
         return query
 
     def _haystack(self, job: dict) -> str:
@@ -1719,15 +2153,6 @@ class JobListScreen(FollowsPointer, Screen):
         if self.query_one("#nomatch", Static).content_size.width not in (0, painted_for):
             self._paint_nomatch()
 
-    def _older_matches(self, query) -> list:
-        """Ids of the jobs older than six months (hidden) that ``query`` matches, newest first."""
-        now = self._clock()
-        home = self._clients.home
-        found = [job for job in self._all_jobs if not views.within_retention(job, now)
-                 and views.is_deployment(job) == self._deployments
-                 and views.job_matches_query(job, query, home=home, hay=self._haystack(job))]
-        return [views.job_id_of(j) for j in views.sort_job_list(found, "created", True)]
-
     # ─── the table ───────────────────────────────────────────────────────────
 
     def _render_jobs(self, *, keep: tuple | None = None, top: bool = False, steady: bool = False,
@@ -1761,7 +2186,10 @@ class JobListScreen(FollowsPointer, Screen):
                     anchor = (key, table.cursor_row - round(table.scroll_y), table.scroll_x)
                 if str(key).startswith("hdr-"):
                     keep_header = key  # so does a LIVE/HISTORY row, while the list grows
-        everyone = self._recent()
+        # A search covers every job read, the list on screen's and the ones read behind it.
+        searching = self._searching()
+        source = self._corpus() if searching else self._all_jobs
+        everyone = source
         recent = self._in_view(everyone)
         layout = self._layout_for(self._location_column_width(recent))
         self._show_notice()
@@ -1778,17 +2206,33 @@ class JobListScreen(FollowsPointer, Screen):
             info_line.update(Text(f"[error] {self._list_error}  (r retries{hint})", style=theme.ERR))
             self._hide_table(table, layout, "")  # an empty message keeps the search box at the bottom
             return
-        hidden = len(self._all_jobs) - len(everyone)
         others = len(everyone) - len(recent)  # the other view's, so nothing looks lost
         query = self._query()
         home = self._clients.home
-        if query.empty and not query.errors:
+        if not searching:
             visible = recent
         else:
             visible = [job for job in recent if views.job_matches_query(job, query, home=home, hay=self._haystack(job))]
         ordered = views.sort_job_list(visible, self._sort, self._descending)
         live = [j for j in ordered if views.is_live(j)]
         history = [j for j in ordered if not views.is_live(j)]
+        # A search's matches show a page at a time, as the list does: 1,000 in history, and every
+        # live one; ] and [ show the others.
+        paged = (self._match_page, self._match_pages)
+        if searching:
+            self._match_pages = max(1, -(-len(history) // ACCOUNT_LIST_CAP))
+            self._match_page = min(self._match_page, self._match_pages)
+            start = (self._match_page - 1) * ACCOUNT_LIST_CAP
+            shown_history = history[start:start + ACCOUNT_LIST_CAP]
+        else:
+            self._match_page = self._match_pages = 1
+            shown_history = history
+        self._match_count, self._match_searched = len(visible), len(recent)
+        if paged != (self._match_page, self._match_pages):
+            self.refresh_bindings()  # ] and [ step through other pages of matches now
+        self._paint_page_line()
+        archive = self._search_archive() if searching else None
+        reading = archive is not None and not archive.done  # more jobs may match, once read
 
         # While the list loads, its counts are of the jobs read so far: the history until the
         # newest jobs are read, the active statuses until the active jobs are (beside the
@@ -1799,13 +2243,13 @@ class JobListScreen(FollowsPointer, Screen):
         active_so_far = loading and not self._scope.active_whole
         live_so_far = active_so_far or older
         left = [_status_chips(live, len(history), live_so_far=active_so_far, unknown_so_far=older,
-                              history_so_far=older)]
+                              history_so_far=older or reading)]
         if others:
             left.append(Content.styled(self._other_view_text(others), theme.MUTED))
         if self._filter:
             # The count before the query: a long query wraps, the count stays in view.
             # The search text is shown literally (assembled, never parsed as markup).
-            matched = f"match{'' if len(visible) == 1 else 'es'}{' so far' if loading else ''} for "
+            matched = f"match{'' if len(visible) == 1 else 'es'}{' so far' if loading or reading else ''} for "
             left.append(Content.assemble((f"{len(visible):,} ", f"bold {theme.TEXT}"), (matched, theme.MUTED),
                                          (self._filter, f"bold {theme.ACCENT}")))
         self._info = (left, _sort_part(self._sort, self._descending))
@@ -1815,19 +2259,32 @@ class JobListScreen(FollowsPointer, Screen):
             one = self._scope is not None and self._scope.kind != ACCOUNT
             widen = self._scope is not None and self._scope.kind == SCHEMA
             if self._filter:
+                # What the search covered, where that is short of every job of the list.
+                if archive is None:
+                    cut = loaded_text(self._scope)
+                elif archive.failed:
+                    cut = "the rest of the list didn't load"
+                elif archive.capped:
+                    cut = f"the newest {len(recent):,}, the most a search reads"
+                elif not archive.done:
+                    cut = "the rest of the list is still being read"
+                else:
+                    cut = ""
                 # The list is cut short and nothing narrowed it: a whole name would read that
                 # database from the service instead of only the jobs loaded here.
-                narrow = (self._scope is not None and self._scope.kind == ACCOUNT
-                          and self._scope.truncated and self._pushdown is None)
-                # A schema's whole list held to its newest jobs: f searches every one of them.
+                narrow = (self._scope is not None and self._scope.kind == ACCOUNT and self._pushdown is None
+                          and (self._scope.truncated or self._scope.page > 1)
+                          and (archive is None or not archive.complete))
+                # A schema's whole list held to its newest jobs: f searches every one of them, where
+                # f is offered (on page 1) and the search doesn't already cover them all.
                 everything = (len(self._cut_listing.everything)
-                              if self._cut_listing is not None and not self._full_list else 0)
+                              if archive is None and self.check_action("full_list", ("all",)) else 0)
                 there = sum(1 for job in everyone if views.is_deployment(job) != self._deployments
                             and views.job_matches_query(job, query, home=home, hay=self._haystack(job)))
                 noun = "job" if self._deployments else "deployment"
                 noun_here = "deployment" if self._deployments else "job"
                 elsewhere = f"d shows the {there:,} matching {noun}{'' if there == 1 else 's'}." if there else ""
-                found = dict(cut=loaded_text(self._scope), older=self._older_matches(query) if hidden else (),
+                found = dict(cut=cut,
                              location=self._schema_label() if one else "", widen=widen, narrow=narrow,
                              everything=everything, elsewhere=elsewhere)
                 message = views.no_match_message(self._filter, query, len(recent), noun=noun_here, **found)
@@ -1835,14 +2292,13 @@ class JobListScreen(FollowsPointer, Screen):
                 what = "jobs"
                 if others:
                     what = "deployments" if self._deployments else "training or sampling jobs"
-                if self._scope is not None and self._scope.truncated:
+                if self._scope is not None and (self._scope.truncated or self._scope.page > 1):
                     message = empty_text(self._scope, what)
                 elif self._scope is not None and self._scope.kind == ACCOUNT:
                     where = f"in {self._scope.narrowed}" if self._scope.narrowed else "in any database and schema"
-                    message = f"No {what} created in the last 6 months that this role can see, {where}."
+                    message = f"No {what} that this role can see, {where}."
                 else:
-                    message = (f"No {what} created in the last 6 months in {self._schema_label()} "
-                               "that this role can see.")
+                    message = f"No {what} in {self._schema_label()} that this role can see."
                     if widen:
                         message += "\n  a lists every database and schema."
                 if others:
@@ -1858,13 +2314,13 @@ class JobListScreen(FollowsPointer, Screen):
         job_by_item: dict = {}
         sub_by_item: dict = {}
         target_row = None
-        groups = (("LIVE", live), ("HISTORY", history))
+        groups = (("LIVE", live), ("HISTORY", shown_history))
         if self._sort == "status" and not self._descending:
             groups = groups[::-1]  # status ↑ ended first: the ended jobs are what comes first
         for group, jobs in groups:
             if not jobs:
                 continue
-            so_far = live_so_far if group == "LIVE" else older
+            so_far = live_so_far if group == "LIVE" else older or reading
             plan.append((f"hdr-{group.lower()}", self._header(group, len(jobs), layout.labels, so_far)))
             if plan[-1][0] == keep_header:
                 target_row = len(plan) - 1

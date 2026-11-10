@@ -236,6 +236,9 @@ class CortexTrainingLogTUI(App):
        here adds only empty rows (the title is one line, cut to fit, either way). */
     Header.-tall { height: 1; }
     #jobs { height: 1fr; }
+    /* The page of the job list on screen, under its title as a second line of the bar, between
+       links that page as [ and ] do (see JobListScreen._page_arrow). */
+    #pageline { background: $surface; color: $text-muted; height: 1; text-align: center; }
     #listwho, #listinfo { padding: 0 1; height: auto; }
     #nomatch-box { height: 1fr; scrollbar-gutter: stable; }
     #nomatch { padding: 1 2; color: $warning; height: auto; }
