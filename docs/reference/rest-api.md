@@ -2871,7 +2871,7 @@ other is `false`.
 
 | Value | Behavior |
 |---|---|
-| omitted or `true` | Balance. A request without ZoRRo balances by sample length. A ZoRRo request balances whole prompt groups and requires `sp_size` of 1. Any other `sp_size` is rejected. |
+| omitted or `true` | Balance. A request without ZoRRo balances by sample length, or by whole prompt group when valid `prompt_group_ids` are sent (see below). A ZoRRo request balances whole prompt groups and requires `sp_size` of 1. Any other `sp_size` is rejected. |
 | `false` | Keep arrival order. This is the opt-out, including for a ZoRRo request that runs with sequence parallelism. |
 
 Cortex measures a non-ZoRRo row by its attention mask. Without one, it uses
@@ -2900,10 +2900,25 @@ larger than one rank is rejected.
 A job-level `training_config.zorro_train_enable` (section 8.2) does not replace
 this per-request key. Job creation rejects it when `sp_size` is greater than 1.
 
-`prompt_group_ids`, a 1-D vector of one integer per row, names the prompt
-group when ZoRRo balancing is on. The same key is what a prompt-mean loss
-uses for its counts. Omitting the ids, or sending a vector of any other
-shape, groups rows that share the same prompt columns.
+`prompt_group_ids`, a 1-D vector of one integer per row, names each row's prompt
+group. The same key is what a prompt-mean loss uses for its counts, and clients
+such as TRL send it on requests without ZoRRo. Its effect depends on the request:
+
+- ZoRRo: the ids name the groups that stay on one data-parallel rank. Omitting
+  them, or sending a vector of any other shape, groups rows that share the same
+  prompt columns.
+- Without ZoRRo, with balancing on: when the ids are a 1-D vector with one entry
+  per row, whole groups are balanced instead of single rows, so each prompt stays
+  on one rank. A group's cost is the sum of its rows' squared lengths. Groups
+  are packed into rank bins of equal row count and are never split. Rows keep
+  their relative order within a group. Groups are placed by size and cost, not
+  by arrival order.
+- Without ZoRRo, arrival order is kept when the ids are malformed (not 1-D, or
+  not one entry per row), when there are no more rows than ranks, when the batch
+  size is not divisible by the rank count, when a group has more rows than one
+  rank holds, or when the groups cannot be packed into equal bins. These cases
+  are not errors for a request without ZoRRo. Ids that are not a tensor are
+  ignored, and rows balance by sample length.
 
 ---
 
