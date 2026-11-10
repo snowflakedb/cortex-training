@@ -30,6 +30,7 @@ EXAMPLE_FOLDERS = (
     "dflash2",
     "skyrl/gsm8k_grpo",
     "trl/gsm8k_grpo",
+    "vision_sft",
 )
 
 
@@ -97,7 +98,9 @@ def _private_imports(path: Path) -> list[str]:
     ]
 
 
-@pytest.mark.parametrize("package", ["sft_quickstart", "rl_quickstart", "inference", "distillation", "dflash2"])
+@pytest.mark.parametrize(
+    "package", ["sft_quickstart", "rl_quickstart", "inference", "distillation", "dflash2", "vision_sft"]
+)
 def test_private_names_do_not_cross_module_boundaries(package):
     offenders = {
         str(path.relative_to(REPO_ROOT)): names
@@ -404,6 +407,7 @@ def test_every_example_ships_an_overrides_file_with_a_comment():
     inference = EXAMPLES / "inference" / "overrides.json"
     distillation_overrides = EXAMPLES / "distillation" / "overrides.json"
     dflash2_overrides = EXAMPLES / "dflash2" / "overrides.json"
+    vision_sft_overrides = EXAMPLES / "vision_sft" / "overrides.json"
     assert set(EXAMPLES.rglob("overrides.json")) == {
         sft,
         RL_OVERRIDES,
@@ -411,9 +415,10 @@ def test_every_example_ships_an_overrides_file_with_a_comment():
         distillation_overrides,
         DARE_OVERRIDES,
         dflash2_overrides,
+        vision_sft_overrides,
     }
 
-    for path in (sft, inference):
+    for path in (sft, inference, vision_sft_overrides):
         data = json.loads(path.read_text())
         assert set(data) == {"_comment"} and isinstance(data["_comment"], str) and data["_comment"]
 
@@ -1105,6 +1110,7 @@ def test_deepseek_v4_trainer_and_vllm_module_names_are_the_same_adapter():
         "recipes/sft_quickstart/conversational/train.py",
         "recipes/rl_quickstart/math_grpo/train.py",
         "recipes/distillation/on_policy/train.py",
+        "recipes/vision_sft/train.py",
     ],
 )
 def test_task_modules_are_entrypoints(relative_path):

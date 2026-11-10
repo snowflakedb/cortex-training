@@ -13,6 +13,7 @@ type on the command line instead of writing a job file.
 | [Inference endpoint](inference/README.md) | Serve, generate, evaluate open weights or a checkpoint | MATH-500, GSM8K, identity |
 | [Model deployment streaming](model_deployment/README.md) | OpenAI-compatible model deployment, streamed chat | Open weights, checkpoints |
 | [DFlash2 draft](dflash2/README.md) | Speculative-decoding draft training, then serving with the target | Target-written chats (UltraChat prompts) |
+| [Vision SFT](vision_sft/README.md) (experimental) | LoRA SFT of a vision-language model on image question answering | ChartQA, synthetic spatial grids |
 | [SkyRL GRPO](skyrl/gsm8k_grpo/README.md) | SkyRL trainer on CPU driver + Cortex training/sampling sub-jobs | GSM8K |
 | [TRL GRPO](trl/gsm8k_grpo/README.md) | TRL trainer on CPU driver + Cortex training/sampling sub-jobs | GSM8K |
 | [prime-rl GRPO](prime-rl/README.md) | prime-rl orchestrator on a CPU driver + Cortex training/sampling sub-jobs | i3_math (math), r2e-gym (SWE) |
@@ -30,6 +31,7 @@ recipes/
 ├── distillation/            # runner.py (shared loop), episodes.py, overrides.json, on_policy/, tasks/, configs/ (generated)
 ├── inference/               # serve.py, generate.py, evaluate.py, overrides.json
 ├── dflash2/                 # generate_data.py, train.py, evaluate.py, overrides.json, drafts/<model>.json
+├── vision_sft/              # train.py, task.py (images, processor, rows), overrides.json
 ├── model_deployment/        # deploy.py, streaming.py, configs/
 ├── api_quickstart/          # raw REST API request bodies
 ├── skyrl/                   # SkyRL GRPO recipe
