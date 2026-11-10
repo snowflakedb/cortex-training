@@ -1805,6 +1805,15 @@ The long-context/memory knobs:
 - `sp_size`: Ulysses sequence-parallel degree, sharding each sample's sequence
   across `sp_size` ranks. `1` (default) disables it; the server requires
   `world_size % sp_size == 0`.
+- `zorro_train_enable`: boolean, default `false`. Declares that the job's
+  training steps use ZoRRo prompt-group balancing. ZoRRo keeps each prompt group
+  on one data-parallel rank, which requires `sp_size` of 1, so a job with
+  `zorro_train_enable` true and `sp_size` greater than 1 is rejected when it is
+  created. The declaration does not change how a step is balanced. A step is a
+  ZoRRo step only when its request sends `zorro_train_enable` true (see
+  [section 10.5](#105-rank-assignment)). A ZoRRo step with `sp_size` greater than
+  1 is still rejected when it runs, so a job that does not declare the field
+  fails on its first such step.
 - `mb_spec`: `{"max_tokens_per_mb": N}`, the most real tokens whose rows are
   packed into one model call (default `10240`). It counts whole rows before
   sequence parallelism splits them, and a row longer than N runs in a call of
@@ -2887,6 +2896,9 @@ keeping the group's row order. `max_token_len_per_gpu` must be at least
 width minus `max_response_len`. A smaller budget is rejected. The batch size
 must be divisible by the number of data-parallel ranks, and a prompt group
 larger than one rank is rejected.
+
+A job-level `training_config.zorro_train_enable` (section 8.2) does not replace
+this per-request key. Job creation rejects it when `sp_size` is greater than 1.
 
 `prompt_group_ids`, a 1-D vector of one integer per row, names the prompt
 group when ZoRRo balancing is on. The same key is what a prompt-mean loss
