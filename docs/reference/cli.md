@@ -182,7 +182,8 @@ cortex-training fwd-bwd --help
 |---------|------------------|-------------|
 | `submit` | Return after submission | `--wait` waits until running; `--dry-run` validates without submitting |
 | `wait JOB_ID` | Wait until running, not until training finishes | Use `get JOB_ID --raw` to inspect current status |
-| `fwd-bwd`, `generate` | Poll the submitted request until completion | Set top-level `"poll": false` in the input JSON |
+| `fwd-bwd` | Poll the submitted request until completion | Set top-level `"poll": false` in the input JSON |
+| `generate` | Submit without waiting, then poll the request until completion | Set top-level `"wait_seconds"` to have the submit wait up to 40 s for the result; `"poll": false` prints only the `request_id` |
 | `step` | Poll until completion; learning rate `1e-4` | Set `--lr`; polling cannot be disabled |
 | `load`, `weight-sync` | Poll the submitted request until completion | `--no-poll` returns without waiting for the result |
 | `capacity` | Query each GPU type the account supports | Select one with `--hardware` |
@@ -876,7 +877,19 @@ all prompts or a list of objects/nulls aligned with `prompts`. A flat list of
 integers such as `"prompts": [1, 2, 3]` is one pre-tokenized prompt, not three;
 use the nested form `[[1, 2], [3, 4]]` for a batch. The CLI submits `generate`
 and polls the request by default. Set `"poll": false` to print only the
-submitted `request_id`.
+submitted `request_id`. Waiting is off unless `"wait_seconds"` is set; the
+example's `0` means no wait. Set a top-level `"wait_seconds"` (whole seconds;
+the server caps it at 40) to have the submit wait for the result, so a short
+generation needs no poll. Like `"poll"`, it is read only from the top level of
+the file: a `"wait_seconds"` inside a `"payload"` object has no effect. If the
+result did not come back with the submit, the CLI polls as before. A waiting
+submit is retried only when the connection could not be opened or on a status
+sent before the work starts. A 5xx, a read timeout, a TLS failure or a
+connection reset after the request was sent is raised, because the generation
+may already be running; see
+[REST API section 3.5](rest-api.md#35-retries). A `"wait_seconds"` other than
+`0` or `null` cannot be combined with `"poll": false`; `0` or `null` means no
+wait and is accepted.
 
 ### Sync Training Weights
 
@@ -1209,8 +1222,12 @@ client metric with its outcome and duration, successes included, tagged
 `client.surface = tui` so the TUI's use can be told from the CLI's and the
 SDK's. The downloads behind the Logs, Resources and Training metrics tabs also
 say how long the first page or graph of a first download took (`preview_ms`,
-`first_commit_ms`), not only the whole download. `CORTEX_TRAINING_DISABLE_TELEMETRY` turns them
-off; see [Client metrics](python-sdk.md#client-metrics).
+`first_commit_ms`), not only the whole download. The TUI also says how long it
+took to show its first screen (`tui_startup`), and reports the errors it writes
+to its error log (`tui_error`) by where they happened and their type, never
+their text. Quitting sends what is left, waiting at most a second.
+`CORTEX_TRAINING_DISABLE_TELEMETRY` turns them off; see
+[Client metrics](python-sdk.md#client-metrics).
 
 The TUI explains a refused read in one line on the view that needed it, worded
 the same on every view: the Logs tab's saved console and execution log, and the
@@ -1246,6 +1263,16 @@ account-level list scoped to that one schema
 so it comes a page at a time; where that route is unavailable for the account,
 fails, or answers with no job at all, it reads `list_jobs`, which answers in one
 call and shows no pages.
+
+The line under the header says how the TUI signs in and as whom:
+`profile NAME` (or `config FILE`, `host HOST` or `base URL URL` for the older
+ways), the `user` and `role` Snowflake says it signs in as, and the
+`cortex-training` version (`profile train · user ME · role TRAINER ·
+cortex-training 0.1.1`). The user is the name the Owner column shows, which can
+differ from the login name a profile sets. The user and role are asked for once,
+with `SELECT CURRENT_USER(), CURRENT_ROLE()`, after the first jobs show; they
+read `…` until then and `—` where Snowflake doesn't answer (a profile still shows
+the role its session signed in with). A `--base-url` server has no user or role.
 
 The list has two views of the same jobs: **Jobs** (training and sampling, where
 `ct tui` opens) and **Deployments** (the jobs `ct` lists as model deployments; see
@@ -2140,7 +2167,8 @@ program that made the call in `client.surface`: `cli` for these commands, `tui`
 for the TUI, `sdk` for Python code. `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY`
 set truthy also emits successful outcomes for every other essential operation;
 set falsy, it emits failures only, the TUI's included. Every call is counted
-either way, and the counts are exported about every 30 seconds. See the [Python SDK reference](python-sdk.md#client-metrics).
+either way, and the counts are exported about every 30 seconds and as each
+command finishes, which waits at most 2 seconds for them. See the [Python SDK reference](python-sdk.md#client-metrics).
 
 `NO_COLOR` (not empty) draws `cortex-training tui` in gray unless it is started
 with `--color always`; `COLORTERM`, `TERM` and `TEXTUAL_COLOR_SYSTEM` say how

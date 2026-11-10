@@ -74,6 +74,7 @@ from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
 from typing import TypeVar
+from typing import overload
 from urllib.parse import quote
 from urllib.parse import unquote
 
@@ -285,6 +286,43 @@ def _success_telemetry_enabled(
     )
 
 
+def _expected_failure(
+    operation: str, error: BaseException, values: Mapping[str, Any]
+) -> bool:
+    """True when a failed call failed the way its callers expect, not as a fault.
+
+    Two do: a download with nothing uploaded yet (``NoChunksError``), and a log
+    tail answered that its session isn't there (404, 409 or 410) for a job that
+    has ended or isn't running yet (the ``job_ended`` and ``job_status`` values
+    :meth:`CortexTrainingClient.tail_logs` records). A tail that fails while its
+    job runs, fails another way after such an answer (a reset, a timeout, no
+    token, a 429 or 5xx), or names a sub-job its job doesn't have, is a real
+    failure. Expected failures still report ``success`` false, with ``expected``
+    true, and are counted under the ``expected_failure`` outcome, so failure
+    rates leave them out.
+    """
+    if isinstance(error, NoChunksError):
+        return True
+    if operation != "tail_logs" or getattr(error, "sub_job_missing", False):
+        return False
+    response = getattr(error, "response", None)
+    if getattr(response, "status_code", None) not in _TAIL_SESSION_GONE_STATUSES:
+        return False
+    status = values.get("job_status")
+    return bool(values.get("job_ended")) or (
+        isinstance(status, str) and bool(status) and status != "running"
+    )
+
+
+def _package_version() -> str | None:
+    """This package's version, which telemetry sends as ``service.version``."""
+    try:
+        from cortex_training import __version__
+    except Exception:  # noqa: BLE001 - a version must never stop a client
+        return None
+    return __version__
+
+
 # HTTP statuses worth retrying: the request was well-formed, so the same call
 # may succeed once transient load/infra conditions clear.
 #   429 Too Many Requests   - rate limited; back off and retry
@@ -306,6 +344,8 @@ def _success_telemetry_enabled(
 # won't fix itself.
 _TRANSIENT_STATUSES = {429, 500, 502, 503, 504, 404, 409, 307, 308}
 _JOB_NOT_FOUND_CODE = "517601"
+# A tail-logs answer that says the sub-job's session isn't there (see _tail_hint).
+_TAIL_SESSION_GONE_STATUSES = frozenset({404, 409, 410})
 # Job states after which nothing more runs, and a sub-job's pods (and so its
 # live logs) are gone. The API reports `cancelled`, `terminated` and `failed`;
 # the other spellings are accepted for robustness.
@@ -320,6 +360,10 @@ _SESSION_EXPIRED_CODES = frozenset({"390111", "390112", "390114"})
 # path DATABASE.SCHEMA it can't resolve (missing database or schema alike).
 _INVALID_REQUEST_CODE = "517602"
 _SCHEMA_NOT_FOUND_MESSAGE = re.compile(r"^Schema .+ is not found or not authorized")
+# Final request states, in the short form _normalize_request_status() returns.
+_SUCCEEDED_REQUEST_STATES = frozenset({"completed", "done", "succeeded"})
+_FAILED_REQUEST_STATES = frozenset({"failed", "cancelled", "canceled"})
+_TERMINAL_REQUEST_STATES = _SUCCEEDED_REQUEST_STATES | _FAILED_REQUEST_STATES
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {
     _CHUNK_GROUP_RESTART_REQUIRED,
@@ -901,6 +945,9 @@ def _metric_identity(
             attributes["request_id"] = result
         elif isinstance(result, dict) and result.get("request_id") is not None:
             attributes["request_id"] = result["request_id"]
+        elif isinstance(getattr(result, "request_id", None), str):
+            # Set on a waited generate's handle, and on the error raised for a failed request.
+            attributes["request_id"] = result.request_id
     return attributes
 
 
@@ -1039,7 +1086,45 @@ def _is_connect_error(exc: BaseException) -> bool:
     return False
 
 
+# Statuses that turn a generate away before any generation starts (see
+# _TRANSIENT_STATUSES), so resending one cannot run it twice.
+_WAITING_GENERATE_RETRY_STATUSES = frozenset({429, 404, 409, 307, 308})
+
+
+def _is_waiting_generate_retryable(exc: BaseException) -> bool:
+    """Retry a waiting generate only on failures that come before it starts:
+    a connection that was never opened (not a TLS failure), or a status above.
+
+    A read timeout, a reset after send, or any 5xx is raised rather than resent:
+    the service may already be generating, and a gateway can answer 503 or 504
+    after the backend accepted the call. A job-not-found 404 is final, except
+    within the 120 s grace for a job this client just created (see
+    ``_definitive_not_found``).
+    """
+    if isinstance(exc, requests.exceptions.HTTPError):
+        resp = exc.response
+        if resp is None or resp.status_code not in _WAITING_GENERATE_RETRY_STATUSES:
+            return False
+        return _chunk_group_error_detail(resp) is None
+    return _is_connect_error(exc)
+
+
 # ─── Canonical types ─────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class GenerateHandle:
+    """Returned by ``generate`` when ``wait_seconds`` is not ``None``.
+
+    If the server sent back the complete, successful result before the wait
+    ran out, ``result`` holds it, in the same form
+    :meth:`CortexTrainingClient.poll_request` gives. Otherwise ``result`` is
+    ``None`` and ``request_id`` should be polled.
+    """
+
+    request_id: str
+    # Left out of the hash, which would fail on a dict; equality still compares it.
+    result: dict | None = field(hash=False)
 
 
 class JobType(str, Enum):
@@ -2840,13 +2925,15 @@ class CortexTrainingClient:
         verify_ssl: bool = True,
         *,
         telemetry_timeout: float = 3.0,
+        telemetry_surface: str | None = None,
         **kwargs: Any,
     ) -> "CortexTrainingClient":
         """Authenticate with a Programmatic Access Token (PAT).
 
         Sends ``Authorization: Bearer <pat>`` plus the
         ``X-Snowflake-Authorization-Token-Type: PROGRAMMATIC_ACCESS_TOKEN`` header
-        on every request. No login round-trip.
+        on every request. No login round-trip. ``telemetry_surface`` is the
+        program making the calls (``client.surface``), when it isn't the SDK.
         """
         client = cls(
             base_url=f"https://{rest_host(host)}",
@@ -2855,6 +2942,8 @@ class CortexTrainingClient:
             endpoint=endpoint,
             **kwargs,
         )
+        if telemetry_surface:
+            client._telemetry_surface = telemetry_surface
         client._session.headers["Authorization"] = f"Bearer {pat}"
         client._session.headers["X-Snowflake-Authorization-Token-Type"] = "PROGRAMMATIC_ACCESS_TOKEN"
         client._session.verify = verify_ssl
@@ -2869,6 +2958,7 @@ class CortexTrainingClient:
             client._metric_emitter = OtlpMetricEmitter(
                 client.base_url,
                 token_provider,
+                service_version=_package_version(),
                 verify_ssl=verify_ssl,
                 timeout=telemetry_timeout,
             )
@@ -2884,6 +2974,7 @@ class CortexTrainingClient:
         endpoint: str = "cortex-training",
         verify_ssl: bool = True,
         telemetry_timeout: float = 3.0,
+        telemetry_surface: str | None = None,
         **kwargs: Any,
     ) -> "CortexTrainingClient":
         """Authenticate through a named or configured-default Snowflake profile.
@@ -2891,7 +2982,9 @@ class CortexTrainingClient:
         Profile discovery and authentication are delegated to
         ``snowflake-connector-python``. The live Connector session token is sent
         to the Cortex Training API, and the Connector session is recreated once
-        if the API reports token expiry.
+        if the API reports token expiry. ``telemetry_surface`` is the program
+        making the calls (``client.surface``), when it isn't the SDK; it is set
+        here so the login the client is built with is reported with it.
         """
         auth = SnowflakeProfileAuth(connection_name)
         resolved_database = database or auth.database
@@ -2915,13 +3008,19 @@ class CortexTrainingClient:
         client._auth_provider = auth
         client._artifact_connection_factory = auth.open_artifact_connection
         client._session.verify = verify_ssl
+        if telemetry_surface:
+            client._telemetry_surface = telemetry_surface
         if not _telemetry_disabled():
             client._metric_emitter = OtlpMetricEmitter(
                 client.base_url,
                 SnowflakeTelemetryTokenProvider(auth),
+                service_version=_package_version(),
                 verify_ssl=verify_ssl,
                 timeout=telemetry_timeout,
             )
+            # Its logins, the one it was just built with included (see _record_connect):
+            # that one is reported now, so the surface is set above, not by the caller later.
+            auth.set_connect_listener(client._record_connect)
         return client
 
     @property
@@ -2990,6 +3089,24 @@ class CortexTrainingClient:
                 if self._auth_provider is not None:
                     self._auth_provider.close()
 
+    def close_telemetry(self, timeout: float = 1.0) -> None:
+        """Send the telemetry this client still holds, waiting at most ``timeout``
+        seconds, then send no more.
+
+        :meth:`close` does this with one second, and so does interpreter exit
+        for a client nobody closed; exit doesn't wait again on telemetry closed
+        here. The ``cortex-training`` CLI calls it as each command finishes, with
+        two seconds, and the TUI as it quits, with one, without closing the
+        client's sessions. A client from :meth:`for_job` borrows its telemetry,
+        so this is a no-op.
+        """
+        if not self._owns_session or self._metric_emitter is None:
+            return
+        try:
+            self._metric_emitter.close(timeout=timeout)
+        except Exception:
+            logger.debug("client telemetry close failed", exc_info=True)
+
     def __enter__(self) -> "CortexTrainingClient":
         return self
 
@@ -3020,6 +3137,12 @@ class CortexTrainingClient:
         ``error_message`` replaces the error's own text when that could quote a
         credential, such as a presigned link. Its request counts are this
         thread's REST calls, so none.
+
+        A failure its callers expect (see :func:`_expected_failure`) is counted
+        under the ``expected_failure`` outcome, and its record says
+        ``expected``. A reported error is marked with the operation's name and
+        whether it was expected, for the TUI's error reports: they say which
+        call an error came from, and skip the expected ones.
         """
         if self._metric_emitter is None:
             return
@@ -3034,6 +3157,23 @@ class CortexTrainingClient:
             )
         except Exception:
             attempt_count = request_count = 0
+        recorded: dict[str, Any] = {}
+        expected = False
+        try:
+            recorded.update(getattr(self._operation_metric_state, "values", None) or {})
+            recorded.update(values or {})
+            if error is not None and not cancelled:
+                expected = _expected_failure(operation, error, recorded)
+                error._telemetry_operation = operation  # type: ignore[attr-defined]
+                error._telemetry_expected = expected  # type: ignore[attr-defined]
+        except Exception:
+            logger.debug("client operation outcome classification failed", exc_info=True)
+        if cancelled:
+            outcome = "cancelled"
+        elif error is None:
+            outcome = "success"
+        else:
+            outcome = "expected_failure" if expected else "failure"
         # Every outcome is counted, so failure rates have a denominator even
         # though only failures emit a detailed record by default.
         try:
@@ -3041,9 +3181,7 @@ class CortexTrainingClient:
             if record_operation is not None:
                 record_operation(
                     operation,
-                    outcome="cancelled"
-                    if cancelled
-                    else ("success" if error is None else "failure"),
+                    outcome=outcome,
                     duration_ms=duration_ms,
                     retry_count=max(attempt_count - request_count, 0),
                     request_count=request_count,
@@ -3054,10 +3192,7 @@ class CortexTrainingClient:
         if error is None and not _success_telemetry_enabled(operation, surface):
             return
         try:
-            value: dict[str, Any] = dict(
-                getattr(self._operation_metric_state, "values", None) or {}
-            )
-            value.update(values or {})
+            value: dict[str, Any] = dict(recorded)
             value |= {
                 "attempt_count": attempt_count,
                 "duration_ms": duration_ms,
@@ -3067,7 +3202,9 @@ class CortexTrainingClient:
             }
             if cancelled:
                 value["cancelled"] = True
-            attributes = _metric_identity(operation, arguments, result)
+            if expected:
+                value["expected"] = True
+            attributes = _metric_identity(operation, arguments, result if error is None else error)
             if error is not None:
                 value["error_message"] = (
                     _safe_metric_error_message(error)
@@ -3098,6 +3235,59 @@ class CortexTrainingClient:
         if not isinstance(values, dict) or not getattr(state, "active", None):
             return {}
         return values
+
+    def _record_connect(
+        self, reason: str, duration_ms: float, error: BaseException | None
+    ) -> None:
+        """Report one Snowflake Connector login as a ``connect`` outcome.
+
+        ``reason`` is ``startup`` (the profile login a client is built with),
+        ``refresh`` (a new session after one expired), ``artifact`` (a session
+        for artifact LIST and GET) or ``fork``. Logins run before telemetry
+        exists or inside other operations, so they are reported here rather
+        than by :func:`_track_operation`; one inside an operation also adds to
+        that operation's ``connect_count`` and ``connect_ms`` values.
+        """
+        if self._metric_emitter is None:
+            return
+        surface = getattr(self, "_telemetry_surface", SDK_SURFACE)
+        duration_ms = round(float(duration_ms), 3)
+        try:
+            values = self._operation_values()
+            values["connect_count"] = int(values.get("connect_count", 0)) + 1
+            values["connect_ms"] = round(float(values.get("connect_ms", 0.0)) + duration_ms, 3)
+        except Exception:
+            logger.debug("client connect values failed", exc_info=True)
+        try:
+            record_operation = getattr(self._metric_emitter, "record_operation", None)
+            if record_operation is not None:
+                record_operation(
+                    "connect",
+                    outcome="success" if error is None else "failure",
+                    duration_ms=duration_ms,
+                    surface=surface,
+                )
+        except Exception:
+            logger.debug("client connect count failed", exc_info=True)
+        if error is None and not _success_telemetry_enabled("connect", surface):
+            return
+        try:
+            value: dict[str, Any] = {
+                "duration_ms": duration_ms,
+                "reason": reason,
+                "success": error is None,
+            }
+            attributes: dict[str, Any] = {}
+            if error is not None:
+                value["error_message"] = _safe_metric_error_message(error)
+                attributes.update(_metric_error_attributes(error))
+                errno = getattr(error, "errno", None)
+                if "error.code" not in attributes and isinstance(errno, int):
+                    # The Connector's error number, such as 394400 for a rejected PAT.
+                    attributes["error.code"] = str(errno)
+            self.emit_metric("connect", value, attributes=attributes)
+        except Exception:
+            logger.debug("client connect metric construction failed", exc_info=True)
 
     @staticmethod
     def _debug_json_summary(value: Any, *, limit: int = 2000) -> str:
@@ -4192,7 +4382,12 @@ class CortexTrainingClient:
         return kwargs
 
     def _open_experiment_artifact_connection(self) -> Any:
-        """Open a connector session for Snowflake experiment artifact LIST/GET."""
+        """Open a connector session for Snowflake experiment artifact LIST/GET.
+
+        A PAT client's login is reported here as a ``connect`` outcome; a
+        profile client's factory is its :class:`SnowflakeProfileAuth`, which
+        reports its own (see :meth:`_record_connect`).
+        """
         if self._artifact_connection_factory is not None:
             return self._artifact_connection_factory()
         if self._artifact_connection_config is None:
@@ -4201,9 +4396,15 @@ class CortexTrainingClient:
             )
         import snowflake.connector
 
-        return snowflake.connector.connect(
-            **self._snowflake_connection_kwargs(), **_artifact_login_options()
-        )
+        kwargs = self._snowflake_connection_kwargs()
+        started = time.monotonic()
+        try:
+            connection = snowflake.connector.connect(**kwargs, **_artifact_login_options())
+        except Exception as exc:
+            self._record_connect("artifact", (time.monotonic() - started) * 1000, exc)
+            raise
+        self._record_connect("artifact", (time.monotonic() - started) * 1000, None)
+        return connection
 
     def _artifact_session_key(self) -> tuple[str, str]:
         """What a kept download session is kept under: it was opened for this schema."""
@@ -6495,6 +6696,9 @@ class CortexTrainingClient:
         allow_group_restart: bool = False,
         debug_context: dict[str, Any] | None = None,
         sub_job_id: str | None = None,
+        final_params: dict[str, Any] | None = None,
+        final_read_timeout: float | None = None,
+        final_retry_on: Callable[[BaseException], bool] | None = None,
     ) -> dict:
         chunks = wire.encode_byte_chunks(
             frame,
@@ -6514,15 +6718,28 @@ class CortexTrainingClient:
         final_body: dict | None = None
         while idx < len(chunks):
             chunk = chunks[idx]
+            retry_on: Callable[[BaseException], bool] = (
+                _is_chunk_post_transient if allow_group_restart else _is_transient
+            )
+            # Earlier chunks are only staged; the last POST creates the request
+            # and is the one that waits.
+            final_kwargs: dict[str, Any] = dict(_sub_job_id_params(sub_job_id))
+            if idx == len(chunks) - 1:
+                if final_params:
+                    final_kwargs["params"] = {**final_kwargs.get("params", {}), **final_params}
+                if final_read_timeout is not None:
+                    final_kwargs["timeout"] = (self.request_timeout[0], final_read_timeout)
+                if final_retry_on is not None:
+                    retry_on = final_retry_on
             try:
                 resp = self._send(
                     "POST",
                     f"{self._prefix}/{job_id}/{path_suffix}",
                     data=chunk,
                     headers={"Content-Type": "application/octet-stream"},
-                    **_sub_job_id_params(sub_job_id),
-                    retry_on=(_is_chunk_post_transient if allow_group_restart else _is_transient),
+                    retry_on=retry_on,
                     debug_context=debug_context,
+                    **final_kwargs,
                 )
             except requests.exceptions.HTTPError as exc:
                 detail = _chunk_group_error_detail(exc.response)
@@ -6600,6 +6817,43 @@ class CortexTrainingClient:
         )
         return request_id
 
+    @overload
+    def generate(
+        self,
+        job_id: str,
+        prompts: list[str | list[int]],
+        sampling_params: dict | list[dict | None] | None = None,
+        routing_key: str | list[str | None] | None = None,
+        strict: bool | None = None,
+        sub_job_id: str | None = None,
+        wait_seconds: None = None,
+    ) -> str: ...
+
+    @overload
+    def generate(
+        self,
+        job_id: str,
+        prompts: list[str | list[int]],
+        sampling_params: dict | list[dict | None] | None = None,
+        routing_key: str | list[str | None] | None = None,
+        strict: bool | None = None,
+        sub_job_id: str | None = None,
+        *,
+        wait_seconds: int,
+    ) -> GenerateHandle: ...
+
+    @overload
+    def generate(
+        self,
+        job_id: str,
+        prompts: list[str | list[int]],
+        sampling_params: dict | list[dict | None] | None = None,
+        routing_key: str | list[str | None] | None = None,
+        strict: bool | None = None,
+        sub_job_id: str | None = None,
+        wait_seconds: int | None = None,
+    ) -> str | GenerateHandle: ...
+
     @_track_operation("generate")
     def generate(
         self,
@@ -6609,8 +6863,12 @@ class CortexTrainingClient:
         routing_key: str | list[str | None] | None = None,
         strict: bool | None = None,
         sub_job_id: str | None = None,
-    ) -> str:
-        """Submit a generate request to a sampling sub-job. Returns request_id.
+        wait_seconds: int | None = None,
+    ) -> str | GenerateHandle:
+        """Submit a generate request to a sampling sub-job.
+
+        Returns a :class:`GenerateHandle` when ``wait_seconds`` is not
+        ``None``; with ``None`` (the default) it returns the request_id.
 
         The typed fields are serialized as a DSSST1 safetensors frame and sent
         as ``application/octet-stream``. Oversized frames are byte-chunked
@@ -6629,6 +6887,32 @@ class CortexTrainingClient:
           tokens), so an over-long string instead fails server-side in vLLM
           with a ``maximum model length`` error rather than client-side.
 
+        ``wait_seconds`` asks the server to hold the call for up to that many
+        whole seconds and reply with the result if the generation ends in
+        time. The server caps the wait, and holds the call only if it has
+        waiting enabled; if not, it answers right away with just the request
+        id, and the retry rule below still applies. A finished result in the
+        reply makes the handle's ``result`` what :meth:`poll_request` would
+        return; it is ``None`` when the generation was still running, the
+        server did not wait, or the reply could not be read whole, and the
+        caller polls ``request_id`` as usual. A chunked result counts as not
+        whole: the chunks that came with the reply are dropped, and
+        :meth:`poll_request` fetches them all again starting with the first.
+        A generation that failed or was cancelled
+        within the wait raises the error :meth:`poll_request` raises. ``0``
+        sends no wait and returns a handle with no result. Use a ``result``
+        that is set rather than polling again: like a second poll of any
+        generate, a re-poll leaves the tensors under ``results`` as tensors,
+        and the server may have dropped the result by then.
+
+        A waiting submit is retried only on failures that come before any
+        generation starts: a connection that could not be opened (refused or
+        connect timeout; a TLS failure does not count), and HTTP 429, 404, 409,
+        307 or 308. A job-not-found 404 is still retried only within 120 seconds
+        of this client creating the job, and a chunk-group 409 is not retried. A
+        5xx, a read timeout, or a reset after send is raised, because the
+        generation may already be running and a retry would run it twice.
+
         Args:
             sub_job_id: Optional. Which sampling sub-job runs the request, e.g.
                 ``"{job_id}:sampling:1"``; discover the ids from
@@ -6638,9 +6922,23 @@ class CortexTrainingClient:
                 job's only sampling sub-job, and a job with several rejects the
                 request and lists the valid ids.
         """
+        if wait_seconds is not None and (
+            isinstance(wait_seconds, bool)
+            or not isinstance(wait_seconds, int)
+            or wait_seconds < 0
+        ):
+            raise ValueError(f"wait_seconds must be a non-negative integer; got {wait_seconds!r}")
         body = self._build_generate_frame(
             "generate", job_id, prompts, sampling_params, routing_key, strict, sub_job_id
         )
+        wait_kwargs: dict[str, Any] = {}
+        if wait_seconds:
+            wait_kwargs = {
+                "final_params": {"wait_seconds": wait_seconds},
+                # The caller's read timeout counts from the end of the wait.
+                "final_read_timeout": self.request_timeout[1] + wait_seconds,
+                "final_retry_on": _is_waiting_generate_retryable,
+            }
         response = self._post_octet_request_chunks(
             job_id=job_id,
             path_suffix="generate",
@@ -6648,10 +6946,37 @@ class CortexTrainingClient:
             frame=body,
             max_bytes=self._MAX_GENERATE_BYTES,
             sub_job_id=sub_job_id,
+            **wait_kwargs,
         )
         request_id = response["request_id"]
         self._generate_request_ids.add(request_id)
-        return request_id
+        if wait_seconds is None:
+            return request_id
+        result = self._waited_generate_result(request_id, response) if wait_seconds else None
+        return GenerateHandle(request_id=request_id, result=result)
+
+    def _waited_generate_result(self, request_id: str, response: dict) -> dict | None:
+        """Decode a waited generate reply; ``None`` if it holds no complete result yet."""
+        state = self._normalize_request_status(str(response.get("status") or ""))
+        if state in _FAILED_REQUEST_STATES:
+            self._finished_request_result(request_id, response, state, [], None)  # raises
+        next_cursor = response.get("next_cursor")
+        if state not in _SUCCEEDED_REQUEST_STATES or (isinstance(next_cursor, str) and next_cursor):
+            return None
+        try:
+            status = self._decode_stream_result_events(response)
+            chunks = [self._decode_result_chunk_event(event) for event in status.get("events") or []]
+            return self._finished_request_result(
+                request_id, status, state, [chunk for chunk in chunks if chunk is not None], None
+            )
+        # Catch everything: the request is already submitted, so losing its id to an
+        # unexpected decode error is worse than a poll that raises the real one.
+        except Exception:
+            logger.warning("waited generate %s reply not decodable; caller polls", request_id, exc_info=True)
+            # Needed: a success that already decoded has discarded the id (in
+            # _normalize_generate_result_if_needed) before a later step raised.
+            self._generate_request_ids.add(request_id)
+            return None
 
     @_track_operation("generate_stream")
     def generate_stream(
@@ -7270,6 +7595,66 @@ class CortexTrainingClient:
         except Exception:  # noqa: BLE001 - best-effort: never fail the call this came from
             logger.debug("local training metrics record failed", exc_info=True)
 
+    def _finished_request_result(
+        self,
+        request_id: str,
+        status: dict,
+        state: str,
+        result_chunks: list[bytes],
+        debug_label: str | None,
+    ) -> dict:
+        """Turn a finished request into its result, or raise for a failure or cancellation.
+
+        :meth:`poll_request` and a waited :meth:`generate` both go through
+        here, so their results are decoded and recorded identically. The raised
+        error exposes the request's ``request_id``.
+        """
+        if state in _SUCCEEDED_REQUEST_STATES:
+            # ``payload`` is the result as the sub-job returned it, for the local
+            # training-metrics log; ``result`` also has the envelope's transport metrics.
+            envelope = status.get("result") or {}
+            if result_chunks:
+                with _server_payload():
+                    payload = wire.decode_result_chunks(result_chunks)
+                result = self._merge_transport_metrics(payload, envelope)
+            else:
+                result = payload = envelope
+                with _server_payload():
+                    decoded = self._decode_result_body(result)
+                if decoded is not None:
+                    payload = decoded
+                    result = self._merge_transport_metrics(decoded, envelope)
+            result = self._normalize_generate_result_if_needed(request_id, result)
+            legacy = self._decode_legacy_forward_result(request_id, result)
+            if legacy is not None:
+                payload = legacy
+                result = self._merge_transport_metrics(legacy, result)
+            self._log_training_result(request_id, payload, envelope)
+            if debug_label is not None:
+                logger.debug(
+                    "%s completed state=%s result=%s",
+                    debug_label,
+                    state,
+                    self._debug_json_summary(result),
+                )
+                self._fwd_bwd_request_debug.pop(request_id, None)
+            return result
+        error = status.get("error", "")
+        if debug_label is not None:
+            logger.debug(
+                "%s failed state=%s error=%s body=%s",
+                debug_label,
+                state,
+                error,
+                self._debug_json_summary(status),
+            )
+            self._fwd_bwd_request_debug.pop(request_id, None)
+        self._generate_request_ids.discard(request_id)
+        self._forward_request_ids.discard(request_id)
+        exc = RuntimeError(f"Request {request_id} ended with state '{state}': {error}")
+        exc.request_id = request_id  # type: ignore[attr-defined]  # read by the outcome metric
+        raise _server_failure(exc, failed=state == "failed")
+
     @_track_operation("poll_request")
     def poll_request(self, job_id: str, request_id: str) -> dict:
         """Poll until the async request completes. Returns the result dict."""
@@ -7295,53 +7680,8 @@ class CortexTrainingClient:
                 cursor = next_cursor
                 # Drain available result chunks without backing off.
                 continue
-            if state in ("completed", "done", "succeeded"):
-                # ``payload`` is the result as the sub-job returned it, for the local
-                # training-metrics log; ``result`` also has the envelope's transport metrics.
-                envelope = status.get("result") or {}
-                if result_chunks:
-                    with _server_payload():
-                        payload = wire.decode_result_chunks(result_chunks)
-                    result = self._merge_transport_metrics(payload, envelope)
-                else:
-                    result = payload = envelope
-                    with _server_payload():
-                        decoded = self._decode_result_body(result)
-                    if decoded is not None:
-                        payload = decoded
-                        result = self._merge_transport_metrics(decoded, envelope)
-                result = self._normalize_generate_result_if_needed(request_id, result)
-                legacy = self._decode_legacy_forward_result(request_id, result)
-                if legacy is not None:
-                    payload = legacy
-                    result = self._merge_transport_metrics(legacy, result)
-                self._log_training_result(request_id, payload, envelope)
-                if debug_label is not None:
-                    logger.debug(
-                        "%s completed state=%s result=%s",
-                        debug_label,
-                        state,
-                        self._debug_json_summary(result),
-                    )
-                    self._fwd_bwd_request_debug.pop(request_id, None)
-                return result
-            if state in ("failed", "cancelled", "canceled"):
-                error = status.get("error", "")
-                if debug_label is not None:
-                    logger.debug(
-                        "%s failed state=%s error=%s body=%s",
-                        debug_label,
-                        state,
-                        error,
-                        self._debug_json_summary(status),
-                    )
-                    self._fwd_bwd_request_debug.pop(request_id, None)
-                self._generate_request_ids.discard(request_id)
-                self._forward_request_ids.discard(request_id)
-                raise _server_failure(
-                    RuntimeError(f"Request {request_id} ended with state '{state}': {error}"),
-                    failed=state == "failed",
-                )
+            if state in _TERMINAL_REQUEST_STATES:
+                return self._finished_request_result(request_id, status, state, result_chunks, debug_label)
             if received_chunk:
                 # Defensive: if the server returns a chunk without next_cursor
                 # before terminal status, poll again immediately rather than
@@ -7455,6 +7795,9 @@ class CortexTrainingClient:
             )
             # Lets stream_logs end a tail cleanly when the job ends under it.
             error.job_ended = bool(checked.get("ended"))  # type: ignore[attr-defined]
+            # A sub-job the job doesn't have is the caller's mistake, whatever the job's
+            # status: never an expected failure (see _expected_failure).
+            error.sub_job_missing = bool(checked.get("sub_job_missing"))  # type: ignore[attr-defined]
             if error.job_ended:  # type: ignore[attr-defined]
                 # Still a failed call, but an expected one: the metric says so.
                 self._operation_values()["job_ended"] = True
@@ -7484,7 +7827,7 @@ class CortexTrainingClient:
         if not isinstance(exc, requests.exceptions.HTTPError):
             return None
         response = exc.response
-        if response is None or response.status_code not in (404, 409, 410):
+        if response is None or response.status_code not in _TAIL_SESSION_GONE_STATUSES:
             return None
         if _response_error_code(response) == _JOB_NOT_FOUND_CODE:
             return None
@@ -7513,6 +7856,7 @@ class CortexTrainingClient:
             if isinstance(sub, dict) and (sub.get("sub_job_id") or sub.get("id"))
         ]
         if sub_job_id and known and sub_job_id not in known:
+            checked["sub_job_missing"] = True
             return f"Sub-job {sub_job_id} is not part of job {job_id}; its sub-jobs are: {', '.join(known)}"
         return None
 

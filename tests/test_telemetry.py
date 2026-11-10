@@ -23,6 +23,7 @@ from unittest.mock import MagicMock
 import pytest
 import requests
 
+from cortex_training.client import telemetry
 from cortex_training.client.telemetry import (
     CachedSessionTokenProvider,
     OtlpMetricEmitter,
@@ -172,6 +173,7 @@ def test_emitter_discovers_hostname_once_and_posts_otlp_payload(monkeypatch):
             "value": {"stringValue": "account.test"},
         },
         {"key": "service.version", "value": {"stringValue": "0.0.2"}},
+        {"key": "service.instance.id", "value": {"stringValue": telemetry._INSTANCE_ID}},
     ]
     assert resource["scopeLogs"][0]["scope"] == {"name": "cortex-training"}
     record = resource["scopeLogs"][0]["logRecords"][0]
@@ -403,6 +405,7 @@ def test_operation_counts_are_aggregated_and_posted_to_metrics_endpoint(monkeypa
         == f"https://{COLLECTOR}/system/v1/metrics"
     )
     resource, metrics = _posted_metrics(emitter)
+    # No service.instance.id: a process would add series of its own (records carry it).
     assert resource["resource"]["attributes"] == [
         {"key": "service.name", "value": {"stringValue": "cortex-training"}},
         {"key": "snowflake.account_host", "value": {"stringValue": "account.test"}},
@@ -567,3 +570,112 @@ def test_counts_not_exported_are_merged_into_the_next_export(monkeypatch):
         "dataPoints"
     ]
     assert requests_sent["asInt"] == "3"
+
+
+def test_duration_buckets_reach_half_an_hour(monkeypatch):
+    emitter = _metrics_emitter(monkeypatch)
+    for minutes in (1.5, 4, 8, 12, 20, 120):  # a download, a wait, one past every bound
+        emitter.record_operation("download_metrics", outcome="success", duration_ms=minutes * 60_000)
+    assert emitter.flush()
+
+    _, metrics = _posted_metrics(emitter)
+    (point,) = metrics["cortex.training.client.operation.duration"]["histogram"]["dataPoints"]
+    assert point["explicitBounds"][-5:] == [120_000.0, 300_000.0, 600_000.0, 900_000.0, 1_800_000.0]
+    assert len(point["bucketCounts"]) == len(point["explicitBounds"]) + 1
+    # 1.5, 4, 8, 12 and 20 minutes each land in their own bucket past a minute; 2 hours overflows.
+    assert point["bucketCounts"][-6:] == ["1", "1", "1", "1", "1", "1"]
+
+
+def test_expected_failures_are_counted_apart_from_failures(monkeypatch):
+    emitter = _metrics_emitter(monkeypatch)
+    emitter.record_operation("tail_logs", outcome="failure", duration_ms=5)
+    emitter.record_operation("tail_logs", outcome="expected_failure", duration_ms=5)
+    emitter.record_operation("tail_logs", outcome="expected_failure", duration_ms=5)
+    emitter.record_operation("tail_logs", outcome="unheard_of", duration_ms=5)  # not counted
+    assert emitter.flush()
+
+    _, metrics = _posted_metrics(emitter)
+    points = metrics["cortex.training.client.operation.count"]["sum"]["dataPoints"]
+    by_outcome = {
+        next(a["value"]["stringValue"] for a in p["attributes"] if a["key"] == "outcome"): p["asInt"]
+        for p in points
+    }
+    assert by_outcome == {"failure": "1", "expected_failure": "2"}
+
+
+def test_every_record_names_its_process_and_metrics_leave_it_out(monkeypatch):
+    emitter = _metrics_emitter(monkeypatch)
+    first = dict(
+        (a["key"], a["value"]["stringValue"]) for a in emitter._resource_attributes()
+    )["service.instance.id"]
+    assert first == telemetry._INSTANCE_ID
+    assert len(first) == 36  # a UUID
+    emitter.record_operation("list_jobs", outcome="success", duration_ms=1)
+    assert emitter.flush()
+    resource, _ = _posted_metrics(emitter)
+    assert "service.instance.id" not in {a["key"] for a in resource["resource"]["attributes"]}
+
+    # A forked child is another process, with an id of its own.
+    monkeypatch.setattr(telemetry, "_INSTANCE_ID", telemetry._INSTANCE_ID)
+    telemetry._new_instance_id()
+    second = dict(
+        (a["key"], a["value"]["stringValue"]) for a in emitter._resource_attributes()
+    )["service.instance.id"]
+    assert second != first
+
+
+def test_the_worker_looks_the_collector_up_before_the_first_export():
+    token_provider = MagicMock()
+    token_provider.get_token.return_value = "session"
+    emitter = OtlpMetricEmitter("https://account.test", token_provider)
+    looked_up = threading.Event()
+    emitter._session = MagicMock()
+
+    def get(*_args, **_kwargs):
+        looked_up.set()
+        return _response({"hostname": COLLECTOR})
+
+    emitter._session.get.side_effect = get
+    emitter._session.post.return_value = _response()
+
+    # A call starts the worker; its counts go out 30 s later, but the lookup runs now,
+    # so a flush at exit has only the post left to send.
+    emitter.record_operation("list_jobs", outcome="success", duration_ms=1)
+    assert looked_up.wait(timeout=5)
+    emitter._session.post.assert_not_called()
+    emitter.close(timeout=1)
+    emitter._session.get.assert_called_once()
+    assert emitter._session.post.call_args.args[0] == f"https://{COLLECTOR}/v1/metrics"
+
+
+def test_a_failed_collector_lookup_counts_as_a_failed_export():
+    token_provider = MagicMock()
+    token_provider.get_token.return_value = "session"
+    emitter = OtlpMetricEmitter("https://account.test", token_provider, background=False)
+    emitter._session = MagicMock()
+    emitter._session.get.return_value = _response(status_code=500)
+
+    emitter._resolve_collector()
+
+    assert emitter._consecutive_failures == 1
+    assert emitter._telemetry_base_url is None
+
+
+def test_exit_does_not_wait_again_on_an_emitter_already_closed():
+    token_provider = MagicMock()
+    token_provider.get_token.return_value = "session"
+    emitter = OtlpMetricEmitter("https://account.test", token_provider)
+    emitter._session = MagicMock()
+    emitter._session.get.return_value = _response({"hostname": COLLECTOR})
+    release = threading.Event()
+    emitter._session.post.side_effect = lambda *_args, **_kwargs: release.wait(5) and _response()
+    try:
+        emitter.emit("tail_logs", {"success": False})  # its post hangs
+        time.sleep(0.1)
+        started = time.monotonic()
+        emitter.close(timeout=0.2)  # gives up on the post
+        telemetry._flush_emitters_at_exit()  # and exit doesn't wait on it again
+        assert time.monotonic() - started < 0.5
+        assert emitter not in telemetry._EMITTERS
+    finally:
+        release.set()

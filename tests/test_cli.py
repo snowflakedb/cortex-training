@@ -30,6 +30,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import cortex_training.cli.commands as cli
+from cortex_training import GenerateHandle
 
 
 class FakeClient:
@@ -57,6 +58,8 @@ class FakeClient:
         self.generate_sampling_params = None
         self.generate_routing_key = None
         self.generate_strict = None
+        self.generate_wait_seconds = None
+        self.generate_waited_result = None
         self.weight_sync_job_id = None
         self.weight_sync_source_sub_job_id = None
         self.weight_sync_target_sub_job_ids = None
@@ -196,13 +199,17 @@ class FakeClient:
         sampling_params=None,
         routing_key=None,
         strict=None,
+        wait_seconds=None,
     ):
         self.generated_job_id = job_id
         self.generate_prompts = prompts
         self.generate_sampling_params = sampling_params
         self.generate_routing_key = routing_key
         self.generate_strict = strict
-        return "req-generate-1"
+        self.generate_wait_seconds = wait_seconds
+        if wait_seconds is None:
+            return "req-generate-1"
+        return GenerateHandle("req-generate-1", self.generate_waited_result)
 
     def weight_sync(
         self,
@@ -2297,6 +2304,8 @@ def test_generate_reads_json_and_polls(tmp_path):
     }
     assert client.generate_routing_key == "sample-route"
     assert client.generate_strict is False
+    # Waiting is opt-in, so a default generate keeps all of its retries.
+    assert client.generate_wait_seconds is None
     assert client.polled_request == ("job-1", "req-generate-1")
     assert json.loads(stdout.getvalue()) == {
         "job_id": "job-1",
@@ -2360,11 +2369,112 @@ def test_generate_can_skip_poll(tmp_path):
 
     assert rc == 0
     assert instances[0].polled_request is None
+    assert instances[0].generate_wait_seconds is None
     assert json.loads(stdout.getvalue()) == {
         "job_id": "job-1",
         "prompt_count": 1,
         "request_id": "req-generate-1",
     }
+
+
+@pytest.mark.parametrize("wait_seconds", [0, 5])
+def test_generate_passes_wait_seconds_through(tmp_path, wait_seconds):
+    instances = []
+    path = tmp_path / "generate.json"
+    path.write_text(
+        json.dumps({"wait_seconds": wait_seconds, "payload": {"prompts": ["hello"]}}),
+        encoding="utf-8",
+    )
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory(instances),
+        stdout=io.StringIO(),
+    )
+
+    assert rc == 0
+    assert instances[0].generate_wait_seconds == wait_seconds
+    # The handle has no result, so the CLI polls as without a wait.
+    assert instances[0].polled_request == ("job-1", "req-generate-1")
+
+
+def test_generate_prints_a_waited_result_without_polling(tmp_path):
+    instances = []
+    stdout = io.StringIO()
+    path = tmp_path / "generate.json"
+    path.write_text(
+        json.dumps({"wait_seconds": 40, "payload": {"prompts": ["hello"]}}),
+        encoding="utf-8",
+    )
+
+    def factory(_args):
+        client = FakeClient()
+        client.generate_waited_result = {"responses": [{"text": "hi"}]}
+        instances.append(client)
+        return client
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=factory,
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert instances[0].polled_request is None
+    assert json.loads(stdout.getvalue()) == {
+        "job_id": "job-1",
+        "prompt_count": 1,
+        "request_id": "req-generate-1",
+        "result": {"responses": [{"text": "hi"}]},
+    }
+
+
+@pytest.mark.parametrize("wait_seconds", [0, None])
+def test_generate_accepts_no_wait_without_poll(tmp_path, wait_seconds):
+    instances = []
+    stdout = io.StringIO()
+    path = tmp_path / "generate.json"
+    path.write_text(
+        json.dumps({"poll": False, "wait_seconds": wait_seconds, "payload": {"prompts": ["hello"]}}),
+        encoding="utf-8",
+    )
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory(instances),
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert instances[0].polled_request is None
+    assert json.loads(stdout.getvalue()) == {
+        "job_id": "job-1",
+        "prompt_count": 1,
+        "request_id": "req-generate-1",
+    }
+
+
+@pytest.mark.parametrize("wait_seconds", [5, -1, True, False, 0.0, "0"])
+def test_generate_rejects_wait_seconds_without_poll(tmp_path, wait_seconds):
+    instances = []
+    path = tmp_path / "generate.json"
+    path.write_text(
+        json.dumps({"poll": False, "wait_seconds": wait_seconds, "payload": {"prompts": ["hello"]}}),
+        encoding="utf-8",
+    )
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory(instances),
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert rc != 0
+    assert "only helps when the CLI polls" in stderr.getvalue()
+    assert f"got {wait_seconds!r}" in stderr.getvalue()
+    assert not instances or instances[0].generated_job_id is None
 
 
 def test_generate_counts_flat_token_list_as_one_prompt(tmp_path):
@@ -4564,3 +4674,69 @@ def test_status_includes_the_pickers_own_notes(monkeypatch):
     code, report, _ = _status(monkeypatch, CORTEX_TRAINING_DATABASE="ENV_DB")
     assert code == 0 and report["database"] == "ENV_DB"
     assert "Using database ENV_DB from CORTEX_TRAINING_DATABASE." in report["warnings"]
+
+
+class _TelemetryClient(FakeClient):
+    def __init__(self):
+        super().__init__()
+        self.telemetry_closes = []
+
+    def close_telemetry(self, timeout):
+        self.telemetry_closes.append(timeout)
+
+    def cancel_job(self, job_id):
+        raise ValueError("no such job")
+
+
+def test_a_command_sends_its_telemetry_as_it_finishes_even_when_it_fails():
+    clients = []
+
+    def make_client(_args):
+        clients.append(_TelemetryClient())
+        return clients[-1]
+
+    stdout, stderr = io.StringIO(), io.StringIO()
+    assert cli.main(_base_args() + ["models"], client_factory=make_client, stdout=stdout, stderr=stderr) == 0
+    assert cli.main(_base_args() + ["cancel", "job-1"], client_factory=make_client, stdout=stdout, stderr=stderr) == 1
+
+    # More than the second interpreter exit allows: a first export looks the collector up.
+    assert [client.telemetry_closes for client in clients] == [[cli.CLI_TELEMETRY_CLOSE_SECONDS]] * 2
+    assert cli.CLI_TELEMETRY_CLOSE_SECONDS > 1
+
+
+def test_a_telemetry_close_that_raises_does_not_change_the_commands_outcome():
+    class Broken(FakeClient):
+        def close_telemetry(self, timeout):
+            raise RuntimeError("telemetry is broken")
+
+    stdout = io.StringIO()
+    assert cli.main(_base_args() + ["models"], client_factory=lambda _args: Broken(), stdout=stdout) == 0
+    assert json.loads(stdout.getvalue())["models"]
+
+
+def test_build_client_passes_its_surface_into_construction(tmp_path, monkeypatch):
+    # A profile client reports the login it is built with, so it must know its
+    # surface then, not only once build_client returns.
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "missing.json"))
+    _write_profiles("training-profile")
+    args = cli.parse_args(["--connection", "training-profile", "list"])
+    args.telemetry_surface = "cli"
+    client_cls = MagicMock()
+
+    cli.build_client(args, client_cls)
+    assert client_cls._from_resolution.call_args.kwargs["telemetry_surface"] == "cli"
+
+    pat_args = cli.parse_args(["--host", "x.test", "--pat", "p", "--database", "DB", "list"])
+    pat_args.telemetry_surface = "cli"
+    cli.build_client(pat_args, client_cls)
+    assert client_cls._from_pat.call_args.kwargs["telemetry_surface"] == "cli"
+
+
+def test_the_commands_build_their_client_as_the_cli(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        cli, "build_client", lambda args, cls: seen.append(args.telemetry_surface) or FakeClient()
+    )
+
+    assert cli.main(_base_args() + ["list"], stdout=io.StringIO()) == 0
+    assert seen == ["cli"]

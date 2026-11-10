@@ -130,7 +130,3 @@ models:
       - inference-endpoint
       - math-grpo
     last_validated: 2026-09-02
-  - id: Qwen/Qwen3.8-Flash-Next
-    training: true
-    inference: true
-    last_validated: 2026-11-05

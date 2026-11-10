@@ -26,10 +26,18 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlsplit
 from urllib.parse import urlunsplit
+
+# Told of each Connector login: why it ran (startup, refresh, artifact or fork),
+# how long it took in milliseconds, and the Connector's error if it failed.
+ConnectListener = Callable[[str, float, "BaseException | None"], None]
+# Logins kept for a listener that isn't set yet (telemetry is set up after the
+# startup login), so a client without telemetry keeps no more than these.
+_UNREPORTED_CONNECTS_KEPT = 4
 
 
 class SnowflakeProfileError(RuntimeError):
@@ -109,7 +117,9 @@ class SnowflakeProfileAuth:
         self._pid = os.getpid()
         self._closed = False
         self._invalidated_token: str | None = None
-        self._connection = self._open_connection()
+        self._connect_listener: ConnectListener | None = None
+        self._connects: list[tuple[str, float, BaseException | None]] = []
+        self._connection = self._open_connection("startup")
 
     def _profile_label(self) -> str:
         if self.connection_name is None:
@@ -123,15 +133,19 @@ class SnowflakeProfileAuth:
 
         return snowflake.connector.connect
 
-    def _open_connection(self) -> Any:
+    def _open_connection(self, reason: str) -> Any:
+        """Log in, noting why (see :data:`ConnectListener`) and how long it took."""
         connect = self._connector_connect()
+        started = time.monotonic()
         try:
             if self.connection_name is None:
                 # Connector only applies its configured default when connect()
                 # receives no ordinary connection arguments.
-                return connect()
-            return connect(connection_name=self.connection_name)
+                connection = connect()
+            else:
+                connection = connect(connection_name=self.connection_name)
         except Exception as exc:
+            self._note_connect(reason, started, exc)
             # The Connector can't load a file that names a profile twice, and doesn't say why.
             message = f"could not open {self._profile_label()}: {_duplicate_profiles() or exc}"
             if _is_pat_rejected(exc):
@@ -139,6 +153,37 @@ class SnowflakeProfileAuth:
                     "Snowflake rejected your programmatic access token (PAT)."
                 )
             raise SnowflakeProfileError(message) from exc
+        self._note_connect(reason, started, None)
+        return connection
+
+    def _note_connect(
+        self, reason: str, started: float, error: BaseException | None
+    ) -> None:
+        self._connects.append((reason, round((time.monotonic() - started) * 1000, 3), error))
+        if self._connect_listener is None:
+            del self._connects[:-_UNREPORTED_CONNECTS_KEPT]
+
+    def set_connect_listener(self, listener: ConnectListener | None) -> None:
+        """Tell ``listener`` of each login (see :data:`ConnectListener`), the ones
+        made before it was set, such as the startup login, at once. A listener
+        that raises is ignored: reporting must never change a login's outcome."""
+        self._connect_listener = listener
+        self._report_connects()
+
+    def _report_connects(self) -> None:
+        """Hand the logins noted since the last report to the listener. Called
+        without the lock held: the listener may send telemetry, whose token
+        comes from this object."""
+        listener = self._connect_listener
+        if not self._connects or listener is None:
+            return
+        with self._lock:
+            reports, self._connects = self._connects, []
+        for reason, duration_ms, error in reports:
+            try:
+                listener(reason, duration_ms, error)
+            except Exception:  # noqa: BLE001
+                pass
 
     @staticmethod
     def _rest(connection: Any) -> Any:
@@ -184,9 +229,11 @@ class SnowflakeProfileAuth:
             self._lock = threading.RLock()
             self._closed = False
             self._invalidated_token = None
+            self._connects = []
             # The inherited connection belongs to the parent process. Avoid
             # calling into it (including close) from the child.
-            self._connection = self._open_connection()
+            self._connection = self._open_connection("fork")
+        self._report_connects()
 
     def _require_open(self) -> None:
         if self._closed:
@@ -227,11 +274,14 @@ class SnowflakeProfileAuth:
     def get_token(self) -> str:
         """Return the current Connector token, reconnecting if invalidated."""
         self._ensure_process()
-        with self._lock:
-            self._require_open()
-            if self._invalidated_token is not None:
-                return self._refresh_locked(self._invalidated_token)
-            return self._read_token(self._connection)
+        try:
+            with self._lock:
+                self._require_open()
+                if self._invalidated_token is not None:
+                    return self._refresh_locked(self._invalidated_token)
+                return self._read_token(self._connection)
+        finally:
+            self._report_connects()
 
     def _refresh_locked(self, observed_token: str | None) -> str:
         current = self._read_token(self._connection)
@@ -239,7 +289,7 @@ class SnowflakeProfileAuth:
             self._invalidated_token = None
             return current
 
-        replacement = self._open_connection()
+        replacement = self._open_connection("refresh")
         try:
             replacement_token = self._read_token(replacement)
             self._read_server_url(replacement)
@@ -261,9 +311,12 @@ class SnowflakeProfileAuth:
     def refresh(self, observed_token: str | None = None) -> str:
         """Reconnect once unless another thread already rotated the token."""
         self._ensure_process()
-        with self._lock:
-            self._require_open()
-            return self._refresh_locked(observed_token)
+        try:
+            with self._lock:
+                self._require_open()
+                return self._refresh_locked(observed_token)
+        finally:
+            self._report_connects()
 
     def invalidate(self) -> None:
         """Mark the current token stale so the next consumer reconnects."""
@@ -276,9 +329,12 @@ class SnowflakeProfileAuth:
     def open_artifact_connection(self) -> Any:
         """Open an independent same-profile connection for artifact LIST/GET."""
         self._ensure_process()
-        with self._lock:
-            self._require_open()
-            return self._open_connection()
+        try:
+            with self._lock:
+                self._require_open()
+                return self._open_connection("artifact")
+        finally:
+            self._report_connects()
 
     def close(self) -> None:
         """Close the owned Connector session exactly once."""

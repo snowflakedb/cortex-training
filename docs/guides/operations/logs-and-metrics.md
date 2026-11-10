@@ -59,6 +59,10 @@ metrics over Snowflake's OTLP endpoint. Failures of essential SDK methods, the
 outcome and timing of every download, and the outcome and timing of every call
 the TUI makes are emitted automatically; other successful outcomes require
 `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY=1`. Every call, successful or not, is
-also counted, and the counts are exported about every 30 seconds. Each metric
-says whether the SDK, the CLI or the TUI made the call (`client.surface`). See
+also counted and timed, and the counts are exported about every 30 seconds.
+Each metric says whether the SDK, the CLI or the TUI made the call
+(`client.surface`) and which client version made it (`service.version`), and
+each event also says which process sent it (`service.instance.id`, one per SDK
+script, CLI command or TUI session). Failures a caller expects, such as a log
+tail of a job that has ended, are counted apart from real ones. See
 [Client metrics](../../reference/python-sdk.md#client-metrics).

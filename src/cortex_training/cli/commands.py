@@ -1406,6 +1406,12 @@ def build_client(args: argparse.Namespace, cortex_training_client_cls):
             kwargs[option] = value
     if args.base_url:
         return cortex_training_client_cls(base_url=args.base_url, **kwargs)
+    # The program making the calls (client.surface), which the CLI and the TUI set on
+    # their args: a profile client reports the login it is built with, so it must know
+    # the surface before then. A --base-url client has no telemetry.
+    surface = getattr(args, "telemetry_surface", None)
+    if surface:
+        kwargs["telemetry_surface"] = surface
     if args.use_connection_profile:
         args.resolution = _picker_choice(args)
         options = {key: kwargs[key] for key in kwargs if key not in ("database", "schema")}
@@ -1947,6 +1953,15 @@ def _cmd_generate(
         raise ValueError("generate payload must be an object")
 
     poll = _json_bool(spec.get("poll", True), "generate poll")
+    wait_seconds = spec.get("wait_seconds")
+    no_wait = wait_seconds is None or (type(wait_seconds) is int and wait_seconds == 0)
+    # Nothing reads a waited result unless the CLI polls, and a waiting submit
+    # still loses its 5xx and read-timeout retries, so reject the combination.
+    if not poll and not no_wait:
+        raise ValueError(
+            'generate "wait_seconds" only helps when the CLI polls for the result; '
+            f'remove it, or remove "poll": false; got {wait_seconds!r}'
+        )
     prompts = payload.get("prompts")
     if not isinstance(prompts, list) or not prompts:
         raise ValueError("generate JSON must contain a non-empty prompts list")
@@ -1971,20 +1986,25 @@ def _cmd_generate(
     if strict is not None:
         strict = _json_bool(strict, "generate strict")
 
-    request_id = client.generate(
+    submitted = client.generate(
         args.job,
         prompts=prompts,
         sampling_params=sampling_params,
         routing_key=payload.get("routing_key"),
         strict=strict,
+        wait_seconds=wait_seconds,
     )
+    if isinstance(submitted, str):
+        request_id, result = submitted, None
+    else:
+        request_id, result = submitted.request_id, submitted.result
     response = {
         "job_id": args.job,
         "prompt_count": prompt_count,
         "request_id": request_id,
     }
     if poll:
-        response["result"] = client.poll_request(args.job, request_id)
+        response["result"] = result if result is not None else client.poll_request(args.job, request_id)
 
     _print_json(response, stdout, compact=args.compact)
     return 0
@@ -2540,6 +2560,35 @@ def _run(
                 raise ValueError(f"{flag} applies to --log-type stdout, not execution logs")
 
     client = client_factory(args)
+    try:
+        return _run_command(args, client, stdout, stdin, stderr)
+    finally:
+        _close_telemetry(client)
+
+
+# A command sends its telemetry as it finishes, waiting at most this long: more
+# than the second interpreter exit allows, which a first export (it looks the
+# collector up, then posts) can need on a slow network.
+CLI_TELEMETRY_CLOSE_SECONDS = 2.0
+
+
+def _close_telemetry(client: Any) -> None:
+    close = getattr(client, "close_telemetry", None)
+    if close is None:
+        return
+    try:
+        close(timeout=CLI_TELEMETRY_CLOSE_SECONDS)
+    except Exception:  # noqa: BLE001 - telemetry must never change a command's outcome
+        pass
+
+
+def _run_command(
+    args: argparse.Namespace,
+    client: Any,
+    stdout: TextIO,
+    stdin: TextIO,
+    stderr: TextIO,
+) -> int:
     if args.command == "submit":
         return _cmd_submit(args, client, stdout, stdin)
     if args.command == "get":
@@ -2626,8 +2675,10 @@ def main(
             def default_client_factory(parsed_args: argparse.Namespace) -> Any:
                 from cortex_training.client import CLI_SURFACE
 
+                # Its metrics say a command made the call (client.surface), its
+                # sign-in's included (see build_client).
+                parsed_args.telemetry_surface = CLI_SURFACE
                 client = build_client(parsed_args, cortex_training_client_cls)
-                # Its metrics say a command made the call (client.surface).
                 client._telemetry_surface = CLI_SURFACE
                 if getattr(parsed_args, "resolution", None) is not None:
                     write_target_line(parsed_args.resolution, stderr)

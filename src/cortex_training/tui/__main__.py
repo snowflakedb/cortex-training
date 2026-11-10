@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import threading
+import time
 from pathlib import Path
 
 from cortex_training.tui import terminal
@@ -35,6 +36,10 @@ READ_TIMEOUT = (10.0, 45.0)
 # How long quitting waits to close the Snowflake sessions the TUI kept for its downloads;
 # one it couldn't close by then expires by itself.
 SESSION_CLOSE_SECONDS = 1.0
+# How long quitting waits, meanwhile, to send the telemetry left (the last half minute's
+# call counts and any queued events). The collector was looked up long before, so what is
+# left is a post or two; interpreter exit doesn't wait on it again.
+TELEMETRY_CLOSE_SECONDS = 1.0
 # The oldest Textual the TUI is tested on (pyproject.toml requires it, below 9).
 TEXTUAL_FLOOR = (8, 2, 8)
 _TEXTUAL_REQUIREMENT = "textual>=8.2.8,<9"
@@ -138,6 +143,7 @@ def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.Argument
 
 
 def run(argv=None, *, prog: str = "cortex-training tui") -> int:
+    launched = time.monotonic()  # for the startup report (see CortexTrainingLogTUI.first_view_drawn)
     parser = _build_arg_parser(prog=prog)
     args = parser.parse_args(argv)
     if args.sub_job_id and not args.job_id:
@@ -155,7 +161,9 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
         # Textual reads its color system once, as it is first imported.
         os.environ["TEXTUAL_COLOR_SYSTEM"] = colors.color_system
     try:
+        from cortex_training.tui import widgets
         from cortex_training.tui.app import CortexTrainingLogTUI
+        from cortex_training.tui.telemetry import ErrorReporter
     except ImportError as exc:
         parser.exit(2, f"{parser.prog}: error: the TUI couldn't load ({exc}); reinstall cortex-training, "
                        f"or pip install --upgrade '{_TEXTUAL_REQUIREMENT}'\n")
@@ -165,6 +173,7 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     # refuses more than 6 s: it keeps the default, so a slow --poll-interval works.
     log_poll_interval, args.poll_interval = args.poll_interval, parser.get_default("poll_interval")
     client, sign_in = _build_read_only_client(parser, args)
+    client_ready = time.monotonic()
     # A tab's download, and each refresh of it, starts without a login (see _close_sessions).
     if hasattr(type(client), "keep_artifact_sessions"):
         client.keep_artifact_sessions = True
@@ -174,9 +183,12 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     app = CortexTrainingLogTUI(client, args.job_id, sub_job_id=args.sub_job_id, poll_interval=log_poll_interval)
     app.sign_in = sign_in  # for the commands the TUI shows to copy
     app.colors = colors
+    app.launched_at, app.client_ready_at = launched, client_ready
+    widgets.set_error_reporter(ErrorReporter(client))  # the errors the TUI logs, as tui_error
     try:
         app.run()
     finally:
+        widgets.set_error_reporter(None)
         _close_sessions(client)
     return app.return_code or 0  # non-zero when the app stopped on an unhandled error
 
@@ -228,18 +240,19 @@ def _build_read_only_client(parser: argparse.ArgumentParser, args: argparse.Name
     # defaults (ten retries, a ten-minute read timeout) left a view silent for
     # about a minute on a 404 or a failing service.
     args.max_retries, args.request_timeout = READ_MAX_RETRIES, READ_TIMEOUT
+    from cortex_training.client import TUI_SURFACE
     from cortex_training.client.auth import SnowflakeProfileError
 
+    # Its metrics, and its for_job clients', say the TUI made the call (client.surface),
+    # and so also report successes and their timings; the sign-in it is built with too
+    # (see cli.build_client).
+    args.telemetry_surface = TUI_SURFACE
     try:
         client = cli.build_client(args, cli._load_cortex_training_client_class())
     except (SnowflakeProfileError, ValueError) as exc:
         # With no config, login state or flags, the TUI tries the configured-default
         # Snowflake connection, which a first run doesn't have: say how to connect.
         parser.exit(2, f"{parser.prog}: error: {exc}\n{_CONNECT_HINT}\n")
-    # Its metrics, and its for_job clients', say the TUI made the call (client.surface),
-    # and so also report successes and their timings.
-    from cortex_training.client import TUI_SURFACE
-
     client._telemetry_surface = TUI_SURFACE
     if getattr(args, "resolution", None) is not None:
         cli.write_target_line(args.resolution, sys.stderr)
@@ -248,27 +261,45 @@ def _build_read_only_client(parser: argparse.ArgumentParser, args: argparse.Name
 
 def _close_sessions(client) -> None:
     """Close the download sessions the client kept, waiting at most SESSION_CLOSE_SECONDS:
-    each close is a request, and quitting must not wait on an unreachable service."""
-    if not hasattr(type(client), "keep_artifact_sessions") or not client.keep_artifact_sessions:
-        return
+    each close is a request, and quitting must not wait on an unreachable service.
+    Meanwhile send the client's telemetry, waiting at most TELEMETRY_CLOSE_SECONDS."""
+    closers = []
+    if hasattr(type(client), "keep_artifact_sessions") and client.keep_artifact_sessions:
 
-    def close() -> None:
-        try:
-            client.keep_artifact_sessions = False
-        except Exception:  # noqa: BLE001 - a session it can't close expires by itself
-            pass
+        def close() -> None:
+            try:
+                client.keep_artifact_sessions = False
+            except Exception:  # noqa: BLE001 - a session it can't close expires by itself
+                pass
 
-    closer = threading.Thread(target=close, name="cortex-tui-session-close", daemon=True)
-    closer.start()
-    closer.join(SESSION_CLOSE_SECONDS)
+        closers.append((threading.Thread(target=close, name="cortex-tui-session-close", daemon=True),
+                        SESSION_CLOSE_SECONDS))
+    close_telemetry = getattr(client, "close_telemetry", None)
+    if callable(close_telemetry):
+
+        def send() -> None:
+            try:
+                close_telemetry(timeout=TELEMETRY_CLOSE_SECONDS)
+            except Exception:  # noqa: BLE001 - telemetry must never keep the TUI from quitting
+                pass
+
+        closers.append((threading.Thread(target=send, name="cortex-tui-telemetry-close", daemon=True),
+                        TELEMETRY_CLOSE_SECONDS))
+    started = time.monotonic()
+    for closer, _ in closers:
+        closer.start()
+    for closer, seconds in closers:
+        closer.join(max(seconds - (time.monotonic() - started), 0.0))
 
 
 def _sign_in(cli, args, from_config: dict) -> dict:
     """How the TUI's client connects, for the commands it shows to copy (read by
-    ``views.sign_in_options``). It never holds the PAT; ``config`` is the config
-    file as an absolute path, so a copied command finds it from any directory."""
+    ``views.sign_in_options``) and the job list's line naming it (``identity.line_parts``).
+    It never holds the PAT; ``config`` is the config file as an absolute path, so a
+    copied command finds it from any directory."""
     if args.use_connection_profile:
-        return {"kind": "profile"}
+        resolution = getattr(args, "resolution", None)
+        return {"kind": "profile", "profile": getattr(resolution, "profile", None)}
     config = None
     if getattr(args, "_legacy_config_selected", False) and args.config:
         config = str(Path(args.config).expanduser().resolve())

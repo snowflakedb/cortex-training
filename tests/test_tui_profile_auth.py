@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import threading
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
@@ -25,6 +26,7 @@ pytest.importorskip("textual")
 
 import snowflake.connector  # noqa: E402
 
+from cortex_training import __version__  # noqa: E402
 from cortex_training.tui import __main__ as tui_main  # noqa: E402
 from cortex_training.tui.app import CortexTrainingLogTUI  # noqa: E402
 from cortex_training.tui.job_list import JobListScreen  # noqa: E402
@@ -83,12 +85,30 @@ class FakeAPI:
         self.server.server_close()
 
 
+class FakeCursor:
+    """A session's cursor, answering ``CURRENT_USER()`` and ``CURRENT_ROLE()``."""
+
+    def __init__(self, statements: list[str]) -> None:
+        self.statements = statements
+        self.description = [("USER_NAME",), ("ROLE_NAME",)]
+
+    def execute(self, statement: str, timeout=None) -> None:
+        self.statements.append(statement)
+
+    def fetchall(self) -> list[tuple]:
+        return [("ME", "TRAINER")]
+
+    def close(self) -> None:
+        pass
+
+
 class FakeConnector:
     """``snowflake.connector.connect``: each sign-in gets the next session token."""
 
     def __init__(self, url: str) -> None:
         self.url = url
         self.calls: list[dict] = []
+        self.statements: list[str] = []
 
     def __call__(self, **kwargs):
         self.calls.append(kwargs)
@@ -96,6 +116,7 @@ class FakeConnector:
         return SimpleNamespace(
             rest=SimpleNamespace(token=token, server_url=self.url),
             database="CT_DB", schema="PUBLIC", role="TRAINER", close=lambda: None,
+            cursor=lambda: FakeCursor(self.statements),
         )
 
 
@@ -149,6 +170,12 @@ def _run_tui(monkeypatch, argv=(), before=None) -> dict:
                         seen["jobs"] = sorted(screen.whole_id(item) for item in screen._job_by_item)
                         break
                 seen["sign_in"] = app.sign_in
+                for _ in range(200):  # who it signs in as, asked once the jobs show
+                    if app.identity is not None:
+                        await pilot.pause()
+                        seen["who"] = app.screen.query_one("#listwho").render().plain
+                        break
+                    await pilot.pause()
                 app.workers.cancel_all()
                 for _ in range(5):
                     await pilot.pause()
@@ -165,7 +192,7 @@ def test_the_tui_signs_in_with_the_profile_login_saved(customer, api, connector,
 
     assert seen["rc"] == 0
     assert seen.get("jobs") == ["job-a", "job-b"], "the job list did not load"
-    assert seen["sign_in"] == {"kind": "profile"}
+    assert seen["sign_in"] == {"kind": "profile", "profile": "cortex-training"}
     # The saved profile, through the Connector: the TUI never reads the PAT itself.
     assert connector.calls[0] == {"connection_name": "cortex-training"}
     assert api.tokens() and set(api.tokens()) == {'Snowflake Token="session-1"'}
@@ -184,6 +211,18 @@ def test_the_tui_takes_a_named_profile(customer, api, connector, monkeypatch):
 
     assert seen.get("jobs") == ["job-a", "job-b"]
     assert connector.calls[0] == {"connection_name": "other"}
+    assert seen["who"].split()[:2] == ["profile", "other"]
+
+
+def test_the_job_list_says_who_the_tui_signs_in_as(customer, api, connector, monkeypatch):
+    seen = _run_tui(monkeypatch)
+
+    # The profile, then the user and role from Snowflake, asked once on the profile's
+    # session (not the REST API), then the version; wrapped where 80 columns are too few.
+    parts = [" ".join(part.split()) for part in re.split(r"·|\n", seen["who"])]
+    assert parts == ["profile cortex-training", "user ME", "role TRAINER", f"cortex-training {__version__}"]
+    assert connector.statements == ["SELECT CURRENT_USER() AS USER_NAME, CURRENT_ROLE() AS ROLE_NAME"]
+    assert all("statements" not in path for path, _ in api.requests)
 
 
 def test_the_tui_signs_in_again_when_the_session_expires(customer, api, connector, monkeypatch):

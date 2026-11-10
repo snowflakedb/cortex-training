@@ -2037,6 +2037,9 @@ class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
             self._job_reason = job.get("reason")
         self._render_summary_line()
         self._paint_sources()  # its sub-jobs' statuses
+        drawn = getattr(self.app, "first_view_drawn", None)
+        if drawn is not None:
+            drawn("job")  # for a TUI opened on this job, how long its start took
         return True
 
     def _tail_status(self, sub_job_id: str | None) -> str:

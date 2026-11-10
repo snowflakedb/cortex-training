@@ -65,11 +65,13 @@ from cortex_training.tui.job_list import JobListScreen
 from cortex_training.tui.logs import LogScreen
 from cortex_training.tui.account import JobLister
 from cortex_training.tui.format import one_line
+from cortex_training.tui.identity import Identity
 from cortex_training.tui.clipboard import copied_note
 from cortex_training.tui.clipboard import copy_local
 from cortex_training.tui.clipboard import screen_dump
 from cortex_training.tui.clipboard import selected_text
 from cortex_training.tui.format import safe_text
+from cortex_training.tui.telemetry import report_startup
 from cortex_training.tui.untrusted import printable_client
 from cortex_training.tui.widgets import SelectableTable
 from cortex_training.tui.widgets import close_keys_panel
@@ -230,8 +232,11 @@ class CortexTrainingLogTUI(App):
     Header { background: $surface; color: $text-muted; }
     Header HeaderIcon { color: $accent; }
     Header HeaderTitle { color: $text; }
+    /* One row, clicked or not: Textual's header toggles a three-row "tall" mode on a click, which
+       here adds only empty rows (the title is one line, cut to fit, either way). */
+    Header.-tall { height: 1; }
     #jobs { height: 1fr; }
-    #listinfo { padding: 0 1; height: auto; }
+    #listwho, #listinfo { padding: 0 1; height: auto; }
     #nomatch-box { height: 1fr; scrollbar-gutter: stable; }
     #nomatch { padding: 1 2; color: $warning; height: auto; }
     #jobs > .datatable--fixed { background: $surface; }
@@ -301,6 +306,14 @@ class CortexTrainingLogTUI(App):
     # the commands the TUI shows to copy connect the same way; None when unknown
     # (a test's client). See views.sign_in_options.
     sign_in: dict | None = None
+    # Who the client signs in as (tui/identity.py), asked once the job list first shows jobs or fails;
+    # None until then.
+    identity: Identity | None = None
+    identity_asked = False
+    # When `cortex-training tui` started and when its client was ready (time.monotonic()),
+    # for the startup report (see first_view_drawn); None when it didn't start the app.
+    launched_at: float | None = None
+    client_ready_at: float | None = None
 
     def __init__(self, client, job_id=None, *, sub_job_id=None, poll_interval=1.0, now=None):
         """Every job record read through ``client`` and its per-location clients comes back printable
@@ -320,6 +333,7 @@ class CortexTrainingLogTUI(App):
         self._clients = JobClients(client)
         self._lister = JobLister(client)
         self._heap_frozen = False
+        self._startup_reported = False
         # A left-button press, and whether it has moved since (see on_event).
         self._press_at = None
         self._press_moved = False
@@ -466,10 +480,22 @@ class CortexTrainingLogTUI(App):
     # of its own, once the list is on screen, rather than one with drawing it.
     _FREEZE_HEAP_AFTER_SECONDS = 1.0
 
+    def first_view_drawn(self, view: str) -> None:
+        """UI thread. A screen drew its first data: ``job_list``, or ``job`` (the job a
+        screen read). For the screen the TUI opened with, the first time, report how long
+        the TUI took to get there (see :func:`telemetry.report_startup`)."""
+        if self._startup_reported or self.launched_at is None:
+            return
+        if view != ("job" if self._job_id else "job_list"):
+            return  # a later screen's: its wait began with a key press, not the launch
+        self._startup_reported = True
+        report_startup(self._client, view, self.launched_at, self.client_ready_at)
+
     def job_list_drawn(self, screen: Screen) -> None:
         """A job list drew the jobs it loaded. The first time, freeze the heap
         soon after (see :func:`_freeze_heap`): the list's records and rows are
         most of it by then."""
+        self.first_view_drawn("job_list")
         if self._heap_frozen or self.is_headless:
             return
         self._heap_frozen = True
@@ -582,8 +608,8 @@ class CortexTrainingLogTUI(App):
         kept = self.screen.selections
         if isinstance(event, events.MouseUp) and self._dragged:
             # A drag isn't a click: Textual makes one of any press and release on one
-            # widget, which toggled the header, picked a list item, switched a tab,
-            # or opened or folded the job on a table's row; and it drops the highlight
+            # widget, which picked a list item, switched a tab, or opened or folded
+            # the job on a table's row; and it drops the highlight
             # when the button comes up where it went down, as a drag let go straight
             # out past the edge of its area does (see above).
             self._mouse_down_widget = None
