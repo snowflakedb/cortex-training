@@ -317,7 +317,7 @@ _TEMPLATES = Path(__file__).resolve().parent / "fixtures" / "chat_templates"
 
 @pytest.mark.parametrize(
     "template",
-    # From Qwen/Qwen3.5-2B, Qwen/Qwen3.5-4B, and Qwen/Qwen3.8-27B, which Qwen3.8-Flash-Next shares.
+    # From Qwen/Qwen3.5-2B, Qwen/Qwen3.5-4B, and Qwen/Qwen3.8-27B.
     ["qwen3.5-2b.jinja", "qwen3.5-4b.jinja", "qwen3.8.jinja"],
 )
 def test_chat_format_matches_vendored_qwen_templates(template):

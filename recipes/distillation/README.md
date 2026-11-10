@@ -79,20 +79,12 @@ uv pip install chromadb
 python -m recipes.distillation.on_policy.train
 ```
 
-The other validated pairs:
+The other validated pair:
 
 ```bash
-# Qwen3.8-Flash-Next -> Qwen3.5-4B (twelve GPUs: the teacher uses eight)
-python -m recipes.distillation.on_policy.train \
-  teacher=Qwen/Qwen3.8-Flash-Next teacher_gpus=8
-
 # Qwen3.8-27B -> Qwen3.5-2B
 python -m recipes.distillation.on_policy.train \
   student=Qwen/Qwen3.5-2B
-
-# Qwen3.8-Flash-Next -> Qwen3.5-2B
-python -m recipes.distillation.on_policy.train \
-  student=Qwen/Qwen3.5-2B teacher=Qwen/Qwen3.8-Flash-Next teacher_gpus=8
 ```
 
 A default run takes about 3 hours: about 4 minutes per training step plus about
@@ -116,10 +108,10 @@ the final checkpoint is saved.
   PrimeIntellect's `wiki_search` environment.
 - **Student:** `Qwen/Qwen3.5-4B` (or `Qwen/Qwen3.5-2B`), full-parameter,
   thinking off.
-- **Teacher:** `Qwen/Qwen3.8-27B` (92.5% on the same evaluation) or
-  `Qwen/Qwen3.8-Flash-Next` (93.5%), thinking off, sampling only.
+- **Teacher:** `Qwen/Qwen3.8-27B` (92.5% on the same evaluation), thinking off,
+  sampling only.
 - **Judge:** `Qwen/Qwen3-30B-A3B`, thinking off, temperature 0, answering yes or
-  no. It is fixed across teachers so their results are comparable.
+  no. It is fixed across runs so their results are comparable.
 
 ## How the jobs are built
 
@@ -175,9 +167,7 @@ about ±4 points, so the table also gives the mean of the last ten evaluations.
 | Teacher → student | Step 0 | Lowest (step) | Mean of steps 31–40 | Step 40 |
 |---|---|---|---|---|
 | Qwen3.8-27B → Qwen3.5-4B (default) | 68.5% | 52.5% (5) | 82.2% | 82.5% |
-| Qwen3.8-Flash-Next → Qwen3.5-4B | 70.0% | 49.5% (6) | 84.7% | 85.5% |
 | Qwen3.8-27B → Qwen3.5-2B | 43.5% | 8.5% (6) | 67.3% | 70.0% |
-| Qwen3.8-Flash-Next → Qwen3.5-2B | 38.0% | 0.0% (5) | 73.9% | 73.5% |
 
 Every run dips around steps 3–8, near the peak learning rate: the student
 starts calling more tools instead of answering, and the share of episodes that
@@ -211,7 +201,7 @@ ended, with a few full transcripts per step.
 | `max_steps=`, `questions_per_step=`, `group_size=` | 40, 32, 4 | Loop size. `group_size` matters only for `reward_coef` |
 | `max_turns=`, `turn_max_tokens=` | 10, 1024 | Episode limits |
 | `lr_schedule=` | `cosine` | Decays to `min_lr_ratio` of the peak after `warmup_steps` (default 2) |
-| `teacher_clip=`, `teacher_clip_negative=` | 3, 1 | Limit how hard any one token is pushed up and down. With a symmetric clip of 3, the Flash-Next → Qwen3.5-2B run stopped answering at step 5 and never recovered; with 1 it recovered by step 10 |
+| `teacher_clip=`, `teacher_clip_negative=` | 3, 1 | Limit how hard any one token is pushed up and down. A symmetric clip of 3 can make a weak student stop answering and never recover |
 | `teacher_tau=` | 1 | Weight of the teacher term |
 | `reward_coef=` | 0 | Adds a group-centred judge reward. `teacher_tau=0 reward_coef=1` runs plain GRPO on that reward with no teacher job |
 | `eval_every=`, `n_eval=`, `eval_samples=` | 5, 100, 2 | Held-out evaluation. Evaluation does not change training |
@@ -259,9 +249,7 @@ lower its `n_gpus`, and pass `job_config=serve.json` instead of `model=` and
   first token of its answer much lower than the first token of another tool
   call, so a weak student can learn to never answer, and then no answer tokens
   remain to correct. Keep `teacher_clip_negative=1`, use a teacher closer to the
-  student (Qwen3.8-27B pushes about half as hard as Flash-Next), or add
-  `reward_coef`. Qwen3.5-0.8B collapsed this way with Flash-Next even with the
-  cap, and only partly recovered with Qwen3.8-27B.
+  student, or add `reward_coef`.
 - A generate request fails because its response is too large (long episodes
   with per-token log probabilities): lower `teacher_prompts_per_request=` for
   teacher scoring, or `max_prompts_per_request=` for rollouts and evaluation.
