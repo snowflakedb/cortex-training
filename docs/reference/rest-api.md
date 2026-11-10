@@ -2888,7 +2888,10 @@ keeping the group's row order. `max_token_len_per_gpu` must be at least
 `prompt_len + max_response_len * cap`, where `prompt_len` is the sequence
 width minus `max_response_len`. A smaller budget is rejected. The batch size
 must be divisible by the number of data-parallel ranks, and a prompt group
-larger than one rank is rejected.
+larger than one rank is rejected. When the batch has no more rows than ranks,
+each rank would get one row, so a request with a prompt group of more than one
+row is rejected rather than split. A request whose groups all have one row is
+accepted.
 
 `prompt_group_ids`, a 1-D vector of one integer per row, names each row's prompt
 group. The same key is what a prompt-mean loss uses for its counts, and clients
