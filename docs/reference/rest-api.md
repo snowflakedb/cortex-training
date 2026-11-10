@@ -699,10 +699,10 @@ Their keys are callback-defined. Callback metrics are reduced across ranks
 according to each callback's reduction rule. A callback metric whose name
 collides with a built-in step field (including `job_id`, `global_steps`,
 `last_lr`, `grad_norm`, and `update_successful`) is dropped and logged by the
-service; it never replaces the built-in field. Callback hook failures and
-cross-rank metric merge failures are fatal: they fail the request the same way
-a training error would. Callbacks must not run collectives; a single-rank raise
-would otherwise hang peers.
+service; it never replaces the built-in field. A hook failure quarantines that
+callback for the rest of the step. If ranks return an incomplete or inconsistent
+callback metric set, the service skips the whole set and still returns the
+successful training result. Callbacks must not run collectives inside hooks.
 
 When `training_config.debug.router_stats_sample_stride` is greater than `0`,
 the result includes top-level `router_stats`. Each key is a router module name;
