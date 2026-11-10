@@ -73,8 +73,8 @@ renderers, so with a thinking-off default pass `enable_thinking=true` or
   GPU optimizer state and offload activations to CPU.
   Sampling uses BF16/TP8 on eight H200s and the native
   `inkling` tokenizer. Served LoRA targets are `wq_du`/`wv_dv`, with
-  `INKLING_MULTIMEM_AR=0`. Router replay is disabled. On EFA, cross-node
-  training uses `prime_rl.ep_comm_backend="uccl"` with an EFA-enabled runtime.
+  `INKLING_MULTIMEM_AR=0`. Router replay is disabled. Full-parameter training
+  uses NCCL; LoRA on EFA uses `prime_rl.ep_comm_backend="uccl"` with an EFA-enabled runtime.
 - **Gemma 4 31B:** both training tiers use SDPA. Full-attention layers have head
   dimension 512, which FlashAttention 3 rejects. Gemma 3 and MedGemma keep
   FlashAttention 3; every one of their layers is 256.
