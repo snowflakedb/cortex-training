@@ -10,7 +10,6 @@ models:
   - Qwen/Qwen3.5-4B
 teacher_models:
   - Qwen/Qwen3.8-27B
-  - Qwen/Qwen3.8-Flash-Next
 judge_models:
   - Qwen/Qwen3-30B-A3B
 datasets:
@@ -26,5 +25,5 @@ provenance:
   project: thinking-machines-lab/tinker-cookbook
   recipe: tinker_cookbook/distillation/train_on_policy.py
 # The README results are full-parameter 40-step runs with the same job settings
-# (student 1 + 1 GPUs at lr 1e-6, teacher and judge on 2 GPUs, Flash-Next on 8).
+# (student 1 + 1 GPUs at lr 1e-6, teacher and judge on 2 GPUs).
 last_validated: 2026-10-22

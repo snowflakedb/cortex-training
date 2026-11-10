@@ -57,15 +57,6 @@ EXPECTED_FILES = {
         "standard/h200-inference-full",
         "standard/h200-training-full",
     ],
-    "Qwen/Qwen3.8-Flash-Next": [
-        "standard/h200-inference-full",
-        "standard/h200-inference-lora",
-        "standard/h200-training-full",
-        "standard/h200-training-lora",
-        "long/h200-inference-full",
-        "long/h200-training-full",
-        "long/h200-training-lora",
-    ],
     "deepseek-ai/DeepSeek-V4.1-Flash-1017": [
         "standard/h200-inference-lora",
         "standard/h200-training-full",
@@ -121,11 +112,11 @@ def _config(body: dict) -> dict:
 
 def test_checked_in_catalog_is_valid():
     assert validate_catalog() == {
-        "models": 22,
-        "files": 106,
-        "training": 52,
-        "inference": 54,
-        "rl": 49,
+        "models": 21,
+        "files": 99,
+        "training": 48,
+        "inference": 51,
+        "rl": 46,
         "distillation": 1,
     }
 
@@ -150,7 +141,6 @@ def test_catalog_models_include_license_links():
         "Qwen/Qwen3.8-27B": "Apache 2.0",
         "Qwen/Qwen3-30B-A3B": "Apache 2.0",
         "Qwen/Qwen3-4B-Instruct-2507": "Apache 2.0",
-        "Qwen/Qwen3.8-Flash-Next": "Apache 2.0",
         "deepseek-ai/DeepSeek-V4.1-Flash-1017": "MIT",
         "openai/gpt-oss-120b": "Apache 2.0",
         "google/gemma-3-4b-it": "Gemma",
@@ -176,7 +166,6 @@ def test_moe_models_record_router_replay_geometry():
     assert {model_id: moe for model_id, (architecture, moe) in geometry.items() if architecture == "moe"} == {
         "Qwen/Qwen3-30B-A3B": {"num_moe_layers": 48, "topk": 8, "num_experts": 128},
         "Qwen/Qwen3.6-35B-A3B": {"num_moe_layers": 40, "topk": 8, "num_experts": 256},
-        "Qwen/Qwen3.8-Flash-Next": {"num_moe_layers": 48, "topk": 10, "num_experts": 512},
         "deepseek-ai/DeepSeek-V4.1-Flash-1017": {"num_moe_layers": 40, "topk": 6, "num_experts": 384},
         "openai/gpt-oss-120b": {"num_moe_layers": 36, "topk": 4, "num_experts": 128},
         "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": {"num_moe_layers": 23, "topk": 6, "num_experts": 128},
@@ -208,8 +197,6 @@ def test_validation_dates_match_completed_live_smokes():
         ("Qwen/Qwen3.6-35B-A3B", "standard/h200-training-lora"): "2026-11-05",
         ("Qwen/Qwen3.8-27B", "long/h200-training-full"): "2026-09-02",
         ("Qwen/Qwen3.8-27B", "long/h200-training-lora"): "2026-09-02",
-        ("Qwen/Qwen3.8-Flash-Next", "long/h200-training-full"): "2026-11-05",
-        ("Qwen/Qwen3.8-Flash-Next", "long/h200-training-lora"): "2026-11-05",
         ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "long/h200-training-full"): "2026-10-23",
         ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "long/h200-training-lora"): "2026-10-26",
         ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "standard/h200-training-full"): "2026-10-23",
@@ -276,10 +263,6 @@ def test_files_keep_their_source_sequence_lengths():
         ("Qwen/Qwen3-4B-Instruct-2507", "standard", "training"): 65536,
         ("Qwen/Qwen3-4B-Instruct-2507", "long", "inference"): 262144,
         ("Qwen/Qwen3-4B-Instruct-2507", "long", "training"): 262144,
-        ("Qwen/Qwen3.8-Flash-Next", "standard", "inference"): 65536,
-        ("Qwen/Qwen3.8-Flash-Next", "standard", "training"): 65536,
-        ("Qwen/Qwen3.8-Flash-Next", "long", "inference"): 262144,
-        ("Qwen/Qwen3.8-Flash-Next", "long", "training"): 262144,
         ("google/gemma-3-4b-it", "standard", "inference"): 65536,
         ("google/gemma-3-4b-it", "standard", "training"): 65536,
         ("google/gemma-3-4b-it", "long", "inference"): 131072,
@@ -661,7 +644,7 @@ def _invalid(catalog_dir: Path, match: str) -> str:
 
 
 def test_copied_catalog_is_valid(catalog):
-    assert validate_catalog(catalog)["models"] == 22
+    assert validate_catalog(catalog)["models"] == 21
 
 
 def test_distillation_jobs_build_with_make_distillation_config(catalog):

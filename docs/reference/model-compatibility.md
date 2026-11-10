@@ -19,7 +19,6 @@ for a specific workload.
 | `Qwen/Qwen3.8-27B` | dense | standard, long | standard, long | 262,144 |
 | `Qwen/Qwen3-30B-A3B` | MoE | standard | standard | — |
 | `Qwen/Qwen3.6-35B-A3B` | MoE | standard, long | standard, long | 262,144 |
-| `Qwen/Qwen3.8-Flash-Next` | MoE | standard, long | standard, long | 262,144 |
 | `deepseek-ai/DeepSeek-V4.1-Flash-1017` | MoE | standard, long | standard, long | 262,144 |
 | `openai/gpt-oss-120b` | MoE | — | long | 131,072 |
 | `google/gemma-3-4b-it` | dense | standard, long | standard, long | 131,072 |
@@ -52,7 +51,7 @@ The examples that tokenize prompts pick a chat renderer from tinker-cookbook
   runs models that tinker-cookbook has no renderer for.
 
 tinker-cookbook lists no renderer for Qwen3-0.6B, Qwen3-1.7B, Qwen3.5-2B,
-Qwen3.8-Flash-Next, the Gemma and MedGemma models, or GLM 5.3 Flash BF16, so
+the Gemma and MedGemma models, or GLM 5.3 Flash BF16, so
 pass `renderer_name=` for those; Math GRPO can't run them. Pick a
 renderer from tinker-cookbook's
 [renderer list](https://tinker-docs.thinkingmachines.ai/tutorials/core-concepts/rendering/#available-renderers)
