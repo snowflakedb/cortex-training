@@ -158,3 +158,117 @@ Local regression tests create no jobs:
 ```bash
 python -m pytest tests/test_job_lifecycle.py -q
 ```
+<<<<<<< Updated upstream
+=======
+
+## Reproducible lifecycle sweep
+
+From this directory, run every config in `rl-pairings.json` with three explicit
+inputs:
+
+```bash
+python3 run_lifecycle_sweep.py \
+  --image-tag BASE_IMAGE_TAG \
+  --max-parallel-gpus 128 \
+  --connection-config /path/to/connection.json
+```
+
+This submits live jobs. Add `--dry-run` to print the complete GPU plan without
+connecting or allocating resources. `--output-dir results/RUN_NAME` selects a
+new output directory. `--previous-run results/PREVIOUS_RUN` adds a comparison;
+the previous and new runs must be sibling directories.
+
+Add `--model MODEL` to run only that exact catalog model name; repeat the flag
+to select multiple models, for example `--model gemma-3-4b-it --model medgemma-4b-it`.
+All context/mode pairings for those models retain their catalog order. Unknown
+or empty model names are rejected before an output directory or live connection
+is created. Omitting the flag still runs the full matrix. The manifest records
+`selected_models` in catalog order; repeat those same `--model` flags when
+replaying a subset from archived source.
+
+Use `--config MODEL--CONTEXT--MODE` instead of `--model` to select individual
+pairings, for example `--config gemma-4-31b-it--standard--full`. Repeat the
+flag for multiple configs. Unknown or empty IDs are rejected before allocation.
+The manifest records `selected_configs` in catalog order; use those same
+`--config` flags when replaying an exact config subset.
+
+Add `--budget-scope sweep` when the GPU limit applies only to this sweep,
+not unrelated jobs in the account. In that mode, all training and sampling
+reservations count against the limit, and each backfill is additionally capped
+by available capacity in the requested hardware pool. Less available capacity
+means fewer concurrent configs; configs that do not fit remain queued until
+capacity becomes available. The chosen scope is archived in the manifest and
+ledger and must be retained when replaying the command.
+
+Training and sampling GPUs are reserved together, including during checkpoint
+restore. The default `--budget-scope account` also accounts conservatively for account jobs
+already active at startup. Capacity is sampled before backfilling, and the
+external GPU charge never drops below its confirmed high-water floor during
+the sweep. Higher measured usage is charged immediately; ambiguous ownership
+or over-budget samples pause admission. Known retired sweep allocations are
+discounted only when confirming the floor, not when admitting jobs, so stale
+capacity cannot permanently inflate it. Measured usage, the charged floor,
+reservations, and observed peaks are recorded separately in the ledger.
+Do not submit unrelated jobs to the same account
+during a sweep. Only one sweep command can run for an operating-system user at
+a time, including archived replays.
+Configs are not tuned or retried. The base image tag is pinned on both original
+and restored requests, and its resolved Hopper variant is verified before
+lifecycle operations.
+
+The output includes exact composed requests, input/source snapshots and SHA256
+fingerprints, Python/package versions, a GPU reservation ledger, per-config
+phase reports and failure logs, and an offline `index.html`. Connection contents
+are never copied; only a fingerprint is recorded. The connection file must be
+outside archived source/config files, and connection environment variables do
+not override it. Source or connection changes
+during a sweep stop further admission, and each child verifies its saved request
+and connection fingerprints before submitting. Archived source fingerprints are
+also checked before admitting each child. Cleanup must be confirmed before
+reservations are released. An unrecorded create or unconfirmed cleanup stops further admission
+and retains its reservation for manual reconciliation. Ctrl-C or SIGTERM stops
+admission and waits for active suites to finish and clean up. Children execute
+the archived helper, SDK, suite, and config utilities, not live source files.
+
+Rebuild the compact, searchable red/green report without credentials or jobs:
+
+```bash
+python3 render_report.py results/RUN_NAME
+```
+
+The HTML embeds styles, scripts, phase details, and failure excerpts. Keep the
+results directory for linked raw reports and full execution logs. Reusing the
+same inputs reproduces the requests and test procedure, not deterministic
+service timings or outcomes. To replay the saved source/configs rather than
+the current checkout, run the snapshotted runner with a new output directory
+and the same three inputs, budget scope, and model selection:
+
+```bash
+python3 results/RUN_NAME/inputs/model-catalog/run_lifecycle_sweep.py \
+  --image-tag BASE_IMAGE_TAG --max-parallel-gpus 128 \
+  --connection-config /path/to/connection.json \
+  --output-dir results/REPLAY_NAME
+```
+
+Use the Python/package versions recorded in the manifest. The snapshotted
+`render_report.py` can also rebuild the report. Local sweep/report tests
+allocate no GPUs:
+
+```bash
+python3 -m pytest ../tests/test_lifecycle_sweep.py ../tests/test_lifecycle_report.py -q
+```
+
+Optional browser regression tests use synthetic results and allocate no GPUs.
+Install Playwright and Chromium once, then test the offline report at desktop
+and mobile sizes:
+
+```bash
+uv pip install playwright
+python3 -m playwright install chromium
+python3 -m pytest ../tests/test_lifecycle_report_browser.py -q
+```
+
+Set `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` to use a preinstalled Chromium binary.
+These tests exercise tile geometry, status colors, accessible labels, filters,
+keyboard navigation, and failure details without contacting the service.
+>>>>>>> Stashed changes
