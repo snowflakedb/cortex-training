@@ -134,8 +134,9 @@ training_cap = utils.plan_training_cache_bytes(
 Model-specific job fields are documented in the reference docs:
 
 - MoE LoRA targets attention only: see [LoRA and QLoRA](../../docs/guides/training/lora-and-qlora.md).
-- `prime_rl` versus `model_options`, and `numerics.fp32_parity` (on by default
-  for Qwen3.5-family models; turn it off if a job runs out of memory): see
+- `model_options`, which replaces the deprecated `prime_rl` block, and
+  `numerics.fp32_parity` (on by default for Qwen3.5-family models; turn it off
+  if a job runs out of memory): see
   [REST API `model_options`](../../docs/reference/rest-api.md#model_options).
 
 ## Evaluation and logs
