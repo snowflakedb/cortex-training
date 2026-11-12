@@ -74,7 +74,7 @@ prompts with its own tokenizer.
   `prime_rl.fused_cross_entropy=false`. The `long` tier offloads activations to
   CPU. Sampling serves the MXFP8 checkpoint with TP8 on eight H200s and the
   `inkling` tokenizer, reasoning and tool-call parsers; LoRA sampling runs
-  eager with prefix caching off. Router replay is disabled, and there are no
+  with prefix caching off. Router replay is disabled, and there are no
   full-parameter training files.
 
 - **Gemma 4 31B:** both training tiers use SDPA. Full-attention layers have head

@@ -39,7 +39,6 @@
             "kernel_config": {
               "enable_flashinfer_autotune": false
             },
-            "enforce_eager": true,
             "enable_prefix_caching": false
           }
         }
