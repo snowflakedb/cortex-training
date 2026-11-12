@@ -1,0 +1,14 @@
+id: dpo
+title: Direct Preference Optimization with a custom loss
+status: runnable
+task: alignment
+methods:
+  - dpo
+  - custom-loss
+  - lora
+datasets:
+  - smoke
+  - HuggingFaceH4/ultrafeedback_binarized
+precision:
+  - bfloat16
+last_validated: null

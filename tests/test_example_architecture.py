@@ -23,6 +23,7 @@ DARE_OVERRIDES = EXAMPLES / "sft_quickstart" / "dare" / "overrides.json"
 EXAMPLE_FOLDERS = (
     "sft_quickstart/conversational",
     "sft_quickstart/custom_loss",
+    "dpo_quickstart",
     "sft_quickstart/dare",
     "rl_quickstart/math_grpo",
     "inference",
