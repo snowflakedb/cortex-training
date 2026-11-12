@@ -629,12 +629,14 @@ class JobListScreen(FollowsPointer, Screen):
         yield _JobTable(id="jobs", cursor_type="row", zebra_stripes=False, fixed_columns=self._FIXED_COLUMNS)
         with VerticalScroll(id="nomatch-box"):
             yield Static("", id="nomatch")
-        # One row; its help shows under it while it has focus, so the rows are the list's otherwise.
+        # The box is one row; its help shows above it while it has focus (the rows are the list's
+        # otherwise), so the box stays where it is: the help opening under it moved it up, away from
+        # the pointer, between the clicks of a double-click (and the press and release of one).
+        yield Static("", id="searchhelp")
         yield TextBox(
             placeholder="/ search  ids, owners, models, locations · status:running gpus>=8 gpu:H200 · Esc clears",
             id="jobfilter",
         )
-        yield Static("", id="searchhelp")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -697,7 +699,7 @@ class JobListScreen(FollowsPointer, Screen):
         self._paint_help()
 
     def _paint_help(self) -> None:
-        """The search help under the box, only while the box has focus (its rows are
+        """The search help above the box, only while the box has focus (its rows are
         the list's otherwise), broken between its phrases and wrapped under its start."""
         try:
             widget = self.query_one("#searchhelp", Static)

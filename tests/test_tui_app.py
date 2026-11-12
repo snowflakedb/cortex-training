@@ -2877,6 +2877,32 @@ async def _select_all_in(pilot, box):
     box.value = "qwen"
     await pilot.press("home")
     assert box.cursor_position == 0 and not box.selected_text
+    # As a terminal that reports keys the kitty way sends them, with the text each key makes: Cmd-A
+    # still selects, Cmd-Z types no "z", and AltGr's "@" (ctrl+alt, named without its alt) still types.
+    from textual import events
+
+    for key, text, value, selected in (("super+a", "a", "qwen", "qwen"), ("super+z", "z", "qwen", ""),
+                                       ("ctrl+at", "@", "qwen@", "")):
+        box.value = "qwen"
+        box.cursor_position = 4
+        box.app.post_message(events.Key(key, text))
+        await pilot.pause()
+        assert (box.value, box.selected_text) == (value, selected), key
+    # A double-click selects it all too (where the terminal keeps Cmd-A), and a click only moves
+    # the cursor: through the app, as a terminal's clicks come, so Textual counts the clicks.
+    box.value = "qwen h200"
+    box.cursor_position = 0
+    mouse = _pointer(box.app, pilot)
+    x, y = box.region.x + 4, box.region.y
+    await _click(mouse, x, y)
+    await _click(mouse, x, y)
+    assert box.selected_text == "qwen h200"
+    await pilot.press("x")
+    assert box.value == "x"
+    box.value = "qwen h200"
+    await pilot.pause(0.6)  # past Textual's double-click time: the next click is a first one
+    await _click(mouse, x, y)
+    assert not box.selected_text and box.cursor_position > 0
 
 
 async def _run_select_all_keys_select_the_search_box_s_text():
@@ -2905,6 +2931,37 @@ async def _run_select_all_keys_select_the_log_filter_s_text():
         await _select_all_in(pilot, box)
         assert not app.screen.selections
         await _settle(app, pilot)
+
+
+async def _run_a_double_click_on_the_search_box_from_the_list_selects_its_text():
+    from textual import events
+
+    app = CortexTrainingLogTUI(_client(), poll_interval=0.01)
+    async with app.run_test() as pilot:
+        assert await _wait(pilot, app, lambda: len(getattr(app.screen, "_job_by_item", {})) >= 2)
+        screen = app.screen
+        box = screen.query_one("#jobfilter", Input)
+        box.value = "qwen h200"
+        await pilot.pause()
+        assert app.focused is not box  # the list has focus
+        mouse = _pointer(app, pilot)
+        x, y = box.region.x + 4, box.region.y
+        # The press focuses the box and opens its help, above it: the box stays under the pointer
+        # (the help under it moved it up between the press and the release, and the clicks).
+        await mouse(events.MouseDown, x, y)
+        await pilot.pause()
+        assert app.focused is box and screen.query_one("#searchhelp").display
+        assert box.region.y == y and screen.get_widget_at(x, y)[0] is box
+        await mouse(events.MouseUp, x, y)
+        await _click(mouse, x, y)
+        assert box.selected_text == "qwen h200" and not screen.selections
+        await pilot.press("x")
+        assert box.value == "x"
+        await _settle(app, pilot)
+
+
+def test_a_double_click_on_the_search_box_from_the_list_selects_its_text():
+    asyncio.run(_run_a_double_click_on_the_search_box_from_the_list_selects_its_text())
 
 
 def test_select_all_keys_select_the_log_filter_s_text():

@@ -816,9 +816,28 @@ class _ColoredLinks(Static):
 class TextBox(Input):
     """A one-line text box (the job list's search, the log's filter) whose select-all keys select
     its text: ``ctrl+a`` (Textual's goes to the start, as ``Home`` still does), and ``super+a``, which
-    is Cmd-A where the terminal passes it on. A terminal that keeps Cmd-A selects its whole screen."""
+    is Cmd-A where the terminal passes it on. A terminal that keeps Cmd-A selects its whole screen,
+    so a double-click selects all the text too."""
 
     BINDINGS = [Binding("ctrl+a,super+a", "select_all", "Select all", show=False)]
+
+    def _on_key(self, event: events.Key) -> None:
+        """A key held with Cmd (``super``) is a shortcut for the bindings, never text. A terminal that
+        reports keys the kitty way (VS Code's and Cursor's, for a program that asks, as Textual does)
+        sends such a key's text too, "a" with Cmd-A, and Input types any key that has printable text
+        before a binding can see it: Cmd-A typed an "a", Cmd-C a "c". Only Cmd: the text that comes
+        with ctrl is AltGr's (ctrl+alt, named without its alt), which types what it makes."""
+        if event.is_printable and "super" in event.key.split("+")[:-1]:
+            event.prevent_default()  # Input's typing, not the bindings: the key goes on up to them
+
+    def _on_click(self, event: events.Click) -> None:
+        """A double-click (or a triple) selects all the text, as Cmd-A would where the terminal keeps
+        Cmd-A for itself (Cursor's, VS Code's, macOS Terminal). Textual's own double-click highlights
+        the box on the screen instead, a highlight that typing doesn't replace."""
+        if event.chain >= 2:
+            event.stop()
+            event.prevent_default()  # not Widget's screen highlight
+            self.select_all()
 
 
 class FittedFooter(Footer):
