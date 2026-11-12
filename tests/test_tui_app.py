@@ -6541,6 +6541,23 @@ async def _run_a_search_covers_every_job_read_behind_the_list(c, pager):
         assert await _wait(pilot, app, lambda: screen._match_count == 1, tries=200), screen._match_count
         assert any(key[2] == oldest for key in screen._job_by_item.values())
         assert screen._page_line_text() == f"1 match in all {jobs:,} jobs"
+        # It is a job like any on the page: copied whole, unfolded, and opened (with its sub-jobs).
+        item = next(item for item, key in screen._job_by_item.items() if key[2] == oldest)
+        assert screen.whole_id(item) == oldest
+        await pilot.press("right")
+        await pilot.pause()
+        assert any(job_key[2] == oldest for job_key, _sid in screen._sub_by_item.values()), "the match didn't unfold"
+        await pilot.press("enter")
+        assert await _wait(pilot, app, lambda: isinstance(app.screen, JobSummaryScreen), tries=200), (
+            "Enter on a match no page on screen holds opened nothing")
+        assert app.screen._job_id == oldest
+        app.pop_screen()
+        assert await _wait(pilot, app, lambda: app.screen is screen, tries=200)
+        await pilot.press("down", "enter")  # its first sub-job's row: that sub-job's logs
+        assert await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen), tries=200)
+        assert (app.screen._job_id, app.screen._sub_job_id) == (oldest, f"{oldest}:training:0")
+        app.pop_screen()
+        assert await _wait(pilot, app, lambda: app.screen is screen, tries=200)
 
         # A search matching every job shows them 1,000 in history a page, and ] and [ step through
         # those pages without asking the service anything.
@@ -6576,7 +6593,12 @@ def test_a_search_covers_every_job_read_behind_the_list():
     from tests.test_tui_account import _Paged
 
     pager = _Paged(3 * ACCOUNT_LIST_CAP + 300)
+    oldest = pager.jobs[-1]  # the match no page on screen holds: a job with sub-jobs, to unfold and open
+    oldest["sub_jobs"] = [{"sub_job_id": f"{oldest['job_id']}:{kind}:0", "job_type": kind, "status": "DONE"}
+                          for kind in ("training", "sampling")]
     c = _client()
+    c.for_job.return_value = c  # its own location's client: the base one here
+    c.get_job.side_effect = lambda job_id, **_kwargs: dict(next(job for job in pager.jobs if job["job_id"] == job_id))
     c.list_jobs_page.side_effect = pager.list_jobs_page
     asyncio.run(_run_a_search_covers_every_job_read_behind_the_list(c, pager))
 

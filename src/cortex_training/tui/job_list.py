@@ -600,6 +600,9 @@ class JobListScreen(FollowsPointer, Screen):
         self._poll_interval = poll_interval
         self._now = now  # fixed clock for tests/screenshots; None = wall clock
         self._job_by_item: dict[str, tuple] = {}
+        # Job key -> the record of each job the table draws: the list's own, or a search's match
+        # from the jobs read behind it (see _job_for).
+        self._drawn: dict[tuple, dict] = {}
         self._jobs_by_key: dict[tuple, dict] = {}
         self._sub_by_item: dict[str, tuple] = {}
         self._all_jobs: list = []
@@ -1447,14 +1450,20 @@ class JobListScreen(FollowsPointer, Screen):
         self._match_page = 1
         self._render_jobs(top=True)
 
+    def _job_for(self, job_key) -> dict | None:
+        """The record of a job the table draws: from the page on screen, or (a search's match) from
+        the jobs read behind it, which no page on screen holds."""
+        job = self._jobs_by_key.get(job_key)
+        return job if job is not None else self._drawn.get(job_key)
+
     def whole_id(self, key) -> str | None:
         """The whole id of the job or sub-job on row ``key`` (a sub-job's row shows its label there)."""
         if key in self._job_by_item:
-            job = self._jobs_by_key.get(self._job_by_item[key])
+            job = self._job_for(self._job_by_item[key])
             return views.job_id_of(job) if job is not None else None
         sub = self._sub_by_item.get(key)  # (job key, sub-job id)
         if sub:
-            job = self._jobs_by_key.get(sub[0])
+            job = self._job_for(sub[0])
             return sub[1] if sub[1] else (views.job_id_of(job) if job is not None else None)
         return None
 
@@ -1557,18 +1566,20 @@ class JobListScreen(FollowsPointer, Screen):
 
     def _toggle(self, job_key, unfold: bool | None) -> bool:
         """Unfold (True) or fold (False) a job, or (None) switch it; whether it did."""
-        job = self._jobs_by_key.get(job_key)
+        job = self._job_for(job_key)
         if job is None or not self._expandable(job) or self._is_expanded(job) == unfold:
             return False
         self._unfold(job_key, not self._is_expanded(job))
         return True
 
     def action_expand_all(self) -> None:
-        with_subs = [j for j in self._in_view(self._all_jobs) if self._expandable(j)]
+        # The jobs listed: during a search, every job it covers, the ones read behind the page too.
+        listed = self._in_view(self._corpus() if self._searching() else self._all_jobs)
+        with_subs = [j for j in listed if self._expandable(j)]
         # Every job folded, or every one unfolded: those listed since too; a fold or unfold
         # after it is the job's own.
         self._all_folded[self._deployments] = bool(with_subs) and all(self._is_expanded(j) for j in with_subs)
-        for job in self._in_view(self._all_jobs):
+        for job in listed:
             self._expanded.discard(self._job_key(job))
             self._collapsed.discard(self._job_key(job))
         self._render_jobs()
@@ -1839,16 +1850,22 @@ class JobListScreen(FollowsPointer, Screen):
         if not isinstance(job, dict):
             return
         key = self._job_key(job)
-        current = self._jobs_by_key.get(key)
+        archive = self._archive
+        current = self._job_for(key)
+        if current is None and archive is not None:
+            current = archive.jobs.get(key)
         if current is None:
             return
         fresh = views.refresh_job(current, job)
         if fresh == current:
             return
-        self._all_jobs = [fresh if j is current else j for j in self._all_jobs]
-        self._jobs_by_key[key] = fresh
-        if self._archive is not None and key in self._archive.jobs:
-            self._archive.add([fresh], self._job_key, fresher=True)
+        if key in self._jobs_by_key:  # on the page on screen
+            self._all_jobs = [fresh if j is current else j for j in self._all_jobs]
+            self._jobs_by_key[key] = fresh
+        if key in self._drawn:
+            self._drawn[key] = fresh
+        if archive is not None and key in archive.jobs:  # read behind the list: a search finds it fresh
+            archive.add([fresh], self._job_key, fresher=True)
 
     # ─── rows ────────────────────────────────────────────────────────────────
 
@@ -2313,6 +2330,7 @@ class JobListScreen(FollowsPointer, Screen):
         plan: list = []
         job_by_item: dict = {}
         sub_by_item: dict = {}
+        drawn: dict = {}
         target_row = None
         groups = (("LIVE", live), ("HISTORY", shown_history))
         if self._sort == "status" and not self._descending:
@@ -2328,6 +2346,7 @@ class JobListScreen(FollowsPointer, Screen):
                 job_key = self._job_key(job)
                 item_id = self._row_key(job_key)
                 job_by_item[item_id] = job_key
+                drawn[job_key] = job
                 rows = self._job_rows(job, layout)
                 plan.append((item_id, rows.row))
                 if job_key == keep and target_row is None:
@@ -2343,6 +2362,7 @@ class JobListScreen(FollowsPointer, Screen):
                         target_row = len(plan) - 1
         self._job_by_item = job_by_item
         self._sub_by_item = sub_by_item
+        self._drawn = drawn
         # Reuse identical row objects, or reorder them without rebuilding; new widths alone
         # (a column dragged, the screen resized) change the columns in place.
         if self._layout is not None and self._layout.labels == layout.labels:
@@ -2417,7 +2437,7 @@ class JobListScreen(FollowsPointer, Screen):
         self._set_columns(table, layout)
         table.clear()
         self._shown = None
-        self._job_by_item, self._sub_by_item = {}, {}
+        self._job_by_item, self._sub_by_item, self._drawn = {}, {}, {}
         table.display = False
         self._show_nomatch(message)
 
@@ -2445,7 +2465,9 @@ class JobListScreen(FollowsPointer, Screen):
         if str(key).startswith("note-"):  # an UNKNOWN job's note line stands for its job
             key = str(key).removeprefix("note-")
         if key in self._job_by_item:
-            job = self._jobs_by_key.get(self._job_by_item[key])
+            job = self._job_for(self._job_by_item[key])
+            if job is None:
+                return  # drawn no more (a refresh between the press and this)
             # Every call about the job goes to its own database and schema.
             client = self._job_client(job)
             if client is not None:
@@ -2454,7 +2476,9 @@ class JobListScreen(FollowsPointer, Screen):
                                                       poll_interval=self._poll_interval, on_job=self.job_fetched))
         elif key in self._sub_by_item:
             job_key, sid = self._sub_by_item[key]
-            job = self._jobs_by_key.get(job_key)
+            job = self._job_for(job_key)
+            if job is None:
+                return
             client = self._job_client(job)
             if client is not None:
                 jid = views.job_id_of(job)
