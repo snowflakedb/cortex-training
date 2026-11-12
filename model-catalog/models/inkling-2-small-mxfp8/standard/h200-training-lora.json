@@ -1,0 +1,92 @@
+{
+  "hardware": "H200",
+  "sub_job_configs": [
+    {
+      "job_type": "training",
+      "model_name": "thinkingmachines/Inkling-2-Small-MXFP8",
+      "dtype": "bfloat16",
+      "seed": 42,
+      "training_config": {
+        "n_gpus": 32,
+        "max_seq_len": 65536,
+        "train_batch_size": 4,
+        "gradient_clipping": 1.0,
+        "model_provider": "arctic",
+        "attn_implementation": "flex_attention",
+        "activation_checkpointing": true,
+        "ep_size": 32,
+        "sp_size": 8,
+        "ac_config": {
+          "router_replay_recompute": false,
+          "offload_config": {
+            "keep_last_n": 1,
+            "tensor_size_threshold": 1048576
+          },
+          "combine_replay": true
+        },
+        "optimizer": {
+          "name": "AdamW",
+          "lr": 0.0001,
+          "weight_decay": 0.0,
+          "betas": [
+            0.9,
+            0.999
+          ],
+          "eps": 1e-08
+        },
+        "ds_config": {
+          "train_batch_size": 4,
+          "train_micro_batch_size_per_gpu": 1,
+          "gradient_accumulation_steps": 1,
+          "zero_optimization": {
+            "stage": 2
+          },
+          "bf16": {
+            "enabled": true
+          },
+          "data_types": {
+            "grad_accum_dtype": "fp32"
+          }
+        },
+        "peft_config": {
+          "peft_type": "Lora",
+          "task_type": "CAUSAL_LM",
+          "r": 16,
+          "lora_alpha": 32,
+          "lora_dropout": 0.0,
+          "bias": "none",
+          "target_modules": [
+            "wq_du",
+            "wv_dv"
+          ],
+          "target_parameters": [
+            "experts.w1",
+            "experts.w2",
+            "experts.w3"
+          ]
+        },
+        "router_replay": {
+          "enabled": false
+        },
+        "model_options": {
+          "checkpointing": {
+            "mode": "full",
+            "freq": 1,
+            "offload": false
+          },
+          "moe": {
+            "comm_backend": "uccl",
+            "grouped_mm": true,
+            "comm_token_chunk": 2048
+          },
+          "lm_head": {
+            "cross_entropy": false,
+            "token_chunk_size": 2048
+          }
+        },
+        "cuda_allocator_conf": "expandable_segments:True"
+      }
+    }
+  ]
+}
+
