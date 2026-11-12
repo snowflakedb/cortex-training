@@ -30,6 +30,7 @@ for a specific workload.
 | `zai-org/GLM-5.3-Flash-BF16` | MoE | standard, long | standard, long | 262,144 |
 | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` | MoE | standard, long | standard, long | 262,144 |
 | `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16` | MoE | standard, long | standard, long | 262,144 |
+| `thinkingmachines/Inkling-2-Small-MXFP8` | MoE | standard, long | standard, long | 262,144 |
 
 `standard` and `long` are each model's smaller and larger `max_seq_len` tiers,
 so the boundary differs between models. Most trainable models have LoRA and full
@@ -59,9 +60,22 @@ whose chat template matches the model's own (its `tokenizer_config.json` on
 Hugging Face); a mismatched template trains and samples on the wrong format.
 Qwen3-4B-Instruct, GLM 5.3, GLM 5.3 Flash and gpt-oss have only thinking
 renderers, so with a thinking-off default pass `enable_thinking=true` or
-`renderer_name=`.
+`renderer_name=`. No tinker-cookbook renderer matches Inkling 2 Small's
+tokenizer, so the examples that tokenize prompts don't run it; build its
+prompts with its own tokenizer.
 
 ## Model notes
+
+- **Inkling 2 Small:** LoRA training uses the `arctic` provider and
+  FlexAttention on 32 H200s across four nodes (EP32/SP8, ZeRO-2), with
+  rank-16 adapters on the attention `wq_du`/`wv_dv` projections and the routed
+  experts (`experts.w1`/`w2`/`w3`). Expert parallelism uses UCCL with a
+  2,048-token MoE chunk, and the LM head is chunked at 2,048 tokens with
+  `prime_rl.fused_cross_entropy=false`. The `long` tier offloads activations to
+  CPU. Sampling serves the MXFP8 checkpoint with TP8 on eight H200s and the
+  `inkling` tokenizer, reasoning and tool-call parsers; LoRA sampling runs
+  eager with prefix caching off. Router replay is disabled, and there are no
+  full-parameter training files.
 
 - **Gemma 4 31B:** both training tiers use SDPA. Full-attention layers have head
   dimension 512, which FlashAttention 3 rejects. Gemma 3 and MedGemma keep

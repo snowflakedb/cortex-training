@@ -44,6 +44,14 @@ _FULL_STANDARD_LONG = [
     "long/h200-training-full",
 ]
 EXPECTED_FILES = {
+    "thinkingmachines/Inkling-2-Small-MXFP8": [
+        "standard/h200-inference-full",
+        "standard/h200-inference-lora",
+        "standard/h200-training-lora",
+        "long/h200-inference-full",
+        "long/h200-inference-lora",
+        "long/h200-training-lora",
+    ],
     "Qwen/Qwen3-0.6B": _TRAINABLE_STANDARD,
     "Qwen/Qwen3-1.7B": _TRAINABLE_STANDARD,
     "Qwen/Qwen3-4B-Instruct-2507": _FULL_STANDARD_LONG,
@@ -112,11 +120,11 @@ def _config(body: dict) -> dict:
 
 def test_checked_in_catalog_is_valid():
     assert validate_catalog() == {
-        "models": 21,
-        "files": 99,
-        "training": 48,
-        "inference": 51,
-        "rl": 46,
+        "models": 22,
+        "files": 105,
+        "training": 50,
+        "inference": 55,
+        "rl": 48,
         "distillation": 1,
     }
 
@@ -131,6 +139,7 @@ def test_catalog_models_include_license_links():
     licenses = {model_id: info["license"] for model_id, (_, info) in _models().items()}
 
     assert {model_id: license["name"] for model_id, license in licenses.items()} == {
+        "thinkingmachines/Inkling-2-Small-MXFP8": "Apache 2.0",
         "Qwen/Qwen3-0.6B": "Apache 2.0",
         "Qwen/Qwen3-1.7B": "Apache 2.0",
         "Qwen/Qwen3-8B": "Apache 2.0",
@@ -164,6 +173,7 @@ def test_moe_models_record_router_replay_geometry():
     }
 
     assert {model_id: moe for model_id, (architecture, moe) in geometry.items() if architecture == "moe"} == {
+        "thinkingmachines/Inkling-2-Small-MXFP8": {"num_moe_layers": 48, "topk": 8, "num_experts": 384},
         "Qwen/Qwen3-30B-A3B": {"num_moe_layers": 48, "topk": 8, "num_experts": 128},
         "Qwen/Qwen3.6-35B-A3B": {"num_moe_layers": 40, "topk": 8, "num_experts": 256},
         "deepseek-ai/DeepSeek-V4.1-Flash-1017": {"num_moe_layers": 40, "topk": 6, "num_experts": 384},
@@ -213,6 +223,10 @@ def test_validation_dates_match_completed_live_smokes():
         ("zai-org/GLM-5.3-Flash", "long/h200-training-lora"): "2026-10-20",
         ("zai-org/GLM-5.3-Flash-BF16", "long/h200-inference-full"): "2026-10-20",
         ("zai-org/GLM-5.3-Flash-BF16", "long/h200-training-full"): "2026-10-20",
+        ("thinkingmachines/Inkling-2-Small-MXFP8", "long/h200-inference-lora"): "2026-11-12",
+        ("thinkingmachines/Inkling-2-Small-MXFP8", "long/h200-training-lora"): "2026-11-12",
+        ("thinkingmachines/Inkling-2-Small-MXFP8", "standard/h200-inference-lora"): "2026-11-12",
+        ("thinkingmachines/Inkling-2-Small-MXFP8", "standard/h200-training-lora"): "2026-11-12",
     }
 
 
@@ -224,6 +238,10 @@ def test_files_keep_their_source_sequence_lengths():
     }
 
     assert lengths == {
+        ("thinkingmachines/Inkling-2-Small-MXFP8", "standard", "inference"): 65536,
+        ("thinkingmachines/Inkling-2-Small-MXFP8", "standard", "training"): 65536,
+        ("thinkingmachines/Inkling-2-Small-MXFP8", "long", "inference"): 262144,
+        ("thinkingmachines/Inkling-2-Small-MXFP8", "long", "training"): 262144,
         ("Qwen/Qwen3-0.6B", "standard", "inference"): 32768,
         ("Qwen/Qwen3-0.6B", "standard", "training"): 32768,
         ("Qwen/Qwen3-1.7B", "standard", "inference"): 32768,
@@ -644,7 +662,7 @@ def _invalid(catalog_dir: Path, match: str) -> str:
 
 
 def test_copied_catalog_is_valid(catalog):
-    assert validate_catalog(catalog)["models"] == 21
+    assert validate_catalog(catalog)["models"] == 22
 
 
 def test_distillation_jobs_build_with_make_distillation_config(catalog):

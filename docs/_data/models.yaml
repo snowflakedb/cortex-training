@@ -130,3 +130,7 @@ models:
       - inference-endpoint
       - math-grpo
     last_validated: 2026-09-02
+  - id: thinkingmachines/Inkling-2-Small-MXFP8
+    training: true
+    inference: true
+    last_validated: 2026-11-12
