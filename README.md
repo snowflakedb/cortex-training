@@ -11,6 +11,7 @@
 
 ## Latest News
 
+* [2026/11] [Inkling 2 Small from Thinking Machines Lab Is Now Available in Snowflake Cortex Training](https://www.snowflake.com/en/blog/inkling-2-small-snowflake-cortex-training/)
 * [2026/11] [Cortex Training Public Preview blog](https://www.snowflake.com/en/blog/cortex-training-fine-tune-open-weight-llms/)
 
 ---
