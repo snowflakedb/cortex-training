@@ -1169,6 +1169,47 @@ When per-step peak-memory reporting is enabled (see
 current `/forward-backward` plus `/step` cycle; `cpu_peak` is rank 0's current
 process RSS. The key is absent when the setting is disabled.
 
+Training callbacks may add top-level fields to a successful `/step` result.
+Their keys are callback-defined. Callback metrics are reduced across ranks
+according to each callback's reduction rule. A callback metric whose name
+collides with a built-in step field (including `job_id`, `global_steps`,
+`last_lr`, `grad_norm`, and `update_successful`) is dropped and logged by the
+service; it never replaces the built-in field. A hook failure quarantines that
+callback for the rest of the step. If ranks return an incomplete or inconsistent
+callback metric set, the service skips the whole set and still returns the
+successful training result. Callbacks must not run collectives inside hooks.
+
+When `training_config.debug.router_stats_sample_stride` is greater than `0`,
+the result includes top-level `router_stats`. Each key is a router module name;
+each value contains world-summed `tokens_per_expert`, `sampled_tokens`,
+`entropy_sum`, `replayed_tokens`, and `replay_agreement_sum` collected since
+the previous `/step`, including forward-only calls:
+
+```json
+{
+  "global_steps": 12,
+  "last_lr": 0.00002,
+  "router_stats": {
+    "model.layers.0.mlp.router": {
+      "tokens_per_expert": [128.0, 96.0],
+      "sampled_tokens": 1024.0,
+      "entropy_sum": 1536.0,
+      "replayed_tokens": 0.0,
+      "replay_agreement_sum": 0.0
+    }
+  }
+}
+```
+
+`router_stats_sample_stride` samples every Nth token and defaults to `0`
+(disabled). `training_config.debug.router_stats_call_stride` observes every Nth
+router call and defaults to `1`. Both are JSON integers;
+`router_stats_sample_stride` must be at least `0`, and
+`router_stats_call_stride` must be at least `1`. A frozen model still flushes
+callback metrics on `/step`: it reports `"grad_norm": null`, returns metrics
+collected since the previous `/step`, and clears them so the next step starts a
+new metrics window.
+
 ### 6.3 Save checkpoint - `POST /{job_id}/save`
 
 ```json
