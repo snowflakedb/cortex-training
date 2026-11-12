@@ -85,7 +85,7 @@ def line_parts(sign_in: Any, identity: Optional[Identity], version: str, *,
         parts.append(("profile", sign["profile"]))
     elif kind in ("pat", "url") and sign.get("config"):
         parts.append(("config", _home_relative(sign["config"])))
-    elif kind == "pat" and sign.get("host"):
+    elif kind in ("pat", "ci") and sign.get("host"):
         parts.append(("host", sign["host"]))
     elif kind == "url" and sign.get("base_url"):
         parts.append(("base URL", sign["base_url"]))

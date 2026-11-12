@@ -15,19 +15,15 @@
 
 """Open a client from the same sources, in the same order, as the CLI and TUI.
 
-Resolution order (first match wins):
+Every connection goes through the connection picker (as ``from_configs()``):
+``connection``, then the profile saved by ``cortex-training login``, then the
+Snowflake default profile, then ``CORTEX_TRAINING_HOST`` + ``CORTEX_TRAINING_PAT``
+when no profile exists (CI). ``CORTEX_TRAINING_BASE_URL`` reaches a local or mock
+server instead.
 
-1. ``connection`` (or ``CORTEX_TRAINING_CONNECTION``, deprecated): a named profile.
-2. ``config`` (or ``CORTEX_TRAINING_CONFIG``): a legacy JSON file. Deprecated.
-3. Complete direct credentials from the environment (``base_url``, or
-   ``host`` plus ``pat``, plus ``database``). ``SNOWFLAKE_HOST``/``_PAT`` are
-   deprecated.
-4. ``login.json``, written by the old ``cortex-training login PATH``. Deprecated.
-5. Otherwise the connection picker (as ``from_configs()``): the profile saved by
-   ``cortex-training login``, then the Snowflake default profile.
-
-The older forms still work, as a fallback, and log a warning that they will be
-deprecated in a future release.
+An old JSON config (``CORTEX_TRAINING_CONFIG``, or the ``login.json`` the old
+``cortex-training login PATH`` wrote) raises :class:`~cortex_training.cli.commands.OldConfigFile`,
+which names the command that converts it into a profile.
 
 The logic lives in :func:`cortex_training.cli.commands._resolve_args`; this module only
 adapts it for library callers so examples and the CLI cannot drift apart.
@@ -61,7 +57,6 @@ _OVERRIDABLE = frozenset(
     }
 )
 
-_DIRECT_SOURCE = "environment variables or arguments"
 _DEFAULT_PROFILE_SOURCE = "default Snowflake connection profile"
 
 
@@ -88,36 +83,31 @@ class ResolvedConnection:
 
 
 def resolve_connection(
-    config: str | None = None,
     connection: str | None = None,
     *,
     default_database: str | None = None,
-    strict_config: bool = True,
     overrides: Mapping[str, Any] | None = None,
 ) -> ResolvedConnection:
-    """Open a client using the CLI's resolution order.
+    """Open a client the way the CLI does.
 
-    ``config`` and ``connection`` are explicit arguments and win over their
-    environment variables. ``default_database`` is used only for PAT or legacy
-    JSON connections that do not name a database; it never replaces a profile's
-    database. ``strict_config=False`` ignores unknown keys in the JSON file, which
-    examples have always accepted. ``overrides`` takes keys listed in
-    ``_OVERRIDABLE``.
+    ``connection`` names a profile. ``default_database`` is used only for a
+    ``CORTEX_TRAINING_BASE_URL`` server that names no database. ``overrides``
+    takes keys listed in ``_OVERRIDABLE``.
     """
-    args = _resolved_args(config, connection, default_database=default_database, strict_config=strict_config, overrides=overrides)
+    args = _resolved_args(connection, default_database=default_database, overrides=overrides)
     client = _cli.build_client(args, CortexTrainingClient)
-    for note in args._deprecations:
+    for note in args._warnings:
         logger.warning("%s", note)
     if args.use_connection_profile:
-        resolution = getattr(args, "resolution", None) or _cli._picker_choice(args)
+        resolution = args.resolution
         # A profile that signs in with a PAT holds the same token an old JSON file did.
         pat = profile_pat(resolution.profile) if resolution.profile else resolution.pat
     else:
-        pat = None if args.base_url else args.pat
+        pat = None
     return ResolvedConnection(
         client=client,
         source=_source_label(args),
-        host=_host_of(args, client),
+        host=_host_of(client),
         database=client.database,
         schema=client.schema,
         verify_ssl=not args.no_verify_ssl,
@@ -126,24 +116,20 @@ def resolve_connection(
 
 
 def _resolved_args(
-    config: str | None,
     connection: str | None,
     *,
     default_database: str | None,
-    strict_config: bool,
     overrides: Mapping[str, Any] | None,
 ) -> argparse.Namespace:
-    """The CLI's resolution of ``config`` and ``connection``, checked, without signing in."""
-    if config and connection:
-        raise ValueError("pass either config= or connection=, not both")
+    """The CLI's resolution of ``connection``, checked, without signing in."""
     extra = dict(overrides or {})
     unknown = set(extra) - _OVERRIDABLE
     if unknown:
         raise TypeError(f"unsupported connection override(s): {', '.join(sorted(unknown))}")
 
     args = argparse.Namespace(
-        config=config or _cli._env("CORTEX_TRAINING_CONFIG"),
-        connection=connection or _cli._env("CORTEX_TRAINING_CONNECTION"),
+        config=None,
+        connection=connection,
         base_url=None,
         host=None,
         pat=None,
@@ -155,7 +141,6 @@ def _resolved_args(
         no_verify_ssl=False,
         max_retries=None,
         request_timeout=None,
-        _strict_config=strict_config,
     )
     for name, value in extra.items():
         setattr(args, name, value)
@@ -163,17 +148,9 @@ def _resolved_args(
     args = _cli._resolve_args(args)
     args = _cli._normalize_connection_args(args)
     if not args.use_connection_profile:
-        if not args.database and default_database:
-            args.database = default_database
+        args.database = args.database or default_database
         if not args.database:
-            raise ValueError(
-                "connection needs a database: set `database` in the config file, "
-                "or CORTEX_TRAINING_DATABASE"
-            )
-        if args.base_url is None and (args.host is None or args.pat is None):
-            raise ValueError(
-                "connection needs `host` and `pat` (or `base_url` for local use)"
-            )
+            raise ValueError("CORTEX_TRAINING_BASE_URL needs a database: set CORTEX_TRAINING_DATABASE")
     return args
 
 
@@ -199,7 +176,7 @@ class PatCredentials:
     schema: str
     # Human-readable origin, e.g. ``connection profile 'training'``.
     source: str
-    # Deprecation notes for an old connection form, for the caller to show.
+    # Warnings for a variable the old connection lookup read, for the caller to show.
     notes: tuple[str, ...] = ()
 
 
@@ -217,25 +194,20 @@ def pat_credentials(
     from cortex_training import _picker
     from cortex_training.client.auth import rest_host
 
-    args = _resolved_args(
-        None, connection, default_database=default_database or _picker.DEFAULT_DATABASE, strict_config=False, overrides=None
-    )
+    args = _resolved_args(connection, default_database=default_database or _picker.DEFAULT_DATABASE, overrides=None)
     if args.base_url:
         raise ValueError("a base_url connection (a local or mock server) has no PAT to export")
-    if args.use_connection_profile:
-        resolution = args.resolution = _cli._picker_choice(args)
-        if resolution.profile is None:
-            host, pat = resolution.host, resolution.pat
-        else:
-            from cortex_training import _profiles
-
-            values = _profiles.read_profiles().get(resolution.profile) or {}
-            pat = profile_pat(resolution.profile)
-            account = values.get("account")
-            host = values.get("host") or (f"{account}.snowflakecomputing.com" if account else None)
-        database, schema = resolution.database, resolution.schema
+    resolution = args.resolution = _cli._picker_choice(args)
+    if resolution.profile is None:
+        host, pat = resolution.host, resolution.pat
     else:
-        host, pat, database, schema = args.host, args.pat, args.database, args.schema or "PUBLIC"
+        from cortex_training import _profiles
+
+        values = _profiles.read_profiles().get(resolution.profile) or {}
+        pat = profile_pat(resolution.profile)
+        account = values.get("account")
+        host = values.get("host") or (f"{account}.snowflakecomputing.com" if account else None)
+    database, schema = resolution.database, resolution.schema
     source = _source_label(args)
     if not pat:
         raise ValueError(
@@ -251,7 +223,7 @@ def pat_credentials(
         database=database,
         schema=schema,
         source=source,
-        notes=tuple(args._deprecations),
+        notes=tuple(args._warnings),
     )
 
 
@@ -266,17 +238,8 @@ def _source_label(args: argparse.Namespace) -> str:
         if chosen == "passed in":
             return f"connection profile '{resolution.profile}'"
         return _DEFAULT_PROFILE_SOURCE
-    if args.base_url:
-        return f"base_url ({_DIRECT_SOURCE})"
-    origin = getattr(args, "_config_origin", None)
-    if origin == "config file":
-        return "config file"
-    if origin == "saved login":
-        return "saved login (cortex-training login)"
-    return _DIRECT_SOURCE
+    return "base_url (CORTEX_TRAINING_BASE_URL)"
 
 
-def _host_of(args: argparse.Namespace, client: CortexTrainingClient) -> str:
-    if args.host and not args.use_connection_profile:
-        return _cli._normalize_host(args.host)
+def _host_of(client: CortexTrainingClient) -> str:
     return urlsplit(client.base_url).netloc or client.base_url

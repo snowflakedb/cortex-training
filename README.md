@@ -91,8 +91,8 @@ using Cortex Training.
 
 ### Already using a JSON connection file?
 
-If you connect with a JSON file (`host`, `pat`, `database`, `schema`), for
-example through `--config`, `CORTEX_TRAINING_CONFIG`, `cortex-training login
+If you used to connect with a JSON file (`host`, `pat`, `database`, `schema`),
+for example through `--config`, `CORTEX_TRAINING_CONFIG`, `cortex-training login
 FILE`, or a recipe's `config=`, convert it into a profile with one command:
 
 ```bash
@@ -101,8 +101,9 @@ cortex-training login --convert-legacy-config ~/cortex-training-config.json
 
 It shows what it will change and asks first: it checks the token, adds a
 profile, saves it as the one to use, and signs in with it. Your JSON file is
-kept as it was, so you can go back to it with `--config FILE`. JSON files still
-work, and will be deprecated in a future release.
+kept as it was. Commands no longer sign in with JSON files: one that would
+stops and offers this conversion. Recipes still accept `config=`, with a
+warning.
 
 ### Hello World with Cortex Training
 

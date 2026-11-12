@@ -101,8 +101,8 @@ def resolve_example_connection(
 
     ``config=`` is a legacy JSON file and behaves exactly as it always has: only the
     file is read, and the environment, saved login and profiles are ignored.
-    ``connection=`` names a profile. With neither, the CLI's resolution order is
-    used (see ``cortex_training.connection``).
+    ``connection=`` names a profile. With neither, the profile is picked as the
+    CLI picks it (see ``cortex_training.connection``).
     """
     if config and connection:
         raise ValueError("pass either config= or connection=, not both")
@@ -116,13 +116,7 @@ def resolve_example_connection(
         )
         resolved = _legacy_json_connection(config, overrides)
     else:
-        resolved = resolve_connection(
-            None,
-            connection,
-            default_database=LEGACY_DEFAULT_DATABASE,
-            strict_config=False,
-            overrides=overrides,
-        )
+        resolved = resolve_connection(connection, default_database=LEGACY_DEFAULT_DATABASE, overrides=overrides)
     logger.info("%s", resolved.describe())
     return resolved
 

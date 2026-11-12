@@ -75,9 +75,10 @@ Every recipe resolves its connection the same way the CLI does:
   [the Snowflake folder](../docs/getting-started/authentication.md#the-snowflake-folder)).
 - With no `connection=`, the profile `cortex-training login` saved is used, then
   the Snowflake default connection profile.
-- The [older connection methods](../docs/reference/cli.md#older-connection-methods),
-  such as `config=<file>`, still work as a fallback and will be deprecated in a
-  future release.
+- `config=<file>`, an older JSON connection file, still works, with a warning
+  that names the command that converts it into a profile. The other
+  [older connection methods](../docs/reference/cli.md#converting-an-older-connection),
+  such as `CORTEX_TRAINING_CONFIG`, stop the recipe before it connects.
 
 Each run logs the target it connected to and the source, never the token. The
 `model_deployment` recipe needs a profile that signs in with a programmatic

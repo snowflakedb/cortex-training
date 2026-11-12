@@ -1127,7 +1127,7 @@ def report_environment(prompter: _Prompter, findings: list[_environment.Finding]
             prompter.say(f"      To clear it in this shell:  {s.cyan(_environment.clear_command(finding.name, shell))}")
     if any(finding.severity == _environment.OVERRIDES for finding in findings):
         prompter.say(
-            "The settings marked ✗ make cortex-training commands ignore the profile you set up here.\n"
+            "The settings marked ✗ make cortex-training commands stop, or ignore the profile you set up here.\n"
             "You can continue now and clear them afterwards."
         )
     prompter.say()

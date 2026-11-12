@@ -106,44 +106,17 @@ def test_the_first_cell_connects_with_the_saved_profile(name, monkeypatch):
 
 
 @pytest.mark.parametrize("name", NOTEBOOKS)
-def test_the_first_cell_still_honors_a_whole_old_connection_file(name, monkeypatch, tmp_path):
+def test_the_first_cell_stops_on_an_old_connection_file_and_says_how_to_convert_it(name, monkeypatch, tmp_path):
     pytest.importorskip("torch")
-    import cortex_training
+    from cortex_training.cli import commands as cli
 
-    captured: dict = {}
-
-    def fake_from_pat(**kwargs):
-        captured.update(kwargs)
-        return types.SimpleNamespace(database=kwargs["database"], schema=kwargs["schema"])
-
-    monkeypatch.setattr(cortex_training.CortexTrainingClient, "_from_pat", staticmethod(fake_from_pat))
     config_file = tmp_path / "conn.json"
-    config_file.write_text(
-        json.dumps(
-            {
-                "host": "acct.example.com",
-                "pat": "tok-123",
-                "database": "MY_DB",
-                "schema": "MY_SCHEMA",
-                "endpoint": "my-endpoint",
-                "verify_ssl": False,
-                "poll_interval": 2.5,
-                "poll_timeout": 42.0,
-            }
-        )
-    )
+    config_file.write_text(json.dumps({"host": "acct.example.com", "pat": "tok-123", "database": "MY_DB"}))
     monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(config_file))
-    _run_first_cell(name, monkeypatch)
-
-    # The whole mapping propagates from the file (with a deprecation warning).
-    assert captured["host"] == "acct.example.com"
-    assert captured["pat"] == "tok-123"
-    assert captured["database"] == "MY_DB"
-    assert captured["schema"] == "MY_SCHEMA"
-    assert captured["endpoint"] == "my-endpoint"
-    assert captured["verify_ssl"] is False
-    assert captured["poll_interval"] == 2.5
-    assert captured["poll_timeout"] == 42.0
+    with pytest.raises(cli.OldConfigFile) as found:
+        _run_first_cell(name, monkeypatch)
+    assert f"cortex-training login --convert-legacy-config {config_file}" in str(found.value)
+    assert "tok-123" not in str(found.value)
 
 
 def _job_body(name: str) -> dict:

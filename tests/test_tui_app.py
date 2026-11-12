@@ -26,6 +26,7 @@ import re
 import tempfile
 import threading
 import time
+import types
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
@@ -3703,7 +3704,7 @@ def test_the_tui_and_the_screenshot_script_build_the_same_bounded_client(monkeyp
     monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", FakeApp)
 
     assert tui_main.run(["--connection", "some-connection"]) == 0
-    client = _screenshot_script()._client(argparse.ArgumentParser(), connection="some-connection", config=None)
+    client = _screenshot_script()._client(argparse.ArgumentParser(), connection="some-connection")
 
     # Never the client's own ten retries and ten-minute read, which stall a view on a 404.
     assert built == [("some-connection", tui_main.READ_MAX_RETRIES, tui_main.READ_TIMEOUT)] * 2
@@ -3716,20 +3717,18 @@ def test_the_screenshot_script_reads_only_the_account_it_is_named(tmp_path, monk
     script = _screenshot_script()
     built = []
     monkeypatch.setattr(cli, "build_client",
-                        lambda args, cls: built.append((args.connection, args.config)) or _ScreenshotClient())
+                        lambda args, cls: built.append((args.connection, args.base_url)) or _ScreenshotClient())
     monkeypatch.setenv("CORTEX_TRAINING_CONNECTION", "ambient")
     # Run the old way, with no account named, it refuses rather than shoot whatever the environment gives.
     with pytest.raises(SystemExit) as exit_:
         script.main([str(tmp_path / "list.svg")])
     assert exit_.value.code == 2
-    assert "one of the arguments --connection --config is required" in capsys.readouterr().err
+    assert "one of the arguments --connection --base-url is required" in capsys.readouterr().err
     assert built == []
 
-    # Named by a config file, the account is that file's, not the environment's profile.
-    path = tmp_path / "config.json"
-    path.write_text(json.dumps({"base_url": "http://localhost:1", "database": "DB"}), encoding="utf-8")
-    script._client(argparse.ArgumentParser(), connection=None, config=str(path))
-    assert built == [(None, str(path))]
+    # Named by a base URL, the server is that one, not the environment's profile.
+    script._client(argparse.ArgumentParser(), connection=None, base_url="http://localhost:1", database="DB")
+    assert built == [(None, "http://localhost:1")]
 
 
 def test_the_screenshot_script_s_connection_errors_are_the_tui_s(tmp_path, monkeypatch, capsys):
@@ -3749,15 +3748,11 @@ def test_the_screenshot_script_s_connection_errors_are_the_tui_s(tmp_path, monke
     lines = capsys.readouterr().err.splitlines()
     assert lines[0].endswith(": error: no connection named NAME") and lines[1:] == [tui_main._CONNECT_HINT]
 
-    for name in ("CORTEX_TRAINING_BASE_URL", "CORTEX_TRAINING_HOST", "SNOWFLAKE_HOST",
-                 "CORTEX_TRAINING_PAT", "SNOWFLAKE_PAT"):
-        monkeypatch.delenv(name, raising=False)
-    path = tmp_path / "config.json"
-    path.write_text(json.dumps({"database": "DB"}), encoding="utf-8")  # no account in it
+    monkeypatch.delenv("CORTEX_TRAINING_DATABASE", raising=False)
     with pytest.raises(SystemExit) as exit_:
-        script.main([str(tmp_path / "list.svg"), "--config", str(path)])
+        script.main([str(tmp_path / "list.svg"), "--base-url", "http://localhost:1"])  # no database
     assert exit_.value.code == 2
-    assert ": error: no connection configured: " in capsys.readouterr().err
+    assert ": error: --base-url needs --database (or CORTEX_TRAINING_DATABASE)" in capsys.readouterr().err
     assert not (tmp_path / "list.svg").exists()
 
 
@@ -3785,36 +3780,23 @@ def test_the_screenshot_script_says_what_it_reads_and_leaves_no_cache_behind(tmp
 
 
 @pytest.mark.parametrize(
-    "config, message, usage",
+    "argv, message, usage",
     [
-        ({"base_url": "http://localhost:1", "database": "DB", "poll_interval": "2"},
-         "config poll_interval must be a number", False),
-        ({"base_url": "http://localhost:1", "database": "DB", "verify_ssl": "yes"},
-         "config verify_ssl must be a boolean", False),
-        ({"base_url": "http://localhost:1", "\x1b]52;c;eA==\x07": 1}, "unknown config key(s): \\x1b]52;c;eA==\\x07",
-         False),
-        ({"base_url": "http://localhost:1", "bad\nkey": 1}, "unknown config key(s): bad\\nkey", False),
-        ("{not json", "invalid JSON in config", False),
-        (None, "No such file or directory", False),
+        (["--host", "acme.snowflakecomputing.com", "--pat", "SECRET-PAT"], "--host and --pat are no longer supported", False),
         # Never a traceback, this one keeps the usage above its error line, as it always has.
-        ({"base_url": "localhost:1", "database": "DB"}, "base_url must start with http:// or https://", True),
+        (["--base-url", "localhost:1", "--database", "DB"], "base_url must start with http:// or https://", True),
     ],
 )
-def test_a_config_the_tui_cannot_use_is_an_error_not_a_traceback(tmp_path, monkeypatch, capsys, config, message,
-                                                                 usage):
+def test_a_connection_the_tui_cannot_use_is_an_error_not_a_traceback(monkeypatch, capsys, argv, message, usage):
     class NeverStarts:
         def __init__(self, *args, **kwargs):
             raise AssertionError("the TUI started")
 
-    for name in ("CORTEX_TRAINING_CONNECTION", "CORTEX_TRAINING_BASE_URL", "CORTEX_TRAINING_HOST", "SNOWFLAKE_HOST",
-                 "CORTEX_TRAINING_PAT", "SNOWFLAKE_PAT"):
-        monkeypatch.delenv(name, raising=False)  # a PAT would make the bare base_url a host
+    for name in ("CORTEX_TRAINING_CONNECTION", "CORTEX_TRAINING_BASE_URL", "CORTEX_TRAINING_CONFIG"):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", NeverStarts)
-    path = tmp_path / "config.json"
-    if config is not None:
-        path.write_text(config if isinstance(config, str) else json.dumps(config), encoding="utf-8")
     with pytest.raises(SystemExit) as exit_:
-        tui_main.run(["--config", str(path)])
+        tui_main.run(argv)
     assert exit_.value.code == 2
     err = capsys.readouterr().err
     lines = err.splitlines()
@@ -3823,7 +3805,24 @@ def test_a_config_the_tui_cannot_use_is_an_error_not_a_traceback(tmp_path, monke
     else:
         assert len(lines) == 1, err  # one line: no usage, no traceback
     assert lines[-1].startswith("cortex-training tui: error: ") and message in lines[-1], err
-    assert "\x1b" not in err and "\x07" not in err  # a key from the file can't act on the terminal
+    assert "SECRET-PAT" not in err
+
+
+def test_an_old_json_config_stops_the_tui_and_says_how_to_convert_it(tmp_path, monkeypatch, capsys):
+    class NeverStarts:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("the TUI started")
+
+    monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", NeverStarts)
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"host": "acme.snowflakecomputing.com", "pat": "SECRET-PAT", "database": "DB"}))
+    with pytest.raises(SystemExit) as exit_:
+        tui_main.run(["--config", str(path)])  # not a terminal: the command, not the question
+    assert exit_.value.code == 2
+    err = capsys.readouterr().err
+    assert f"error: signing in with an old JSON config ({path}, from --config) is no longer supported." in err
+    assert f"To convert it, run in a terminal:  cortex-training login --convert-legacy-config {path}" in err
+    assert "SECRET-PAT" not in err
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf"])
@@ -3834,9 +3833,7 @@ def test_the_log_poll_interval_must_be_positive_and_finite(value, capsys):
     assert "must be a finite number greater than zero" in capsys.readouterr().err
 
 
-def test_the_poll_interval_is_the_flag_s_alone_and_the_sign_in_names_what_the_config_gives(tmp_path, monkeypatch):
-    import cortex_training.cli.commands as cli
-
+def test_the_poll_interval_is_the_flag_s_alone_and_the_sign_in_names_the_base_url(monkeypatch):
     seen = []
 
     class FakeApp:
@@ -3849,29 +3846,24 @@ def test_the_poll_interval_is_the_flag_s_alone_and_the_sign_in_names_what_the_co
         def run(self):
             seen.append((self.poll_interval, self.sign_in))
 
-    reads = []
-    load_config = cli._load_config
-    monkeypatch.setattr(
-        cli,
-        "_load_config",
-        lambda path, **kwargs: reads.append(path) or load_config(path, **kwargs),
-    )
     monkeypatch.delenv("CORTEX_TRAINING_CONNECTION", raising=False)
     monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", FakeApp)
     built = []  # the poll interval each client is built with
     monkeypatch.setattr("cortex_training.cli.commands.build_client", lambda args, cls: built.append(args.poll_interval) or MagicMock())
-    path = tmp_path / "config.json"
-    # The config's poll_interval is the CLI's result polling: neither the TUI's log polls nor a reason not to start.
-    path.write_text(json.dumps({"base_url": "http://localhost:1", "database": "DB", "poll_interval": 10}),
-                    encoding="utf-8")
-    sign_in = {"kind": "url", "config": str(path.resolve()), "base_url": "http://localhost:1",
-               "base_url_in_config": True}
-    assert tui_main.run(["--config", str(path)]) == 0
+    sign_in = {"kind": "url", "config": None, "base_url": "http://localhost:1", "base_url_in_config": False}
+    assert tui_main.run(["--base-url", "http://localhost:1", "--database", "DB"]) == 0
     assert seen == [(1.0, sign_in)]
-    assert len(reads) == 2  # the CLI's resolution, then the TUI's one read for what that doesn't say
-    assert tui_main.run(["--config", str(path), "--poll-interval", "30", "--base-url", "http://other:2"]) == 0
-    assert seen[-1] == (30.0, {**sign_in, "base_url": "http://other:2", "base_url_in_config": False})
+    assert tui_main.run(["--base-url", "http://localhost:1", "--database", "DB", "--poll-interval", "30"]) == 0
+    assert seen[-1] == (30.0, sign_in)
     assert built == [1.0, 1.0]  # never the log polls' 30 s: the client refuses more than 6
+
+
+def test_the_sign_in_names_the_profile_or_the_ci_host():
+    profile = argparse.Namespace(base_url=None, resolution=types.SimpleNamespace(profile="train", host=None))
+    ci = argparse.Namespace(base_url=None, resolution=types.SimpleNamespace(profile=None, host="ci.snowflakecomputing.com"))
+    assert tui_main._sign_in(profile) == {"kind": "profile", "profile": "train"}
+    # A copied command reads the same CI variables, so it needs no flag for them.
+    assert tui_main._sign_in(ci) == {"kind": "ci", "host": "ci.snowflakecomputing.com"}
 
 
 def test_resource_refresh_skips_the_reparse_when_nothing_new_arrived(monkeypatch):

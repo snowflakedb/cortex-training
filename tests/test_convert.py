@@ -563,26 +563,28 @@ def test_the_plan_says_it_signs_in_with_the_new_profile_and_keeps_the_old_file(o
     code, _, err = convert(world, path, YES)
     assert code == 0, err
     assert "  3. Sign in with profile cortex-training to check that it works" in err
-    assert f"{path} is kept as it is, so you can go back to it." in err
+    assert f"{path} is kept as it is." in err
     assert "delete" not in err.lower().split("you're all set")[0] and "without the PAT" not in err
     assert "  ✓ Signed in with profile cortex-training" in err
     assert world.profiles_opened == [("cortex-training", "CORTEX_TRAINING_DB", "PUBLIC")]
 
 
-def test_the_ending_says_how_to_go_back(old_file, isolated):
+def test_the_ending_says_how_to_undo_it(old_file, isolated):
     path = old_file()
     code, _, err = convert(World(), path, YES)
     assert code == 0, err
-    assert f"--config {path}" in err and f"config={path}" in err and "CORTEX_TRAINING_CONFIG" in err
-    assert f'remove "profile" from {_picker.config_path()}' in err
-    assert f"delete [cortex-training] from {isolated / 'connections.toml'}" in err
+    # Commands can't go back to the old file; recipes still take it, with a warning.
+    assert f"--config {path}" not in err and "CORTEX_TRAINING_CONFIG" not in err.split("You're all set")[1]
+    assert f'To undo this, remove "profile" from {_picker.config_path()}, and delete' in err
+    assert f"[cortex-training] from {isolated / 'connections.toml'}." in err
 
 
-def test_the_old_file_still_signs_in_with_config_after_converting(old_file, monkeypatch):
+def test_after_converting_the_old_file_is_kept_and_commands_use_the_profile(old_file, monkeypatch):
     path = old_file()
     login_file = _point_login_json_at(path)
     code, _, err = convert(World(), path, YES)
     assert code == 0, err
+    assert f"Commands no longer read {path}; recipes still accept `config={path}`, with a warning." in err
     seen = {}
 
     class Client:
@@ -594,15 +596,16 @@ def test_the_old_file_still_signs_in_with_config_after_converting(old_file, monk
 
     stdout, stderr = io.StringIO(), io.StringIO()
     rc = _cli.main(
-        ["--config", str(path), "list"],
-        client_factory=lambda args: seen.update(host=args.host, pat=args.pat, profile=args.use_connection_profile) or Client(),
+        ["list"],
+        client_factory=lambda args: seen.update(profile=args.use_connection_profile) or Client(),
         stdout=stdout,
         stderr=stderr,
     )
+    # login.json still points at the old file, but the saved profile wins, with no nag to convert again.
     assert rc == 0, stderr.getvalue()
-    assert seen == {"host": HOST, "pat": PAT, "profile": False}
-    assert f"Signing in with an old JSON config ({path}, from --config)" in stderr.getvalue()
-    assert login_file.exists()
+    assert seen == {"profile": True}
+    assert "old JSON config" not in stderr.getvalue()
+    assert path.exists() and login_file.exists()
 
 
 def test_a_new_profile_that_cant_sign_in_puts_every_file_back(old_file, isolated):

@@ -112,14 +112,14 @@ def test_ci_variables_are_used_when_no_profile_exists(home, monkeypatch):
     assert seen["env"]["ARCTIC_CORTEX_PAT"] == "ci-tok"
 
 
-def test_an_old_json_config_still_works_with_its_warning(home, monkeypatch, tmp_path):
+def test_an_old_json_config_stops_and_says_how_to_convert_it(home, monkeypatch, tmp_path):
     old = tmp_path / "old.json"
     old.write_text(json.dumps({"host": "acme.snowflakecomputing.com", "pat": "old-tok", "database": "DB"}))
     monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(old))
     code, seen, err = run(["--", "true"])
-    assert code == 7, err
-    assert seen["env"]["ARCTIC_CORTEX_PAT"] == "old-tok" and seen["env"]["ARCTIC_CORTEX_SCHEMA"] == "PUBLIC"
-    assert "warning: Signing in with an old JSON config" in err
+    assert code == 1 and seen == {}
+    assert f"error: signing in with an old JSON config ({old}, from CORTEX_TRAINING_CONFIG) is no longer supported." in err
+    assert f"cortex-training login --convert-legacy-config {old}" in err and "old-tok" not in err
 
 
 def test_unknown_options_are_refused(home):

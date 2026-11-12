@@ -158,14 +158,13 @@ Then run commands directly:
 cortex-training capacity
 ```
 
-`CORTEX_TRAINING_HOST` and `CORTEX_TRAINING_PAT` are meant for machines with no
-profile. If you also have a profile, they're still used for now, with a
-warning that the profile will be used instead in a future release.
-`CORTEX_TRAINING_DATABASE` and `CORTEX_TRAINING_SCHEMA` choose the database and
-schema with any connection.
+`CORTEX_TRAINING_HOST` and `CORTEX_TRAINING_PAT` are used only on machines with
+no profile. If you also have a profile, the profile is used, and the command
+warns that they're ignored. `CORTEX_TRAINING_DATABASE` and
+`CORTEX_TRAINING_SCHEMA` choose the database and schema with any connection.
 
-Use the `CORTEX_TRAINING_` names; the older `SNOWFLAKE_`-prefixed ones still
-work for now and will be deprecated in a future release.
+Use the `CORTEX_TRAINING_` names: the older `SNOWFLAKE_`-prefixed ones are
+ignored, with a warning.
 
 ## Old users who log in with a JSON connection file
 
@@ -199,20 +198,18 @@ Then it asks before each step:
 
 Either every change happens, or every file is put back as it was.
 
-**Going back.** The old file is kept exactly as it was, and `login.json` is
-left alone. Once a profile is saved, commands use it ahead of the file
-`login.json` remembers. `--config FILE`, `CORTEX_TRAINING_CONFIG`, and a
-recipe's `config=FILE` still win over the profile, with a deprecation warning,
-so pass one of them to use the old file again. To stop using the profile,
+**After converting.** The old file is kept exactly as it was, and `login.json`
+is left alone, but commands no longer read either: they use the profile.
+Recipes still accept `config=FILE`, with a warning. To undo the conversion,
 remove `"profile"` from `cortex-training/config.json` in your Snowflake folder
 (`$SNOWFLAKE_HOME`, `~/.snowflake`, or the platform folder; the converter prints
-the exact path), and optionally delete the profile from `connections.toml`.
-The converter prints these steps when it finishes.
+the exact path), and delete the profile from `connections.toml`.
 
-Until you convert, the file keeps working the ways it did. See
-[Older Connection Methods](../reference/cli.md#older-connection-methods) if the
-profile setup doesn't work for you; they will be deprecated in a future
-release.
+Until you convert, a command that would sign in with the file (`--config FILE`,
+`CORTEX_TRAINING_CONFIG`, or `login.json`) stops before it connects. In a
+terminal it offers to convert the file then and there; otherwise it prints the
+command above. See
+[Converting An Older Connection](../reference/cli.md#converting-an-older-connection).
 
 ## Troubleshooting
 
