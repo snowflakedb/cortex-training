@@ -842,9 +842,12 @@ service hop fails rather than blocking indefinitely.
   `running` jobs. Queued work is not counted here; see `pending_gpus`.
 - `pending_gpus`: GPUs requested by jobs still waiting for capacity
   (`pending`). Claims quota, so it reduces `available_gpus`.
-- `available_gpus`: what a new job could start with now — ceiling headroom
-  capped by currently schedulable capacity. Zero does not mean blocked: a
-  submit within the ceiling is still accepted and queued.
+- `available_gpus`: what a new job could start with now. For an account with a
+  ceiling, this is `max_total_gpus − in_use_gpus − pending_gpus`, never below
+  zero. For an uncapped account (`max_total_gpus` is `-1`), it is the GPUs
+  currently schedulable on the platform, less this account's pending GPUs.
+  Zero does not mean blocked: a submit within the ceiling is still accepted and
+  queued.
 
 Proto3 JSON may omit false or zero fields, so an account holding nothing under a
 zero ceiling responds with literally `{}`. `get_capacity()` fills in the
