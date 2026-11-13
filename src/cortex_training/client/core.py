@@ -4244,12 +4244,8 @@ class CortexTrainingClient:
         - ``pending_gpus`` (int): GPUs requested by jobs still waiting for
           capacity (``pending``). It claims quota, so it reduces
           ``available_gpus``.
-        - ``available_gpus`` (int): what a new job could start with right now.
-          With a ceiling it is ``max_total_gpus - in_use_gpus - pending_gpus``,
-          never below ``0``. Uncapped (``max_total_gpus`` is ``-1``) it is the
-          GPUs schedulable on the platform, less this account's pending GPUs.
-          ``0`` does not mean blocked: a submit within the ceiling is still
-          accepted and queued.
+        - ``available_gpus`` (int): what a new job could start with right now,
+          ``max_total_gpus - in_use_gpus - pending_gpus``, never below ``0``.
 
         See ``docs/reference/rest-api.md`` section 5.5 for the authoritative
         field list, and :meth:`get_capacity_breakdown` to split ``in_use_gpus``
