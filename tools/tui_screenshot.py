@@ -4,14 +4,14 @@
 """Save an SVG screenshot of the TUI, read-only, against a real account.
 
 For reviewing how a screen looks without a terminal. Name the account with
-``--connection NAME`` (a Snowflake connection profile) or ``--config FILE``: the
-script never takes one from ``CORTEX_TRAINING_CONNECTION``,
-``CORTEX_TRAINING_CONFIG`` or login state, and says on stderr which account and
-database it reads before it shoots. The screenshot shows that account's jobs
+``--connection NAME`` (a Snowflake connection profile), or a local or mock server
+with ``--base-url URL --database DB``: the script never takes one from the
+environment or the saved profile, and says on stderr which account and database
+it reads before it shoots. The screenshot shows that account's jobs
 (their IDs and names), so check it before you commit or share it.
 
     python tools/tui_screenshot.py list.svg --connection NAME
-    python tools/tui_screenshot.py logs.svg --config config.json --keys "slash,type:gsm8k,enter,enter,wait:1,l,wait:4"
+    python tools/tui_screenshot.py logs.svg --connection NAME --keys "slash,type:gsm8k,enter,enter,wait:1,l,wait:4"
     python tools/tui_screenshot.py job.svg --connection NAME --size 120x36 --job-id JOB_ID
 
 The client is the one ``cortex-training tui`` builds for that account: the same
@@ -34,15 +34,16 @@ import tempfile
 from pathlib import Path
 
 
-def _client(parser: argparse.ArgumentParser, *, connection: str | None, config: str | None):
-    """The client ``cortex-training tui --connection NAME`` (or ``--config FILE``)
-    builds; ``parser`` reports what keeps it from connecting."""
+def _client(parser: argparse.ArgumentParser, *, connection: str | None, base_url: str | None = None,
+            database: str | None = None):
+    """The client ``cortex-training tui --connection NAME`` (or ``--base-url URL
+    --database DB``) builds; ``parser`` reports what keeps it from connecting."""
     from cortex_training.tui.__main__ import _build_arg_parser, _build_read_only_client
 
     args = _build_arg_parser().parse_args([])
-    # The account named here alone, not one the TUI's flags default to from the environment.
-    args.connection, args.config = connection, config
-    # Its sign-in stays off the app, so the commands a shot shows to copy never name the config file or host.
+    # The account named here alone, not the saved profile or one from the environment.
+    args.connection, args.base_url, args.database = connection, base_url, database
+    # Its sign-in stays off the app, so the commands a shot shows to copy never name the host.
     client, _sign_in = _build_read_only_client(parser, args)
     return client
 
@@ -89,7 +90,8 @@ def main(argv=None) -> int:
     p.add_argument("output", help="SVG file to write")
     account = p.add_mutually_exclusive_group(required=True)
     account.add_argument("--connection", help="read the account of this Snowflake connection profile")
-    account.add_argument("--config", help="read the account this Cortex Training config file gives")
+    account.add_argument("--base-url", help="read this local or mock server instead (needs --database)")
+    p.add_argument("--database", help="the database, with --base-url")
     p.add_argument("--size", default="150x42", help="COLUMNSxROWS (default 150x42)")
     p.add_argument("--keys", default="", help="comma-separated keys to press first")
     p.add_argument("--job-id", help="open this job's dashboard directly")
@@ -102,7 +104,7 @@ def main(argv=None) -> int:
     columns, rows = (int(n) for n in args.size.lower().split("x"))
     keys = [k for k in args.keys.split(",") if k]
     out = Path(args.output).resolve()
-    client = _client(p, connection=args.connection, config=args.config)
+    client = _client(p, connection=args.connection, base_url=args.base_url, database=args.database)
     # Said before it shoots: the screenshot shows this account's jobs.
     print(f"{p.prog}: reading {_escaped(client.base_url)}, database {_escaped(client.database)}, "
           f"schema {_escaped(client.schema)}", file=sys.stderr)

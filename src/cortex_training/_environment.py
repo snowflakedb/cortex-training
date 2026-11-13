@@ -27,9 +27,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-# Overrides the profile that login sets up.
+# Overrides the profile that login sets up, or stops commands: clear it.
 OVERRIDES = "overrides"
-# Changes a default, such as which profile or folder is used.
+# Changes a default, such as which profile or folder is used, or is ignored with a warning.
 CHANGES = "changes"
 
 
@@ -42,30 +42,30 @@ class _Variable:
 
 
 _OLDER_SNOWFLAKE = (
-    "An older setting that other Snowflake tools often set. Cortex Training commands use it too, "
-    "instead of your profile."
+    "An older setting that other Snowflake tools often set. Cortex Training ignores it, "
+    "and warns that it does."
 )
 
 _VARIABLES = (
     _Variable(
         "CORTEX_TRAINING_CONFIG",
         OVERRIDES,
-        "Makes cortex-training commands use this JSON file instead of the profile you set up here.",
+        "Makes cortex-training commands stop, and offer to convert this old JSON file into a profile.",
     ),
     _Variable(
         "CORTEX_TRAINING_CONNECTION",
-        OVERRIDES,
-        "Makes cortex-training commands use this profile instead of the one you set up here.",
+        CHANGES,
+        "An older setting. Cortex Training ignores it, and warns that it does; use --connection NAME.",
     ),
     _Variable(
         "CORTEX_TRAINING_HOST",
-        OVERRIDES,
-        "Can make commands sign in to this account instead of your profile's (meant for CI).",
+        CHANGES,
+        "For CI: used only when no Snowflake connection profile exists, so your profile is used instead.",
     ),
     _Variable(
         "CORTEX_TRAINING_PAT",
-        OVERRIDES,
-        "Can make commands sign in with this token instead of your profile (meant for CI).",
+        CHANGES,
+        "For CI: used only when no Snowflake connection profile exists, so your profile is used instead.",
         secret=True,
     ),
     _Variable(
@@ -73,10 +73,10 @@ _VARIABLES = (
         OVERRIDES,
         "Sends cortex-training commands to this server instead of your Snowflake account.",
     ),
-    _Variable("SNOWFLAKE_HOST", OVERRIDES, _OLDER_SNOWFLAKE),
-    _Variable("SNOWFLAKE_PAT", OVERRIDES, _OLDER_SNOWFLAKE, secret=True),
-    _Variable("SNOWFLAKE_DATABASE", OVERRIDES, _OLDER_SNOWFLAKE),
-    _Variable("SNOWFLAKE_SCHEMA", OVERRIDES, _OLDER_SNOWFLAKE),
+    _Variable("SNOWFLAKE_HOST", CHANGES, _OLDER_SNOWFLAKE),
+    _Variable("SNOWFLAKE_PAT", CHANGES, _OLDER_SNOWFLAKE, secret=True),
+    _Variable("SNOWFLAKE_DATABASE", CHANGES, _OLDER_SNOWFLAKE),
+    _Variable("SNOWFLAKE_SCHEMA", CHANGES, _OLDER_SNOWFLAKE),
     _Variable(
         "CORTEX_TRAINING_DATABASE",
         CHANGES,
@@ -102,7 +102,8 @@ _VARIABLES = (
     _Variable(
         "XDG_CONFIG_HOME",
         CHANGES,
-        "Changes where the older login.json (from `cortex-training login PATH`) is looked up.",
+        "Changes where the older login.json (from `cortex-training login PATH`) is looked for, "
+        "to offer converting it.",
     ),
 )
 

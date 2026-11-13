@@ -14,7 +14,10 @@ job) to the first row it fits. Never ask for the token to "check" it.
 | "MODIFY privilege required on experiment" | The job joins an existing experiment the role can't change | Use a new experiment (omit `experiment_name`), or an admin grants `MODIFY` on that experiment |
 | "has 2 profiles named NAME" | `connections.toml` names a profile twice, so Snowflake can't read the file | `cortex-training login` shows the fix and asks before renaming the extra copy |
 | "profile 'NAME' … does not exist; known profiles: …" | A typo in `--connection`, or the profile file is in another folder | Check the name with `cortex-training status`; `profile_file` shows which file is read |
-| "will be deprecated in a future release" | An older connection method (a JSON config, `--host`/`--pat`, or an old variable) | It still works. Suggest `cortex-training login --convert-legacy-config FILE`, or `cortex-training login` |
+| "signing in with an old JSON config … is no longer supported" | `--config`, `CORTEX_TRAINING_CONFIG`, or the `login.json` an old `cortex-training login FILE` wrote | The user runs `cortex-training login --convert-legacy-config FILE` in their terminal (it keeps the file), or unsets `CORTEX_TRAINING_CONFIG` |
+| "--host and --pat are no longer supported" | Signing in with flags instead of a profile | The user runs `cortex-training login`, which can create a profile from an account and a PAT. In CI, set `CORTEX_TRAINING_HOST` and `CORTEX_TRAINING_PAT` |
+| "is set but ignored" | An old variable (`SNOWFLAKE_HOST`, `SNOWFLAKE_PAT`, `CORTEX_TRAINING_CONNECTION`, …) | Nothing is wrong; the warning names what to use instead. Unset the variable to stop it |
+| "will be deprecated in a future release" | A recipe's `config=FILE`, or the SDK's `from_pat()`/`from_connection_name()` | It still works. Suggest `cortex-training login --convert-legacy-config FILE`, then `connection=NAME` |
 
 The full list of privileges per operation is in
 [Access control](https://github.com/snowflakedb/cortex-training/blob/main/docs/reference/rest-api.md#37-access-control).

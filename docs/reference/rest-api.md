@@ -94,7 +94,7 @@ https://{account_host}/api/v2/databases/{database}/schemas/{schema}/{endpoint}
 ```
 
 `{account_host}` is the host the client connects to: the Connector's server URL
-for a profile, or the PAT host (`--host`, `CORTEX_TRAINING_HOST`,
+for a profile, or the PAT host (`CORTEX_TRAINING_HOST`, in CI, or
 `from_pat(host=...)`). For a `*.snowflakecomputing.com` or
 `*.snowflakecomputing.cn` host whose first label, the account name, contains
 `_`, the client sends its REST calls to the hyphen form instead

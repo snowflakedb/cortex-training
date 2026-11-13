@@ -672,15 +672,21 @@ def test_validate_host_rejects(raw):
 # ─── CLI ────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("argv", [["login", "config.json"], ["login", "~/ct/config.json"], ["login", "--config", "ct.json"]])
-def test_the_old_login_forms_still_work_with_a_warning(argv, isolated):
-    # The old form remembers a JSON file, as before; here the file doesn't exist, so it fails as it always did.
-    stderr = io.StringIO()
-    code = _cli.main(argv, stdout=io.StringIO(), stderr=stderr, stdin=io.StringIO())
-    assert code == 1
-    err = stderr.getvalue()
-    assert "will be deprecated in a future release." in err
-    assert "cortex-training login --convert-legacy-config" in err
+@pytest.mark.parametrize(("argv", "path"), [
+    (["login", "config.json"], "config.json"),
+    (["login", "~/ct/config.json"], "'~/ct/config.json'"),
+    (["login", "--config", "ct.json"], "ct.json"),
+])
+def test_the_old_login_forms_point_to_the_converter(argv, path, isolated):
+    # They no longer remember a JSON file; nothing is written.
+    stdout, stderr = io.StringIO(), io.StringIO()
+    code = _cli.main(argv, stdout=stdout, stderr=stderr, stdin=io.StringIO())
+    assert code == 2 and stdout.getvalue() == ""
+    assert stderr.getvalue() == (
+        f"error: `cortex-training login {argv[-1]}` no longer remembers a JSON config. To convert it into a "
+        f"profile, run:  cortex-training login --convert-legacy-config {path}\n"
+    )
+    assert not _cli._login_state_path().exists()
 
 
 def test_the_cli_runs_the_new_login(monkeypatch, isolated):

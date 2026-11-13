@@ -26,8 +26,8 @@ database, and settings. Converting it:
 3. shows every change and asks once;
 4. writes a Snowflake connection profile and sets it in ``config.json``, then
    signs in with the new profile. The old file and ``login.json`` are never
-   changed, so ``--config PATH`` still works. Either every change happens, or
-   every file is put back as it was.
+   changed (recipes still accept ``config=PATH``, with a warning). Either every
+   change happens, or every file is put back as it was.
 """
 
 from __future__ import annotations
@@ -375,7 +375,7 @@ class _Converter:
         )
         self.p.say(f"  2. Set Cortex Training to use it, in {_login._home(_picker.config_path())}")
         self.p.say(f"  3. Sign in with profile {plan.profile} to check that it works")
-        self.p.say(f"   {_login._home(old.path)} is kept as it is, so you can go back to it.")
+        self.p.say(f"   {_login._home(old.path)} is kept as it is.")
         self.p.say("   If anything fails, every file is put back as it was.")
         dropped = _dropped_settings(old.settings)
         if dropped:
@@ -544,11 +544,9 @@ def run_convert(
     prompter.say()
     prompter.say(f"Try it:  {style.cyan('cortex-training capacity')}")
     prompter.say()
-    prompter.say("To go back to the old config:")
-    prompter.say(f"  - Use it for one command with `--config {kept}` (or `config={kept}` in a recipe, or")
-    prompter.say("    CORTEX_TRAINING_CONFIG). It wins over the profile and prints a deprecation warning.")
-    prompter.say(f"  - To stop using the profile everywhere, remove \"profile\" from {_login._home(_picker.config_path())}.")
-    prompter.say(f"    You can also delete [{plan.profile}] from {_login._home(_profiles.profile_file())}.")
+    prompter.say(f"Commands no longer read {kept}; recipes still accept `config={kept}`, with a warning.")
+    prompter.say(f"To undo this, remove \"profile\" from {_login._home(_picker.config_path())}, and delete")
+    prompter.say(f"[{plan.profile}] from {_login._home(_profiles.profile_file())}.")
     prompter.say()
     for line in _login.PRIVILEGE_NOTE:
         prompter.say(style.yellow(line))

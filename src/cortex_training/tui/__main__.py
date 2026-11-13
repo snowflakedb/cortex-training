@@ -24,7 +24,6 @@ import re
 import sys
 import threading
 import time
-from pathlib import Path
 
 from cortex_training.tui import terminal
 
@@ -98,24 +97,17 @@ def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.Argument
         help=("Open the job details scoped to this sub-job (JOB_ID:TYPE:INDEX, for example JOB_ID:training:0); "
               "JOB_ID may then be omitted."),
     )
-    p.add_argument(
-        "--config",
-        dest="config",
-        default=os.environ.get("CORTEX_TRAINING_CONFIG"),
-        help=(
-            "Path to a reusable Cortex Training config or credential JSON file "
-            "(same format as the cortex-training CLI config)."
-        ),
-    )
+    # Old JSON configs and --host/--pat no longer connect; they're still parsed so
+    # the TUI can say what replaced them, as the CLI does.
+    p.add_argument("--config", dest="config", help=argparse.SUPPRESS)
     p.add_argument(
         "--connection",
         "-c",
-        default=os.environ.get("CORTEX_TRAINING_CONNECTION"),
         help="Snowflake connection profile to use (default: the one `cortex-training login` saved).",
     )
     p.add_argument("--base-url", help="Direct base URL for a local or otherwise compatible server.")
-    p.add_argument("--host", help="Snowflake account host for PAT auth.")
-    p.add_argument("--pat", help="Programmatic access token.")
+    p.add_argument("--host", help=argparse.SUPPRESS)
+    p.add_argument("--pat", help=argparse.SUPPRESS)
     p.add_argument("--database", help="Database containing the endpoint.")
     # Left as None so config-file / env values can fill them; the CLI resolver
     # applies the PUBLIC / cortex-training defaults when nothing is set.
@@ -198,41 +190,30 @@ def _build_read_only_client(parser: argparse.ArgumentParser, args: argparse.Name
     as the CLI resolves them), and how it signs in (``CortexTrainingLogTUI.sign_in``).
 
     Its reads are bounded and its calls tagged as the TUI's. Whatever keeps it from
-    connecting (a config it can't use, no database, no connection) exits with one of
-    ``parser``'s error lines, not a traceback. ``tools/tui_screenshot.py`` builds
-    its client here too, so the two stay the same.
+    connecting (an older way to connect, no database, no connection) exits with one
+    of ``parser``'s error lines, not a traceback; an old JSON config is offered for
+    conversion, as the CLI offers it. ``tools/tui_screenshot.py`` builds its client
+    here too, so the two stay the same.
     """
     import cortex_training.cli.commands as cli
 
-    # Reuse the CLI's resolution: --config / login state / env / defaults.
+    # Reuse the CLI's resolution: it stops on an older way to connect.
     try:
         args = cli._resolve_args(args)
-        # What the resolved arguments don't say, from the TUI's one read of the
-        # config file they came from (the CLI's resolution reads it for itself):
-        # the host or base URL it gives by itself (for the commands the TUI shows to copy).
-        selected = getattr(args, "_legacy_config_selected", False) and args.config
-        config = cli._load_config(args.config) if selected else {}
-        from_config = _config_connection(cli, config)
+    except cli.OldConfigFile as found:
+        parser.exit(cli.offer_convert(found, sys.stdin, sys.stdout, sys.stderr))
     except (OSError, ValueError, RuntimeError) as exc:
-        # A config the TUI can't use (a value of the wrong type, such as a quoted
-        # poll_interval, JSON that doesn't parse, an unknown key, a file that isn't
-        # there), or flags that don't go together: one error line, as the CLI gives,
-        # not a traceback. Escaped: it can quote the file's keys.
+        # --host or --pat, a config that isn't there, or flags that don't go
+        # together: one error line, as the CLI gives, not a traceback.
         parser.exit(2, f"{parser.prog}: error: {_escaped(str(exc))}\n")
     try:
         args = cli._normalize_connection_args(args)
     except ValueError as exc:
         parser.error(str(exc))
     if not args.use_connection_profile and not args.database:
-        parser.error("provide --database or set CORTEX_TRAINING_DATABASE")
-    if (
-        not args.use_connection_profile
-        and args.base_url is None
-        and (args.host is None or args.pat is None)
-    ):
-        parser.error(f"no connection configured: {_CONNECT_HINT}")
-    # The old ways still work, with the same warnings as the CLI.
-    for note in getattr(args, "_deprecations", ()):
+        parser.error("--base-url needs --database (or CORTEX_TRAINING_DATABASE)")
+    # The variables the old lookup read, with the same warnings as the CLI.
+    for note in getattr(args, "_warnings", ()):
         sys.stderr.write(f"warning: {note}\n")
     cli.write_terminal_notes(args, sys.stderr)
 
@@ -250,13 +231,14 @@ def _build_read_only_client(parser: argparse.ArgumentParser, args: argparse.Name
     try:
         client = cli.build_client(args, cli._load_cortex_training_client_class())
     except (SnowflakeProfileError, ValueError) as exc:
-        # With no config, login state or flags, the TUI tries the configured-default
-        # Snowflake connection, which a first run doesn't have: say how to connect.
+        # A first run has no profile: in a terminal, offer to set one up, as the CLI does.
+        if cli._no_profile(exc) and cli._interactive(sys.stdin, sys.stderr):
+            parser.exit(cli.offer_login(exc, sys.stdin, sys.stdout, sys.stderr))
         parser.exit(2, f"{parser.prog}: error: {exc}\n{_CONNECT_HINT}\n")
     client._telemetry_surface = TUI_SURFACE
     if getattr(args, "resolution", None) is not None:
         cli.write_target_line(args.resolution, sys.stderr)
-    return client, _sign_in(cli, args, from_config)
+    return client, _sign_in(args)
 
 
 def _close_sessions(client) -> None:
@@ -292,32 +274,17 @@ def _close_sessions(client) -> None:
         closer.join(max(seconds - (time.monotonic() - started), 0.0))
 
 
-def _sign_in(cli, args, from_config: dict) -> dict:
+def _sign_in(args) -> dict:
     """How the TUI's client connects, for the commands it shows to copy (read by
     ``views.sign_in_options``) and the job list's line naming it (``identity.line_parts``).
-    It never holds the PAT; ``config`` is the config file as an absolute path, so a
-    copied command finds it from any directory."""
-    if args.use_connection_profile:
-        resolution = getattr(args, "resolution", None)
-        return {"kind": "profile", "profile": getattr(resolution, "profile", None)}
-    config = None
-    if getattr(args, "_legacy_config_selected", False) and args.config:
-        config = str(Path(args.config).expanduser().resolve())
+    It never holds the PAT. ``ci`` is CORTEX_TRAINING_HOST and CORTEX_TRAINING_PAT,
+    used when no profile exists: a copied command reads them too, so it needs no flag."""
     if args.base_url:
-        return {"kind": "url", "config": config, "base_url": args.base_url,
-                "base_url_in_config": from_config.get("base_url") == args.base_url}
-    host = cli._normalize_host(args.host or "")
-    return {"kind": "pat", "config": config, "host": host,
-            "host_in_config": bool(host) and from_config.get("host") == host}
-
-
-def _config_connection(cli, values: dict) -> dict:
-    """What the config file (``values``, as the CLI reads it; empty for none) gives by
-    itself: its ``base_url`` and PAT ``host`` (normalized), None where it gives neither."""
-    base_url, host = cli._config_str(values, "base_url"), cli._config_str(values, "host")
-    if base_url and not cli._has_url_scheme(base_url) and host is None:
-        base_url, host = None, base_url  # the CLI reads a base URL without a scheme as the PAT host
-    return {"base_url": base_url, "host": cli._normalize_host(host) if host else None}
+        return {"kind": "url", "config": None, "base_url": args.base_url, "base_url_in_config": False}
+    resolution = getattr(args, "resolution", None)
+    if resolution is not None and resolution.profile is None:
+        return {"kind": "ci", "host": resolution.host}
+    return {"kind": "profile", "profile": getattr(resolution, "profile", None)}
 
 
 if __name__ == "__main__":

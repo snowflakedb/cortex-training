@@ -177,13 +177,15 @@ def test_profile_keeps_its_database_instead_of_the_example_default(env):
     assert resolved.database != utils.LEGACY_DEFAULT_DATABASE
 
 
-def test_connection_env_var_selects_the_profile(env):
+def test_the_connection_env_var_is_ignored_with_a_warning(env, caplog):
     env.setenv("CORTEX_TRAINING_CONNECTION", "from-env")
 
-    resolved = utils.resolve_example_connection()
+    with caplog.at_level("WARNING"):
+        resolved = utils.resolve_example_connection()
 
-    assert [auth.connection_name for auth in FakeProfileAuth.instances] == ["from-env"]
-    assert resolved.source == "connection profile 'from-env'"
+    assert [auth.connection_name for auth in FakeProfileAuth.instances] == ["default"]
+    assert resolved.source == "default Snowflake connection profile"
+    assert "CORTEX_TRAINING_CONNECTION is set but ignored." in caplog.text
 
 
 def test_profile_ignores_pat_in_the_environment(env):
@@ -201,7 +203,7 @@ def test_config_and_connection_together_are_rejected(env, tmp_path):
         utils.resolve_example_connection(pat_config(tmp_path), connection="training")
 
 
-# No arguments: CLI resolution order -------------------------------------------
+# No arguments: the picker, as the CLI uses it ---------------------------------
 
 
 def test_no_arguments_falls_back_to_the_default_profile(env):
@@ -213,60 +215,55 @@ def test_no_arguments_falls_back_to_the_default_profile(env):
     assert resolved.pat is None
 
 
-def test_config_env_var_beats_the_default_profile(env, tmp_path):
-    env.setenv("CORTEX_TRAINING_CONFIG", pat_config(tmp_path))
+def test_the_config_env_var_stops_with_the_command_that_converts_it(env, tmp_path):
+    path = pat_config(tmp_path)
+    env.setenv("CORTEX_TRAINING_CONFIG", path)
 
-    resolved = utils.resolve_example_connection()
+    with pytest.raises(_cli.OldConfigFile, match="is no longer supported") as found:
+        utils.resolve_example_connection()
 
-    assert resolved.source == "config file"
-    assert resolved.pat == PAT
+    assert f"cortex-training login --convert-legacy-config {path}" in str(found.value)
+    assert PAT not in str(found.value)
     assert FakeProfileAuth.instances == []
 
 
-def test_complete_direct_env_credentials_beat_the_saved_login(env, tmp_path):
-    login = tmp_path / "login.json"
-    login.write_text(json.dumps({"config_path": pat_config(tmp_path, pat="login-pat")}))
-    env.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login))
+def test_ci_variables_connect_only_when_no_profile_exists(env, tmp_path):
     env.setenv("CORTEX_TRAINING_HOST", HOST)
     env.setenv("CORTEX_TRAINING_PAT", PAT)
     env.setenv("CORTEX_TRAINING_DATABASE", "ENV_DB")
 
     resolved = utils.resolve_example_connection()
+    assert resolved.source == "default Snowflake connection profile" and resolved.pat is None
 
-    assert resolved.source == "environment variables or arguments"
-    assert resolved.pat == PAT
-    assert resolved.database == "ENV_DB"
+    (Path(os.environ["SNOWFLAKE_HOME"]) / "connections.toml").unlink()
+    resolved = utils.resolve_example_connection()
+    assert resolved.source == "from CORTEX_TRAINING_HOST (no profile exists)"
+    assert (resolved.pat, resolved.database) == (PAT, "ENV_DB")
 
 
-def test_saved_login_beats_the_default_profile(env, tmp_path):
+def test_saved_login_stops_with_the_command_that_converts_it(env, tmp_path):
     login = tmp_path / "login.json"
     login.write_text(json.dumps({"config_path": pat_config(tmp_path)}))
     env.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login))
 
-    resolved = utils.resolve_example_connection()
-
-    assert resolved.source == "saved login (cortex-training login)"
-    assert resolved.pat == PAT
+    with pytest.raises(_cli.OldConfigFile, match=f"from {login}"):
+        utils.resolve_example_connection()
     assert FakeProfileAuth.instances == []
-
-
-# Parity with the CLI ----------------------------------------------------------
 
 
 @pytest.mark.parametrize(
     "setup",
-    ["profile-env", "config-env", "default"],
+    ["profile-env", "default"],
 )
 def test_example_resolution_matches_the_cli_resolver(env, tmp_path, setup):
     if setup == "profile-env":
-        env.setenv("CORTEX_TRAINING_CONNECTION", "training")
-    elif setup == "config-env":
-        env.setenv("CORTEX_TRAINING_CONFIG", pat_config(tmp_path))
+        env.setenv("CORTEX_TRAINING_CONNECTION", "training")  # ignored by both
 
     args = _cli.parse_args(["list"])
     resolved = utils.resolve_example_connection()
 
-    assert resolved.pat == (args.pat if not args.use_connection_profile else None)
+    assert args.use_connection_profile and resolved.pat is None
+    assert resolved.source == "default Snowflake connection profile"
     assert resolved.verify_ssl is (not args.no_verify_ssl)
 
 
@@ -275,17 +272,6 @@ def test_shared_resolver_is_what_the_cli_uses(env):
 
     assert resolved.source == "connection profile 'training'"
     assert [auth.connection_name for auth in FakeProfileAuth.instances] == ["training"]
-
-
-# Connector-level config parsing -----------------------------------------------
-
-
-def test_cli_loader_rejects_unknown_keys_unless_non_strict(tmp_path):
-    path = write_json(tmp_path, {"host": HOST, "notes": "x"})
-
-    with pytest.raises(ValueError, match="unknown config key"):
-        _cli._load_config(path)
-    assert _cli._load_config(path, strict=False) == {"host": HOST}
 
 
 def test_example_command_hints_render_the_connection_argument():
@@ -436,13 +422,6 @@ def test_an_example_without_arguments_uses_the_saved_profile(env):
     resolved = utils.resolve_example_connection()
     assert [auth.connection_name for auth in FakeProfileAuth.instances] == ["training"]
     assert resolved.source == "connection profile 'training' (saved by cortex-training login)"
-
-
-def test_an_example_reached_by_cortex_training_config_warns(env, tmp_path, caplog):
-    env.setenv("CORTEX_TRAINING_CONFIG", pat_config(tmp_path))
-    with caplog.at_level("WARNING"):
-        utils.resolve_example_connection()
-    assert "from CORTEX_TRAINING_CONFIG) will be deprecated in a future release." in caplog.text
 
 
 def test_an_example_that_needs_a_pat_doesn_t_call_its_config_deprecated(env, tmp_path, caplog):

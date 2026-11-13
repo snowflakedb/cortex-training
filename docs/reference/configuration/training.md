@@ -3,10 +3,10 @@
 The examples take two separate things:
 
 - `connection=` or `config=` — the Snowflake connection. Omit both to use the
-  same resolution as the CLI (see [Set up the client](../../getting-started/setup.md)).
-  `config=` is an older JSON connection file; it still works and will be
-  deprecated in a future release (see
-  [Older Connection Methods](../cli.md#older-connection-methods)).
+  same profile as the CLI (see [Set up the client](../../getting-started/setup.md)).
+  `config=` is an older JSON connection file; recipes still accept it, with a
+  warning (see
+  [Converting An Older Connection](../cli.md#converting-an-older-connection)).
 - The job — a create-job body holding the whole training configuration. The
   example builds it from the [model catalog](../../../model-catalog/README.md),
   or takes your own file with `job_config=`; see

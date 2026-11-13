@@ -81,6 +81,10 @@ class PickerError(ValueError):
     """The inputs do not pick a usable connection."""
 
 
+class NoProfileError(PickerError):
+    """No Snowflake connection profile exists, and no CI variables are set."""
+
+
 @dataclass(frozen=True)
 class Resolution:
     """What the picker chose, and where each choice came from."""
@@ -244,7 +248,7 @@ def resolve(
             missing = PAT_ENV if env_host else HOST_ENV if env_pat else None
             if missing:
                 raise PickerError(f"{missing} is not set; CI connections need both {HOST_ENV} and {PAT_ENV}.")
-            raise PickerError(f"No Snowflake connection profile is set up. {_SETUP_HINT}")
+            raise NoProfileError(f"No Snowflake connection profile is set up. {_SETUP_HINT}")
         host, pat = normalize_host(env_host, HOST_ENV), env_pat
         sources["host"] = f"from {HOST_ENV}"
         profile_values = {}

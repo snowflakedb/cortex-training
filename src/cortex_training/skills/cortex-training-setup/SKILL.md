@@ -51,8 +51,9 @@ It never signs in. It prints JSON with the same keys every time; read
 | Exit code 2, "No Snowflake connection profile is set up" | Ask the user to run `cortex-training login` in their terminal. It sets up a profile, checks it, and saves it |
 | `"connection": "profile"`, `"usable": true`, no `warnings` | Summarize the profile, account, role and database, then go to Step 3 |
 | `"usable": false` | Explain the reason in `warnings` (for example "no user set"); suggest `cortex-training login` |
-| `"connection": "config file"` or `"flags or environment"` | It uses an older connection method. Suggest the user converts it: `cortex-training login --convert-legacy-config FILE` (it keeps the old file) |
-| A `warnings` entry about an environment variable | Explain which variable changes the result, and that `unset NAME` (bash/zsh) or `set -e NAME` (fish) removes it |
+| Exit code 2, "signing in with an old JSON config … is no longer supported" | An old JSON config (`--config`, `CORTEX_TRAINING_CONFIG`, or `login.json`) stops every command. Ask the user to run the `cortex-training login --convert-legacy-config FILE` it names, in their terminal (it keeps the old file) |
+| `"connection": "CI variables"` | `CORTEX_TRAINING_HOST` and `CORTEX_TRAINING_PAT` are used because no profile exists. Fine in CI; on the user's own machine, suggest `cortex-training login` |
+| A `warnings` entry about an environment variable | Explain which variable changes the result, or that it's ignored ("is set but ignored"), and that `unset NAME` (bash/zsh) or `set -e NAME` (fish) removes it |
 
 `--connection NAME`, `--database` and `--schema` work as with any command:
 `cortex-training --connection NAME status`.

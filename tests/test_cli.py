@@ -21,6 +21,7 @@ import io
 import json
 import logging
 import os
+import re
 import threading
 import time
 from datetime import date
@@ -3684,248 +3685,13 @@ def test_invalid_job_json_returns_error(tmp_path):
     assert "job JSON must be an object" in stderr.getvalue()
 
 
-def test_config_file_supplies_connection_values(tmp_path):
-    config = _write_config(
-        tmp_path,
-        {
-            "base_url": "http://config.local",
-            "database": "CONFIG_DB",
-            "schema": "CONFIG_SCHEMA",
-            "endpoint": "config-endpoint",
-            "poll_interval": 2.0,
-            "poll_timeout": 30.0,
-        },
-    )
-    seen = {}
-    stdout = io.StringIO()
-
-    def make_client(args):
-        seen.update(vars(args))
-        return FakeClient()
-
-    rc = cli.main(["--config", str(config), "list"], client_factory=make_client, stdout=stdout)
-
-    assert rc == 0
-    assert seen["base_url"] == "http://config.local"
-    assert seen["database"] == "CONFIG_DB"
-    assert seen["schema"] == "CONFIG_SCHEMA"
-    assert seen["endpoint"] == "config-endpoint"
-    assert seen["poll_interval"] == 2.0
-    assert seen["poll_timeout"] == 30.0
-
-
-def test_cli_flags_override_config_file(tmp_path):
-    config = _write_config(
-        tmp_path,
-        {
-            "base_url": "http://config.local",
-            "database": "CONFIG_DB",
-            "schema": "CONFIG_SCHEMA",
-        },
-    )
-    seen = {}
-
-    def make_client(args):
-        seen.update(vars(args))
-        return FakeClient()
-
-    rc = cli.main(
-        [
-            "--config",
-            str(config),
-            "--base-url",
-            "http://cli.local",
-            "--database",
-            "CLI_DB",
-            "list",
-        ],
-        client_factory=make_client,
-        stdout=io.StringIO(),
-    )
-
-    assert rc == 0
-    assert seen["base_url"] == "http://cli.local"
-    assert seen["database"] == "CLI_DB"
-    assert seen["schema"] == "CONFIG_SCHEMA"
-
-
-def test_config_can_come_from_env(tmp_path, monkeypatch):
-    config = _write_config(
-        tmp_path,
-        {
-            "base_url": "http://env-config.local",
-            "database": "ENV_CONFIG_DB",
-        },
-    )
-    monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(config))
-    seen = {}
-
-    def make_client(args):
-        seen.update(vars(args))
-        return FakeClient()
-
-    rc = cli.main(["list"], client_factory=make_client, stdout=io.StringIO())
-
-    assert rc == 0
-    assert seen["base_url"] == "http://env-config.local"
-    assert seen["database"] == "ENV_CONFIG_DB"
-
-
-def test_config_accepts_common_aliases(tmp_path):
-    config = _write_config(tmp_path, {"url": "http://alias.local", "db": "ALIAS_DB"})
-    seen = {}
-
-    def make_client(args):
-        seen.update(vars(args))
-        return FakeClient()
-
-    rc = cli.main(["--config", str(config), "list"], client_factory=make_client, stdout=io.StringIO())
-
-    assert rc == 0
-    assert seen["base_url"] == "http://alias.local"
-    assert seen["database"] == "ALIAS_DB"
-
-
-def test_bare_base_url_with_pat_is_treated_as_host(tmp_path):
-    config = _write_config(
-        tmp_path,
-        {
-            "base_url": "ACCOUNT.snowflakecomputing.com",
-            "pat": "test-pat",
-            "database": "CORTEX_TRAINING_DB",
-        },
-    )
-    seen = {}
-
-    def make_client(args):
-        seen.update(vars(args))
-        return FakeClient()
-
-    rc = cli.main(
-        ["--config", str(config), "list"],
-        client_factory=make_client,
-        stdout=io.StringIO(),
-    )
-
-    assert rc == 0
-    assert seen["base_url"] is None
-    assert seen["host"] == "ACCOUNT.snowflakecomputing.com"
-    assert seen["pat"] == "test-pat"
-
-
-def test_bare_base_url_without_pat_returns_clear_error(tmp_path, monkeypatch):
-    monkeypatch.delenv("CORTEX_TRAINING_PAT", raising=False)
-    monkeypatch.delenv("SNOWFLAKE_PAT", raising=False)
-    config = _write_config(
-        tmp_path,
-        {
-            "base_url": "ACCOUNT.snowflakecomputing.com",
-            "database": "CORTEX_TRAINING_DB",
-        },
-    )
+def test_a_base_url_without_a_scheme_returns_a_clear_error(monkeypatch):
     stderr = io.StringIO()
 
-    rc = cli.main(["--config", str(config), "list"], stderr=stderr)
+    rc = cli.main(["--base-url", "ACCOUNT.snowflakecomputing.com", "--database", "DB", "list"], stderr=stderr)
 
     assert rc == 1
     assert "base_url must start with http:// or https://" in stderr.getvalue()
-
-
-def test_invalid_config_returns_error(tmp_path):
-    config = _write_config(tmp_path, {"base_url": "http://test.local", "typo": "value"})
-    stderr = io.StringIO()
-
-    rc = cli.main(["--config", str(config), "submit", "missing.json", "--dry-run"], stderr=stderr)
-
-    assert rc == 1
-    assert "unknown config key" in stderr.getvalue()
-
-
-def test_invalid_config_value_type_returns_error(tmp_path):
-    config = _write_config(tmp_path, {"base_url": 123, "database": "DB"})
-    stderr = io.StringIO()
-
-    rc = cli.main(["--config", str(config), "list"], stderr=stderr)
-
-    assert rc == 1
-    assert "config base_url must be a string" in stderr.getvalue()
-
-
-@pytest.mark.parametrize("config_flags", [[], ["--config"]])
-def test_the_old_login_form_still_saves_the_config_with_a_warning(tmp_path, monkeypatch, config_flags):
-    login_state = tmp_path / "login.json"
-    config = _write_config(
-        tmp_path,
-        {"base_url": "http://login.local", "database": "LOGIN_DB"},
-    )
-    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
-    stdout, stderr = io.StringIO(), io.StringIO()
-
-    rc = cli.main(["login"] + config_flags + [str(config)], stdout=stdout, stderr=stderr)
-
-    assert rc == 0
-    assert json.loads(login_state.read_text())["config_path"] == str(config.resolve())
-    assert json.loads(stdout.getvalue()) == {"config_path": str(config.resolve()), "logged_in": True}
-    warning = stderr.getvalue()
-    assert "will be deprecated in a future release." in warning
-    assert f"cortex-training login --convert-legacy-config {config}" in warning
-
-
-def test_logged_in_config_is_used_without_config_arg(tmp_path, monkeypatch):
-    login_state = tmp_path / "login.json"
-    config = _write_config(
-        tmp_path,
-        {"base_url": "http://login.local", "database": "LOGIN_DB"},
-    )
-    login_state.write_text(
-        json.dumps({"config_path": str(config)}),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
-    seen = {}
-
-    def make_client(args):
-        seen.update(vars(args))
-        return FakeClient()
-
-    rc = cli.main(["list"], client_factory=make_client, stdout=io.StringIO())
-
-    assert rc == 0
-    assert seen["base_url"] == "http://login.local"
-    assert seen["database"] == "LOGIN_DB"
-
-
-def test_cli_flags_override_logged_in_config(tmp_path, monkeypatch):
-    login_state = tmp_path / "login.json"
-    config = _write_config(
-        tmp_path,
-        {
-            "base_url": "http://login.local",
-            "database": "LOGIN_DB",
-            "schema": "LOGIN_SCHEMA",
-        },
-    )
-    login_state.write_text(
-        json.dumps({"config_path": str(config)}),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
-    seen = {}
-
-    def make_client(args):
-        seen.update(vars(args))
-        return FakeClient()
-
-    rc = cli.main(
-        ["--database", "CLI_DB", "list"],
-        client_factory=make_client,
-        stdout=io.StringIO(),
-    )
-
-    assert rc == 0
-    assert seen["base_url"] == "http://login.local"
-    assert seen["database"] == "CLI_DB"
-    assert seen["schema"] == "LOGIN_SCHEMA"
 
 
 def test_direct_connection_flags_do_not_read_login_state(tmp_path, monkeypatch):
@@ -4029,25 +3795,6 @@ def test_named_connection_bypasses_invalid_login_state(tmp_path, monkeypatch):
     assert seen["connection"] == "training-profile"
 
 
-def test_existing_legacy_config_wins_over_profile_fallback(tmp_path, monkeypatch):
-    config = _write_config(
-        tmp_path,
-        {"base_url": "http://legacy.local", "database": "LEGACY_DB"},
-    )
-    monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(config))
-    seen = {}
-
-    def make_client(args):
-        seen.update(vars(args))
-        return FakeClient()
-
-    rc = cli.main(["list"], client_factory=make_client, stdout=io.StringIO())
-
-    assert rc == 0
-    assert seen["use_connection_profile"] is False
-    assert seen["base_url"] == "http://legacy.local"
-
-
 def test_missing_remembered_config_falls_back_to_profile(tmp_path, monkeypatch):
     login_state = tmp_path / "login.json"
     login_state.write_text(
@@ -4067,16 +3814,16 @@ def test_missing_remembered_config_falls_back_to_profile(tmp_path, monkeypatch):
     assert seen["use_connection_profile"] is True
 
 
-def test_named_connection_conflicts_with_direct_flags():
+def test_named_connection_conflicts_with_a_base_url():
     stderr = io.StringIO()
 
     rc = cli.main(
-        ["--connection", "training-profile", "--host", "x.test", "list"],
+        ["--connection", "training-profile", "--base-url", "http://test.local", "--database", "DB", "list"],
         stderr=stderr,
     )
 
     assert rc == 1
-    assert "--connection cannot be combined" in stderr.getvalue()
+    assert "--connection cannot be combined with --base-url" in stderr.getvalue()
 
 
 def _write_profiles(*names: str) -> None:
@@ -4294,22 +4041,28 @@ def test_download_lock_paths_are_resolved(tmp_path, monkeypatch):
         pass
 
 
-# ─── Both ways work; the old ones warn (release 1) ──────────────────────────
+# ─── Older ways to connect stop, and say what replaced them ─────────────────
+
+_SECRET = "SECRET-PAT"
 
 
-def _connect(argv, monkeypatch, **env):
-    """Run `list` with a fake client; return what it connected with and its stderr."""
+def _no_connection_env(monkeypatch):
     for name in ("CORTEX_TRAINING_CONFIG", "CORTEX_TRAINING_CONNECTION", "CORTEX_TRAINING_HOST", "CORTEX_TRAINING_PAT",
                  "CORTEX_TRAINING_DATABASE", "CORTEX_TRAINING_SCHEMA", "SNOWFLAKE_HOST", "SNOWFLAKE_PAT",
                  "SNOWFLAKE_DATABASE", "SNOWFLAKE_SCHEMA", "CORTEX_TRAINING_BASE_URL"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(Path(os.environ["SNOWFLAKE_HOME"]) / "no-login.json"))
+
+
+def _connect(argv, monkeypatch, *, stdin=None, stderr=None, **env):
+    """Run `list` with a fake client; return its exit code, what it connected with, and its stderr."""
+    _no_connection_env(monkeypatch)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     seen = {}
-    stderr = io.StringIO()
+    stderr = stderr or io.StringIO()
     rc = cli.main(argv + ["list"], client_factory=lambda args: seen.update(vars(args)) or FakeClient(),
-                  stdout=io.StringIO(), stderr=stderr)
+                  stdin=stdin or io.StringIO(), stdout=io.StringIO(), stderr=stderr)
     return rc, seen, stderr.getvalue()
 
 
@@ -4319,51 +4072,166 @@ def _save_choice(profile):
     path.write_text(json.dumps({"profile": profile}))
 
 
-def test_a_json_config_still_works_and_warns(tmp_path, monkeypatch):
-    config = _write_config(tmp_path, {"host": "acme.snowflakecomputing.com", "pat": "tok", "database": "DB"})
-    rc, seen, err = _connect(["--config", str(config)], monkeypatch)
-    assert rc == 0
-    assert (seen["use_connection_profile"], seen["host"], seen["pat"], seen["database"]) == (False, "acme.snowflakecomputing.com", "tok", "DB")
-    assert f"warning: Signing in with an old JSON config ({config}, from --config) will be deprecated in a future release." in err
-    assert f"`cortex-training login --convert-legacy-config {config}`" in err
-    assert "tok" not in err
+def _old_config(tmp_path):
+    return _write_config(tmp_path, {"host": "acme.snowflakecomputing.com", "pat": _SECRET, "database": "DB"})
 
 
-def test_cortex_training_config_and_login_json_still_work_and_say_where_from(tmp_path, monkeypatch):
-    config = _write_config(tmp_path, {"host": "acme.snowflakecomputing.com", "pat": "tok", "database": "DB"})
-    _, seen, err = _connect([], monkeypatch, CORTEX_TRAINING_CONFIG=str(config))
-    assert seen["host"] == "acme.snowflakecomputing.com" and "from CORTEX_TRAINING_CONFIG)" in err
+def _login_json(tmp_path, config_path):
     login_state = tmp_path / "login.json"
-    login_state.write_text(json.dumps({"config_path": str(config)}))
-    monkeypatch.delenv("CORTEX_TRAINING_CONFIG")
+    login_state.write_text(json.dumps({"config_path": str(config_path)}))
+    return login_state
+
+
+def test_a_json_config_stops_and_says_how_to_convert_it(tmp_path, monkeypatch):
+    config = _old_config(tmp_path)
+    for argv, env, source in ((["--config", str(config)], {}, "--config"),
+                              ([], {"CORTEX_TRAINING_CONFIG": str(config)}, "CORTEX_TRAINING_CONFIG")):
+        rc, seen, err = _connect(argv, monkeypatch, **env)
+        # Nothing connects.
+        assert rc == 2 and seen == {}
+        assert f"error: signing in with an old JSON config ({config}, from {source}) is no longer supported." in err
+        assert err.endswith(f"To convert it, run in a terminal:  cortex-training login --convert-legacy-config {config}\n")
+        assert _SECRET not in err
+
+
+def test_a_json_config_stops_even_with_a_saved_profile(tmp_path, monkeypatch):
+    # Named on purpose, it isn't silently replaced by the profile.
+    config = _old_config(tmp_path)
+    _write_profiles("default", "train")
+    _save_choice("train")
+    rc, seen, err = _connect(["--config", str(config)], monkeypatch)
+    assert rc == 2 and seen == {} and "old JSON config" in err
+
+
+@pytest.mark.parametrize(("answer", "rc", "converted"), [("\n", 0, True), ("n\n", 2, False)])
+def test_in_a_terminal_a_json_config_is_offered_for_conversion(tmp_path, monkeypatch, answer, rc, converted):
+    config = _old_config(tmp_path)
+    ran = []
+    monkeypatch.setattr("cortex_training._convert.run_convert", lambda path, **_: ran.append(path) or 0)
+    code, seen, err = _connect(["--config", str(config)], monkeypatch, stdin=_Terminal(answer), stderr=_Terminal())
+    assert code == rc and seen == {}
+    assert "Convert it now? [Y/n]" in err
+    assert ran == ([str(config)] if converted else [])
+    if not converted:
+        assert err.endswith(f"Nothing was changed. To convert it later, run:  cortex-training login --convert-legacy-config {config}\n")
+
+
+def test_a_cancelled_convert_question_changes_nothing(tmp_path, monkeypatch):
+    config = _old_config(tmp_path)
+    monkeypatch.setattr("cortex_training._convert.run_convert", lambda path, **_: pytest.fail("converted"))
+    code, seen, err = _connect(["--config", str(config)], monkeypatch, stdin=_Terminal(""), stderr=_Terminal())
+    assert code == 130 and seen == {} and "Nothing was changed." in err
+
+
+def test_login_json_stops_only_while_no_profile_is_saved(tmp_path, monkeypatch):
+    config = _old_config(tmp_path)
+    login_state = _login_json(tmp_path, config)
+    rc, seen, err = _connect([], monkeypatch, CORTEX_TRAINING_LOGIN_FILE=str(login_state))
+    assert rc == 2 and seen == {}
+    assert f"old JSON config ({config}, from {login_state})" in err
+    # Converting saves a profile and keeps login.json: from then on, it's left alone.
+    _write_profiles("default", "train")
+    _save_choice("train")
+    rc, seen, err = _connect([], monkeypatch, CORTEX_TRAINING_LOGIN_FILE=str(login_state))
+    assert rc == 0 and seen["use_connection_profile"] is True
+    assert cli._picker_choice(argparse_namespace(seen)).profile == "train"
+    assert "old JSON config" not in err and "note:" not in err  # Not a terminal: nothing about it.
+    assert login_state.exists()
+
+
+def test_a_terminal_is_told_a_leftover_login_json_can_go(tmp_path, monkeypatch):
+    login_state = _login_json(tmp_path, _old_config(tmp_path))
+    _write_profiles("default", "train")
+    _save_choice("train")
+    rc, _, err = _connect([], monkeypatch, stderr=_Terminal(), CORTEX_TRAINING_LOGIN_FILE=str(login_state))
+    assert rc == 0
+    assert f"note: {login_state} is no longer used: profile train is saved. You can delete it.\n" in err
+    # It doesn't send someone who already converted back to convert again.
+    assert "--convert-legacy-config" not in err
+
+
+def test_login_json_with_a_saved_profile_that_is_gone_still_stops(tmp_path, monkeypatch):
+    # Only a saved profile that exists replaces the file login.json remembers.
+    config = _old_config(tmp_path)
+    login_state = _login_json(tmp_path, config)
+    _write_profiles("default", "train")
+    _save_choice("gone")
+    rc, seen, err = _connect([], monkeypatch, CORTEX_TRAINING_LOGIN_FILE=str(login_state))
+    assert rc == 2 and seen == {} and f"({config}, from {login_state})" in err
+
+
+def test_a_config_that_isnt_there_stops_and_a_stale_login_json_only_warns(tmp_path, monkeypatch):
+    missing = tmp_path / "gone.json"
+    rc, seen, err = _connect([], monkeypatch, CORTEX_TRAINING_CONFIG=str(missing))
+    assert rc == 2 and seen == {}
+    assert f"error: CORTEX_TRAINING_CONFIG points to an old JSON config, {missing}, which doesn't exist" in err
+    assert "Unset CORTEX_TRAINING_CONFIG. Run `cortex-training login`" in err
+    login_state = _login_json(tmp_path, missing)
+    _write_profiles("default")
+    rc, seen, err = _connect([], monkeypatch, CORTEX_TRAINING_LOGIN_FILE=str(login_state))
+    assert rc == 0 and seen["use_connection_profile"] is True
+    assert f"warning: {login_state} points to {missing}, which doesn't exist; it's ignored. Delete it.\n" in err
+
+
+def test_a_dry_run_doesnt_read_login_json(tmp_path, monkeypatch):
+    login_state = _login_json(tmp_path, _old_config(tmp_path))
     monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
-    seen.clear()
-    stderr = io.StringIO()
-    cli.main(["list"], client_factory=lambda args: seen.update(vars(args)) or FakeClient(), stdout=io.StringIO(), stderr=stderr)
-    assert seen["host"] == "acme.snowflakecomputing.com" and f"from {login_state})" in stderr.getvalue()
+    job = _write_job(tmp_path)
+    assert cli.main(["submit", str(job), "--dry-run"], stdout=io.StringIO(), stderr=io.StringIO()) == 0
 
 
-def test_host_and_pat_flags_still_work_and_warn(monkeypatch):
-    rc, seen, err = _connect(["--host", "acme.snowflakecomputing.com", "--pat", "tok", "--database", "DB"], monkeypatch)
-    assert rc == 0 and (seen["host"], seen["pat"]) == ("acme.snowflakecomputing.com", "tok")
-    assert "warning: Signing in with --host and --pat will be deprecated" in err
+@pytest.mark.parametrize(("argv", "named"), [
+    (["--host", "acme.snowflakecomputing.com", "--pat", _SECRET], "--host and --pat are"),
+    (["--pat", _SECRET], "--pat is"),
+    (["--host", "acme.snowflakecomputing.com"], "--host is"),
+])
+def test_host_and_pat_flags_stop_and_point_to_login(monkeypatch, argv, named):
+    rc, seen, err = _connect(argv + ["--database", "DB"], monkeypatch)
+    assert rc == 2 and seen == {}
+    assert err == (
+        f"error: {named} no longer supported: Cortex Training signs in with a Snowflake connection profile. "
+        "Run `cortex-training login` to set one up (it can create one from an account and a PAT). "
+        "In CI, set CORTEX_TRAINING_HOST and CORTEX_TRAINING_PAT instead.\n"
+    )
 
 
-def test_snowflake_credentials_still_work_and_warn(monkeypatch):
-    rc, seen, err = _connect([], monkeypatch, SNOWFLAKE_HOST="acme.snowflakecomputing.com", SNOWFLAKE_PAT="tok",
-                             SNOWFLAKE_DATABASE="DB")
-    assert rc == 0 and seen["use_connection_profile"] is False and seen["database"] == "DB"
-    assert "warning: SNOWFLAKE_HOST and SNOWFLAKE_PAT will be deprecated in a future release." in err
+def test_the_old_flags_are_hidden_from_help(capsys):
+    with pytest.raises(SystemExit):
+        cli.parse_args(["--help"])
+    out = capsys.readouterr().out
+    for flag in ("--config", "--host", "--pat"):
+        assert not re.search(rf"(?<![\w-]){flag}\b", out), flag
+    assert "--connection" in out and "--base-url" in out
 
 
-def test_ci_credentials_warn_only_when_a_profile_exists(monkeypatch):
-    creds = dict(CORTEX_TRAINING_HOST="acme.snowflakecomputing.com", CORTEX_TRAINING_PAT="tok", CORTEX_TRAINING_DATABASE="DB")
-    _, seen, err = _connect([], monkeypatch, **creds)
-    assert seen["host"] == "acme.snowflakecomputing.com" and "warning" not in err
-    _write_profiles("prod")
-    _, seen, err = _connect([], monkeypatch, **creds)
-    assert seen["host"] == "acme.snowflakecomputing.com"  # still used, as before
-    assert "warning: CORTEX_TRAINING_HOST and CORTEX_TRAINING_PAT are used while you have a Snowflake connection profile." in err
+def test_variables_the_old_lookup_read_are_ignored_with_a_warning(monkeypatch):
+    _write_profiles("default", "train")
+    rc, seen, err = _connect([], monkeypatch, CORTEX_TRAINING_CONNECTION="train", SNOWFLAKE_HOST="acme.snowflakecomputing.com",
+                             SNOWFLAKE_PAT=_SECRET, SNOWFLAKE_DATABASE="OLD_DB", SNOWFLAKE_SCHEMA="OLD")
+    assert rc == 0 and seen["connection"] is None and seen["use_connection_profile"] is True
+    choice = cli._picker_choice(argparse_namespace(seen))
+    assert (choice.profile, choice.database, choice.schema) == ("default", "CORTEX_TRAINING_DB", "PUBLIC")
+    assert ("warning: CORTEX_TRAINING_CONNECTION is set but ignored. Use --connection NAME, or run "
+            "`cortex-training login` to change the saved profile.\n") in err
+    assert "warning: SNOWFLAKE_HOST is set but ignored; Cortex Training uses a profile (or CORTEX_TRAINING_HOST, in CI only).\n" in err
+    assert "warning: SNOWFLAKE_DATABASE is set but ignored; Cortex Training uses CORTEX_TRAINING_DATABASE, or the profile's database.\n" in err
+    for name in ("SNOWFLAKE_PAT", "SNOWFLAKE_SCHEMA"):
+        assert f"warning: {name} is set but ignored" in err
+    assert _SECRET not in err
+
+
+def test_ci_variables_connect_only_when_no_profile_exists(monkeypatch, caplog):
+    creds = dict(CORTEX_TRAINING_HOST="ci.snowflakecomputing.com", CORTEX_TRAINING_PAT=_SECRET, CORTEX_TRAINING_DATABASE="CI_DB")
+    rc, seen, err = _connect([], monkeypatch, **creds)
+    assert rc == 0 and seen["use_connection_profile"] is True and "warning" not in err
+    choice = cli._picker_choice(argparse_namespace(seen))
+    assert (choice.profile, choice.host, choice.database) == (None, "ci.snowflakecomputing.com", "CI_DB")
+    _write_profiles("default")
+    _, seen, _ = _connect([], monkeypatch, **creds)
+    with caplog.at_level("WARNING"):
+        choice = cli._picker_choice(argparse_namespace(seen))
+    assert (choice.profile, choice.host) == ("default", None)
+    assert "are set but ignored: profile default is used." in caplog.text
 
 
 def test_without_an_old_form_the_saved_profile_is_used(monkeypatch):
@@ -4373,6 +4241,29 @@ def test_without_an_old_form_the_saved_profile_is_used(monkeypatch):
     assert rc == 0 and seen["use_connection_profile"] is True and "warning" not in err
     # The fake client factory skips build_client; the picker's choice is what build_client would use.
     assert cli._picker_choice(argparse_namespace(seen)).profile == "train"
+
+
+@pytest.mark.parametrize(("answer", "logged_in"), [("\n", True), ("n\n", False)])
+def test_with_no_profile_a_terminal_is_offered_login(monkeypatch, answer, logged_in):
+    _no_connection_env(monkeypatch)
+    ran = []
+    monkeypatch.setattr("cortex_training._login.run_login", lambda name, **_: ran.append(name) or 0)
+    monkeypatch.setattr(cli, "_load_cortex_training_client_class", lambda: _ResolutionClient)
+    stderr = _Terminal()
+    rc = cli.main(["list"], stdin=_Terminal(answer), stdout=io.StringIO(), stderr=stderr)
+    assert (rc, ran) == ((0, [None]) if logged_in else (1, []))
+    assert stderr.getvalue().startswith("error: No Snowflake connection profile is set up.")
+    assert "Run `cortex-training login` now? [Y/n]" in stderr.getvalue()
+
+
+def test_with_no_profile_and_no_terminal_it_only_says_so(monkeypatch):
+    _no_connection_env(monkeypatch)
+    monkeypatch.setattr("cortex_training._login.run_login", lambda name, **_: pytest.fail("ran login"))
+    monkeypatch.setattr(cli, "_load_cortex_training_client_class", lambda: _ResolutionClient)
+    stderr = io.StringIO()
+    assert cli.main(["list"], stdin=io.StringIO(), stdout=io.StringIO(), stderr=stderr) == 1
+    assert stderr.getvalue().startswith("error: No Snowflake connection profile is set up.")
+    assert "now?" not in stderr.getvalue()
 
 
 def test_the_target_line_names_the_saved_profile(monkeypatch):
@@ -4403,96 +4294,6 @@ def test_the_target_line_is_left_out_for_a_saved_profile_with_its_own_database(m
     # Any other choice is shown: here --connection, though it names the same profile.
     _, _, err = _connect_real(monkeypatch, tty=True, argv=["--connection", "train"])
     assert "→ profile train (from --connection) · database TEAM_DB (from profile train) · schema RUNS (from profile train)" in err
-
-
-def test_a_saved_profile_beats_login_json(tmp_path, monkeypatch):
-    config = _write_config(tmp_path, {"host": "acme.snowflakecomputing.com", "pat": "tok", "database": "DB"})
-    login_state = tmp_path / "login.json"
-    login_state.write_text(json.dumps({"config_path": str(config)}))
-    _write_profiles("default", "train")
-    _save_choice("train")
-    rc, seen, err = _connect([], monkeypatch, CORTEX_TRAINING_LOGIN_FILE=str(login_state))
-    assert rc == 0 and seen["use_connection_profile"] is True and seen["host"] is None
-    assert cli._picker_choice(argparse_namespace(seen)).profile == "train"
-    # Kept on purpose (it is the way back), so scripts and CI logs get no note about it.
-    assert "is ignored because" not in err
-    assert "old JSON config" not in err
-    assert login_state.exists()
-
-
-def test_a_terminal_is_told_how_to_use_login_json_again(tmp_path, monkeypatch):
-    config = _write_config(tmp_path, {"host": "acme.snowflakecomputing.com", "pat": "tok", "database": "DB"})
-    login_state = tmp_path / "login.json"
-    login_state.write_text(json.dumps({"config_path": str(config)}))
-    _write_profiles("default", "train")
-    _save_choice("train")
-    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
-    for name in ("CORTEX_TRAINING_CONFIG", "CORTEX_TRAINING_HOST", "CORTEX_TRAINING_PAT", "SNOWFLAKE_HOST", "SNOWFLAKE_PAT"):
-        monkeypatch.delenv(name, raising=False)
-
-    class Terminal(io.StringIO):
-        def isatty(self):
-            return True
-
-    stderr = Terminal()
-    rc = cli.main(["list"], client_factory=lambda args: FakeClient(), stdout=io.StringIO(), stderr=stderr)
-    assert rc == 0
-    config_json = Path(os.environ["SNOWFLAKE_HOME"]) / "cortex-training" / "config.json"
-    assert (
-        f"note: {login_state} is ignored because profile train is saved. "
-        f'To use it again, remove "profile" from {config_json}.'
-    ) in stderr.getvalue()
-    # It doesn't send someone who already converted back to convert again.
-    assert "--convert-legacy-config" not in stderr.getvalue()
-
-
-def test_login_json_still_works_when_the_saved_profile_is_gone(tmp_path, monkeypatch):
-    # Only a saved profile that exists replaces the file login.json remembers.
-    config = _write_config(tmp_path, {"host": "acme.snowflakecomputing.com", "pat": "tok", "database": "DB"})
-    login_state = tmp_path / "login.json"
-    login_state.write_text(json.dumps({"config_path": str(config)}))
-    _write_profiles("default", "train")
-    _save_choice("gone")
-    rc, seen, err = _connect([], monkeypatch, CORTEX_TRAINING_LOGIN_FILE=str(login_state))
-    assert rc == 0 and seen["use_connection_profile"] is False and seen["host"] == "acme.snowflakecomputing.com"
-    assert f"Signing in with an old JSON config ({config}, from {login_state}) will be deprecated" in err
-    assert "is ignored because" not in err
-
-
-def test_config_still_beats_a_saved_profile_with_its_warning(tmp_path, monkeypatch):
-    config = _write_config(tmp_path, {"host": "acme.snowflakecomputing.com", "pat": "tok", "database": "DB"})
-    _write_profiles("default", "train")
-    _save_choice("train")
-    for argv, env, source in (([ "--config", str(config)], {}, "--config"), ([], {"CORTEX_TRAINING_CONFIG": str(config)}, "CORTEX_TRAINING_CONFIG")):
-        rc, seen, err = _connect(argv, monkeypatch, **env)
-        assert rc == 0 and seen["use_connection_profile"] is False and seen["host"] == "acme.snowflakecomputing.com"
-        assert f"Signing in with an old JSON config ({config}, from {source}) will be deprecated" in err
-        assert "is ignored because" not in err
-
-
-def test_the_old_login_file_form_says_a_saved_profile_wins(tmp_path, monkeypatch):
-    config = _write_config(tmp_path, {"host": "acme.snowflakecomputing.com", "pat": "tok", "database": "DB"})
-    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "login.json"))
-    _write_profiles("train")
-    _save_choice("train")
-    stderr = io.StringIO()
-    assert cli.main(["login", str(config)], stdout=io.StringIO(), stderr=stderr) == 0
-    assert f"warning: profile train is saved by `cortex-training login`, so commands use it and ignore {config}." in stderr.getvalue()
-
-
-def test_cortex_training_connection_still_works_and_warns(monkeypatch):
-    _write_profiles("default", "train")
-    rc, seen, err = _connect([], monkeypatch, CORTEX_TRAINING_CONNECTION="train")
-    assert rc == 0 and seen["connection"] == "train"
-    assert "warning: CORTEX_TRAINING_CONNECTION will be deprecated" in err
-
-
-def test_snowflake_database_is_still_honored_with_a_warning(monkeypatch):
-    _write_profiles("default")
-    rc, seen, err = _connect([], monkeypatch, SNOWFLAKE_DATABASE="OLD_DB")
-    assert rc == 0
-    assert "warning: SNOWFLAKE_DATABASE will be deprecated in a future release. Use --database or CORTEX_TRAINING_DATABASE." in err
-    assert cli._picker_choice(argparse_namespace(seen)).database == "OLD_DB"
 
 
 def test_base_url_does_not_warn(monkeypatch):
@@ -4578,7 +4379,6 @@ def test_status_reports_the_saved_profile_and_where_each_value_came_from(monkeyp
         "connection": "profile",
         "profile": "train",
         "profile_source": "saved by cortex-training login",
-        "config_file": None,
         "base_url": None,
         "account": "ACME",
         "host": "acme.snowflakecomputing.com",
@@ -4617,24 +4417,21 @@ def test_status_follows_connection_and_database_flags(monkeypatch):
 
 
 def test_status_with_ci_variables_and_no_profile(monkeypatch):
-    # Like every command, CI variables need a database too.
     code, report, _ = _status(
         monkeypatch, CORTEX_TRAINING_HOST="ci.snowflakecomputing.com", CORTEX_TRAINING_PAT="ci-tok", CORTEX_TRAINING_DATABASE="CI_DB"
     )
     assert code == 0
-    assert report["connection"] == "flags or environment" and report["config_file"] is None
+    assert (report["connection"], report["profile"], report["signs_in_with"]) == ("CI variables", None, "a programmatic access token")
     assert (report["host"], report["database"], report["database_source"]) == ("ci.snowflakecomputing.com", "CI_DB", "from CORTEX_TRAINING_DATABASE")
     assert "ci-tok" not in json.dumps(report)
 
 
-def test_status_with_an_old_json_config_says_so_and_warns(monkeypatch, tmp_path):
+def test_status_with_an_old_json_config_stops_like_every_command(monkeypatch, tmp_path):
     config = _write_config(tmp_path, {"host": "old.snowflakecomputing.com", "pat": "old-tok", "database": "OLD_DB"})
     code, report, err = _status(monkeypatch, ["--config", str(config)])
-    assert code == 0
-    assert (report["connection"], report["config_file"], report["database"]) == ("config file", str(config), "OLD_DB")
-    assert report["warnings"] and "will be deprecated in a future release" in report["warnings"][0]
-    assert "warning: Signing in with an old JSON config" in err
-    assert "old-tok" not in json.dumps(report)
+    assert code == 2 and report is None
+    assert f"old JSON config ({config}, from --config) is no longer supported" in err
+    assert "old-tok" not in err
 
 
 def test_status_with_nothing_set_up_says_how_to_start(monkeypatch):
@@ -4649,11 +4446,10 @@ def test_status_always_has_the_same_keys(monkeypatch, tmp_path):
     _token_profile("train")
     _save_choice("train")
     _, from_profile, _ = _status(monkeypatch)
-    config = _write_config(tmp_path, {"host": "old.snowflakecomputing.com", "pat": "old-tok", "database": "OLD_DB"})
-    _, from_file, _ = _status(monkeypatch, ["--config", str(config)])
-    assert list(from_profile) == list(from_file) == list(cli._STATUS_KEYS)
-    assert (from_file["profile"], from_file["user"], from_file["role"]) == (None, None, None)
-    assert (from_file["database_source"], from_file["schema_source"]) == ("from the config file", "default")
+    _, from_url, _ = _status(monkeypatch, _base_args())
+    assert list(from_profile) == list(from_url) == list(cli._STATUS_KEYS)
+    assert (from_url["connection"], from_url["profile"], from_url["user"], from_url["role"]) == ("base_url", None, None, None)
+    assert (from_url["database_source"], from_url["schema_source"]) == ("from --database", "default")
 
 
 def test_status_warns_about_a_profile_commands_cant_use(monkeypatch):
@@ -4725,11 +4521,6 @@ def test_build_client_passes_its_surface_into_construction(tmp_path, monkeypatch
 
     cli.build_client(args, client_cls)
     assert client_cls._from_resolution.call_args.kwargs["telemetry_surface"] == "cli"
-
-    pat_args = cli.parse_args(["--host", "x.test", "--pat", "p", "--database", "DB", "list"])
-    pat_args.telemetry_surface = "cli"
-    cli.build_client(pat_args, client_cls)
-    assert client_cls._from_pat.call_args.kwargs["telemetry_surface"] == "cli"
 
 
 def test_the_commands_build_their_client_as_the_cli(monkeypatch):
