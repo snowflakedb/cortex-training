@@ -30,6 +30,7 @@ for a specific workload.
 | `zai-org/GLM-5.3-Flash-BF16` | MoE | standard, long | standard, long | 262,144 |
 | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` | MoE | standard, long | standard, long | 262,144 |
 | `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16` | MoE | standard, long | standard, long | 262,144 |
+| `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16` | MoE | standard, long | standard, long | 262,144 |
 | `thinkingmachines/Inkling-2-Small-MXFP8` | MoE | standard, long | standard, long | 262,144 |
 
 `standard` and `long` are each model's smaller and larger `max_seq_len` tiers,
@@ -52,7 +53,7 @@ The examples that tokenize prompts pick a chat renderer from tinker-cookbook
   runs models that tinker-cookbook has no renderer for.
 
 tinker-cookbook lists no renderer for Qwen3-0.6B, Qwen3-1.7B, Qwen3.5-2B,
-the Gemma and MedGemma models, or GLM 5.3 Flash BF16, so
+the Gemma and MedGemma models, GLM 5.3 Flash BF16, or Nemotron 3.5 Super VL, so
 pass `renderer_name=` for those; Math GRPO can't run them. Pick a
 renderer from tinker-cookbook's
 [renderer list](https://tinker-docs.thinkingmachines.ai/tutorials/core-concepts/rendering/#available-renderers)
@@ -66,6 +67,14 @@ prompts with its own tokenizer.
 
 ## Model notes
 
+- **Nemotron 3.5 Super VL:** training is text-only. It trains the language
+  model; the vision encoder, projector and multi-token-prediction (MTP) head
+  are not trained and are written unchanged into weights-only checkpoints, so a
+  checkpoint still serves images and video. The MTP head is not updated, so
+  speculative decoding with it may accept fewer draft tokens after fine-tuning.
+  Full-parameter training runs on 32 H200s (EP32, SP8); sequence parallelism is
+  capped at 8 because the Mamba layers have 8 groups. Sampling serves the
+  checkpoint with TP4 on four H200s. There are no LoRA files.
 - **Inkling 2 Small:** LoRA training uses the `arctic` provider and
   FlexAttention on 32 H200s across four nodes (EP32/SP8, ZeRO-2), with
   rank-16 adapters on the attention `wq_du`/`wv_dv` projections and the routed

@@ -80,6 +80,7 @@ EXPECTED_FILES = {
     "google/medgemma-1.5-4b-it": _FULL_STANDARD_LONG,
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": _FULL_STANDARD_LONG,
     "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16": _FULL_STANDARD_LONG,
+    "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16": _FULL_STANDARD_LONG,
     "zai-org/GLM-5.3": ["standard/h200-inference-full", "long/h200-inference-full"],
     "zai-org/GLM-5.3-Flash": [
         "standard/h200-inference-full",
@@ -120,11 +121,11 @@ def _config(body: dict) -> dict:
 
 def test_checked_in_catalog_is_valid():
     assert validate_catalog() == {
-        "models": 22,
-        "files": 105,
-        "training": 50,
-        "inference": 55,
-        "rl": 48,
+        "models": 23,
+        "files": 109,
+        "training": 52,
+        "inference": 57,
+        "rl": 50,
         "distillation": 1,
     }
 
@@ -171,6 +172,7 @@ def test_catalog_models_include_license_links():
         "google/medgemma-1.5-4b-it": "Health AI Developer Foundations",
         "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": "NVIDIA Nemotron Open Model License",
         "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16": "OpenMDW-1.1",
+        "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16": "OpenMDW-1.1",
         "zai-org/GLM-5.3": "GLM-5.3 License",
         "zai-org/GLM-5.3-Flash": "MIT",
         "zai-org/GLM-5.3-Flash-BF16": "MIT",
@@ -193,6 +195,7 @@ def test_moe_models_record_router_replay_geometry():
         "openai/gpt-oss-120b": {"num_moe_layers": 36, "topk": 4, "num_experts": 128},
         "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": {"num_moe_layers": 23, "topk": 6, "num_experts": 128},
         "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16": {"num_moe_layers": 23, "topk": 6, "num_experts": 128},
+        "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16": {"num_moe_layers": 40, "topk": 22, "num_experts": 512},
         "zai-org/GLM-5.3": {"num_moe_layers": 78, "topk": 8, "num_experts": 256},
         "zai-org/GLM-5.3-Flash": {"num_moe_layers": 42, "topk": 8, "num_experts": 288},
         "zai-org/GLM-5.3-Flash-BF16": {"num_moe_layers": 42, "topk": 8, "num_experts": 288},
@@ -318,6 +321,10 @@ def test_files_keep_their_source_sequence_lengths():
         ("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16", "standard", "training"): 65536,
         ("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16", "long", "inference"): 262144,
         ("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16", "long", "training"): 262144,
+        ("nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16", "standard", "inference"): 65536,
+        ("nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16", "standard", "training"): 65536,
+        ("nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16", "long", "inference"): 262144,
+        ("nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16", "long", "training"): 262144,
         ("zai-org/GLM-5.3-Flash", "standard", "inference"): 65536,
         ("zai-org/GLM-5.3-Flash", "standard", "training"): 65536,
         ("zai-org/GLM-5.3-Flash", "long", "inference"): 262144,
@@ -675,7 +682,7 @@ def _invalid(catalog_dir: Path, match: str) -> str:
 
 
 def test_copied_catalog_is_valid(catalog):
-    assert validate_catalog(catalog)["models"] == 22
+    assert validate_catalog(catalog)["models"] == 23
 
 
 def test_distillation_jobs_build_with_make_distillation_config(catalog):

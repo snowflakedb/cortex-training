@@ -66,6 +66,10 @@ models:
       - inference-endpoint
       - math-grpo
     last_validated: 2026-10-14
+  - id: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
+    training: true
+    inference: true
+    last_validated: null
   - id: Qwen/Qwen3-0.6B
     training: true
     inference: true
