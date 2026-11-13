@@ -8,6 +8,9 @@ token ids and a supervision mask. It owns the data pipeline and the two per-step
 rate, selector weight), saves the draft as a weights-only checkpoint in the serving layout, and reports
 the draft's accepted-length diagnostics. With ``eval_prompts=`` it then serves the final draft with its
 target and measures the served acceptance length (see ``recipes.dflash2.evaluate``).
+
+The target is ``model``, or a fine-tune of it (``target_job_id=`` and ``target_checkpoint_id=``, or
+``target_stage_path=``; see ``recipes.dflash2.target``).
 """
 
 from __future__ import annotations
@@ -26,6 +29,8 @@ from recipes.dflash2.metrics import UNARY_ACCEPTED_LENGTH
 from recipes.dflash2.metrics import summarize
 from recipes.dflash2.schedule import learning_rate
 from recipes.dflash2.schedule import selector_loss_alpha
+from recipes.dflash2.target import FineTunedTarget
+from recipes.dflash2.target import fine_tuned_target
 from recipes.dflash2.task import TokenizedConversation
 from recipes.dflash2.task import collate
 from recipes.dflash2.task import iter_jsonl
@@ -34,6 +39,7 @@ from recipes.logging import setup_logging
 from recipes.utils import build_job
 from recipes.utils import forward_backward
 from recipes.utils import make_client
+from recipes.utils import merge_job_config
 from recipes.utils import model_slug
 from recipes.utils import optimizer_step
 from recipes.utils import running_job
@@ -60,6 +66,12 @@ class Config:
     # The target model. The job is its catalog training file, then overrides.json, then
     # drafts/<model>.json; job_config= replaces all three with a file.
     model: str = "Qwen/Qwen3.5-4B"
+    # A fine-tune of `model` to train the draft against instead: the weights-only checkpoint a Cortex Training
+    # job saved (target_job_id + target_checkpoint_id), or a Hugging Face directory in a stage
+    # (target_stage_path, `@DB.SCHEMA.STAGE/path`). `model` stays its base. Every save of the draft carries it.
+    target_job_id: str | None = None
+    target_checkpoint_id: str | None = None
+    target_stage_path: str | None = None
     context: str = "standard"
     hardware: str = "h200"
     job_config: str | None = None
@@ -107,9 +119,9 @@ def draft_overrides(model: str) -> Path:
     return path
 
 
-def job_body(config: Config) -> dict:
-    """The training job: the catalog file, overrides.json, drafts/<model>.json, then ``config``."""
-    return build_job(
+def job_body(config: Config, target: FineTunedTarget | None = None) -> dict:
+    """The training job: the catalog file, overrides.json, drafts/<model>.json, ``config``, then the target."""
+    body = build_job(
         "training",
         model=config.model,
         context=config.context,
@@ -123,6 +135,10 @@ def job_body(config: Config) -> dict:
         max_seq_len=config.max_seq_len,
         debug_image_tag=config.debug_image_tag,
     )
+    if target is None:
+        return body
+    logger.info("training the draft against the fine-tune %s", target.source_checkpoint_info)
+    return merge_job_config(body, target.training_override())
 
 
 def training_sub_job(body: dict) -> dict:
@@ -166,7 +182,15 @@ def train(config: Config) -> dict[str, Any]:
     # setup_logging replaces these handlers once the job runs; until then this
     # keeps the created job id in the log, so an interrupted start can be cancelled.
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    body = job_body(config)
+    client = make_client(config.config, config.connection)
+    target = fine_tuned_target(
+        client,
+        config.model,
+        job_id=config.target_job_id,
+        checkpoint_id=config.target_checkpoint_id,
+        stage_path=config.target_stage_path,
+    )
+    body = job_body(config, target)
     sub = training_sub_job(body)
     training = sub["training_config"]
     batch_size = int(training["train_batch_size"])
@@ -200,7 +224,6 @@ def train(config: Config) -> dict[str, Any]:
         picked, order = order[:batch_size], order[batch_size:]
         return [sequences[i] for i in picked]
 
-    client = make_client(config.config, config.connection)
     saved: dict[str, Any] = {}
     with running_job(client, body, job_id=config.job_id) as job_id:
         ml_logger = setup_logging(config, client=client, job_id=job_id)

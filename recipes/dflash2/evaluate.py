@@ -6,6 +6,9 @@
 There is no API call for the engine's speculative-decoding counters for now. The sampling sub-job's log carries
 them instead: every 30 seconds it writes a ``drain_metrics`` summary with the engine's running totals
 ``spec_num_drafts_total``, ``spec_num_draft_tokens_total`` and ``spec_num_accepted_tokens_total``.
+
+A draft trained against a fine-tune of ``model`` carries that fine-tune in its checkpoint, and the endpoint serves it as
+the target; ``model`` stays the base it was fine-tuned from.
 """
 
 from __future__ import annotations
@@ -18,6 +21,11 @@ from collections.abc import Sequence
 from typing import Any
 
 import chz
+from recipes.dflash2.target import ADAPTER_DIR
+from recipes.dflash2.target import TARGET_DIR
+from recipes.dflash2.target import checkpoint_files
+from recipes.dflash2.target import find_files
+from recipes.dflash2.target import has_file
 from recipes.dflash2.task import iter_jsonl
 from recipes.utils import build_job
 from recipes.utils import make_client
@@ -60,12 +68,11 @@ class Config:
     out: str | None = None
 
 
-def checkpoint_block_size(client: Any, job_id: str, checkpoint_id: str) -> int:
-    """``dflash_config.block_size`` of a draft checkpoint, read from its exported ``config.json``."""
-    files = client.export_checkpoint(job_id, checkpoint_id).get("files") or ()
-    urls = [f["url"] for f in files if f.get("filename", "").rsplit("/", 1)[-1] == "config.json"]
+def draft_block_size(files: Sequence[dict[str, Any]], checkpoint_id: str) -> int:
+    """``dflash_config.block_size`` of a draft checkpoint, read from the ``config.json`` at its root."""
+    urls = [f["url"] for f in find_files(files, "config.json")]
     if len(urls) != 1:
-        raise ValueError(f"checkpoint {checkpoint_id} of job {job_id} has {len(urls)} config.json files, expected 1")
+        raise ValueError(f"checkpoint {checkpoint_id} has {len(urls)} config.json files at its root, expected 1")
     with urllib.request.urlopen(urls[0], timeout=60) as response:
         config = json.loads(response.read())
     block_size = (config.get("dflash_config") or {}).get("block_size")
@@ -116,6 +123,7 @@ def endpoint_body(
     num_speculative_tokens: int,
     context: str = "standard",
     hardware: str = "h200",
+    lora: bool = False,
     job_config: str | None = None,
     max_seq_len: int | None = None,
     n_gpus: int = 1,
@@ -123,7 +131,11 @@ def endpoint_body(
     attention_backend: str | None = "TRITON_ATTN",
     debug_image_tag: str | None = None,
 ) -> dict[str, Any]:
-    """Create-job body of an endpoint serving ``model`` with the draft checkpoint as its DFlash2 speculator."""
+    """Create-job body of an endpoint serving ``model`` with the draft checkpoint as its DFlash2 speculator.
+
+    ``lora``: the draft carries a LoRA fine-tune of ``model`` as its target, which the catalog's LoRA inference file
+    serves with its adapter.
+    """
     override = speculative_override(
         num_speculative_tokens,
         max_seq_len=max_seq_len or DEFAULT_MAX_SEQ_LEN,
@@ -136,6 +148,7 @@ def endpoint_body(
         model=model,
         context=context,
         hardware=hardware,
+        lora=lora,
         job_config=job_config,
         overrides=[override],
         max_seq_len=max_seq_len,
@@ -273,13 +286,17 @@ def evaluate_draft(
     if job_id is None:
         if not (draft_job_id and draft_checkpoint_id):
             raise ValueError("pass draft_job_id and draft_checkpoint_id, or job_id of a running endpoint")
+        files = checkpoint_files(client, draft_job_id, draft_checkpoint_id)
+        if has_file(files, f"{TARGET_DIR}/config.json"):
+            logger.info("the draft carries the fine-tune of %s it was trained against; the endpoint serves it", model)
         body = endpoint_body(
             model=model,
             draft_job_id=draft_job_id,
             draft_checkpoint_id=draft_checkpoint_id,
-            num_speculative_tokens=checkpoint_block_size(client, draft_job_id, draft_checkpoint_id) - 1,
+            num_speculative_tokens=draft_block_size(files, draft_checkpoint_id) - 1,
             context=context,
             hardware=hardware,
+            lora=has_file(files, f"{TARGET_DIR}/{ADAPTER_DIR}/adapter_config.json"),
             debug_image_tag=debug_image_tag,
         )
 
