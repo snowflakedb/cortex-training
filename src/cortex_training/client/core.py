@@ -4246,6 +4246,9 @@ class CortexTrainingClient:
           ``available_gpus``.
         - ``available_gpus`` (int): what a new job could start with right now,
           ``max_total_gpus - in_use_gpus - pending_gpus``, never below ``0``.
+          When ``has_reservation`` is ``True``, it is also capped at what the
+          hardware can currently schedule, so a shortfall in your reserved
+          capacity shows here.
 
         See ``docs/reference/rest-api.md`` section 5.5 for the authoritative
         field list, and :meth:`get_capacity_breakdown` to split ``in_use_gpus``
