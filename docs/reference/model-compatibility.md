@@ -30,6 +30,7 @@ for a specific workload.
 | `zai-org/GLM-5.3-Flash-BF16` | MoE | standard, long | standard, long | 262,144 |
 | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` | MoE | standard, long | standard, long | 262,144 |
 | `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16` | MoE | standard, long | standard, long | 262,144 |
+| `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16` | MoE | standard, long | standard, long | 262,144 |
 | `thinkingmachines/Inkling-2-Small-MXFP8` | MoE | standard, long | standard, long | 262,144 |
 
 `standard` and `long` are each model's smaller and larger `max_seq_len` tiers,
@@ -66,6 +67,14 @@ prompts with its own tokenizer.
 
 ## Model notes
 
+- **Nemotron 3.5 Super VL:** training is text-only. It trains the language
+  model; the vision encoder, projector and multi-token-prediction (MTP) head
+  are not trained and are written unchanged into weights-only checkpoints, so a
+  checkpoint still serves images and video. The MTP head is not updated, so
+  speculative decoding with it may accept fewer draft tokens after fine-tuning.
+  Full-parameter training runs on 32 H200s (EP32, SP8); sequence parallelism is
+  capped at 8 because the Mamba layers have 8 groups. Sampling serves the
+  checkpoint with TP4 on four H200s. There are no LoRA files.
 - **Inkling 2 Small:** LoRA training uses the `arctic` provider and
   FlexAttention on 32 H200s across four nodes (EP32/SP8, ZeRO-2), with
   rank-16 adapters on the attention `wq_du`/`wv_dv` projections and the routed
