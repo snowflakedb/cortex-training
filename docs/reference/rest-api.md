@@ -1282,8 +1282,9 @@ If the target sub-job has a different `n_gpus` than the checkpoint's source
 sub-job (changing DP size), the target sub-job **must** have been created with
 both of these settings:
 
-- `load_optimizer_states: false` in its `SubJobConfig`.
-- `load_module_only: true` in its `extra_training` (sent in `training_config`).
+- `training_config.load_optimizer_states: false`.
+- `training_config.load_module_only: true`. The SDK sends it through
+  `extra_training` (see [section 8.2](#82-trainingconfig)).
 
 The ZeRO optimizer states are DP-sharded and cannot be resized, so with
 `load_module_only: true` the server loads model weights only and skips them. The
