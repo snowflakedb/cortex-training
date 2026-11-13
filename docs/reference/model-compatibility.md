@@ -53,7 +53,7 @@ The examples that tokenize prompts pick a chat renderer from tinker-cookbook
   runs models that tinker-cookbook has no renderer for.
 
 tinker-cookbook lists no renderer for Qwen3-0.6B, Qwen3-1.7B, Qwen3.5-2B,
-the Gemma and MedGemma models, GLM 5.3 Flash BF16, or Nemotron 3.5 Super VL, so
+the Gemma and MedGemma models, or GLM 5.3 Flash BF16, so
 pass `renderer_name=` for those; Math GRPO can't run them. Pick a
 renderer from tinker-cookbook's
 [renderer list](https://tinker-docs.thinkingmachines.ai/tutorials/core-concepts/rendering/#available-renderers)
