@@ -603,7 +603,9 @@ defaults filled in (`null` for an optional field left unset). A key the service
 did not use, such as a misspelled one, is not in it. Before the job runs, on
 services that don't report it, and for model deployments, the entry is the
 config as submitted, and its whole numbers may come back as floats
-(`"n_gpus": 4.0`).
+(`"n_gpus": 4.0`). The one exception is an `external_stage_path` source: it
+comes back as `source_checkpoint_info: {"is_external": true}`, without the path
+([section 8.4](#84-source_checkpoint_info)).
 
 The record also has `hardware` (the default when none was set), `comment`
 (`null` when none was set), and `idle_timeout_seconds` /
@@ -2573,6 +2575,10 @@ Exactly one source is required:
 The typed client forwards this object without validating its fields. The server
 resolves stage credentials; clients must not provide `stage_info` themselves.
 
+On reads, an `external_stage_path` source comes back as
+`{"is_external": true}`; the stage path is never returned. That is a read-only
+shape: `create` rejects `is_external`.
+
 ### 8.5 Memory-diagnostics settings
 
 Training workers expose low-volume, customer-facing memory observability through
@@ -3790,13 +3796,25 @@ LoRA checkpoint, the server copies the source training sub-job's
 with the trained adapter. The spec has no LoRA settings, and `peft_config`
 cannot be set on a deployment.
 
+An external source is `{"type": "external", "model": ..., "stage_path": ...}`.
+`stage_path` is an `@DB.SCHEMA.STAGE/path` naming weights uploaded to a stage,
+under the same rules as `external_stage_path` on a job
+([section 5.1](#51-create-job---post-)); a checkpoint saved by Cortex Training
+uses a `checkpoint` source instead. `model` is the base model the weights were
+trained from, and `create` sends it as the sub-job's `model_name`. The role
+needs `READ` on the stage. The stage is read once GPUs are assigned, so a wrong
+path, or stage credentials that expired (they last at most 12 hours from
+`create`), shows up as a `FAILED` deployment with `failure.code`
+`sub_job_failed` and a message that the sub-job could not download its source
+checkpoint, not as a `create` error.
+
 Client-side checks (all others are left to the server):
 
 | Field | Rule |
 |---|---|
 | every object | no unknown keys; an error names both unknown and missing keys, so a typo such as `min_replica` is reported as such |
 | `deployment.class` | exactly `"EVALUATION"`; only `EVALUATION` is supported today |
-| `source.type` | `base_model` or `checkpoint`; every source field a non-empty string |
+| `source.type` | `base_model`, `checkpoint`, or `external`; every source field a non-empty string |
 | counts | positive integers (`true`/`false` and fractions rejected) |
 | `deployment.gpu_type` | `H200`, `B200`, or `B300`, case-insensitive |
 | `gpus_per_replica` | 1, 2, 4, or 8 |
@@ -3813,7 +3831,8 @@ The spec becomes a `POST /` body with `idle_timeout_seconds: 0`, top-level
 `inference_config.{deployment_class, num_replicas, n_gpus, max_seq_len}`,
 `inference_config.vllm_config.{tensor_parallel_size, max_model_len}`, and
 `source_checkpoint_info: {source_job_id, checkpoint_id}` for a checkpoint
-source. `n_gpus` is `min_replicas * gpus_per_replica`.
+source, or `source_checkpoint_info: {external_stage_path}` for an external one.
+`n_gpus` is `min_replicas * gpus_per_replica`.
 
 ### 14.3 Statuses
 
@@ -3884,8 +3903,10 @@ Missing metadata is reported, not guessed:
 - `gpu_type` (and `describe`'s `spec.deployment.gpu_type`) is `null` when the
   server returns no `hardware`, e.g. for a job read while the server cannot
   reach its scheduler.
-- The source is `checkpoint` only when the sub-job carries
-  `source_checkpoint_info` (see [section 15](#15-known-limitations), item 5).
+- The source is `checkpoint` or `external` only when the sub-job carries
+  `source_checkpoint_info`. An external source is reported as
+  `{"type": "external", "model": ...}`: the server never returns its stage
+  path, so neither `create` nor the reads do.
 
 ### 14.5 Dropping
 
@@ -3991,7 +4012,7 @@ change it. The example treats a chunk with an `error` key, a `data` line that
 is not JSON, or a stream that ends without `[DONE]` as a failed call.
 
 `GET {base_url}/models` is meant to list the `READY` deployments the caller
-owns in the schema, but see [section 15](#15-known-limitations), item 6.
+owns in the schema, but see [section 15](#15-known-limitations), item 5.
 
 ---
 
@@ -4009,12 +4030,7 @@ These are current gaps, not supported API behavior:
 4. Generate prompt validation resolves `max_seq_len` from the first sub-job
    carrying an `inference_config` rather than matching `job_type="sampling"`. A
    `log_probability` sub-job listed first therefore supplies the wrong window.
-5. The server does not yet echo `source_checkpoint_info` when a job is read
-   back (it is accepted on create), so a checkpoint model deployment is
-   reported with a `base_model` source by `list_model_deployments`,
-   `describe_model_deployment`, and `wait_for_model_deployment`
-   ([section 14.4](#144-reading-deployments)).
-6. `GET {base_url}/models` has been seen to return HTTP 200 with an empty
+5. `GET {base_url}/models` has been seen to return HTTP 200 with an empty
    `data` list while a `READY` deployment in the same schema served chat
    completions ([section 14.8](#148-calling-a-deployment)). Use
    `list_model_deployments` or `cortex-training model-deployment list` to find

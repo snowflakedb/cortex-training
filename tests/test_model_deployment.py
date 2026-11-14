@@ -208,6 +208,126 @@ def test_checkpoint_spec_translates_only_public_checkpoint_identity():
     assert "source_stage_info" not in sub_job["source_checkpoint_info"]
 
 
+def external_spec() -> dict:
+    value = deployment_spec(model="Qwen/Qwen3-8B", gpus=2)
+    value["source"] = {
+        "type": "external",
+        "model": "Qwen/Qwen3-8B",
+        "stage_path": "@MY_DB.MY_SCHEMA.MODEL_IMPORT/qwen-sft-run7",
+    }
+    return value
+
+
+def test_external_spec_sends_only_the_stage_path_as_its_source():
+    spec = ModelDeploymentSpec.from_dict(external_spec())
+    sub_job = spec._to_create_job_body()["sub_job_configs"][0]
+
+    assert sub_job["model_name"] == "Qwen/Qwen3-8B"
+    assert sub_job["source_checkpoint_info"] == {
+        "external_stage_path": "@MY_DB.MY_SCHEMA.MODEL_IMPORT/qwen-sft-run7"
+    }
+    assert sub_job["inference_config"]["deployment_class"] == "EVALUATION"
+    assert spec.to_public_spec() == external_spec()
+
+
+@pytest.mark.parametrize("missing", ["model", "stage_path"])
+def test_external_spec_requires_model_and_stage_path(missing):
+    value = external_spec()
+    del value["source"][missing]
+    with pytest.raises(ValueError, match=missing):
+        ModelDeploymentSpec.from_dict(value)
+
+
+@pytest.mark.parametrize("source_type", ["base_model", "checkpoint"])
+def test_only_an_external_source_takes_a_stage_path(source_type):
+    value = checkpoint_spec() if source_type == "checkpoint" else deployment_spec()
+    value["source"]["stage_path"] = "@MY_DB.MY_SCHEMA.MODEL_IMPORT/qwen-sft-run7"
+    with pytest.raises(ValueError, match="unsupported field"):
+        ModelDeploymentSpec.from_dict(value)
+
+
+@pytest.mark.parametrize("stage_path", ["", "   "])
+def test_external_spec_rejects_an_empty_stage_path(stage_path):
+    value = external_spec()
+    value["source"]["stage_path"] = stage_path
+    with pytest.raises(ValueError, match="source.stage_path must be a non-empty string"):
+        ModelDeploymentSpec.from_dict(value)
+
+
+def test_create_reports_an_external_source_as_reads_do():
+    instance = client()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"job_id": JOB_ID}
+    response.raise_for_status.return_value = None
+    instance._session = MagicMock()
+    instance._session.post.return_value = response
+
+    created = instance.create_model_deployment(external_spec())
+
+    job = marked_job()
+    job["sub_jobs"][0]["model_name"] = "Qwen/Qwen3-8B"
+    job["sub_jobs"][0]["source_checkpoint_info"] = {"is_external": True}
+    read = client_module._model_deployment_metadata(job, DEPLOYMENT_ID)
+    assert created["model_source"] == read["model_source"]
+
+
+def test_a_source_that_is_not_marked_external_needs_a_checkpoint_identity():
+    job = marked_job()
+    job["sub_jobs"][0]["source_checkpoint_info"] = {"checkpoint_id": "", "is_external": False}
+
+    with pytest.raises(ValueError, match="source_job_id must be a non-empty string"):
+        client_module._model_deployment_metadata(job, DEPLOYMENT_ID)
+
+
+def test_describe_reports_an_external_source_in_its_spec():
+    job = marked_job()
+    job["sub_jobs"][0]["source_checkpoint_info"] = {"is_external": True}
+
+    metadata = client_module._model_deployment_metadata(job, DEPLOYMENT_ID)
+    described = client_module._model_deployment_description(metadata, database="DB", schema="S")
+
+    assert described["spec"]["source"] == {"type": "external", "model": "Qwen/Qwen3-1.7B"}
+
+
+def test_external_spec_rejects_checkpoint_identity():
+    value = external_spec()
+    value["source"]["job_id"] = "source-training-job"
+    with pytest.raises(ValueError, match="unsupported field"):
+        ModelDeploymentSpec.from_dict(value)
+
+
+def test_create_external_deployment_posts_without_reading_a_source_job():
+    instance = client()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"job_id": JOB_ID}
+    response.raise_for_status.return_value = None
+    instance._session = MagicMock()
+    instance._session.post.return_value = response
+    instance.get_job = MagicMock()
+
+    metadata = instance.create_model_deployment(external_spec())
+
+    instance.get_job.assert_not_called()
+    assert metadata["deployment"] == DEPLOYMENT_ID
+    posted = instance._session.post.call_args.kwargs["json"]
+    assert posted["sub_job_configs"][0]["source_checkpoint_info"] == {
+        "external_stage_path": "@MY_DB.MY_SCHEMA.MODEL_IMPORT/qwen-sft-run7"
+    }
+
+
+def test_metadata_reports_an_external_source_by_its_base_model():
+    job = marked_job()
+    job["sub_jobs"][0]["source_checkpoint_info"] = {"is_external": True}
+
+    metadata = client_module._model_deployment_metadata(
+        job, DEPLOYMENT_ID, base_url="https://account/api/inference/v1"
+    )
+
+    assert metadata["model_source"] == {"type": "external", "model": "Qwen/Qwen3-1.7B"}
+
+
 @pytest.mark.parametrize(
     "mutate,error",
     [
@@ -1389,7 +1509,7 @@ def test_missing_hardware_is_reported_as_unknown_not_h200():
 
 
 def test_describe_reports_checkpoint_source_in_the_shape_the_server_returns():
-    # What the server renders once it echoes source_checkpoint_info on reads: the
+    # What the server returns on reads: the
     # proto field names, flattened into the sub-job, stage_info stripped, and
     # is_external omitted while false.
     job = marked_job()

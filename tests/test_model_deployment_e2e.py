@@ -3,9 +3,9 @@
 
 """End-to-end model deployment tests against a live Cortex Training account.
 
-Cases TC1-TC11 cover the deployment lifecycle (dry run, create, list,
+Cases TC1-TC12 cover the deployment lifecycle (dry run, create, list,
 describe, wait, calling the endpoint, downloads, checkpoint sources, drop,
-errors, and interrupts). Every command runs the installed CLI in a subprocess,
+errors, interrupts, and imported weights). Every command runs the installed CLI in a subprocess,
 as a user would, and deployments hold real GPUs while they run. They are skipped unless
 ``CORTEX_TRAINING_E2E_CONFIG`` names a CLI config JSON file
 (see ``docs/reference/cli.md``)::
@@ -16,6 +16,10 @@ as a user would, and deployments hold real GPUs while they run. They are skipped
 TC8 deploys a weights-only checkpoint. Set
 ``CORTEX_TRAINING_E2E_CHECKPOINT=TRAINING_JOB_UUID/CHECKPOINT_ID`` to use an
 existing one; otherwise a 1-GPU training job saves one and is cancelled.
+
+TC12 deploys weights imported from a stage. It runs only when
+``CORTEX_TRAINING_E2E_EXTERNAL=MODEL|@DB.SCHEMA.STAGE/path|GPUS_PER_REPLICA``
+names an uploaded directory and the base model it was trained from.
 
 Every deployment a test creates is dropped when the module finishes, even if a
 test fails. Run ``model-deployment list`` afterwards if the run was killed.
@@ -38,6 +42,7 @@ import requests
 
 CONFIG_ENV = "CORTEX_TRAINING_E2E_CONFIG"
 CHECKPOINT_ENV = "CORTEX_TRAINING_E2E_CHECKPOINT"
+EXTERNAL_ENV = "CORTEX_TRAINING_E2E_EXTERNAL"
 CONFIG_PATH = os.environ.get(CONFIG_ENV)
 
 pytestmark = pytest.mark.skipif(
@@ -247,7 +252,7 @@ def test_tc6_base_url_serves_openai_chat_completions(ready_deployment):
 
 @pytest.mark.xfail(
     reason="GET /models has returned an empty data list for a READY deployment; "
-    "see docs/reference/rest-api.md section 15, item 6",
+    "see docs/reference/rest-api.md section 15, item 5",
     strict=False,
 )
 def test_tc6_models_lists_the_ready_deployment(ready_deployment):
@@ -570,3 +575,48 @@ def test_tc11_interrupt_and_timeout_leave_the_deployment_running(created, spec_d
 
     dropped = run_ok("model-deployment", "drop", deployment_id)
     assert dropped == {"deployment": deployment_id, "dropped": True}
+
+
+@pytest.mark.skipif(
+    not os.environ.get(EXTERNAL_ENV), reason=f"set {EXTERNAL_ENV} to deploy imported weights"
+)
+def test_tc12_external_deployment_serves_and_reports_its_source(created, spec_dir):
+    parts = os.environ[EXTERNAL_ENV].split("|")
+    assert len(parts) == 3, f"{EXTERNAL_ENV} must be MODEL|@DB.SCHEMA.STAGE/path|GPUS_PER_REPLICA"
+    model, stage_path, gpus = parts
+    # Resolved before create, so a missing PAT skips without holding GPUs.
+    pat = deployment_pat()
+    spec = {
+        **base_spec(gpus_per_replica=int(gpus)),
+        "source": {"type": "external", "model": model, "stage_path": stage_path},
+    }
+    result = run_cli(
+        "model-deployment", "create",
+        "--spec", write_spec(spec_dir, "spec-external.json", spec), "--wait",
+        "--timeout", str(READY_TIMEOUT_SECONDS),
+    )
+    summary = json.loads(result.stdout) if result.stdout.strip() else {}
+    if summary.get("deployment"):
+        created.append(summary["deployment"])
+    assert result.returncode == 0, result.stderr
+    assert summary["status"] == "READY"
+
+    from recipes.model_deployment.streaming import deployment_headers
+
+    response = requests.post(
+        f"{summary['base_url']}/chat/completions",
+        headers=deployment_headers(pat),
+        json={"model": summary["deployment"], "messages": [{"role": "user", "content": "Hello"}]},
+        timeout=300,
+    )
+    skip_if_not_permitted(response.status_code, response.text)
+    assert response.status_code == 200, response.text
+    assert response.json()["choices"][0]["message"]["content"]
+
+    described = run_ok("model-deployment", "describe", summary["deployment"])
+    assert described["spec"]["source"] == {"type": "external", "model": model}
+    listed = run_ok("model-deployment", "list")["deployments"]
+    assert summary["deployment"] in {entry["deployment"] for entry in listed}
+
+    dropped = run_ok("model-deployment", "drop", summary["deployment"])
+    assert dropped == {"deployment": summary["deployment"], "dropped": True}

@@ -370,6 +370,10 @@ For a checkpoint, use:
   "source": {"type": "checkpoint", "job_id": "TRAINING_JOB_UUID",
              "checkpoint_id": "CHECKPOINT_ID"}
 
+For weights imported from a stage, use:
+  "source": {"type": "external", "model": "Qwen/Qwen3-8B",
+             "stage_path": "@MY_DB.MY_SCHEMA.MODEL_IMPORT/qwen-sft-run7"}
+
 Only EVALUATION is supported today. gpu_type is H200, B200, or B300; gpus_per_replica is 1, 2, 4, or 8; and
 min_replicas * gpus_per_replica must be at most 8 or a multiple of 8. Use
 --dry-run to check a spec without creating anything.
@@ -818,7 +822,7 @@ def build_parser(
 
     deployment_create = deployment_commands.add_parser(
         "create",
-        help="Create an evaluation deployment from a base model or checkpoint.",
+        help="Create an evaluation deployment from a base model, checkpoint, or imported weights.",
         description=(
             "Create an evaluation deployment. Checkpoint sources must name a "
             "completed Cortex Training weights-only checkpoint."

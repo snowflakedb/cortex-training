@@ -169,6 +169,7 @@ from cortex_training.model_deployment import SPEC_SOURCE
 from cortex_training.model_deployment import WIRE_CHECKPOINT_ID
 from cortex_training.model_deployment import WIRE_DEPLOYMENT_CLASS
 from cortex_training.model_deployment import WIRE_INFERENCE_CONFIG
+from cortex_training.model_deployment import WIRE_IS_EXTERNAL
 from cortex_training.model_deployment import WIRE_MAX_MODEL_LEN
 from cortex_training.model_deployment import WIRE_MAX_SEQ_LEN
 from cortex_training.model_deployment import WIRE_NUM_REPLICAS
@@ -177,6 +178,7 @@ from cortex_training.model_deployment import WIRE_SOURCE_CHECKPOINT_INFO
 from cortex_training.model_deployment import WIRE_SOURCE_JOB_ID
 from cortex_training.model_deployment import WIRE_TENSOR_PARALLEL_SIZE
 from cortex_training.model_deployment import WIRE_VLLM_CONFIG
+from cortex_training.model_deployment import external_source_read_view
 
 # tenacity renamed wait_exponential_jitter's `initial` to `multiplier` (and warns on
 # `initial`); the oldest supported tenacity has only `initial`.
@@ -1845,6 +1847,8 @@ def _model_deployment_metadata(
     checkpoint = sub_job.get(WIRE_SOURCE_CHECKPOINT_INFO)
     if checkpoint is None:
         model_source = {SOURCE_TYPE: SOURCE_TYPE_BASE_MODEL, SOURCE_MODEL: model_name}
+    elif isinstance(checkpoint, dict) and checkpoint.get(WIRE_IS_EXTERNAL):
+        model_source = external_source_read_view(model_name)
     elif isinstance(checkpoint, dict):
         # A checkpoint source needs both IDs as non-empty strings.
         for key in (WIRE_SOURCE_JOB_ID, WIRE_CHECKPOINT_ID):
@@ -1998,7 +2002,7 @@ def _pending_model_deployment_metadata(
         OUT_DEPLOYMENT: deployment_id,
         OUT_DEPLOYMENT_CLASS: spec.deployment_class,
         OUT_STATUS: DEPLOYMENT_STATUS_PENDING,
-        OUT_MODEL_SOURCE: spec.source_to_wire(),
+        OUT_MODEL_SOURCE: spec.source_read_view(),
         OUT_MAX_SEQ_LEN: spec.max_seq_len,
         OUT_GPUS_PER_REPLICA: spec.gpus_per_replica,
         OUT_REPLICAS: spec.min_replicas,

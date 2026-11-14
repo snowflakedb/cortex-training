@@ -373,6 +373,43 @@ def test_create_dry_run_validates_and_prints_the_spec_without_a_client(tmp_path,
     assert json.loads(stdout.getvalue())["deployment"]["gpu_type"] == "H200"
 
 
+def test_create_dry_run_prints_an_external_source_with_its_stage_path(tmp_path, monkeypatch):
+    source = {
+        "type": "external",
+        "model": "Qwen/Qwen3-8B",
+        "stage_path": "@MY_DB.MY_SCHEMA.MODEL_IMPORT/qwen-sft-run7",
+    }
+    spec_path = tmp_path / "deployment.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "deployment": {
+                    "class": "EVALUATION",
+                    "min_replicas": 1,
+                    "gpus_per_replica": 2,
+                    "gpu_type": "H200",
+                },
+                "source": source,
+                "inference": {"max_seq_len": 8192},
+            }
+        )
+    )
+
+    def no_client():
+        raise AssertionError("dry-run must not build a client")
+
+    monkeypatch.setattr(cli, "_load_cortex_training_client_class", no_client)
+    stdout = io.StringIO()
+    result = cli.main(
+        ["model-deployment", "create", "--spec", str(spec_path), "--dry-run"],
+        stdout=stdout,
+        stderr=io.StringIO(),
+    )
+
+    assert result == 0
+    assert json.loads(stdout.getvalue())["source"] == source
+
+
 def test_create_dry_run_reports_spec_errors(tmp_path):
     spec_path = tmp_path / "deployment.json"
     spec_path.write_text(json.dumps({"deployment": {"class": "EVALUATION"}}))
