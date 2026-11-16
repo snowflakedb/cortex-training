@@ -2464,6 +2464,13 @@ class TestCreateJobBodyFromJob:
         assert "job_id" not in body
         assert record == _job_record()  # the record is left as it was
 
+    def test_a_status_history_is_not_config(self):
+        # The TUI's Config card is this body; `cortex-training get` adds the history to what it prints.
+        history = [{"status": "PENDING", "entered_at": "2026-07-20T18:00:00Z"},
+                   {"status": "RUNNING", "entered_at": "2026-07-20T18:01:00Z"}]
+        body = nc.create_job_body_from_job(_job_record(status_history=history), experiment_name="DB.SCHEMA.EXPERIMENT")
+        assert body == nc.create_job_body_from_job(_job_record(), experiment_name="DB.SCHEMA.EXPERIMENT")
+
     def test_a_field_the_record_leaves_out_has_the_value_the_job_runs_with(self):
         record = _job_record(sub_jobs=[{
             "sub_job_id": "job-id:sampling:0",

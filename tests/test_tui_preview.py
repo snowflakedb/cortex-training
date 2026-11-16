@@ -112,6 +112,16 @@ def test_job_config_json_for_a_sub_job_has_it_alone():
     assert "label" not in body["sub_job_configs"][0]  # the TUI's own, not the service's
 
 
+def test_job_config_json_is_what_ct_get_prints_without_the_status_history():
+    sj = {"sub_job_id": "JOB_ID:training:0", "status": "RUNNING", "job_type": "TRAINING",
+          "training_config": {"n_gpus": 8}}
+    job = _job(hardware="H200", sub_jobs=[sj], status_history=[{"status": "RUNNING", "entered_at": _iso(NOW)}])
+    printed = json.loads("\n".join(_get_prints(job)))
+    assert printed.pop("status_history") == job["status_history"]  # get adds it beside the config
+    assert v.job_config_json(job, experiment_name="DB.SCHEMA.EXPERIMENT") == json.dumps(
+        printed, indent=2, sort_keys=True).splitlines()
+
+
 def test_job_config_json_escapes_what_a_terminal_would_act_on():
     job = _job(hardware="H200", sub_jobs=[{"job_type": "training", "training_config": {"a\nb": "x\x1b[2Jy\u2028z"}}])
     lines = v.job_config_json(job)
@@ -135,6 +145,29 @@ def test_elapsed_text_runs_from_creation():
     # Ended: to when it entered its last state, and "lasted", since it may never have run.
     assert v.elapsed_text(_job("FAILED"), NOW) == "lasted 1h 30m"
     assert v.elapsed_text(_job("RUNNING", created=None), NOW) == ""
+
+
+def _history(*entries) -> list:
+    """A ``status_history``: each ``(status, how long before NOW the job entered it)``."""
+    return [{"status": status, "entered_at": _iso(NOW - ago)} for status, ago in entries]
+
+
+# How a job created two hours ago came up: queued, placed, warmed up, then ran.
+CAME_UP = (("PENDING", timedelta(hours=2)), ("PLACING", timedelta(hours=1, minutes=58)),
+           ("INITIALIZING", timedelta(hours=1, minutes=57, seconds=25)), ("RUNNING", timedelta(hours=1, minutes=45)))
+
+
+def test_elapsed_text_of_a_job_with_a_status_history_ends_when_it_stopped():
+    # Cancelled 40 minutes ago, and cleaned up for ten minutes after: it lasted until
+    # it stopped, where its lifecycle ends, not until its cleanup ended.
+    stopped = _job("CANCELLED", status_history=_history(*CAME_UP, ("CANCELLED", timedelta(minutes=40))))
+    assert v.elapsed_text(stopped, NOW) == "lasted 1h 20m"
+    assert v.elapsed_text(_job("CANCELLED"), NOW) == "lasted 1h 30m"  # no history: to state_changed_at
+    # The job list's Duration still ends at state_changed_at, with or without a history.
+    assert v.job_elapsed(stopped, NOW) == v.job_elapsed(_job("CANCELLED"), NOW) == 5400
+    # A live job's runs to now either way.
+    live = _job("RUNNING", changed=timedelta(hours=1, minutes=45), status_history=_history(*CAME_UP))
+    assert v.elapsed_text(live, NOW) == "2h 00m so far"
 
 
 def test_short_time_drops_the_date_only_on_the_same_day():
@@ -173,6 +206,97 @@ def test_lifecycle_invents_no_time_the_record_lacks():
     assert [s.label for s in v.lifecycle(_job("PENDING", changed=timedelta(hours=2)), NOW)] == [
         "Created, pending since", "now"]
     assert v.lifecycle(_job("FAILED", changed=timedelta(hours=2)), NOW)[0].then == ""
+
+
+def test_lifecycle_with_a_status_history_has_a_step_for_each_status():
+    job = _job("CANCELLED", changed=timedelta(minutes=29, seconds=31),
+               status_history=_history(*CAME_UP, ("CANCELLED", timedelta(minutes=30))))
+    steps = v.lifecycle(job, NOW)
+    # It was created pending, so no Created step: each status has its time and how long it lasted.
+    assert [(s.status, s.label, s.then) for s in steps] == [
+        ("pending", "Pending", "2m 00s"), ("placing", "Placing", "35s"), ("initializing", "Initializing", "12m 25s"),
+        ("running", "Running", "1h 15m"), ("cancelled", "Cancelled", "")]
+    assert steps[0].at == v.short_time(_iso(NOW - timedelta(hours=2)), NOW)
+    # It ended when it stopped, not when its cleanup ended (state_changed_at), and that has no duration.
+    assert steps[-1].at == f"{v.short_time(_iso(NOW - timedelta(minutes=30)), NOW)} (30m 00s ago)"
+    assert [s.current for s in steps] == [False, False, False, False, True]
+    # A status it skipped has no step; one that lasted under a second says so.
+    skipped = _job("FAILED", status_history=_history(
+        ("PENDING", timedelta(hours=2)), ("PLACING", timedelta(hours=2)), ("RUNNING", timedelta(hours=1)),
+        ("FAILED", timedelta(minutes=30))))
+    assert [(s.label, s.then) for s in v.lifecycle(skipped, NOW)] == [
+        ("Pending", "0s"), ("Placing", "1h 00m"), ("Running", "30m 00s"), ("Failed", "")]
+
+
+def test_lifecycle_with_a_status_history_runs_the_current_status_to_now():
+    job = _job("RUNNING", changed=timedelta(hours=1, minutes=45), status_history=_history(*CAME_UP))
+    steps = v.lifecycle(job, NOW)
+    assert [(s.label, s.then, s.current) for s in steps] == [
+        ("Pending", "2m 00s", False), ("Placing", "35s", False), ("Initializing", "12m 25s", False),
+        ("Running since", "1h 45m so far", True), ("now", "", False)]
+    still_pending = _job("PENDING", changed=timedelta(hours=2), status_history=_history(CAME_UP[0]))
+    assert [(s.label, s.then) for s in v.lifecycle(still_pending, NOW)] == [
+        ("Pending since", "2h 00m so far"), ("now", "")]
+
+
+def test_lifecycle_of_an_incomplete_status_history_keeps_the_created_step_and_its_gap():
+    # The service did not record the statuses before INITIALIZING: their time is one gap, as without a history.
+    job = _job("RUNNING", changed=timedelta(hours=1, minutes=45), status_history=_history(*CAME_UP[2:]))
+    steps = v.lifecycle(job, NOW)
+    assert [(s.status, s.label, s.then, s.current) for s in steps] == [
+        ("created", "Created", "2m 35s", False), ("initializing", "Initializing", "12m 25s", False),
+        ("running", "Running since", "1h 45m so far", True), ("now", "now", "", False)]
+    assert steps[0].at == v.short_time(_iso(NOW - timedelta(hours=2)), NOW)
+    ended = _job("TERMINATED", status_history=_history(CAME_UP[3], ("TERMINATED", timedelta(minutes=31))))
+    assert [(s.label, s.then) for s in v.lifecycle(ended, NOW)] == [
+        ("Created", "15m 00s"), ("Running", "1h 14m"), ("Terminated", "")]
+
+
+def test_lifecycle_without_a_usable_status_history_keeps_today_s_steps():
+    jobs = [_job("RUNNING"), _job("FAILED"), _job("PENDING", changed=None), _job("UNKNOWN"),
+            _job("PENDING", changed=timedelta(hours=2)), _job("RUNNING", created=None)]
+    for job in jobs:
+        steps = v.lifecycle(job, NOW)
+        # The job's own state is the current step, as each status step was before there were histories.
+        assert [s.current for s in steps] == [s.status not in ("created", "now") for s in steps], job
+    # A history that is empty, has nothing usable, or is not this record's (it ends in another
+    # status, or the job's state can't be read): the steps without one.
+    unusable = [[], "RUNNING", ["RUNNING"], [{"status": "RUNNING"}], [{"entered_at": _iso(NOW)}],
+                [{"status": "UNKNOWN", "entered_at": _iso(NOW)}], _history(*CAME_UP[:3])]
+    for history in unusable:
+        assert v.lifecycle(_job("RUNNING", status_history=history), NOW) == v.lifecycle(_job("RUNNING"), NOW), history
+    assert v.lifecycle(_job("UNKNOWN", status_history=_history(*CAME_UP)), NOW) == v.lifecycle(_job("UNKNOWN"), NOW)
+
+
+def test_lifecycle_skips_entries_it_cannot_read_and_never_counts_back():
+    history = [{"status": "PENDING", "entered_at": _iso(NOW - timedelta(minutes=10))},
+               "PLACING", {"status": "PLACING"}, {"entered_at": _iso(NOW - timedelta(minutes=9))},
+               {"status": "PAUSED", "entered_at": _iso(NOW - timedelta(minutes=9))},
+               {"status": "INITIALIZING", "entered_at": "not a time"},
+               # Two clocks that disagree: it entered INITIALIZING a minute "before" PENDING ...
+               {"status": "INITIALIZING", "entered_at": _iso(NOW - timedelta(minutes=11))},
+               # ... and RUNNING in the same second, so their order is their place in the list.
+               {"status": "running", "entered_at": _iso(NOW - timedelta(minutes=11))}]
+    steps = v.lifecycle(_job("RUNNING", changed=timedelta(minutes=11), status_history=history), NOW)
+    assert [(s.label, s.then) for s in steps] == [("Pending", "0s"), ("Initializing", "0s"),
+                                                  ("Running since", "11m 00s so far"), ("now", "")]
+
+
+def _bold(rows: list) -> list:
+    """The bold text of the preview's Timeline rows."""
+    return [row.plain[span.start:span.end] for row in rows for span in row.spans if "bold" in str(span.style)]
+
+
+def test_only_the_job_s_current_step_is_bold():
+    job = _job("RUNNING", changed=timedelta(hours=1, minutes=45), status_history=_history(*CAME_UP))
+    screen = JobSummaryScreen(MagicMock(), "JOB_ID", job=job)
+    rows = screen._lifecycle_rows(NOW, 300)
+    assert "Pending" in rows[0].plain and _bold(rows) == ["Running since"]
+    # A job without a history keeps its status step bold, whatever its status.
+    for job, label in ((_job("RUNNING"), "Running since"), (_job("FAILED"), "Failed"),
+                       (_job("PENDING", changed=None), "Pending"), (_job("UNKNOWN"), "status unavailable")):
+        screen._job = job
+        assert _bold(screen._lifecycle_rows(NOW, 300)) == [label]
 
 
 # ─── callout ─────────────────────────────────────────────────────────────────
@@ -254,12 +378,12 @@ def test_preview_shows_cards_with_the_id_facts_lifecycle_and_callout():
             app.push_screen(JobSummaryScreen(client, "JOB_ID", job=job))
             for _ in range(50):
                 await pilot.pause(0.02)
-                if isinstance(app.screen, JobSummaryScreen) and "Lifecycle" in "".join(_rows(app, "#preview")):
+                if isinstance(app.screen, JobSummaryScreen) and "Timeline" in "".join(_rows(app, "#preview")):
                     break
             rows = [row.rstrip() for row in _rows(app, "#preview")]
-            # Two columns of facts at this width, and the lifecycle under them.
+            # Two columns of facts at this width, and the timeline under them.
             assert any(row.startswith("Model") and "Owner" in row for row in rows)
-            assert any(row.startswith("Lifecycle") and "Pending since" in row for row in rows)
+            assert any(row.startswith("Timeline") and "Pending since" in row for row in rows)
             hero = _rows(app, "#hero")
             assert hero[0].startswith("JOB_ID") and "PENDING" in hero[0] and "so far" in hero[0]
             assert "l Logs" in hero[-1] and "g Resources" in hero[-1]
@@ -286,11 +410,140 @@ def test_preview_of_a_running_job_has_no_callout_and_one_column_when_narrow():
             app.push_screen(JobSummaryScreen(client, "JOB_ID", job=job))
             for _ in range(50):
                 await pilot.pause(0.02)
-                if isinstance(app.screen, JobSummaryScreen) and "Lifecycle" in "".join(_rows(app, "#preview")):
+                if isinstance(app.screen, JobSummaryScreen) and "Timeline" in "".join(_rows(app, "#preview")):
                     break
             rows = [row.rstrip() for row in _rows(app, "#preview")]
             assert not any(row.startswith("Model") and "Owner" in row for row in rows)
             assert not app.screen.query_one("#health", Static).display
+            app.workers.cancel_all()
+            await pilot.pause(0.1)
+
+    asyncio.run(run())
+
+
+async def _until_read(app, pilot) -> None:
+    """Wait until the job card's own read of the job has answered."""
+    for _ in range(100):
+        await pilot.pause(0.02)
+        if isinstance(app.screen, JobSummaryScreen) and not app.screen._loading:
+            return
+
+
+def test_the_card_has_no_last_line_once_its_read_answers():
+    job = _job("RUNNING")
+    client = MagicMock()
+    client.list_jobs.return_value = [job]
+    client.get_job.return_value = job
+
+    async def run():
+        app = CortexTrainingLogTUI(client, poll_interval=0.01)
+        async with app.run_test(size=(150, 42)) as pilot:
+            app.push_screen(JobSummaryScreen(client, "JOB_ID", job=job))
+            await _until_read(app, pilot)
+            assert client.get_job.called and not app.screen._loading
+            # No "read from the service at ..." line: the row is hidden.
+            assert not app.screen.query_one("#fetch", Static).display
+            app.workers.cancel_all()
+            await pilot.pause(0.1)
+
+    asyncio.run(run())
+
+
+def test_the_card_still_says_when_its_read_fails():
+    job = _job("RUNNING")
+    client = MagicMock()
+    client.list_jobs.return_value = [job]
+    client.get_job.side_effect = RuntimeError("HTTP 503")
+
+    async def run():
+        app = CortexTrainingLogTUI(client, poll_interval=0.01)
+        async with app.run_test(size=(150, 42)) as pilot:
+            app.push_screen(JobSummaryScreen(client, "JOB_ID", job=job))
+            await _until_read(app, pilot)
+            fetch = app.screen.query_one("#fetch", Static)
+            assert fetch.display
+            assert "couldn't read the job" in "".join(_rows(app, "#fetch"))
+            app.workers.cancel_all()
+            await pilot.pause(0.1)
+
+    asyncio.run(run())
+
+
+def _lifecycle_text(app) -> str:
+    """The preview's Timeline row, its wrapped rows joined; ``""`` before it is drawn."""
+    rows = _rows(app, "#preview")
+    start = next((at for at, row in enumerate(rows) if row.startswith("Timeline")), len(rows))
+    return " ".join(row.strip() for row in rows[start:]).removeprefix("Timeline").strip()
+
+
+def test_the_preview_draws_a_step_per_status_once_get_job_answers_with_a_history():
+    # The list's row has no history (lists carry none); the Get job answer has one.
+    row = _job("CANCELLED", changed=timedelta(minutes=29), hardware="H200", sub_jobs=[
+        {"sub_job_id": "JOB_ID:training:0", "job_type": "training", "status": "CANCELLED",
+         "training_config": {"n_gpus": 8}}])
+    answer = {**row, "status_history": _history(*CAME_UP, ("CANCELLED", timedelta(minutes=30)))}
+    client = MagicMock()
+    client.list_jobs.return_value = [row]
+    client.get_job.return_value = answer
+    client.get_experiment_run.return_value = EXPERIMENT_RUN
+    seen = []
+
+    async def run():
+        app = CortexTrainingLogTUI(client, poll_interval=0.01)
+        async with app.run_test(size=(150, 60)) as pilot:
+            app.push_screen(JobSummaryScreen(client, "JOB_ID", job=row, on_job=seen.append))
+            for _ in range(50):
+                await pilot.pause(0.02)
+                # The redraw is a row taller: wait for its last step, as well as for the experiment.
+                if isinstance(app.screen, JobSummaryScreen) and "Cancelled" in _lifecycle_text(app) \
+                        and "DB.SCHEMA.EXPERIMENT" in "".join(_rows(app, "#config")):
+                    break
+            at = lambda ago: v.short_time(_iso(NOW - ago), datetime.now(timezone.utc))  # noqa: E731
+            assert _lifecycle_text(app).startswith(
+                f"○ Pending {at(timedelta(hours=2))} ── 2m 00s ─▸ "
+                f"◔ Placing {at(timedelta(hours=1, minutes=58))} ── 35s ─▸ ◐ Initializing")
+            assert "● Running" in _lifecycle_text(app) and "◇ Created" not in _lifecycle_text(app)
+            assert f"− Cancelled {at(timedelta(minutes=30))} (" in _lifecycle_text(app)
+            # It lasted until it stopped, as its lifecycle shows; without the history it was a minute longer.
+            assert "lasted 1h 30m" in _rows(app, "#hero")[0]
+            assert seen[-1]["status_history"] == answer["status_history"]  # the job list gets it too
+            # The Config card is still the config alone.
+            assert "status_history" not in "\n".join(_rows(app, "#config"))
+            app.workers.cancel_all()
+            await pilot.pause(0.1)
+
+    asyncio.run(run())
+
+
+def test_the_preview_adds_a_step_when_a_refresh_finds_the_job_in_its_next_status():
+    row = _job("PLACING", changed=CAME_UP[1][1], hardware="H200", sub_jobs=[
+        {"sub_job_id": "JOB_ID:training:0", "job_type": "training", "status": "PLACING",
+         "training_config": {"n_gpus": 8}}])
+    moved_on = {**row, "status": "INITIALIZING", "state_changed_at": _iso(NOW - CAME_UP[2][1]),
+                "status_history": _history(*CAME_UP[:3])}
+    client = MagicMock()
+    client.list_jobs.return_value = [row]
+    client.get_job.return_value = {**row, "status_history": _history(*CAME_UP[:2])}
+    client.get_experiment_run.return_value = EXPERIMENT_RUN
+
+    async def run():
+        app = CortexTrainingLogTUI(client, poll_interval=0.01)
+        async with app.run_test(size=(150, 60)) as pilot:
+            app.push_screen(JobSummaryScreen(client, "JOB_ID", job=row))
+            for _ in range(50):
+                await pilot.pause(0.02)
+                # Its first read answered: the list's copy has no history, so no Pending step.
+                if isinstance(app.screen, JobSummaryScreen) and "○ Pending" in _lifecycle_text(app):
+                    break
+            assert "○ Pending" in _lifecycle_text(app) and "◔ Placing since" in _lifecycle_text(app)
+            # The job moved on: the next read closes Placing, and its new status runs to now.
+            client.get_job.return_value = moved_on
+            await pilot.press("r")
+            for _ in range(50):
+                await pilot.pause(0.02)
+                if "Initializing since" in _lifecycle_text(app):
+                    break
+            assert "◔ Placing" in _lifecycle_text(app) and "── 35s ─▸ ◐ Initializing since" in _lifecycle_text(app)
             app.workers.cancel_all()
             await pilot.pause(0.1)
 
@@ -416,6 +669,30 @@ def _deployment_job(status="RUNNING") -> dict:
     return _job(status, job_id=UUID, idle_timeout_seconds=0, sub_jobs=[{
         "sub_job_id": f"{UUID}:sampling:0", "job_type": "sampling", "status": status, "model_name": "org/model",
         "inference_config": {"deployment_class": "EVALUATION", "num_replicas": 2.0}}])
+
+
+def test_a_deployment_s_lifecycle_says_its_statuses_in_deployment_words():
+    ready = {**_deployment_job(), "state_changed_at": _iso(NOW - timedelta(hours=1, minutes=45)),
+             "status_history": _history(*CAME_UP)}
+    steps = v.lifecycle(ready, NOW)
+    # PLACING and INITIALIZING are both "initializing" to a deployment: one step, at the first's
+    # time and look (the step's status picks its glyph and color, and stays the job's).
+    assert [(s.status, s.label, s.then, s.current) for s in steps] == [
+        ("pending", "Pending", "2m 00s", False), ("placing", "Initializing", "13m 00s", False),
+        ("running", "Ready since", "1h 45m so far", True), ("now", "now", "", False)]
+    assert steps[1].at == v.short_time(_iso(NOW - timedelta(hours=1, minutes=58)), NOW)
+    dropped = {**_deployment_job("CANCELLED"),
+               "status_history": _history(*CAME_UP, ("CANCELLED", timedelta(minutes=30)))}
+    assert [s.label for s in v.lifecycle(dropped, NOW)] == ["Pending", "Initializing", "Ready", "Dropped"]
+    # Still coming up: the one step is the current one, since it began placing.
+    starting = {**_deployment_job("INITIALIZING"),
+                "state_changed_at": _iso(NOW - timedelta(hours=1, minutes=57, seconds=25)),
+                "status_history": _history(*CAME_UP[:3])}
+    assert [(s.label, s.then, s.current) for s in v.lifecycle(starting, NOW)] == [
+        ("Pending", "2m 00s", False), ("Initializing since", "1h 58m so far", True), ("now", "", False)]
+    # Without a history, its two points say it too.
+    assert [s.label for s in v.lifecycle(_deployment_job(), NOW)] == ["Created", "Ready since", "now"]
+    assert [s.label for s in v.lifecycle(_deployment_job("CANCELLED"), NOW)] == ["Created", "Dropped"]
 
 
 def test_a_deployment_s_preview_says_how_to_call_it_and_offers_serving():

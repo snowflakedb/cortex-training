@@ -49,6 +49,19 @@ _H200_FB = 141 * _GIB
 _GPU_MEMORY = {"H200": _H200_FB, "B200": 179 * _GIB, "B300": 268 * _GIB}
 # Reasons a job ended without ever being placed: no GPU telemetry and no console.
 _NEVER_PLACED = frozenset({"pending_timeout", "placement_too_large", "placement_timeout"})
+# The statuses a status history holds. A record in any other (SUCCEEDED, DONE,
+# JOB_STATE_CANCELLED) is from before the service reported them: it has none.
+_HISTORY_STATUSES = frozenset({"PENDING", "PLACING", "INITIALIZING", "RUNNING", "CANCELLED", "TERMINATED", "FAILED"})
+# The statuses a job goes through to run, and when it enters each, as a share of
+# the time it takes to come up.
+_COMING_UP = ("PENDING", "PLACING", "INITIALIZING", "RUNNING")
+_COMING_UP_AT = (0, 1 / 4, 2 / 5, 1)
+# How many of _COMING_UP a job that failed for this reason went through.
+_FAILED_AFTER = {"pending_timeout": 1, "placement_too_large": 1, "placement_timeout": 2, "out_of_memory": 3}
+# The service began recording status changes this long before the fake starts. A
+# job that ended before then has no status history; the two B200 jobs running
+# then have one from RUNNING, the status they were in.
+_RECORDING_FOR = timedelta(days=15, hours=23, minutes=50)
 
 
 def _iso(dt: datetime) -> str:
@@ -213,6 +226,26 @@ def _in_location(row: dict, wanted: tuple) -> bool:
     return all(name is None or name == held[at] for at, name in enumerate(wanted))
 
 
+def _went_through(status: str, reason: str, created: datetime, ended: Optional[datetime], placed: datetime) -> list:
+    """``(status, when the job entered it)`` for each status a job went through, oldest first.
+
+    A live job has been in its status since ``placed`` (its ``state_changed_at``),
+    and came up to it from creation. An ended job came up in a tenth of its run, at
+    most 4 minutes, as far as its reason says, and the status it ended in began
+    when it stopped, before its cleanup ended it (``ended``). ``[]`` for a status a
+    history never holds.
+    """
+    if status not in _HISTORY_STATUSES:
+        return []
+    if ended is None:
+        before = _COMING_UP[:_COMING_UP.index(status)]
+        came_up = [(s, created + (placed - created) * share) for s, share in zip(before, _COMING_UP_AT)]
+        return [*came_up, (status, placed)]
+    up = min((ended - created) / 10, timedelta(minutes=4))
+    went = [(s, created + up * share) for s, share in zip(_COMING_UP[:_FAILED_AFTER.get(reason, 4)], _COMING_UP_AT)]
+    return [*went, (status, ended - min(timedelta(seconds=29), (ended - created) / 20))]
+
+
 def _http_error(status: int, message: str) -> requests.HTTPError:
     """The error the client raises for a service answer of ``status`` with ``message``."""
     response = requests.Response()
@@ -250,6 +283,7 @@ class FakeClient:
         self._jobs: list = []
         self._kinds: dict = {}
         self._extra: dict = {}  # job id -> its spec's overrides
+        self._went: dict = {}  # job id -> [(status, when it entered it)] before the fake started
         for status, reason, age, duration, hw, subs, kind, *extra in _SPECS:
             jid = str(uuid.UUID(int=self._rng.getrandbits(128), version=4))
             created = self.now - age
@@ -274,6 +308,7 @@ class FakeClient:
             })
             self._kinds[jid] = kind
             self._extra[jid] = extra[0] if extra else {}
+            self._went[jid] = _went_through(status, reason, created, ended, placed)
         for jid, more in self._extra.items():
             job = self._find(jid)
             job.update({key: more[key] for key in ("reason_details",) if key in more})
@@ -373,7 +408,24 @@ class FakeClient:
         return [self._served(j) for j in self._jobs if self._here(j["job_id"])]
 
     def get_job(self, job_id: str) -> dict:
-        return self._served(self._record(job_id))
+        """The job as Get job returns it: as listed, and with the ``status_history`` that no list has."""
+        job = self._served(self._record(job_id))
+        history = self._status_history(job_id)
+        if history and not views.is_unknown(job):  # none for a job whose state the service can't read
+            job["status_history"] = history
+        return job
+
+    def _status_history(self, job_id: str) -> list:
+        """The job's ``status_history`` as of now: the statuses it went through, then those its
+        timeline has reached, from the one it was in when the service began recording (see
+        _RECORDING_FOR); ``[]`` when it has not changed since then."""
+        went = [*self._went[job_id], *((status, self.now + timedelta(seconds=offset))
+                                       for offset, status, _reason in self._steps_reached(job_id))]
+        began = self.now - _RECORDING_FOR
+        if not went or went[-1][1] < began:
+            return []
+        first = max((at for at, (_status, entered) in enumerate(went) if entered < began), default=0)
+        return [{"status": status, "entered_at": _iso(entered)} for status, entered in went[first:]]
 
     def _account_row(self, job: dict) -> dict:
         """``job`` as the account-wide list returns it: with its location, and its

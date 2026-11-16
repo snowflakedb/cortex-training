@@ -603,6 +603,12 @@ The response shape consumed by this repository is flat at each sub-job:
   "created_at": "2026-07-20T18:00:00Z",
   "updated_at": "2026-07-20T18:01:00Z",
   "state_changed_at": "2026-07-20T18:01:00Z",
+  "status_history": [
+    {"status": "PENDING", "entered_at": "2026-07-20T18:00:00Z"},
+    {"status": "PLACING", "entered_at": "2026-07-20T18:00:04Z"},
+    {"status": "INITIALIZING", "entered_at": "2026-07-20T18:00:21Z"},
+    {"status": "RUNNING", "entered_at": "2026-07-20T18:01:00Z"}
+  ],
   "submitted_by": "SOME_USER",
   "owner_role": "SOME_ROLE",
   "sub_jobs": [
@@ -663,20 +669,37 @@ from [section 5.1](#51-create-job---post-) (1800 and 86400 seconds); a
 that experiment as a new run. A model deployment, which can set neither, keeps
 `pending_timeout_seconds` and `experiment_name` `null`. Left out are `job_id`
 (the service rejects one on create), `sub_job_id`, `status`, `reason`, the
-times, `submitted_by`, `owner_role` and `image_tag` (a new job runs the current
-image). A sub-job started from external weights has
+times, `status_history`, `submitted_by`, `owner_role` and `image_tag` (a new job
+runs the current image). A sub-job started from external weights has
 `source_checkpoint_info: {"external_stage_path": null}` to fill in, as the record
 does not say which weights. Whole-number floats become integers. It raises
 `ValueError` for a record with no sub-jobs or no `hardware` (the service could
 not read the job). `cortex-training get JOB_ID` prints the same body, with the
-job's experiment; `get --raw` prints the record.
+job's experiment, and adds the record's `status_history` when it has one, which
+`cortex-training submit` drops; `get --raw` prints the record.
 
 `wait_for_job()` repeatedly calls this endpoint until `running`.
 
 `state_changed_at` (UTC time the job entered its current `status`) is optional
-and may be absent. The client reads it only for the stalled-upload warnings in
+and may be absent. The client reads it for the stalled-upload warnings in
 [section 12.3](#123-persisted-stdout-download); without it, those warnings skip
 the recent-start grace period and still require the sub-job to be `running`.
+The TUI reads it too, for how long a job has been in its status and when an
+ended job ended.
+
+`status_history` lists every status the job has entered, oldest first, each with
+the UTC time it entered it (`entered_at`, to the second). Each status lasts until
+the next entry's `entered_at`; the last entry is the job's current `status`, in
+progress while the job is active and with no duration once it has ended. A final
+status's `entered_at` is when the job stopped; `state_changed_at` is when the
+cleanup after it finished, so it can be later. Entries can share a time, and a
+status the job skipped (`INITIALIZING` can be) has no entry. When the service did
+not record a job's earlier statuses, the first entry is not `PENDING`. Statuses
+are upper case (`RUNNING`); like `status`, read them without regard to case
+([section 3.2](#32-job-states)). The field is absent from list responses
+([section 5.3](#53-list-jobs---get-)), when `status` is `unknown`, when the
+service has recorded none of the job's statuses, and from services or accounts
+that don't report it. `get_job()` and `wait_for_job()` return it as sent.
 
 `submitted_by` (submitting user's name) and `owner_role` (owning role's name)
 are best-effort and may be absent, e.g. if the user/role has since been
