@@ -42,9 +42,6 @@
     "qwen3.8-27b--standard--full",
     "qwen3.8-27b--standard--lora",
     "qwen3.8-27b--long--full",
-    "qwen3.8-27b--long--lora",
-    "qwen3.8-flash-next--standard--full",
-    "qwen3.8-flash-next--standard--lora",
-    "qwen3.8-flash-next--long--full"
+    "qwen3.8-27b--long--lora"
   ]
 }
