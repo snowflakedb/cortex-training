@@ -206,7 +206,7 @@ def explain(exc: BaseException, old: OldConfig) -> str:
     status = getattr(getattr(exc, "response", None), "status_code", None)
     if status in (401, 403):
         return credentials_rejected_hint(f"Snowflake rejected the PAT in {_login._home(old.path)}.").lstrip("\n")
-    return f"The check failed: {_login._first_line(exc)}"
+    return f"The check failed: {_login._error_line(exc)}"
 
 
 def look_up_identity(client: Any) -> Identity:
@@ -484,7 +484,7 @@ def apply(plan: Plan, old: OldConfig, check: Callable[[], None] | None = None) -
                 "If Cortex Training or the network was briefly unavailable, run the command again in a few minutes."
             ) from cause
         if isinstance(exc, Exception):
-            raise ConvertError(f"Couldn't finish the conversion ({_login._first_line(exc)}), so every file was put back as it was.") from exc
+            raise ConvertError(f"Couldn't finish the conversion ({_login._error_line(exc)}), so every file was put back as it was.") from exc
         raise
 
 

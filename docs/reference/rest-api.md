@@ -310,13 +310,17 @@ retries above. See
 
 Non-2xx responses are raised through `requests.Response.raise_for_status()`.
 Because that call ignores 3xx, any 3xx response is raised first as an
-`Unexpected redirect <status> for url: <url>` HTTP error. Bodies may contain:
+`Unexpected redirect <status> for url: <url>` HTTP error. An error body
+usually has this shape, where `code` and `error_code` hold the same value:
 
 ```json
-{"message": "description", "code": 409}
+{"code": "517602", "error_code": "517602", "message": "description", "request_id": "<id>"}
 ```
 
-or validation details:
+A failure relayed from the service's training backend, such as an unsupported
+hardware type, has code `517604` and a message that starts
+`Cortex training <operation> failed:`. A body may instead hold validation
+details:
 
 ```json
 {
@@ -328,18 +332,40 @@ or validation details:
 
 When a 4xx or 5xx body is a JSON error with a `code` or a `message`, the Python
 client adds them to the end of the `requests.HTTPError` message that
-`raise_for_status()` gives:
+`raise_for_status()` gives. A body with no `message` but a string `error`, as
+some gateways send, counts that `error` and any `error_description` as the
+message. For the refusals the client recognizes, an explanation with next steps
+follows on the lines under it:
 
 ```text
-[snowflake request id: <id>] 403 Client Error: Forbidden for url: <url> (<code>): <message>
+[snowflake request id: <id>] 400 Client Error: Bad Request for url: <url> (<code>): <message>
+<explanation>
 ```
 
-A message longer than 1,000 characters is cut and ends in `...`, and common
-credential patterns in it are redacted. The error's `.response` is still the
-service's answer. A 3xx keeps its `Unexpected redirect` text, and a body that
-is not JSON, or has neither field, leaves the message as `raise_for_status()`
-gives it. An error the client raises with its own explanation instead, such as
-`DatabaseAccessError` or a chunk-group error, keeps its own message.
+| Refusal | Explanation |
+|---|---|
+| 400, code `517602`, `Schema <database>.<schema> is not found or not authorized`, for the client's own database and schema | Which role can't find the database or schema, the statements that create them, and the grants that give the role access. The error is a `DatabaseAccessError`. From a client made by `for_job()`, and on the account-level job list, the path's database is not the client's: the error is a plain `HTTPError` with the service's code and message alone. |
+| A message saying the job's Experiment can't be read, such as the 500 `Linked experiment is not found or not authorized for the training job` | The role can't read the job's Experiment, where saved logs, GPU metrics and checkpoints live: ask for access to it, or use the role that created the job. |
+| 401 on a request that sent a PAT, whatever its body, unless the answer carries one of the service's own codes (`5176xx`, as a 401 relayed from a running job's backend does) | The most common reasons Snowflake rejects a PAT, such as a user with no network policy. |
+
+Any other refusal, such as a missing `CREATE EXPERIMENT` privilege or a stage
+that can't be found ([section 3.7](#37-access-control)), shows the service's
+code and message alone. An explanation always follows the service's message
+and never replaces it. The CLI prints the same text, and the TUI shows the
+same status, code, message and explanation on one line, without the URL.
+
+Every `requests.HTTPError` the client raises for an answer also carries these
+attributes: `server_code`, `server_message` (the message as the error shows
+it), `snowflake_request_id`, and `explanation` (None when there is none). That
+includes `DatabaseAccessError`, whose `explanation` is the schema explanation
+under its first line. The chunk-group errors, `AccountJobListUnavailable`,
+`InvalidPageToken` and a 3xx keep their own messages, so their `explanation`
+is None. A message longer than 1,000
+characters is cut and ends in `...`, and common credential patterns in it are
+redacted. The error's `.response` is still the service's answer. A 3xx keeps
+its `Unexpected redirect` text. A body that is not JSON, or has neither field,
+adds no code or message to the error's text; a 401 on a request that sent a PAT
+still gets its explanation.
 
 Most data-plane calls and request polls require a `running` job. `tail-logs` is
 the exception allowed during `placing`.
@@ -3937,14 +3963,19 @@ made by the log and metrics downloads, is replaced by
 
 ```text
 model deployment sf-ct-<UUID> request failed with HTTP <status> (<code>): <message> (snowflake request id: <id>)
+<explanation>
 ```
 
 `create` has no deployment ID yet, so its errors start with
 `model deployment request failed`. The server's error code and message are
 kept, so "feature disabled", "not authorized", and "unsupported model" stay
-distinguishable. The backing job ID is replaced by the deployment ID in the
-message, and the request URL and raw body are never shown. A job-not-found
-error becomes `model deployment sf-ct-<UUID> not found in <DB>.<SCHEMA>`.
+distinguishable, and the explanation the client has for a refusal it
+recognizes follows on the lines under them ([section 3.6](#36-errors)). The
+backing job ID is replaced by the deployment ID in the message, and the
+request URL and raw body are never shown. A job-not-found error becomes
+`model deployment sf-ct-<UUID> not found in <DB>.<SCHEMA>`. The error carries
+the same attributes as an HTTP error, with the deployment ID in
+`server_message`.
 
 Request debug log lines written while a deployment method runs also name the
 deployment ID instead of the backing job ID. Local filesystem errors are

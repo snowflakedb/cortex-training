@@ -2731,7 +2731,7 @@ class TestHttpErrorMessages:
     def test_a_long_message_is_cut_as_a_model_deployment_error_cuts_it(self):
         c = _make_client()
         response = _refusal(
-            {"code": "517604", "message": "x" * (nc._MAX_SERVER_ERROR_MESSAGE_CHARS + 500)}, 409, reason="Conflict"
+            {"code": "517604", "message": "x" * (nc._errors.MAX_SERVER_MESSAGE_CHARS + 500)}, 409, reason="Conflict"
         )
         c._session.post.return_value = response
 
@@ -2739,7 +2739,7 @@ class TestHttpErrorMessages:
             c.create_job_from_body(_SAMPLING_BODY)
 
         assert str(excinfo.value) == (
-            f"{_requests_text(response)} (517604): {'x' * nc._MAX_SERVER_ERROR_MESSAGE_CHARS}..."
+            f"{_requests_text(response)} (517604): {'x' * nc._errors.MAX_SERVER_MESSAGE_CHARS}..."
         )
 
     def test_a_credential_in_the_message_is_redacted(self):
@@ -2799,7 +2799,7 @@ class TestHttpErrorMessages:
         def unreadable(_response):
             raise RecursionError("maximum recursion depth exceeded while decoding a JSON object")
 
-        monkeypatch.setattr(nc, "_server_error_code_and_message", unreadable)
+        monkeypatch.setattr(nc._errors, "read_server_error", unreadable)
         with caplog.at_level("DEBUG", logger=nc.logger.name):
             with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
                 c.get_job("job-1")
@@ -2808,6 +2808,40 @@ class TestHttpErrorMessages:
         assert excinfo.value.response is response
         assert c._session.get.call_count == 2  # still retried as a 503
         assert "could not add the server's error message" in caplog.text
+
+    @pytest.mark.parametrize(
+        ("status", "reason", "profile"),
+        [
+            pytest.param(400, "Bad Request", False, id="400"),
+            pytest.param(404, "Not Found", False, id="404-whose-code-the-retry-check-reads"),
+            pytest.param(400, "Bad Request", True, id="profile-client-that-checks-for-an-expired-session"),
+        ],
+    )
+    def test_a_body_nested_too_deep_to_decode_leaves_the_error_as_it_was(self, status, reason, profile):
+        # A string nested deeper than the JSON decoder recurses.
+        c = _make_client()
+        c.max_retries = 0
+        if profile:
+            c._auth_provider = MagicMock()
+            c._auth_provider.get_token.return_value = "session-token"
+        response = _refusal({"detail": "[" * 100_000}, status, reason=reason)
+        c._session.get.return_value = response
+
+        with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+            c.get_job("job-1")
+
+        assert str(excinfo.value) == _requests_text(response)
+        assert (excinfo.value.server_code, excinfo.value.server_message, excinfo.value.explanation) == (
+            None, None, None
+        )
+
+    def test_a_success_with_a_field_nested_too_deep_to_decode_is_returned(self):
+        c = _make_client()
+        c._auth_provider = MagicMock()  # a profile client looks for an expired session in every answer
+        c._auth_provider.get_token.return_value = "session-token"
+        c._session.get.return_value = _refusal({"job_id": "job-1", "note": "[" * 100_000}, 200, reason="OK")
+
+        assert c.get_job("job-1")["job_id"] == "job-1"
 
     def test_a_job_not_found_is_still_final(self):
         c = _make_client()
@@ -2832,10 +2866,14 @@ class TestHttpErrorMessages:
             c._send("GET", url)
 
         assert str(excinfo.value) == f"[snowflake request id: sf-redirect] Unexpected redirect 302 for url: {url}"
+        error = excinfo.value  # its own message, and the answer's fields
+        assert (error.server_code, error.server_message, error.snowflake_request_id, error.explanation) == (
+            "517604", "moved", "sf-redirect", None
+        )
 
-    def test_the_schema_not_found_explanation_is_unchanged(self):
+    def test_the_schema_not_found_explanation_follows_the_server_message(self):
         c = _make_client()
-        response = _refusal(_failed_request(c), 400, reason="Bad Request")
+        response = _refusal(_failed_request(c), 400, reason="Bad Request", request_id="sf-schema")
         c._session.get.return_value = response
 
         with pytest.raises(nc.DatabaseAccessError) as explained:
@@ -2843,10 +2881,21 @@ class TestHttpErrorMessages:
         with pytest.raises(nc.requests.exceptions.HTTPError) as plain:
             c._send("GET", f"{c.base_url}/test", explain_database=False)
 
-        assert str(explained.value) == str(c._schema_not_found_error(response))
-        assert "517602" not in str(explained.value)
+        first, *explanation = str(explained.value).splitlines()
+        assert first == (
+            f"[snowflake request id: sf-schema] {_requests_text(response)} (517602): "
+            "Schema DB.SCH is not found or not authorized"
+        )
+        assert explanation[0] == "Role <ROLE> (couldn't determine your role) can't find database DB or its schema SCH."
+        error = explained.value
+        assert (error.server_code, error.server_message, error.snowflake_request_id) == (
+            "517602", "Schema DB.SCH is not found or not authorized", "sf-schema"
+        )
+        assert error.explanation == "\n".join(explanation)
+        # Without the database explanation: the same first line, and nothing under it.
         assert type(plain.value) is nc.requests.exceptions.HTTPError
-        assert str(plain.value).endswith(" (517602): Schema DB.SCH is not found or not authorized")
+        assert str(plain.value) == first
+        assert plain.value.explanation is None
 
     def test_a_chunk_group_error_keeps_its_own_message(self):
         c = _make_client()
@@ -2869,6 +2918,9 @@ class TestHttpErrorMessages:
 
         assert str(excinfo.value) == "[snowflake request id: sf-chunk] request chunk group is missing chunks"
         assert str(excinfo.value.__cause__).count("Cortex training forwardBackward failed") == 1
+        error = excinfo.value  # its own message, and the answer's fields
+        assert (error.server_code, error.snowflake_request_id, error.explanation) == ("517604", "sf-chunk", None)
+        assert error.server_message.startswith("Cortex training forwardBackward failed: zone returned 409")
 
     def test_a_tail_logs_hint_quotes_the_message_once(self):
         c = _make_client()
@@ -2884,6 +2936,12 @@ class TestHttpErrorMessages:
         message = str(excinfo.value)
         assert message.count("session s not found") == 1
         assert " (517604): Cortex training operation failed: session s not found. Job j1 is cancelled" in message
+        # Rebuilt with the hint, it keeps the fields of the error it quotes.
+        error = excinfo.value
+        assert (error.server_code, error.server_message, error.explanation) == (
+            "517604", "Cortex training operation failed: session s not found", None
+        )
+        assert error.snowflake_request_id == excinfo.value.__cause__.snowflake_request_id
 
 
 # ─── CortexTrainingClient — read & control endpoints ─────────────────────────
@@ -3225,6 +3283,9 @@ class TestIterJobs:
             list(c.iter_jobs())
 
         assert exc.value.response.status_code == 404
+        assert (exc.value.server_message, exc.value.explanation) == (
+            "Account-level job listing is not enabled for this account", None
+        )
         assert c.max_retries == 10
         c._session.get.assert_called_once()
         # No auto-create, or any other request, follows a 404.
@@ -9291,10 +9352,12 @@ class TestMissingDatabase:
     def test_a_pat_client_gets_a_clear_error_and_nothing_runs(self):
         c = self._client(pat=True)
         c.max_retries = 5
-        c._session.get.return_value = _make_error_response(_failed_request(c), 400)
+        response = _make_error_response(_failed_request(c), 400)
+        c._session.get.return_value = response
         with pytest.raises(nc.DatabaseAccessError) as exc:
             c._send("GET", f"{c.base_url}/test")
         assert str(exc.value) == (
+            f"{_requests_text(response)} (517602): Schema MY_DB.PUBLIC is not found or not authorized\n"
             "Your PAT's role (its role restriction, or your user's DEFAULT_ROLE if it has none) "
             "can't find database MY_DB or its schema PUBLIC.\n"
             "- If that's the wrong role: restrict the PAT to a role that has access, or run "
@@ -9323,9 +9386,10 @@ class TestMissingDatabase:
         with pytest.raises(nc.DatabaseAccessError) as exc:
             c._send("GET", f"{c.base_url}/test")
         message = str(exc.value)
-        assert message.startswith(
-            "Role TRAINER can't find database MY_DB or its schema PUBLIC (from profile prod).\n"
+        assert message.splitlines()[1] == (
+            "Role TRAINER can't find database MY_DB or its schema PUBLIC (from profile prod)."
         )
+        assert exc.value.explanation.startswith(message.splitlines()[1])
         assert "GRANT USAGE ON SCHEMA MY_DB.PUBLIC TO ROLE TRAINER" in message
         assert "PAT" not in message
         assert exc.value.role == "TRAINER"
@@ -9337,7 +9401,7 @@ class TestMissingDatabase:
         with pytest.raises(nc.DatabaseAccessError) as exc:
             c._send("GET", f"{c.base_url}/test")
         message = str(exc.value)
-        assert message.splitlines()[0] == (
+        assert message.splitlines()[1] == (
             "Role <ROLE> (couldn't determine your role) can't find database MY_DB or its schema PUBLIC."
         )
         assert "PAT" not in message
@@ -9369,7 +9433,7 @@ class TestMissingDatabase:
         c._session.get.return_value = _make_error_response(_failed_request(c), 400)
         with pytest.raises(nc.DatabaseAccessError) as exc:
             c._send("GET", f"{c.base_url}/test")
-        assert str(exc.value).splitlines()[:3] == [
+        assert str(exc.value).splitlines()[1:4] == [
             "Role TRAINER can't find database MY_DB or its schema CUSTOM (from profile prod).",
             "- If they don't exist: run `CREATE DATABASE IF NOT EXISTS MY_DB` and "
             "`CREATE SCHEMA IF NOT EXISTS MY_DB.CUSTOM` (or ask an admin to).",

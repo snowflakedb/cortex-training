@@ -1569,26 +1569,29 @@ def test_request_log_lines_name_the_deployment_not_the_backing_job(monkeypatch, 
 
 
 @pytest.mark.parametrize(
-    "status_code,body,expected",
+    "status_code,body,expected,explained",
     [
         (
             403,
             {"code": "517600", "message": "Cortex Training API is not enabled for this account"},
             "with HTTP 403 (517600): Cortex Training API is not enabled for this account",
+            False,
         ),
         (
             400,
             {"code": "517602", "message": "Schema SCH is not found or not authorized"},
             "with HTTP 400 (517602): Schema SCH is not found or not authorized",
+            True,
         ),
         (
             409,
             {"code": "517602", "message": f"job {JOB_ID} is busy"},
             f"with HTTP 409 (517602): job {DEPLOYMENT_ID} is busy",
+            False,
         ),
     ],
 )
-def test_deployment_errors_keep_server_code_and_message(status_code, body, expected):
+def test_deployment_errors_keep_server_code_and_message(status_code, body, expected, explained):
     error = requests.exceptions.HTTPError(
         f"{status_code} for url: http://test.local/jobs/{JOB_ID}",
         response=_server_error_response(status_code, body),
@@ -1600,8 +1603,56 @@ def test_deployment_errors_keep_server_code_and_message(status_code, body, expec
         )
     )
 
-    assert rendered == f"model deployment {DEPLOYMENT_ID} request failed {expected}"
+    first_line = f"model deployment {DEPLOYMENT_ID} request failed {expected}"
+    if explained:  # the explanation the client has for the answer, on the lines under the first
+        first, *explanation = rendered.splitlines()
+        assert first == first_line and explanation
+        assert "\n".join(explanation) == client_module._errors.explanation_of(error)
+    else:
+        assert rendered == first_line
     assert "http://" not in rendered
+
+
+def test_a_deployment_error_keeps_the_explanation_after_the_server_message():
+    instance = client()
+    instance._session = MagicMock()
+    instance._session.get.return_value = _server_error_response(
+        400, {"code": "517602", "message": "Schema DB.SCH is not found or not authorized"}
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        instance.describe_model_deployment(DEPLOYMENT_ID)
+
+    first, *explanation = str(excinfo.value).splitlines()
+    assert first == (
+        f"model deployment {DEPLOYMENT_ID} request failed with HTTP 400 (517602): "
+        "Schema DB.SCH is not found or not authorized"
+    )
+    assert explanation[0].endswith("can't find database DB or its schema SCH.")
+    assert excinfo.value.explanation == "\n".join(explanation)
+    assert (excinfo.value.server_code, excinfo.value.server_message) == (
+        "517602", "Schema DB.SCH is not found or not authorized"
+    )
+
+
+def test_a_deployment_error_hides_the_backing_job_in_its_fields_too():
+    instance = client()
+    instance._session = MagicMock()
+    response = _server_error_response(400, {"code": "517602", "message": f"job {JOB_ID} can't be described"})
+    response.headers["x-snowflake-request-id"] = "REQUEST_ID"
+    instance._session.get.return_value = response
+
+    with pytest.raises(RuntimeError) as excinfo:
+        instance.describe_model_deployment(DEPLOYMENT_ID)
+
+    public, sent = excinfo.value, excinfo.value.__cause__
+    assert public.server_message == f"job {DEPLOYMENT_ID} can't be described"
+    assert (public.server_code, public.snowflake_request_id, public.explanation) == ("517602", "REQUEST_ID", None)
+    # The HTTP error it replaced had what the client added rewritten the same way.
+    assert sent.server_message == public.server_message
+    assert str(sent).endswith(f" (517602): job {DEPLOYMENT_ID} can't be described")
+    for text in (str(public), public.server_message, sent.server_message):
+        assert JOB_ID not in text.replace(DEPLOYMENT_ID, "")
 
 
 def test_deployment_errors_cut_a_long_server_message_after_hiding_the_job():
@@ -1619,7 +1670,7 @@ def test_deployment_errors_cut_a_long_server_message_after_hiding_the_job():
     hidden = f"job {DEPLOYMENT_ID} " + "x" * 2000
     assert rendered == (
         f"model deployment {DEPLOYMENT_ID} request failed with HTTP 409 (517602): "
-        f"{hidden[:client_module._MAX_SERVER_ERROR_MESSAGE_CHARS]}..."
+        f"{hidden[:client_module._errors.MAX_SERVER_MESSAGE_CHARS]}..."
     )
 
 

@@ -564,7 +564,9 @@ class JobSummaryScreen(FollowsPointer, Screen):
         try:
             run = self._client.get_experiment_run(self._job_id)
         except Exception as exc:  # noqa: BLE001 - said on the config card
-            return None, v.collapse(v.describe_error(exc))
+            # Without the explanation: the card's one-line subtitle must keep its own note
+            # after it. The Logs and Resources tabs explain the same refusal in full.
+            return None, v.collapse(v.describe_error(exc, explain=False))
         name = run.get("experiment_name") if isinstance(run, dict) else None
         return (name, None) if isinstance(name, str) and name else (None, "the service sent no experiment name")
 

@@ -340,13 +340,33 @@ def test_config_card_follows_the_highlighted_row():
     asyncio.run(run())
 
 
-def test_config_card_says_when_it_could_not_read_the_experiment():
+def _experiment_refused() -> Exception:
+    """The service's 500 for a job whose Experiment this role can't read."""
+    import requests
+
+    response = requests.Response()
+    response.status_code, response.reason = 500, "Internal Server Error"
+    response._content = json.dumps({"code": "517603", "message": "Linked experiment is not found for job JOB_ID"}).encode()
+    return requests.HTTPError("500 Server Error", response=response)
+
+
+@pytest.mark.parametrize(
+    ("error", "shown"),
+    [
+        pytest.param(RuntimeError("HTTP 503"), "RuntimeError: HTTP 503", id="any-error"),
+        # The card's one line keeps its note: the explanation is left to the Logs and Resources tabs.
+        pytest.param(_experiment_refused(),
+                     "HTTP 500 Internal Server Error (517603): Linked experiment is not found for job JOB_ID",
+                     id="experiment-refused"),
+    ],
+)
+def test_config_card_says_when_it_could_not_read_the_experiment(error, shown):
     job = _job("RUNNING", hardware="H200", sub_jobs=[
         {"sub_job_id": "JOB_ID:training:0", "job_type": "training", "status": "RUNNING", "training_config": {"n_gpus": 8}}])
     client = MagicMock()
     client.list_jobs.return_value = [job]
     client.get_job.return_value = job
-    client.get_experiment_run.side_effect = RuntimeError("HTTP 503")
+    client.get_experiment_run.side_effect = error
 
     async def run():
         app = CortexTrainingLogTUI(client, poll_interval=0.01)
@@ -357,7 +377,8 @@ def test_config_card_says_when_it_could_not_read_the_experiment():
                 if isinstance(app.screen, JobSummaryScreen) and "couldn't read" in str(
                         app.screen.query_one("#config-card").border_subtitle):
                     break
-            assert "couldn't read the experiment: RuntimeError: HTTP 503" in str(app.screen.query_one("#config-card").border_subtitle)
+            subtitle = str(app.screen.query_one("#config-card").border_subtitle)
+            assert f"couldn't read the experiment: {shown}; null gives a copy its own" in subtitle
             assert '"experiment_name": null' in "\n".join(_rows(app, "#config"))
             app.workers.cancel_all()
             await pilot.pause(0.1)

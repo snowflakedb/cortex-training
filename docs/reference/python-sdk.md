@@ -518,25 +518,47 @@ current role: it doesn't exist, or the role can't access it. It carries
 `.response` (the HTTP 400), `.kind` (`"schema"`), `.name` (`DATABASE.SCHEMA`),
 `.role` (the session's role, or None when it can't be determined, as for PAT
 clients), and `.statement`, the SQL that would set it up: `CREATE DATABASE IF NOT
-EXISTS ...` and `CREATE SCHEMA IF NOT EXISTS ...`, separated by `; `.
+EXISTS ...` and `CREATE SCHEMA IF NOT EXISTS ...`, separated by `; `. Its
+message is an HTTP error's, as below, with the explanation under it.
 
 When the service answers with a 4xx or 5xx, the `requests.exceptions.HTTPError`
 that `raise_for_status()` raises keeps the service's answer as `.response`, and
 the client adds to its message: the Snowflake request id first, when the answer
 has the `x-snowflake-request-id` header, and the JSON error body's `code` and
-`message` last, when it has them:
+`message` at the end of the line, when it has them. For a refusal the client
+recognizes, an explanation with next steps follows on the lines under it:
 
 ```text
-[snowflake request id: <id>] 403 Client Error: Forbidden for url: <url> (<code>): <message>
+[snowflake request id: <id>] 400 Client Error: Bad Request for url: <url> (517602): Schema MY_DB.PUBLIC is not found or not authorized
+Role TRAINER can't find database MY_DB or its schema PUBLIC (from profile prod).
+- If they don't exist: run `CREATE DATABASE IF NOT EXISTS MY_DB` and `CREATE SCHEMA IF NOT EXISTS MY_DB.PUBLIC` (or ask an admin to).
+...
 ```
 
-With only one of them the message ends in ` (<code>)` or `: <message>`. The
+With only one of them the line ends in ` (<code>)` or `: <message>`. The
 service's message is cut at 1,000 characters, ending in `...`, and common
 credential patterns in it are redacted. A body that is not JSON, or has neither,
-adds nothing at the end. The errors above keep their own messages, and the model
-deployment methods raise their own; see
-[REST API section 3.6](rest-api.md#36-errors) and
-[section 14.7](rest-api.md#147-errors).
+adds nothing at the end of the line. The client explains a missing database or
+schema (in its own database and schema), a job Experiment the role can't read,
+and a `401` on a request that sent a PAT, whatever its body, unless the answer
+carries one of the service's own codes (`5176xx`); any other refusal shows the
+service's code and message alone. Every `HTTPError` the client
+raises for an answer, the subclasses above included, has these attributes:
+
+| Attribute | Value |
+|---|---|
+| `server_code` | The service's error code, or None |
+| `server_message` | The service's message as the error shows it (cut and redacted), or None |
+| `snowflake_request_id` | The answer's Snowflake request ID, or None |
+| `explanation` | The explanation under the first line, or None |
+
+The chunk-group errors, `AccountJobListUnavailable` and `InvalidPageToken` keep
+their own messages (their `explanation` is None), and the model deployment
+methods raise their own; see [REST API section 3.6](rest-api.md#36-errors) and
+[section 14.7](rest-api.md#147-errors). When Snowflake refuses the SQL that
+reads saved logs or GPU metrics on the job's Experiment, the client raises the
+Snowflake connector's own error unchanged; the CLI and the TUI add the
+explanation after it.
 
 ## Details not covered here
 

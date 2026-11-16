@@ -1229,18 +1229,28 @@ their text. Quitting sends what is left, waiting at most a second.
 `CORTEX_TRAINING_DISABLE_TELEMETRY` turns them off; see
 [Client metrics](python-sdk.md#client-metrics).
 
+The TUI shows a failed call on one line, without the URL: the HTTP status, the
+service's error code and message, then the explanation the CLI and the Python
+client give for it, if any (see [Troubleshooting](#troubleshooting)), such as
+`HTTP 400 Bad Request (517602): Schema MY_DB.PUBLIC is not found or not
+authorized. Role TRAINER can't find database MY_DB ...`. A line too short for
+all of it keeps the start: when both of the job list's routes fail, it names
+both before the explanation. The job screen's config card, whose subtitle also
+says why `experiment_name` is null, leaves the explanation to the Logs and
+Resources tabs.
+
 The TUI explains a refused read in one line on the view that needed it, worded
 the same on every view: the Logs tab's saved console and execution log, and the
 Resources tab (`GPU metrics unavailable: ...`). When the service can't resolve
 the job's Experiment for this role (a 500 that says `Linked experiment is not
-found ...`), the line says the role can't read the job's Experiment, and, for
-`Linked experiment is not found for job ...`, that it may no longer exist. When
-Snowflake refuses the SQL on the Experiment, as it does for a `MONITOR`-only
-role, the line says that saved logs and GPU metrics live there and that
-`checkpoints` still works. A refusal about another object (a warehouse, a
-schema) keeps its own text. A 403 whose message names a privilege says the role
-isn't allowed to read that view's data; one with no such message keeps the
-standard error text.
+found ...`), the line gives the service's message, then says the role can't
+read the job's Experiment, and, for `Linked experiment is not found for job
+...`, that it may no longer exist. When Snowflake refuses the SQL on the
+Experiment, as it does for a `MONITOR`-only role, the line says that saved logs
+and GPU metrics live there and that listing checkpoints still works. A refusal
+about another object (a warehouse, a schema) keeps its own text. A 403 whose
+message names a privilege says the role isn't allowed to read that view's data;
+one with no such message keeps the standard error text.
 
 A config the TUI can't use, such as one with a value of the wrong type (a
 quoted number: `"poll_interval": "2"`), JSON that doesn't parse, an unknown
@@ -2271,21 +2281,30 @@ to an old JSON file, or switch to a profile with `cortex-training login`.
 If Snowflake rejects your PAT, the CLI keeps the original error and adds next
 steps: `394400 (08001) ... Programmatic access token is invalid` from a
 connection profile, or a `401` on a request that sent the PAT directly
-(`config.json`, `--pat`, or `CORTEX_TRAINING_PAT`). The most common cause is a
-user with no network policy; see
+(`config.json`, `--pat`, or `CORTEX_TRAINING_PAT`). The Python client adds the
+same next steps to the error it raises for that `401`. The most common cause is
+a user with no network policy; see
 [Network policy requirement](../getting-started/authentication.md#network-policy-requirement).
 A `401` on a connection-profile request gets no hint, because the PAT was
-already accepted at login.
+already accepted at login, and neither does a `401` that carries one of the
+service's own codes (`5176xx`, a failure relayed from a running job's backend),
+which Snowflake had already let in.
 
 If you see `Invalid URL ... No scheme supplied`, the config is using a bare
 Snowflake hostname as `base_url`. Use `host` for Snowflake PAT auth, or use a
 full local/mock URL such as `http://localhost:8084` for `base_url`.
 
-For server errors, the CLI prints the error with the service's error code and
-message, and any Snowflake request id. A message over 1,000 characters is cut,
+For server errors, the CLI prints the error as the Python client raises it: the
+service's error code and message, and any Snowflake request id. For a refusal
+the client recognizes (a missing database or schema, a job Experiment the role
+can't read, a rejected PAT), an explanation with next steps follows on the
+lines under it; see [REST API section 3.6](rest-api.md#36-errors). When
+Snowflake refuses the SQL on the job's Experiment that `download-log` and
+`download-metrics` run, the CLI adds the same explanation the TUI shows under
+Snowflake's error and its query id. A message over 1,000 characters is cut,
 common credential patterns in it are redacted, and the body's other fields are
 not printed. The CLI also prints the raw response body when the error line
-shows no code or message from it: for a body that is not JSON or has neither,
-such as a validation `detail` list, and for errors the client explains in its
-own words, such as a missing database or schema. Include those details when
-debugging a `500`.
+doesn't show the code and message read from it: for a body that is not JSON or
+has neither, such as a validation `detail` list, and for an error with its own
+text, such as a redirect or a chunk-group error, whose body has the group's
+code and ids. Include those details when debugging a `500`.

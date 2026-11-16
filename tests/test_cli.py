@@ -3491,8 +3491,11 @@ def test_a_schema_not_found_error_shows_the_server_message_once():
 
     err = stderr.getvalue()
     assert rc == 1
-    assert err.startswith("error: Role <ROLE> (couldn't determine your role) can't find database MY_DB")
+    first, explanation = err.splitlines()[:2]
+    assert first == f"error: 400 Client Error: None for url: {response.url} (517602): {message}"
+    assert explanation.startswith("Role <ROLE> (couldn't determine your role) can't find database MY_DB")
     assert err.count(message) == 1
+    assert "response body:" not in err
 
 
 _CROSS_REGION_MESSAGE = (
@@ -3661,16 +3664,14 @@ def test_a_rejected_pat_shows_the_server_message_once_and_the_hint():
     assert "Snowflake rejected your credentials (HTTP 401)." in output
 
 
-def test_an_http_error_prints_a_body_the_client_cannot_parse(caplog):
+def test_an_http_error_prints_a_body_the_client_cannot_parse():
     # A string nested deeper than the JSON decoder recurses.
     content = json.dumps({"detail": "[" * 100_000}).encode()
 
-    with caplog.at_level("DEBUG", logger=cli.logger.name):
-        rc, output = _get_output(_refusing_client(content))
+    rc, output = _get_output(_refusing_client(content))
 
     assert rc == 1
     assert output.endswith(f"\nresponse body: {content.decode()[:4000]}...<truncated>\n")
-    assert "could not read the service's error from the response body" in caplog.text
 
 
 def test_invalid_job_json_returns_error(tmp_path):

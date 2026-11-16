@@ -37,6 +37,7 @@ from typing import Optional
 import requests
 from rich.cells import cell_len
 
+from cortex_training.client import errors as _errors
 from cortex_training.client.core import _deployment_id_from_job_id
 from cortex_training.client.core import _model_deployment_status
 from cortex_training.client.core import _model_deployment_sub_job
@@ -139,26 +140,36 @@ def status_word(status: Any) -> str:
     return (str(status or "").strip() or "?").removeprefix("JOB_STATE_").lower()
 
 
-def describe_error(exc: BaseException) -> str:
-    """A failed call for display, on one printable line: the HTTP status and the
-    service's message, not the URL.
+def describe_error(exc: BaseException, *, explain: bool = True) -> str:
+    """A failed call for display, on one printable line: the HTTP status, the
+    service's code and message, then the explanation the client gives for them,
+    but not the URL.
 
-    An HTTP error's own text ("500 Server Error: ... for url: <full URL>") repeats
-    the host, database and schema.
+    The code, message and explanation are the ones the CLI and the Python
+    client show (see ``cortex_training.client.errors``). An HTTP error's own
+    text ("500 Server Error: ... for url: <full URL>") repeats the host,
+    database and schema, so it is left out. Any other error is its type and
+    text, then the explanation for that text, if any (such as for a refused SQL
+    statement on the job's Experiment). ``explain=False`` leaves the
+    explanation out, for a line that has no room for it (see
+    :func:`with_explanation`).
     """
-    response = getattr(exc, "response", None)
-    status = getattr(response, "status_code", None)
     if isinstance(exc, requests.exceptions.Timeout):
         return _timeout_text(exc)
-    if not isinstance(status, int):
-        return collapse(f"{type(exc).__name__}: {exc}")
-    try:
-        body = response.json()
-        message = str(body.get("message") or body.get("error") or "") if isinstance(body, dict) else ""
-    except Exception:  # noqa: BLE001 - not JSON
-        message = ""
-    reason = str(getattr(response, "reason", "") or "")
-    return collapse(f"HTTP {status}" + (f" {reason}" if reason else "") + (f": {message}" if message else ""))
+    error = _errors.read_server_error(getattr(exc, "response", None))
+    if error is None or error.status is None:
+        text = collapse(f"{type(exc).__name__}: {exc}")
+    else:
+        text = collapse(f"HTTP {error.status}" + (f" {error.reason}" if error.reason else "") + error.suffix)
+    return with_explanation(text, exc) if explain else text
+
+
+def with_explanation(text: str, exc: BaseException) -> str:
+    """``text``, then the explanation the client gives for ``exc``, on one line, unless ``text`` has it."""
+    explanation = collapse(_errors.explanation_of(exc) or "")
+    if explanation and explanation not in text:
+        text += ("" if text.endswith((".", "!", "?")) else ".") + f" {explanation}"
+    return text
 
 
 # How long a timed-out request waited, as urllib3 says it: "(read timeout=45.0)".
@@ -174,32 +185,18 @@ def _timeout_text(exc: BaseException) -> str:
     return f"no answer from the service{within} ({type(exc).__name__})"
 
 
-# The service's 500 when it can't resolve the job's Experiment for the caller: the
-# checkpoint routes say "... or not authorized for the training job", and the
-# experiment-run route that saved logs and GPU metrics start with says "... for
-# job <id>", which a deleted Experiment gets too.
-EXPERIMENT_ACCESS_MARKER = "Linked experiment is not found or not authorized"
-_EXPERIMENT_NOT_FOUND = "Linked experiment is not found"
-_ASK = "ask for access to the Experiment, or use the role that created the job"
-
-
 def experiment_access_hint(exc: BaseException) -> str | None:
-    """The one-line explanation when ``exc`` means this role can't read the job's Experiment, else None.
+    """The explanation when ``exc`` means this role can't read the job's Experiment, else None.
 
-    The HTTP reply holds the service's whole message; ``str(exc)`` holds a refused
-    SQL statement's, and an HTTP error's only when the client added it, cut at
-    1,000 characters. So both are read. A refusal about another object (a
-    warehouse, a schema) is None even when its message names the Experiment.
+    It comes from the client's table of explanations (``EXPERIMENT_ACCESS`` in
+    ``cortex_training.client.errors``), which reads the start (the first 4,000
+    characters) of an HTTP error's message from its answer, and of any other
+    error's text, such as a refused SQL statement's. A refusal about another
+    object (a warehouse, a schema) is None even when its message names the
+    Experiment.
     """
-    text = f"{exc}\n{_reply_text(exc)}"
-    if EXPERIMENT_ACCESS_MARKER in text:
-        return f"this role can't read the job's Experiment (saved logs, GPU metrics and checkpoints live there); {_ASK}"
-    if _EXPERIMENT_NOT_FOUND in text:  # the experiment-run route's: hidden from this role, or gone
-        return ("this role can't read the job's Experiment, or it no longer exists (saved logs, GPU metrics and "
-                f"checkpoints live there); {_ASK}")
-    if _EXPERIMENT_SQL_DENIED.search(text):  # a MONITOR-only role: the service still lists the checkpoints
-        return f"this role can't read the job's Experiment, where saved logs and GPU metrics live (the checkpoints command works); {_ASK}"
-    return None
+    found = _errors.look_up(exc)
+    return found.text if found is not None and found.topic == _errors.EXPERIMENT_ACCESS else None
 
 
 def is_live(job: Any) -> bool:
@@ -1396,18 +1393,6 @@ def _reply_text(exc: BaseException) -> str:
     return text if isinstance(text, str) else ""
 
 
-# How Snowflake refuses SQL on the job's Experiment for this role (the LIST and
-# GET that read saved logs and GPU metrics): "003001 (42501): SQL access control
-# error: Insufficient privileges to operate on experiment 'NAME'", "Experiment
-# 'NAME' does not exist or not authorized", or the same said of a
-# snow://experiment/ path. The refusal itself must be about the Experiment, so a
-# denial about some other object (a warehouse, a schema) keeps its own text even
-# when the message names the Experiment elsewhere.
-_EXPERIMENT_SQL_DENIED = re.compile(
-    r"insufficient privileges to operate on experiment\b"
-    r"|\bexperiment(?:\s+run)?\s+(?:'[^']*'|\"[^\"]*\"|[^\s'\"]+)\s+does not exist or not authorized"
-    r"|snow://experiment/[^\s'\"]*['\"]?:?\s+does not exist or not authorized",
-    re.IGNORECASE)
 # A 403 refuses this role when its reply says so in Snowflake's words. An empty or
 # unrelated 403 (a proxy or a network gate can send one) keeps the standard text.
 _PRIVILEGE_REFUSAL = re.compile(r"privilege|not authorized|access control error", re.IGNORECASE)
@@ -1415,10 +1400,14 @@ _PRIVILEGE_REFUSAL = re.compile(r"privilege|not authorized|access control error"
 
 def access_hint(exc: BaseException, subject: str) -> Optional[str]:
     """One line when ``exc`` means this role may not read the job's ``subject`` ("saved logs", "GPU
-    metrics"), else None: the caller then shows the standard error text."""
-    hint = experiment_access_hint(exc)
-    if hint:
-        return hint
+    metrics"), else None: the caller then shows the standard error text.
+
+    When the job's Experiment is what the role can't read, that is
+    :func:`describe_error`'s line: the service's message, then the explanation
+    (:func:`experiment_access_hint`), which follows the message and never
+    replaces it."""
+    if experiment_access_hint(exc):
+        return describe_error(exc)
     status = getattr(getattr(exc, "response", None), "status_code", None)
     if status == 403 and _PRIVILEGE_REFUSAL.search(_reply_text(exc)):
         return f"this role isn't allowed to read this job's {subject} ({describe_error(exc)})"
