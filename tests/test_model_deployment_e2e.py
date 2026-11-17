@@ -13,6 +13,9 @@ as a user would, and deployments hold real GPUs while they run. They are skipped
     CORTEX_TRAINING_E2E_CONFIG=~/config.json python3 -m pytest \\
         tests/test_model_deployment_e2e.py -v
 
+Also set ``CORTEX_TRAINING_E2E_CONNECTION=NAME`` to have the CLI sign in with
+that connection profile instead of the JSON config.
+
 TC8 deploys a weights-only checkpoint. Set
 ``CORTEX_TRAINING_E2E_CHECKPOINT=TRAINING_JOB_UUID/CHECKPOINT_ID`` to use an
 existing one; otherwise a 1-GPU training job saves one and is cancelled.
@@ -39,6 +42,9 @@ import requests
 CONFIG_ENV = "CORTEX_TRAINING_E2E_CONFIG"
 CHECKPOINT_ENV = "CORTEX_TRAINING_E2E_CHECKPOINT"
 CONFIG_PATH = os.environ.get(CONFIG_ENV)
+# The CLI signs in with this profile when set; the JSON config is still read
+# for the direct HTTP checks.
+CONNECTION = os.environ.get("CORTEX_TRAINING_E2E_CONNECTION")
 
 pytestmark = pytest.mark.skipif(
     not CONFIG_PATH, reason=f"set {CONFIG_ENV} to run live model deployment tests"
@@ -71,15 +77,11 @@ def load_config() -> dict:
 
 
 def cli_command(*arguments: str) -> list[str]:
-    return [
-        sys.executable,
-        "-m",
-        "cortex_training.cli",
-        "--config",
-        str(Path(CONFIG_PATH).expanduser()),
-        "--compact",
-        *arguments,
-    ]
+    if CONNECTION:
+        sign_in = ["--connection", CONNECTION]
+    else:
+        sign_in = ["--config", str(Path(CONFIG_PATH).expanduser())]
+    return [sys.executable, "-m", "cortex_training", *sign_in, "--compact", *arguments]
 
 
 def run_cli(*arguments: str, timeout: float = READY_TIMEOUT_SECONDS + 120):
