@@ -207,16 +207,28 @@ def is_live(job: Any) -> bool:
     return word in ACTIVE_STATUSES or (word == "unknown" and not job_not_found(job))
 
 
-# The status of a job being cancelled, a deployment being dropped. Such a job is
-# not live (it takes no more work: see serving.serving_state), but it isn't over
-# either: its status still changes to the end.
+# The statuses of a job being cleaned up after it was cancelled (a deployment
+# being dropped), terminated or failed, and the status each ends in. Such a job
+# is not live (it takes no more work: see serving.serving_state), but it isn't
+# over either: its status still changes to the end.
 CANCELLING = "cancelling"
+_CLEANUP_ENDS_AS = {CANCELLING: "cancelled", "terminating": "terminated", "failing": "failed"}
 
 
 def time_runs_on(job: Any) -> bool:
     """Whether a job's clock still runs: it is live (:func:`is_live`), or being
-    cancelled, so its current step counts up and its screens keep re-reading it."""
-    return is_live(job) or (isinstance(job, dict) and status_word(job.get("status")) == CANCELLING)
+    cleaned up, so its current step counts up and its screens keep re-reading it.
+
+    The service reports a job being cleaned up with the status it ends in, so
+    such a job is told by its status history, which ends in the cleanup."""
+    if not isinstance(job, dict):
+        return False
+    if is_live(job):
+        return True
+    word = status_word(job.get("status"))
+    entries = _history_entries(job)
+    last = entries[-1][0] if entries else ""
+    return word in _CLEANUP_ENDS_AS or (last in _CLEANUP_ENDS_AS and _settled(last) == _settled(word))
 
 
 def job_not_found(job: Any) -> bool:
@@ -646,32 +658,46 @@ class _Period:
     seconds: Optional[float]  # how long it lasted, or has so far; None for the status a job ended in
 
 
-# Every status word a job can have, cancelling included; a status history's entries in any other are skipped.
-_JOB_STATUSES = frozenset(ACTIVE_STATUSES) | frozenset(TERMINAL_STATUSES) | {CANCELLING}
+# Every status word a job can have, cleanup included; a status history's entries in any other are skipped.
+_JOB_STATUSES = frozenset(ACTIVE_STATUSES) | frozenset(TERMINAL_STATUSES) | frozenset(_CLEANUP_ENDS_AS)
 
 
-def _status_periods(job: dict, now: datetime) -> list:
-    """The job's ``status_history`` as :class:`_Period` s, oldest first; ``[]``
-    when it has none to show, the job is ``unknown``, or the last entry is not the
-    job's status (the history is then not this record's).
-
-    Each status lasts until the next began, never below zero, and the current one
-    until ``now`` while the job's clock runs (:func:`time_runs_on`: live, or still
-    cancelling). Entries the screens word alike (a deployment's PLACING and
-    INITIALIZING) merge into the first. An entry without a known status and a
-    time is skipped.
-    """
+def _history_entries(job: dict) -> list:
+    """``(status word, when the job entered it)`` for each entry of the job's
+    ``status_history`` that has a known status and a time, oldest first."""
     history = job.get("status_history")
-    word = status_word(job.get("status"))
-    if not isinstance(history, list) or word == "unknown":
+    if not isinstance(history, list):
         return []
-    entries = []  # (status word, when the job entered it)
+    entries = []
     for entry in history:
         status = status_word(entry.get("status")) if isinstance(entry, dict) else ""
         start = parse_ts(entry.get("entered_at")) if status in _JOB_STATUSES else None
         if start is not None:
             entries.append((status, start))
-    if not entries or _STATUS_SPELLINGS.get(entries[-1][0], entries[-1][0]) != _STATUS_SPELLINGS.get(word, word):
+    return entries
+
+
+def _settled(word: str) -> str:
+    """The status ``word`` ends in, in one spelling: a cleanup's is the status after it."""
+    word = _CLEANUP_ENDS_AS.get(word, word)
+    return _STATUS_SPELLINGS.get(word, word)
+
+
+def _status_periods(job: dict, now: datetime) -> list:
+    """The job's ``status_history`` as :class:`_Period` s, oldest first; ``[]``
+    when it has none to show, the job is ``unknown``, or the last entry is neither
+    the job's status nor the cleanup before it (the history is then not this
+    record's).
+
+    Each status lasts until the next began, never below zero, and the current one
+    until ``now`` while the job's clock runs (:func:`time_runs_on`: live, or being
+    cleaned up). Entries the screens word alike (a deployment's PLACING and
+    INITIALIZING) merge into the first. An entry without a known status and a
+    time is skipped.
+    """
+    word = status_word(job.get("status"))
+    entries = _history_entries(job) if word != "unknown" else []
+    if not entries or _settled(entries[-1][0]) != _settled(word):
         return []
     merged = [entry for at, entry in enumerate(entries)
               if not at or status_word_for(job, entry[0]) != status_word_for(job, entries[at - 1][0])]

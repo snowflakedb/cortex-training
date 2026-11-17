@@ -1497,9 +1497,8 @@ Duration is how long a live job has run so far (since it was created, so it
 counts time spent waiting to be placed; in its status's color), or how long a
 finished one ran until its last state change (`40s`, `12m`, `3h 05m`,
 `2d 4h`). For a cancelled, terminated or failed job, that change is the end of
-its cleanup, so its preview can show it lasted a little less (see
-[Job preview](#job-preview)). The times are as of the last refresh, which
-redraws them. On a narrow
+its cleanup. The times are as of the last refresh, which redraws them. On a
+narrow
 screen the Job ID column narrows (its id ends in `…`) and stays in view while
 the other columns scroll. The Schema column, shown when the list spans more than
 one location, is as wide as its longest `DB.SCHEMA` where the screen has room,
@@ -1629,8 +1628,7 @@ table, and toggles them short again.
 **GPUs** sums each sub-job's `n_gpus`, excluding `log_probability` and
 multiplexed sub-jobs that run on another sub-job's GPUs. The time beside the
 status includes queue and placement time; an `unknown` job runs to now. With a
-status history, an ended job's `lasted` ends when it stopped, as its timeline
-does; the job list's Duration also counts the cleanup after.
+status history, an ended job's `lasted` ends where its timeline does.
 Missing times show `—`, and a clock up to five minutes ahead reads `just now`.
 
 **Timeline** has a step for each status in the job's status history
@@ -1638,13 +1636,14 @@ Missing times show `—`, and a clock up to five minutes ahead reads `just now`.
 how long each lasted, and runs on to now while the job is live:
 `○ Pending 00:58 ── 1m 43s ─▸ ◔ Placing 00:59 ── 35s ─▸ ◐ Initializing 01:00
 ── 11m 47s ─▸ ● Running since 01:12 ── 9m 02s so far ─▸ now`, or, once it ended,
-`… ─▸ ● Running 01:12 ── 5h 59m ─▸ − Cancelled 07:12 (2h 00m ago)`, its last
-step when it stopped. A history that starts after `Pending` gets a `◇ Created`
-step first, whose gap covers the statuses not recorded. The current status is
-in bold. A job being cancelled has a `⊖ Cancelling` step, `⊖ Dropping` for a
-deployment, that counts up like a live step, so the time it took to cancel is
-not counted as running time; the preview keeps re-reading such a job until it
-is cancelled. A deployment's steps use deployment words, with placing and
+`… ─▸ ● Running 01:12 ── 5h 59m ─▸ ⊖ Cancelling 07:12 ── 29s ─▸ − Cancelled 07:12
+(2h 00m ago)`. A history that starts after `Pending` gets a `◇ Created` step
+first, whose gap covers the statuses not recorded. The current status is in
+bold. A job being cancelled, terminated or failed has a `⊖ Cancelling`,
+`⊙ Terminating` or `⊗ Failing` step (`⊖ Dropping` for a deployment) that counts
+up like a live step until the job ends, so its cleanup is not counted as
+running time; the preview keeps re-reading such a job until then. A
+deployment's steps use deployment words, with placing and
 initializing as one `Initializing` step, then `● Ready`. The preview first
 draws the job as the job list has it, without a history, and redraws the
 timeline when its own read of the job answers.

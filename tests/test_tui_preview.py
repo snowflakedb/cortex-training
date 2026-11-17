@@ -742,9 +742,32 @@ def test_once_cancelled_the_time_spent_cancelling_is_not_running_time(job, label
     assert steps[-1].current and v.elapsed_text(ended, NOW) == "lasted 1h 35m"
 
 
-@pytest.mark.parametrize(("status", "rereads"), [("CANCELLING", True), ("RUNNING", True), ("CANCELLED", False)])
-def test_the_card_rereads_a_job_until_its_status_stops_changing(status, rereads):
-    job = _job(status)
+@pytest.mark.parametrize(("cleanup", "ends_as"),
+                         [("CANCELLING", "CANCELLED"), ("TERMINATING", "TERMINATED"), ("FAILING", "FAILED")])
+def test_a_job_s_cleanup_has_its_own_step_while_its_status_already_says_how_it_ended(cleanup, ends_as):
+    # As the service reports a job being cleaned up: the status it ends in, and a history that ends in the cleanup.
+    cleaning_up = _job(ends_as, changed=timedelta(minutes=30),
+                       status_history=_history(*CAME_UP, (cleanup, timedelta(minutes=30))))
+    assert [(s.label, s.then, s.current) for s in v.lifecycle(cleaning_up, NOW)][-3:] == [
+        ("Running", "1h 15m", False), (f"{cleanup.capitalize()} since", "30m 00s so far", True), ("now", "", False)]
+    assert v.time_runs_on(cleaning_up) and not v.is_live(cleaning_up)
+    assert v.elapsed_text(cleaning_up, NOW) == "2h 00m so far"
+
+    ended = {**cleaning_up, "state_changed_at": _iso(NOW - timedelta(minutes=25)),
+             "status_history": _history(*CAME_UP, (cleanup, timedelta(minutes=30)), (ends_as, timedelta(minutes=25)))}
+    assert [(s.label, s.then) for s in v.lifecycle(ended, NOW)][-3:] == [
+        ("Running", "1h 15m"), (cleanup.capitalize(), "5m 00s"), (ends_as.capitalize(), "")]
+    assert not v.time_runs_on(ended) and v.elapsed_text(ended, NOW) == "lasted 1h 35m"
+
+
+@pytest.mark.parametrize(("job", "rereads"), [
+    pytest.param(_job("CANCELLING"), True, id="cancelling"),
+    pytest.param(_job("CANCELLED", status_history=_history(*CAME_UP, ("CANCELLING", timedelta(minutes=30)))), True,
+                 id="cancelled-history-in-cleanup"),
+    pytest.param(_job("RUNNING"), True, id="running"),
+    pytest.param(_job("CANCELLED"), False, id="cancelled"),
+])
+def test_the_card_rereads_a_job_until_its_status_stops_changing(job, rereads):
     client = MagicMock()
     client.list_jobs.return_value = [job]
     client.get_job.return_value = job

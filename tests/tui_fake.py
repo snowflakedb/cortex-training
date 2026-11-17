@@ -58,6 +58,8 @@ _COMING_UP = ("PENDING", "PLACING", "INITIALIZING", "RUNNING")
 _COMING_UP_AT = (0, 1 / 4, 2 / 5, 1)
 # How many of _COMING_UP a job that failed for this reason went through.
 _FAILED_AFTER = {"pending_timeout": 1, "placement_too_large": 1, "placement_timeout": 2, "out_of_memory": 3}
+# The cleanup a job goes through before each status it can end in.
+_CLEANUP_BEFORE = {"CANCELLED": "CANCELLING", "TERMINATED": "TERMINATING", "FAILED": "FAILING"}
 # The service began recording status changes this long before the fake starts. A
 # job that ended before then has no status history; the two B200 jobs running
 # then have one from RUNNING, the status they were in.
@@ -231,9 +233,9 @@ def _went_through(status: str, reason: str, created: datetime, ended: Optional[d
 
     A live job has been in its status since ``placed`` (its ``state_changed_at``),
     and came up to it from creation. An ended job came up in a tenth of its run, at
-    most 4 minutes, as far as its reason says, and the status it ended in began
-    when it stopped, before its cleanup ended it (``ended``). ``[]`` for a status a
-    history never holds.
+    most 4 minutes, as far as its reason says, and was cleaned up for up to 29 s
+    before the status it ended in (``ended``). ``[]`` for a status a history never
+    holds.
     """
     if status not in _HISTORY_STATUSES:
         return []
@@ -243,7 +245,8 @@ def _went_through(status: str, reason: str, created: datetime, ended: Optional[d
         return [*came_up, (status, placed)]
     up = min((ended - created) / 10, timedelta(minutes=4))
     went = [(s, created + up * share) for s, share in zip(_COMING_UP[:_FAILED_AFTER.get(reason, 4)], _COMING_UP_AT)]
-    return [*went, (status, ended - min(timedelta(seconds=29), (ended - created) / 20))]
+    stopped = ended - min(timedelta(seconds=29), (ended - created) / 20)
+    return [*went, (_CLEANUP_BEFORE[status], stopped), (status, ended)]
 
 
 def _http_error(status: int, message: str) -> requests.HTTPError:

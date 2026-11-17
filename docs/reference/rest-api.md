@@ -689,10 +689,13 @@ ended job ended.
 
 `status_history` lists every status the job has entered, oldest first, each with
 the UTC time it entered it (`entered_at`, to the second). Each status lasts until
-the next entry's `entered_at`; the last entry is the job's current `status`, in
-progress while the job is active and with no duration once it has ended. A final
-status's `entered_at` is when the job stopped; `state_changed_at` is when the
-cleanup after it finished, so it can be later. Entries can share a time, and a
+the next entry's `entered_at`; the last one is in progress until the job has
+ended, and the status it ends in has no duration. A job that is cancelled,
+terminated or fails spends its cleanup in `CANCELLING`, `TERMINATING` or
+`FAILING`, while its `status` already reads `CANCELLED`, `TERMINATED` or
+`FAILED`; its final entry is entered at `state_changed_at`, once the cleanup has
+finished. A service that predates these cleanup entries folds the cleanup into
+the final status, entered when the job stopped. Entries can share a time, and a
 status the job skipped (`INITIALIZING` can be) has no entry. When the service did
 not record a job's earlier statuses, the first entry is not `PENDING`. Statuses
 are upper case (`RUNNING`); like `status`, read them without regard to case
