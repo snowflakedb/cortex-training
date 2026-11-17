@@ -251,6 +251,12 @@ def _answer(content: bytes | str, status: int = 400, *, reason: str = "Bad Reque
             {"error": "invalid_token", "error_description": "The access token expired"}, None,
             "invalid_token - The access token expired", id="an-oauth-error-and-its-description",
         ),
+        pytest.param(
+            {"error": "Bad Request", "data": {"code": "517602", "message": "Schema DB.SCH is not found or not authorized"}},
+            "517602", "Schema DB.SCH is not found or not authorized", id="an-error-string-over-a-nested-code-and-message",
+        ),
+        pytest.param({"code": "517604", "error": "busy"}, "517604", "busy", id="a-code-with-an-error-string"),
+        pytest.param({"error": "outer", "data": {"detail": "x"}}, None, "outer", id="an-error-string-over-nothing-else"),
         pytest.param({"code": "", "error_code": "", "message": "no code"}, None, "no code", id="an-empty-code"),
         pytest.param({"code": "517602", "message": "  "}, "517602", None, id="a-blank-message"),
         pytest.param({"detail": [{"loc": ["body"], "msg": "bad"}]}, None, None, id="a-validation-list"),
@@ -266,8 +272,50 @@ def test_a_body_that_is_not_json_has_no_code_or_message():
     response = _answer(b"<html>busy</html>", 503, reason="Service Unavailable")
     response.headers["x-snowflake-request-id"] = "sf-1"
 
-    assert errors.read_server_error(response) == errors.ServerError(503, "Service Unavailable", None, None, "sf-1")
+    assert errors.read_server_error(response) == errors.ServerError(
+        503, "Service Unavailable", None, None, "sf-1", body_text="<html>busy</html>"
+    )
     assert errors.read_server_error(None) is None
+
+
+def test_an_error_string_does_not_hide_a_missing_schema_nested_under_it():
+    body = {"error": "Bad Request", "data": {"code": "517602", "message": _SCHEMA_MESSAGE}}
+    client, _response = _client(Refusal(400, "Bad Request", body))
+
+    with pytest.raises(DatabaseAccessError) as excinfo:
+        client.get_job("job-1")
+
+    assert (excinfo.value.server_code, excinfo.value.server_message) == ("517602", _SCHEMA_MESSAGE)
+    assert excinfo.value.explanation.startswith(REFUSALS["schema-not-found"].explanation)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(_EXPERIMENT_MESSAGE.encode(), id="plain-text"),
+        pytest.param(json.dumps({"detail": f"Cortex training getCheckpoints failed: {_EXPERIMENT_MESSAGE}"}).encode(),
+                     id="detail-only"),
+    ],
+)
+def test_a_body_without_a_message_is_read_as_text_for_the_experiment_explanation(body):
+    refusal = Refusal(500, "Internal Server Error", body)
+    error, _response = _sdk_error(refusal)
+
+    explanation = REFUSALS["experiment-access"].explanation
+    assert error.server_message is None and error.explanation == explanation
+    assert str(error).endswith("\n" + explanation)
+    assert views.experiment_access_hint(error) == explanation
+    assert views.describe_error(error).endswith(explanation)
+    assert _cli_output(refusal).count(explanation) == 1
+
+
+def test_a_parsed_message_is_what_the_explanations_read():
+    # The body's text names the Experiment too, but the service's own message is about something else.
+    body = {"code": "517603", "message": "Internal error", "trace": _EXPERIMENT_MESSAGE}
+    error, _response = _sdk_error(Refusal(500, "Internal Server Error", body))
+
+    assert error.explanation is None
+    assert views.experiment_access_hint(error) is None
 
 
 def test_an_oauth_description_is_shown_whole():

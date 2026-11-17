@@ -190,10 +190,11 @@ def experiment_access_hint(exc: BaseException) -> str | None:
 
     It comes from the client's table of explanations (``EXPERIMENT_ACCESS`` in
     ``cortex_training.client.errors``), which reads the start (the first 4,000
-    characters) of an HTTP error's message from its answer, and of any other
-    error's text, such as a refused SQL statement's. A refusal about another
-    object (a warehouse, a schema) is None even when its message names the
-    Experiment.
+    characters) of an HTTP error's message from its answer, or of the answer's
+    whole text when it has no message (a plain-text body, or one with only a
+    ``detail``), and of any other error's text, such as a refused SQL
+    statement's. A refusal about another object (a warehouse, a schema) is None
+    even when its message names the Experiment.
     """
     found = _errors.look_up(exc)
     return found.text if found is not None and found.topic == _errors.EXPERIMENT_ACCESS else None

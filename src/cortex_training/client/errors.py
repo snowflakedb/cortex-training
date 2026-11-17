@@ -111,8 +111,11 @@ class ServerError:
 
     ``message`` is the service's own text, whole and unredacted (the
     explanations match its first ``_MATCHED_CHARS`` characters);
-    :attr:`shown_message` is how errors show it. ``status`` is None when the
-    answer has no integer status (as a mocked one may not).
+    :attr:`shown_message` is how errors show it. ``body_text`` is the start of the
+    answer's body as text, which the explanations read instead when no message
+    was found in it (a plain-text body, or one with only a ``detail``); it is
+    never shown. ``status`` is None when the answer has no integer status (as a
+    mocked one may not).
     """
 
     status: int | None
@@ -120,6 +123,7 @@ class ServerError:
     code: str | None
     message: str | None
     snowflake_request_id: str | None
+    body_text: str | None = None
 
     @property
     def shown_message(self) -> str | None:
@@ -135,33 +139,46 @@ class ServerError:
         return text
 
 
+def _error_text(candidate: dict) -> str | None:
+    """A dict's string ``error``, followed by its ``error_description`` when it has one; else None.
+
+    As some gateways send it (OAuth's ``{"error": "invalid_token",
+    "error_description": "..."}``). The two are joined with `` - ``, which the
+    credential redaction does not read as ``token: <value>``.
+    """
+    error = candidate.get("error")
+    if not isinstance(error, str) or not error.strip():
+        return None
+    description = candidate.get("error_description")
+    if isinstance(description, str) and description.strip():
+        return f"{error.strip()} - {description.strip()}"
+    return error.strip()
+
+
 def _code_and_message(body: Any) -> tuple[str | None, str | None]:
     """The first ``code`` and ``message`` in a JSON error body, plain or wrapped.
 
     The service sends ``{"code", "error_code", "message", "request_id"}``, its
-    chat completions ``{"error": {"message", "type", "code"}}``. A dict's
-    ``message`` is read, or else its ``error`` when that is a string, as some
-    gateways send it, followed by its ``error_description`` when it has one
-    (OAuth's ``{"error": "invalid_token", "error_description": "..."}``), so
-    nothing such a body says is left out. The two are joined with `` - ``,
-    which the credential redaction does not read as ``token: <value>``. An
-    empty code (the service sends ``""`` for an error without one) is no code.
+    chat completions ``{"error": {"message", "type", "code"}}``. The first dict
+    with a ``code`` or a ``message`` gives them, so a code and message nested
+    under another field are found even when the outer dict has a string
+    ``error``; that dict's own ``error`` string (see :func:`_error_text`) stands
+    in for a ``message`` it lacks. Only when no dict has a code or a message
+    does the first string ``error`` count as the message on its own. An empty
+    code (the service sends ``""`` for an error without one) is no code.
     """
+    fallback = None
     for candidate in iter_error_dicts(body):
         raw_code = candidate.get("code") or candidate.get("error_code")
         code = str(raw_code).strip() if raw_code is not None else ""
         message = candidate.get("message")
-        if not isinstance(message, str) and isinstance(candidate.get("error"), str):
-            message = candidate["error"]
-            description = candidate.get("error_description")
-            if isinstance(description, str) and description.strip():
-                message = f"{message.strip()} - {description.strip()}"
         if code or isinstance(message, str):
-            return (
-                code or None,
-                message.strip() if isinstance(message, str) and message.strip() else None,
-            )
-    return None, None
+            if not (isinstance(message, str) and message.strip()):
+                message = _error_text(candidate)
+            return code or None, message.strip() if isinstance(message, str) and message.strip() else None
+        if fallback is None:
+            fallback = _error_text(candidate)
+    return None, fallback
 
 
 def read_server_error(response: Any) -> ServerError | None:
@@ -173,7 +190,7 @@ def read_server_error(response: Any) -> ServerError | None:
     if response is None:
         return None
     status = getattr(response, "status_code", None)
-    code = message = None
+    code = message = body_text = None
     try:
         body = response.json()
     except Exception:  # noqa: BLE001 - not JSON, or no body
@@ -182,12 +199,18 @@ def read_server_error(response: Any) -> ServerError | None:
         code, message = _code_and_message(body)
     except Exception:  # noqa: BLE001 - such as a RecursionError on a deeply nested string
         logger.debug("could not read the service's error from the response body", exc_info=True)
+    try:
+        raw = response.text
+        body_text = raw[:_MATCHED_CHARS] if isinstance(raw, str) and raw.strip() else None
+    except Exception:  # noqa: BLE001 - a body that can't be read as text
+        logger.debug("could not read the response body as text", exc_info=True)
     return ServerError(
         status=status if isinstance(status, int) and not isinstance(status, bool) else None,
         reason=str(getattr(response, "reason", "") or ""),
         code=code,
         message=message,
         snowflake_request_id=response_snowflake_request_id(response),
+        body_text=body_text,
     )
 
 
@@ -231,11 +254,13 @@ class Explanation:
 class _Entry:
     """One row of :data:`EXPLANATIONS`: when it applies, and what it says.
 
-    ``pattern`` is searched in the service's message (or, for an error with
-    no HTTP answer, such as a refused SQL statement, in the error's text).
-    ``status``, ``code`` and ``needs_pat`` further limit it to an HTTP answer
-    with that status, that code, or to a request that sent a PAT;
-    ``unless_code`` leaves out answers whose code it matches.
+    ``pattern`` is searched in the service's message; in the answer's body as
+    text when no message was found in it (a plain-text body, or one with only a
+    ``detail``); and, for an error with no HTTP answer, such as a refused SQL
+    statement, in the error's text. ``status``, ``code`` and ``needs_pat``
+    further limit it to an HTTP answer with that status, that code, or to a
+    request that sent a PAT; ``unless_code`` leaves out answers whose code it
+    matches.
     """
 
     topic: str
@@ -255,8 +280,9 @@ class _Entry:
             return False
         if self.needs_pat and not context.sent_pat:
             return False
-        # Only the start of the message, so that a huge one costs little on every failed attempt.
-        return bool(self.pattern.search((error.message or "")[:_MATCHED_CHARS]))
+        # Only the start, so that a huge message costs little on every failed attempt.
+        said = error.message if error.message is not None else (error.body_text or "")
+        return bool(self.pattern.search(said[:_MATCHED_CHARS]))
 
 
 # How much of a message the explanations look at. Every refusal they explain

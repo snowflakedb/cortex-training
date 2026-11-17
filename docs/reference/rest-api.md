@@ -332,10 +332,12 @@ details:
 
 When a 4xx or 5xx body is a JSON error with a `code` or a `message`, the Python
 client adds them to the end of the `requests.HTTPError` message that
-`raise_for_status()` gives. A body with no `message` but a string `error`, as
-some gateways send, counts that `error` and any `error_description` as the
-message. For the refusals the client recognizes, an explanation with next steps
-follows on the lines under it:
+`raise_for_status()` gives. The first object in the body with a `code` or a
+`message` gives them, even when it is nested under another field. A string
+`error`, as some gateways send, counts as the message, together with any
+`error_description`, when that object has no `message`, or when no object in the
+body has a `code` or a `message`. For the refusals the client recognizes, an
+explanation with next steps follows on the lines under it:
 
 ```text
 [snowflake request id: <id>] 400 Client Error: Bad Request for url: <url> (<code>): <message>
@@ -345,7 +347,7 @@ follows on the lines under it:
 | Refusal | Explanation |
 |---|---|
 | 400, code `517602`, `Schema <database>.<schema> is not found or not authorized`, for the client's own database and schema | Which role can't find the database or schema, the statements that create them, and the grants that give the role access. The error is a `DatabaseAccessError`. From a client made by `for_job()`, and on the account-level job list, the path's database is not the client's: the error is a plain `HTTPError` with the service's code and message alone. |
-| A message saying the job's Experiment can't be read, such as the 500 `Linked experiment is not found or not authorized for the training job` | The role can't read the job's Experiment, where saved logs, GPU metrics and checkpoints live: ask for access to it, or use the role that created the job. |
+| A message saying the job's Experiment can't be read, such as the 500 `Linked experiment is not found or not authorized for the training job`. A body with no message, such as plain text or a `detail` only, is read as text instead. | The role can't read the job's Experiment, where saved logs, GPU metrics and checkpoints live: ask for access to it, or use the role that created the job. |
 | 401 on a request that sent a PAT, whatever its body, unless the answer carries one of the service's own codes (`5176xx`, as a 401 relayed from a running job's backend does) | The most common reasons Snowflake rejects a PAT, such as a user with no network policy. |
 
 Any other refusal, such as a missing `CREATE EXPERIMENT` privilege or a stage
