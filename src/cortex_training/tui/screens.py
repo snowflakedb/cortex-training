@@ -195,14 +195,15 @@ class JobSummaryScreen(FollowsPointer, Screen):
         self.set_interval(1, self._fetch_tick)
 
     def _refresh_tick(self) -> None:
-        if self.app.screen is self and v.is_live(self._job):
+        # A job being cancelled too: its status still changes, and its timeline counts up.
+        if self.app.screen is self and v.time_runs_on(self._job):
             self._start_fetch()
 
     def on_screen_resume(self) -> None:
         self._refresh_view()
         # Back from the details, which may have seen the status move on: re-read the job now.
         reread, self._reread_on_resume = self._reread_on_resume, False
-        if reread and v.is_live(self._job):
+        if reread and v.time_runs_on(self._job):
             self._start_fetch()
 
     # The grid's label column: a 12-cell label and a space. Its values wrap

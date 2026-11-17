@@ -1483,8 +1483,8 @@ history` (counting the jobs a search matches, followed by `N matches for
 QUERY`, while there is one), and ends with the sort (`sort: created ↓ newest
 first`). The Status column draws each status as a glyph and the word:
 `● RUNNING`, `◐ INITIALIZING`, `◔ PLACING` (and `creating`), `○ PENDING` (and
-`queued`), `? UNKNOWN`, `× FAILED`, `− CANCELLED`, and `✓` for `terminated`,
-`done` and `succeeded`.
+`queued`), `? UNKNOWN`, `× FAILED`, `⊖ CANCELLING` (being cancelled),
+`− CANCELLED`, and `✓` for `terminated`, `done` and `succeeded`.
 
 Rows show the job id, status, type, created time, duration and owner, then
 model, requested GPUs, optional location, and updated time. Created and Updated
@@ -1641,7 +1641,10 @@ how long each lasted, and runs on to now while the job is live:
 `… ─▸ ● Running 01:12 ── 5h 59m ─▸ − Cancelled 07:12 (2h 00m ago)`, its last
 step when it stopped. A history that starts after `Pending` gets a `◇ Created`
 step first, whose gap covers the statuses not recorded. The current status is
-in bold. A deployment's steps use deployment words, with placing and
+in bold. A job being cancelled has a `⊖ Cancelling` step, `⊖ Dropping` for a
+deployment, that counts up like a live step, so the time it took to cancel is
+not counted as running time; the preview keeps re-reading such a job until it
+is cancelled. A deployment's steps use deployment words, with placing and
 initializing as one `Initializing` step, then `● Ready`. The preview first
 draws the job as the job list has it, without a history, and redraws the
 timeline when its own read of the job answers.
@@ -1708,7 +1711,7 @@ its record says it is a deployment.
   carry no sub-job tag; each starts with its time (`HH:MM:SS`), and its
   wrapped rows start under the end of that time. The list marks each sub-job
   with its status's glyph and colour (`●` running, `◐` initializing, `◔`
-  placing, `○` pending, `×` failed, `−` cancelled, `✓` ended, `?` unknown), with the status under its name; the one the
+  placing, `○` pending, `×` failed, `⊖` cancelling, `−` cancelled, `✓` ended, `?` unknown), with the status under its name; the one the
   pane shows has an accent edge and a bold name. Saved logs (`s`) and copies
   stay as the lines came, uncoloured. In the pane the time is faint, the level
   has its severity's colour (a warning's or an error's message is tinted to

@@ -126,6 +126,7 @@ _PLACING = StatusLook("◔", WARN)
 _WAITING = StatusLook("○", WARN)
 _FAILED = StatusLook("×", ERR, bold=True)
 _CANCELLED = StatusLook("−", ENDED)
+_CANCELLING = StatusLook("⊖", WARN)  # on its way to cancelled's "−", still in progress
 _ENDED = StatusLook("✓", ENDED)
 _UNKNOWN = StatusLook("?", WARN)
 
@@ -138,6 +139,7 @@ STATUS_LOOKS: dict[str, StatusLook] = {
     "queued": _WAITING,
     "failed": _FAILED,
     "error": _FAILED,
+    "cancelling": _CANCELLING,
     "cancelled": _CANCELLED,
     "canceled": _CANCELLED,
     "terminated": _ENDED,

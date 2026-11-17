@@ -207,6 +207,18 @@ def is_live(job: Any) -> bool:
     return word in ACTIVE_STATUSES or (word == "unknown" and not job_not_found(job))
 
 
+# The status of a job being cancelled, a deployment being dropped. Such a job is
+# not live (it takes no more work: see serving.serving_state), but it isn't over
+# either: its status still changes to the end.
+CANCELLING = "cancelling"
+
+
+def time_runs_on(job: Any) -> bool:
+    """Whether a job's clock still runs: it is live (:func:`is_live`), or being
+    cancelled, so its current step counts up and its screens keep re-reading it."""
+    return is_live(job) or (isinstance(job, dict) and status_word(job.get("status")) == CANCELLING)
+
+
 def job_not_found(job: Any) -> bool:
     """An UNKNOWN job whose reason says the control plane has no record of it."""
     return is_unknown(job) and "not found" in " ".join(collapse(job.get(key) or "") for key in ("reason", "reason_details")).lower()
@@ -538,7 +550,7 @@ def job_elapsed(job: dict, now: datetime) -> Optional[float]:
     start = parse_ts(job.get("created_at"))
     if not start:
         return None
-    end = now if is_live(job) else parse_ts(job.get("state_changed_at") or job.get("updated_at")) or now
+    end = now if time_runs_on(job) else parse_ts(job.get("state_changed_at") or job.get("updated_at")) or now
     return max(0.0, (end - start).total_seconds())
 
 
@@ -585,7 +597,8 @@ def preview_facts(job: dict, now: datetime, *, base_url: str = "") -> list:
 
 def elapsed_text(job: dict, now: datetime) -> str:
     """The time beside the preview's status: ``12m 04s so far`` while the job is
-    live, ``lasted 1h 20m`` once it ended, ``""`` without a creation time.
+    live or being cancelled (:func:`time_runs_on`), ``lasted 1h 20m`` once it
+    ended, ``""`` without a creation time.
 
     It runs from creation (:func:`job_elapsed`), so it includes any time spent
     queued or placing: "lasted", not "ran", since a job may never have run.
@@ -595,7 +608,7 @@ def elapsed_text(job: dict, now: datetime) -> str:
     seconds = job_elapsed(job, now)
     if seconds is None:
         return ""
-    if is_live(job):
+    if time_runs_on(job):
         return f"{fmt_duration(seconds)} so far"
     periods = _status_periods(job, now)
     if periods:
@@ -633,8 +646,8 @@ class _Period:
     seconds: Optional[float]  # how long it lasted, or has so far; None for the status a job ended in
 
 
-# Every status word a job can have; a status history's entries in any other are skipped.
-_JOB_STATUSES = frozenset(ACTIVE_STATUSES) | frozenset(TERMINAL_STATUSES)
+# Every status word a job can have, cancelling included; a status history's entries in any other are skipped.
+_JOB_STATUSES = frozenset(ACTIVE_STATUSES) | frozenset(TERMINAL_STATUSES) | {CANCELLING}
 
 
 def _status_periods(job: dict, now: datetime) -> list:
@@ -643,9 +656,10 @@ def _status_periods(job: dict, now: datetime) -> list:
     job's status (the history is then not this record's).
 
     Each status lasts until the next began, never below zero, and the current one
-    until ``now`` while the job is live. Entries the screens word alike (a
-    deployment's PLACING and INITIALIZING) merge into the first. An entry without
-    a known status and a time is skipped.
+    until ``now`` while the job's clock runs (:func:`time_runs_on`: live, or still
+    cancelling). Entries the screens word alike (a deployment's PLACING and
+    INITIALIZING) merge into the first. An entry without a known status and a
+    time is skipped.
     """
     history = job.get("status_history")
     word = status_word(job.get("status"))
@@ -661,7 +675,7 @@ def _status_periods(job: dict, now: datetime) -> list:
         return []
     merged = [entry for at, entry in enumerate(entries)
               if not at or status_word_for(job, entry[0]) != status_word_for(job, entries[at - 1][0])]
-    ends = [start for _status, start in merged[1:]] + [now if is_live(job) else None]
+    ends = [start for _status, start in merged[1:]] + [now if time_runs_on(job) else None]
     return [_Period(status, start, None if end is None else max(0.0, (end - start).total_seconds()))
             for (status, start), end in zip(merged, ends)]
 
@@ -697,7 +711,7 @@ def lifecycle(job: dict, now: datetime) -> list:
     name = shown.capitalize()
     if not changed:
         return [*steps, LifeStep(word, name, current=True)]
-    if not is_live(job):
+    if not time_runs_on(job):
         return [*steps, LifeStep(word, name, f"{short_time(changed, now)} ({fmt_ago(changed, now)})", current=True)]
     so_far = (now - changed).total_seconds()
     if created and abs((changed - created).total_seconds()) < 1:

@@ -695,6 +695,77 @@ def test_a_deployment_s_lifecycle_says_its_statuses_in_deployment_words():
     assert [s.label for s in v.lifecycle(_deployment_job("CANCELLED"), NOW)] == ["Created", "Dropped"]
 
 
+# Ready, then dropped: it began cancelling 30 minutes ago and was cancelled five minutes later.
+DROPPED = (*CAME_UP, ("CANCELLING", timedelta(minutes=30)), ("CANCELLED", timedelta(minutes=25)))
+
+
+def test_a_deployment_being_dropped_has_a_dropping_step_that_counts_up():
+    dropping = {**_deployment_job("CANCELLING"), "state_changed_at": _iso(NOW - timedelta(minutes=30)),
+                "status_history": _history(*DROPPED[:-1])}
+
+    assert [(s.status, s.label, s.then, s.current) for s in v.lifecycle(dropping, NOW)] == [
+        ("pending", "Pending", "2m 00s", False), ("placing", "Initializing", "13m 00s", False),
+        ("running", "Ready", "1h 15m", False), ("cancelling", "Dropping since", "30m 00s so far", True),
+        ("now", "now", "", False)]
+    assert v.elapsed_text(dropping, NOW) == "2h 00m so far"
+    # Its clock runs, but it is not live: it takes no more work.
+    assert v.time_runs_on(dropping) and not v.is_live(dropping)
+
+
+def test_a_job_being_cancelled_has_a_cancelling_step_that_counts_up():
+    cancelling = _job("CANCELLING", changed=timedelta(minutes=30), status_history=_history(*DROPPED[:-1]))
+
+    assert [(s.label, s.then, s.current) for s in v.lifecycle(cancelling, NOW)][-3:] == [
+        ("Running", "1h 15m", False), ("Cancelling since", "30m 00s so far", True), ("now", "", False)]
+    # Without a history, it counts up from when it began cancelling.
+    assert [(s.label, s.then) for s in v.lifecycle(_job("CANCELLING", changed=timedelta(minutes=30)), NOW)] == [
+        ("Created", "1h 30m"), ("Cancelling since", "30m 00s so far"), ("now", "")]
+
+
+@pytest.mark.parametrize(
+    ("job", "labels"),
+    [
+        pytest.param(_deployment_job("CANCELLED"), ["Pending", "Initializing", "Ready", "Dropping", "Dropped"],
+                     id="deployment"),
+        pytest.param(_job("CANCELLED"), ["Pending", "Placing", "Initializing", "Running", "Cancelling", "Cancelled"],
+                     id="job"),
+    ],
+)
+def test_once_cancelled_the_time_spent_cancelling_is_not_running_time(job, labels):
+    ended = {**job, "status_history": _history(*DROPPED)}
+
+    steps = v.lifecycle(ended, NOW)
+
+    assert [s.label for s in steps] == labels
+    # Running ends where cancelling began; cancelling lasts until the job was cancelled.
+    assert [s.then for s in steps][-3:] == ["1h 15m", "5m 00s", ""]
+    assert steps[-1].current and v.elapsed_text(ended, NOW) == "lasted 1h 35m"
+
+
+@pytest.mark.parametrize(("status", "rereads"), [("CANCELLING", True), ("RUNNING", True), ("CANCELLED", False)])
+def test_the_card_rereads_a_job_until_its_status_stops_changing(status, rereads):
+    job = _job(status)
+    client = MagicMock()
+    client.list_jobs.return_value = [job]
+    client.get_job.return_value = job
+
+    async def run():
+        app = CortexTrainingLogTUI(client, poll_interval=0.01)
+        async with app.run_test(size=(150, 42)) as pilot:
+            screen = JobSummaryScreen(client, "JOB_ID", job=job)
+            app.push_screen(screen)
+            await _until_read(app, pilot)
+            before = client.get_job.call_count
+            screen._refresh_tick()  # what the card's refresh timer calls
+            await pilot.pause(0.05)
+            await _until_read(app, pilot)
+            assert (client.get_job.call_count > before) is rereads
+            app.workers.cancel_all()
+            await pilot.pause(0.1)
+
+    asyncio.run(run())
+
+
 def test_a_deployment_s_preview_says_how_to_call_it_and_offers_serving():
     job = _deployment_job()
     client = MagicMock()
