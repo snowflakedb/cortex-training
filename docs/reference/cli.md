@@ -798,8 +798,9 @@ sampling sub-jobs and can be repeated — see
 #### DP Size Compatibility
 
 When changing `n_gpus` from the checkpoint's source job, create the target
-training sub-job with `"load_optimizer_states": false` in its `training_config`.
-This cannot be changed at load time. See
+training sub-job with `"load_optimizer_states": false` and
+`"load_module_only": true` in its `training_config`. Both are fixed at creation
+time and cannot be changed at load time. See
 [DP size compatibility](rest-api.md#dp-size-compatibility) for the constraint.
 
 This is the runtime load path. Create-time initialization from a checkpoint
