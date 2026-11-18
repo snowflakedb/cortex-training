@@ -3,10 +3,11 @@
 
 """Conversation tokenization for draft-model (DFlash2) training.
 
-``loss_mask[i] == 1`` means token ``i`` is a supervised target. This is the
-unshifted convention the DFlash2 loss expects; it differs from the
-next-token convention of the SFT examples, where ``loss_mask[i]`` weights the
-logits that predict token ``i + 1``.
+In a ``TokenizedConversation``, ``loss_mask[i] == 1`` means token ``i`` is a
+supervised target, the convention DFlash2 draft training uses. A request to the
+``dflash2`` loss carries the next-token mask of the SFT examples instead, where
+``loss_mask[i]`` weights the logits that predict token ``i + 1``: ``collate``
+converts one into the other.
 """
 
 from __future__ import annotations
@@ -149,9 +150,9 @@ def collate(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build the ``kwargs`` / ``context`` of one forward-backward request.
 
-    Rows are right-padded to the longest sequence. ``context["loss_mask"]`` is the unshifted
-    supervision mask (1 where the token is a training target) as float32, which is what the
-    ``dflash2`` loss function expects.
+    Rows are right-padded to the longest sequence. ``context["loss_mask"]`` is the float32
+    next-token mask the ``dflash2`` loss function expects: entry ``i`` is the supervision of
+    token ``i + 1``, so each row is its token mask shifted left by one and ends in 0.
     """
     import torch
 
@@ -166,7 +167,7 @@ def collate(
         padding = longest - len(seq.input_ids)
         input_ids.append(list(seq.input_ids) + [pad_token_id] * padding)
         attention_mask.append([1] * len(seq.input_ids) + [0] * padding)
-        loss_mask.append([float(v) for v in seq.loss_mask] + [0.0] * padding)
+        loss_mask.append([float(v) for v in seq.loss_mask[1:]] + [0.0] + [0.0] * padding)
 
     kwargs = dict(
         input_ids=torch.tensor(input_ids, dtype=torch.long),
