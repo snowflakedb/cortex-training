@@ -158,8 +158,8 @@ CAME_UP = (("PENDING", timedelta(hours=2)), ("PLACING", timedelta(hours=1, minut
 
 
 def test_elapsed_text_of_a_job_with_a_status_history_ends_when_it_stopped():
-    # Cancelled 40 minutes ago, and cleaned up for ten minutes after: it lasted until
-    # it stopped, where its lifecycle ends, not until its cleanup ended.
+    # Cancelled 40 minutes ago, and cleaned up for ten minutes after, which its history doesn't
+    # record: it lasted until it stopped, where its lifecycle ends, not until its cleanup ended.
     stopped = _job("CANCELLED", status_history=_history(*CAME_UP, ("CANCELLED", timedelta(minutes=40))))
     assert v.elapsed_text(stopped, NOW) == "lasted 1h 20m"
     assert v.elapsed_text(_job("CANCELLED"), NOW) == "lasted 1h 30m"  # no history: to state_changed_at
@@ -168,6 +168,16 @@ def test_elapsed_text_of_a_job_with_a_status_history_ends_when_it_stopped():
     # A live job's runs to now either way.
     live = _job("RUNNING", changed=timedelta(hours=1, minutes=45), status_history=_history(*CAME_UP))
     assert v.elapsed_text(live, NOW) == "2h 00m so far"
+
+
+def test_a_job_still_being_cleaned_up_counts_up_on_its_card_but_not_in_the_list():
+    # The service already says how it ended; its history ends in the cleanup, begun 30 minutes ago.
+    cleaning = _job("CANCELLED", status_history=_history(*CAME_UP, ("CANCELLING", timedelta(minutes=30))))
+    assert v.time_runs_on(cleaning) and v.elapsed_text(cleaning, NOW) == "2h 00m so far"
+    # The job list draws it ended: its Duration stays at state_changed_at, history or not.
+    assert v.job_elapsed(cleaning, NOW) == v.job_elapsed(_job("CANCELLED"), NOW) == 5400
+    # So does a job the service reports as CANCELLING, which isn't live either.
+    assert v.job_elapsed(_job("CANCELLING"), NOW) == 5400 and v.elapsed_text(_job("CANCELLING"), NOW) == "2h 00m so far"
 
 
 def test_short_time_drops_the_date_only_on_the_same_day():

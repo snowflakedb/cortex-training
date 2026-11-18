@@ -559,10 +559,15 @@ def training_method(sj: dict) -> str:
 
 
 def job_elapsed(job: dict, now: datetime) -> Optional[float]:
+    """The job list's Duration: from creation to now while the job is live (:func:`is_live`),
+    else to when its status last changed. A job being cleaned up is not live, and the list draws
+    it as ended, so its Duration must not run on: a status history that ends in the cleanup
+    (which the job's preview copies onto the list's row) changes nothing here. The preview's own
+    clock, which runs on through a cleanup, is :func:`elapsed_text`'s."""
     start = parse_ts(job.get("created_at"))
     if not start:
         return None
-    end = now if time_runs_on(job) else parse_ts(job.get("state_changed_at") or job.get("updated_at")) or now
+    end = now if is_live(job) else parse_ts(job.get("state_changed_at") or job.get("updated_at")) or now
     return max(0.0, (end - start).total_seconds())
 
 
@@ -612,19 +617,24 @@ def elapsed_text(job: dict, now: datetime) -> str:
     live or being cancelled (:func:`time_runs_on`), ``lasted 1h 20m`` once it
     ended, ``""`` without a creation time.
 
-    It runs from creation (:func:`job_elapsed`), so it includes any time spent
-    queued or placing: "lasted", not "ran", since a job may never have run.
-    With a status history, an ended job lasted until it stopped, as its lifecycle
-    shows, not until its cleanup finished (``state_changed_at``).
+    It runs from creation, so it includes any time spent queued or placing:
+    "lasted", not "ran", since a job may never have run. With a status history,
+    an ended job lasted until its last history entry began, as its lifecycle
+    shows: when it stopped, or, where the history records its cleanup
+    (``CANCELLING``, then ``CANCELLED``), when the cleanup finished. Without one,
+    until its status last changed (``state_changed_at``), as the job list's
+    Duration (:func:`job_elapsed`).
     """
-    seconds = job_elapsed(job, now)
-    if seconds is None:
+    created = parse_ts(job.get("created_at"))
+    if not created:
         return ""
     if time_runs_on(job):
-        return f"{fmt_duration(seconds)} so far"
+        return f"{fmt_duration(max(0.0, (now - created).total_seconds()))} so far"
     periods = _status_periods(job, now)
     if periods:
-        seconds = max(0.0, (periods[-1].start - parse_ts(job.get("created_at"))).total_seconds())
+        seconds = max(0.0, (periods[-1].start - created).total_seconds())
+    else:
+        seconds = job_elapsed(job, now)
     return f"lasted {fmt_duration(seconds)}"
 
 

@@ -1497,7 +1497,9 @@ Duration is how long a live job has run so far (since it was created, so it
 counts time spent waiting to be placed; in its status's color), or how long a
 finished one ran until its last state change (`40s`, `12m`, `3h 05m`,
 `2d 4h`). For a cancelled, terminated or failed job, that change is the end of
-its cleanup. The times are as of the last refresh, which redraws them. On a
+its cleanup. A job still being cleaned up counts as finished here, its Duration
+ending at its last state change, while its card's time counts up until the
+cleanup ends. The times are as of the last refresh, which redraws them. On a
 narrow
 screen the Job ID column narrows (its id ends in `…`) and stays in view while
 the other columns scroll. The Schema column, shown when the list spans more than

@@ -5520,11 +5520,15 @@ def test_job_list_ages_are_rebuilt_only_once_they_read_differently():
     assert screen._job_rows(ended, layout) is first_ended  # its duration never changes, its age by the day
 
 
-def test_a_preview_s_status_history_reaches_the_list_row_but_never_moves_its_duration():
+@pytest.mark.parametrize("last", ["CANCELLED", "CANCELLING"], ids=["ends-as-it-ended", "ends-in-its-cleanup"])
+def test_a_preview_s_status_history_reaches_the_list_row_but_never_moves_its_duration(last):
     from cortex_training.tui.job_list import _ListLayout
 
     # Cancelled three hours after it was created, and cleaned up for ten minutes: its history
-    # ends when it stopped, ten minutes before state_changed_at, where the list's Duration ends.
+    # ends when it stopped (or, still in it, when its cleanup began), ten minutes before
+    # state_changed_at, where the list's Duration ends. The service reports a job being cleaned
+    # up with the status it ends in, so a history ending in CANCELLING sits on a CANCELLED row,
+    # whose Duration must not run on to now.
     created = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=2)
     iso = lambda dt: dt.strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
     ended = iso(created + timedelta(hours=3))
@@ -5533,7 +5537,7 @@ def test_a_preview_s_status_history_reaches_the_list_row_but_never_moves_its_dur
            "sub_jobs": [{"sub_job_id": "7:training:0", "job_type": "training", "status": "CANCELLED"}]}
     history = [{"status": "PENDING", "entered_at": iso(created)},
                {"status": "RUNNING", "entered_at": iso(created + timedelta(minutes=4))},
-               {"status": "CANCELLED", "entered_at": iso(created + timedelta(hours=2, minutes=50))}]
+               {"status": last, "entered_at": iso(created + timedelta(hours=2, minutes=50))}]
     c = _client()
     c.list_jobs.return_value = [row]  # no list carries a history
     c.get_job.return_value = {**row, "status_history": history}
@@ -5558,7 +5562,9 @@ def test_a_preview_s_status_history_reaches_the_list_row_but_never_moves_its_dur
             app.push_screen(JobSummaryScreen(c, "7", job=listed(), on_job=screen.job_fetched))
             assert await _wait(pilot, app, lambda: "status_history" in listed())
             assert listed()["status_history"] == history
-            assert duration() == "3h 00m"  # still to state_changed_at, not 2h 50m
+            assert duration() == "3h 00m"  # still to state_changed_at: not 2h 50m, nor the two days to now
+            # And the Duration cell never reads otherwise (its row's ages do, by the day).
+            assert JobListScreen._span_cell(listed(), datetime.now(timezone.utc))[1] == float("inf")
             # A later answer without one (the service can't read the job's state now) leaves no stale history.
             c.get_job.return_value = {"job_id": "7", "status": "UNKNOWN",
                                       "reason": "Job status unavailable: Control Plane is unavailable"}
