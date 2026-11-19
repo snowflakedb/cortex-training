@@ -439,6 +439,32 @@ def _first_line(value: Any, limit: int = 160) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
+def _error_line(exc: BaseException) -> str:
+    """A refused request on one short line, from the fields the client gives its errors.
+
+    The client's explanation, such as which role can't find which database;
+    else the HTTP status with the service's code and message; else the
+    error's first line. An HTTP error's first line ends in its URL, which
+    would fill the line. The Snowflake request id goes first.
+    """
+    request_id = getattr(exc, "snowflake_request_id", None)
+    prefix = f"[snowflake request id: {request_id}] " if isinstance(request_id, str) and request_id else ""
+    explanation = getattr(exc, "explanation", None)
+    if isinstance(explanation, str) and explanation.strip():
+        return _first_line(prefix + explanation.strip())
+    message = getattr(exc, "server_message", None)
+    if isinstance(message, str) and message:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        code = getattr(exc, "server_code", None)
+        head = (f"HTTP {status}" if isinstance(status, int) else "") + (f" ({code})" if code else "")
+        return _first_line(prefix + (f"{head.strip()}: " if head.strip() else "") + message)
+    return _first_line(exc)
+
+
+def _not_enabled(account: Any) -> str:
+    return f"Cortex Training isn't enabled on account {account}"
+
+
 def _same(a: Any, b: Any) -> bool:
     return isinstance(a, str) and isinstance(b, str) and a.strip().casefold() == b.strip().casefold()
 
@@ -644,8 +670,8 @@ class _Login:
             code = _response_error_code(getattr(exc, "response", None))
             account = _profiles.read_profiles().get(check.profile, {}).get("account", "this account")
             if code == _NOT_ENABLED_CODE:
-                return f"Cortex Training isn't enabled on account {account}"
-            return f"Profile {check.profile} signs in, but Cortex Training didn't answer: {_first_line(exc)}"
+                return _not_enabled(account)
+            return f"Profile {check.profile} signs in, but Cortex Training didn't answer: {_error_line(exc)}"
 
     def same_identity(self, profile: str, role: str | None) -> list[str]:
         """Other profiles with a database that sign in as the same account, user, and role."""
@@ -709,7 +735,9 @@ class _Login:
                 pass
         if error is None:
             return CT_ENABLED, None, True
-        if "isn't enabled" in error:
+        # Only service_error's own sentence: the service's message, which can say
+        # anything, now shows in the "didn't answer" reason.
+        if error.startswith(_not_enabled("")):
             return CT_NOT_ENABLED, None, True
         return CT_COULDNT_CHECK, _first_line(error), True
 
@@ -802,7 +830,7 @@ class _Login:
             if not hints[name].usable:
                 return hints[name].summary
             if (self.account_status or {}).get(self._account(name), ("",))[0] == CT_NOT_ENABLED:
-                return f"Cortex Training isn't enabled on account {self._account(name)}"
+                return _not_enabled(self._account(name))
             return None
 
         width = max(len(name) for name in names)
@@ -955,7 +983,7 @@ class _Login:
         except Exception as exc:
             reason = self.service_error(check) or (
                 f"Cortex Training can't find database {check.database} or schema {check.schema} "
-                f"with profile {check.profile}: {_first_line(exc)}"
+                f"with profile {check.profile}: {_error_line(exc)}"
             )
             self.p.say(f"  {self.s.bad(reason)}")
             self.offer_delete(check.profile, signed_in=True)

@@ -37,6 +37,7 @@ from typing import Optional
 import requests
 from rich.cells import cell_len
 
+from cortex_training.client import errors as _errors
 from cortex_training.client.core import _deployment_id_from_job_id
 from cortex_training.client.core import _model_deployment_status
 from cortex_training.client.core import _model_deployment_sub_job
@@ -46,6 +47,7 @@ from cortex_training.model_deployment import WIRE_DEPLOYMENT_CLASS
 from cortex_training.model_deployment import WIRE_INFERENCE_CONFIG
 from cortex_training.model_deployment import WIRE_NUM_REPLICAS
 from cortex_training.tui.format import _ACTIVE_STATUSES as ACTIVE_STATUSES
+from cortex_training.tui.format import _TERMINAL_STATUSES as TERMINAL_STATUSES
 from cortex_training.tui.format import _num as compact_number
 from cortex_training.tui.format import cut_cells
 from cortex_training.tui.format import _subjob_config as subjob_config
@@ -139,26 +141,36 @@ def status_word(status: Any) -> str:
     return (str(status or "").strip() or "?").removeprefix("JOB_STATE_").lower()
 
 
-def describe_error(exc: BaseException) -> str:
-    """A failed call for display, on one printable line: the HTTP status and the
-    service's message, not the URL.
+def describe_error(exc: BaseException, *, explain: bool = True) -> str:
+    """A failed call for display, on one printable line: the HTTP status, the
+    service's code and message, then the explanation the client gives for them,
+    but not the URL.
 
-    An HTTP error's own text ("500 Server Error: ... for url: <full URL>") repeats
-    the host, database and schema.
+    The code, message and explanation are the ones the CLI and the Python
+    client show (see ``cortex_training.client.errors``). An HTTP error's own
+    text ("500 Server Error: ... for url: <full URL>") repeats the host,
+    database and schema, so it is left out. Any other error is its type and
+    text, then the explanation for that text, if any (such as for a refused SQL
+    statement on the job's Experiment). ``explain=False`` leaves the
+    explanation out, for a line that has no room for it (see
+    :func:`with_explanation`).
     """
-    response = getattr(exc, "response", None)
-    status = getattr(response, "status_code", None)
     if isinstance(exc, requests.exceptions.Timeout):
         return _timeout_text(exc)
-    if not isinstance(status, int):
-        return collapse(f"{type(exc).__name__}: {exc}")
-    try:
-        body = response.json()
-        message = str(body.get("message") or body.get("error") or "") if isinstance(body, dict) else ""
-    except Exception:  # noqa: BLE001 - not JSON
-        message = ""
-    reason = str(getattr(response, "reason", "") or "")
-    return collapse(f"HTTP {status}" + (f" {reason}" if reason else "") + (f": {message}" if message else ""))
+    error = _errors.read_server_error(getattr(exc, "response", None))
+    if error is None or error.status is None:
+        text = collapse(f"{type(exc).__name__}: {exc}")
+    else:
+        text = collapse(f"HTTP {error.status}" + (f" {error.reason}" if error.reason else "") + error.suffix)
+    return with_explanation(text, exc) if explain else text
+
+
+def with_explanation(text: str, exc: BaseException) -> str:
+    """``text``, then the explanation the client gives for ``exc``, on one line, unless ``text`` has it."""
+    explanation = collapse(_errors.explanation_of(exc) or "")
+    if explanation and explanation not in text:
+        text += ("" if text.endswith((".", "!", "?")) else ".") + f" {explanation}"
+    return text
 
 
 # How long a timed-out request waited, as urllib3 says it: "(read timeout=45.0)".
@@ -174,38 +186,49 @@ def _timeout_text(exc: BaseException) -> str:
     return f"no answer from the service{within} ({type(exc).__name__})"
 
 
-# The service's 500 when it can't resolve the job's Experiment for the caller: the
-# checkpoint routes say "... or not authorized for the training job", and the
-# experiment-run route that saved logs and GPU metrics start with says "... for
-# job <id>", which a deleted Experiment gets too.
-EXPERIMENT_ACCESS_MARKER = "Linked experiment is not found or not authorized"
-_EXPERIMENT_NOT_FOUND = "Linked experiment is not found"
-_ASK = "ask for access to the Experiment, or use the role that created the job"
-
-
 def experiment_access_hint(exc: BaseException) -> str | None:
-    """The one-line explanation when ``exc`` means this role can't read the job's Experiment, else None.
+    """The explanation when ``exc`` means this role can't read the job's Experiment, else None.
 
-    The HTTP reply holds the service's whole message; ``str(exc)`` holds a refused
-    SQL statement's, and an HTTP error's only when the client added it, cut at
-    1,000 characters. So both are read. A refusal about another object (a
-    warehouse, a schema) is None even when its message names the Experiment.
+    It comes from the client's table of explanations (``EXPERIMENT_ACCESS`` in
+    ``cortex_training.client.errors``), which reads the start (the first 4,000
+    characters) of an HTTP error's message from its answer, or of the answer's
+    whole text when it has no message (a plain-text body, or one with only a
+    ``detail``), and of any other error's text, such as a refused SQL
+    statement's. A refusal about another object (a warehouse, a schema) is None
+    even when its message names the Experiment.
     """
-    text = f"{exc}\n{_reply_text(exc)}"
-    if EXPERIMENT_ACCESS_MARKER in text:
-        return f"this role can't read the job's Experiment (saved logs, GPU metrics and checkpoints live there); {_ASK}"
-    if _EXPERIMENT_NOT_FOUND in text:  # the experiment-run route's: hidden from this role, or gone
-        return ("this role can't read the job's Experiment, or it no longer exists (saved logs, GPU metrics and "
-                f"checkpoints live there); {_ASK}")
-    if _EXPERIMENT_SQL_DENIED.search(text):  # a MONITOR-only role: the service still lists the checkpoints
-        return f"this role can't read the job's Experiment, where saved logs and GPU metrics live (the checkpoints command works); {_ASK}"
-    return None
+    found = _errors.look_up(exc)
+    return found.text if found is not None and found.topic == _errors.EXPERIMENT_ACCESS else None
 
 
 def is_live(job: Any) -> bool:
     """Whether a job is active, including UNKNOWN unless it is not found."""
     word = status_word(job.get("status")) if isinstance(job, dict) else ""
     return word in ACTIVE_STATUSES or (word == "unknown" and not job_not_found(job))
+
+
+# The statuses of a job being cleaned up after it was cancelled (a deployment
+# being dropped), terminated or failed, and the status each ends in. Such a job
+# is not live (it takes no more work: see serving.serving_state), but it isn't
+# over either: its status still changes to the end.
+CANCELLING = "cancelling"
+_CLEANUP_ENDS_AS = {CANCELLING: "cancelled", "terminating": "terminated", "failing": "failed"}
+
+
+def time_runs_on(job: Any) -> bool:
+    """Whether a job's clock still runs: it is live (:func:`is_live`), or being
+    cleaned up, so its current step counts up and its screens keep re-reading it.
+
+    The service reports a job being cleaned up with the status it ends in, so
+    such a job is told by its status history, which ends in the cleanup."""
+    if not isinstance(job, dict):
+        return False
+    if is_live(job):
+        return True
+    word = status_word(job.get("status"))
+    entries = _history_entries(job)
+    last = entries[-1][0] if entries else ""
+    return word in _CLEANUP_ENDS_AS or (last in _CLEANUP_ENDS_AS and _settled(last) == _settled(word))
 
 
 def job_not_found(job: Any) -> bool:
@@ -536,6 +559,11 @@ def training_method(sj: dict) -> str:
 
 
 def job_elapsed(job: dict, now: datetime) -> Optional[float]:
+    """The job list's Duration: from creation to now while the job is live (:func:`is_live`),
+    else to when its status last changed. A job being cleaned up is not live, and the list draws
+    it as ended, so its Duration must not run on: a status history that ends in the cleanup
+    (which the job's preview copies onto the list's row) changes nothing here. The preview's own
+    clock, which runs on through a cleanup, is :func:`elapsed_text`'s."""
     start = parse_ts(job.get("created_at"))
     if not start:
         return None
@@ -544,11 +572,12 @@ def job_elapsed(job: dict, now: datetime) -> Optional[float]:
 
 
 def job_config_json(job: dict, sub_job: Optional[dict] = None, *, experiment_name: Optional[str] = None) -> list:
-    """The job's config as the lines ``cortex-training get`` prints: a CreateJob
-    body that ``submit`` takes as it is, with ``experiment_name`` the job's
-    experiment (see the client's ``create_job_body_from_job``). With ``sub_job``,
-    one of the job's entries, the body has that sub-job alone, so a copy of it
-    launches just that one. Raises ``ValueError`` for a job that cannot be copied."""
+    """The job's config as the lines ``cortex-training get`` prints, without the
+    status history: a CreateJob body that ``submit`` takes as it is, with
+    ``experiment_name`` the job's experiment (see the client's
+    ``create_job_body_from_job``). With ``sub_job``, one of the job's entries, the
+    body has that sub-job alone, so a copy of it launches just that one. Raises
+    ``ValueError`` for a job that cannot be copied."""
     if sub_job is not None:
         # Without the label sub_jobs gives an entry that has no id.
         job = {**job, "sub_jobs": [{key: value for key, value in sub_job.items() if key != "label"}]}
@@ -585,15 +614,28 @@ def preview_facts(job: dict, now: datetime, *, base_url: str = "") -> list:
 
 def elapsed_text(job: dict, now: datetime) -> str:
     """The time beside the preview's status: ``12m 04s so far`` while the job is
-    live, ``lasted 1h 20m`` once it ended, ``""`` without a creation time.
+    live or being cancelled (:func:`time_runs_on`), ``lasted 1h 20m`` once it
+    ended, ``""`` without a creation time.
 
-    It runs from creation (:func:`job_elapsed`), so it includes any time spent
-    queued or placing: "lasted", not "ran", since a job may never have run.
+    It runs from creation, so it includes any time spent queued or placing:
+    "lasted", not "ran", since a job may never have run. With a status history,
+    an ended job lasted until its last history entry began, as its lifecycle
+    shows: when it stopped, or, where the history records its cleanup
+    (``CANCELLING``, then ``CANCELLED``), when the cleanup finished. Without one,
+    until its status last changed (``state_changed_at``), as the job list's
+    Duration (:func:`job_elapsed`).
     """
-    seconds = job_elapsed(job, now)
-    if seconds is None:
+    created = parse_ts(job.get("created_at"))
+    if not created:
         return ""
-    return f"{fmt_duration(seconds)} so far" if is_live(job) else f"lasted {fmt_duration(seconds)}"
+    if time_runs_on(job):
+        return f"{fmt_duration(max(0.0, (now - created).total_seconds()))} so far"
+    periods = _status_periods(job, now)
+    if periods:
+        seconds = max(0.0, (periods[-1].start - created).total_seconds())
+    else:
+        seconds = job_elapsed(job, now)
+    return f"lasted {fmt_duration(seconds)}"
 
 
 def short_time(raw: Any, now: datetime) -> str:
@@ -614,19 +656,84 @@ class LifeStep:
     label: str
     at: str = ""  # when the step began, "" when the job record has no time for it
     then: str = ""  # how long until the next step, "" when the record can't tell
+    current: bool = False  # the job's current state, drawn in bold
+
+
+@dataclass(frozen=True)
+class _Period:
+    """One status of a job's status history."""
+
+    status: str  # the job status the period began with, as status_word spells it
+    start: datetime  # when the job entered it
+    seconds: Optional[float]  # how long it lasted, or has so far; None for the status a job ended in
+
+
+# Every status word a job can have, cleanup included; a status history's entries in any other are skipped.
+_JOB_STATUSES = frozenset(ACTIVE_STATUSES) | frozenset(TERMINAL_STATUSES) | frozenset(_CLEANUP_ENDS_AS)
+
+
+def _history_entries(job: dict) -> list:
+    """``(status word, when the job entered it)`` for each entry of the job's
+    ``status_history`` that has a known status and a time, oldest first."""
+    history = job.get("status_history")
+    if not isinstance(history, list):
+        return []
+    entries = []
+    for entry in history:
+        status = status_word(entry.get("status")) if isinstance(entry, dict) else ""
+        start = parse_ts(entry.get("entered_at")) if status in _JOB_STATUSES else None
+        if start is not None:
+            entries.append((status, start))
+    return entries
+
+
+def _settled(word: str) -> str:
+    """The status ``word`` ends in, in one spelling: a cleanup's is the status after it."""
+    word = _CLEANUP_ENDS_AS.get(word, word)
+    return _STATUS_SPELLINGS.get(word, word)
+
+
+def _status_periods(job: dict, now: datetime) -> list:
+    """The job's ``status_history`` as :class:`_Period` s, oldest first; ``[]``
+    when it has none to show, the job is ``unknown``, or the last entry is neither
+    the job's status nor the cleanup before it (the history is then not this
+    record's).
+
+    Each status lasts until the next began, never below zero, and the current one
+    until ``now`` while the job's clock runs (:func:`time_runs_on`: live, or being
+    cleaned up). Entries the screens word alike (a deployment's PLACING and
+    INITIALIZING) merge into the first. An entry without a known status and a
+    time is skipped.
+    """
+    word = status_word(job.get("status"))
+    entries = _history_entries(job) if word != "unknown" else []
+    if not entries or _settled(entries[-1][0]) != _settled(word):
+        return []
+    merged = [entry for at, entry in enumerate(entries)
+              if not at or status_word_for(job, entry[0]) != status_word_for(job, entries[at - 1][0])]
+    ends = [start for _status, start in merged[1:]] + [now if time_runs_on(job) else None]
+    return [_Period(status, start, None if end is None else max(0.0, (end - start).total_seconds()))
+            for (status, start), end in zip(merged, ends)]
 
 
 def lifecycle(job: dict, now: datetime) -> list:
     """The :class:`LifeStep` s from the job's creation to its current state, and on
-    to now while it is live.
+    to now while it is live; the current state's step is ``current``, and a
+    deployment's steps use deployment words (``Ready``).
 
-    The job record has two times: ``created_at`` and ``state_changed_at``, when
-    it entered its current status. So there are no steps for the states between
-    (a running job's time pending and placing is in its first gap), and none for
-    a time the record lacks; an ended job's current state began when it ended.
-    An ``unknown`` job's state has no time: the service could not read it.
+    With a ``status_history``, there is a step for each status in it (see
+    :func:`_status_periods`), after a ``Created`` step when it does not start at
+    PENDING. Without one, the job record has two times: ``created_at`` and
+    ``state_changed_at``, when it entered its current status. So there are no
+    steps for the states between (a running job's time pending and placing is in
+    its first gap), and none for a time the record lacks; an ended job's current
+    state began when it ended. An ``unknown`` job's state has no time: the
+    service could not read it.
     """
     created = parse_ts(job.get("created_at"))
+    periods = _status_periods(job, now)
+    if periods:
+        return _history_steps(job, periods, created, now)
     word = status_word(job.get("status"))
     changed = parse_ts(job.get("state_changed_at")) if word != "unknown" else None
     steps = []
@@ -635,18 +742,37 @@ def lifecycle(job: dict, now: datetime) -> list:
         steps.append(LifeStep("created", "Created", short_time(created, now),
                               fmt_duration(gap) if gap is not None and gap >= 1 else ""))
     if word == "unknown":
-        return [*steps, LifeStep("unknown", "status unavailable")]
-    name = word.capitalize()
+        return [*steps, LifeStep("unknown", "status unavailable", current=True)]
+    shown = status_word_for(job, job.get("status"))
+    name = shown.capitalize()
     if not changed:
-        return [*steps, LifeStep(word, name)]
-    if not is_live(job):
-        return [*steps, LifeStep(word, name, f"{short_time(changed, now)} ({fmt_ago(changed, now)})")]
+        return [*steps, LifeStep(word, name, current=True)]
+    if not time_runs_on(job):
+        return [*steps, LifeStep(word, name, f"{short_time(changed, now)} ({fmt_ago(changed, now)})", current=True)]
     so_far = (now - changed).total_seconds()
     if created and abs((changed - created).total_seconds()) < 1:
         # In this state since it was created (a job still pending): one step says both.
-        steps, name = [], f"Created, {word}"
+        steps, name = [], f"Created, {shown}"
     return [*steps, LifeStep(word, f"{name} since", short_time(changed, now),
-                             f"{fmt_duration(so_far)} so far" if so_far >= 0 else ""),
+                             f"{fmt_duration(so_far)} so far" if so_far >= 0 else "", current=True),
+            LifeStep("now", "now")]
+
+
+def _history_steps(job: dict, periods: list, created: Optional[datetime], now: datetime) -> list:
+    """:func:`lifecycle` with a status history, ``periods`` its :func:`_status_periods`."""
+    steps = []
+    if created and periods[0].status != "pending":
+        # What came before the first status was not recorded: one gap from creation, as without a history.
+        gap = (periods[0].start - created).total_seconds()
+        steps.append(LifeStep("created", "Created", short_time(created, now), fmt_duration(gap) if gap >= 1 else ""))
+    for period in periods[:-1]:
+        steps.append(LifeStep(period.status, status_word_for(job, period.status).capitalize(),
+                              short_time(period.start, now), fmt_duration(period.seconds)))
+    last = periods[-1]
+    name, at = status_word_for(job, last.status).capitalize(), short_time(last.start, now)
+    if last.seconds is None:  # the status it ended in
+        return [*steps, LifeStep(last.status, name, f"{at} ({fmt_ago(last.start, now)})", current=True)]
+    return [*steps, LifeStep(last.status, f"{name} since", at, f"{fmt_duration(last.seconds)} so far", current=True),
             LifeStep("now", "now")]
 
 
@@ -760,9 +886,10 @@ def status_unavailable_text(job: dict) -> str:
 
 
 # Fields the service recomputes on every get: a fresh answer replaces them as a
-# whole, so one it stopped sending (a cleared reason) disappears. created_at is
-# not one: it never changes, and an UNKNOWN answer leaves it out.
-SERVICE_FIELDS = ("status", "reason", "reason_details", "updated_at", "state_changed_at", "sub_jobs")
+# whole, so one it stopped sending (a cleared reason, or a status history that
+# an UNKNOWN answer leaves out) disappears. created_at is not one: it never
+# changes, and an UNKNOWN answer leaves it out.
+SERVICE_FIELDS = ("status", "reason", "reason_details", "updated_at", "state_changed_at", "status_history", "sub_jobs")
 
 
 def refresh_job(current: Optional[dict], fresh: dict) -> dict:
@@ -1396,18 +1523,6 @@ def _reply_text(exc: BaseException) -> str:
     return text if isinstance(text, str) else ""
 
 
-# How Snowflake refuses SQL on the job's Experiment for this role (the LIST and
-# GET that read saved logs and GPU metrics): "003001 (42501): SQL access control
-# error: Insufficient privileges to operate on experiment 'NAME'", "Experiment
-# 'NAME' does not exist or not authorized", or the same said of a
-# snow://experiment/ path. The refusal itself must be about the Experiment, so a
-# denial about some other object (a warehouse, a schema) keeps its own text even
-# when the message names the Experiment elsewhere.
-_EXPERIMENT_SQL_DENIED = re.compile(
-    r"insufficient privileges to operate on experiment\b"
-    r"|\bexperiment(?:\s+run)?\s+(?:'[^']*'|\"[^\"]*\"|[^\s'\"]+)\s+does not exist or not authorized"
-    r"|snow://experiment/[^\s'\"]*['\"]?:?\s+does not exist or not authorized",
-    re.IGNORECASE)
 # A 403 refuses this role when its reply says so in Snowflake's words. An empty or
 # unrelated 403 (a proxy or a network gate can send one) keeps the standard text.
 _PRIVILEGE_REFUSAL = re.compile(r"privilege|not authorized|access control error", re.IGNORECASE)
@@ -1415,10 +1530,14 @@ _PRIVILEGE_REFUSAL = re.compile(r"privilege|not authorized|access control error"
 
 def access_hint(exc: BaseException, subject: str) -> Optional[str]:
     """One line when ``exc`` means this role may not read the job's ``subject`` ("saved logs", "GPU
-    metrics"), else None: the caller then shows the standard error text."""
-    hint = experiment_access_hint(exc)
-    if hint:
-        return hint
+    metrics"), else None: the caller then shows the standard error text.
+
+    When the job's Experiment is what the role can't read, that is
+    :func:`describe_error`'s line: the service's message, then the explanation
+    (:func:`experiment_access_hint`), which follows the message and never
+    replaces it."""
+    if experiment_access_hint(exc):
+        return describe_error(exc)
     status = getattr(getattr(exc, "response", None), "status_code", None)
     if status == 403 and _PRIVILEGE_REFUSAL.search(_reply_text(exc)):
         return f"this role isn't allowed to read this job's {subject} ({describe_error(exc)})"

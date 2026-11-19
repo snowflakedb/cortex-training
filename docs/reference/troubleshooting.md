@@ -3,6 +3,16 @@
 For authentication, URL, and server error messages, see the
 [CLI troubleshooting section](cli.md#troubleshooting).
 
+A request the service refuses shows the same error in the Python SDK, the CLI
+and the TUI: the service's error code and message, such as
+`(517602): CREATE EXPERIMENT privilege required on schema <schema>`, and, for a
+refusal the client recognizes, an explanation with next steps after it. The
+messages and what they mean are listed in
+[Access control](rest-api.md#37-access-control); the explanations, in
+[Errors](rest-api.md#36-errors). When Snowflake refuses the SQL that reads a
+job's saved logs or GPU metrics, the CLI and the TUI explain it the same way;
+the Python SDK raises Snowflake's own error.
+
 ## 403 when creating a job
 
 `Insufficient privileges to operate on Account '<account>'. Your primary role
@@ -21,7 +31,8 @@ When an example fails, first capture:
 - Model, precision, GPU count, and sequence length
 - The Snowflake request ID. The CLI prints it on server errors. In the Python
   SDK, HTTP errors start with `[snowflake request id: <id>]` when the response
-  carried one. A server-side failure with no response of its own (a request
+  carried one, and hold it as `snowflake_request_id`. A server-side failure
+  with no response of its own (a request
   or job that ended `failed`, a poll that timed out, an undecodable response,
   or a connection error) logs a `WARNING` such as
   `[last snowflake request id: <id>] poll_request failed: ...`; that is the

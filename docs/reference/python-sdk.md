@@ -305,13 +305,13 @@ client, including notebooks, CI and containers that never open the TUI.
 |---|---|---|
 | `create_job(sub_jobs, job_id=None, experiment_name=None, hardware=None)` | `job_id` | Validates each `SubJobConfig` client-side first. Only `training` and `sampling` sub-jobs can be submitted: a job takes zero or one `training` sub-job and any number of `sampling` sub-jobs. `hardware` is `H200`, `B200`, or `B300` (the `Hardware` enum or its string); omitted means `H200`. Needs `USE CORTEX TRAINING` on the account; without it the call raises `requests.HTTPError` (403). See [REST API section 3.7](rest-api.md#37-access-control) |
 | `create_job_from_body(body)` | response dict | For callers that already hold the REST JSON. Enforces the same one-training-sub-job and no-`log_probability` rules before sending |
-| `get_job(job_id)` | job dict | Includes `sub_jobs` with their configs |
+| `get_job(job_id)` | job dict | Includes `sub_jobs` with their configs and, on a service that reports it, `status_history`: each status the job entered and when. See [REST API section 5.2](rest-api.md#52-get-job---get-job_id) |
 | `list_jobs(status=None)` | list of jobs | Returns the inner list, not the envelope |
 | `list_models()` | list of models | Active models for the account, from `GET /api/v2/cortex-training/models`; returns the inner list. The configured database and schema are not part of the request |
 | `iter_jobs(*, database=None, schema=None, status=None, submitted_by=None, created_after=None, created_before=None, page_size=100)` | iterator of jobs | Jobs across the account that the caller can see, newest first, following page tokens; each also carries `database_name` and `schema_name`. The server applies every filter. Arguments are checked on the call: `page_size` is 1 to 1000, and `schema` needs `database` with it. A 404 means account-level listing is not enabled for the account. See [REST API section 5.3](rest-api.md#across-the-account---get-apiv2endpoint) |
 | `list_jobs_page(*, database=None, schema=None, status=None, submitted_by=None, created_after=None, created_before=None, page_size=100, page_token=None, max_retries=None, request_timeout=None)` | `{"jobs": [...], "next_page_token": str \| None}` | One page of what `iter_jobs` walks, with the same filters read the same way. Pass `next_page_token` back as `page_token`, with the same filters, for the next page; `None` means no more. A page can be short or empty and still have a token. `max_retries` (retries after the first attempt) and `request_timeout` (seconds, or `(connect, read)`) bound this page; omitted, the client's own apply. Raises `AccountJobListUnavailable` (`reason`: `not_deployed`, `disabled`, `forbidden`, `rest_disabled`) for 404, 403 and 405 without retrying, and `InvalidPageToken` for 400 `Invalid page_token` (start again from the first page); both subclass `requests.HTTPError`. Bad arguments, or a page body that is not a job list, raise `ValueError`. See [REST API section 5.3](rest-api.md#across-the-account---get-apiv2endpoint) |
 | `for_job(job)` | `CortexTrainingClient` | Bound to a job from `iter_jobs` or `list_jobs_page` for per-job calls. Borrows this client's session, auth, and telemetry, its `client.surface` included, so keep this one open; closing the returned client is a no-op. Never creates the job's database |
-| `wait_for_job(job_id)` | job dict | Polls until `running`; raises once the job has ended (`failed`, `cancelled`, `terminated`) or on timeout |
+| `wait_for_job(job_id)` | job dict | Polls until `running` and returns the job as `get_job` does; raises once the job has ended (`failed`, `cancelled`, `terminated`) or on timeout |
 | `cancel_job(job_id)` | `None` | Idempotent while cancelling/cancelled |
 | `get_capacity(hardware=None)` | capacity dict | `has_reservation`, `max_total_gpus`, `reserved_gpus`, `in_use_gpus`, `pending_gpus`, `available_gpus`, scoped to `hardware` (omitted means the server default, H200). The CLI `capacity` command queries every type unless `--hardware` is set. `max_total_gpus` is the canonical ceiling (`-1` uncapped); `reserved_gpus` is deprecated |
 | `get_capacity_breakdown(hardware=None, *, dimensions=("job_type", "submitted_by"))` | capacity dict plus `breakdown` | `get_capacity` split by sub-job type and/or submitter; each split has a `status` and `groups`. Unknown dimensions raise `ValueError`. See [rest-api.md section 5.4](rest-api.md#breakdown---breakdown) |
@@ -518,25 +518,47 @@ current role: it doesn't exist, or the role can't access it. It carries
 `.response` (the HTTP 400), `.kind` (`"schema"`), `.name` (`DATABASE.SCHEMA`),
 `.role` (the session's role, or None when it can't be determined, as for PAT
 clients), and `.statement`, the SQL that would set it up: `CREATE DATABASE IF NOT
-EXISTS ...` and `CREATE SCHEMA IF NOT EXISTS ...`, separated by `; `.
+EXISTS ...` and `CREATE SCHEMA IF NOT EXISTS ...`, separated by `; `. Its
+message is an HTTP error's, as below, with the explanation under it.
 
 When the service answers with a 4xx or 5xx, the `requests.exceptions.HTTPError`
 that `raise_for_status()` raises keeps the service's answer as `.response`, and
 the client adds to its message: the Snowflake request id first, when the answer
 has the `x-snowflake-request-id` header, and the JSON error body's `code` and
-`message` last, when it has them:
+`message` at the end of the line, when it has them. For a refusal the client
+recognizes, an explanation with next steps follows on the lines under it:
 
 ```text
-[snowflake request id: <id>] 403 Client Error: Forbidden for url: <url> (<code>): <message>
+[snowflake request id: <id>] 400 Client Error: Bad Request for url: <url> (517602): Schema MY_DB.PUBLIC is not found or not authorized
+Role TRAINER can't find database MY_DB or its schema PUBLIC (from profile prod).
+- If they don't exist: run `CREATE DATABASE IF NOT EXISTS MY_DB` and `CREATE SCHEMA IF NOT EXISTS MY_DB.PUBLIC` (or ask an admin to).
+...
 ```
 
-With only one of them the message ends in ` (<code>)` or `: <message>`. The
+With only one of them the line ends in ` (<code>)` or `: <message>`. The
 service's message is cut at 1,000 characters, ending in `...`, and common
 credential patterns in it are redacted. A body that is not JSON, or has neither,
-adds nothing at the end. The errors above keep their own messages, and the model
-deployment methods raise their own; see
-[REST API section 3.6](rest-api.md#36-errors) and
-[section 14.7](rest-api.md#147-errors).
+adds nothing at the end of the line. The client explains a missing database or
+schema (in its own database and schema), a job Experiment the role can't read,
+and a `401` on a request that sent a PAT, whatever its body, unless the answer
+carries one of the service's own codes (`5176xx`); any other refusal shows the
+service's code and message alone. Every `HTTPError` the client
+raises for an answer, the subclasses above included, has these attributes:
+
+| Attribute | Value |
+|---|---|
+| `server_code` | The service's error code, or None |
+| `server_message` | The service's message as the error shows it (cut and redacted), or None |
+| `snowflake_request_id` | The answer's Snowflake request ID, or None |
+| `explanation` | The explanation under the first line, or None |
+
+The chunk-group errors, `AccountJobListUnavailable` and `InvalidPageToken` keep
+their own messages (their `explanation` is None), and the model deployment
+methods raise their own; see [REST API section 3.6](rest-api.md#36-errors) and
+[section 14.7](rest-api.md#147-errors). When Snowflake refuses the SQL that
+reads saved logs or GPU metrics on the job's Experiment, the client raises the
+Snowflake connector's own error unchanged; the CLI and the TUI add the
+explanation after it.
 
 ## Details not covered here
 

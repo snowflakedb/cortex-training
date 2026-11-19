@@ -310,13 +310,17 @@ retries above. See
 
 Non-2xx responses are raised through `requests.Response.raise_for_status()`.
 Because that call ignores 3xx, any 3xx response is raised first as an
-`Unexpected redirect <status> for url: <url>` HTTP error. Bodies may contain:
+`Unexpected redirect <status> for url: <url>` HTTP error. An error body
+usually has this shape, where `code` and `error_code` hold the same value:
 
 ```json
-{"message": "description", "code": 409}
+{"code": "517602", "error_code": "517602", "message": "description", "request_id": "<id>"}
 ```
 
-or validation details:
+A failure relayed from the service's training backend, such as an unsupported
+hardware type, has code `517604` and a message that starts
+`Cortex training <operation> failed:`. A body may instead hold validation
+details:
 
 ```json
 {
@@ -328,18 +332,42 @@ or validation details:
 
 When a 4xx or 5xx body is a JSON error with a `code` or a `message`, the Python
 client adds them to the end of the `requests.HTTPError` message that
-`raise_for_status()` gives:
+`raise_for_status()` gives. The first object in the body with a `code` or a
+`message` gives them, even when it is nested under another field. A string
+`error`, as some gateways send, counts as the message, together with any
+`error_description`, when that object has no `message`, or when no object in the
+body has a `code` or a `message`. For the refusals the client recognizes, an
+explanation with next steps follows on the lines under it:
 
 ```text
-[snowflake request id: <id>] 403 Client Error: Forbidden for url: <url> (<code>): <message>
+[snowflake request id: <id>] 400 Client Error: Bad Request for url: <url> (<code>): <message>
+<explanation>
 ```
 
-A message longer than 1,000 characters is cut and ends in `...`, and common
-credential patterns in it are redacted. The error's `.response` is still the
-service's answer. A 3xx keeps its `Unexpected redirect` text, and a body that
-is not JSON, or has neither field, leaves the message as `raise_for_status()`
-gives it. An error the client raises with its own explanation instead, such as
-`DatabaseAccessError` or a chunk-group error, keeps its own message.
+| Refusal | Explanation |
+|---|---|
+| 400, code `517602`, `Schema <database>.<schema> is not found or not authorized`, for the client's own database and schema | Which role can't find the database or schema, the statements that create them, and the grants that give the role access. The error is a `DatabaseAccessError`. From a client made by `for_job()`, and on the account-level job list, the path's database is not the client's: the error is a plain `HTTPError` with the service's code and message alone. |
+| A message saying the job's Experiment can't be read, such as the 500 `Linked experiment is not found or not authorized for the training job`. A body with no message, such as plain text or a `detail` only, is read as text instead. | The role can't read the job's Experiment, where saved logs, GPU metrics and checkpoints live: ask for access to it, or use the role that created the job. |
+| 401 on a request that sent a PAT, whatever its body, unless the answer carries one of the service's own codes (`5176xx`, as a 401 relayed from a running job's backend does) | The most common reasons Snowflake rejects a PAT, such as a user with no network policy. |
+
+Any other refusal, such as a missing `CREATE EXPERIMENT` privilege or a stage
+that can't be found ([section 3.7](#37-access-control)), shows the service's
+code and message alone. An explanation always follows the service's message
+and never replaces it. The CLI prints the same text, and the TUI shows the
+same status, code, message and explanation on one line, without the URL.
+
+Every `requests.HTTPError` the client raises for an answer also carries these
+attributes: `server_code`, `server_message` (the message as the error shows
+it), `snowflake_request_id`, and `explanation` (None when there is none). That
+includes `DatabaseAccessError`, whose `explanation` is the schema explanation
+under its first line. The chunk-group errors, `AccountJobListUnavailable`,
+`InvalidPageToken` and a 3xx keep their own messages, so their `explanation`
+is None. A message longer than 1,000
+characters is cut and ends in `...`, and common credential patterns in it are
+redacted. The error's `.response` is still the service's answer. A 3xx keeps
+its `Unexpected redirect` text. A body that is not JSON, or has neither field,
+adds no code or message to the error's text; a 401 on a request that sent a PAT
+still gets its explanation.
 
 Most data-plane calls and request polls require a `running` job. `tail-logs` is
 the exception allowed during `placing`.
@@ -575,6 +603,12 @@ The response shape consumed by this repository is flat at each sub-job:
   "created_at": "2026-07-20T18:00:00Z",
   "updated_at": "2026-07-20T18:01:00Z",
   "state_changed_at": "2026-07-20T18:01:00Z",
+  "status_history": [
+    {"status": "PENDING", "entered_at": "2026-07-20T18:00:00Z"},
+    {"status": "PLACING", "entered_at": "2026-07-20T18:00:04Z"},
+    {"status": "INITIALIZING", "entered_at": "2026-07-20T18:00:21Z"},
+    {"status": "RUNNING", "entered_at": "2026-07-20T18:01:00Z"}
+  ],
   "submitted_by": "SOME_USER",
   "owner_role": "SOME_ROLE",
   "sub_jobs": [
@@ -637,20 +671,40 @@ from [section 5.1](#51-create-job---post-) (1800 and 86400 seconds); a
 that experiment as a new run. A model deployment, which can set neither, keeps
 `pending_timeout_seconds` and `experiment_name` `null`. Left out are `job_id`
 (the service rejects one on create), `sub_job_id`, `status`, `reason`, the
-times, `submitted_by`, `owner_role` and `image_tag` (a new job runs the current
-image). A sub-job started from external weights has
+times, `status_history`, `submitted_by`, `owner_role` and `image_tag` (a new job
+runs the current image). A sub-job started from external weights has
 `source_checkpoint_info: {"external_stage_path": null}` to fill in, as the record
 does not say which weights. Whole-number floats become integers. It raises
 `ValueError` for a record with no sub-jobs or no `hardware` (the service could
 not read the job). `cortex-training get JOB_ID` prints the same body, with the
-job's experiment; `get --raw` prints the record.
+job's experiment, and adds the record's `status_history` when it has one, which
+`cortex-training submit` drops; `get --raw` prints the record.
 
 `wait_for_job()` repeatedly calls this endpoint until `running`.
 
 `state_changed_at` (UTC time the job entered its current `status`) is optional
-and may be absent. The client reads it only for the stalled-upload warnings in
+and may be absent. The client reads it for the stalled-upload warnings in
 [section 12.3](#123-persisted-stdout-download); without it, those warnings skip
 the recent-start grace period and still require the sub-job to be `running`.
+The TUI reads it too, for how long a job has been in its status and when an
+ended job ended.
+
+`status_history` lists every status the job has entered, oldest first, each with
+the UTC time it entered it (`entered_at`, to the second). Each status lasts until
+the next entry's `entered_at`; the last one is in progress until the job has
+ended, and the status it ends in has no duration. A job that is cancelled,
+terminated or fails spends its cleanup in `CANCELLING`, `TERMINATING` or
+`FAILING`, while its `status` already reads `CANCELLED`, `TERMINATED` or
+`FAILED`; its final entry is entered at `state_changed_at`, once the cleanup has
+finished. A service that predates these cleanup entries folds the cleanup into
+the final status, entered when the job stopped. Entries can share a time, and a
+status the job skipped (`INITIALIZING` can be) has no entry. When the service did
+not record a job's earlier statuses, the first entry is not `PENDING`. Statuses
+are upper case (`RUNNING`); like `status`, read them without regard to case
+([section 3.2](#32-job-states)). The field is absent from list responses
+([section 5.3](#53-list-jobs---get-)), when `status` is `unknown`, when the
+service has recorded none of the job's statuses, and from services or accounts
+that don't report it. `get_job()` and `wait_for_job()` return it as sent.
 
 `submitted_by` (submitting user's name) and `owner_role` (owning role's name)
 are best-effort and may be absent, e.g. if the user/role has since been
@@ -844,9 +898,10 @@ service hop fails rather than blocking indefinitely.
   `running` jobs. Queued work is not counted here; see `pending_gpus`.
 - `pending_gpus`: GPUs requested by jobs still waiting for capacity
   (`pending`). Claims quota, so it reduces `available_gpus`.
-- `available_gpus`: what a new job could start with now — ceiling headroom
-  capped by currently schedulable capacity. Zero does not mean blocked: a
-  submit within the ceiling is still accepted and queued.
+- `available_gpus`: what a new job could start with now, `max_total_gpus −
+  in_use_gpus − pending_gpus`, never below zero. When `has_reservation` is
+  `true`, it is also capped at what the hardware can currently schedule, so a
+  shortfall in your reserved capacity shows here.
 
 Proto3 JSON may omit false or zero fields, so an account holding nothing under a
 zero ceiling responds with literally `{}`. `get_capacity()` fills in the
@@ -3958,14 +4013,19 @@ made by the log and metrics downloads, is replaced by
 
 ```text
 model deployment sf-ct-<UUID> request failed with HTTP <status> (<code>): <message> (snowflake request id: <id>)
+<explanation>
 ```
 
 `create` has no deployment ID yet, so its errors start with
 `model deployment request failed`. The server's error code and message are
 kept, so "feature disabled", "not authorized", and "unsupported model" stay
-distinguishable. The backing job ID is replaced by the deployment ID in the
-message, and the request URL and raw body are never shown. A job-not-found
-error becomes `model deployment sf-ct-<UUID> not found in <DB>.<SCHEMA>`.
+distinguishable, and the explanation the client has for a refusal it
+recognizes follows on the lines under them ([section 3.6](#36-errors)). The
+backing job ID is replaced by the deployment ID in the message, and the
+request URL and raw body are never shown. A job-not-found error becomes
+`model deployment sf-ct-<UUID> not found in <DB>.<SCHEMA>`. The error carries
+the same attributes as an HTTP error, with the deployment ID in
+`server_message`.
 
 Request debug log lines written while a deployment method runs also name the
 deployment ID instead of the backing job ID. Local filesystem errors are

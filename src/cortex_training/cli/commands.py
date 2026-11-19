@@ -1497,52 +1497,54 @@ def _print_json(value: Any, stdout: TextIO, *, compact: bool, sort_keys: bool = 
     stdout.write("\n")
 
 
-def _request_sent_pat(response: Any) -> bool:
-    # Connection-profile requests carry a session token from a login that
-    # already accepted the PAT, so a 401 there is not a PAT problem.
-    headers = getattr(getattr(response, "request", None), "headers", None) or {}
-    return headers.get("X-Snowflake-Authorization-Token-Type") == "PROGRAMMATIC_ACCESS_TOKEN"
-
-
-def _message_shows_server_error(message: str, response: Any) -> bool:
-    """Whether ``message`` already shows the code and message of ``response``'s JSON error body.
-
-    The client adds them to the HTTP errors it raises for a 4xx or 5xx answer.
-    Errors it explains in its own words, such as a missing database, leave them
-    to the body.
-    """
-    from cortex_training.client.core import _server_message_suffix
-
-    try:
-        suffix = _server_message_suffix(response)
-    except Exception:
-        logger.debug("could not read the service's error from the response body", exc_info=True)
-        return False
-    return bool(suffix) and suffix in message
-
-
 def _format_error(exc: BaseException) -> str:
+    """The ``error:`` text for ``exc``: its message, as the Python client raises it.
+
+    The client ends an HTTP error's message with the service's code and
+    message, then the explanation for the answer (see
+    ``cortex_training.client.errors``). This adds only what the message lacks:
+    the Snowflake request id; the raw response body when the message doesn't
+    show the code and message read from it (a body that is not JSON or has
+    neither, such as a validation ``detail`` list, or an error with its own
+    text, such as a redirect or a chunk-group error, whose body has fields its
+    text leaves out); and the explanation, for an error the client didn't
+    explain, such as a refused SQL statement.
+    """
+    from cortex_training.client import errors
+
     response = getattr(exc, "response", None)
     if response is None:
-        return str(exc)
+        return _with_explanation(str(exc), exc)
 
-    parts = [str(exc)]
-    request_id = getattr(response, "headers", {}).get("x-snowflake-request-id")
-    if request_id and request_id not in parts[0]:
+    message = str(exc)
+    parts = [message]
+    request_id = errors.response_snowflake_request_id(response)
+    if request_id and request_id not in message:
         parts.append(f"snowflake request id: {request_id}")
 
     body = (getattr(response, "text", "") or "").strip()
-    if body and not _message_shows_server_error(parts[0], response):
+    error = errors.read_server_error(response)
+    suffix = error.suffix if error else ""
+    if body and not (suffix and suffix in message):
         if len(body) > 4000:
             body = body[:4000] + "...<truncated>"
         parts.append(f"response body: {body}")
-    if getattr(response, "status_code", None) == 401 and _request_sent_pat(response):
-        from cortex_training.client.auth import credentials_rejected_hint
+    return _with_explanation("\n".join(parts), exc)
 
-        parts.append(
-            credentials_rejected_hint("Snowflake rejected your credentials (HTTP 401).")
-        )
-    return "\n".join(parts)
+
+def _with_explanation(message: str, exc: BaseException) -> str:
+    """``message``, then the explanation for ``exc`` on the lines under it, unless it is there already."""
+    from cortex_training.client import errors
+
+    explanation = errors.explanation_of(exc)
+    if explanation and explanation not in message:
+        return f"{message}\n{explanation}"
+    return message
+
+
+# The job record's status history: plain `get` prints it beside the config, and
+# `submit` drops it.
+_STATUS_HISTORY = "status_history"
 
 
 def _cmd_submit(
@@ -1552,6 +1554,7 @@ def _cmd_submit(
     stdin: TextIO,
 ) -> int:
     body = _read_json_object(args.json_file, stdin)
+    body.pop(_STATUS_HISTORY, None)  # not config, so neither --dry-run nor the request has it
     _validate_create_job_body(body)
     if args.job_id is not None:
         body = dict(body)
@@ -1585,6 +1588,9 @@ def _cmd_get(args: argparse.Namespace, client, stdout: TextIO, stderr: TextIO) -
         raise ValueError(f"{exc} (get --raw prints the job's record as the service returned it)") from None
     if _model_deployment_sub_job(job) is None:  # a deployment sets no experiment
         body = create_job_body_from_job(job, experiment_name=_job_experiment_name(client, args.job_id, stderr))
+    history = job.get(_STATUS_HISTORY)
+    if isinstance(history, list) and history:
+        body[_STATUS_HISTORY] = history
     _print_json(body, stdout, compact=args.compact)
     return 0
 
@@ -1598,8 +1604,18 @@ def _job_experiment_name(client, job_id: str, stderr: TextIO) -> str | None:
             raise ValueError("the service sent no experiment_name")
         return name
     except (OSError, ValueError, RuntimeError) as exc:
-        print(f"warning: could not read the job's experiment ({exc}); experiment_name is null, "
+        from cortex_training.client import errors
+
+        # The error, on one line, in the parentheses; its explanation on the lines under the warning.
+        explanation = errors.explanation_of(exc)
+        message = str(exc)
+        if explanation:
+            message = message.removesuffix(explanation)
+        message = " ".join(message.split()) or type(exc).__name__
+        print(f"warning: could not read the job's experiment ({message}); experiment_name is null, "
               "so a job submitted from this gets an experiment of its own", file=stderr)
+        if explanation:
+            print(explanation.strip("\n"), file=stderr)
         return None
 
 
@@ -2766,11 +2782,16 @@ def _is_connector_error(exc: BaseException) -> bool:
 
 
 def _format_connector_error(exc: BaseException) -> str:
+    """A Snowflake connector error, its query id, then the explanation the client gives for it.
+
+    Such as for a refused SQL statement on the job's Experiment, which the TUI
+    explains the same way (see ``cortex_training.client.errors``).
+    """
     message = str(exc).strip() or type(exc).__name__
     query_id = getattr(exc, "sfqid", None)
     if query_id and str(query_id) not in message:
         message += f"\nsnowflake query id: {query_id}"
-    return message
+    return _with_explanation(message, exc)
 
 
 if __name__ == "__main__":

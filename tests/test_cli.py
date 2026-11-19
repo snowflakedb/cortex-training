@@ -1524,6 +1524,70 @@ def test_get_says_why_a_record_cannot_be_copied():
     assert "get --raw prints the job's record" in stderr.getvalue()
 
 
+# The statuses a running job went through, as Get job reports them.
+_STATUS_HISTORY = [{"status": "PENDING", "entered_at": "2026-11-10T00:58:02Z"},
+                   {"status": "PLACING", "entered_at": "2026-11-10T00:59:45Z"},
+                   {"status": "INITIALIZING", "entered_at": "2026-11-10T01:00:20Z"},
+                   {"status": "RUNNING", "entered_at": "2026-11-10T01:12:07Z"}]
+
+
+def _deployment_record():
+    record = _get_record()
+    record["sub_jobs"] = [{"sub_job_id": "j1:sampling:0", "status": "RUNNING", "job_type": "SAMPLING",
+                           "model_name": "gpt2", "inference_config": {"deployment_class": "EVALUATION", "n_gpus": 1}}]
+    return record
+
+
+def _get_prints(record, *args) -> str:
+    """What `get j1` prints for a job whose Get job record is ``record``."""
+    stdout = io.StringIO()
+    assert cli.main(_base_args() + ["get", "j1", *args], client_factory=_record_factory(record, []), stdout=stdout) == 0
+    return stdout.getvalue()
+
+
+@pytest.mark.parametrize("make_record", [_get_record, _deployment_record], ids=["job", "deployment"])
+def test_get_adds_the_job_s_status_history_to_the_body(make_record):
+    today = _get_prints(make_record())
+    assert "status_history" not in json.loads(today)
+    # A record without one (an older service, or one that reports none for the job): today's output.
+    for absent in ([], None):
+        assert _get_prints({**make_record(), "status_history": absent}) == today
+    # With one: today's body and one key more, as the service sent it.
+    printed = _get_prints({**make_record(), "status_history": _STATUS_HISTORY})
+    expected = {**json.loads(today), "status_history": _STATUS_HISTORY}
+    assert printed == json.dumps(expected, indent=2, sort_keys=True) + "\n"
+
+
+def test_submit_drops_the_status_history_that_get_prints(tmp_path):
+    printed = _get_prints({**_get_record(), "status_history": _STATUS_HISTORY})
+    assert json.loads(printed)["status_history"] == _STATUS_HISTORY
+    path = tmp_path / "copy.json"
+    path.write_text(printed, encoding="utf-8")
+    body = json.loads(_get_prints(_get_record()))
+    dry = io.StringIO()
+    assert cli.main(["submit", str(path), "--dry-run"], stdout=dry) == 0
+    assert dry.getvalue() == json.dumps(body, indent=2, sort_keys=True) + "\n"  # what --dry-run prints for today's
+    instances = []
+    assert cli.main(_base_args() + ["submit", str(path)], client_factory=_factory(instances),
+                    stdout=io.StringIO()) == 0
+    assert instances[0].submitted_body == body
+
+
+def test_get_raw_wait_and_submit_wait_print_the_status_history(tmp_path):
+    record = {**_get_record(), "status_history": _STATUS_HISTORY}
+    assert json.loads(_get_prints(record, "--raw")) == record
+
+    def make_client(_args):
+        client = FakeClient()
+        client.wait_for_job = lambda job_id: record
+        return client
+
+    for args in (["wait", "j1"], ["submit", str(_write_job(tmp_path)), "--wait"]):
+        stdout = io.StringIO()
+        assert cli.main(_base_args() + args, client_factory=make_client, stdout=stdout) == 0
+        assert json.loads(stdout.getvalue()) == record, args
+
+
 def test_checkpoints_lists_checkpoints_for_job():
     instances = []
     stdout = io.StringIO()
@@ -3491,8 +3555,11 @@ def test_a_schema_not_found_error_shows_the_server_message_once():
 
     err = stderr.getvalue()
     assert rc == 1
-    assert err.startswith("error: Role <ROLE> (couldn't determine your role) can't find database MY_DB")
+    first, explanation = err.splitlines()[:2]
+    assert first == f"error: 400 Client Error: None for url: {response.url} (517602): {message}"
+    assert explanation.startswith("Role <ROLE> (couldn't determine your role) can't find database MY_DB")
     assert err.count(message) == 1
+    assert "response body:" not in err
 
 
 _CROSS_REGION_MESSAGE = (
@@ -3661,16 +3728,14 @@ def test_a_rejected_pat_shows_the_server_message_once_and_the_hint():
     assert "Snowflake rejected your credentials (HTTP 401)." in output
 
 
-def test_an_http_error_prints_a_body_the_client_cannot_parse(caplog):
+def test_an_http_error_prints_a_body_the_client_cannot_parse():
     # A string nested deeper than the JSON decoder recurses.
     content = json.dumps({"detail": "[" * 100_000}).encode()
 
-    with caplog.at_level("DEBUG", logger=cli.logger.name):
-        rc, output = _get_output(_refusing_client(content))
+    rc, output = _get_output(_refusing_client(content))
 
     assert rc == 1
     assert output.endswith(f"\nresponse body: {content.decode()[:4000]}...<truncated>\n")
-    assert "could not read the service's error from the response body" in caplog.text
 
 
 def test_invalid_job_json_returns_error(tmp_path):

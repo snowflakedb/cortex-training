@@ -545,7 +545,9 @@ with status 2 before connecting.
 to launch another job configured like it; `get --raw` prints the job's record
 as the service returns it, with its status, sub-job ids and times.
 `checkpoints` lists saved checkpoints. `wait` waits for the job to reach
-**running**, not for training to finish. See
+**running**, not for training to finish, and prints the job's record as
+`get --raw` does, `status_history` included when the service reports it
+([REST API reference section 5.2](rest-api.md#52-get-job---get-job_id)). See
 [Manage Jobs](../guides/operations/manage-jobs.md) for the operational workflow.
 
 ```bash
@@ -560,7 +562,7 @@ with: its `hardware`, `comment`, `experiment_name`, `idle_timeout_seconds` and
 training or inference config. Edit any of it before you submit. Whole numbers
 print as integers (`4`, not `4.0`). What the service sets is left out: the job
 and sub-job ids, statuses, times, submitter, owner and image (a new job runs the
-current image).
+current image). The one exception is the job's status history, last below.
 
 - Each sub-job's config is its effective config, with the service's defaults
   filled in, once the job is running on a service that reports one. Before
@@ -580,6 +582,9 @@ current image).
   say which weights, so set it before you submit.
 - For a record without `hardware` (the service could not read the job's
   details), `get` fails and prints nothing; `get --raw` still prints the record.
+- When the job's record has a `status_history`, the body has it too. It is not
+  config: `submit` drops it, so `submit --dry-run` prints, and `submit` sends,
+  the body without it.
 
 ### List Available Models
 
@@ -1233,18 +1238,28 @@ their text. Quitting sends what is left, waiting at most a second.
 `CORTEX_TRAINING_DISABLE_TELEMETRY` turns them off; see
 [Client metrics](python-sdk.md#client-metrics).
 
+The TUI shows a failed call on one line, without the URL: the HTTP status, the
+service's error code and message, then the explanation the CLI and the Python
+client give for it, if any (see [Troubleshooting](#troubleshooting)), such as
+`HTTP 400 Bad Request (517602): Schema MY_DB.PUBLIC is not found or not
+authorized. Role TRAINER can't find database MY_DB ...`. A line too short for
+all of it keeps the start: when both of the job list's routes fail, it names
+both before the explanation. The job screen's config card, whose subtitle also
+says why `experiment_name` is null, leaves the explanation to the Logs and
+Resources tabs.
+
 The TUI explains a refused read in one line on the view that needed it, worded
 the same on every view: the Logs tab's saved console and execution log, and the
 Resources tab (`GPU metrics unavailable: ...`). When the service can't resolve
 the job's Experiment for this role (a 500 that says `Linked experiment is not
-found ...`), the line says the role can't read the job's Experiment, and, for
-`Linked experiment is not found for job ...`, that it may no longer exist. When
-Snowflake refuses the SQL on the Experiment, as it does for a `MONITOR`-only
-role, the line says that saved logs and GPU metrics live there and that
-`checkpoints` still works. A refusal about another object (a warehouse, a
-schema) keeps its own text. A 403 whose message names a privilege says the role
-isn't allowed to read that view's data; one with no such message keeps the
-standard error text.
+found ...`), the line gives the service's message, then says the role can't
+read the job's Experiment, and, for `Linked experiment is not found for job
+...`, that it may no longer exist. When Snowflake refuses the SQL on the
+Experiment, as it does for a `MONITOR`-only role, the line says that saved logs
+and GPU metrics live there and that listing checkpoints still works. A refusal
+about another object (a warehouse, a schema) keeps its own text. A 403 whose
+message names a privilege says the role isn't allowed to read that view's data;
+one with no such message keeps the standard error text.
 
 A config the TUI can't use, such as one with a value of the wrong type (a
 quoted number: `"poll_interval": "2"`), JSON that doesn't parse, an unknown
@@ -1472,8 +1487,8 @@ history` (counting the jobs a search matches, followed by `N matches for
 QUERY`, while there is one), and ends with the sort (`sort: created ↓ newest
 first`). The Status column draws each status as a glyph and the word:
 `● RUNNING`, `◐ INITIALIZING`, `◔ PLACING` (and `creating`), `○ PENDING` (and
-`queued`), `? UNKNOWN`, `× FAILED`, `− CANCELLED`, and `✓` for `terminated`,
-`done` and `succeeded`.
+`queued`), `? UNKNOWN`, `× FAILED`, `⊖ CANCELLING` (being cancelled),
+`− CANCELLED`, and `✓` for `terminated`, `done` and `succeeded`.
 
 Rows show the job id, status, type, created time, duration and owner, then
 model, requested GPUs, optional location, and updated time. Created and Updated
@@ -1485,7 +1500,11 @@ computer's clock reads `just now`; one further ahead reads how far ahead it is
 Duration is how long a live job has run so far (since it was created, so it
 counts time spent waiting to be placed; in its status's color), or how long a
 finished one ran until its last state change (`40s`, `12m`, `3h 05m`,
-`2d 4h`). The times are as of the last refresh, which redraws them. On a narrow
+`2d 4h`). For a cancelled, terminated or failed job, that change is the end of
+its cleanup. A job still being cleaned up counts as finished here, its Duration
+ending at its last state change, while its card's time counts up until the
+cleanup ends. The times are as of the last refresh, which redraws them. On a
+narrow
 screen the Job ID column narrows (its id ends in `…`) and stays in view while
 the other columns scroll. The Schema column, shown when the list spans more than
 one location, is as wide as its longest `DB.SCHEMA` where the screen has room,
@@ -1614,16 +1633,35 @@ table, and toggles them short again.
 
 **GPUs** sums each sub-job's `n_gpus`, excluding `log_probability` and
 multiplexed sub-jobs that run on another sub-job's GPUs. The time beside the
-status includes queue and placement time; an `unknown` job runs to now.
+status includes queue and placement time; an `unknown` job runs to now. With a
+status history, an ended job's `lasted` ends where its timeline does.
 Missing times show `—`, and a clock up to five minutes ahead reads `just now`.
 
-**Lifecycle** runs from `created_at` to `state_changed_at`, the two times the
-job record has, and on to now while the job is live, with how long each step
-took: `◇ Created 15:14 ── 3m 10s ─▸ ● Running since 15:17 ── 9m 02s so far ─▸
-now`, or `◇ Created 2026-10-12 15:41 ── 2h 00m ─▸ × Failed 2026-10-12 17:41
-(5d 22h ago)`. States in between have no time in the record and get no step;
-a live job still in the state it was created in is one step (`○ Created,
-pending since 15:14`). An `unknown` job's state has no time.
+**Timeline** has a step for each status in the job's status history
+([REST API reference section 5.2](rest-api.md#52-get-job---get-job_id)), with
+how long each lasted, and runs on to now while the job is live:
+`○ Pending 00:58 ── 1m 43s ─▸ ◔ Placing 00:59 ── 35s ─▸ ◐ Initializing 01:00
+── 11m 47s ─▸ ● Running since 01:12 ── 9m 02s so far ─▸ now`, or, once it ended,
+`… ─▸ ● Running 01:12 ── 5h 59m ─▸ ⊖ Cancelling 07:12 ── 29s ─▸ − Cancelled 07:12
+(2h 00m ago)`. A history that starts after `Pending` gets a `◇ Created` step
+first, whose gap covers the statuses not recorded. The current status is in
+bold. A job being cancelled, terminated or failed has a `⊖ Cancelling`,
+`⊙ Terminating` or `⊗ Failing` step (`⊖ Dropping` for a deployment) that counts
+up like a live step until the job ends, so its cleanup is not counted as
+running time; the preview keeps re-reading such a job until then. A
+deployment's steps use deployment words, with placing and
+initializing as one `Initializing` step, then `● Ready`. The preview first
+draws the job as the job list has it, without a history, and redraws the
+timeline when its own read of the job answers.
+
+Without a status history, the timeline runs from `created_at` to
+`state_changed_at`, the two times the job record has, and on to now while the
+job is live, with how long each step took: `◇ Created 15:14 ── 3m 10s ─▸
+● Running since 15:17 ── 9m 02s so far ─▸ now`, or `◇ Created 2026-10-12 15:41
+── 2h 00m ─▸ × Failed 2026-10-12 17:41 (5d 22h ago)`. States in between have
+no time in the record and get no step; a live job still in the state it was
+created in is one step (`○ Created, pending since 15:14`). An `unknown` job's
+state has no time.
 
 A callout box under the job card says where the job stands, titled and colored
 by state: red for a failure (`Why it failed`, or `Failed before it got GPUs`);
@@ -1638,8 +1676,9 @@ screens omit Type, and wider tables scroll with `←` / `→` or `Home` / `End`;
 the card's bottom border says so (`e whole table`, `← → scroll`).
 
 The Config card under it follows the highlighted row. On the entire-job row it
-is the job's config exactly as `cortex-training get JOB_ID` prints it, a body
-that `submit` takes as it is (see [Manage existing jobs](#manage-existing-jobs));
+is the job's config exactly as `cortex-training get JOB_ID` prints it, without
+the status history, a body that `submit` takes as it is (see
+[Manage existing jobs](#manage-existing-jobs));
 on a sub-job's row, the same body with that sub-job alone, so a copy of it
 launches just that one. Its `experiment_name` is read once when the preview
 opens; until then, or when it can't be read, it is `null` and the card's bottom
@@ -1677,7 +1716,7 @@ its record says it is a deployment.
   carry no sub-job tag; each starts with its time (`HH:MM:SS`), and its
   wrapped rows start under the end of that time. The list marks each sub-job
   with its status's glyph and colour (`●` running, `◐` initializing, `◔`
-  placing, `○` pending, `×` failed, `−` cancelled, `✓` ended, `?` unknown), with the status under its name; the one the
+  placing, `○` pending, `×` failed, `⊖` cancelling, `−` cancelled, `✓` ended, `?` unknown), with the status under its name; the one the
   pane shows has an accent edge and a bold name. Saved logs (`s`) and copies
   stay as the lines came, uncoloured. In the pane the time is faint, the level
   has its severity's colour (a warning's or an error's message is tinted to
@@ -2275,21 +2314,30 @@ to an old JSON file, or switch to a profile with `cortex-training login`.
 If Snowflake rejects your PAT, the CLI keeps the original error and adds next
 steps: `394400 (08001) ... Programmatic access token is invalid` from a
 connection profile, or a `401` on a request that sent the PAT directly
-(`config.json`, `--pat`, or `CORTEX_TRAINING_PAT`). The most common cause is a
-user with no network policy; see
+(`config.json`, `--pat`, or `CORTEX_TRAINING_PAT`). The Python client adds the
+same next steps to the error it raises for that `401`. The most common cause is
+a user with no network policy; see
 [Network policy requirement](../getting-started/authentication.md#network-policy-requirement).
 A `401` on a connection-profile request gets no hint, because the PAT was
-already accepted at login.
+already accepted at login, and neither does a `401` that carries one of the
+service's own codes (`5176xx`, a failure relayed from a running job's backend),
+which Snowflake had already let in.
 
 If you see `Invalid URL ... No scheme supplied`, the config is using a bare
 Snowflake hostname as `base_url`. Use `host` for Snowflake PAT auth, or use a
 full local/mock URL such as `http://localhost:8084` for `base_url`.
 
-For server errors, the CLI prints the error with the service's error code and
-message, and any Snowflake request id. A message over 1,000 characters is cut,
+For server errors, the CLI prints the error as the Python client raises it: the
+service's error code and message, and any Snowflake request id. For a refusal
+the client recognizes (a missing database or schema, a job Experiment the role
+can't read, a rejected PAT), an explanation with next steps follows on the
+lines under it; see [REST API section 3.6](rest-api.md#36-errors). When
+Snowflake refuses the SQL on the job's Experiment that `download-log` and
+`download-metrics` run, the CLI adds the same explanation the TUI shows under
+Snowflake's error and its query id. A message over 1,000 characters is cut,
 common credential patterns in it are redacted, and the body's other fields are
 not printed. The CLI also prints the raw response body when the error line
-shows no code or message from it: for a body that is not JSON or has neither,
-such as a validation `detail` list, and for errors the client explains in its
-own words, such as a missing database or schema. Include those details when
-debugging a `500`.
+doesn't show the code and message read from it: for a body that is not JSON or
+has neither, such as a validation `detail` list, and for an error with its own
+text, such as a redirect or a chunk-group error, whose body has the group's
+code and ids. Include those details when debugging a `500`.

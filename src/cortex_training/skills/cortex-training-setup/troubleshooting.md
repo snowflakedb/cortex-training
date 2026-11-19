@@ -1,7 +1,12 @@
 # Cortex Training connection errors
 
 Match the error the user sees (from `cortex-training capacity`, `login`, or a
-job) to the first row it fits. Never ask for the token to "check" it.
+job) to the first row it fits. Never ask for the token to "check" it. An
+`error:` line from a refused request ends with the service's code and message,
+such as `(517602): Schema DB.SCHEMA is not found or not authorized`; for a
+missing database or schema, a job Experiment the role can't read (including
+Snowflake refusing the SQL that reads saved logs), or a rejected PAT, the lines
+under it already give the next steps, the same as the TUI shows.
 
 | Error contains | Cause | Fix |
 |---|---|---|

@@ -7,11 +7,14 @@ Cases TC1-TC12 cover the deployment lifecycle (dry run, create, list,
 describe, wait, calling the endpoint, downloads, checkpoint sources, drop,
 errors, interrupts, and imported weights). Every command runs the installed CLI in a subprocess,
 as a user would, and deployments hold real GPUs while they run. They are skipped unless
-``CORTEX_TRAINING_E2E_CONFIG`` names a CLI config JSON file
-(see ``docs/reference/cli.md``)::
+``CORTEX_TRAINING_E2E_CONNECTION`` names a Snowflake connection profile, as for
+``tests/test_examples_e2e.py``::
 
-    CORTEX_TRAINING_E2E_CONFIG=~/config.json python3 -m pytest \\
+    CORTEX_TRAINING_E2E_CONNECTION=NAME python3 -m pytest \\
         tests/test_model_deployment_e2e.py -v
+
+The direct calls to a deployment's ``base_url`` need a profile that signs in
+with a PAT; with another authenticator they are skipped.
 
 TC8 deploys a weights-only checkpoint. Set
 ``CORTEX_TRAINING_E2E_CHECKPOINT=TRAINING_JOB_UUID/CHECKPOINT_ID`` to use an
@@ -27,6 +30,7 @@ test fails. Run ``model-deployment list`` afterwards if the run was killed.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -40,14 +44,29 @@ from pathlib import Path
 import pytest
 import requests
 
-CONFIG_ENV = "CORTEX_TRAINING_E2E_CONFIG"
+from cortex_training.connection import ResolvedConnection, resolve_connection
+
+CONNECTION_ENV = "CORTEX_TRAINING_E2E_CONNECTION"
 CHECKPOINT_ENV = "CORTEX_TRAINING_E2E_CHECKPOINT"
 EXTERNAL_ENV = "CORTEX_TRAINING_E2E_EXTERNAL"
-CONFIG_PATH = os.environ.get(CONFIG_ENV)
+CONNECTION = os.environ.get(CONNECTION_ENV)
 
 pytestmark = pytest.mark.skipif(
-    not CONFIG_PATH, reason=f"set {CONFIG_ENV} to run live model deployment tests"
+    not CONNECTION, reason=f"set {CONNECTION_ENV} to run live model deployment tests"
 )
+# Read at import, before conftest points every test at empty profile folders.
+RUN_ENV = dict(os.environ)
+PROFILE_ENV = ("SNOWFLAKE_HOME", "XDG_CONFIG_HOME", "SNOWFLAKE_DEFAULT_CONNECTION_NAME")
+
+
+@pytest.fixture(autouse=True)
+def _run_profiles(_isolated_connection_files, monkeypatch):
+    """Undo conftest's isolation: the CLI and the client sign in with the run's profiles."""
+    for name in PROFILE_ENV:
+        if name in RUN_ENV:
+            monkeypatch.setenv(name, RUN_ENV[name])
+        else:
+            monkeypatch.delenv(name, raising=False)
 
 MODEL = "Qwen/Qwen3-1.7B"
 DEPLOYMENT_ID_PATTERN = re.compile(r"^sf-ct-[0-9a-f-]{36}$")
@@ -71,17 +90,21 @@ def base_spec(**deployment_overrides) -> dict:
     }
 
 
-def load_config() -> dict:
-    return json.loads(Path(CONFIG_PATH).expanduser().read_text())
+@functools.cache
+def connection() -> ResolvedConnection:
+    """The profile, resolved as the CLI resolves ``--connection``."""
+    return resolve_connection(
+        connection=CONNECTION, overrides={"poll_timeout": READY_TIMEOUT_SECONDS}
+    )
 
 
 def cli_command(*arguments: str) -> list[str]:
     return [
         sys.executable,
         "-m",
-        "cortex_training.cli",
-        "--config",
-        str(Path(CONFIG_PATH).expanduser()),
+        "cortex_training",
+        "--connection",
+        CONNECTION,
         "--compact",
         *arguments,
     ]
@@ -197,13 +220,12 @@ def test_tc3_list_shows_id_and_status_and_filters(ready_deployment):
 def test_tc4_describe_returns_the_full_record_without_internal_ids(ready_deployment):
     deployment_id = ready_deployment["deployment"]
     described = run_ok("model-deployment", "describe", deployment_id)
-    config = load_config()
 
     assert described["deployment"] == deployment_id
     assert described["status"] == "READY"
     assert described["base_url"] == ready_deployment["base_url"]
-    assert described["database"].upper() == config["database"].upper()
-    assert described["schema"].upper() == config["schema"].upper()
+    assert described["database"].upper() == connection().database.upper()
+    assert described["schema"].upper() == connection().schema.upper()
     for field in ("created_at", "creator", "owner_role"):
         assert described.get(field), f"describe has no {field}: {described}"
     assert described["spec"] == base_spec()
@@ -225,12 +247,8 @@ def skip_if_not_permitted(status_code: int, body: str) -> None:
 
 
 def test_tc6_base_url_serves_openai_chat_completions(ready_deployment):
-    config = load_config()
-    pat = config.get("pat") or os.environ.get("CORTEX_TRAINING_PAT")
-    if not pat:
-        pytest.skip("the config has no PAT to call the deployment with")
     headers = {
-        "Authorization": f"Bearer {pat}",
+        "Authorization": f"Bearer {deployment_pat()}",
         "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
     }
     base_url = ready_deployment["base_url"]
@@ -269,9 +287,9 @@ def test_tc6_models_lists_the_ready_deployment(ready_deployment):
 
 
 def deployment_pat() -> str:
-    pat = load_config().get("pat") or os.environ.get("CORTEX_TRAINING_PAT")
+    pat = connection().pat
     if not pat:
-        pytest.skip("the config has no PAT to call the deployment with")
+        pytest.skip("the profile does not sign in with a PAT to call the deployment with")
     return pat
 
 
@@ -397,17 +415,9 @@ def weights_only_checkpoint() -> dict:
         job_id, _, checkpoint_id = existing.partition("/")
         return {"job_id": job_id, "checkpoint_id": checkpoint_id}
 
-    from cortex_training import CortexTrainingClient, SubJobConfig
+    from cortex_training import SubJobConfig
 
-    config = load_config()
-    client = CortexTrainingClient.from_pat(
-        host=config["host"],
-        pat=config["pat"],
-        database=config["database"],
-        schema=config["schema"],
-        endpoint=config.get("endpoint", "cortex-training"),
-        poll_timeout=READY_TIMEOUT_SECONDS,
-    )
+    client = connection().client
     sub_job = SubJobConfig.training_job(
         model_name=MODEL,
         optimizer={"name": "adamw", "lr": 1e-5},
@@ -487,10 +497,9 @@ def test_tc9_drop_releases_the_deployment_and_can_be_repeated(ready_deployment):
 
 
 def test_tc10_errors_are_clear_and_hide_internals(spec_dir):
-    config = load_config()
     not_found = run_error("model-deployment", "describe", MISSING_DEPLOYMENT)
     assert f"model deployment {MISSING_DEPLOYMENT} not found in" in not_found
-    assert config["database"].upper() in not_found.upper()
+    assert connection().database.upper() in not_found.upper()
 
     assert "sf-ct-<UUID>" in run_error(
         "model-deployment", "describe", "not-a-deployment"

@@ -99,6 +99,11 @@ from cortex_training._artifact_download import DownloadCancelled
 from cortex_training._artifact_download import NoChunksError
 from cortex_training.client import _account_jobs
 from cortex_training.client import custom_loss
+from cortex_training.client import errors as _errors
+from cortex_training.client.errors import bounded_server_message as _bounded_server_message
+from cortex_training.client.errors import iter_error_dicts as _iter_error_dicts
+from cortex_training.client.errors import redact_secrets as _redact_secrets
+from cortex_training.client.errors import response_snowflake_request_id as _response_snowflake_request_id
 from cortex_training.client.auth import SnowflakeProfileAuth
 from cortex_training.client.auth import SnowflakeProfileError
 from cortex_training.client.auth import SnowflakeTelemetryTokenProvider
@@ -360,10 +365,6 @@ _ENDED_JOB_STATES = frozenset(
 # out the service's read-after-create window.
 _RECENTLY_CREATED_SECONDS = 120.0
 _SESSION_EXPIRED_CODES = frozenset({"390111", "390112", "390114"})
-# The Cortex Training API's invalid-request code, and its message for a URL
-# path DATABASE.SCHEMA it can't resolve (missing database or schema alike).
-_INVALID_REQUEST_CODE = "517602"
-_SCHEMA_NOT_FOUND_MESSAGE = re.compile(r"^Schema .+ is not found or not authorized")
 # Final request states, in the short form _normalize_request_status() returns.
 _SUCCEEDED_REQUEST_STATES = frozenset({"completed", "done", "succeeded"})
 _FAILED_REQUEST_STATES = frozenset({"failed", "cancelled", "canceled"})
@@ -452,6 +453,7 @@ class ChunkGroupError(requests.exceptions.HTTPError):
             request=getattr(response, "request", None),
         )
         self.detail = detail
+        _errors.carry(self)
 
 
 class ChunkGroupRestartError(ChunkGroupError):
@@ -612,33 +614,6 @@ def _is_transient_unless_job_not_found(exc: BaseException) -> bool:
     return _is_transient(exc)
 
 
-def _iter_error_dicts(value: Any, *, depth: int = 0) -> Iterator[dict]:
-    """Yield dictionaries from direct or service-wrapped JSON error bodies."""
-    if depth > 8:
-        return
-    if isinstance(value, dict):
-        yield value
-        for child in value.values():
-            yield from _iter_error_dicts(child, depth=depth + 1)
-        return
-    if isinstance(value, list):
-        for child in value:
-            yield from _iter_error_dicts(child, depth=depth + 1)
-        return
-    if not isinstance(value, str):
-        return
-
-    decoder = json.JSONDecoder()
-    for index, char in enumerate(value):
-        if char not in "[{":
-            continue
-        try:
-            decoded, _ = decoder.raw_decode(value[index:])
-        except (TypeError, ValueError):
-            continue
-        yield from _iter_error_dicts(decoded, depth=depth + 1)
-
-
 def _is_session_auth_expired_response(response: requests.Response) -> bool:
     """Return whether the API explicitly rejected an expired session token."""
     structured_code_seen = False
@@ -706,19 +681,9 @@ def _response_error_code(response: requests.Response | None) -> str | None:
 
 
 def _is_schema_not_found(response: requests.Response | None) -> bool:
-    """Whether ``response`` says the URL's schema can't be found."""
-    if response is None:
-        return False
-    try:
-        body = response.json()
-    except Exception:
-        return False
-    for candidate in _iter_error_dicts(body):
-        code = candidate.get("code") or candidate.get("error_code")
-        message = str(candidate.get("message") or "").strip()
-        if str(code) == _INVALID_REQUEST_CODE and _SCHEMA_NOT_FOUND_MESSAGE.match(message):
-            return True
-    return False
+    """Whether ``response`` says the URL's schema can't be found (see ``errors.EXPLANATIONS``)."""
+    found = _errors.explain(_errors.read_server_error(response))
+    return found is not None and found.topic == _errors.SCHEMA_NOT_FOUND
 
 
 def _chunk_group_error_detail(response: requests.Response | None) -> dict | None:
@@ -766,20 +731,6 @@ _REQUEST_ID_RESULT_OPERATIONS = {
     "cancel_request",
 }
 _METRIC_ERROR_MESSAGE_LIMIT = 512
-_SECRET_IN_ERROR_RE = re.compile(
-    r"(?i)(authorization[\"']?\s*[:=]\s*"
-    r"(?:bearer\s+|snowflake\s+token\s*=\s*)?|"
-    r"bearer\s+|snowflake\s+token\s*=\s*|"
-    r"(?:password|secret|credential|pat|api[_-]?key|private[_-]?key|"
-    r"access[_-]?token|refresh[_-]?token|session[_-]?token|token)"
-    r"[\"']?\s*[:=]\s*)"
-    r"(?:\"[^\"]*\"|'[^']*'|\S+)"
-)
-
-
-def _redact_secrets(text: str) -> str:
-    """Return ``text`` with the obvious secrets ``_SECRET_IN_ERROR_RE`` finds redacted."""
-    return _SECRET_IN_ERROR_RE.sub(r"\1<redacted>", text)
 
 
 def _safe_metric_error_message(exc: BaseException) -> str:
@@ -789,15 +740,8 @@ def _safe_metric_error_message(exc: BaseException) -> str:
     return message[:_METRIC_ERROR_MESSAGE_LIMIT]
 
 
-_SNOWFLAKE_REQUEST_ID_HEADER = "x-snowflake-request-id"
 # Bound per-operation history so long polls (wait_for_job) stay cheap.
 _MAX_TRACKED_SNOWFLAKE_REQUEST_IDS = 10
-
-
-def _response_snowflake_request_id(response: Any) -> str | None:
-    headers = getattr(response, "headers", None) or {}
-    request_id = headers.get(_SNOWFLAKE_REQUEST_ID_HEADER)
-    return request_id if isinstance(request_id, str) and request_id else None
 
 
 def _add_snowflake_request_id_to_error(
@@ -1006,6 +950,11 @@ def _track_operation(operation: str):
                 _add_snowflake_request_id_to_error(
                     exc, _response_snowflake_request_id(getattr(exc, "response", None))
                 )
+                if getattr(exc, "response", None) is not None:
+                    try:  # any error raised in place of an HTTP error still says what the answer said
+                        _errors.carry(exc)
+                    except Exception:  # noqa: BLE001 - never replace the error being raised
+                        logger.debug("could not add the server's error fields to an error", exc_info=True)
                 _log_untagged_request_id(operation, exc, state.snowflake_request_ids)
                 if arguments is not None:
                     self._emit_operation_outcome(
@@ -1076,6 +1025,7 @@ def _account_list_error(
     )
     if error is not None:
         _add_snowflake_request_id_to_error(error, _response_snowflake_request_id(response))
+        _errors.carry(error)
     return error
 
 
@@ -2056,73 +2006,6 @@ def _model_deployment_description(
     return result
 
 
-# Longest server error message kept in an error the client raises.
-_MAX_SERVER_ERROR_MESSAGE_CHARS = 1000
-
-
-def _server_error_code_and_message(
-    response: requests.Response | None,
-) -> tuple[str | None, str | None]:
-    """Return the ``code`` and ``message`` from a JSON error body, if any."""
-    if response is None:
-        return None, None
-    try:
-        body = response.json()
-    except Exception:
-        return None, None
-    for candidate in _iter_error_dicts(body):
-        code = candidate.get("code") or candidate.get("error_code")
-        message = candidate.get("message")
-        if code is not None or isinstance(message, str):
-            return (
-                str(code) if code is not None else None,
-                message if isinstance(message, str) and message.strip() else None,
-            )
-    return None, None
-
-
-def _bounded_server_message(message: str) -> str:
-    """Return ``message`` cut to ``_MAX_SERVER_ERROR_MESSAGE_CHARS``, ending in ``...`` when cut."""
-    if len(message) > _MAX_SERVER_ERROR_MESSAGE_CHARS:
-        return message[:_MAX_SERVER_ERROR_MESSAGE_CHARS] + "..."
-    return message
-
-
-def _server_message_suffix(response: requests.Response | None) -> str:
-    """The text an HTTP error's message gains from ``response``'s JSON error body.
-
-    `` (<code>): <message>``, or the half the body has, with the message
-    redacted and cut; ``""`` when the body is not JSON or has neither.
-    """
-    code, detail = _server_error_code_and_message(response)
-    suffix = f" ({code})" if code else ""
-    if detail:
-        suffix += f": {_bounded_server_message(_redact_secrets(detail))}"
-    return suffix
-
-
-def _add_server_message_to_error(
-    exc: BaseException, response: requests.Response | None
-) -> None:
-    """Append the ``code`` and ``message`` of ``response``'s JSON error body to ``exc``'s message.
-
-    requests' own text ("403 Client Error: Forbidden for url: ...") leaves them
-    out, and the message is often the only place that says what to change, such
-    as an account parameter. A body that is not JSON, or has neither, leaves the
-    message as it is, and so does a message that already carries them. Never
-    raises, so it cannot replace the error it explains.
-    """
-    try:
-        if not exc.args or not isinstance(exc.args[0], str):
-            return
-        suffix = _server_message_suffix(response)
-        if not suffix or suffix in exc.args[0]:
-            return
-        exc.args = (exc.args[0] + suffix, *exc.args[1:])
-    except Exception:
-        logger.debug("could not add the server's error message to an HTTP error", exc_info=True)
-
-
 def _sanitized_model_deployment_request_error(
     exc: requests.exceptions.RequestException,
     deployment_id: str | None,
@@ -2134,14 +2017,24 @@ def _sanitized_model_deployment_request_error(
 
     The request URL and raw body are dropped, but the server's error ``code``
     and ``message`` are kept so "feature disabled", "not authorized" and "wrong
-    ID" stay distinguishable. ``job_id`` is replaced by ``deployment_id`` in the
-    message, since the server's own messages can name the backing job.
-    ``deployment_id`` is ``None`` for ``create``, which has no deployment yet.
+    ID" stay distinguishable, and the explanation the client added follows on
+    the lines under them (see ``errors.EXPLANATIONS``). ``job_id`` is replaced
+    by ``deployment_id`` in the message, since the server's own messages can
+    name the backing job. ``deployment_id`` is ``None`` for ``create``, which
+    has no deployment yet. The error carries the same
+    ``errors.SERVER_ERROR_ATTRIBUTES`` as an HTTP error, rewritten the same way.
     """
+
+    def hide(text: str) -> str:
+        return text.replace(job_id, deployment_id) if job_id and deployment_id else text
+
     response = exc.response
     status_code = getattr(response, "status_code", None)
     subject = f"model deployment {deployment_id}" if deployment_id else "model deployment"
-    code, detail = _server_error_code_and_message(response)
+    error = _errors.read_server_error(response)
+    code = error.code if error else None
+    detail = error.message if error else None
+    shown = _bounded_server_message(_redact_secrets(hide(detail))) if detail else None
     if code == _JOB_NOT_FOUND_CODE and deployment_id:
         message = f"{subject} not found" + (f" in {scope}" if scope else "")
     else:
@@ -2150,14 +2043,18 @@ def _sanitized_model_deployment_request_error(
             message += f" with HTTP {status_code}"
         if code:
             message += f" ({code})"
-        if detail:
-            if job_id and deployment_id:
-                detail = detail.replace(job_id, deployment_id)
-            message += f": {_bounded_server_message(detail)}"
+        if shown:
+            message += f": {shown}"
     request_id = _response_snowflake_request_id(response)
     if request_id:
         message += f" (snowflake request id: {request_id})"
-    return RuntimeError(message)
+    explanation = _errors.explanation_of(exc)
+    if explanation:
+        explanation = hide(explanation)
+        message += "\n" + explanation
+    public = RuntimeError(message)
+    _errors.attach(public, error, explanation, message=shown)
+    return public
 
 
 class ModelDeploymentWaitError(RuntimeError):
@@ -3342,49 +3239,78 @@ class CortexTrainingClient:
             logger.debug("Could not read the session's role.", exc_info=True)
             return None
 
-    def _schema_not_found_error(self, response: requests.Response) -> DatabaseAccessError:
-        """Explain an HTTP 400 saying the configured schema can't be found."""
-        role = self._current_role()
-        sent_headers = getattr(getattr(response, "request", None), "headers", None) or self._session.headers
-        sent_pat = sent_headers.get("X-Snowflake-Authorization-Token-Type") == "PROGRAMMATIC_ACCESS_TOKEN"
-        if role:
-            who = f"Role {role}"
-        elif sent_pat:
-            who = "Your PAT's role (its role restriction, or your user's DEFAULT_ROLE if it has none)"
-        else:
-            who = "Role <ROLE> (couldn't determine your role)"
-        grantee = role or "<ROLE>"
-        source = ""
-        if self._auth_provider is not None:
-            profile = getattr(self._auth_provider, "connection_name", None)
-            source = f" (from profile {profile})" if profile else " (from your default Snowflake profile)"
+    def _request_context(self, response: requests.Response, role: str | None = None) -> _errors.RequestContext:
+        """What an explanation may say about the request ``response`` answers (see ``errors.EXPLANATIONS``).
+
+        ``role`` is the session's role, which only the schema-not-found
+        explanation names; it is read only for that answer.
+        """
+        provider = self._auth_provider
+        return _errors.RequestContext(
+            sent_pat=_errors.sent_pat(response, self._session.headers),
+            role=role,
+            profile_client=provider is not None,
+            profile=getattr(provider, "connection_name", None) if provider is not None else None,
+            database=self.database,
+            schema=self.schema,
+        )
+
+    def _schema_not_found_error(
+        self, exc: requests.exceptions.HTTPError, response: requests.Response, role: str | None
+    ) -> DatabaseAccessError:
+        """The :class:`DatabaseAccessError` for ``exc``, an HTTP 400 saying the configured schema can't be found.
+
+        It keeps ``exc``'s message, which :meth:`_explain_http_error` ended
+        with the service's code and message and the explanation, and its
+        ``errors.SERVER_ERROR_ATTRIBUTES``. ``role`` is the session's role.
+        """
         database, schema = self.database, self.schema
-        create_database = f"CREATE DATABASE IF NOT EXISTS {database}"
-        create_schema = f"CREATE SCHEMA IF NOT EXISTS {database}.{schema}"
-        # The server's message is the same whether the database or the schema is missing, or
-        # the role can't use either, so the explanation covers all three.
-        lines = [
-            f"{who} can't find database {database} or its schema {schema}{source}.",
-            f"- If they don't exist: run `{create_database}` and `{create_schema}` (or ask an admin to).",
-            f"- If they exist: ask an admin to run `GRANT USAGE ON DATABASE {database} TO ROLE {grantee}` "
-            f"and `GRANT USAGE ON SCHEMA {database}.{schema} TO ROLE {grantee}`.",
-        ]
-        if not role and sent_pat:
-            lines.insert(
-                1,
-                "- If that's the wrong role: restrict the PAT to a role that has access, or run "
-                "`ALTER USER <USER> SET DEFAULT_ROLE = <ROLE>`. Snowsight shows the token's role under "
-                "Settings > Authentication.",
-            )
-        lines.append("- Or use another database: --database NAME / CORTEX_TRAINING_DATABASE.")
-        return DatabaseAccessError(
-            "\n".join(lines),
+        create_database, create_schema = _errors.schema_statements(database, schema)
+        error = DatabaseAccessError(
+            str(exc),
             response=response,
             kind="schema",
             name=f"{database}.{schema}",
             role=role,
             statement=f"{create_database}; {create_schema}",
         )
+        for name in _errors.SERVER_ERROR_ATTRIBUTES:
+            setattr(error, name, getattr(exc, name, None))
+        return error
+
+    def _explain_http_error(
+        self,
+        exc: requests.exceptions.HTTPError,
+        response: requests.Response,
+        *,
+        explain_database: bool,
+    ) -> DatabaseAccessError | None:
+        """End ``exc``'s message with the service's code and message, then any explanation.
+
+        The explanation comes from ``errors.EXPLANATIONS``, and ``exc`` gets
+        the ``errors.SERVER_ERROR_ATTRIBUTES``; what is added passes through
+        :meth:`_redact_for_log`. Returns the :class:`DatabaseAccessError` to
+        raise instead when the answer says the configured schema can't be
+        found and ``explain_database`` holds; without it, that answer gets no
+        explanation, since the path's database is not the client's. Never
+        raises, so it cannot replace the error it explains.
+        """
+        try:
+            error = _errors.read_server_error(response)
+            found = _errors.explain(error, self._request_context(response))
+            role = None
+            if found is not None and found.topic == _errors.SCHEMA_NOT_FOUND:
+                if explain_database:
+                    role = self._current_role()  # read only for the one explanation that names it
+                    found = _errors.explain(error, self._request_context(response, role))
+                else:
+                    found = None
+            _errors.decorate(exc, error, found.text if found else None, hide=self._redact_for_log)
+            if found is not None and found.topic == _errors.SCHEMA_NOT_FOUND:
+                return self._schema_not_found_error(exc, response, role)
+        except Exception:
+            logger.debug("could not add the server's error message to an HTTP error", exc_info=True)
+        return None
 
     def _redact_for_log(self, text: str) -> str:
         """Replace hidden backing job IDs in ``text`` (see _hiding_backing_job_id)."""
@@ -3415,13 +3341,15 @@ class CortexTrainingClient:
     ) -> requests.Response:
         """Send one request with retries.
 
+        A 4xx or 5xx raises ``requests.HTTPError``. When the answer's JSON body
+        has an error ``code`` or ``message``, the error's message ends with
+        them, and the explanation ``errors.EXPLANATIONS`` has for the answer,
+        if any, follows on the lines under it (see :meth:`_explain_http_error`).
         An HTTP 400 saying the configured schema can't be found (code 517602,
         "Schema ... is not found or not authorized") raises
-        :class:`DatabaseAccessError`. ``explain_database=False`` leaves that
-        answer as it is, for routes whose path names no database; a
-        client from :meth:`for_job` always leaves it. Any other 4xx or 5xx
-        raises ``requests.HTTPError``; when the answer's JSON body has an
-        error ``code`` or ``message``, the error's message ends with them.
+        :class:`DatabaseAccessError` instead. ``explain_database=False`` leaves
+        that answer as it is, for routes whose path names no database; a
+        client from :meth:`for_job` always leaves it.
         """
         explain_database = explain_database and self._explain_database_errors
         fn = getattr(self._session, method.lower())
@@ -3549,12 +3477,6 @@ class CortexTrainingClient:
                         snowflake,
                         self._redact_for_log(self._debug_response_summary(resp)),
                     )
-                if (
-                    explain_database
-                    and status_code == 400
-                    and _is_schema_not_found(resp)
-                ):
-                    raise self._schema_not_found_error(resp)
                 try:
                     # requests.Response.raise_for_status() intentionally ignores 3xx.
                     if 300 <= resp.status_code < 400:
@@ -3567,7 +3489,11 @@ class CortexTrainingClient:
                 except requests.exceptions.HTTPError as exc:
                     _add_snowflake_request_id_to_error(exc, sf_request_id)
                     if resp.status_code >= 400:
-                        _add_server_message_to_error(exc, resp)
+                        explained = self._explain_http_error(exc, resp, explain_database=explain_database)
+                        if explained is not None:
+                            raise explained from None
+                    else:  # a redirect keeps its own message, and gets the fields
+                        _errors.carry(exc)
                     raise
                 return resp
 
@@ -4165,11 +4091,13 @@ class CortexTrainingClient:
         except requests.exceptions.HTTPError as exc:
             if exc.response is None or exc.response.status_code != 404:
                 raise
-            raise requests.exceptions.HTTPError(
+            error = requests.exceptions.HTTPError(
                 "account-level job listing is not enabled for this account",
                 request=exc.request,
                 response=exc.response,
-            ) from exc
+            )
+            _errors.carry(error)
+            raise error from exc
         return resp.json()
 
     def for_job(self, job: dict) -> "CortexTrainingClient":
@@ -4248,9 +4176,11 @@ class CortexTrainingClient:
         - ``pending_gpus`` (int): GPUs requested by jobs still waiting for
           capacity (``pending``). It claims quota, so it reduces
           ``available_gpus``.
-        - ``available_gpus`` (int): what a new job could start with right now —
-          ceiling headroom capped by what is schedulable. ``0`` does not mean
-          blocked: a submit within the ceiling is still accepted and queued.
+        - ``available_gpus`` (int): what a new job could start with right now,
+          ``max_total_gpus - in_use_gpus - pending_gpus``, never below ``0``.
+          When ``has_reservation`` is ``True``, it is also capped at what the
+          hardware can currently schedule, so a shortfall in your reserved
+          capacity shows here.
 
         See ``docs/reference/rest-api.md`` section 5.5 for the authoritative
         field list, and :meth:`get_capacity_breakdown` to split ``in_use_gpus``
@@ -7880,6 +7810,7 @@ class CortexTrainingClient:
             error = requests.exceptions.HTTPError(
                 f"{exc}. {hint}", response=exc.response, request=exc.request
             )
+            _errors.carry(error, exc)  # its message quotes exc's
             # Lets stream_logs end a tail cleanly when the job ends under it.
             error.job_ended = bool(checked.get("ended"))  # type: ignore[attr-defined]
             # A sub-job the job doesn't have is the caller's mistake, whatever the job's

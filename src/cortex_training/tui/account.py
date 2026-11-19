@@ -399,10 +399,14 @@ def _one_line(text: str) -> str:
     return views.fit_cells(views.collapse(text), _FAILURE_LIMIT)
 
 
-def _failure_text(route: str, exc: BaseException) -> str:
-    """What failed, on one line: the route, then the answer's status and message or the error's own text."""
+def _failure_text(route: str, exc: BaseException, *, explain: bool = True) -> str:
+    """What failed, on one line: the route, then the answer's status and message or the error's own
+    text, then the explanation the client gives for it. ``explain=False`` leaves the explanation out,
+    for a line that goes on to name another route's failure: it then comes after both, so a long one
+    can't cut off the second route."""
     answered = isinstance(getattr(getattr(exc, "response", None), "status_code", None), int)
-    return _one_line(f"{route} {'answered' if answered else 'failed:'} {views.describe_error(exc)}")
+    text = f"{route} {'answered' if answered else 'failed:'} {views.describe_error(exc, explain=False)}"
+    return _one_line(views.with_explanation(text, exc) if explain else text)
 
 
 def _page(page: Any) -> tuple:
@@ -588,8 +592,9 @@ class JobLister:
                 return self._schema(ListScope(SCHEMA), before)
             except JobListError as schema_failed:
                 # Both routes failed: say so, as either alone would leave the other unexplained.
-                why = str(exc) if isinstance(exc, _BadNarrowing) else _failure_text(_ACCOUNT_ROUTE, exc)
-                raise JobListError(_one_line(f"{why}; and {schema_failed}")) from exc
+                # Both come before any explanation, which can be long (see _failure_text).
+                why = str(exc) if isinstance(exc, _BadNarrowing) else _failure_text(_ACCOUNT_ROUTE, exc, explain=False)
+                raise JobListError(_one_line(views.with_explanation(f"{why}; and {schema_failed}", exc))) from exc
         if listing is None:
             return None  # cancelled before a page: the load in its place decides
         if not is_cancelled():
