@@ -3839,6 +3839,19 @@ server already knows the source job's model and rejects one that does not
 match it, so `create` reads the training sub-job's `model_name` from
 `GET /{source job_id}` and sends that. `model` is rejected as an unknown key.
 
+`inference` may also carry `vllm_config`, an object of engine options (for
+example `gpu_memory_utilization` or `speculative_config`). The client sends it
+unchanged in the sub-job's `inference_config.vllm_config`, next to the two keys
+it sets itself, so it may not contain `tensor_parallel_size` (from
+`gpus_per_replica`) or `max_model_len` (from `max_seq_len`). The server decides
+what is valid. Engine options must be enabled for the account; until they are,
+the server rejects any other key with `inference_config.vllm_config contains
+unsupported field: <key>`. `describe` and `list` do not report engine options.
+
+```json
+"inference": {"max_seq_len": 8192, "vllm_config": {"gpu_memory_utilization": 0.85}}
+```
+
 The checkpoint can come from a full fine-tune or a LoRA training job. For a
 LoRA checkpoint, the server copies the source training sub-job's
 `training_config.peft_config` into the deployment, so it serves the base model
@@ -3856,6 +3869,7 @@ Client-side checks (all others are left to the server):
 | `deployment.gpu_type` | `H200`, `B200`, or `B300`, case-insensitive |
 | `gpus_per_replica` | 1, 2, 4, or 8 |
 | `min_replicas * gpus_per_replica` | at most 8, or a multiple of 8 |
+| `inference.vllm_config` | an object without `tensor_parallel_size` or `max_model_len`; its contents are left to the server |
 
 Which models can be deployed, and the minimum GPUs per replica each needs, is
 decided by the server (`Unsupported model for a model deployment: <name>`), as
@@ -3866,7 +3880,8 @@ it does not read a checkpoint's source job.
 The spec becomes a `POST /` body with `idle_timeout_seconds: 0`, top-level
 `hardware` set to `gpu_type`, and one sampling sub-job with
 `inference_config.{deployment_class, num_replicas, n_gpus, max_seq_len}`,
-`inference_config.vllm_config.{tensor_parallel_size, max_model_len}`, and
+`inference_config.vllm_config.{tensor_parallel_size, max_model_len}` (plus any
+`inference.vllm_config` keys), and
 `source_checkpoint_info: {source_job_id, checkpoint_id}` for a checkpoint
 source. `n_gpus` is `min_replicas * gpus_per_replica`.
 

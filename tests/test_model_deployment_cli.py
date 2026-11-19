@@ -373,6 +373,34 @@ def test_create_dry_run_validates_and_prints_the_spec_without_a_client(tmp_path,
     assert json.loads(stdout.getvalue())["deployment"]["gpu_type"] == "H200"
 
 
+def test_create_dry_run_keeps_engine_options(tmp_path):
+    spec_path = tmp_path / "deployment.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "deployment": {
+                    "class": "EVALUATION",
+                    "min_replicas": 1,
+                    "gpus_per_replica": 8,
+                    "gpu_type": "H200",
+                },
+                "source": {"type": "base_model", "model": "Qwen/Qwen3-1.7B"},
+                "inference": {"max_seq_len": 16384, "vllm_config": {"max_num_seqs": 512}},
+            }
+        )
+    )
+    stdout = io.StringIO()
+
+    result = cli.main(
+        ["model-deployment", "create", "--spec", str(spec_path), "--dry-run"],
+        stdout=stdout,
+        stderr=io.StringIO(),
+    )
+
+    assert result == 0
+    assert json.loads(stdout.getvalue())["inference"]["vllm_config"] == {"max_num_seqs": 512}
+
+
 def test_create_dry_run_reports_spec_errors(tmp_path):
     spec_path = tmp_path / "deployment.json"
     spec_path.write_text(json.dumps({"deployment": {"class": "EVALUATION"}}))
