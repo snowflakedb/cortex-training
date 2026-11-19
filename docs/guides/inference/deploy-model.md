@@ -37,8 +37,10 @@ using the LoRA settings of the training job.
 
 `gpus_per_replica` (1, 2, 4, or 8) is each replica's tensor-parallel size, and
 `min_replicas * gpus_per_replica` must be at most 8 or a multiple of 8. Which
-models can be deployed is decided by the server. Check a spec without creating
-anything:
+models can be deployed is decided by the server. Engine options go in
+`inference.vllm_config` and are sent unchanged, once they are enabled for your
+account (see the [REST API reference](../../reference/rest-api.md#142-deployment-spec)).
+Check a spec without creating anything:
 
 ```bash
 cortex-training model-deployment create --spec deployment.json --dry-run
