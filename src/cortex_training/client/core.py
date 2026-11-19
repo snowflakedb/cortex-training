@@ -1762,23 +1762,31 @@ def _model_deployment_metadata(
         raise ValueError("the requested resource is not a model deployment")
     inference_config = sub_job[WIRE_INFERENCE_CONFIG]
     vllm_config = inference_config.get(WIRE_VLLM_CONFIG)
+    if vllm_config is None:
+        # Optional on the server; deployments created by other tools omit it.
+        vllm_config = {}
     if not isinstance(vllm_config, dict):
         raise ValueError(
-            f"invalid marked deployment: {WIRE_INFERENCE_CONFIG}.{WIRE_VLLM_CONFIG} is required"
+            f"invalid marked deployment: {WIRE_INFERENCE_CONFIG}.{WIRE_VLLM_CONFIG} must be an object"
         )
 
     # Every count the server stored for the deployment must be a positive whole
     # number. The error location is built from the key so the two cannot drift
     # apart.
     vllm_location = f"{WIRE_INFERENCE_CONFIG}.{WIRE_VLLM_CONFIG}"
-    replicas, total_gpus, max_seq_len, gpus_per_replica, max_model_len = (
-        _deployment_int(container.get(key), location=f"{location}.{key}")
-        for container, location, key in (
-            (inference_config, WIRE_INFERENCE_CONFIG, WIRE_NUM_REPLICAS),
-            (inference_config, WIRE_INFERENCE_CONFIG, WIRE_N_GPUS),
-            (inference_config, WIRE_INFERENCE_CONFIG, WIRE_MAX_SEQ_LEN),
-            (vllm_config, vllm_location, WIRE_TENSOR_PARALLEL_SIZE),
-            (vllm_config, vllm_location, WIRE_MAX_MODEL_LEN),
+    replicas, total_gpus, max_seq_len = (
+        _deployment_int(inference_config.get(key), location=f"{WIRE_INFERENCE_CONFIG}.{key}")
+        for key in (WIRE_NUM_REPLICAS, WIRE_N_GPUS, WIRE_MAX_SEQ_LEN)
+    )
+    # Unset engine sizes take the values the server runs with: one GPU per
+    # replica and a context of max_seq_len.
+    gpus_per_replica, max_model_len = (
+        default
+        if vllm_config.get(key) is None
+        else _deployment_int(vllm_config[key], location=f"{vllm_location}.{key}")
+        for key, default in (
+            (WIRE_TENSOR_PARALLEL_SIZE, 1),
+            (WIRE_MAX_MODEL_LEN, max_seq_len),
         )
     )
     if total_gpus != replicas * gpus_per_replica:
@@ -3806,6 +3814,8 @@ class CortexTrainingClient:
     ) -> list[dict[str, Any]]:
         """Return sanitized metadata for every marked deployment in scope.
 
+        A record this client cannot read is skipped with a logged warning.
+
         ``status`` keeps only deployments in the given deployment status(es),
         e.g. ``"READY"`` or ``["PENDING", "INITIALIZING"]`` (case-insensitive).
         """
@@ -3813,7 +3823,12 @@ class CortexTrainingClient:
         deployments = []
         for job in self._list_model_deployment_jobs():
             deployment_id = _deployment_id_from_job_id(job.get(JOB_FIELD_JOB_ID))
-            metadata = _model_deployment_metadata(job, deployment_id)
+            try:
+                metadata = _model_deployment_metadata(job, deployment_id)
+            except ValueError as error:
+                # One record this client cannot read must not hide the others.
+                logger.warning("skipping deployment %s: %s", deployment_id, error)
+                continue
             if wanted is None or metadata[OUT_STATUS] in wanted:
                 deployments.append(metadata)
         return deployments

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import ssl
 from dataclasses import replace
 from pathlib import Path
@@ -1047,7 +1048,8 @@ def _broken(**changes):
         (_broken(num_replicas=0), "num_replicas must be a positive integer"),
         (_broken(num_replicas=2.5), "num_replicas must be a positive integer"),
         (_broken(num_replicas=True), "num_replicas must be a positive integer"),
-        (_broken(vllm_config=None), "vllm_config is required"),
+        (_broken(vllm_config="tp=2"), "vllm_config must be an object"),
+        (_broken(tensor_parallel_size=0), "tensor_parallel_size must be a positive integer"),
         (_broken(n_gpus=7.0), "inconsistent replica GPU totals"),
         (_broken(max_model_len=4096.0), "inconsistent sequence lengths"),
         (_broken(model_name=""), "model_name must be a non-empty string"),
@@ -1061,6 +1063,31 @@ def _broken(**changes):
 def test_metadata_rejects_a_broken_stored_deployment(job, error):
     with pytest.raises(ValueError, match=error):
         client_module._model_deployment_metadata(job, DEPLOYMENT_ID)
+
+
+def test_metadata_reads_a_deployment_stored_without_vllm_config():
+    # The server does not require vllm_config, and deployments created by other
+    # tools leave it out. Unset sizes are the ones the server runs with.
+    job = _broken(vllm_config=None, num_replicas=2.0, n_gpus=2.0)
+
+    metadata = client_module._model_deployment_metadata(job, DEPLOYMENT_ID)
+
+    assert (metadata["replicas"], metadata["gpus_per_replica"]) == (2, 1)
+    assert metadata["max_seq_len"] == 8192
+
+
+def test_metadata_reads_a_vllm_config_without_max_model_len():
+    job = marked_job()
+    del job["sub_jobs"][0]["inference_config"]["vllm_config"]["max_model_len"]
+
+    metadata = client_module._model_deployment_metadata(job, DEPLOYMENT_ID)
+
+    assert (metadata["gpus_per_replica"], metadata["max_seq_len"]) == (2, 8192)
+
+
+def test_metadata_without_vllm_config_still_checks_the_gpu_total():
+    with pytest.raises(ValueError, match="inconsistent replica GPU totals"):
+        client_module._model_deployment_metadata(_broken(vllm_config=None), DEPLOYMENT_ID)
 
 
 def test_metadata_rejects_a_job_that_is_not_a_deployment():
@@ -1370,6 +1397,22 @@ def test_list_reports_deployments_with_models_and_shapes_this_client_does_not_kn
     assert len(deployments) == 3
     assert deployments[1]["model_source"] == {"type": "base_model", "model": "Qwen/Qwen3-72B"}
     assert (deployments[2]["replicas"], deployments[2]["gpus_per_replica"]) == (3, 4)
+
+
+def test_list_skips_a_record_it_cannot_read_and_warns(caplog):
+    unreadable = _broken(model_name="")
+    unreadable["job_id"] = "22345678-1234-4234-8234-123456789abc"
+    instance = client()
+    instance.list_jobs = MagicMock(return_value=[unreadable, marked_job()])
+
+    with caplog.at_level(logging.WARNING, logger="cortex_training"):
+        deployments = instance.list_model_deployments()
+
+    assert [d["deployment"] for d in deployments] == [DEPLOYMENT_ID]
+    assert (
+        "skipping deployment sf-ct-22345678-1234-4234-8234-123456789abc: "
+        "marked deployment model_name must be a non-empty string"
+    ) in caplog.messages
 
 
 def test_missing_hardware_is_reported_as_unknown_not_h200():
