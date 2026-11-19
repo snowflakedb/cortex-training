@@ -29,6 +29,11 @@ from typing import Any
 
 import requests
 
+__all__ = [
+    "AccountJobListUnavailable",
+    "InvalidPageToken",
+]
+
 # The service's message when the route is deployed but not enabled for the
 # account. Any other 404 means the route is missing; the service sends those
 # with an empty body.
@@ -39,27 +44,19 @@ _SERVICE_MESSAGE_LIMIT = 300
 
 
 class AccountJobListUnavailable(requests.exceptions.HTTPError):
-    """The account-level job list is not available to this caller.
+    """Raised when account-level job listing isn't available to you.
 
-    Raised by :meth:`CortexTrainingClient.list_jobs_page` at once, without
-    retries. ``reason`` is one of:
+    `list_jobs_page` raises it at once, without retrying. It's a `requests.HTTPError`, and
+    `response` is the service's answer. The `reason` attribute is one of:
 
-    - ``"not_deployed"``: 404 without the service's not-enabled error, normally
-      with an empty body: the service does not have the route yet. With some
-      other body, a proxy in front of the service may have answered instead.
-    - ``"disabled"``: 404 whose JSON body says account-level job listing is not
-      enabled for this account.
-    - ``"forbidden"``: 403. When the answer carries the service's reason, the
-      message quotes it. A 403 without one can also come from a network policy
-      or a proxy in front of the service.
-    - ``"rest_disabled"``: 405. The Cortex Training REST API is turned off for
-      the account.
+    - `"not_deployed"`: The service doesn't have account-level listing yet.
+    - `"disabled"`: Account-level listing isn't enabled for your account.
+    - `"forbidden"`: You aren't allowed to use Cortex Training. A network policy or a proxy in
+      front of the service can also cause this.
+    - `"rest_disabled"`: The Cortex Training REST API is turned off for your account.
 
-    ``not_deployed`` and ``disabled`` concern this route only, so
-    :meth:`CortexTrainingClient.list_jobs` still lists the configured schema.
-    ``forbidden`` and ``rest_disabled`` mostly come from gates the per-schema
-    routes share. A subclass of ``requests.HTTPError``; ``response`` is the
-    service's answer, and ``str()`` is one line.
+    With `"not_deployed"` and `"disabled"`, `list_jobs` still lists the jobs in the client's
+    database and schema.
     """
 
     NOT_DEPLOYED = "not_deployed"
@@ -86,10 +83,10 @@ class AccountJobListUnavailable(requests.exceptions.HTTPError):
 
 
 class InvalidPageToken(requests.exceptions.HTTPError):
-    """The service could not open a ``page_token``: 400 ``Invalid page_token``.
+    """Raised when the service can't use a `page_token` that you passed to `list_jobs_page`.
 
-    It happens, for example, after the service rotates the key that seals its
-    tokens. Start the walk again from the first page.
+    It can happen, for example, after the service rotates the key that seals page tokens. Start
+    again from the first page. It's a `requests.HTTPError`.
     """
 
 
@@ -103,6 +100,9 @@ def page_error(
     """The typed error for a failed page, or None when the answer is not one of them.
 
     ``messages`` are the ``message`` strings found in the answer's JSON body.
+
+    Returns:
+        The error, or `None`.
     """
     reason = _unavailable_reason(response.status_code, messages)
     if reason is not None:

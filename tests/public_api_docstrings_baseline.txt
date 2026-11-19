@@ -1,0 +1,3 @@
+# Public API docstring violations that are accepted for now. See "Public API docstrings"
+# in AGENTS.md. One per line: `<qualname>: <rule> <detail>  # reason`. Remove an entry
+# when you fix it; the test fails on an entry that no longer occurs.

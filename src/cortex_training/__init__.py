@@ -32,6 +32,8 @@ from .client import InferenceConfig
 from .client import InvalidPageToken
 from .client import JobType
 from .client import ModelDeploymentSpec
+from .client import ModelDeploymentWaitError
+from .client import ModelDeploymentWaitTimeout
 from .client import SubJobConfig
 from .client import TrainingConfig
 from .client import build_forward_backward_kwargs
@@ -59,6 +61,8 @@ __all__ = [
     "InferenceConfig",
     "JobType",
     "ModelDeploymentSpec",
+    "ModelDeploymentWaitError",
+    "ModelDeploymentWaitTimeout",
     "Hardware",
     "wire",
     "__version__",

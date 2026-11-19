@@ -622,7 +622,7 @@ def test_drop_rejects_non_deployment_job():
         instance.drop_model_deployment(DEPLOYMENT_ID)
 
     instance.get_job.assert_called_once_with(
-        JOB_ID, retry_on=client_module._is_transient_unless_job_not_found
+        JOB_ID, _retry_on=client_module._is_transient_unless_job_not_found
     )
     instance.cancel_job.assert_not_called()
 
@@ -640,7 +640,7 @@ def test_drop_is_idempotent_when_direct_get_says_job_not_found():
         "dropped": True,
     }
     instance.get_job.assert_called_once_with(
-        JOB_ID, retry_on=client_module._is_transient_unless_job_not_found
+        JOB_ID, _retry_on=client_module._is_transient_unless_job_not_found
     )
     instance.cancel_job.assert_not_called()
 
@@ -722,7 +722,7 @@ def test_drop_propagates_non_404_direct_get_error():
 
     assert JOB_ID not in str(exc_info.value).replace(DEPLOYMENT_ID, "")
     instance.get_job.assert_called_once_with(
-        JOB_ID, retry_on=client_module._is_transient_unless_job_not_found
+        JOB_ID, _retry_on=client_module._is_transient_unless_job_not_found
     )
     instance.cancel_job.assert_not_called()
 

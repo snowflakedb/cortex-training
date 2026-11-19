@@ -41,6 +41,7 @@ dev = [
     "black>=22.0.0",
     "flake8>=5.0.0",
     "mypy>=0.990",
+    "ruff==0.17.5",
 ]
 
 [tool.setuptools]
@@ -57,3 +58,32 @@ cortex_training = ["skills/*/*.md"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+
+# Docstring lint for the public API; see "Public API docstrings" in AGENTS.md.
+# Run it with `ruff check`. `include` lists the modules that define the names in
+# cortex_training.__all__ (tests/test_public_api_docstrings.py keeps it complete),
+# and Ruff reads each module's own `__all__` to tell public from internal for D1xx.
+[tool.ruff]
+include = [
+    "src/cortex_training/client/_account_jobs.py",
+    "src/cortex_training/client/core.py",
+    "src/cortex_training/model_deployment.py",
+    "src/cortex_training/_artifact_download.py",
+]
+
+[tool.ruff.lint]
+# The pydoclint (DOC) rules are still preview rules, so enable them by explicit code.
+preview = true
+explicit-preview-rules = true
+# DOC502 (documented exception not raised in the body) is left out: it can't see an
+# exception that a helper or a library raises, so it flags accurate Raises sections.
+select = ["D", "DOC102", "DOC201", "DOC202", "DOC402", "DOC403", "DOC501"]
+# Magic methods aren't documented API.
+ignore = ["D105"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.pydoclint]
+# Internal helpers have one-line docstrings that don't need a Returns or Raises section.
+ignore-one-line-docstrings = true
