@@ -3850,8 +3850,10 @@ Client-side checks (all others are left to the server):
 | Field | Rule |
 |---|---|
 | every object | no unknown keys; an error names both unknown and missing keys, so a typo such as `min_replica` is reported as such |
-| `deployment.class` | exactly `"EVALUATION"`; only `EVALUATION` is supported today |
-| `source.type` | `base_model` or `checkpoint`; every source field a non-empty string |
+| `deployment.class` | `"EVALUATION"` or `"PRODUCTION"`; `PRODUCTION` needs a `checkpoint` or `registry_model` source and `gpus_per_replica` 1 |
+| `deployment.name` | optional, `PRODUCTION` only; a non-empty string |
+| `source.type` | `base_model`, `checkpoint`, or `registry_model`; every source field a non-empty string |
+| `registry_model` source | `model` and `version` required; `gpus_per_replica` must be `1` |
 | counts | positive integers (`true`/`false` and fractions rejected) |
 | `deployment.gpu_type` | `H200`, `B200`, or `B300`, case-insensitive |
 | `gpus_per_replica` | 1, 2, 4, or 8 |
@@ -3869,6 +3871,25 @@ The spec becomes a `POST /` body with `idle_timeout_seconds: 0`, top-level
 `inference_config.vllm_config.{tensor_parallel_size, max_model_len}`, and
 `source_checkpoint_info: {source_job_id, checkpoint_id}` for a checkpoint
 source. `n_gpus` is `min_replicas * gpus_per_replica`.
+
+A `registry_model` source, `{"type": "registry_model", "model": "[[db.]schema.]name", "version": "V1"}`,
+serves a registered Model Registry version ([section 16](#16-registered-model-versions)).
+It is sent to `POST /deployments` instead, as
+`{"deployment": {class, min_replicas, gpu_type}, "source": {"type": "registry_model",
+"registry_model": {"name", "version"}}, "inference": {"max_seq_len"}}`; the server reads the
+version's base model and folders, and chooses the GPUs per replica. Read back, such a
+deployment shows `{"type": "registry_model", "model": <base model>}`: the job keeps the
+version's folders, not its name.
+
+A `PRODUCTION` deployment always goes to `POST /deployments` with a
+`registry_model` source. With a `checkpoint` source the client first calls
+`:register` ([section 16](#16-registered-model-versions)), waits for it, and
+finds the new version by its `source_job` / `source_checkpoint` metadata; the
+server does not register implicitly. `drop` ends a `PRODUCTION` deployment
+with `DELETE /deployments/sf-ct-<UUID>`, since job cancel refuses it. It sends
+the DELETE whatever the status: a failed or ended `PRODUCTION` deployment keeps
+its MODEL DEPLOYMENT record until then, and the server refuses to drop a model
+a record names.
 
 ### 14.3 Statuses
 
@@ -4079,3 +4100,42 @@ These are current gaps, not supported API behavior:
    completions ([section 14.8](#148-calling-a-deployment)). Use
    `list_model_deployments` or `cortex-training model-deployment list` to find
    deployments.
+
+## 16. Registered model versions
+
+`POST /{job_id}/checkpoints/{checkpoint_id}:register` registers a saved
+`weights-only` checkpoint as a Snowflake Model Registry version of type
+`CORTEX_TRAINING`. The body is `{model?, version?, comment?}`; `model` is
+`[[db.]schema.]name`. Without `model` and `version` the server uses
+`JOB_<job id>` and `CP_<checkpoint id>`, with the hyphens removed and the IDs
+upper-cased.
+
+The copy runs as an asynchronous SQL statement in the caller's session and
+role. The call answers:
+
+| Status | Meaning |
+|---|---|
+| 202 | started; `job_id` is the statement's query ID (the *operation*), and `Location` is its result URL |
+| 200 | this checkpoint already made that version; nothing runs |
+| 4xx | refused before anything ran (bad name, version taken, missing privilege, incomplete checkpoint) |
+
+`CortexTrainingClient.register_checkpoint` does not retry a sent call: a second
+call while the first still runs starts a second registration.
+`wait_for_registration` and `get_registration` read the operation's status
+with the Snowflake Connector's `get_query_status` (the SQL API cannot return a
+finished `CREATE MODEL`'s result), and `cancel_registration` calls
+`POST /api/v2/statements/{operation}/cancel`. A failed or cancelled
+registration leaves no model or version.
+
+`list_registered_versions` runs `SHOW MODELS` (keeping `model_type =
+CORTEX_TRAINING`) and `SHOW VERSIONS`, whose `metadata` holds `source_job`,
+`source_checkpoint`, and `registration_query_id`, and reads `kind` and
+`base_model` from each version's `model/model.yaml`.
+`drop_registered_model` first reads `SHOW MODEL DEPLOYMENTS IN SCHEMA` and
+drops nothing while a named deployment still serves the model or version,
+unless `force`; it then runs `DROP MODEL` or `ALTER MODEL ... DROP VERSION`.
+The server itself refuses both while a named deployment uses the model
+(`402156`, "Model is being used by MODEL DEPLOYMENT"), and refuses dropping a
+model's only version (`092958`) or its default version (`092922`).
+A cancelled registration's statement ends with error `000604`, which the
+client reports as `CANCELLED`.

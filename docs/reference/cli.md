@@ -167,6 +167,18 @@ cortex-training model-deployment download-metrics sf-ct-DEPLOYMENT_UUID --output
 cortex-training model-deployment drop sf-ct-DEPLOYMENT_UUID
 ```
 
+### [Registered Models](#registered-models)
+
+```bash
+cortex-training model register --job JOB_UUID --checkpoint CHECKPOINT_ID --wait
+cortex-training model register --job JOB_UUID --checkpoint CHECKPOINT_ID --model CORTEX_TRAINING_DB.PUBLIC.SUPPORT_BOT --version V1 --comment "epoch 3"
+cortex-training model wait OPERATION_ID
+cortex-training model cancel OPERATION_ID
+cortex-training model list --job JOB_UUID --kind LORA
+cortex-training model drop SUPPORT_BOT/V1
+cortex-training model-deployment create --spec production-checkpoint.json --wait   # registers, then deploys
+```
+
 ### [Output And Help](#json-output-and-help)
 
 ```bash
@@ -1081,8 +1093,9 @@ cortex-training model-deployment create \
 customer-supplied stage credentials are not accepted. A checkpoint source
 names only `job_id` and `checkpoint_id`; the model is read from the source
 job. Base-model sources use `{"type": "base_model", "model": "Qwen/Qwen3-1.7B"}`
-instead. The `deployment` object sets `class` (only `EVALUATION` is supported
-today), `min_replicas`, `gpus_per_replica` (1, 2, 4, or 8), and `gpu_type`
+instead. The `deployment` object sets `class` (`EVALUATION`, or `PRODUCTION`
+for a checkpoint or registered-version source; see
+[Registered Models](#registered-models)), `min_replicas`, `gpus_per_replica` (1, 2, 4, or 8), and `gpu_type`
 (`H200`, `B200`, or `B300`, in any case); `min_replicas * gpus_per_replica`
 must be at most 8 or a multiple of 8. `create --help` shows a full example
 spec, and `create --dry-run` checks a spec and prints it without connecting.
@@ -1191,6 +1204,76 @@ $BASE_URL/models` can return an empty list while a deployment is `READY`
 ([known limitation 6](rest-api.md#15-known-limitations)). The full request and
 response behavior is in
 [REST API reference section 14.8](rest-api.md#148-calling-a-deployment).
+
+### Registered Models
+
+`cortex-training model` turns a saved `weights-only` checkpoint into a
+Snowflake Model Registry version (type `CORTEX_TRAINING`) and manages those
+versions, with no SQL. See
+[REST API reference section 16](rest-api.md#16-registered-model-versions).
+
+`register` needs `--job` and `--checkpoint`. `--model` is
+`[[database.]schema.]name` (the job's database and schema when left out) and
+is created if it does not exist; `--version` names the version. Without them
+the version is `JOB_<job>/CP_<checkpoint>`, with the hyphens removed and the
+IDs upper-cased. The copy runs on the server, so `register` prints at once:
+
+```json
+{"operation": "OPERATION_ID", "status": "RUNNING"}
+```
+
+`--wait` (or `model wait OPERATION_ID`) polls until the registration ends and
+prints `SUCCEEDED`, or `FAILED` / `CANCELLED` with the server's `error`, and
+exits `1` for those two. Registering the same checkpoint into the same version
+again prints `{"status": "ALREADY_REGISTERED", "message": ...}` and exits `0`.
+`model cancel OPERATION_ID` stops a running registration; a failed or
+cancelled registration leaves no model or version behind.
+
+`list` shows every registered version in the schema with its `kind` (`FULL`
+or `LORA`), `base_model`, `source_job`, `source_checkpoint`, `created_on`,
+and `comment`. `--job` and `--kind` filter the rows.
+
+`drop MODEL` drops a model and `drop MODEL/VERSION` one version. If a named
+model deployment still serves it, nothing is dropped and `drop` exits `1`,
+listing those deployments: Snowflake refuses to drop a model or version that a
+named deployment uses, so drop the deployment first. `--force` skips this
+check and sends the drop anyway (Snowflake still refuses it). EVALUATION
+deployments keep no record of the version they serve, so they are not
+checked: their running replicas keep serving, but a restart or scale-out
+fails. Snowflake also refuses to drop a model's only version or its default
+version; drop the whole model, or set another default, instead.
+
+`model-deployment create` also takes a registered version as its source,
+`{"type": "registry_model", "model": "[[database.]schema.]name", "version": "V1"}`
+(`gpus_per_replica` must be `1`). The client sends the model fully qualified,
+filling in `--database` and `--schema`.
+
+A `PRODUCTION` deployment with a checkpoint source registers the checkpoint
+first: it registers it as `JOB_<job>/CP_<checkpoint>` (or `--model` /
+`--version`), waits for the registration, and deploys that version, in one
+command. Registering the same checkpoint again reuses its version. A
+`PRODUCTION` deployment may set `deployment.name`, uses `gpus_per_replica` 1,
+and cannot use a `base_model` source. An `EVALUATION` deployment with a
+checkpoint source still serves the checkpoint directly; `--register` makes it
+register first too.
+
+```bash
+cortex-training model-deployment create --spec production-checkpoint.json --wait
+```
+
+```json
+{
+  "deployment": {"class": "PRODUCTION", "name": "SUPPORT_BOT", "min_replicas": 2,
+                 "gpus_per_replica": 1, "gpu_type": "H200"},
+  "source": {"type": "checkpoint", "job_id": "TRAINING_JOB_UUID", "checkpoint_id": "CHECKPOINT_ID"},
+  "inference": {"max_seq_len": 8192}
+}
+```
+
+`model-deployment drop` ends a `PRODUCTION` deployment through the
+deployments route, which also frees its name; job cancel refuses it. A
+`PRODUCTION` deployment that has already failed or ended keeps its record, and
+the record keeps its model from being dropped, so `drop` removes it too.
 
 ### Job TUI
 

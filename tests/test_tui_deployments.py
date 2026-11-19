@@ -46,7 +46,9 @@ def _training():
 
 def test_the_cli_s_rule_tells_a_deployment_apart():
     assert v.is_deployment(_deployment())
-    assert not v.is_deployment(_deployment(cls="PRODUCTION"))  # not one until the CLI's rule says so
+    assert v.is_deployment(_deployment(cls="PRODUCTION"))
+    assert v.deployment_class(_deployment(cls="PRODUCTION")) == "PRODUCTION"
+    assert not v.is_deployment(_deployment(cls="STAGING"))
     assert not v.is_deployment(_sampling())
     assert not v.is_deployment(_training())
     assert not v.is_deployment({"job_id": "1"})  # an old record without sub-jobs stays a job
