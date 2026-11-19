@@ -62,7 +62,7 @@ class FakeSession:
         return self.response
 
 
-@pytest.mark.parametrize("name", ["base-model.json", "checkpoint.json"])
+@pytest.mark.parametrize("name", ["base-model.json", "checkpoint.json", "external.json"])
 def test_shipped_specs_are_valid(name):
     spec = json.loads((EXAMPLE_DIR / "configs" / name).read_text())
     assert ModelDeploymentSpec.from_dict(spec).to_public_spec() == spec

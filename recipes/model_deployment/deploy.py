@@ -15,10 +15,11 @@
 
 """Deploy a model and stream a chat completion from its OpenAI-compatible endpoint.
 
-Creates a model deployment from a spec (a base model or a weights-only
-checkpoint), waits until it is READY, streams one reply, and drops the
-deployment unless ``keep_deployment=True``. Pass ``deployment=sf-ct-<UUID>`` to
-call a deployment that is already running instead of creating one.
+Creates a model deployment from a spec (a base model, a weights-only
+checkpoint, or weights imported from a stage), waits until it is READY,
+streams one reply, and drops the deployment unless ``keep_deployment=True``.
+Pass ``deployment=sf-ct-<UUID>`` to call a deployment that is already running
+instead of creating one.
 """
 
 from __future__ import annotations
