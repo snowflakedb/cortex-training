@@ -56,21 +56,21 @@ class DatabaseSetupError(RuntimeError):
     """A CREATE for the database or schema failed; the message says what to do."""
 
 
-def run_statement(client: Any, statement: str) -> list[dict[str, Any]]:
+def run_statement(client: Any, statement: str, *, timeout: int = 60) -> list[dict[str, Any]]:
     """Run one SQL statement with ``client``'s sign-in and return its rows.
 
     Profile clients use their Connector session, because the SQL API does not
-    accept its session token; PAT clients use the SQL API. Each row maps
-    lower-case column names to values. Raises when the statement fails or has
-    not finished.
+    accept its session token; PAT clients use the SQL API, whose large results
+    come in several partitions: every one is read. Each row maps lower-case
+    column names to values. Raises when the statement fails or has not finished.
     """
     auth = client._auth_provider
     if auth is not None:
-        return _run_on_session(auth, statement)
+        return _run_on_session(auth, statement, timeout)
     resp = client._send(
         "POST",
         f"{client.base_url}/api/v2/statements",
-        json={"statement": statement, "timeout": 60},
+        json={"statement": statement, "timeout": timeout},
         max_retries=1,
         explain_database=False,
     )
@@ -82,16 +82,34 @@ def run_statement(client: Any, statement: str) -> list[dict[str, Any]]:
     if not isinstance(row_type, list) or not isinstance(data, list):
         raise RuntimeError(f"Unexpected SQL API response for: {statement}")
     columns = [str(column.get("name", "")).lower() for column in row_type]
-    return [dict(zip(columns, row)) for row in data]
+    rows = list(data)
+    # The first partition comes with the reply; fetch the rest by the statement's handle.
+    partitions = body.get("resultSetMetaData", {}).get("partitionInfo") or []
+    handle = body.get("statementHandle")
+    if len(partitions) > 1 and not handle:
+        raise RuntimeError(f"SQL API reply has {len(partitions)} partitions but no statement handle: {statement}")
+    for number in range(1, len(partitions)):
+        part = client._send(
+            "GET",
+            f"{client.base_url}/api/v2/statements/{handle}",
+            params={"partition": number},
+            max_retries=1,
+            explain_database=False,
+        ).json()
+        more = part.get("data") if isinstance(part, dict) else None
+        if not isinstance(more, list):
+            raise RuntimeError(f"Unexpected SQL API partition {number} for: {statement}")
+        rows.extend(more)
+    return [dict(zip(columns, row)) for row in rows]
 
 
-def _run_on_session(auth: Any, statement: str) -> list[dict[str, Any]]:
+def _run_on_session(auth: Any, statement: str, timeout: int = 60) -> list[dict[str, Any]]:
     auth._ensure_process()
     with auth._lock:
         auth._require_open()
         cursor = auth._connection.cursor()
         try:
-            cursor.execute(statement, timeout=60)
+            cursor.execute(statement, timeout=timeout)
             columns = [column[0].lower() for column in cursor.description or ()]
             return [dict(zip(columns, row)) for row in cursor.fetchall()]
         finally:

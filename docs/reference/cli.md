@@ -385,9 +385,32 @@ cortex-training login training   # use or create the profile "training"
    to check a new one.
 
 A passing check (`✓ Connected to Cortex Training on this account`) means the
-profile connects to Cortex Training on that account. It doesn't test every
-privilege an operation can need, so login and `--convert-legacy-config` end by
-saying so: if your role lacks one, that operation's error says which.
+profile connects to Cortex Training on that account. Login, and
+`--convert-legacy-config`, then check whether the role can **create training
+jobs**: it needs `CREATE EXPERIMENT` on the schema (each job creates its own
+experiment) and `USE CORTEX TRAINING` on the account (see
+[Access control](rest-api.md#37-access-control)). Both are read-only checks of
+the role's grants, including ones it inherits. As when a job is created, only
+the primary role counts for `CREATE EXPERIMENT`, and active secondary roles
+count too for `USE CORTEX TRAINING`.
+
+- `✓ Role R can create training jobs in DB.SCHEMA`: ready.
+- `! Role R can't create training jobs yet`: it lists what's missing and the
+  `GRANT` statements to ask an account admin for. The profile still signs in and
+  reaches Cortex Training, so it's saved, and login ends with "Saved, but not
+  ready for training" instead of "You're all set". Run `cortex-training login`
+  again once the privileges are granted.
+- `! Role R doesn't have USE CORTEX TRAINING yet`: until Snowflake enforces
+  that privilege, jobs still start without it, so this is a heads-up with the
+  `GRANT` to ask for, and login still ends with "You're all set".
+- `? Could not check whether role R can create training jobs`: the check
+  couldn't run; login carries on.
+
+Other operations, such as a job that joins an existing experiment (it needs
+`MODIFY` on that experiment), can need more privileges; if one is refused, its
+error says which. When stdout is piped, the JSON summary includes
+`ready_for_training` (`true`, `false`, or `null` if it couldn't check) and
+`missing_privileges`.
 
 If your profile file names a profile more than once (for example, a profile
 pasted in twice), Snowflake can't read the file, so no profile in it works.

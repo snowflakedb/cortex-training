@@ -8,6 +8,7 @@ import pytest
 
 import cortex_training.cli.commands as _cli
 from cortex_training import _database_setup
+from cortex_training import _job_access
 from cortex_training import _login
 from cortex_training import _picker
 from cortex_training import _profiles
@@ -27,7 +28,22 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(_database_setup, "missing", lambda client: client.missing())
     monkeypatch.setattr(_database_setup, "is_listed", lambda client, kind, name: client.is_listed(kind, name))
     monkeypatch.setattr(_database_setup, "create", lambda client, objects: client.create(objects))
+    monkeypatch.setattr(_job_access, "check", fake_job_access)
     return snowflake
+
+
+def fake_job_access(client, role):
+    """The job-creation check, answered from the fake world: ready unless a test says otherwise."""
+    world = client.world
+    role = role or "your role"
+    if getattr(world, "job_access_unknown", None):
+        return _job_access.JobAccess(role=role, unknown=world.job_access_unknown)
+    missing = []
+    for privilege in getattr(world, "missing_privileges", ()):
+        on = "the account" if privilege == _job_access.USE_CORTEX_TRAINING else f"schema {client.database}.{client.schema}"
+        target = "ACCOUNT" if privilege == _job_access.USE_CORTEX_TRAINING else f"SCHEMA {client.database}.{client.schema}"
+        missing.append(_job_access.Missing(privilege, on, f"GRANT {privilege} ON {target} TO ROLE {role};"))
+    return _job_access.JobAccess(role=role, missing=tuple(missing))
 
 
 def write_profiles(snowflake, text):
@@ -1091,9 +1107,52 @@ def test_login_says_what_its_checks_dont_cover(isolated):
     assert code == 0, err
     assert "Connected to Cortex Training on this account" in err
     assert "Cortex Training is enabled on this account" not in err
+    # Job creation was checked, so the note only covers what the checks don't.
+    assert "✓ Role TRAINER can create training jobs in TRAIN_DB.PUBLIC" in err
+    assert "Other operations, such as joining an existing experiment, can need more privileges;" in err
+    assert "Your role may still lack" not in err
+
+
+def test_the_general_note_stays_when_job_creation_couldnt_be_checked(isolated):
+    write_profiles(isolated, PROFILES)
+    _picker.save_profile("train")
+    world = World(databases={"TRAIN_DB"})
+    world.job_access_unknown = "SQL compilation error"
+    code, _, err = login(world, ["", ""])
+    assert code == 0, err
+    assert "? Could not check whether role TRAINER can create training jobs (SQL compilation error); continuing" in err
+    assert "You're all set." in err
     assert "This profile connects to Cortex Training on this account. Your role may still lack" in err
-    assert "privileges that some operations need; if one is refused, its error says which." in err
-    assert "USE CORTEX TRAINING" not in err
+
+
+def test_a_role_missing_job_privileges_is_saved_but_not_ready(isolated):
+    # It still signs in and reaches Cortex Training: a warning with the GRANTs, and the profile is saved.
+    write_profiles(isolated, PROFILES)
+    _picker.save_profile("train")
+    world = World(databases={"TRAIN_DB"})
+    world.missing_privileges = (_job_access.CREATE_EXPERIMENT, _job_access.USE_CORTEX_TRAINING)
+    code, summary, err = login(world, ["", ""])
+    assert code == 0, err
+    assert "! Role TRAINER can't create training jobs yet. It needs:" in err
+    assert "      - CREATE EXPERIMENT on schema TRAIN_DB.PUBLIC" in err
+    assert "      - USE CORTEX TRAINING on the account" in err
+    assert "    Ask an account admin to run:" in err
+    assert "GRANT CREATE EXPERIMENT ON SCHEMA TRAIN_DB.PUBLIC TO ROLE TRAINER;" in err
+    assert "GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE TRAINER;" in err
+    assert "Saved, but not ready for training. Cortex Training will use profile train." in err
+    assert "It signs in, and the account has Cortex Training, but role TRAINER can't create" in err
+    assert "You're all set." not in err
+    assert config() == {"profile": "train"}
+    assert summary["ready_for_training"] is False
+    assert summary["missing_privileges"] == ["CREATE EXPERIMENT", "USE CORTEX TRAINING"]
+
+
+def test_a_ready_role_says_so_in_the_summary(isolated):
+    write_profiles(isolated, PROFILES)
+    _picker.save_profile("train")
+    code, summary, err = login(World(databases={"TRAIN_DB"}), ["", ""])
+    assert code == 0, err
+    assert summary["ready_for_training"] is True and summary["missing_privileges"] == []
 
 
 def test_the_note_is_yellow_in_a_terminal(isolated, monkeypatch):
@@ -1109,7 +1168,7 @@ def test_the_note_is_yellow_in_a_terminal(isolated, monkeypatch):
     stderr = Terminal()
     code = _login.run_login(None, stdin=io.StringIO("\n\n"), stdout=io.StringIO(), stderr=stderr, interactive=True, open_client=world.open)
     assert code == 0
-    assert f"\x1b[33m{_login.PRIVILEGE_NOTE[0]}\x1b[0m" in stderr.getvalue()
+    assert f"\x1b[33m{_login.CHECKED_NOTE[0]}\x1b[0m" in stderr.getvalue()
 
 
 # ─── A profile name used twice ──────────────────────────────────────────────
@@ -1154,3 +1213,18 @@ def test_keeping_the_saved_profile_offers_the_same_database_choice_as_login_name
     assert "It works. Keep using train?" in err
     assert "Profile train uses database TRAIN_DB." in err and "Which database should Cortex Training use?" in err
     assert summary["profile"] == "train"
+
+
+def test_only_use_cortex_training_missing_is_a_heads_up_until_enforced(isolated):
+    # Snowflake doesn't enforce it yet, so jobs still start: ready, with the GRANT to ask for.
+    write_profiles(isolated, PROFILES)
+    _picker.save_profile("train")
+    world = World(databases={"TRAIN_DB"})
+    world.missing_privileges = (_job_access.USE_CORTEX_TRAINING,)
+    code, summary, err = login(world, ["", ""])
+    assert code == 0, err
+    assert "✓ Role TRAINER can create training jobs in TRAIN_DB.PUBLIC" in err
+    assert "! Role TRAINER doesn't have USE CORTEX TRAINING yet. Creating training jobs will need it once Snowflake enforces it." in err
+    assert "GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE TRAINER;" in err
+    assert "You're all set." in err and "not ready for training" not in err
+    assert summary["ready_for_training"] is True and summary["missing_privileges"] == ["USE CORTEX TRAINING"]
