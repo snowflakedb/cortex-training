@@ -1,0 +1,18 @@
+id: vision-sft
+title: Vision-language SFT on image question answering
+status: experimental
+task: sft
+methods:
+  - lora
+models:
+  - Qwen/Qwen3.6-35B-A3B
+datasets:
+  - HuggingFaceM4/ChartQA
+dataset_revisions:
+  HuggingFaceM4/ChartQA: b605b6e08b57faf4359aeb2fe6a3ca595f99b6c5
+precision:
+  - bfloat16
+default_training_gpus: 8
+# Needs image support in the training service (Arctic-Platform and dss-platform); until that ships,
+# runs use debug_image_tag= with a dev image. The README results are from such a run.
+last_validated: 2026-11-10
