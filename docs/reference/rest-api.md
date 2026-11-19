@@ -1260,6 +1260,10 @@ Immediate response:
 {"request_id": "request-id", "job_id": "job-id"}
 ```
 
+A save can be refused with HTTP 400 when the stage credentials the service
+issued for it are within 30 minutes of expiring. Nothing is saved; retry the
+save, which is issued fresh credentials.
+
 On `release_20260903_175601`, the polled `weights-only` save result observed on
 2026-09-07 carries no `checkpoint_id` key:
 
