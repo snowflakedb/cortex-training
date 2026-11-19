@@ -9,10 +9,10 @@
       "training_config": {
         "n_gpus": 8,
         "max_seq_len": 32768,
-        "train_batch_size": 8,
+        "train_batch_size": 32,
         "gradient_clipping": 1.0,
         "attn_implementation": "flash_attention_3",
-        "activation_checkpointing": true,
+        "activation_checkpointing": false,
         "fused_lm_head_token_chunk_size": 8192,
         "optimizer": {
           "name": "AdamW",
@@ -25,16 +25,18 @@
           "eps": 1e-08
         },
         "ds_config": {
-          "train_batch_size": 8,
-          "train_micro_batch_size_per_gpu": 1,
-          "gradient_accumulation_steps": 1,
           "zero_optimization": {
-            "stage": 2
+            "stage": 1
           },
           "bf16": {
             "enabled": true
           }
-        }
+        },
+        "model_options": {
+          "liger": true
+        },
+        "cuda_allocator_conf": "expandable_segments:True",
+        "fused_qk_norm_rope": true
       }
     }
   ]

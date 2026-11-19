@@ -8,7 +8,6 @@
       "seed": 42,
       "training_config": {
         "n_gpus": 8,
-        "sp_size": 4,
         "max_seq_len": 65536,
         "train_batch_size": 8,
         "gradient_clipping": 1.0,
@@ -17,9 +16,11 @@
         "attn_impl": "flash_attention_3",
         "ac_config": {
           "mode": "full",
-          "freq": 1
+          "freq": 1,
+          "core_replay": "attention",
+          "combine_replay": true
         },
-        "ep_size": 8,
+        "ep_size": 4,
         "optimizer": {
           "name": "AdamW",
           "lr": 0.0001,
@@ -38,6 +39,24 @@
           "bf16": {
             "enabled": true
           }
+        },
+        "model_options": {
+          "lm_head": {
+            "cross_entropy": false,
+            "token_chunk_size": 16384
+          },
+          "moe": {
+            "sonicmoe": true,
+            "comm_sms": 64,
+            "ultraep_spares": 2,
+            "ultraep_ipc_symm": true
+          }
+        },
+        "mb_spec": {
+          "max_tokens_per_mb": 131072
+        },
+        "nccl": {
+          "proto": "Simple"
         }
       }
     }

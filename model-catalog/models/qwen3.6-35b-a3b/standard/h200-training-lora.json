@@ -21,6 +21,10 @@
           "lm_head": {
             "token_chunk_size": 8192,
             "cross_entropy": false
+          },
+          "moe": {
+            "ultraep_spares": 2,
+            "ultraep_ipc_symm": true
           }
         },
         "ep_size": 4,

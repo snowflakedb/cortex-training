@@ -10,10 +10,10 @@
         "n_gpus": 8,
         "sp_size": 2,
         "max_seq_len": 65536,
-        "train_batch_size": 8,
+        "train_batch_size": 16,
         "gradient_clipping": 1.0,
         "model_provider": "huggingface",
-        "attn_implementation": "sdpa",
+        "attn_implementation": "flash_attention_3",
         "activation_checkpointing": true,
         "fused_lm_head_token_chunk_size": 8192,
         "optimizer": {
@@ -28,16 +28,19 @@
         },
         "ds_config": {
           "zero_optimization": {
-            "stage": 2,
-            "offload_optimizer": {
-              "device": "cpu",
-              "pin_memory": false
-            }
+            "stage": 2
           },
           "bf16": {
             "enabled": true
           }
-        }
+        },
+        "model_options": {
+          "liger": true
+        },
+        "checkpoint_keep_attention": [
+          "arctic_hd512::forward"
+        ],
+        "shard_dense": true
       }
     }
   ]

@@ -7,10 +7,9 @@
       "dtype": "bfloat16",
       "seed": 42,
       "training_config": {
-        "n_gpus": 16,
+        "n_gpus": 8,
         "max_seq_len": 65536,
-        "train_batch_size": 2,
-        "sp_size": 8,
+        "train_batch_size": 8,
         "gradient_clipping": 1.0,
         "attn_implementation": "flash_attention_3",
         "activation_checkpointing": true,
@@ -32,7 +31,18 @@
           "bf16": {
             "enabled": true
           }
-        }
+        },
+        "cuda_allocator_conf": "expandable_segments:True",
+        "mb_spec": {
+          "max_tokens_per_mb": 262144
+        },
+        "checkpoint_keep_attention": true,
+        "model_options": {
+          "checkpointing": {
+            "offload": true
+          }
+        },
+        "shard_dense": true
       }
     }
   ]

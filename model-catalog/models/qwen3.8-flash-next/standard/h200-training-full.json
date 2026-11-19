@@ -1,0 +1,70 @@
+{
+  "hardware": "H200",
+  "sub_job_configs": [
+    {
+      "job_type": "training",
+      "model_name": "Qwen/Qwen3.8-Flash-Next",
+      "dtype": "bfloat16",
+      "seed": 42,
+      "training_config": {
+        "n_gpus": 32,
+        "max_seq_len": 65536,
+        "train_batch_size": 16,
+        "sp_size": 8,
+        "gradient_clipping": 1.0,
+        "model_provider": "arctic",
+        "attn_implementation": "qsa_flex",
+        "ac_config": {
+          "mode": "full",
+          "freq": 1
+        },
+        "prime_rl": {
+          "ngram_table_on_host": true
+        },
+        "ep_size": 8,
+        "optimizer": {
+          "name": "AdamW",
+          "lr": 5e-06,
+          "weight_decay": 0.0,
+          "betas": [
+            0.9,
+            0.999
+          ],
+          "eps": 1e-08
+        },
+        "ds_config": {
+          "zero_optimization": {
+            "stage": 2,
+            "overlap_comm": true,
+            "optimizer_state_swap": {
+              "fraction": 0.9,
+              "stream": true,
+              "group_gib": 2
+            }
+          },
+          "bf16": {
+            "enabled": true
+          }
+        },
+        "cuda_allocator_conf": "expandable_segments:True,pinned_max_round_threshold_mb:64",
+        "model_options": {
+          "moe": {
+            "ultraep_spares": 2,
+            "ultraep_ipc_symm": true,
+            "comm_backend": "deepep",
+            "comm_sms": 48
+          },
+          "lm_head": {
+            "token_chunk_size": 8192,
+            "cross_entropy": false
+          }
+        },
+        "nccl": {
+          "net_plugin": "ofi",
+          "tuner_plugin": "ofi"
+        },
+        "numa_bind": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,75 @@
+{
+  "hardware": "H200",
+  "sub_job_configs": [
+    {
+      "job_type": "training",
+      "model_name": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+      "dtype": "bfloat16",
+      "seed": 42,
+      "training_config": {
+        "n_gpus": 8,
+        "sp_size": 4,
+        "max_seq_len": 262144,
+        "train_batch_size": 2,
+        "gradient_clipping": 1.0,
+        "model_provider": "arctic",
+        "attn_implementation": "flash_attention_3",
+        "ac_config": {
+          "mode": "full",
+          "freq": 1,
+          "core_replay": "attention",
+          "combine_replay": true
+        },
+        "ep_size": 2,
+        "model_options": {
+          "lm_head": {
+            "cross_entropy": false
+          },
+          "moe": {
+            "sonicmoe": true,
+            "expert_replicas": 2
+          }
+        },
+        "optimizer": {
+          "name": "AdamW",
+          "lr": 2e-05,
+          "weight_decay": 0.0,
+          "betas": [
+            0.9,
+            0.999
+          ],
+          "eps": 1e-08
+        },
+        "ds_config": {
+          "zero_optimization": {
+            "stage": 2
+          },
+          "bf16": {
+            "enabled": true
+          }
+        },
+        "peft_config": {
+          "peft_type": "Lora",
+          "r": 32,
+          "lora_alpha": 32,
+          "lora_dropout": 0.0,
+          "bias": "none",
+          "target_modules": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj"
+          ],
+          "target_parameters": [
+            "experts.w1",
+            "experts.w2"
+          ]
+        },
+        "cuda_allocator_conf": "expandable_segments:True"
+      }
+    }
+  ]
+}

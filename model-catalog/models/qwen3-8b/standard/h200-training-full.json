@@ -9,7 +9,7 @@
       "training_config": {
         "n_gpus": 4,
         "max_seq_len": 32768,
-        "train_batch_size": 4,
+        "train_batch_size": 8,
         "gradient_clipping": 1.0,
         "model_provider": "huggingface",
         "attn_implementation": "flash_attention_3",
@@ -31,6 +31,18 @@
           "bf16": {
             "enabled": true
           }
+        },
+        "model_options": {
+          "liger": true
+        },
+        "checkpoint_keep_attention": true,
+        "fused_qk_norm_rope": true,
+        "mb_spec": {
+          "max_tokens_per_mb": 65536
+        },
+        "fused_lm_head_token_chunk_size": 8192,
+        "ac_config": {
+          "layers": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
         }
       }
     }

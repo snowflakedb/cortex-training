@@ -33,7 +33,12 @@
           "bf16": {
             "enabled": true
           }
-        }
+        },
+        "checkpoint_keep_attention": true,
+        "model_options": {
+          "liger": true
+        },
+        "fused_qk_norm_rope": true
       }
     }
   ]

@@ -10,21 +10,17 @@
         "n_gpus": 8,
         "max_seq_len": 262144,
         "train_batch_size": 1,
-        "sp_size": 8,
         "gradient_clipping": 1.0,
         "model_provider": "arctic",
         "attn_implementation": "flash_attention_3",
+        "attn_impl": "flash_attention_3",
         "ac_config": {
           "mode": "full",
-          "freq": 1
+          "freq": 1,
+          "core_replay": "attention",
+          "combine_replay": true
         },
-        "model_options": {
-          "lm_head": {
-            "token_chunk_size": 8192,
-            "cross_entropy": false
-          }
-        },
-        "ep_size": 4,
+        "ep_size": 2,
         "optimizer": {
           "name": "AdamW",
           "lr": 5e-06,
@@ -37,12 +33,30 @@
         },
         "ds_config": {
           "zero_optimization": {
-            "stage": 2
+            "stage": 2,
+            "reduce_scatter": true
           },
           "bf16": {
             "enabled": true
           }
-        }
+        },
+        "model_options": {
+          "lm_head": {
+            "cross_entropy": false,
+            "token_chunk_size": 16384
+          },
+          "moe": {
+            "sonicmoe": true,
+            "comm_sms": 64
+          }
+        },
+        "mb_spec": {
+          "max_tokens_per_mb": 262144
+        },
+        "nccl": {
+          "proto": "Simple"
+        },
+        "sp_size": 8
       }
     }
   ]

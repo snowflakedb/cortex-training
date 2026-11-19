@@ -69,6 +69,94 @@ The validator checks:
 - every training and inference pair builds a valid RL job, and the default
   distillation student and teacher jobs build.
 
+## H200 SFT throughput files
+
+These training files are measured H200 SFT throughput finals: for each file, the
+job with the most tokens per GPU found without GDRCopy, on the fewest nodes it
+fits. Every full-weight file keeps FP32 master weights and FP32 Adam moments.
+The files marked "fork" below run on DeepSpeed `jaelee/v3/zero-memory`
+(`61c11b39`, on DeepSpeed master `0fe80cb9`): its ZeRO-1/2
+`optimizer_state_swap` keeps the FP32 optimizer state in pinned host memory and
+streams it through the step. Every other file runs on stock DeepSpeed.
+Standard files keep their tier's `max_seq_len`. Long files, full and LoRA, train
+at 262,144 tokens, or at the model's own maximum when its context is shorter:
+Qwen3's 40,960 and Gemma 3's 131,072.
+
+| Model | Files |
+|---|---|
+| `Qwen/Qwen3-0.6B` | `standard/h200-training-full` (1 GPU), `standard/h200-training-lora` (1 GPU), `long/h200-training-full` (1 GPU), `long/h200-training-lora` |
+| `Qwen/Qwen3-1.7B` | `standard/h200-training-full`, `long/h200-training-full`, `long/h200-training-lora` |
+| `Qwen/Qwen3-4B-Instruct-2507` | `standard/h200-training-full` (1 GPU), `long/h200-training-full`, `long/h200-training-lora` |
+| `Qwen/Qwen3-8B` | `standard/h200-training-full` (4 GPUs), `standard/h200-training-lora` (4 GPUs), `long/h200-training-full` (4 GPUs), `long/h200-training-lora` |
+| `Qwen/Qwen3.5-2B`, `Qwen/Qwen3.5-4B` | `standard/h200-training-full`, `long/h200-training-full`, `long/h200-training-lora` |
+| `Qwen/Qwen3.5-9B` | `standard/h200-training-full` (4 GPUs), `long/h200-training-full`, `long/h200-training-lora` |
+| `Qwen/Qwen3.8-27B` | `standard/h200-training-full`, `long/h200-training-full`, `long/h200-training-lora` |
+| `Qwen/Qwen3-30B-A3B` | `standard/h200-training-full`, `standard/h200-training-lora` |
+| `Qwen/Qwen3.6-35B-A3B` | `standard/h200-training-full`, `long/h200-training-full`, `long/h200-training-lora` |
+| `google/gemma-3-4b-it`, `google/medgemma-4b-it`, `google/medgemma-1.5-4b-it` | `standard/h200-training-full` (1 GPU), `long/h200-training-full`, `long/h200-training-lora` |
+| `google/gemma-4-31B-it` | `standard/h200-training-full`, `long/h200-training-full`, `long/h200-training-lora` |
+| `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`, `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16` | `standard/h200-training-full`, `long/h200-training-full`, `long/h200-training-lora` |
+| `zai-org/GLM-5.3-Flash-BF16` | `standard/h200-training-full` (32 GPUs, fork), `long/h200-training-full` (32 GPUs, fork) |
+
+The other files in the table use 8 GPUs. The MedGemma files are Gemma 3 4B's
+bodies under their own model ID (same architecture; not measured on the
+MedGemma checkpoints).
+
+The GLM-5.3-Flash-BF16 and Qwen3.8-Flash-Next long full files train
+262,144-token rows with UCCL-EP expert dispatch. They need a UCCL build with
+upstream's 18b588a ("Keep the D2H handle table in device memory", #1085). With
+UCCL a3d520e alone, an allocation that finds the GPU full moves the EP handle
+table to host memory, and the next expert-parallel kernel faults (Xid 31, an
+illegal memory access).
+
+The MoE LoRA files train routed-expert LoRA through `target_parameters`, with
+one exception: the Qwen3.6-35B-A3B long LoRA file keeps the attention-only
+adapter its long LoRA sampler serves.
+
+Every training file in the table has an inference file of its context and mode
+with the same `max_seq_len`, so each pair composes an RL job; MoE router replay
+needs the two windows to match. The samplers added for this follow the model's
+other inference files: a long sampler takes the long full-weight sampler's
+layout, a LoRA sampler the full-weight sampler's plus the training adapter, and
+a Qwen3 long LoRA sampler (40,960 tokens) the standard LoRA sampler's engine
+settings on one GPU. Their `last_validated` entries are `null`.
+
+Some LoRA samplers serve a narrower adapter than their trainer's: no catalog
+sampler serves expert LoRA, so the samplers of the Nemotron long LoRA files and
+of Qwen3-30B-A3B's standard LoRA file leave out the trainers'
+`target_parameters` (routed and shared experts). Gemma 4's lists the
+language-model projections its trainer selects with a regex. These pairs build
+RL jobs, but a follow-up command finds no catalog sampler that loads their
+whole checkpoints.
+
+The Gemma 4 31B and Qwen3.8-27B full files train on one node with
+`shard_dense`: each trainable weight is sharded across the node's eight GPUs
+and gathered when its layer runs, so a GPU holds an eighth of the weights
+instead of all of them (ZeRO-2 shards only the optimizer state and
+gradients). The room goes to keeping the optimizer on the GPU (Gemma 4) and to
+a 64K sequence per GPU (Qwen3.8-27B's standard file, its checkpointed
+activations offloaded to host memory), and the long full files train 256K
+rows on eight GPUs: Gemma 4's used 16 before and Qwen3.8-27B's 32.
+
+They need server changes that are not yet in a released image, the stacked
+branches:
+
+- Arctic-Platform `jaelee/v3/stack/15-gemma-4` (on main `3e2ba2bf`)
+- dss-platform `jaelee/v3/stack/15-gemma-4` (on main `7731f9c`)
+
+The files marked "fork" need that DeepSpeed branch in the image; the others run
+on the stock release and set no DeepSpeed fork field. An
+image without these branches drops or rejects fields such as `numa_bind`,
+`shard_dense`, `checkpoint_keep_attention`, `fused_qk_norm_rope`, `ac_config.core_replay`
+and the `prime_rl` loader options. The
+Qwen3.5 files were measured with `flash-qla` installed, and the Nemotron long
+LoRA files need a CUDA build of `mamba-ssm`. Every `last_validated` entry for
+these files is `null`: the live smoke test below has not run on them.
+
+Each file is its measured job body with only these changes: `hardware` added,
+`step_peak_memory_log` (a diagnostic) removed, and `model_provider` written as
+`arctic` (the client sends `prime_rl`).
+
 ## Smoke testing
 
 Print the smoke-test plan for a catalog file without submitting it: a JSON

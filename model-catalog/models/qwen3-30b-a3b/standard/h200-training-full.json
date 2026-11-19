@@ -15,15 +15,22 @@
         "attn_implementation": "flash_attention_3",
         "ac_config": {
           "mode": "full",
-          "freq": 1
+          "freq": 1,
+          "core_replay": true
         },
         "model_options": {
           "lm_head": {
             "token_chunk_size": 8192,
             "cross_entropy": false
+          },
+          "moe": {
+            "sonicmoe": true,
+            "comm_sms": 96,
+            "ultraep_spares": 2,
+            "ultraep_ipc_symm": true
           }
         },
-        "ep_size": 4,
+        "ep_size": 2,
         "optimizer": {
           "name": "AdamW",
           "lr": 2e-05,
@@ -41,7 +48,8 @@
           "bf16": {
             "enabled": true
           }
-        }
+        },
+        "cuda_allocator_conf": "expandable_segments:True"
       }
     }
   ]

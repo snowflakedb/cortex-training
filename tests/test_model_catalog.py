@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -43,6 +44,8 @@ _FULL_STANDARD_LONG = [
     "long/h200-inference-full",
     "long/h200-training-full",
 ]
+# A long LoRA training file (the H200 SFT throughput finals added it) and the LoRA sampler that pairs it for RL.
+_LONG_LORA = ["long/h200-inference-lora", "long/h200-training-lora"]
 EXPECTED_FILES = {
     "thinkingmachines/Inkling-2-Small-MXFP8": [
         "standard/h200-inference-full",
@@ -52,19 +55,26 @@ EXPECTED_FILES = {
         "long/h200-inference-lora",
         "long/h200-training-lora",
     ],
-    "Qwen/Qwen3-0.6B": _TRAINABLE_STANDARD,
-    "Qwen/Qwen3-1.7B": _TRAINABLE_STANDARD,
-    "Qwen/Qwen3-4B-Instruct-2507": _FULL_STANDARD_LONG,
-    "Qwen/Qwen3-8B": _TRAINABLE_STANDARD,
+    "Qwen/Qwen3-0.6B": _TRAINABLE_STANDARD + _TRAINABLE_LONG,
+    "Qwen/Qwen3-1.7B": _TRAINABLE_STANDARD + _TRAINABLE_LONG,
+    "Qwen/Qwen3-4B-Instruct-2507": _FULL_STANDARD_LONG + _LONG_LORA,
+    "Qwen/Qwen3-8B": _TRAINABLE_STANDARD + _TRAINABLE_LONG,
     "Qwen/Qwen3.5-2B": _TRAINABLE_LONG + _TRAINABLE_STANDARD,
     "Qwen/Qwen3.5-4B": _TRAINABLE_LONG + _TRAINABLE_STANDARD,
-    "Qwen/Qwen3.5-9B": _TRAINABLE_STANDARD + ["long/h200-inference-full", "long/h200-training-full"],
+    "Qwen/Qwen3.5-9B": _TRAINABLE_LONG + _TRAINABLE_STANDARD,
     "Qwen/Qwen3.6-35B-A3B": _TRAINABLE_LONG + _TRAINABLE_STANDARD,
     "Qwen/Qwen3.8-27B": _TRAINABLE_LONG + _TRAINABLE_STANDARD,
-    "Qwen/Qwen3-30B-A3B": [
+    "Qwen/Qwen3.8-Flash-Next": [
         "standard/h200-inference-full",
+        "standard/h200-inference-lora",
         "standard/h200-training-full",
+        "standard/h200-training-lora",
+        "long/h200-inference-full",
+        "long/h200-inference-lora",
+        "long/h200-training-full",
+        "long/h200-training-lora",
     ],
+    "Qwen/Qwen3-30B-A3B": _TRAINABLE_STANDARD,
     "deepseek-ai/DeepSeek-V4.1-Flash-1017": [
         "standard/h200-inference-lora",
         "standard/h200-training-full",
@@ -74,12 +84,12 @@ EXPECTED_FILES = {
         "long/h200-training-lora",
     ],
     "openai/gpt-oss-120b": ["long/h200-inference-full"],
-    "google/gemma-3-4b-it": _FULL_STANDARD_LONG,
-    "google/gemma-4-31B-it": _FULL_STANDARD_LONG,
-    "google/medgemma-4b-it": _FULL_STANDARD_LONG,
-    "google/medgemma-1.5-4b-it": _FULL_STANDARD_LONG,
-    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": _FULL_STANDARD_LONG,
-    "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16": _FULL_STANDARD_LONG,
+    "google/gemma-3-4b-it": _FULL_STANDARD_LONG + _LONG_LORA,
+    "google/gemma-4-31B-it": _FULL_STANDARD_LONG + _LONG_LORA,
+    "google/medgemma-4b-it": _FULL_STANDARD_LONG + _LONG_LORA,
+    "google/medgemma-1.5-4b-it": _FULL_STANDARD_LONG + _LONG_LORA,
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": _FULL_STANDARD_LONG + _LONG_LORA,
+    "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16": _FULL_STANDARD_LONG + _LONG_LORA,
     "zai-org/GLM-5.3": ["standard/h200-inference-full", "long/h200-inference-full"],
     "zai-org/GLM-5.3-Flash": [
         "standard/h200-inference-full",
@@ -120,11 +130,11 @@ def _config(body: dict) -> dict:
 
 def test_checked_in_catalog_is_valid():
     assert validate_catalog() == {
-        "models": 22,
-        "files": 105,
-        "training": 50,
-        "inference": 55,
-        "rl": 48,
+        "models": 23,
+        "files": 143,
+        "training": 69,
+        "inference": 74,
+        "rl": 67,
         "distillation": 1,
     }
 
@@ -161,6 +171,7 @@ def test_catalog_models_include_license_links():
         "Qwen/Qwen3.5-9B": "Apache 2.0",
         "Qwen/Qwen3.6-35B-A3B": "Apache 2.0",
         "Qwen/Qwen3.8-27B": "Apache 2.0",
+        "Qwen/Qwen3.8-Flash-Next": "Qwen Community License 1.0",
         "Qwen/Qwen3-30B-A3B": "Apache 2.0",
         "Qwen/Qwen3-4B-Instruct-2507": "Apache 2.0",
         "deepseek-ai/DeepSeek-V4.1-Flash-1017": "MIT",
@@ -190,6 +201,7 @@ def test_moe_models_record_router_replay_geometry():
         "Qwen/Qwen3-30B-A3B": {"num_moe_layers": 48, "topk": 8, "num_experts": 128},
         "Qwen/Qwen3.6-35B-A3B": {"num_moe_layers": 40, "topk": 8, "num_experts": 256},
         "deepseek-ai/DeepSeek-V4.1-Flash-1017": {"num_moe_layers": 40, "topk": 6, "num_experts": 384},
+        "Qwen/Qwen3.8-Flash-Next": {"num_moe_layers": 48, "topk": 10, "num_experts": 512},
         "openai/gpt-oss-120b": {"num_moe_layers": 36, "topk": 4, "num_experts": 128},
         "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": {"num_moe_layers": 23, "topk": 6, "num_experts": 128},
         "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16": {"num_moe_layers": 23, "topk": 6, "num_experts": 128},
@@ -201,6 +213,7 @@ def test_moe_models_record_router_replay_geometry():
 
 
 def test_validation_dates_match_completed_live_smokes():
+    # The H200 SFT throughput finals replaced some validated files; their dates went back to null.
     validated = {
         (model_id, key): day
         for model_id, (_, info) in _models().items()
@@ -209,33 +222,19 @@ def test_validation_dates_match_completed_live_smokes():
     }
 
     assert validated == {
-        ("Qwen/Qwen3-30B-A3B", "standard/h200-training-full"): "2026-11-05",
         ("Qwen/Qwen3-4B-Instruct-2507", "long/h200-inference-full"): "2026-10-14",
-        ("Qwen/Qwen3-4B-Instruct-2507", "long/h200-training-full"): "2026-10-14",
-        ("Qwen/Qwen3.5-4B", "standard/h200-training-full"): "2026-09-02",
         ("Qwen/Qwen3.5-4B", "standard/h200-training-lora"): "2026-09-02",
         ("Qwen/Qwen3.5-9B", "long/h200-inference-full"): "2026-10-14",
-        ("Qwen/Qwen3.5-9B", "long/h200-training-full"): "2026-10-14",
-        ("Qwen/Qwen3.6-35B-A3B", "standard/h200-training-full"): "2026-09-02",
-        ("Qwen/Qwen3.6-35B-A3B", "standard/h200-training-lora"): "2026-11-05",
-        ("Qwen/Qwen3.8-27B", "long/h200-training-full"): "2026-09-02",
-        ("Qwen/Qwen3.8-27B", "long/h200-training-lora"): "2026-09-02",
+        ("Qwen/Qwen3.8-Flash-Next", "long/h200-training-full"): "2026-11-05",
         ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "long/h200-training-full"): "2026-10-23",
         ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "long/h200-training-lora"): "2026-10-26",
         ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "standard/h200-training-full"): "2026-10-23",
         ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "standard/h200-training-lora"): "2026-10-26",
         ("google/gemma-4-31B-it", "long/h200-inference-full"): "2026-10-15",
-        ("google/gemma-4-31B-it", "long/h200-training-full"): "2026-10-15",
         ("google/medgemma-1.5-4b-it", "long/h200-inference-full"): "2026-10-15",
-        ("google/medgemma-1.5-4b-it", "long/h200-training-full"): "2026-10-15",
         ("google/medgemma-4b-it", "long/h200-inference-full"): "2026-10-15",
-        ("google/medgemma-4b-it", "long/h200-training-full"): "2026-10-15",
-        ("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "long/h200-training-full"): "2026-10-14",
-        ("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16", "long/h200-training-full"): "2026-10-14",
         ("zai-org/GLM-5.3-Flash", "long/h200-inference-lora"): "2026-10-20",
-        ("zai-org/GLM-5.3-Flash", "long/h200-training-lora"): "2026-10-20",
         ("zai-org/GLM-5.3-Flash-BF16", "long/h200-inference-full"): "2026-10-20",
-        ("zai-org/GLM-5.3-Flash-BF16", "long/h200-training-full"): "2026-10-20",
         ("thinkingmachines/Inkling-2-Small-MXFP8", "long/h200-inference-lora"): "2026-11-12",
         ("thinkingmachines/Inkling-2-Small-MXFP8", "long/h200-training-lora"): "2026-11-12",
         ("thinkingmachines/Inkling-2-Small-MXFP8", "standard/h200-inference-lora"): "2026-11-12",
@@ -244,11 +243,15 @@ def test_validation_dates_match_completed_live_smokes():
 
 
 def test_files_keep_their_source_sequence_lengths():
-    lengths = {
-        (model_id, key.split("/")[0], key.split("-")[1]): _config(_body(model_id, key))["max_seq_len"]
+    by_file = {
+        (model_id, key): _config(_body(model_id, key))["max_seq_len"]
         for model_id, files in EXPECTED_FILES.items()
         for key in files
     }
+    lengths = {(model_id, key.split("/")[0], key.split("-")[1]): length for (model_id, key), length in by_file.items()}
+    # A tier's LoRA and full files of one kind share its length.
+    for (model_id, key), length in by_file.items():
+        assert length == lengths[model_id, key.split("/")[0], key.split("-")[1]], (model_id, key)
 
     assert lengths == {
         ("thinkingmachines/Inkling-2-Small-MXFP8", "standard", "inference"): 65536,
@@ -257,10 +260,17 @@ def test_files_keep_their_source_sequence_lengths():
         ("thinkingmachines/Inkling-2-Small-MXFP8", "long", "training"): 262144,
         ("Qwen/Qwen3-0.6B", "standard", "inference"): 32768,
         ("Qwen/Qwen3-0.6B", "standard", "training"): 32768,
+        # Qwen3's max_position_embeddings: the long LoRA files train at the model's own maximum.
+        ("Qwen/Qwen3-0.6B", "long", "inference"): 40960,
+        ("Qwen/Qwen3-0.6B", "long", "training"): 40960,
         ("Qwen/Qwen3-1.7B", "standard", "inference"): 32768,
         ("Qwen/Qwen3-1.7B", "standard", "training"): 32768,
+        ("Qwen/Qwen3-1.7B", "long", "inference"): 40960,
+        ("Qwen/Qwen3-1.7B", "long", "training"): 40960,
         ("Qwen/Qwen3-8B", "standard", "inference"): 32768,
         ("Qwen/Qwen3-8B", "standard", "training"): 32768,
+        ("Qwen/Qwen3-8B", "long", "inference"): 40960,
+        ("Qwen/Qwen3-8B", "long", "training"): 40960,
         ("Qwen/Qwen3.5-2B", "long", "inference"): 262144,
         ("Qwen/Qwen3.5-2B", "long", "training"): 262144,
         ("Qwen/Qwen3.5-2B", "standard", "inference"): 65536,
@@ -281,6 +291,10 @@ def test_files_keep_their_source_sequence_lengths():
         ("Qwen/Qwen3.8-27B", "long", "training"): 262144,
         ("Qwen/Qwen3.8-27B", "standard", "inference"): 65536,
         ("Qwen/Qwen3.8-27B", "standard", "training"): 65536,
+        ("Qwen/Qwen3.8-Flash-Next", "long", "inference"): 262144,
+        ("Qwen/Qwen3.8-Flash-Next", "long", "training"): 262144,
+        ("Qwen/Qwen3.8-Flash-Next", "standard", "inference"): 65536,
+        ("Qwen/Qwen3.8-Flash-Next", "standard", "training"): 65536,
         ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "long", "inference"): 262144,
         ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "long", "training"): 262144,
         ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "standard", "inference"): 65536,
@@ -375,9 +389,10 @@ def test_qwen3_8b_files_carry_the_example_defaults():
     lora = _config(_body("Qwen/Qwen3-8B", "standard/h200-training-lora"))
     inference = _config(_body("Qwen/Qwen3-8B", "standard/h200-inference-lora"))
 
-    assert (training["n_gpus"], training["train_batch_size"], training["optimizer"]["lr"]) == (4, 4, 2e-05)
+    # Four GPUs, as before the H200 SFT throughput tuning; the rows per step are the tuned ones.
+    assert (training["n_gpus"], training["train_batch_size"], training["optimizer"]["lr"]) == (4, 8, 2e-05)
     assert training["optimizer"]["betas"] == [0.9, 0.999]
-    assert (lora["n_gpus"], lora["optimizer"]["lr"]) == (4, 1e-04)
+    assert (lora["n_gpus"], lora["train_batch_size"], lora["optimizer"]["lr"]) == (4, 16, 1e-04)
     assert (inference["n_gpus"], inference["vllm_config"]["tensor_parallel_size"]) == (2, 1)
     assert inference["peft_config"] == lora["peft_config"]
 
@@ -386,16 +401,20 @@ def test_qwen3_0_6b_standard_fits_on_one_gpu():
     for mode in ("full", "lora"):
         training = _config(_body("Qwen/Qwen3-0.6B", f"standard/h200-training-{mode}"))
         inference = _config(_body("Qwen/Qwen3-0.6B", f"standard/h200-inference-{mode}"))
-        assert (training["n_gpus"], training["train_batch_size"], training["max_seq_len"]) == (1, 1, 32768)
-        assert training["ds_config"]["train_batch_size"] == 1
+        assert (training["n_gpus"], training["train_batch_size"], training["max_seq_len"]) == (1, 4, 32768)
+        # The service derives DeepSpeed's batch fields from train_batch_size.
+        assert not {"train_batch_size", "train_micro_batch_size_per_gpu", "gradient_accumulation_steps"} & set(
+            training["ds_config"]
+        )
         assert (inference["n_gpus"], inference["max_seq_len"], inference["vllm_config"]["tensor_parallel_size"]) == (1, 32768, 1)
 
 
-def test_gemma4_31b_training_uses_sdpa():
-    # Full-attention layers have head_dim 512, past FlashAttention 3's 256.
-    for key in ("standard/h200-training-full", "long/h200-training-full"):
+def test_gemma4_31b_training_uses_flash_attention_3():
+    # Full-attention layers have head_dim 512, past FlashAttention 3's 256: they run on the trainer's head-512
+    # attention kernels (a server change the H200 SFT throughput files need).
+    for key in ("standard/h200-training-full", "long/h200-training-full", "long/h200-training-lora"):
         training = _config(_body("google/gemma-4-31B-it", key))
-        assert training["attn_implementation"] == "sdpa"
+        assert training["attn_implementation"] == "flash_attention_3"
 
 
 @pytest.mark.parametrize(
@@ -415,9 +434,27 @@ def test_qwen36_lora_uses_arctic_attention_targets(key):
 
 
 def test_qwen36_long_training_uses_sequence_parallelism():
-    for mode in ("lora", "full"):
+    expected = {"lora": (8, 2, 4), "full": (8, 8, 1)}
+    for mode, mesh in expected.items():
         config = _config(_body("Qwen/Qwen3.6-35B-A3B", f"long/h200-training-{mode}"))
-        assert (config["n_gpus"], config["sp_size"], config["train_batch_size"]) == (8, 8, 1)
+        assert (config["n_gpus"], config["sp_size"], config["train_batch_size"]) == mesh
+
+
+_LM_PROJECTIONS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+# LoRA samplers whose target_modules differ from their training adapter's, and the modules they serve. No
+# sampler carries the trainer's target_parameters (routed and shared experts): no catalog sampler of these
+# families serves expert LoRA. Gemma 4's trainer names its language-model projections with a regex; the sampler
+# lists them, and vLLM applies LoRA to the language model only. These pairs build RL jobs, but the sampler does
+# not load the trainer's whole adapter, so inference_job_args serves the checkpoint with no catalog file.
+LORA_SAMPLER_TARGETS = {
+    ("google/gemma-3-4b-it", "long/h200-inference-lora"): _LM_PROJECTIONS,
+    ("google/gemma-4-31B-it", "long/h200-inference-lora"): _LM_PROJECTIONS,
+    ("google/medgemma-1.5-4b-it", "long/h200-inference-lora"): _LM_PROJECTIONS,
+    ("google/medgemma-4b-it", "long/h200-inference-lora"): _LM_PROJECTIONS,
+    ("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "long/h200-inference-lora"): _LM_PROJECTIONS,
+    ("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16", "long/h200-inference-lora"): _LM_PROJECTIONS,
+    ("Qwen/Qwen3-30B-A3B", "standard/h200-inference-lora"): _LM_PROJECTIONS,
+}
 
 
 def test_lora_inference_files_match_their_training_adapter():
@@ -428,6 +465,17 @@ def test_lora_inference_files_match_their_training_adapter():
             training_key = key.replace("inference-lora", "training-lora")
             inference = _config(_body(model_id, key))["peft_config"]
             training = _config(_body(model_id, training_key))["peft_config"]
+            if (model_id, key) in LORA_SAMPLER_TARGETS:
+                # The same rank, scale, dropout and bias; only the modules differ.
+                assert {name: value for name, value in inference.items() if name != "target_modules"} == {
+                    name: value
+                    for name, value in training.items()
+                    if name not in ("target_modules", "target_parameters")
+                }, (model_id, key)
+                assert inference["target_modules"] == LORA_SAMPLER_TARGETS[model_id, key], (model_id, key)
+                if isinstance(training["target_modules"], list):
+                    assert set(inference["target_modules"]) <= set(training["target_modules"]), (model_id, key)
+                continue
             if model_id == "deepseek-ai/DeepSeek-V4.1-Flash-1017":
                 # vLLM names these attention projections; the trainer uses the checkpoint names.
                 assert {name: value for name, value in inference.items() if name != "target_modules"} == {
@@ -455,16 +503,18 @@ def test_lora_inference_files_match_their_training_adapter():
 def test_qwen_inference_uses_single_gpu_tensor_parallelism(model_id):
     for key in EXPECTED_FILES[model_id]:
         # Qwen3.5-9B's 262,144-token long tier serves on eight GPUs instead.
-        if "inference" in key and (model_id, key) != ("Qwen/Qwen3.5-9B", "long/h200-inference-full"):
+        if "inference" in key and not (model_id == "Qwen/Qwen3.5-9B" and key.startswith("long/")):
             assert _config(_body(model_id, key))["vllm_config"]["tensor_parallel_size"] == 1
 
 
 def test_qwen35_9b_long_tier_uses_eight_gpus():
     training = _config(_body("Qwen/Qwen3.5-9B", "long/h200-training-full"))
-    inference = _config(_body("Qwen/Qwen3.5-9B", "long/h200-inference-full"))
 
-    assert (training["n_gpus"], training["sp_size"], training["train_batch_size"]) == (8, 8, 1)
-    assert (inference["n_gpus"], inference["vllm_config"]["tensor_parallel_size"]) == (8, 8)
+    # Two 262,144-token rows per step, each over four GPUs (the H200 SFT throughput final).
+    assert (training["n_gpus"], training["sp_size"], training["train_batch_size"]) == (8, 4, 2)
+    for mode in ("full", "lora"):
+        inference = _config(_body("Qwen/Qwen3.5-9B", f"long/h200-inference-{mode}"))
+        assert (inference["n_gpus"], inference["vllm_config"]["tensor_parallel_size"]) == (8, 8)
 
 
 def test_large_quantized_inference_uses_single_node_tp8_with_fp8_kv_cache():
@@ -531,6 +581,46 @@ def test_deepseek_v41_sampler_captures_every_layer_for_router_replay():
         assert inference["vllm_config"]["extra_engine_kwargs"]["swa_bounded_replay"] is False
 
 
+def test_every_h200_sft_training_file_has_an_inference_partner_for_rl():
+    # Each H200 SFT throughput training file has an inference file of its context and mode with the same
+    # max_seq_len, so validate_catalog builds its RL job and MoE router replay covers the whole training window.
+    for model_id, key in H200_SFT_FILES | set(H200_SFT_COPIES):
+        partner = key.replace("-training-", "-inference-")
+        assert partner in EXPECTED_FILES[model_id], (model_id, key)
+        assert _config(_body(model_id, partner))["max_seq_len"] == _config(_body(model_id, key))["max_seq_len"]
+
+
+def test_rl_partner_samplers_start_unvalidated():
+    added = {
+        ("Qwen/Qwen3-30B-A3B", "standard/h200-inference-lora"),
+    } | {
+        (model_id, "long/h200-inference-lora")
+        for model_id in (
+            "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+            "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+            "google/gemma-3-4b-it",
+            "google/gemma-4-31B-it",
+            "google/medgemma-1.5-4b-it",
+            "google/medgemma-4b-it",
+            "Qwen/Qwen3-0.6B",
+            "Qwen/Qwen3-1.7B",
+            "Qwen/Qwen3-4B-Instruct-2507",
+            "Qwen/Qwen3-8B",
+            "Qwen/Qwen3.5-9B",
+        )
+    }
+    for model_id, key in added:
+        assert _models()[model_id][1]["last_validated"][key] is None, (model_id, key)
+
+
+def test_moe_training_files_keep_the_rl_router_replay_keys():
+    # Router replay recomputes the replayed routes inside activation checkpointing.
+    for model_id, key in [
+        ("zai-org/GLM-5.3-Flash-BF16", "standard/h200-training-full"),
+    ]:
+        assert _config(_body(model_id, key))["ac_config"]["router_replay_recompute"] is True, (model_id, key)
+
+
 def test_glm53_catalog_file_serves_on_eight_gpus_with_the_fp8_mla_cache():
     body = _body("zai-org/GLM-5.3", "long/h200-inference-full")
     (sub_job,) = body["sub_job_configs"]
@@ -542,6 +632,138 @@ def test_glm53_catalog_file_serves_on_eight_gpus_with_the_fp8_mla_cache():
     assert config["vllm_config"]["tensor_parallel_size"] == 8
     assert config["vllm_config"]["kv_cache_dtype"] == "fp8_ds_mla"
     assert config["max_seq_len"] == 720896
+
+
+# ─── The H200 SFT throughput files ───────────────────────────────────────────
+
+# The catalog files that are measured H200 SFT throughput finals.
+H200_SFT_FILES = {
+    ("Qwen/Qwen3-0.6B", "long/h200-training-full"),
+    ("Qwen/Qwen3-0.6B", "long/h200-training-lora"),
+    ("Qwen/Qwen3-0.6B", "standard/h200-training-full"),
+    ("Qwen/Qwen3-0.6B", "standard/h200-training-lora"),
+    ("Qwen/Qwen3-1.7B", "long/h200-training-full"),
+    ("Qwen/Qwen3-1.7B", "long/h200-training-lora"),
+    ("Qwen/Qwen3-1.7B", "standard/h200-training-full"),
+    ("Qwen/Qwen3-30B-A3B", "standard/h200-training-full"),
+    ("Qwen/Qwen3-30B-A3B", "standard/h200-training-lora"),
+    ("Qwen/Qwen3-4B-Instruct-2507", "long/h200-training-full"),
+    ("Qwen/Qwen3-4B-Instruct-2507", "long/h200-training-lora"),
+    ("Qwen/Qwen3-4B-Instruct-2507", "standard/h200-training-full"),
+    ("Qwen/Qwen3-8B", "long/h200-training-full"),
+    ("Qwen/Qwen3-8B", "long/h200-training-lora"),
+    ("Qwen/Qwen3-8B", "standard/h200-training-full"),
+    ("Qwen/Qwen3-8B", "standard/h200-training-lora"),
+    ("Qwen/Qwen3.5-2B", "long/h200-training-full"),
+    ("Qwen/Qwen3.5-2B", "long/h200-training-lora"),
+    ("Qwen/Qwen3.5-2B", "standard/h200-training-full"),
+    ("Qwen/Qwen3.5-4B", "long/h200-training-full"),
+    ("Qwen/Qwen3.5-4B", "long/h200-training-lora"),
+    ("Qwen/Qwen3.5-4B", "standard/h200-training-full"),
+    ("Qwen/Qwen3.5-9B", "long/h200-training-full"),
+    ("Qwen/Qwen3.5-9B", "long/h200-training-lora"),
+    ("Qwen/Qwen3.5-9B", "standard/h200-training-full"),
+    ("Qwen/Qwen3.6-35B-A3B", "long/h200-training-full"),
+    ("Qwen/Qwen3.6-35B-A3B", "long/h200-training-lora"),
+    ("Qwen/Qwen3.6-35B-A3B", "standard/h200-training-full"),
+    ("Qwen/Qwen3.8-27B", "long/h200-training-full"),
+    ("Qwen/Qwen3.8-27B", "long/h200-training-lora"),
+    ("Qwen/Qwen3.8-27B", "standard/h200-training-full"),
+    ("Qwen/Qwen3.8-Flash-Next", "long/h200-training-lora"),
+    ("Qwen/Qwen3.8-Flash-Next", "standard/h200-training-full"),
+    ("google/gemma-3-4b-it", "long/h200-training-full"),
+    ("google/gemma-3-4b-it", "long/h200-training-lora"),
+    ("google/gemma-3-4b-it", "standard/h200-training-full"),
+    ("google/gemma-4-31B-it", "long/h200-training-full"),
+    ("google/gemma-4-31B-it", "long/h200-training-lora"),
+    ("google/gemma-4-31B-it", "standard/h200-training-full"),
+    ("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "long/h200-training-full"),
+    ("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "long/h200-training-lora"),
+    ("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "standard/h200-training-full"),
+    ("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16", "long/h200-training-full"),
+    ("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16", "long/h200-training-lora"),
+    ("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16", "standard/h200-training-full"),
+    ("zai-org/GLM-5.3-Flash-BF16", "long/h200-training-full"),
+    ("zai-org/GLM-5.3-Flash-BF16", "standard/h200-training-full"),
+}
+# Same architecture as Gemma 3 4B: Gemma 3 4B's files under their own model ID.
+H200_SFT_COPIES = {
+    ("google/medgemma-1.5-4b-it", "long/h200-training-full"): ("google/gemma-3-4b-it", "long/h200-training-full"),
+    ("google/medgemma-4b-it", "long/h200-training-full"): ("google/gemma-3-4b-it", "long/h200-training-full"),
+    ("google/medgemma-1.5-4b-it", "long/h200-training-lora"): ("google/gemma-3-4b-it", "long/h200-training-lora"),
+    ("google/medgemma-1.5-4b-it", "standard/h200-training-full"): ("google/gemma-3-4b-it", "standard/h200-training-full"),
+    ("google/medgemma-4b-it", "long/h200-training-lora"): ("google/gemma-3-4b-it", "long/h200-training-lora"),
+    ("google/medgemma-4b-it", "standard/h200-training-full"): ("google/gemma-3-4b-it", "standard/h200-training-full"),
+}
+# DeepSpeed ZeRO fields that stock DeepSpeed does not read. DeepSpeed jaelee/zero-memory-upstream reads
+# optimizer_state_swap; no DeepSpeed these files run on reads the other two.
+_DEEPSPEED_FORK_FIELDS = ("optimizer_state_swap", "reduce_to_owners", "record_reduction_input")
+# The files that run on DeepSpeed jaelee/zero-memory-upstream (its optimizer_state_swap); every other
+# file runs on stock DeepSpeed.
+H200_SFT_DEEPSPEED_FORK = {
+    ("Qwen/Qwen3.8-Flash-Next", "standard/h200-training-full"),
+    ("zai-org/GLM-5.3-Flash-BF16", "long/h200-training-full"),
+    ("zai-org/GLM-5.3-Flash-BF16", "standard/h200-training-full"),
+}
+# The files that need GDRCopy (gdrdrv on the hosts; NCCL 2.32.3 and DeepEP V2.5 in the image).
+H200_SFT_GDRCOPY: set[tuple[str, str]] = set()
+
+
+def _gdrcopy(body: dict) -> bool:
+    return bool((_config(body).get("nccl") or {}).get("gdrcopy_enable"))
+
+
+@pytest.mark.parametrize(("model_id", "key"), sorted(H200_SFT_FILES) + sorted(H200_SFT_COPIES))
+def test_h200_sft_files_carry_only_job_fields(model_id, key):
+    _, info = _models()[model_id]
+    body = _body(model_id, key)
+    config = _config(body)
+
+    assert body["hardware"] == "H200"
+    # The client sends prime_rl; the catalog names the provider arctic, or leaves it to the server's default.
+    assert config.get("model_provider") != "prime_rl"
+    # Diagnostics and host paths stay out of the catalog files.
+    assert "step_peak_memory_log" not in config
+    assert not {"EP_JIT_CACHE_DIR", "CUDA_HOME", "DS_SKIP_CUDA_CHECK"} & set(config.get("worker_env") or {})
+    # The catalog's own live smoke test has not run on these files.
+    assert info["last_validated"][key] is None
+
+
+@pytest.mark.parametrize(("model_id", "key"), sorted(H200_SFT_COPIES))
+def test_medgemma_h200_sft_files_are_gemma3_files(model_id, key):
+    expected = copy.deepcopy(_body(*H200_SFT_COPIES[model_id, key]))
+    expected["sub_job_configs"][0]["model_name"] = model_id
+
+    assert _body(model_id, key) == expected
+
+
+def test_h200_sft_files_set_fork_fields_and_gdrcopy_only_where_listed():
+    assert H200_SFT_GDRCOPY <= H200_SFT_DEEPSPEED_FORK <= H200_SFT_FILES
+    for model_id, files in EXPECTED_FILES.items():
+        for key in files:
+            body = _body(model_id, key)
+            assert _gdrcopy(body) == ((model_id, key) in H200_SFT_GDRCOPY), (model_id, key)
+            zero = (_config(body).get("ds_config") or {}).get("zero_optimization") or {}
+            if (model_id, key) in H200_SFT_DEEPSPEED_FORK:
+                assert "optimizer_state_swap" in zero, (model_id, key)
+                assert not {"reduce_to_owners", "record_reduction_input"} & set(zero), (model_id, key)
+                continue
+            assert not set(_DEEPSPEED_FORK_FIELDS) & set(zero), (model_id, key)
+            # Stock DeepSpeed's ZeRO-1/2 overlap_comm reduces a parameter larger than its bucket from param.grad
+            # without recording the reduction stream, which can corrupt that gradient.
+            assert not zero.get("overlap_comm"), (model_id, key)
+            # ZeRO-1 with BF16 and the trainer's FP32 gradient accumulation runs DeepSpeed's BF16_Optimizer, whose
+            # gradient norm on stock DeepSpeed fails on a sequence-parallel rank that holds no counted gradient
+            # ("stack expects a non-empty TensorList").
+            if zero.get("stage") == 1:
+                assert (_config(body).get("sp_size") or 1) == 1, (model_id, key)
+
+
+def test_glm53_flash_lora_files_leave_out_kv_b_proj():
+    # MLA serving absorbs kv_b_proj, so a sampler cannot load an adapter that trains it.
+    for key in EXPECTED_FILES["zai-org/GLM-5.3-Flash"]:
+        if key.endswith("-lora"):
+            assert "kv_b_proj" not in _config(_body("zai-org/GLM-5.3-Flash", key))["peft_config"]["target_modules"]
 
 
 def _yaml_models(path: Path) -> dict[str, dict]:
@@ -675,7 +897,7 @@ def _invalid(catalog_dir: Path, match: str) -> str:
 
 
 def test_copied_catalog_is_valid(catalog):
-    assert validate_catalog(catalog)["models"] == 22
+    assert validate_catalog(catalog)["models"] == 23
 
 
 def test_distillation_jobs_build_with_make_distillation_config(catalog):
@@ -905,7 +1127,8 @@ def test_files_hold_one_sub_job_of_their_kind(catalog):
     ],
 )
 def test_validation_dates_cover_exactly_the_model_files(catalog, change, match):
-    _edit(catalog / "qwen3-8b/model.json", lambda info: change(info["last_validated"]))
+    # Qwen3-30B-A3B has no long tier.
+    _edit(catalog / "qwen3-30b-a3b/model.json", lambda info: change(info["last_validated"]))
 
     _invalid(catalog, match)
 
@@ -972,9 +1195,9 @@ def test_smoke_request_is_the_catalog_file():
 
 
 def test_smoke_request_names_the_files_that_exist():
-    # Qwen3.5-9B's long tier has no LoRA files, so a long LoRA request names the files it has.
-    with pytest.raises(ValueError, match="has no long/h200-inference-lora.json; its catalog files are: long/"):
-        build_catalog_request(CATALOG_DIR, "Qwen/Qwen3.5-9B", "inference-lora", context="long")
+    # Qwen3-30B-A3B has no long tier, so a long LoRA training request names the files it has.
+    with pytest.raises(ValueError, match="has no long/h200-training-lora.json; its catalog files are: standard/"):
+        build_catalog_request(CATALOG_DIR, "Qwen/Qwen3-30B-A3B", "training-lora", context="long")
 
 
 def test_smoke_request_rejects_a_mismatched_model_namespace():
@@ -1008,8 +1231,8 @@ def test_full_context_training_probe_uses_exact_declared_limit():
         full_context=True,
     )
 
-    assert len(spec["payload"]["input_ids"]) == 1
-    assert len(spec["payload"]["input_ids"][0]) == 32768
+    assert len(spec["payload"]["input_ids"]) == 4
+    assert {len(row) for row in spec["payload"]["input_ids"]} == {32768}
     assert set(spec["payload"]["input_ids"][0]) == {1}
 
 
@@ -1019,16 +1242,17 @@ def test_qwen38_sft_uses_chunked_logprob_loss(job, context):
     request = build_catalog_request(CATALOG_DIR, "Qwen/Qwen3.8-27B", job, context=context)
     training = request["sub_job_configs"][0]["training_config"]
 
-    # Each sequence is split across eight GPUs. 256K full fine-tuning needs
-    # four of those groups; a larger sequence-parallel degree does not divide
-    # the attention heads.
-    assert training["sp_size"] == 8
+    # The full files are H200 SFT throughput finals on one node with the trainable weights sharded across its GPUs
+    # (shard_dense): the long one splits each 256K sequence across all eight; the standard one trains a 64K
+    # sequence per GPU, its checkpointed activations offloaded to host memory.
     if context == "long" and job == "training-full":
-        assert (training["n_gpus"], training["train_batch_size"]) == (32, 4)
+        assert (training["n_gpus"], training["sp_size"], training["train_batch_size"]) == (8, 8, 1)
     elif job == "training-full":
-        assert (training["n_gpus"], training["train_batch_size"]) == (16, 2)
+        assert (training["n_gpus"], training.get("sp_size", 1), training["train_batch_size"]) == (8, 1, 8)
     else:
-        assert (training["n_gpus"], training["train_batch_size"]) == (8, 1)
+        assert (training["n_gpus"], training["sp_size"], training["train_batch_size"]) == (8, 8, 1)
+    if job == "training-full":
+        assert training["shard_dense"] is True
     assert training["fused_lm_head_token_chunk_size"] == 8192
 
     spec = build_forward_backward_probe_spec(
@@ -1071,7 +1295,7 @@ def test_rl_forward_backward_probe_uses_packing_aware_grpo_contract():
     spec = build_forward_backward_probe_spec(request, "rl-full")
     payload = spec["payload"]
 
-    assert len(payload["input_ids"]) == 1
+    assert len(payload["input_ids"]) == 4
     assert payload["include_attention_mask"] is True
     assert payload["labels"] == "none"
     assert spec["processing"] == {
@@ -1081,7 +1305,7 @@ def test_rl_forward_backward_probe_uses_packing_aware_grpo_contract():
             "eps_clip": 0.2,
             "loss_agg_mode": "token-mean",
             "entropy_coeff": 0.0,
-            "global_batch_size": 1,
+            "global_batch_size": 4,
         },
     }
     assert spec["context"]["advantages"]["dtype"] == "float32"

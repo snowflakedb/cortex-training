@@ -7,6 +7,10 @@
   },
   "architecture": "dense",
   "last_validated": {
+    "long/h200-inference-full": null,
+    "long/h200-inference-lora": null,
+    "long/h200-training-full": null,
+    "long/h200-training-lora": null,
     "standard/h200-inference-full": null,
     "standard/h200-inference-lora": null,
     "standard/h200-training-full": null,

@@ -39,7 +39,9 @@
 	"model_options": {
           "moe": {
             "comm_backend": "deepep",
-            "comm_token_chunk": 8192
+            "comm_token_chunk": 8192,
+            "ultraep_spares": 2,
+            "ultraep_ipc_symm": true
           },
           "lm_head": {
             "cross_entropy": false

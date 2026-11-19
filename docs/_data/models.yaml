@@ -57,7 +57,7 @@ models:
       - conversational-sft
       - inference-endpoint
       - math-grpo
-    last_validated: 2026-10-14
+    last_validated: null
   - id: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
     training: true
     inference: true
@@ -65,7 +65,7 @@ models:
       - conversational-sft
       - inference-endpoint
       - math-grpo
-    last_validated: 2026-10-14
+    last_validated: null
   - id: Qwen/Qwen3-0.6B
     training: true
     inference: true
@@ -81,7 +81,7 @@ models:
       - conversational-sft
       - inference-endpoint
       - math-grpo
-    last_validated: 2026-11-05
+    last_validated: null
   - id: Qwen/Qwen3-4B-Instruct-2507
     training: true
     inference: true
@@ -121,7 +121,7 @@ models:
       - conversational-sft
       - inference-endpoint
       - math-grpo
-    last_validated: 2026-11-05
+    last_validated: null
   - id: Qwen/Qwen3.8-27B
     training: true
     inference: true
@@ -129,7 +129,11 @@ models:
       - conversational-sft
       - inference-endpoint
       - math-grpo
-    last_validated: 2026-09-02
+    last_validated: null
+  - id: Qwen/Qwen3.8-Flash-Next
+    training: true
+    inference: true
+    last_validated: 2026-11-05
   - id: thinkingmachines/Inkling-2-Small-MXFP8
     training: true
     inference: true

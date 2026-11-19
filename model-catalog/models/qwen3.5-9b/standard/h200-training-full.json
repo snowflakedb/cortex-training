@@ -7,10 +7,10 @@
       "dtype": "bfloat16",
       "seed": 42,
       "training_config": {
-        "n_gpus": 2,
+        "n_gpus": 4,
         "sp_size": 1,
         "max_seq_len": 65536,
-        "train_batch_size": 2,
+        "train_batch_size": 16,
         "gradient_clipping": 1.0,
         "model_provider": "huggingface",
         "attn_implementation": "flash_attention_3",

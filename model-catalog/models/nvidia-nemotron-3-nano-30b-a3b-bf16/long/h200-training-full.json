@@ -8,18 +8,38 @@
       "seed": 42,
       "training_config": {
         "n_gpus": 8,
-        "sp_size": 8,
         "max_seq_len": 262144,
-        "train_batch_size": 1,
+        "train_batch_size": 2,
         "activation_checkpointing": true,
         "gradient_clipping": 1.0,
         "model_provider": "arctic",
         "attn_implementation": "flash_attention_3",
         "ac_config": {
           "mode": "full",
-          "freq": 1
+          "freq": 1,
+          "core_replay": "attention",
+          "combine_replay": true,
+          "offload_config": {
+            "enabled": true,
+            "keep_last_n": 1,
+            "use_streams": true,
+            "pin_memory_enabled": true,
+            "pin_memory_max_size_gib": "auto",
+            "pin_memory_bucket_size_mib": 64
+          }
         },
         "ep_size": 4,
+        "model_options": {
+          "lm_head": {
+            "cross_entropy": false,
+            "token_chunk_size": 8192
+          },
+          "moe": {
+            "sonicmoe": true,
+            "expert_replicas": 4,
+            "comm_sms": 48
+          }
+        },
         "optimizer": {
           "name": "AdamW",
           "lr": 2e-05,
@@ -31,16 +51,19 @@
           "eps": 1e-08
         },
         "ds_config": {
-          "train_batch_size": 1,
-          "train_micro_batch_size_per_gpu": 1,
-          "gradient_accumulation_steps": 1,
           "zero_optimization": {
-            "stage": 2
+            "stage": 2,
+            "reduce_bucket_size": 1000000000,
+            "allgather_bucket_size": 1000000000
           },
           "bf16": {
             "enabled": true
           }
-        }
+        },
+        "mb_spec": {
+          "max_tokens_per_mb": 262144
+        },
+        "sp_size": 4
       }
     }
   ]

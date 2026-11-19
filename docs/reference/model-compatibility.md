@@ -9,16 +9,17 @@ for a specific workload.
 
 | Model | Architecture | Training | Inference | Long-context `max_seq_len` |
 |---|---|---|---|---|
-| `Qwen/Qwen3-0.6B` | dense | standard | standard | — |
-| `Qwen/Qwen3-1.7B` | dense | standard | standard | — |
+| `Qwen/Qwen3-0.6B` | dense | standard, long | standard, long | 40,960 |
+| `Qwen/Qwen3-1.7B` | dense | standard, long | standard, long | 40,960 |
 | `Qwen/Qwen3-4B-Instruct-2507` | dense | standard, long | standard, long | 262,144 |
-| `Qwen/Qwen3-8B` | dense | standard | standard | — |
+| `Qwen/Qwen3-8B` | dense | standard, long | standard, long | 40,960 |
 | `Qwen/Qwen3.5-2B` | dense | standard, long | standard, long | 262,144 |
 | `Qwen/Qwen3.5-4B` | dense | standard, long | standard, long | 262,144 |
 | `Qwen/Qwen3.5-9B` | dense | standard, long | standard, long | 262,144 |
 | `Qwen/Qwen3.8-27B` | dense | standard, long | standard, long | 262,144 |
 | `Qwen/Qwen3-30B-A3B` | MoE | standard | standard | — |
 | `Qwen/Qwen3.6-35B-A3B` | MoE | standard, long | standard, long | 262,144 |
+| `Qwen/Qwen3.8-Flash-Next` | MoE | standard, long | standard, long | 262,144 |
 | `deepseek-ai/DeepSeek-V4.1-Flash-1017` | MoE | standard, long | standard, long | 262,144 |
 | `openai/gpt-oss-120b` | MoE | — | long | 131,072 |
 | `google/gemma-3-4b-it` | dense | standard, long | standard, long | 131,072 |
@@ -77,14 +78,25 @@ prompts with its own tokenizer.
   with prefix caching off. Router replay is disabled, and there are no
   full-parameter training files.
 
-- **Gemma 4 31B:** both training tiers use SDPA. Full-attention layers have head
-  dimension 512, which FlashAttention 3 rejects. Gemma 3 and MedGemma keep
-  FlashAttention 3; every one of their layers is 256.
+- **Gemma 4 31B:** training uses FlashAttention 3. Its full-attention layers
+  have head dimension 512, past FlashAttention 3's 256, and run on the trainer's
+  own head-512 attention kernels, one of the server changes listed under
+  [H200 SFT throughput files](../../model-catalog/README.md#h200-sft-throughput-files).
+  Every Gemma 3 and MedGemma layer is 256.
 - **DeepSeek V4.1-Flash:** full-parameter and attention LoRA train from the
   official checkpoint. LoRA inference records routes on every layer
   (`swa_bounded_replay` off). The sampler names the attention projections
   `wq_a`, `wkv`, `wq_b`, and `wo_b`. tinker-cookbook renders it as
   `deepseekv4_1`, and `deepseekv4_1_disable_thinking` with thinking off.
+- **H200 SFT throughput files:** the training files listed under
+  [H200 SFT throughput files](../../model-catalog/README.md#h200-sft-throughput-files)
+  are measured H200 throughput configurations. They need server changes that
+  are not yet in a released image.
+- **RL pairs:** every training file in the
+  [H200 SFT throughput files](../../model-catalog/README.md#h200-sft-throughput-files)
+  table has an inference file of its context and mode with the same
+  `max_seq_len`. Some LoRA samplers serve a narrower adapter than their
+  trainer's (no expert LoRA); see that section.
 - **Qwen3.6-35B-A3B:** LoRA training and checkpoint save/load require the
   `arctic` model provider, and LoRA is limited to `q_proj`, `k_proj`,
   `v_proj`, and `o_proj`. Routed-expert LoRA is not yet supported.
