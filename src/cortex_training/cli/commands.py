@@ -1538,6 +1538,11 @@ def _with_explanation(message: str, exc: BaseException) -> str:
     return message
 
 
+# The job record's status history: plain `get` prints it beside the config, and
+# `submit` drops it.
+_STATUS_HISTORY = "status_history"
+
+
 def _cmd_submit(
     args: argparse.Namespace,
     client,
@@ -1545,6 +1550,7 @@ def _cmd_submit(
     stdin: TextIO,
 ) -> int:
     body = _read_json_object(args.json_file, stdin)
+    body.pop(_STATUS_HISTORY, None)  # not config, so neither --dry-run nor the request has it
     _validate_create_job_body(body)
     if args.job_id is not None:
         body = dict(body)
@@ -1578,6 +1584,9 @@ def _cmd_get(args: argparse.Namespace, client, stdout: TextIO, stderr: TextIO) -
         raise ValueError(f"{exc} (get --raw prints the job's record as the service returned it)") from None
     if _model_deployment_sub_job(job) is None:  # a deployment sets no experiment
         body = create_job_body_from_job(job, experiment_name=_job_experiment_name(client, args.job_id, stderr))
+    history = job.get(_STATUS_HISTORY)
+    if isinstance(history, list) and history:
+        body[_STATUS_HISTORY] = history
     _print_json(body, stdout, compact=args.compact)
     return 0
 

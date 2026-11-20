@@ -195,14 +195,15 @@ class JobSummaryScreen(FollowsPointer, Screen):
         self.set_interval(1, self._fetch_tick)
 
     def _refresh_tick(self) -> None:
-        if self.app.screen is self and v.is_live(self._job):
+        # A job being cancelled too: its status still changes, and its timeline counts up.
+        if self.app.screen is self and v.time_runs_on(self._job):
             self._start_fetch()
 
     def on_screen_resume(self) -> None:
         self._refresh_view()
         # Back from the details, which may have seen the status move on: re-read the job now.
         reread, self._reread_on_resume = self._reread_on_resume, False
-        if reread and v.is_live(self._job):
+        if reread and v.time_runs_on(self._job):
             self._start_fetch()
 
     # The grid's label column: a 12-cell label and a space. Its values wrap
@@ -377,9 +378,10 @@ class JobSummaryScreen(FollowsPointer, Screen):
     _LIFE_GLYPHS = {"created": ("◇ ", theme.MUTED), "now": ("", theme.ACCENT)}  # "now" has the arrow
 
     def _lifecycle_rows(self, now: datetime, width: int) -> list:
-        """The job's lifecycle (:func:`~cortex_training.tui.views.lifecycle`) in
-        ``width`` cells: its steps joined by arrows that say how long each took, on
-        as few rows as they fit, each row after the first under the value column."""
+        """The card's Timeline row: the job's lifecycle
+        (:func:`~cortex_training.tui.views.lifecycle`) in ``width`` cells, its steps
+        joined by arrows that say how long each took, on as few rows as they fit,
+        each row after the first under the value column."""
         steps = v.lifecycle(self._job, now)
         if not steps:
             return []
@@ -387,7 +389,6 @@ class JobSummaryScreen(FollowsPointer, Screen):
         for before, step in zip([None, *steps], steps):
             look = theme.status_look(step.status)
             glyph, color = self._LIFE_GLYPHS.get(step.status, (f"{look.glyph} ", look.color))
-            current = step.status not in self._LIFE_GLYPHS  # the job's own state, in its color
             # The arrow from the step before, with how long that step took when the record tells.
             if before is None:
                 arrow = []
@@ -395,8 +396,9 @@ class JobSummaryScreen(FollowsPointer, Screen):
                 arrow = [(" ──", theme.FAINT), (f" {before.then} ", theme.MUTED), ("─▸ ", theme.FAINT)]
             else:
                 arrow = [(" ──▸ ", theme.FAINT)]
+            # The current state bold in its color; the steps before it plain.
             parts.append(Content.assemble(*arrow, (glyph, color),
-                                          (step.label, f"bold {color}" if current else theme.TEXT),
+                                          (step.label, f"bold {color}" if step.current else theme.TEXT),
                                           *([(f" {step.at}", theme.MUTED)] if step.at else [])))
         value_width = max(10, width - self._LABEL_WIDTH)
         lines = [parts[0]]
@@ -406,7 +408,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
             else:
                 lines.append(part[1:])  # a row starts at the connector's line, not a space
         pad = Content(" " * self._LABEL_WIDTH)
-        label = Content.styled(f"{'Lifecycle':<{self._LABEL_WIDTH - 1}} ", theme.MUTED)
+        label = Content.styled(f"{'Timeline':<{self._LABEL_WIDTH - 1}} ", theme.MUTED)
         return [label + lines[0], *(pad + line for line in lines[1:])]
 
     def _show_table(self, table: DataTable, labels: list, rows: list, wider: bool) -> None:
@@ -595,7 +597,8 @@ class JobSummaryScreen(FollowsPointer, Screen):
             self._render_fetch()
 
     def _fetch_line(self) -> Content:
-        """The job card's last line: a read in flight, the last one's failure, or when the copy was read."""
+        """The job card's last line: a read in flight, or the last one's failure; empty, so not shown, once a
+        read answers."""
         took = ""
         if self._loading and self._fetch_since is not None:
             seconds = int(monotonic() - self._fetch_since)
@@ -615,8 +618,6 @@ class JobSummaryScreen(FollowsPointer, Screen):
                                            error=error, at=at)
             return Content.from_markup(f"[{theme.WARN}]couldn't read the job: $error; showing the job list's copy[/]",
                                        error=error)
-        if at:
-            return Content.from_markup(f"[{theme.FAINT}]read from the service at $at[/]", at=at)
         return Content("")
 
     def _render_fetch(self) -> None:
@@ -625,7 +626,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
         except Exception:  # noqa: BLE001 - not mounted, or already removed
             return
         content = self._fetch_line()
-        line.display = bool(content.plain)  # no blank row before the first read
+        line.display = bool(content.plain)  # no blank row when there is nothing to say
         # A long error continues under its text, after the two-cell indent.
         line.update(hanging(content, self._inner_width(), 2))
 

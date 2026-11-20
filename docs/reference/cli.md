@@ -545,7 +545,9 @@ with status 2 before connecting.
 to launch another job configured like it; `get --raw` prints the job's record
 as the service returns it, with its status, sub-job ids and times.
 `checkpoints` lists saved checkpoints. `wait` waits for the job to reach
-**running**, not for training to finish. See
+**running**, not for training to finish, and prints the job's record as
+`get --raw` does, `status_history` included when the service reports it
+([REST API reference section 5.2](rest-api.md#52-get-job---get-job_id)). See
 [Manage Jobs](../guides/operations/manage-jobs.md) for the operational workflow.
 
 ```bash
@@ -560,7 +562,7 @@ with: its `hardware`, `comment`, `experiment_name`, `idle_timeout_seconds` and
 training or inference config. Edit any of it before you submit. Whole numbers
 print as integers (`4`, not `4.0`). What the service sets is left out: the job
 and sub-job ids, statuses, times, submitter, owner and image (a new job runs the
-current image).
+current image). The one exception is the job's status history, last below.
 
 - Each sub-job's config is its effective config, with the service's defaults
   filled in, once the job is running on a service that reports one. Before
@@ -580,6 +582,9 @@ current image).
   say which weights, so set it before you submit.
 - For a record without `hardware` (the service could not read the job's
   details), `get` fails and prints nothing; `get --raw` still prints the record.
+- When the job's record has a `status_history`, the body has it too. It is not
+  config: `submit` drops it, so `submit --dry-run` prints, and `submit` sends,
+  the body without it.
 
 ### List Available Models
 
@@ -1478,8 +1483,8 @@ history` (counting the jobs a search matches, followed by `N matches for
 QUERY`, while there is one), and ends with the sort (`sort: created ↓ newest
 first`). The Status column draws each status as a glyph and the word:
 `● RUNNING`, `◐ INITIALIZING`, `◔ PLACING` (and `creating`), `○ PENDING` (and
-`queued`), `? UNKNOWN`, `× FAILED`, `− CANCELLED`, and `✓` for `terminated`,
-`done` and `succeeded`.
+`queued`), `? UNKNOWN`, `× FAILED`, `⊖ CANCELLING` (being cancelled),
+`− CANCELLED`, and `✓` for `terminated`, `done` and `succeeded`.
 
 Rows show the job id, status, type, created time, duration and owner, then
 model, requested GPUs, optional location, and updated time. Created and Updated
@@ -1491,7 +1496,11 @@ computer's clock reads `just now`; one further ahead reads how far ahead it is
 Duration is how long a live job has run so far (since it was created, so it
 counts time spent waiting to be placed; in its status's color), or how long a
 finished one ran until its last state change (`40s`, `12m`, `3h 05m`,
-`2d 4h`). The times are as of the last refresh, which redraws them. On a narrow
+`2d 4h`). For a cancelled, terminated or failed job, that change is the end of
+its cleanup. A job still being cleaned up counts as finished here, its Duration
+ending at its last state change, while its card's time counts up until the
+cleanup ends. The times are as of the last refresh, which redraws them. On a
+narrow
 screen the Job ID column narrows (its id ends in `…`) and stays in view while
 the other columns scroll. The Schema column, shown when the list spans more than
 one location, is as wide as its longest `DB.SCHEMA` where the screen has room,
@@ -1620,16 +1629,35 @@ table, and toggles them short again.
 
 **GPUs** sums each sub-job's `n_gpus`, excluding `log_probability` and
 multiplexed sub-jobs that run on another sub-job's GPUs. The time beside the
-status includes queue and placement time; an `unknown` job runs to now.
+status includes queue and placement time; an `unknown` job runs to now. With a
+status history, an ended job's `lasted` ends where its timeline does.
 Missing times show `—`, and a clock up to five minutes ahead reads `just now`.
 
-**Lifecycle** runs from `created_at` to `state_changed_at`, the two times the
-job record has, and on to now while the job is live, with how long each step
-took: `◇ Created 15:14 ── 3m 10s ─▸ ● Running since 15:17 ── 9m 02s so far ─▸
-now`, or `◇ Created 2026-10-12 15:41 ── 2h 00m ─▸ × Failed 2026-10-12 17:41
-(5d 22h ago)`. States in between have no time in the record and get no step;
-a live job still in the state it was created in is one step (`○ Created,
-pending since 15:14`). An `unknown` job's state has no time.
+**Timeline** has a step for each status in the job's status history
+([REST API reference section 5.2](rest-api.md#52-get-job---get-job_id)), with
+how long each lasted, and runs on to now while the job is live:
+`○ Pending 00:58 ── 1m 43s ─▸ ◔ Placing 00:59 ── 35s ─▸ ◐ Initializing 01:00
+── 11m 47s ─▸ ● Running since 01:12 ── 9m 02s so far ─▸ now`, or, once it ended,
+`… ─▸ ● Running 01:12 ── 5h 59m ─▸ ⊖ Cancelling 07:12 ── 29s ─▸ − Cancelled 07:12
+(2h 00m ago)`. A history that starts after `Pending` gets a `◇ Created` step
+first, whose gap covers the statuses not recorded. The current status is in
+bold. A job being cancelled, terminated or failed has a `⊖ Cancelling`,
+`⊙ Terminating` or `⊗ Failing` step (`⊖ Dropping` for a deployment) that counts
+up like a live step until the job ends, so its cleanup is not counted as
+running time; the preview keeps re-reading such a job until then. A
+deployment's steps use deployment words, with placing and
+initializing as one `Initializing` step, then `● Ready`. The preview first
+draws the job as the job list has it, without a history, and redraws the
+timeline when its own read of the job answers.
+
+Without a status history, the timeline runs from `created_at` to
+`state_changed_at`, the two times the job record has, and on to now while the
+job is live, with how long each step took: `◇ Created 15:14 ── 3m 10s ─▸
+● Running since 15:17 ── 9m 02s so far ─▸ now`, or `◇ Created 2026-10-12 15:41
+── 2h 00m ─▸ × Failed 2026-10-12 17:41 (5d 22h ago)`. States in between have
+no time in the record and get no step; a live job still in the state it was
+created in is one step (`○ Created, pending since 15:14`). An `unknown` job's
+state has no time.
 
 A callout box under the job card says where the job stands, titled and colored
 by state: red for a failure (`Why it failed`, or `Failed before it got GPUs`);
@@ -1644,8 +1672,9 @@ screens omit Type, and wider tables scroll with `←` / `→` or `Home` / `End`;
 the card's bottom border says so (`e whole table`, `← → scroll`).
 
 The Config card under it follows the highlighted row. On the entire-job row it
-is the job's config exactly as `cortex-training get JOB_ID` prints it, a body
-that `submit` takes as it is (see [Manage existing jobs](#manage-existing-jobs));
+is the job's config exactly as `cortex-training get JOB_ID` prints it, without
+the status history, a body that `submit` takes as it is (see
+[Manage existing jobs](#manage-existing-jobs));
 on a sub-job's row, the same body with that sub-job alone, so a copy of it
 launches just that one. Its `experiment_name` is read once when the preview
 opens; until then, or when it can't be read, it is `null` and the card's bottom
@@ -1683,7 +1712,7 @@ its record says it is a deployment.
   carry no sub-job tag; each starts with its time (`HH:MM:SS`), and its
   wrapped rows start under the end of that time. The list marks each sub-job
   with its status's glyph and colour (`●` running, `◐` initializing, `◔`
-  placing, `○` pending, `×` failed, `−` cancelled, `✓` ended, `?` unknown), with the status under its name; the one the
+  placing, `○` pending, `×` failed, `⊖` cancelling, `−` cancelled, `✓` ended, `?` unknown), with the status under its name; the one the
   pane shows has an accent edge and a bold name. Saved logs (`s`) and copies
   stay as the lines came, uncoloured. In the pane the time is faint, the level
   has its severity's colour (a warning's or an error's message is tinted to

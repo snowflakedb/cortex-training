@@ -47,6 +47,7 @@ from cortex_training.model_deployment import WIRE_DEPLOYMENT_CLASS
 from cortex_training.model_deployment import WIRE_INFERENCE_CONFIG
 from cortex_training.model_deployment import WIRE_NUM_REPLICAS
 from cortex_training.tui.format import _ACTIVE_STATUSES as ACTIVE_STATUSES
+from cortex_training.tui.format import _TERMINAL_STATUSES as TERMINAL_STATUSES
 from cortex_training.tui.format import _num as compact_number
 from cortex_training.tui.format import cut_cells
 from cortex_training.tui.format import _subjob_config as subjob_config
@@ -204,6 +205,30 @@ def is_live(job: Any) -> bool:
     """Whether a job is active, including UNKNOWN unless it is not found."""
     word = status_word(job.get("status")) if isinstance(job, dict) else ""
     return word in ACTIVE_STATUSES or (word == "unknown" and not job_not_found(job))
+
+
+# The statuses of a job being cleaned up after it was cancelled (a deployment
+# being dropped), terminated or failed, and the status each ends in. Such a job
+# is not live (it takes no more work: see serving.serving_state), but it isn't
+# over either: its status still changes to the end.
+CANCELLING = "cancelling"
+_CLEANUP_ENDS_AS = {CANCELLING: "cancelled", "terminating": "terminated", "failing": "failed"}
+
+
+def time_runs_on(job: Any) -> bool:
+    """Whether a job's clock still runs: it is live (:func:`is_live`), or being
+    cleaned up, so its current step counts up and its screens keep re-reading it.
+
+    The service reports a job being cleaned up with the status it ends in, so
+    such a job is told by its status history, which ends in the cleanup."""
+    if not isinstance(job, dict):
+        return False
+    if is_live(job):
+        return True
+    word = status_word(job.get("status"))
+    entries = _history_entries(job)
+    last = entries[-1][0] if entries else ""
+    return word in _CLEANUP_ENDS_AS or (last in _CLEANUP_ENDS_AS and _settled(last) == _settled(word))
 
 
 def job_not_found(job: Any) -> bool:
@@ -534,6 +559,11 @@ def training_method(sj: dict) -> str:
 
 
 def job_elapsed(job: dict, now: datetime) -> Optional[float]:
+    """The job list's Duration: from creation to now while the job is live (:func:`is_live`),
+    else to when its status last changed. A job being cleaned up is not live, and the list draws
+    it as ended, so its Duration must not run on: a status history that ends in the cleanup
+    (which the job's preview copies onto the list's row) changes nothing here. The preview's own
+    clock, which runs on through a cleanup, is :func:`elapsed_text`'s."""
     start = parse_ts(job.get("created_at"))
     if not start:
         return None
@@ -542,11 +572,12 @@ def job_elapsed(job: dict, now: datetime) -> Optional[float]:
 
 
 def job_config_json(job: dict, sub_job: Optional[dict] = None, *, experiment_name: Optional[str] = None) -> list:
-    """The job's config as the lines ``cortex-training get`` prints: a CreateJob
-    body that ``submit`` takes as it is, with ``experiment_name`` the job's
-    experiment (see the client's ``create_job_body_from_job``). With ``sub_job``,
-    one of the job's entries, the body has that sub-job alone, so a copy of it
-    launches just that one. Raises ``ValueError`` for a job that cannot be copied."""
+    """The job's config as the lines ``cortex-training get`` prints, without the
+    status history: a CreateJob body that ``submit`` takes as it is, with
+    ``experiment_name`` the job's experiment (see the client's
+    ``create_job_body_from_job``). With ``sub_job``, one of the job's entries, the
+    body has that sub-job alone, so a copy of it launches just that one. Raises
+    ``ValueError`` for a job that cannot be copied."""
     if sub_job is not None:
         # Without the label sub_jobs gives an entry that has no id.
         job = {**job, "sub_jobs": [{key: value for key, value in sub_job.items() if key != "label"}]}
@@ -583,15 +614,28 @@ def preview_facts(job: dict, now: datetime, *, base_url: str = "") -> list:
 
 def elapsed_text(job: dict, now: datetime) -> str:
     """The time beside the preview's status: ``12m 04s so far`` while the job is
-    live, ``lasted 1h 20m`` once it ended, ``""`` without a creation time.
+    live or being cancelled (:func:`time_runs_on`), ``lasted 1h 20m`` once it
+    ended, ``""`` without a creation time.
 
-    It runs from creation (:func:`job_elapsed`), so it includes any time spent
-    queued or placing: "lasted", not "ran", since a job may never have run.
+    It runs from creation, so it includes any time spent queued or placing:
+    "lasted", not "ran", since a job may never have run. With a status history,
+    an ended job lasted until its last history entry began, as its lifecycle
+    shows: when it stopped, or, where the history records its cleanup
+    (``CANCELLING``, then ``CANCELLED``), when the cleanup finished. Without one,
+    until its status last changed (``state_changed_at``), as the job list's
+    Duration (:func:`job_elapsed`).
     """
-    seconds = job_elapsed(job, now)
-    if seconds is None:
+    created = parse_ts(job.get("created_at"))
+    if not created:
         return ""
-    return f"{fmt_duration(seconds)} so far" if is_live(job) else f"lasted {fmt_duration(seconds)}"
+    if time_runs_on(job):
+        return f"{fmt_duration(max(0.0, (now - created).total_seconds()))} so far"
+    periods = _status_periods(job, now)
+    if periods:
+        seconds = max(0.0, (periods[-1].start - created).total_seconds())
+    else:
+        seconds = job_elapsed(job, now)
+    return f"lasted {fmt_duration(seconds)}"
 
 
 def short_time(raw: Any, now: datetime) -> str:
@@ -612,19 +656,84 @@ class LifeStep:
     label: str
     at: str = ""  # when the step began, "" when the job record has no time for it
     then: str = ""  # how long until the next step, "" when the record can't tell
+    current: bool = False  # the job's current state, drawn in bold
+
+
+@dataclass(frozen=True)
+class _Period:
+    """One status of a job's status history."""
+
+    status: str  # the job status the period began with, as status_word spells it
+    start: datetime  # when the job entered it
+    seconds: Optional[float]  # how long it lasted, or has so far; None for the status a job ended in
+
+
+# Every status word a job can have, cleanup included; a status history's entries in any other are skipped.
+_JOB_STATUSES = frozenset(ACTIVE_STATUSES) | frozenset(TERMINAL_STATUSES) | frozenset(_CLEANUP_ENDS_AS)
+
+
+def _history_entries(job: dict) -> list:
+    """``(status word, when the job entered it)`` for each entry of the job's
+    ``status_history`` that has a known status and a time, oldest first."""
+    history = job.get("status_history")
+    if not isinstance(history, list):
+        return []
+    entries = []
+    for entry in history:
+        status = status_word(entry.get("status")) if isinstance(entry, dict) else ""
+        start = parse_ts(entry.get("entered_at")) if status in _JOB_STATUSES else None
+        if start is not None:
+            entries.append((status, start))
+    return entries
+
+
+def _settled(word: str) -> str:
+    """The status ``word`` ends in, in one spelling: a cleanup's is the status after it."""
+    word = _CLEANUP_ENDS_AS.get(word, word)
+    return _STATUS_SPELLINGS.get(word, word)
+
+
+def _status_periods(job: dict, now: datetime) -> list:
+    """The job's ``status_history`` as :class:`_Period` s, oldest first; ``[]``
+    when it has none to show, the job is ``unknown``, or the last entry is neither
+    the job's status nor the cleanup before it (the history is then not this
+    record's).
+
+    Each status lasts until the next began, never below zero, and the current one
+    until ``now`` while the job's clock runs (:func:`time_runs_on`: live, or being
+    cleaned up). Entries the screens word alike (a deployment's PLACING and
+    INITIALIZING) merge into the first. An entry without a known status and a
+    time is skipped.
+    """
+    word = status_word(job.get("status"))
+    entries = _history_entries(job) if word != "unknown" else []
+    if not entries or _settled(entries[-1][0]) != _settled(word):
+        return []
+    merged = [entry for at, entry in enumerate(entries)
+              if not at or status_word_for(job, entry[0]) != status_word_for(job, entries[at - 1][0])]
+    ends = [start for _status, start in merged[1:]] + [now if time_runs_on(job) else None]
+    return [_Period(status, start, None if end is None else max(0.0, (end - start).total_seconds()))
+            for (status, start), end in zip(merged, ends)]
 
 
 def lifecycle(job: dict, now: datetime) -> list:
     """The :class:`LifeStep` s from the job's creation to its current state, and on
-    to now while it is live.
+    to now while it is live; the current state's step is ``current``, and a
+    deployment's steps use deployment words (``Ready``).
 
-    The job record has two times: ``created_at`` and ``state_changed_at``, when
-    it entered its current status. So there are no steps for the states between
-    (a running job's time pending and placing is in its first gap), and none for
-    a time the record lacks; an ended job's current state began when it ended.
-    An ``unknown`` job's state has no time: the service could not read it.
+    With a ``status_history``, there is a step for each status in it (see
+    :func:`_status_periods`), after a ``Created`` step when it does not start at
+    PENDING. Without one, the job record has two times: ``created_at`` and
+    ``state_changed_at``, when it entered its current status. So there are no
+    steps for the states between (a running job's time pending and placing is in
+    its first gap), and none for a time the record lacks; an ended job's current
+    state began when it ended. An ``unknown`` job's state has no time: the
+    service could not read it.
     """
     created = parse_ts(job.get("created_at"))
+    periods = _status_periods(job, now)
+    if periods:
+        return _history_steps(job, periods, created, now)
     word = status_word(job.get("status"))
     changed = parse_ts(job.get("state_changed_at")) if word != "unknown" else None
     steps = []
@@ -633,18 +742,37 @@ def lifecycle(job: dict, now: datetime) -> list:
         steps.append(LifeStep("created", "Created", short_time(created, now),
                               fmt_duration(gap) if gap is not None and gap >= 1 else ""))
     if word == "unknown":
-        return [*steps, LifeStep("unknown", "status unavailable")]
-    name = word.capitalize()
+        return [*steps, LifeStep("unknown", "status unavailable", current=True)]
+    shown = status_word_for(job, job.get("status"))
+    name = shown.capitalize()
     if not changed:
-        return [*steps, LifeStep(word, name)]
-    if not is_live(job):
-        return [*steps, LifeStep(word, name, f"{short_time(changed, now)} ({fmt_ago(changed, now)})")]
+        return [*steps, LifeStep(word, name, current=True)]
+    if not time_runs_on(job):
+        return [*steps, LifeStep(word, name, f"{short_time(changed, now)} ({fmt_ago(changed, now)})", current=True)]
     so_far = (now - changed).total_seconds()
     if created and abs((changed - created).total_seconds()) < 1:
         # In this state since it was created (a job still pending): one step says both.
-        steps, name = [], f"Created, {word}"
+        steps, name = [], f"Created, {shown}"
     return [*steps, LifeStep(word, f"{name} since", short_time(changed, now),
-                             f"{fmt_duration(so_far)} so far" if so_far >= 0 else ""),
+                             f"{fmt_duration(so_far)} so far" if so_far >= 0 else "", current=True),
+            LifeStep("now", "now")]
+
+
+def _history_steps(job: dict, periods: list, created: Optional[datetime], now: datetime) -> list:
+    """:func:`lifecycle` with a status history, ``periods`` its :func:`_status_periods`."""
+    steps = []
+    if created and periods[0].status != "pending":
+        # What came before the first status was not recorded: one gap from creation, as without a history.
+        gap = (periods[0].start - created).total_seconds()
+        steps.append(LifeStep("created", "Created", short_time(created, now), fmt_duration(gap) if gap >= 1 else ""))
+    for period in periods[:-1]:
+        steps.append(LifeStep(period.status, status_word_for(job, period.status).capitalize(),
+                              short_time(period.start, now), fmt_duration(period.seconds)))
+    last = periods[-1]
+    name, at = status_word_for(job, last.status).capitalize(), short_time(last.start, now)
+    if last.seconds is None:  # the status it ended in
+        return [*steps, LifeStep(last.status, name, f"{at} ({fmt_ago(last.start, now)})", current=True)]
+    return [*steps, LifeStep(last.status, f"{name} since", at, f"{fmt_duration(last.seconds)} so far", current=True),
             LifeStep("now", "now")]
 
 
@@ -758,9 +886,10 @@ def status_unavailable_text(job: dict) -> str:
 
 
 # Fields the service recomputes on every get: a fresh answer replaces them as a
-# whole, so one it stopped sending (a cleared reason) disappears. created_at is
-# not one: it never changes, and an UNKNOWN answer leaves it out.
-SERVICE_FIELDS = ("status", "reason", "reason_details", "updated_at", "state_changed_at", "sub_jobs")
+# whole, so one it stopped sending (a cleared reason, or a status history that
+# an UNKNOWN answer leaves out) disappears. created_at is not one: it never
+# changes, and an UNKNOWN answer leaves it out.
+SERVICE_FIELDS = ("status", "reason", "reason_details", "updated_at", "state_changed_at", "status_history", "sub_jobs")
 
 
 def refresh_job(current: Optional[dict], fresh: dict) -> dict:
