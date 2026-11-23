@@ -1,0 +1,17 @@
+id: self-training-loop
+title: Self-training loop on judged agent traces
+status: runnable
+task: sft
+methods:
+  - lora
+datasets:
+  - synthetic-retail-sql
+judge_models:
+  - claude-sonnet-4-6
+seed_models:
+  - glm-5.3
+precision:
+  - bfloat16
+provenance:
+  project: Snowflake-Labs/agent-self-training-loop
+last_validated: null

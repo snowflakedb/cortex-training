@@ -10,6 +10,7 @@ type on the command line instead of writing a job file.
 | [Custom-loss SFT](sft_quickstart/custom_loss/README.md) | SFT with a loss written in PyTorch (focal loss) | The conversational SFT datasets |
 | [DPO](dpo_quickstart/README.md) | Direct Preference Optimization with a custom loss (chosen/rejected pairs) | UltraFeedback, a built-in smoke set |
 | [DARE-Bench agent SFT](sft_quickstart/dare/README.md) | Full-parameter multi-turn tool SFT + agent eval | DARE-Bench |
+| [Self-training loop](self_training_loop/README.md) | LoRA SFT on an agent's own judge-selected traces, repeated as traffic drifts | Synthetic retail SQL tasks, traced through Cortex AI Gateway |
 | [Math GRPO](rl_quickstart/README.md) | Reinforcement learning | Hendrycks MATH, MATH-500 |
 | [On-policy distillation](distillation/README.md) | Multi-turn tool-use distillation from a frozen teacher | Wiki-search trivia |
 | [Inference endpoint](inference/README.md) | Serve, generate, evaluate open weights or a checkpoint | MATH-500, GSM8K, identity |
@@ -31,6 +32,7 @@ recipes/
 ├── rl_quickstart/           # runner.py (shared loop), overrides.json, math_grpo/, configs/ (generated)
 ├── distillation/            # runner.py (shared loop), episodes.py, overrides.json, on_policy/, tasks/, configs/ (generated)
 ├── inference/               # serve.py, generate.py, evaluate.py, overrides.json
+├── self_training_loop/      # collect.py, select.py, train.py, sql/, overrides.json
 ├── dflash2/                 # generate_data.py, train.py, evaluate.py, overrides.json, drafts/<model>.json
 ├── model_deployment/        # deploy.py, streaming.py, configs/
 ├── api_quickstart/          # raw REST API request bodies
