@@ -1763,6 +1763,16 @@ comes from a server version that predates this behavior. If you set the opt-out
 and the result still shows `clear_cache: true`, check the key's spelling and
 that it is set under `vllm_config`.
 
+On server versions that include this behavior, a weight sync that times out
+(after 30 minutes per sampling target), is cancelled with `cancel_request`, or
+fails on either side stops both the training and the sampling sub-job, because
+neither side of the transfer can continue without the other. The job then
+fails with `failure.code` `runtime_sub_job_failed` and a message saying that a
+weight sync between the training and sampling sub-jobs failed or timed out. A
+sub-job that had already failed for its own reason, such as running out of GPU
+memory, reports that reason instead. Create a new job, resuming from your last
+checkpoint if you have one.
+
 ### 7.3 LoRA adapter sync
 
 LoRA synchronization uses the same `weight-sync` operation, but it requires
