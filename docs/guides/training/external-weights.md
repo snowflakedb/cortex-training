@@ -2,7 +2,9 @@
 
 Use an external-weight import (also called a BYO checkpoint) when you have a
 complete Hugging Face model directory that was produced outside Cortex Training
-and want to use its weights for a new training or sampling job.
+and want to use its weights for a new training or sampling job. To serve the
+weights from a model deployment instead, see
+[Deploy a Model](../inference/deploy-model.md).
 
 This initializes model weights; it does not restore an optimizer, scheduler, or
 training step. A training job starts with a fresh optimizer. External-weight
@@ -246,3 +248,5 @@ for any other job.
   an existing stage is only read once GPUs are assigned, so a mistyped path
   makes the job fail during initialization rather than at submission. Run
   `LIST` on the exact path before submitting.
+- The stage read credentials last at most 12 hours from submission, so a job
+  that waits longer than that for GPUs also fails during initialization.

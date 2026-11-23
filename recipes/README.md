@@ -13,7 +13,7 @@ type on the command line instead of writing a job file.
 | [Math GRPO](rl_quickstart/README.md) | Reinforcement learning | Hendrycks MATH, MATH-500 |
 | [On-policy distillation](distillation/README.md) | Multi-turn tool-use distillation from a frozen teacher | Wiki-search trivia |
 | [Inference endpoint](inference/README.md) | Serve, generate, evaluate open weights or a checkpoint | MATH-500, GSM8K, identity |
-| [Model deployment streaming](model_deployment/README.md) | OpenAI-compatible model deployment, streamed chat | Open weights, checkpoints |
+| [Model deployment streaming](model_deployment/README.md) | OpenAI-compatible model deployment, streamed chat | Open weights, checkpoints, imported weights |
 | [DFlash2 draft](dflash2/README.md) | Speculative-decoding draft training, then serving with the target | Target-written chats (UltraChat prompts) |
 | [SkyRL GRPO](skyrl/gsm8k_grpo/README.md) | SkyRL trainer on CPU driver + Cortex training/sampling sub-jobs | GSM8K |
 | [TRL GRPO](trl/gsm8k_grpo/README.md) | TRL trainer on CPU driver + Cortex training/sampling sub-jobs | GSM8K |
