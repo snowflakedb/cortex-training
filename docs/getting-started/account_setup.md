@@ -5,15 +5,17 @@ Follow the steps in order.
 
 ## Step 1: Create a Snowflake Account
 
-Cortex Training is in public preview. Snowflake accounts with a capacity
-contract have access by default. If your account has a capacity contract, skip
+Cortex Training is in public preview and available in all commercial Amazon Web
+Services (AWS) regions. Snowflake accounts with a capacity contract have access
+by default. If your account has a capacity contract, skip
 to [Step 3](#step-3-authenticate).
 
 To try Cortex Training, create a free trial account at
 [signup.snowflake.com](https://signup.snowflake.com). Fill in your details and
 verify your email. No credit card is required. The cloud provider and region
-are assigned automatically. Trial accounts need enablement, which is covered in
-the next step.
+are assigned automatically, so check in the next step that the region is a
+commercial AWS region. Trial accounts need enablement, which is covered in the
+next step.
 
 ## Step 2: Request Enablement on Trial Accounts
 
@@ -33,7 +35,8 @@ reserve GPU capacity. You will need to provide:
    ```
    Or from the Snowsight URL: the `ORG` part.
 
-3. **Region** — confirm which cloud region your account is in:
+3. **Region** — confirm which cloud region your account is in. It must be a
+   commercial AWS region:
    ```sql
    SELECT CURRENT_REGION();
    ```
