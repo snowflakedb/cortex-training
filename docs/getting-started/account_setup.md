@@ -5,17 +5,20 @@ Follow the steps in order.
 
 ## Step 1: Create a Snowflake Account
 
-If you already have a Snowflake account with Cortex Training enabled, skip to
-[Step 3](#step-3-authenticate).
+Cortex Training is in public preview. Snowflake accounts with a capacity
+contract have access by default. If your account has a capacity contract, skip
+to [Step 3](#step-3-authenticate).
 
-Create a free trial account at [signup.snowflake.com](https://signup.snowflake.com).
-Fill in your details and verify your email. No credit card is required. The
-cloud provider and region are assigned automatically.
+To try Cortex Training, create a free trial account at
+[signup.snowflake.com](https://signup.snowflake.com). Fill in your details and
+verify your email. No credit card is required. The cloud provider and region
+are assigned automatically. Trial accounts need enablement, which is covered in
+the next step.
 
-## Step 2: Request Cortex Training Enablement
+## Step 2: Request Enablement on Trial Accounts
 
-After creating your account, contact the Snowflake team to enable Cortex
-Training and reserve GPU capacity. You will need to provide:
+Trial accounts must contact the Snowflake team to enable Cortex Training and
+reserve GPU capacity. You will need to provide:
 
 1. **Account locator** — find it in Snowsight by running:
    ```sql
@@ -43,8 +46,15 @@ Share these three values with the Snowflake team. They will:
 You cannot proceed until this is complete. Once the team confirms enablement,
 continue to the next step.
 
+## Step 3: Authenticate
+
+Generate a Programmatic Access Token (PAT) and configure your client connection.
+Follow the [authentication guide](authentication.md) to complete this step.
+You verify the connection after installing the client in the next step.
+
 ### Grant access to other roles
 
+Run this on every account, including accounts with a capacity contract.
 Creating a job requires the `USE CORTEX TRAINING` privilege on the account.
 `ACCOUNTADMIN` has it. To let another role create jobs, an `ACCOUNTADMIN` runs:
 
@@ -66,12 +76,6 @@ GRANT USE CORTEX TRAINING ON ACCOUNT TO ROLE PUBLIC;
 Roles also need privileges on the database and schema you use, and
 `CREATE EXPERIMENT` on that schema unless you pass an existing experiment. See
 [Access control](../reference/rest-api.md#37-access-control) for every operation.
-
-## Step 3: Authenticate
-
-Generate a Programmatic Access Token (PAT) and configure your client connection.
-Follow the [authentication guide](authentication.md) to complete this step.
-You verify the connection after installing the client in the next step.
 
 ## Step 4: Install the Client and Example Dependencies
 
@@ -103,8 +107,8 @@ cortex-training capacity
 ```
 
 You should see your reserved GPU capacity listed. If you see zero capacity or
-an error, confirm with the Snowflake team that enablement and GPU reservation
-are complete.
+an error, confirm that your account has a capacity contract or, for a trial
+account, that the Snowflake team has finished enablement and GPU reservation.
 
 ## Step 5: Run Your First Training Job
 
