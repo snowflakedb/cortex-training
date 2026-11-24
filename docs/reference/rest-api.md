@@ -1231,6 +1231,66 @@ When per-step peak-memory reporting is enabled (see
 current `/forward-backward` plus `/step` cycle; `cpu_peak` is rank 0's current
 process RSS. The key is absent when the setting is disabled.
 
+Training callbacks may add top-level fields to a successful `/step` result.
+Their keys are callback-defined; `router_stats` is the currently documented
+field. Callback metrics are reduced across ranks according to each callback's
+reduction rule (`SUM`, `MEAN`, `MAX`, `MIN`, `PER_RANK` / stack, or `RANK0`).
+A callback metric whose name collides with a built-in step field is dropped and
+logged by the service; it never replaces the built-in field. Reserved names
+include `job_id`, `global_steps`, `last_lr`, `grad_norm`,
+`update_successful`, `bandwidth`, `callback_metrics_dropped`, `skip_reason`,
+`non_finite_gradient_rank`, `non_finite_gradient_parameter`, and the service's
+rank-0 diagnostic fields.
+
+A hook `Exception` after initialization quarantines only that callback for the
+rest of the step. Other callbacks' valid metrics are still returned. Every
+quarantined metric name appears in the sorted top-level
+`callback_metrics_dropped` array; this field is present only when non-empty. A
+declared metric that the callback did not log is treated as quarantined and is
+reported in the same array. An `Exception` from `post_init` is different: it is
+fatal during worker initialization/job creation and is not quarantined.
+
+If ranks return incomplete or inconsistent non-`RANK0` metric sets, or their
+values cannot be reduced, the head omits callback values from that flush, adds
+the union of participating non-`RANK0` names to
+`callback_metrics_dropped`, and still returns the successful training result.
+Callbacks must not run collectives inside hooks; aggregation is the head's
+`Reduce` merge.
+
+When `training_config.debug.router_stats_sample_stride` is greater than `0`
+(see [section 8.7](#87-router-statistics)), an optimizer step's result includes
+a top-level `router_stats` object. Each key is a router module name; each value
+contains world-summed `tokens_per_expert`, `sampled_tokens`, `entropy_sum`,
+`replayed_tokens`, and `replay_agreement_sum` collected since the previous
+`/step`, including forward-only calls such as reference logprobs:
+
+```json
+{
+  "global_steps": 12,
+  "last_lr": 0.00002,
+  "router_stats": {
+    "model.layers.0.mlp.router": {
+      "tokens_per_expert": [128.0, 96.0],
+      "sampled_tokens": 1024.0,
+      "entropy_sum": 1536.0,
+      "replayed_tokens": 0.0,
+      "replay_agreement_sum": 0.0
+    }
+  }
+}
+```
+
+`tokens_per_expert` has one number per expert. `sampled_tokens` is the count of
+tokens included in the entropy and replay sample. `entropy_sum` is the summed
+entropy of the router's normalized scores, in nats. `replayed_tokens` and
+`replay_agreement_sum` cover that same sample when routing was replayed, and
+are `0.0` otherwise. The key is absent when the sample stride is `0`. A frozen
+model has no optimizer to update, but its `/step` still closes the step: the
+result reports `"grad_norm": null` and carries `router_stats` (and any other
+callback metric) collected by forward calls since the previous `/step`. That
+flush clears the collected callback state, so the next `/step` starts a new
+metrics window even though no optimizer update occurred.
+
 ### 6.3 Save checkpoint - `POST /{job_id}/save`
 
 ```json
@@ -2738,6 +2798,63 @@ The flag is rejected unless all of these hold:
 - `speculative_config.model` is not set. A job names its draft either by `model`
   or by this flag, not both.
 
+### 8.7 Router statistics
+
+Router health statistics are enabled through `training_config.debug`. When
+`debug` is omitted, the same keys are read from
+`training_config.prime_rl.debug`. The typed client has no dedicated fields, so
+pass them through `extra_training`.
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `router_stats_sample_stride` | JSON integer | `0` | Token stride for entropy and replay agreement. `0` disables the statistics and omits `router_stats` from `/step`. Must be `>= 0`. Booleans, strings, and non-integers are rejected. |
+| `router_stats_call_stride` | JSON integer | `1` | Observe every Nth router call. Must be `>= 1`. Booleans, strings, and non-integers are rejected. |
+
+```python
+training = SubJobConfig.training_job(
+    model_name="Qwen/Qwen3-30B-A3B",
+    optimizer={"name": "AdamW", "lr": 1e-4},
+    max_seq_len=2048,
+    train_batch_size=8,
+    n_gpus=8,
+    extra_training={
+        "ep_size": 8,
+        "debug": {"router_stats_sample_stride": 1, "router_stats_call_stride": 1},
+    },
+)
+```
+
+A positive sample stride is supported only for an expert-parallel MoE model
+whose loaded module tree contains `TokenChoiceTopKRouter`, with `ep_size > 1`.
+It is not supported for dense models or the default `ep_size=1`. If this
+requirement is not met, the callback's `post_init` raises during worker
+initialization and job creation fails; this error is fatal, not quarantined.
+The Qwen MoE example above therefore sets `ep_size` to all 8 workers.
+
+For a supported MoE job, a positive sample stride adds `router_stats` to each
+optimizer `/step` result, as described in
+[section 6.2](#62-optimizer-step---post-job_idstep). Totals are world sums of
+the forward-backward and forward-only calls since the previous optimizer step.
+Entropy and replay agreement use every
+`router_stats_sample_stride`-th token of every `router_stats_call_stride`-th
+router call. Padding microbatches and activation-checkpoint reruns are not
+counted. A router with `top_k < 2` is rejected. A frozen model's `/step` still
+includes `router_stats` from the forward calls since the previous `/step`. A
+callback metric whose name is already a `/step` field, including `grad_norm`
+and `last_lr`, is dropped and logged instead of replacing that field.
+Quarantined metrics and incomplete cross-rank metric names are reported through
+`callback_metrics_dropped` as described above.
+
+    optimizer={"name": "AdamW", "lr": 1e-4},
+    max_seq_len=2048,
+    train_batch_size=8,
+    n_gpus=8,
+    extra_training={
+    },
+)
+```
+
+
 ---
 
 ## 9. DSSST1 binary wire protocol
@@ -3195,7 +3312,7 @@ These are conventional backend results, not closed REST schemas:
 | Operation | Common result |
 |---|---|
 | `forward-backward` | `job_id`, `avg_loss`, `metrics`, `post_process_outputs`; `metrics` carries the ratio-control metrics when those controls are active (see [section 10.3](#103-arctictraining-extensions)) |
-| `step` | `global_steps`, `last_lr`, optional `peak_memory` |
+| `step` | `global_steps`, `last_lr`, optional `peak_memory`, optional `router_stats`, optional `callback_metrics_dropped` |
 | `save` | `job_id`, `stage_path` (carries the `cp_<uuid>` id), `checkpoint_path`, `checkpoint_tag`, `version` — no `checkpoint_id` key in the observed release (see 6.3) |
 | `load` | `checkpoint_id` and backend load metadata |
 | `generate` | `job_id`, `results[]` |
