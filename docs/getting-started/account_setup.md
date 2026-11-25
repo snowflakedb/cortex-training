@@ -51,9 +51,10 @@ continue to the next step.
 
 ## Step 3: Authenticate
 
-Generate a Programmatic Access Token (PAT) and configure your client connection.
-Follow the [authentication guide](authentication.md) to complete this step.
-You verify the connection after installing the client in the next step.
+Generate a Programmatic Access Token (PAT): follow
+[Create a PAT](authentication.md#step-1-create-a-pat) in the authentication
+guide. After installing the client in the next step, `cortex-training login`
+uses it to set up your connection and database.
 
 ### Grant access to other roles
 
@@ -102,6 +103,18 @@ raw API examples do not:
 ```bash
 uv pip install 'tinker-cookbook[math-rl] @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
 ```
+
+Set up your connection and database:
+
+```bash
+cortex-training login
+```
+
+It asks for the account, user, role and PAT, checks that the profile connects
+to Cortex Training, and saves it as the one to use. It also checks the
+profile's database and schema: if either is missing, it shows the `CREATE`
+statement and runs it only if you say yes. See the
+[authentication guide](authentication.md) for other ways to connect.
 
 Verify your connection and GPU capacity:
 

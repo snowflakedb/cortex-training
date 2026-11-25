@@ -1,11 +1,11 @@
 # Authentication
 
 Cortex Training authenticates through a Snowflake Programmatic Access Token
-(PAT). This page walks you through three steps:
+(PAT). This page walks you through two steps:
 
 1. **Create a PAT** — required regardless of which configuration method you use
-2. **Create the database** — one-time setup for the connection config
-3. **Configure the client** — pick one of the methods below to supply your PAT
+2. **Configure the client** — pick one of the methods below to supply your PAT.
+   `cortex-training login` (recommended) also sets up the database
 
 ## Step 1: Create a PAT
 
