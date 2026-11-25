@@ -2292,6 +2292,11 @@ many colors the terminal has. See [Terminals](#terminals).
 as JSON lists inside the request frame instead of as tensors. The request body
 stays a DSSST1 frame either way.
 
+`CORTEX_TRAINING_ENABLE_MEDIA_INPUT` (truthy) lets the Python client send
+`ModelInput` prompts (text and media chunks) to `generate()`. It is off by
+default and experimental; without it such a prompt raises `ValueError` before
+anything is sent. See the [REST API reference](rest-api.md#chunked-modelinput-prompts).
+
 `CORTEX_TRAINING_FORWARD_OPERATION_MAX_JSON_BYTES` is the per-request JSON body
 ceiling for byte `forward()` `/operation` posts (integer bytes, default 16 MiB,
 minimum 16 KiB). Frames larger than that are split into request chunks.

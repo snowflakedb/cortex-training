@@ -1420,7 +1420,9 @@ Rules:
   `sub_job_id` and the server chooses the sub-job. Currently it uses the job's only
   sampling sub-job, and rejects the request (listing the valid ids) when there are
   several. Applies to `generate-stream` identically.
-- `prompts` is a list of string prompts and/or token-id lists. A flat list of
+- `prompts` is a list of string prompts, token-id lists, and/or chunked
+  `{"chunks": [...]}` prompts (see
+  [Chunked prompts](#chunked-modelinput-prompts) below). A flat list of
   integers such as `[1, 2, 3]`, and a bare 1-D tensor, are each read as one
   pre-tokenized prompt rather than as a batch. For a batch of several prompts,
   use the nested form `[[1, 2, 3], [4, 5]]`.
@@ -1447,6 +1449,156 @@ validate.
 Generate uses the same DSSST1 response options as forward/backward, but unlike
 forward/backward it sends the frame unwrapped when it fits, and only splits it
 into request chunks above 60 MiB. See [section 9.3](#93-request-chunking).
+
+#### Chunked (`ModelInput`) prompts
+
+A third prompt shape is an ordered list of text and media chunks:
+
+```json
+{"chunks": [
+  {"type": "encoded_text", "tokens": [1, 2, 3]},
+  {"type": "image", "data": "<uint8 tensor>", "format": "png"},
+  {"type": "encoded_text", "tokens": [4, 5]}
+]}
+```
+
+`chunks` must hold at least one chunk. Each chunk is selected by its `type` and
+takes only the fields below; an unknown `type` or an unknown field is a 400, so
+media is never dropped silently.
+
+| `type` | Field | Type | Notes |
+|---|---|---|---|
+| `encoded_text` | `tokens` | non-empty token-id list, or a 1-D integer tensor | Token ids from the model's tokenizer |
+| `image` | `data` | non-empty 1-D `uint8` tensor | Encoded image bytes |
+| `image` | `format` | `"png"` or `"jpeg"` | Must match the bytes (see below) |
+| `video` | `data` | non-empty 1-D `uint8` tensor | Encoded video bytes |
+| `video` | `format` | `"mp4"` | Must match the bytes (see below) |
+| `image`, `video` | `expected_tokens` | integer >= 1, optional | Refused when set (see below) |
+| `video` | `fps` | number > 0, optional | Refused when set (see below) |
+
+The server also parses `image_asset_pointer` and `video_asset_pointer`
+(`format`, `location`, plus `fps` on video) and `dmel` (`dmel` bytes) chunks,
+and refuses them (see below).
+
+In the DSSST1 frame, media `data` is always a 1-D `uint8` tensor in the tensor
+section; the server has no JSON form for it and refuses media bytes sent any
+other way. `encoded_text` tokens follow the rule for pre-tokenized prompts
+above: `int32` tensors, or JSON lists when
+`CORTEX_TRAINING_DISABLE_TENSOR_PROMPTS` is set. Media bytes stay tensors in
+both cases. Fields that are `None` are left out of the frame.
+
+The server puts one placeholder token id per image or video chunk into the
+prompt's token ids, in the chunk's position, and passes the media alongside;
+the model's processor expands each placeholder to the media's real token
+count. A chunked prompt with only `encoded_text` chunks is sent to the engine
+as a plain token-id list.
+
+Python client: pass a `cortex_training.model_input.ModelInput` as a prompt,
+alone or in a batch with string and token-list prompts:
+
+```python
+from cortex_training.model_input import EncodedTextChunk, ImageChunk, ModelInput
+
+prompt = ModelInput(chunks=[
+    EncodedTextChunk(tokens=[1, 2, 3]),
+    ImageChunk(data=open("cat.png", "rb").read(), format="png"),
+    EncodedTextChunk(tokens=[4, 5]),
+])
+request_id = client.generate(job_id, prompts=[prompt])
+```
+
+This is experimental in the client: a `ModelInput` prompt raises `ValueError`
+before anything is sent unless `CORTEX_TRAINING_ENABLE_MEDIA_INPUT` is set to
+a truthy value. The client's length check counts text tokens plus each media
+chunk's `expected_tokens`; a media chunk without `expected_tokens` counts as
+zero, so the check is a lower bound. Because `generate` refuses
+`expected_tokens` today (below), a prompt the server accepts is checked on its
+text tokens alone.
+
+When a chunked prompt is accepted:
+
+- `POST /{job_id}/generate` accepts `encoded_text`-only chunked prompts on
+  every sampling job, whatever its model and whatever the media setting below.
+- `image` and `video` chunks are accepted only when media is turned on in the
+  service (it is off by default) and the sampling job's model reports that
+  modality. The setting and the limits below are read when the service starts.
+  A job learns its model's modalities when it is created, so a job created
+  while media was off takes no media until it is recreated.
+- `POST /{job_id}/generate-stream` refuses every chunked prompt, text-only
+  included ([section 6.7](#67-streaming-generate---post-job_idgenerate-stream)).
+
+Refusals. All of these come before a request is created; each `detail` entry
+has `type` `unsupported_prompt_shape`, and its `msg` says what was refused
+(the chunk, the setting, or the limit) without quoting the media bytes. The
+server checks in this order and answers the first that fails: chunk types and
+fields, the media setting, the job's modalities, the count and byte limits
+(413), then each media chunk's content (400, or 413 for image or video size).
+With media on, a request sent in several chunks is also checked as its chunks
+arrive: past the per-request media bytes plus frame overhead it answers 413
+then, text-only requests included.
+
+- 400 `unsupported_prompt_shape`:
+  - `image_asset_pointer`, `video_asset_pointer`, or `dmel` chunks, whatever
+    the media setting;
+  - an `image` or `video` chunk that sets `expected_tokens`, or a `video`
+    chunk that sets `fps` (leave them unset or `null`; the video is sampled at
+    the model processor's own rate);
+  - `image` or `video` chunks while media is turned off (the message names
+    the setting);
+  - a modality the job's model does not take ("this job's model takes no
+    images");
+  - a chunk whose bytes are not its declared `format`, checked by content
+    (the check the inference worker runs before it decodes): `png` must open
+    with the PNG signature, `jpeg` with `FF D8 FF`, and `mp4` with an `ftyp`
+    box as its first box whose major brand is `isom`, `iso2`, `iso4`, `iso5`,
+    `iso6`, `mp41`, `mp42` or `avc1`. Any other MP4-family file (HEVC
+    `hvc1`/`hev1`, AV1 `av01`, DASH, 3GPP, QuickTime `qt  `) is refused here
+    rather than queued and refused by the worker;
+  - an image whose PNG `IHDR` or JPEG `SOFn` header states no readable width
+    and height: truncated before it, a zero size, a JPEG with no frame header or
+    more than one before its scan, or with a reserved `JPG`/`JPGn` marker, or
+    whose markers before the scan run past 4096 bytes of fill, marker codes and
+    length fields. An image cut off after its header passes this check; if the
+    inference worker cannot decode it, the request fails with `error_type`
+    `invalid_argument`;
+  - a video whose MP4 `moov` box (read wherever it sits in the file, without
+    decoding) cannot be walked, or states no video track, a zero frame size or
+    no duration. A fragmented MP4 whose `mvhd` states no duration and that has
+    no `mvex/mehd` box (common in fragmented ffmpeg output) states no duration:
+    the duration limit cannot be checked, so it is refused, and the message
+    says to remux it to a non-fragmented MP4 (for example
+    `ffmpeg -i in.mp4 -c copy -movflags +faststart out.mp4`) or give it an
+    `mehd` box.
+- 413 `unsupported_prompt_shape`, naming the limit (defaults in parentheses):
+  - image and video chunks in one prompt (64);
+  - video chunks in one prompt (1);
+  - encoded bytes of one image or video chunk (64 MiB);
+  - image and video chunks across all prompts of a request (256);
+  - encoded media bytes across a request (512 MiB). With media on, a
+    request-chunked generate whose staged chunks pass this plus frame
+    overhead is refused before it is reassembled;
+  - width or height of one image (8000), read from its header without
+    decoding;
+  - width x height of one image (25000000);
+  - frame width or height of one video (4096), the largest any video track
+    states in its MP4 `tkhd` box or `stsd` sample entry;
+  - frame width x height of one video (8847360, 4096 x 2160);
+  - duration of one video, from the MP4 `mvhd` box (600 seconds).
+
+A media chunk that passes these checks but that the inference worker cannot
+decode fails the request with error type `invalid_argument`.
+
+A malformed prompt (none of a string, a token-id list, or a `{"chunks": [...]}`
+prompt) answers 400 with one `detail` entry per member of the prompt union:
+string, token-id list, `ModelInputPrompt`, and the batch list of them. Older
+servers named only the string and token-list shapes.
+
+Not supported yet: asset pointers, `dmel` audio, `expected_tokens`, video
+`fps`, chunked prompts on `/generate-stream`, and more than one video per
+prompt by default. A video's frame size and duration are checked from its MP4
+header only; the codec's own parameters (the H.264 SPS) are not read. How many
+frames are sampled from a video is set by the sampling job's engine
+configuration, not by the request.
 
 Typical polled result:
 
@@ -1567,6 +1719,10 @@ pre-tokenized prompts described in [section 6.6](#66-generate---post-job_idgener
 
 Unlike `generate`, this path is not request-chunked: the client sends the frame
 in a single POST, and the encoded body must not exceed 60 MiB.
+
+This path refuses every chunked `{"chunks": [...]}` prompt, `encoded_text`-only
+included, with 400 `unsupported_prompt_shape`; send chunked prompts to
+`/generate` ([section 6.6](#chunked-modelinput-prompts)).
 
 **Breaking change.** `POST /{job_id}/generate-stream` no longer accepts a
 UTF-8 JSON body. There is no dual encoding and no negotiation — the frame is
@@ -3186,6 +3342,69 @@ The result's `metrics["weighted_cross_entropy_objective_sum"]` is
 `L_surrogate`, not `L`; read it rather than `avg_loss`, whose scale depends on
 how the server combines its ranks' losses.
 
+### 10.6 Media in training batches
+
+A forward/backward ([section 6.1](#61-forwardbackward---post-job_idforward-backward))
+or forward ([section 7.1](#71-forward)) batch may carry media leaves next to
+its model kwargs, at the top level of the batch or of its `kwargs`:
+`pixel_values`, `image_grid_thw`, and `image_row_ids` for images, and their
+video counterparts (such as `pixel_values_videos` and `video_grid_thw`). A
+leaf that is `None` does not count as media.
+
+They are behind the same service media setting as media prompts
+([section 6.6](#chunked-modelinput-prompts)), off by default. The server
+reads only the frame header, before the batch is staged on the job:
+
+- Media off: any media leaf answers 400 `unsupported_prompt_shape` with
+  `loc` `["batch"]`, naming the leaves and the setting.
+- Media on, the job's model takes no media: 400 `unsupported_prompt_shape`
+  with `loc` `["batch"]` when the service has no media layout for the model's
+  `model_type`, naming the type, or when that layout does not fit the model's
+  config, giving the reason. A job does not fail at create for either; it
+  takes text-only batches.
+- Media on: 413 `unsupported_prompt_shape` naming the limit when a batch
+  exceeds either cap:
+  - 1024 images and videos, counted as rows of `image_grid_thw` and
+    `video_grid_thw`;
+  - 4194304 patches, counted as rows of `pixel_values` and
+    `pixel_values_videos`.
+
+For a request-chunked forward/backward whose frame header does not fit in its
+first chunk, or a job whose model type the server could not learn at create,
+the training job applies the same checks when it decodes the batch, and the
+request fails with error type `invalid_argument` instead of an HTTP error.
+
+A batch that passes those checks must also carry `mm_token_type_ids`, which
+places each image and video token in its row, and 2-D `input_ids`, and its
+media leaves must agree with each other and with the batch's rows:
+
+- A kind's three leaves travel together: `pixel_values`, `image_grid_thw` and
+  `image_row_ids` for images, `pixel_values_videos`, `video_grid_thw` and
+  `video_row_ids` for videos. Sending one or two of them is refused, the row
+  ids included, also for a one-row batch.
+- The grid is `[items, 3]` (`t`, `h`, `w` per item), and the row ids hold one
+  row index per item, each in `[0, rows)` of the batch's `input_ids`, and
+  non-decreasing (items in row order).
+- The values have exactly as many rows (patches) as the grid describes: the
+  sum over items of `t * h * w`.
+- Media leaves sit at the top level of the batch or of its `kwargs`; a media
+  leaf inside `context` (or any other nested dict) is refused.
+
+These are checked by the training job when it dispatches the batch, not by the
+HTTP layer: a batch that breaks one is accepted, and the request then fails
+with error type `invalid_argument`, naming the leaf, the shapes or the row ids
+(never the pixels).
+
+Under sequence parallelism the job cuts each packed call into `sp_size` equal
+windows, and the windows are not media-aware: an image or video whose tokens
+straddle a window boundary fails the request with error type
+`invalid_argument`, naming the item's kind, index, token span and the boundary
+(never its pixels). Where the boundaries fall follows from the row lengths and
+`max_tokens_per_mb` (`training_config.mb_spec.max_tokens_per_mb`, section 8),
+which together decide which rows pack into a call. To fix it, lower `sp_size`
+(`sp_size` 1 never splits), or change `max_tokens_per_mb` or the rows' lengths
+so each item's tokens sit inside one window.
+
 ---
 
 ## 11. Result summary
@@ -4079,3 +4298,10 @@ These are current gaps, not supported API behavior:
    completions ([section 14.8](#148-calling-a-deployment)). Use
    `list_model_deployments` or `cortex-training model-deployment list` to find
    deployments.
+7. Chunked `{"chunks": [...]}` prompts are partly supported: `/generate`
+   takes `encoded_text`, `image`, and `video` chunks (media only where the
+   service has it turned on), and refuses asset pointers, `dmel`,
+   `expected_tokens`, and video `fps`; `/generate-stream` refuses every
+   chunked prompt. The client's `ModelInput` prompt is experimental
+   (`CORTEX_TRAINING_ENABLE_MEDIA_INPUT`). See
+   [section 6.6](#chunked-modelinput-prompts).

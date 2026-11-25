@@ -112,6 +112,9 @@ from cortex_training.client.optimizer import normalize_optimizer_config
 from cortex_training.client.peft import normalize_lora_peft_config
 from cortex_training.client.telemetry import CachedSessionTokenProvider
 from cortex_training.client.telemetry import OtlpMetricEmitter
+from cortex_training.model_input import BYTE_FIELDS
+from cortex_training.model_input import EncodedTextChunk
+from cortex_training.model_input import ModelInput
 from cortex_training.model_deployment import DEPLOYMENT_CLASS
 from cortex_training.model_deployment import DEPLOYMENT_GPUS_PER_REPLICA
 from cortex_training.model_deployment import DEPLOYMENT_GPU_TYPE
@@ -226,6 +229,12 @@ ENABLE_SUCCESS_TELEMETRY_ENV = "CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY"
 # Setting this puts the token ids back in the frame's JSON header; it does not
 # change the request body, which is a DSSST1 frame either way.
 DISABLE_TENSOR_PROMPTS_ENV = "CORTEX_TRAINING_DISABLE_TENSOR_PROMPTS"
+
+# Opt-in for ``ModelInput`` prompts (text and media chunks) on generate. Off by
+# default while the service's support for them is incomplete: the client
+# refuses a ``ModelInput`` prompt unless this is set to a truthy value. The
+# service gates media independently.
+MEDIA_INPUT_ENV = "CORTEX_TRAINING_ENABLE_MEDIA_INPUT"
 
 
 def _env_flag_enabled(name: str) -> bool:
@@ -2473,8 +2482,20 @@ def _pack_token_prompts(prompts):
     them. Empty lists are left alone so the server's own non-empty check is
     the one that rejects them, rather than this becoming a second, differently
     worded validation.
+
+    A :class:`ModelInput` prompt becomes a ``{"chunks": [...]}`` dict, even
+    with tensor prompts disabled: its media bytes have no JSON form. See
+    :func:`_encode_model_input`.
     """
-    if _tensor_prompts_disabled():
+    pack_tokens = not _tensor_prompts_disabled()
+    if isinstance(prompts, ModelInput):
+        return _encode_model_input(prompts, pack_tokens=pack_tokens)
+    if isinstance(prompts, list) and any(isinstance(p, ModelInput) for p in prompts):
+        prompts = [
+            _encode_model_input(p, pack_tokens=pack_tokens) if isinstance(p, ModelInput) else p
+            for p in prompts
+        ]
+    if not pack_tokens:
         return prompts
     torch = _load_torch()
     if torch.is_tensor(prompts) or not isinstance(prompts, list) or not prompts:
@@ -2492,6 +2513,70 @@ def _pack_token_prompts(prompts):
         else:
             packed.append(prompt)
     return packed
+
+
+def _bytes_as_uint8_tensor(data: bytes):
+    torch = _load_torch()
+    if not data:
+        # ``frombuffer`` refuses an empty buffer. Sent as an empty tensor so the
+        # service's own check is the one that rejects it.
+        return torch.empty(0, dtype=torch.uint8)
+    # bytearray makes the buffer writable, which ``frombuffer`` wants.
+    return torch.frombuffer(bytearray(data), dtype=torch.uint8)
+
+
+def _encode_model_input(prompt: ModelInput, *, pack_tokens: bool) -> dict:
+    """One :class:`ModelInput` as the frame's ``{"chunks": [...]}`` prompt shape.
+
+    Each chunk becomes a dict with its ``type`` and fields, ``None`` fields
+    left out. Media bytes always go to the tensor section as 1-D ``uint8``: the
+    header is JSON, which would need base64 and a third more bytes. Token ids
+    follow the same rule as a plain pre-tokenized prompt (``int32`` tensors
+    unless tensor prompts are disabled).
+    """
+    chunks = []
+    for chunk in prompt.chunks:
+        encoded = chunk.to_dict()
+        if isinstance(chunk, EncodedTextChunk) and pack_tokens and chunk.tokens:
+            encoded["tokens"] = _as_token_tensor(list(chunk.tokens))
+        for name in BYTE_FIELDS:
+            if name in encoded:
+                encoded[name] = _bytes_as_uint8_tensor(encoded[name])
+        chunks.append(encoded)
+    return {"chunks": chunks}
+
+
+def _model_input_min_length(prompt: ModelInput) -> tuple[int, bool]:
+    """Positions ``prompt`` occupies, and whether that count is exact.
+
+    A media chunk without ``expected_tokens`` has no client-side length, so it
+    counts as zero and the result is only a lower bound. A lower bound can
+    still reject: if it already fills the window, the full prompt does too.
+    """
+    total = 0
+    exact = True
+    for chunk in prompt.chunks:
+        if isinstance(chunk, EncodedTextChunk):
+            total += len(chunk.tokens)
+        elif chunk.expected_tokens is None:
+            exact = False
+        else:
+            total += chunk.expected_tokens
+    return total, exact
+
+
+def _has_model_input(prompts) -> bool:
+    return isinstance(prompts, ModelInput) or (
+        isinstance(prompts, list) and any(isinstance(p, ModelInput) for p in prompts)
+    )
+
+
+def _require_media_input(op: str) -> None:
+    if not _env_flag_enabled(MEDIA_INPUT_ENV):
+        raise ValueError(
+            f"a ModelInput prompt to {op}() is experimental; set "
+            f"{MEDIA_INPUT_ENV}=1 to send one"
+        )
 
 
 def _sql_string_literal(value: str) -> str:
@@ -6474,6 +6559,8 @@ class CortexTrainingClient:
 
         ``op`` only names the caller in the length-check error message.
         """
+        if _has_model_input(prompts):
+            _require_media_input(op)
         self._check_prompt_lengths(op, job_id, prompts, sub_job_id)
         # Packed after validation so the check above still reads plain lists,
         # and so a rejected prompt is never converted for nothing.
@@ -6560,7 +6647,7 @@ class CortexTrainingClient:
         self,
         op: str,
         job_id: str,
-        prompts: list[str | list[int]],
+        prompts,
         sub_job_id: str | None = None,
     ) -> None:
         """Fail fast when a pre-tokenized prompt cannot fit the sampling window.
@@ -6577,11 +6664,16 @@ class CortexTrainingClient:
         token ids, and matching on ``list`` alone let one through unchecked --
         silently trading a clear client-side error for vLLM's much later
         ``maximum model length`` failure.
+
+        A :class:`ModelInput` counts its text tokens plus each media chunk's
+        ``expected_tokens``. A media chunk without ``expected_tokens`` adds
+        nothing, so the count is a lower bound and can only reject a prompt
+        that is too long whatever the media expands to.
         """
         torch = _load_torch()
 
         def _pretokenized(p) -> bool:
-            return isinstance(p, list) or torch.is_tensor(p)
+            return isinstance(p, (list, ModelInput)) or torch.is_tensor(p)
 
         # ``prompts`` is either one prompt or a batch of them. Iterating one
         # prompt yields its tokens, which the loop below would then read as
@@ -6591,7 +6683,7 @@ class CortexTrainingClient:
         # raises on them. Wrapping first means one prompt is checked as one
         # prompt in either shape, and reads the argument the same way
         # ``_pack_token_prompts`` does.
-        if torch.is_tensor(prompts) or (
+        if torch.is_tensor(prompts) or isinstance(prompts, ModelInput) or (
             isinstance(prompts, list) and prompts and _is_token_id(prompts[0])
         ):
             prompts = [prompts]
@@ -6603,6 +6695,19 @@ class CortexTrainingClient:
             return
         for i, prompt in enumerate(prompts):
             if not _pretokenized(prompt):
+                continue
+            if isinstance(prompt, ModelInput):
+                n, exact = _model_input_min_length(prompt)
+                if n >= max_seq_len:
+                    qualifier = "" if exact else "at least "
+                    raise ValueError(
+                        f"{op} prompt at index {i} occupies {qualifier}{n} positions "
+                        "(text tokens plus each media chunk's expected_tokens), which "
+                        f"does not fit the sampling job's max_seq_len of {max_seq_len}: "
+                        "a prompt must be shorter than max_seq_len to leave room for at "
+                        "least one generated token. Shorten the text, send fewer or "
+                        "smaller media, or recreate the job with a larger max_seq_len."
+                    )
                 continue
             n = len(prompt)
             if n >= max_seq_len:
@@ -6753,7 +6858,7 @@ class CortexTrainingClient:
     def generate(
         self,
         job_id: str,
-        prompts: list[str | list[int]],
+        prompts: list[str | list[int] | ModelInput] | ModelInput,
         sampling_params: dict | list[dict | None] | None = None,
         routing_key: str | list[str | None] | None = None,
         strict: bool | None = None,
@@ -6765,7 +6870,7 @@ class CortexTrainingClient:
     def generate(
         self,
         job_id: str,
-        prompts: list[str | list[int]],
+        prompts: list[str | list[int] | ModelInput] | ModelInput,
         sampling_params: dict | list[dict | None] | None = None,
         routing_key: str | list[str | None] | None = None,
         strict: bool | None = None,
@@ -6778,7 +6883,7 @@ class CortexTrainingClient:
     def generate(
         self,
         job_id: str,
-        prompts: list[str | list[int]],
+        prompts: list[str | list[int] | ModelInput] | ModelInput,
         sampling_params: dict | list[dict | None] | None = None,
         routing_key: str | list[str | None] | None = None,
         strict: bool | None = None,
@@ -6790,7 +6895,7 @@ class CortexTrainingClient:
     def generate(
         self,
         job_id: str,
-        prompts: list[str | list[int]],
+        prompts: list[str | list[int] | ModelInput] | ModelInput,
         sampling_params: dict | list[dict | None] | None = None,
         routing_key: str | list[str | None] | None = None,
         strict: bool | None = None,
@@ -6818,6 +6923,15 @@ class CortexTrainingClient:
           would require replicating the server tokenizer (including special
           tokens), so an over-long string instead fails server-side in vLLM
           with a ``maximum model length`` error rather than client-side.
+        * **ModelInput prompts** (text and media chunks, see
+          :mod:`cortex_training.model_input`; experimental, needs
+          ``CORTEX_TRAINING_ENABLE_MEDIA_INPUT=1``) count text tokens plus
+          each media chunk's ``expected_tokens``. A media chunk without
+          ``expected_tokens`` counts as zero, so only a prompt that is too long
+          regardless of its media is rejected here. The service refuses
+          ``expected_tokens`` (and video ``fps``) today with 400
+          ``unsupported_prompt_shape``, so leave them unset in a prompt you
+          send. Media bytes travel in the frame's tensor section as ``uint8``.
 
         ``wait_seconds`` asks the server to hold the call for up to that many
         whole seconds and reply with the result if the generation ends in
@@ -6914,7 +7028,7 @@ class CortexTrainingClient:
     def generate_stream(
         self,
         job_id: str,
-        prompts: list[str | list[int]],
+        prompts: list[str | list[int] | ModelInput] | ModelInput,
         sampling_params: dict | list[dict | None] | None = None,
         routing_key: str | list[str | None] | None = None,
         strict: bool | None = None,
@@ -6934,6 +7048,12 @@ class CortexTrainingClient:
         prompts are checked client-side against the sampling sub-job's
         ``max_seq_len`` and fail fast, while over-long string prompts are left
         to fail server-side in vLLM (see :meth:`generate`).
+
+        The service refuses every :class:`~cortex_training.model_input.ModelInput`
+        prompt on this path, text-only included, with 400
+        ``unsupported_prompt_shape``; send them to :meth:`generate`. The
+        client still encodes them the same way, so the frame matches
+        :meth:`generate`'s once the service takes them.
 
         Args:
             sub_job_id: Optional. Which sampling sub-job runs the request; see
