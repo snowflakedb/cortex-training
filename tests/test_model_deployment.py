@@ -915,6 +915,110 @@ def test_documented_deployment_json_translates_to_create_job_body():
     }
 
 
+_ENGINE_OPTIONS = {
+    "gpu_memory_utilization": 0.85,
+    "speculative_config": {"method": "dflash", "num_speculative_tokens": 7},
+    "extra_engine_kwargs": {"block_size": 128},
+    "extra_env": {"SOME_SWITCH": "1"},
+}
+
+
+def spec_with_engine_options() -> dict:
+    value = deployment_spec(gpus=8, max_seq_len=16384)
+    value["inference"]["vllm_config"] = json.loads(json.dumps(_ENGINE_OPTIONS))
+    return value
+
+
+def test_engine_options_reach_the_create_job_body_unchanged():
+    spec = ModelDeploymentSpec.from_dict(spec_with_engine_options())
+
+    sub_job = spec._to_create_job_body()["sub_job_configs"][0]
+    assert sub_job["inference_config"]["vllm_config"] == {
+        **_ENGINE_OPTIONS,
+        "tensor_parallel_size": 8,
+        "max_model_len": 16384,
+    }
+    assert sub_job["inference_config"]["n_gpus"] == 8
+
+
+def test_client_create_posts_engine_options():
+    instance = client()
+    instance.create_job_from_body = MagicMock(return_value={"job_id": JOB_ID})
+
+    instance.create_model_deployment(spec_with_engine_options())
+
+    posted = instance.create_job_from_body.call_args.args[0]
+    vllm_config = posted["sub_job_configs"][0]["inference_config"]["vllm_config"]
+    assert vllm_config["speculative_config"] == _ENGINE_OPTIONS["speculative_config"]
+    assert vllm_config["tensor_parallel_size"] == 8
+
+
+def test_a_spec_without_engine_options_is_unchanged():
+    spec = ModelDeploymentSpec.from_dict(deployment_spec(gpus=2))
+
+    assert spec.vllm_config is None
+    assert spec._to_create_job_body()["sub_job_configs"][0]["inference_config"]["vllm_config"] == {
+        "tensor_parallel_size": 2,
+        "max_model_len": 8192,
+    }
+    assert "vllm_config" not in spec.to_public_spec()["inference"]
+
+
+def test_engine_options_round_trip_through_the_public_spec():
+    original = spec_with_engine_options()
+
+    spec = ModelDeploymentSpec.from_dict(original)
+
+    assert spec.to_public_spec() == original
+    assert ModelDeploymentSpec.from_dict(spec.to_public_spec()) == spec
+    hash(spec)
+
+
+def test_engine_options_are_copied_not_shared():
+    original = spec_with_engine_options()
+    spec = ModelDeploymentSpec.from_dict(original)
+
+    original["inference"]["vllm_config"]["extra_env"]["SOME_SWITCH"] = "changed"
+    body = spec._to_create_job_body()
+    body["sub_job_configs"][0]["inference_config"]["vllm_config"]["extra_env"]["X"] = "y"
+    spec.to_public_spec()["inference"]["vllm_config"]["extra_env"]["Y"] = "z"
+
+    assert spec.vllm_config["extra_env"] == {"SOME_SWITCH": "1"}
+    assert spec._to_create_job_body()["sub_job_configs"][0]["inference_config"]["vllm_config"][
+        "extra_env"
+    ] == {"SOME_SWITCH": "1"}
+
+
+@pytest.mark.parametrize("value", ["a string", ["a"], 3, None])
+def test_engine_options_must_be_an_object(value):
+    spec = deployment_spec()
+    spec["inference"]["vllm_config"] = value
+
+    with pytest.raises(ValueError, match="inference.vllm_config must be an object"):
+        ModelDeploymentSpec.from_dict(spec)
+
+
+@pytest.mark.parametrize("key", ["tensor_parallel_size", "max_model_len"])
+def test_engine_options_cannot_set_what_the_spec_already_sets(key):
+    spec = deployment_spec()
+    spec["inference"]["vllm_config"] = {key: 2}
+
+    with pytest.raises(
+        ValueError,
+        match=rf"inference.vllm_config must not set {key}: they come from "
+        r"deployment.gpus_per_replica and inference.max_seq_len",
+    ):
+        ModelDeploymentSpec.from_dict(spec)
+
+
+def test_other_unknown_inference_keys_are_still_rejected():
+    spec = deployment_spec()
+    spec["inference"]["extra"] = 1
+
+    with pytest.raises(ValueError, match=r"inference contains unsupported field\(s\): extra"):
+        ModelDeploymentSpec.from_dict(spec)
+
+
 def test_failed_deployment_metadata_reports_every_design_doc_list_field():
     """Design doc: list returns ID, status, model source, resource configuration,
     creation time, creator, owner role, and failure information when applicable."""

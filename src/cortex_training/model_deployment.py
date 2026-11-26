@@ -23,7 +23,8 @@ it must not import the client at module level. See
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import copy
+from dataclasses import dataclass, field
 from typing import Any
 
 # Only EVALUATION deployments are supported today.
@@ -59,6 +60,8 @@ SOURCE_TYPE_BASE_MODEL = "base_model"
 SOURCE_TYPE_CHECKPOINT = "checkpoint"
 # Keys inside spec.inference.
 INFERENCE_MAX_SEQ_LEN = "max_seq_len"
+# Optional engine options, sent unchanged in the sub-job's vllm_config.
+INFERENCE_VLLM_CONFIG = "vllm_config"
 # Keys of the sampling sub-job the server stores for a deployment.
 WIRE_INFERENCE_CONFIG = "inference_config"
 WIRE_NUM_REPLICAS = "num_replicas"
@@ -201,8 +204,9 @@ class ModelDeploymentSpec:
     """Validated evaluation-deployment specification.
 
     The public JSON shape is intentionally narrower than CreateJob. It cannot
-    carry stage credentials, admission settings, arbitrary vLLM options, or a
-    customer-selected job identifier.
+    carry stage credentials, admission settings, or a customer-selected job
+    identifier. ``inference.vllm_config`` carries engine options, which are sent
+    unchanged; the server decides which accounts may use them.
     """
 
     # None for a checkpoint source until create reads it from the source job.
@@ -215,6 +219,7 @@ class ModelDeploymentSpec:
     source_job_id: str | None = None
     checkpoint_id: str | None = None
     deployment_class: str = MODEL_DEPLOYMENT_CLASS
+    vllm_config: dict[str, Any] | None = field(default=None, hash=False)
 
     @classmethod
     def from_dict(cls, value: Any) -> "ModelDeploymentSpec":
@@ -298,6 +303,7 @@ class ModelDeploymentSpec:
             spec[SPEC_INFERENCE],
             location=SPEC_INFERENCE,
             required={INFERENCE_MAX_SEQ_LEN},
+            allowed={INFERENCE_MAX_SEQ_LEN, INFERENCE_VLLM_CONFIG},
         )
         max_seq_len_location = f"{SPEC_INFERENCE}.{INFERENCE_MAX_SEQ_LEN}"
         # Counts must be positive integers. bool is excluded because Python treats
@@ -338,6 +344,22 @@ class ModelDeploymentSpec:
                 "a positive multiple of 8"
             )
 
+        vllm_config = None
+        if INFERENCE_VLLM_CONFIG in inference:
+            vllm_config_location = f"{SPEC_INFERENCE}.{INFERENCE_VLLM_CONFIG}"
+            raw_vllm_config = inference[INFERENCE_VLLM_CONFIG]
+            if not isinstance(raw_vllm_config, dict):
+                raise ValueError(f"{vllm_config_location} must be an object")
+            # These two follow from gpus_per_replica and max_seq_len, so the spec
+            # has one source for each and cannot contradict itself.
+            owned = sorted({WIRE_TENSOR_PARALLEL_SIZE, WIRE_MAX_MODEL_LEN} & raw_vllm_config.keys())
+            if owned:
+                raise ValueError(
+                    f"{vllm_config_location} must not set {', '.join(owned)}: they come from "
+                    f"{gpus_per_replica_location} and {max_seq_len_location}"
+                )
+            vllm_config = copy.deepcopy(raw_vllm_config)
+
         return cls(
             model_name=model_name,
             min_replicas=min_replicas,
@@ -348,6 +370,7 @@ class ModelDeploymentSpec:
             source_job_id=source_job_id,
             checkpoint_id=checkpoint_id,
             deployment_class=deployment_class,
+            vllm_config=vllm_config,
         )
 
     @property
@@ -380,7 +403,14 @@ class ModelDeploymentSpec:
                 DEPLOYMENT_GPU_TYPE: self.gpu_type,
             },
             SPEC_SOURCE: self.source_to_wire(),
-            SPEC_INFERENCE: {INFERENCE_MAX_SEQ_LEN: self.max_seq_len},
+            SPEC_INFERENCE: {
+                INFERENCE_MAX_SEQ_LEN: self.max_seq_len,
+                **(
+                    {INFERENCE_VLLM_CONFIG: copy.deepcopy(self.vllm_config)}
+                    if self.vllm_config is not None
+                    else {}
+                ),
+            },
         }
 
     def _to_create_job_body(self) -> dict[str, Any]:
@@ -401,6 +431,7 @@ class ModelDeploymentSpec:
                 WIRE_DEPLOYMENT_CLASS: self.deployment_class,
                 WIRE_NUM_REPLICAS: self.min_replicas,
                 WIRE_VLLM_CONFIG: {
+                    **copy.deepcopy(self.vllm_config or {}),
                     WIRE_TENSOR_PARALLEL_SIZE: self.gpus_per_replica,
                     WIRE_MAX_MODEL_LEN: self.max_seq_len,
                 },
