@@ -26,6 +26,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+__all__ = [
+    "ModelDeploymentSpec",
+]
+
 # Only EVALUATION deployments are supported today.
 MODEL_DEPLOYMENT_CLASS = "EVALUATION"
 # Public deployment IDs are sf-ct-<backing job UUID>.
@@ -178,6 +182,12 @@ def _strict_object(
     """Require ``value`` to be an object with every ``required`` key.
 
     Keys outside ``allowed`` (default: ``required``) are rejected.
+
+    Returns:
+        `value`.
+
+    Raises:
+        ValueError: If `value` is not an object, or has missing or unsupported keys.
     """
     if not isinstance(value, dict):
         raise ValueError(f"{location} must be an object")
@@ -198,11 +208,23 @@ def _strict_object(
 
 @dataclass(frozen=True)
 class ModelDeploymentSpec:
-    """Validated evaluation-deployment specification.
+    """The validated settings of a model deployment.
 
-    The public JSON shape is intentionally narrower than CreateJob. It cannot
-    carry stage credentials, admission settings, arbitrary vLLM options, or a
-    customer-selected job identifier.
+    Use `ModelDeploymentSpec.from_dict` to build one from the JSON form, which has `deployment`,
+    `source`, and `inference` fields. Pass it to `CortexTrainingClient.create_model_deployment`.
+
+    Attributes:
+        model_name: The base model to serve. `None` for a checkpoint source until the deployment
+            is created.
+        min_replicas: The number of replicas.
+        gpus_per_replica: The number of GPUs in each replica: 1, 2, 4, or 8.
+        max_seq_len: The maximum sequence length that the deployment serves.
+        source_type: `"base_model"` or `"checkpoint"`.
+        gpu_type: The GPU type: `"H200"`, `"B200"`, or `"B300"`.
+        source_job_id: For a checkpoint source, the job that the checkpoint belongs to.
+        checkpoint_id: For a checkpoint source, the checkpoint to serve. It must be a completed
+            `weights-only` checkpoint.
+        deployment_class: The deployment class. Only `"EVALUATION"` is supported.
     """
 
     # None for a checkpoint source until create reads it from the source job.
@@ -218,7 +240,32 @@ class ModelDeploymentSpec:
 
     @classmethod
     def from_dict(cls, value: Any) -> "ModelDeploymentSpec":
-        """Validate a deployment JSON spec and return the parsed ``ModelDeploymentSpec``."""
+        """Check a deployment spec and return it as a `ModelDeploymentSpec`.
+
+        Args:
+            value: The spec, as a dictionary with `deployment`, `source`, and `inference` fields:
+
+                ```json
+                {
+                  "deployment": {"class": "EVALUATION", "min_replicas": 1, "gpus_per_replica": 1,
+                                 "gpu_type": "H200"},
+                  "source": {"type": "base_model", "model": "Qwen/Qwen3-1.7B"},
+                  "inference": {"max_seq_len": 8192}
+                }
+                ```
+
+                `deployment.gpu_type` is `H200`, `B200`, or `B300`, and case doesn't matter.
+                `deployment.gpus_per_replica` is 1, 2, 4, or 8. `min_replicas` times
+                `gpus_per_replica` must be at most 8 or a multiple of 8. A `source` of type
+                `checkpoint` has `job_id` and `checkpoint_id` instead of `model`, and the
+                checkpoint must be a completed `weights-only` checkpoint.
+
+        Returns:
+            The validated spec.
+
+        Raises:
+            ValueError: If the spec isn't valid.
+        """
         if not isinstance(value, dict):
             raise ValueError("deployment specification must be an object")
         spec = _strict_object(
@@ -352,15 +399,14 @@ class ModelDeploymentSpec:
 
     @property
     def total_gpus(self) -> int:
-        """Total GPUs across all replicas (``min_replicas * gpus_per_replica``)."""
+        """The total number of GPUs across all replicas."""
         return self.min_replicas * self.gpus_per_replica
 
     def source_to_wire(self) -> dict[str, Any]:
-        """Return the spec's model source in its public JSON form.
+        """Return the model source in its JSON form.
 
-        Values pass through unchanged, so a directly constructed spec with an
-        unknown ``source_type`` or a missing checkpoint ID still fails
-        ``from_dict`` instead of being coerced into a valid-looking source.
+        Returns:
+            A dictionary with the source `type` and its `model`, or its `job_id` and `checkpoint_id`.
         """
         if self.source_type == SOURCE_TYPE_CHECKPOINT:
             return {
@@ -371,7 +417,11 @@ class ModelDeploymentSpec:
         return {SOURCE_TYPE: self.source_type, SOURCE_MODEL: self.model_name}
 
     def to_public_spec(self) -> dict[str, Any]:
-        """Return the spec as deployment JSON, in the same shape ``from_dict`` accepts."""
+        """Return the spec in the JSON form that `from_dict` accepts.
+
+        Returns:
+            A dictionary with `deployment`, `source`, and `inference` fields.
+        """
         return {
             SPEC_DEPLOYMENT: {
                 DEPLOYMENT_CLASS: self.deployment_class,

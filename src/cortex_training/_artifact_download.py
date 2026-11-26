@@ -54,6 +54,11 @@ from typing import TypeVar
 
 import requests
 
+__all__ = [
+    "DownloadCancelled",
+    "NoChunksError",
+]
+
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
@@ -97,19 +102,22 @@ RECONNECT = "reconnect"
 
 
 class DownloadCancelled(Exception):
-    """Raise from a download ``progress`` callback to stop the download.
+    """Raise this from a download callback to stop the download.
 
-    The download stops promptly, keeps the chunks already written so a later
-    ``resume=True`` call continues from them, and re-raises this exception.
-    Client telemetry records it as a cancellation rather than a failure.
+    The download stops promptly, keeps the parts it has already saved so that a later call with
+    `resume=True` continues from them, and raises this exception again. Client telemetry counts
+    it as a cancellation, not a failure.
     """
 
 
 class NoChunksError(ValueError):
-    """A sub-job named in ``sub_job_ids`` has no chunks of the requested kind.
+    """Raised when a sub-job named in `sub_job_ids` has nothing to download.
 
-    ``sub_job_ids`` lists the sub-jobs without chunks; ``available`` lists the
-    sub-jobs that have some. It is a ``ValueError``, as before it existed.
+    It's a `ValueError`.
+
+    Attributes:
+        sub_job_ids: The sub-jobs that have nothing to download.
+        available: The sub-jobs that have something to download.
     """
 
     def __init__(self, message: str, *, sub_job_ids: list[str], available: list[str]):
@@ -229,8 +237,13 @@ class SessionClosed(RuntimeError):
 
 
 def _reports_closed(connection: Any) -> bool:
-    """Whether the Connector says ``connection`` is closed; a connection that can't say is open,
-    and one whose answer raises is taken as closed."""
+    """Whether the Connector says ``connection`` is closed.
+
+    A connection that can't say is open, and one whose answer raises is taken as closed.
+
+    Returns:
+        True when the connection is closed or can't say.
+    """
     is_closed = getattr(connection, "is_closed", None)
     if not callable(is_closed):
         return False
@@ -241,8 +254,9 @@ def _reports_closed(connection: Any) -> bool:
 
 
 class KeptSessions:
-    """Connector sessions kept open between downloads, a few per key, so the next
-    download under that key starts without logging in.
+    """Connector sessions kept open between downloads, a few per key.
+
+    The next download under that key starts without logging in.
 
     Up to ``per_key`` are kept under one key: downloads that ran at once (a saved
     console and the metrics, say) each give theirs back. The one kept last is taken
@@ -268,8 +282,13 @@ class KeptSessions:
         self._closed = False
 
     def take(self, key: Hashable) -> Any | None:
-        """A session kept under ``key``, which the caller then owns; None without one. One the
-        Connector reports closed is closed here and passed over: it can serve nothing."""
+        """Take the session kept under ``key``, which the caller then owns.
+
+        One the Connector reports closed is closed here and passed over: it can serve nothing.
+
+        Returns:
+            The kept session, or `None` without one.
+        """
         with self._lock:
             stale = self._drop_stale(key)
             kept = self._kept.get(key)
@@ -293,8 +312,10 @@ class KeptSessions:
                        for connection, since in self._kept.get(key, []))
 
     def keep(self, key: Hashable, connection: Any) -> None:
-        """Keep ``connection`` under ``key``; close it when ``per_key`` are kept there
-        already, or after :meth:`close`."""
+        """Keep ``connection`` under ``key``.
+
+        It is closed instead when ``per_key`` are kept there already, or after :meth:`close`.
+        """
         with self._lock:
             stale = self._drop_stale(key)
             kept = None if self._closed else self._kept.setdefault(key, [])
@@ -387,8 +408,9 @@ class SharedConnection:
                 self._stale_suspect = None
 
     def replace_stale_kept(self, generation: int) -> bool:
-        """For an attempt that failed on ``generation``: whether it should run again at once on a
-        fresh session, with no backoff and without counting against the retry policy.
+        """Whether an attempt that failed on ``generation`` should run again at once.
+
+        It runs on a fresh session, with no backoff and without counting against the retry policy.
 
         It should when ``generation`` is the kept session this download started on and no
         attempt on it has succeeded: it most likely went stale while it sat in the pool,
@@ -396,6 +418,12 @@ class SharedConnection:
         or fail again. The first such failure logs in afresh; another thread's failure on the
         same session then retries on that fresh login. A fresh login that fails leaves the
         attempt to the retry policy.
+
+        Returns:
+            True when the attempt should run again on a fresh session.
+
+        Raises:
+            SessionClosed: If the download session is closed.
         """
         with self._lock:
             if self._closed:
@@ -417,8 +445,11 @@ class SharedConnection:
             return True
 
     def abandon(self) -> None:
-        """Something left running on the connection cannot be waited for: the connection is
-        then closed at the end of the download, never kept, as after a timed-out attempt."""
+        """Note that something left running on the connection cannot be waited for.
+
+        The connection is then closed at the end of the download, never kept, as after a
+        timed-out attempt.
+        """
         with self._lock:
             self._abandoned = True
 
@@ -441,9 +472,12 @@ class SharedConnection:
             self._generation += 1
 
     def close(self, *, keep: bool = False) -> None:
-        """Close the connections. With ``keep`` (a download that succeeded), the current one
-        goes to the kept sessions instead, for the next download, unless an attempt on it was
-        abandoned (see :func:`run_bounded` and :meth:`abandon`): it may still be running on it."""
+        """Close the connections.
+
+        With ``keep`` (a download that succeeded), the current one goes to the kept sessions
+        instead, for the next download, unless an attempt on it was abandoned (see
+        :func:`run_bounded` and :meth:`abandon`): it may still be running on it.
+        """
         with self._lock:
             self._closed = True
             replaced, self._replaced = self._replaced, []
@@ -488,6 +522,13 @@ def run_bounded(
     every attempt writes into its own temp directory. After ``cancel`` is set
     the attempt gets :data:`CANCEL_GRACE_SECONDS` to finish, then
     :class:`DownloadCancelled` is raised.
+
+    Returns:
+        The operation's return value.
+
+    Raises:
+        TransferTimeout: If the operation runs longer than ``timeout`` seconds.
+        DownloadCancelled: If ``cancel`` is set and the operation does not finish within the grace period.
     """
     if timeout is None and cancel is None:
         return operation()
@@ -535,6 +576,12 @@ def call_with_retry(
 
     Once ``cancel`` is set no new attempt starts and a backoff wait ends early;
     the call then raises :class:`DownloadCancelled`.
+
+    Returns:
+        The operation's return value.
+
+    Raises:
+        DownloadCancelled: If ``cancel`` is set.
     """
     attempt = 1
     while True:
@@ -694,6 +741,9 @@ def row_time(line: bytes, field_name: str) -> float | None:
     after: on 3.10 it reads a fraction of exactly three or six digits, while the schema
     allows any number of them, or none. Digits past a microsecond are truncated, and times
     outside 1970 to 9998 are rejected, as the Resources tab reads them.
+
+    Returns:
+        The epoch seconds, or `None`.
     """
     try:
         row = json.loads(line)
@@ -720,6 +770,9 @@ def _newest_row_time(data_path: Path, end: int, field_name: str, horizon: float)
 
     ``end`` is the committed length: rows after it are not the file's yet, so they must not
     place a window the cut cannot reach.
+
+    Returns:
+        The newest time, or `None` when no row has one.
     """
     start = max(0, end - _COMPACT_TAIL_BYTES)
     with data_path.open("rb") as handle:
@@ -742,6 +795,9 @@ def _compact_cut(data_path: Path, field_name: str, cutoff: float, horizon: float
     boundary and never past the committed bytes. A row stamped past ``horizon`` is passed
     over as one without a time: taken as recent, one such row near the start of the file
     would keep everything after it, and the file would grow again without end.
+
+    Returns:
+        The byte offset where the kept rows start.
     """
     offset = 0
     with data_path.open("rb") as handle:
@@ -801,7 +857,13 @@ def compact_window(
     (``DownloadLock(data_path.parent.parent)``, the job's ``metrics``): a download that
     planned its resume before the compaction, or writes the file through a descriptor it
     opened before, would otherwise extend it at an offset that no longer exists.
-    """
+
+    Returns:
+        The bytes freed.
+
+    Raises:
+        ValueError: If ``keep_seconds`` is not a finite, non-negative number.
+    """  # noqa: DOC501 - the OSError raised below is handled in the function
     if not math.isfinite(keep_seconds) or keep_seconds < 0:
         raise ValueError(f"keep_seconds must be a finite number of seconds, not {keep_seconds!r}")
     manifest = read_manifest(manifest_path)
@@ -1011,8 +1073,10 @@ class Background:
 
 
 class Beside:
-    """Run ``operation`` on a daemon thread while the caller does its own share;
-    :meth:`result` waits for it and returns its value or raises its error."""
+    """Run ``operation`` on a daemon thread while the caller does its own share.
+
+    :meth:`result` waits for it and returns its value or raises its error.
+    """
 
     def __init__(self, operation: Callable[[], _T], *, name: str):
         self._outcome: list[Any] = []

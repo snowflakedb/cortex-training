@@ -42,6 +42,8 @@ from cortex_training.client.core import Hardware
 from cortex_training.client.core import InferenceConfig
 from cortex_training.client.core import JobType
 from cortex_training.client.core import ModelDeploymentSpec
+from cortex_training.client.core import ModelDeploymentWaitError
+from cortex_training.client.core import ModelDeploymentWaitTimeout
 from cortex_training.client.core import NoChunksError
 from cortex_training.client.core import SubJobConfig
 from cortex_training.client.core import TrainingConfig
@@ -72,6 +74,8 @@ __all__ = [
     "InvalidPageToken",
     "JobType",
     "ModelDeploymentSpec",
+    "ModelDeploymentWaitError",
+    "ModelDeploymentWaitTimeout",
     "NoChunksError",
     "SubJobConfig",
     "TrainingConfig",

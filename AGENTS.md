@@ -6,9 +6,10 @@ from the root of this repository:
 ```bash
 uv pip install -e ".[dev]"
 python3 -m pytest tests/ -q
+ruff check
 ```
 
-All tests must pass.
+All tests must pass, and `ruff check` must report no errors.
 
 ## Context
 
@@ -24,6 +25,42 @@ The reference documents in this repository are the contract to code against:
   Treat it as the source of truth for anything a customer can observe, and
   update it in the same change as the client whenever the wire behavior moves.
 - `docs/reference/cli.md` — commands, flags, configuration, environment vars.
+
+## Public API docstrings
+
+Public docstrings are customer documentation: each PyPI release's docstrings are
+rendered verbatim into the Cortex Training API reference on docs.snowflake.com. Fix
+API wording here, never in the docs repository. "Public" means the names in
+`cortex_training.__all__` and the public members of exported classes.
+
+Two required checks enforce the mechanical rules, and both run with the commands at the
+top of this file. `ruff check` covers Google-style structure (summary, `Args:`,
+`Returns:`, `Raises:`); its rules and file list are in `pyproject.toml`.
+`tests/test_public_api_docstrings.py` covers what Ruff can't, such as private names in
+public signatures, repository paths, wire details, and internal service names; its
+failure message says how to fix each violation.
+
+When a check gets in the way:
+
+- Exporting a name from a new module: add the module to `[tool.ruff] include` and the
+  name to that module's `__all__`. The test tells you when one is missing.
+- `DOC501` names a helper that returns the real exception
+  (`raise _server_failure(RuntimeError(...))`): document the real exception and put
+  `# noqa: DOC501 - <reason>` on the docstring's closing line. Don't hide a `raise` by
+  assigning the exception to a variable first.
+- Fix the docstring rather than adding `noqa` on public code or an entry to
+  `tests/public_api_docstrings_baseline.txt`. A baseline entry needs a reason, and the
+  test fails once it's stale.
+
+What no check catches, so reviewers look for it:
+
+- Describe observable behavior (inputs, outputs, errors, side effects), not mechanism
+  such as chunking, retry rules, storage layout, or internal routes.
+- Name only what the reader can use: exported classes, public methods, and the
+  exceptions a call raises.
+- Use contractions, the serial comma, "or" instead of a slash, units for numbers
+  ("300 to 604,800 seconds"), "might" or "can" instead of "may", and American spelling
+  outside literal values (`cancelled` stays as a status value).
 
 ## Troubleshooting a user's setup
 

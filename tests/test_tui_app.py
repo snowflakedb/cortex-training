@@ -4300,7 +4300,7 @@ TUI_CALLS = ("get_job", "list_jobs", "list_jobs_page", "for_job", "tail_logs", "
 _ENGINE = {"max_workers", "progress", "on_chunk", "sub_job_ids", "strict", "stale_after_seconds",
            "transfer_timeout_seconds", "preview_seconds", "on_preview"}
 NOT_IN_DEMO = {
-    "get_job": {"retry_on"},
+    "get_job": {"_retry_on"},
     "tail_logs": {"sub_job_type"},
     "download_metrics": _ENGINE,
     "download_stdout_logs": _ENGINE,
