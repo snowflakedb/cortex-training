@@ -2682,8 +2682,13 @@ rejected for every other provider. Unknown keys are rejected.
 | `loss_decay_gamma` | `7.0` | Per-slot loss decay; greater than zero, or `null` to disable |
 | `selector_loss_alpha` | `1.0` | Weight of the selector loss; zero or greater |
 | `selector_stop_gradient` | `false` | Detach the selector's inputs so only its own parameters train on its loss |
-| `objective_chunk_blocks` | `128` | Blocks per vocabulary-projection chunk; bounds memory |
+| `lk_loss_type` | none | Acceptance-aware token objective in place of cross-entropy: `alpha` (equal to cross-entropy on hard labels), `tv` (one minus the label's probability), or `lambda` (a mix of the two) |
+| `kl_scale` | `1.0` | Scale of the cross-entropy weight in the `lambda` objective |
+| `kl_decay` | `1.0` | How fast the `lambda` objective's cross-entropy weight decays as the acceptance rate rises |
+| `objective_chunk_blocks` | `128` | Blocks per vocabulary-projection chunk; bounds memory. `0` projects all blocks at once |
+| `teacher_metrics` | `false` | Also report the `dflash/teacher/*` agreement metrics, computed from the target's final hidden state; they do not change the loss |
 | `seed` | `0` | Seed for draft initialization and anchor sampling |
+| `target_from_source_checkpoint` | `false` | Train against the fine-tune of `model_name` whose weights-only checkpoint `source_checkpoint_info` names, instead of `model_name`; see [Training a draft for a fine-tune](#training-a-draft-for-a-fine-tune) |
 
 A `dflash2` job is rejected when any of these hold:
 
@@ -2721,14 +2726,75 @@ training = SubJobConfig.training_job(
 )
 ```
 
+#### Training a draft for a fine-tune
+
+A draft speeds up the model it was trained against. To train one for a model
+fine-tuned on Cortex Training, keep `model_name` as the base the fine-tune
+started from, name the fine-tune's **weights-only** checkpoint in the training
+sub-job's `source_checkpoint_info` (`checkpoint_id` and `source_job_id`), and set
+`extra_training["dflash2"]["target_from_source_checkpoint"]` to `true`. The
+checkpoint becomes the frozen target. It is not restored as a resume of the
+draft, so no optimizer state is read from it. A checkpoint of a LoRA fine-tune
+holds its adapter, which is merged into the base before training.
+
+```python
+training = SubJobConfig.training_job(
+    model_name="Qwen/Qwen3-8B",  # the base of the fine-tune
+    optimizer={"name": "AdamW", "lr": 1e-4},
+    max_seq_len=2048,
+    train_batch_size=8,
+    n_gpus=8,
+    source_checkpoint_info={"checkpoint_id": "checkpoint-id", "source_job_id": "fine-tuning-job-id"},
+    extra_training={
+        "model_provider": "dflash2",
+        "activation_checkpointing": False,
+        "dflash2": {"draft_config": draft_config, "target_from_source_checkpoint": True},
+    },
+)
+```
+
+A fine-tune uploaded to a stage is named by `source_checkpoint_info.external_stage_path`
+instead, without `target_from_source_checkpoint`: imported weights are always
+the job's model, which for `dflash2` is the target. As for any import,
+`model_name` has to be a supported base that the uploaded directory matches (see
+[Start a Job From Your Own Weights](../guides/training/external-weights.md)). The
+request alone cannot show a mismatch, so a client cannot check a stage directory
+against `model_name` the way it can check a saved checkpoint's job.
+
+`target_from_source_checkpoint` must be `true` or `false`, and `true` is rejected
+unless `source_checkpoint_info` names a checkpoint saved by Cortex Training. A
+checkpoint that is not weights-only fails the job when it starts.
+
+Every weights-only checkpoint of a draft trained against a fine-tune, whether
+named by checkpoint or imported from a stage, carries the fine-tune under
+`target/` next to the draft's own `config.json` and `model.safetensors`, so it
+is the size of both.
+
+Resuming such a job from its own `resumable` checkpoint is not supported, and
+the service does not reject it: the resumed job has no fine-tune to carry, so
+its later saves have no `target/`, and an endpoint serving one of them serves
+`model_name` as the target. Start a new job from the fine-tune instead. The
+DFlash2 recipe refuses a job config that names a `source_checkpoint_info` of its
+own next to a fine-tune.
+
 #### Serving a trained draft
 
 To serve a draft trained with the `dflash2` provider, set
 `vllm_config.speculative_config.from_source_checkpoint` to `true` instead of
 `model`, and name the training job's weights-only checkpoint in
 `source_checkpoint_info` (`checkpoint_id` and `source_job_id`). The checkpoint
-becomes the draft model, `model_name` stays the target, and the flag is not
-forwarded to vLLM. The checkpoint is not treated as a LoRA adapter.
+becomes the draft model, `model_name` is the target unless the checkpoint
+carries one (see below), and the flag is not forwarded to vLLM. The checkpoint
+is not treated as a LoRA adapter.
+
+When the checkpoint carries a `target/` folder (a draft trained for a
+fine-tune), that folder is served as the target instead of `model_name`, which
+must still be the fine-tune's base. When that fine-tune is a LoRA fine-tune,
+set `inference_config.peft_config` as you would to sample from its own
+checkpoint; without it the job fails at startup rather than serving the base.
+Whether the fine-tune is LoRA is known only from the checkpoint, so the request
+is not rejected when it is created: the failure comes when the sampling job
+starts, after the draft has trained. Set `peft_config` up front.
 
 The flag is rejected unless all of these hold:
 
