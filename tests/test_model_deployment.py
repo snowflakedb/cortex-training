@@ -214,7 +214,11 @@ def test_checkpoint_spec_translates_only_public_checkpoint_identity():
         (lambda value: value.update(extra=True), "unsupported field"),
         (
             lambda value: value["deployment"].update({"class": "PRODUCTION"}),
-            'deployment.class must be "EVALUATION"; only EVALUATION is supported today',
+            "a PRODUCTION deployment needs a 'checkpoint' or 'registry_model' source",
+        ),
+        (
+            lambda value: value["deployment"].update({"class": "STAGING"}),
+            'deployment.class must be "EVALUATION" or "PRODUCTION"',
         ),
         (
             lambda value: value["source"].update(stage_credentials={"token": "x"}),
@@ -1047,7 +1051,7 @@ def _broken(**changes):
         (_broken(num_replicas=0), "num_replicas must be a positive integer"),
         (_broken(num_replicas=2.5), "num_replicas must be a positive integer"),
         (_broken(num_replicas=True), "num_replicas must be a positive integer"),
-        (_broken(vllm_config=None), "vllm_config is required"),
+        (_broken(vllm_config="tp=2"), "vllm_config must be an object"),
         (_broken(n_gpus=7.0), "inconsistent replica GPU totals"),
         (_broken(max_model_len=4096.0), "inconsistent sequence lengths"),
         (_broken(model_name=""), "model_name must be a non-empty string"),

@@ -527,7 +527,7 @@ def test_tc10_errors_are_clear_and_hide_internals(spec_dir):
         ({"min_replicas": 0}, "deployment.min_replicas must be a positive integer"),
         ({"min_replicas": 1.5}, "deployment.min_replicas must be a positive integer"),
         ({"min_replicas": True}, "deployment.min_replicas must be a positive integer"),
-        ({"class": "PRODUCTION"}, 'deployment.class must be "EVALUATION"'),
+        ({"class": "PRODUCTION"}, "a PRODUCTION deployment needs a 'checkpoint' or 'registry_model' source"),
     ],
 )
 def test_tc10_invalid_specs_are_rejected_before_sending(

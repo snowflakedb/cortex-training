@@ -112,6 +112,7 @@ from cortex_training.client.optimizer import normalize_optimizer_config
 from cortex_training.client.peft import normalize_lora_peft_config
 from cortex_training.client.telemetry import CachedSessionTokenProvider
 from cortex_training.client.telemetry import OtlpMetricEmitter
+from cortex_training import model_registry as _registry
 from cortex_training.model_deployment import DEPLOYMENT_CLASS
 from cortex_training.model_deployment import DEPLOYMENT_GPUS_PER_REPLICA
 from cortex_training.model_deployment import DEPLOYMENT_GPU_TYPE
@@ -137,6 +138,8 @@ from cortex_training.model_deployment import JOB_FIELD_SUBMITTED_BY
 from cortex_training.model_deployment import JOB_REASON_CANCELLED_BY_CLIENT
 from cortex_training.model_deployment import JOB_STATUS_TO_DEPLOYMENT_STATUS
 from cortex_training.model_deployment import MODEL_DEPLOYMENT_CLASS
+from cortex_training.model_deployment import MODEL_DEPLOYMENT_CLASSES
+from cortex_training.model_deployment import PRODUCTION_DEPLOYMENT_CLASS
 from cortex_training.model_deployment import MODEL_DEPLOYMENT_ID_PREFIX
 from cortex_training.model_deployment import ModelDeploymentSpec
 from cortex_training.model_deployment import OUT_BASE_URL
@@ -168,6 +171,8 @@ from cortex_training.model_deployment import SOURCE_MODEL
 from cortex_training.model_deployment import SOURCE_TYPE
 from cortex_training.model_deployment import SOURCE_TYPE_BASE_MODEL
 from cortex_training.model_deployment import SOURCE_TYPE_CHECKPOINT
+from cortex_training.model_deployment import SOURCE_TYPE_REGISTRY_MODEL
+from cortex_training.model_deployment import WIRE_MODEL_REGISTRY
 from cortex_training.model_deployment import SPEC_DEPLOYMENT
 from cortex_training.model_deployment import SPEC_INFERENCE
 from cortex_training.model_deployment import SPEC_SOURCE
@@ -1709,7 +1714,7 @@ def create_job_body_from_job(job: Mapping[str, Any], *, experiment_name: str | N
 
 
 def _model_deployment_sub_job(job: Any) -> dict[str, Any] | None:
-    """Return a job's sub-job if the job is an ``EVALUATION`` deployment, else ``None``."""
+    """Return a job's sub-job if the job is an ``EVALUATION`` or ``PRODUCTION`` deployment, else ``None``."""
     if not isinstance(job, dict):
         return None
     sub_jobs = job.get("sub_jobs")
@@ -1723,7 +1728,7 @@ def _model_deployment_sub_job(job: Any) -> dict[str, Any] | None:
     inference_config = sub_job.get(WIRE_INFERENCE_CONFIG)
     if not isinstance(inference_config, dict):
         return None
-    if inference_config.get(WIRE_DEPLOYMENT_CLASS) != MODEL_DEPLOYMENT_CLASS:
+    if inference_config.get(WIRE_DEPLOYMENT_CLASS) not in MODEL_DEPLOYMENT_CLASSES:
         return None
     return sub_job
 
@@ -1762,29 +1767,35 @@ def _model_deployment_metadata(
         raise ValueError("the requested resource is not a model deployment")
     inference_config = sub_job[WIRE_INFERENCE_CONFIG]
     vllm_config = inference_config.get(WIRE_VLLM_CONFIG)
-    if not isinstance(vllm_config, dict):
-        raise ValueError(
-            f"invalid marked deployment: {WIRE_INFERENCE_CONFIG}.{WIRE_VLLM_CONFIG} is required"
-        )
 
     # Every count the server stored for the deployment must be a positive whole
     # number. The error location is built from the key so the two cannot drift
     # apart.
-    vllm_location = f"{WIRE_INFERENCE_CONFIG}.{WIRE_VLLM_CONFIG}"
-    replicas, total_gpus, max_seq_len, gpus_per_replica, max_model_len = (
-        _deployment_int(container.get(key), location=f"{location}.{key}")
-        for container, location, key in (
-            (inference_config, WIRE_INFERENCE_CONFIG, WIRE_NUM_REPLICAS),
-            (inference_config, WIRE_INFERENCE_CONFIG, WIRE_N_GPUS),
-            (inference_config, WIRE_INFERENCE_CONFIG, WIRE_MAX_SEQ_LEN),
-            (vllm_config, vllm_location, WIRE_TENSOR_PARALLEL_SIZE),
-            (vllm_config, vllm_location, WIRE_MAX_MODEL_LEN),
-        )
+    replicas, total_gpus, max_seq_len = (
+        _deployment_int(inference_config.get(key), location=f"{WIRE_INFERENCE_CONFIG}.{key}")
+        for key in (WIRE_NUM_REPLICAS, WIRE_N_GPUS, WIRE_MAX_SEQ_LEN)
     )
+    if isinstance(vllm_config, dict):
+        vllm_location = f"{WIRE_INFERENCE_CONFIG}.{WIRE_VLLM_CONFIG}"
+        gpus_per_replica, max_model_len = (
+            _deployment_int(vllm_config.get(key), location=f"{vllm_location}.{key}")
+            for key in (WIRE_TENSOR_PARALLEL_SIZE, WIRE_MAX_MODEL_LEN)
+        )
+        if max_model_len != max_seq_len:
+            raise ValueError("invalid marked deployment: inconsistent sequence lengths")
+    elif vllm_config is None:
+        # A deployment made through the deployments route (for example from a
+        # registered model version) stores no engine settings; the server chose
+        # the GPUs per replica, so they follow from the totals.
+        if total_gpus % replicas:
+            raise ValueError("invalid marked deployment: inconsistent replica GPU totals")
+        gpus_per_replica = total_gpus // replicas
+    else:
+        raise ValueError(
+            f"invalid marked deployment: {WIRE_INFERENCE_CONFIG}.{WIRE_VLLM_CONFIG} must be an object"
+        )
     if total_gpus != replicas * gpus_per_replica:
         raise ValueError("invalid marked deployment: inconsistent replica GPU totals")
-    if max_model_len != max_seq_len:
-        raise ValueError("invalid marked deployment: inconsistent sequence lengths")
 
     # The server already admitted this deployment, so admission rules (supported
     # models, GPU minimums and shapes) are not re-checked here: a model or shape
@@ -1795,6 +1806,13 @@ def _model_deployment_metadata(
     checkpoint = sub_job.get(WIRE_SOURCE_CHECKPOINT_INFO)
     if checkpoint is None:
         model_source = {SOURCE_TYPE: SOURCE_TYPE_BASE_MODEL, SOURCE_MODEL: model_name}
+    elif isinstance(checkpoint, dict) and checkpoint.get(WIRE_MODEL_REGISTRY) is not None:
+        # The server keeps the version's folders, not its name, so only the
+        # source type and the base model it serves can be shown.
+        model_source = {SOURCE_TYPE: SOURCE_TYPE_REGISTRY_MODEL, SOURCE_MODEL: model_name}
+    elif isinstance(checkpoint, dict) and checkpoint.get("is_external") is True:
+        # Weights imported from a stage: the stage path is not echoed back.
+        model_source = {SOURCE_TYPE: "external", SOURCE_MODEL: model_name}
     elif isinstance(checkpoint, dict):
         # A checkpoint source needs both IDs as non-empty strings.
         for key in (WIRE_SOURCE_JOB_ID, WIRE_CHECKPOINT_ID):
@@ -2515,6 +2533,16 @@ def _artifact_login_options() -> dict[str, Any]:
     if "platform_detection_timeout_seconds" not in DEFAULT_CONFIGURATION:
         return {}
     return {"platform_detection_timeout_seconds": 0.0}
+
+
+# A Snowflake query ID, which a registration's operation ID is.
+_QUERY_ID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def _require_query_id(operation: Any) -> None:
+    """Reject anything but a query ID before it reaches a URL or the Connector."""
+    if not isinstance(operation, str) or not _QUERY_ID_RE.fullmatch(operation):
+        raise ValueError(f"not a registration operation ID: {operation!r}")
 
 
 _PLAIN_IDENTIFIER_RE = re.compile(r"[A-Z_][A-Z0-9_$]*")
@@ -3670,10 +3698,20 @@ class CortexTrainingClient:
         return job
 
     def create_model_deployment(
-        self, spec: ModelDeploymentSpec | Mapping[str, Any]
+        self,
+        spec: ModelDeploymentSpec | Mapping[str, Any],
+        *,
+        register: bool = False,
+        model: str | None = None,
+        version: str | None = None,
     ) -> dict[str, Any]:
-        """Create an evaluation deployment and return only its public metadata.
+        """Create a deployment and return only its public metadata.
 
+        A ``PRODUCTION`` deployment with a checkpoint source first registers the
+        checkpoint as a model version, waits for it, and deploys that version.
+        ``register=True`` does the same for an ``EVALUATION`` deployment, which
+        otherwise serves the checkpoint directly. The version is
+        ``JOB_<job>/CP_<checkpoint>`` unless ``model`` / ``version`` name it.
         See ``docs/reference/rest-api.md`` section 14.
         """
         raw_spec = (
@@ -3684,7 +3722,43 @@ class CortexTrainingClient:
         spec = ModelDeploymentSpec.from_dict(
             dict(raw_spec) if isinstance(raw_spec, Mapping) else raw_spec
         )
+        if spec.source_type == SOURCE_TYPE_CHECKPOINT and (
+            register or spec.deployment_class == PRODUCTION_DEPLOYMENT_CLASS
+        ):
+            registered_model, registered_version = self.register_checkpoint_for_deployment(
+                spec.source_job_id, spec.checkpoint_id, model=model, version=version
+            )
+            spec = replace(
+                spec,
+                source_type=SOURCE_TYPE_REGISTRY_MODEL,
+                registry_model=registered_model,
+                registry_version=registered_version,
+                source_job_id=None,
+                checkpoint_id=None,
+            )
+        elif register:
+            raise ValueError("register needs a spec whose source.type is 'checkpoint'")
         try:
+            if spec.source_type == SOURCE_TYPE_REGISTRY_MODEL:
+                # Only the deployments route can serve a registered version. It
+                # resolves a model name against the session's defaults, so the
+                # name is sent fully qualified.
+                spec = replace(
+                    spec,
+                    registry_model=_registry.qualify_model_name(
+                        spec.registry_model, self.database, self.schema
+                    ),
+                )
+                response = self._send(
+                    "POST",
+                    f"{self._prefix}/deployments",
+                    json=spec._to_deployments_body(),
+                    retry_on=_is_connect_error,
+                ).json()
+                deployment_id = _deployment_id_from_job_id(response.get(JOB_FIELD_JOB_ID))
+                return _pending_model_deployment_metadata(
+                    spec, deployment_id, self.model_deployment_base_url
+                )
             if spec.source_type == SOURCE_TYPE_CHECKPOINT:
                 spec = replace(
                     spec, model_name=self._checkpoint_source_model_name(spec.source_job_id)
@@ -3713,6 +3787,317 @@ class CortexTrainingClient:
         raise ValueError(
             f"{SPEC_SOURCE}.{SOURCE_JOB_ID} {job_id} has no training sub-job model_name"
         )
+
+    # ------------------------------------------------------------------
+    # Registered model versions (``cortex-training model``). See
+    # ``docs/reference/rest-api.md`` section 16.
+
+    @_track_operation("register_checkpoint")
+    def register_checkpoint(
+        self,
+        job_id: str,
+        checkpoint_id: str,
+        *,
+        model: str | None = None,
+        version: str | None = None,
+        comment: str | None = None,
+    ) -> dict[str, Any]:
+        """Start registering a saved weights-only checkpoint as a model version.
+
+        ``model`` is ``[[database.]schema.]name`` (the job's database and schema
+        when left out); without ``model`` and ``version`` the server names them
+        ``JOB_<job>`` and ``CP_<checkpoint>``. Returns ``{operation, status:
+        RUNNING}`` while the copy runs, or ``{status: ALREADY_REGISTERED,
+        message}`` when this checkpoint already made that version. The call is
+        not retried once sent: a second call while the first still runs starts a
+        second registration.
+        """
+        body: dict[str, Any] = {}
+        for key, value in (
+            (_registry.REGISTER_MODEL, model),
+            (_registry.REGISTER_VERSION, version),
+            (_registry.REGISTER_COMMENT, comment),
+        ):
+            if value is not None:
+                body[key] = value
+        resp = self._send(
+            "POST",
+            f"{self._prefix}/{quote(job_id, safe='')}/checkpoints/"
+            f"{quote(checkpoint_id, safe='')}:register",
+            json=body,
+            retry_on=_is_connect_error,
+        )
+        data = resp.json() if resp.content else {}
+        if resp.status_code == 200:
+            return {
+                _registry.OUT_STATUS: _registry.OPERATION_ALREADY_REGISTERED,
+                _registry.OUT_MESSAGE: (data or {}).get("status"),
+            }
+        operation = (data or {}).get("job_id")
+        if not isinstance(operation, str) or not _QUERY_ID_RE.fullmatch(operation):
+            raise ValueError("register response did not include an operation ID")
+        return {_registry.OUT_OPERATION: operation, _registry.OUT_STATUS: _registry.OPERATION_RUNNING}
+
+    def _registration_status(self, connection: Any, operation: str) -> dict[str, Any]:
+        """One status read of ``operation`` on an open connector session."""
+        status = connection.get_query_status(operation)
+        state = _registry.operation_state(getattr(status, "name", status))
+        result = {_registry.OUT_OPERATION: operation, _registry.OUT_STATUS: state}
+        if state in (_registry.OPERATION_FAILED, _registry.OPERATION_CANCELLED):
+            try:
+                connection.get_query_status_throw_if_error(operation)
+            except Exception as exc:  # noqa: BLE001 - the error is the result
+                result[_registry.OUT_ERROR] = _redact_secrets(str(exc)).strip()
+            # A cancelled statement ends as FAILED_WITH_ERROR with error 000604.
+            if _registry.CANCELLED_ERROR_CODE in result.get(_registry.OUT_ERROR, ""):
+                result[_registry.OUT_STATUS] = _registry.OPERATION_CANCELLED
+        return result
+
+    @_track_operation("get_registration")
+    def get_registration(self, operation: str) -> dict[str, Any]:
+        """Return ``{operation, status[, error]}`` for one registration."""
+        _require_query_id(operation)
+        connection = self._open_experiment_artifact_connection()
+        try:
+            return self._registration_status(connection, operation)
+        finally:
+            connection.close()
+
+    @_track_operation("wait_for_registration")
+    def wait_for_registration(self, operation: str) -> dict[str, Any]:
+        """Poll a registration until it ends; return its final status.
+
+        A failed or cancelled registration is returned, not raised, with the
+        server's ``error``: nothing of it is left behind. Raises ``TimeoutError``
+        after ``poll_timeout`` seconds; the registration keeps running then.
+        """
+        _require_query_id(operation)
+        deadline = time.monotonic() + self.poll_timeout
+        delay = self.poll_interval
+        connection = self._open_experiment_artifact_connection()
+        try:
+            while True:
+                result = self._registration_status(connection, operation)
+                if result[_registry.OUT_STATUS] != _registry.OPERATION_RUNNING:
+                    return result
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"registration {operation} did not finish within {self.poll_timeout}s; "
+                        "it keeps running"
+                    )
+                delay = self._sleep_with_backoff(delay, deadline)
+        finally:
+            connection.close()
+
+    @_track_operation("cancel_registration")
+    def cancel_registration(self, operation: str) -> dict[str, Any]:
+        """Cancel a running registration and return its status afterwards.
+
+        The registration's statement is cancelled; a cancelled statement leaves
+        no partial model or version. A registration that already ended is
+        reported with its final status.
+        """
+        _require_query_id(operation)
+        self._send(
+            "POST",
+            f"{self.base_url}/api/v2/statements/{operation}/cancel",
+            explain_database=False,
+        )
+        return self.wait_for_registration(operation)
+
+    def _sql_rows(self, statement: str) -> list[dict[str, Any]]:
+        """Run one SQL statement in this client's database and schema; return its rows."""
+        resp = self._send(
+            "POST",
+            f"{self.base_url}/api/v2/statements",
+            json={"statement": statement, "database": self.database, "schema": self.schema},
+        )
+        body = resp.json()
+        columns = [
+            str(column.get("name", "")).lower()
+            for column in ((body.get("resultSetMetaData") or {}).get("rowType") or [])
+        ]
+        return [dict(zip(columns, row)) for row in (body.get("data") or [])]
+
+    def _model_version_spec(self, connection: Any, model: str, version: str) -> dict[str, Any]:
+        """Read ``kind`` and ``base_model`` from one version's ``model/model.yaml``."""
+        # In a snow:// path the model is an identifier (quoted when it is not plain
+        # upper case); the version is written as stored, without quotes.
+        uri = (
+            f"snow://model/{self.database}.{self.schema}.{_sql_identifier(model)}/versions/{version}/"
+            f"{_registry.MODEL_SPEC_PATH}"
+        )
+        with tempfile.TemporaryDirectory(prefix="cortex-training-model-") as folder:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(f"GET {_sql_string_literal(uri)} 'file://{folder}/'")
+            finally:
+                cursor.close()
+            path = Path(folder) / Path(_registry.MODEL_SPEC_PATH).name
+            text = path.read_text(encoding="utf-8") if path.exists() else ""
+        return _registry.parse_model_spec(text)
+
+    @_track_operation("list_registered_versions")
+    def list_registered_versions(
+        self, *, job_id: str | None = None, kind: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Return the registered (``CORTEX_TRAINING``) versions in this schema.
+
+        Each row has ``model``, ``version``, ``kind`` (FULL or LORA),
+        ``base_model``, ``source_job``, ``source_checkpoint``, ``created_on``,
+        and ``comment``. ``job_id`` keeps versions registered from that job;
+        ``kind`` keeps one kind.
+        """
+        wanted_kind = kind.upper() if kind else None
+        if wanted_kind is not None and wanted_kind not in _registry.KINDS:
+            raise ValueError(f"kind must be one of {', '.join(_registry.KINDS)}")
+        models = [
+            row
+            for row in self._sql_rows("SHOW MODELS IN SCHEMA")
+            if str(row.get("model_type", "")).upper() == _registry.MODEL_TYPE_CORTEX_TRAINING
+        ]
+        found: list[dict[str, Any]] = []
+        connection = None
+        try:
+            for model in models:
+                name = model.get("name")
+                for version in self._sql_rows(f"SHOW VERSIONS IN MODEL {_sql_identifier(name)}"):
+                    metadata = _registry.version_metadata(version.get("metadata"))
+                    if job_id is not None and metadata.get(_registry.METADATA_SOURCE_JOB) != job_id:
+                        continue
+                    if connection is None:
+                        connection = self._open_experiment_artifact_connection()
+                    try:
+                        spec = self._model_version_spec(connection, name, version.get("name"))
+                    except Exception:  # noqa: BLE001 - one unreadable spec must not hide the rest
+                        logger.warning("could not read the spec of %s/%s", name, version.get("name"))
+                        spec = {_registry.OUT_KIND: None, _registry.OUT_BASE_MODEL: None}
+                    if wanted_kind is not None and spec[_registry.OUT_KIND] != wanted_kind:
+                        continue
+                    found.append(
+                        {
+                            _registry.OUT_MODEL: name,
+                            _registry.OUT_VERSION: version.get("name"),
+                            _registry.OUT_KIND: spec[_registry.OUT_KIND],
+                            _registry.OUT_BASE_MODEL: spec[_registry.OUT_BASE_MODEL],
+                            _registry.OUT_SOURCE_JOB: metadata.get(_registry.METADATA_SOURCE_JOB),
+                            _registry.OUT_SOURCE_CHECKPOINT: metadata.get(
+                                _registry.METADATA_SOURCE_CHECKPOINT
+                            ),
+                            _registry.OUT_CREATED_ON: version.get("created_on"),
+                            _registry.OUT_COMMENT: version.get("comment"),
+                        }
+                    )
+        finally:
+            if connection is not None:
+                connection.close()
+        return found
+
+    def _model_deployments_using(self, model: str, version: str | None) -> list[dict[str, Any]]:
+        """Named model deployments (``SHOW MODEL DEPLOYMENTS``) whose record names ``model``.
+
+        A failed or ended deployment is included until it is dropped: its record
+        stays, and the server refuses to drop a model a record names. Only
+        deployments with a record are found: an EVALUATION deployment of a
+        registered version keeps no record of which version it serves.
+        """
+        wanted_model = _registry.last_identifier(model)
+        wanted_version = _registry.unquote_identifier(version) if version else None
+        using = []
+        for row in self._sql_rows("SHOW MODEL DEPLOYMENTS IN SCHEMA"):
+            if str(row.get("status", "")).upper() in _registry.ENDED_MODEL_DEPLOYMENT_STATUSES:
+                continue
+            if _registry.last_identifier(str(row.get("model") or "")) != wanted_model:
+                continue
+            if wanted_version is not None and str(row.get("version") or "") != wanted_version:
+                continue
+            using.append(
+                {
+                    "name": row.get("name"),
+                    "status": row.get("status"),
+                    "model": row.get("model"),
+                    "version": row.get("version"),
+                }
+            )
+        return using
+
+    @_track_operation("drop_registered_model")
+    def drop_registered_model(
+        self, model: str, version: str | None = None, *, force: bool = False
+    ) -> dict[str, Any]:
+        """Drop a registered model, or one of its versions.
+
+        First looks for named model deployments that still serve it. If there
+        are any, nothing is dropped unless ``force``: a running deployment keeps
+        serving its local copy, but a restart or scale-out would fail. The
+        result always says which deployments were found.
+        """
+        model = _registry.require_model_name(model)
+        if version is not None:
+            version = _registry.require_version_name(version)
+        deployments = self._model_deployments_using(model, version)
+        result: dict[str, Any] = {
+            _registry.OUT_MODEL: model,
+            _registry.OUT_VERSION: version,
+            _registry.OUT_DEPLOYMENTS: deployments,
+        }
+        if deployments and not force:
+            result[_registry.OUT_DROPPED] = False
+            result[_registry.OUT_WARNING] = (
+                "model deployments still serve this model. Snowflake refuses to drop a model or "
+                "version that a named model deployment uses: drop those deployments first "
+                "(cortex-training model-deployment drop)."
+            )
+            return result
+        if version is None:
+            self._sql_rows(f"DROP MODEL {model}")
+        else:
+            self._sql_rows(f"ALTER MODEL {model} DROP VERSION {version}")
+        result[_registry.OUT_DROPPED] = True
+        return result
+
+    def find_registered_version(self, model: str, job_id: str, checkpoint_id: str) -> str | None:
+        """The version of ``model`` registered from ``job_id``'s ``checkpoint_id``, if any."""
+        model = _registry.require_model_name(model)
+        for version in self._sql_rows(f"SHOW VERSIONS IN MODEL {model}"):
+            metadata = _registry.version_metadata(version.get("metadata"))
+            if (
+                metadata.get(_registry.METADATA_SOURCE_JOB) == job_id
+                and metadata.get(_registry.METADATA_SOURCE_CHECKPOINT) == checkpoint_id
+            ):
+                return version.get("name")
+        return None
+
+    def register_checkpoint_for_deployment(
+        self,
+        job_id: str,
+        checkpoint_id: str,
+        *,
+        model: str | None = None,
+        version: str | None = None,
+    ) -> tuple[str, str]:
+        """Register a checkpoint (or reuse its version) and return ``(model, version)``.
+
+        Waits for the registration. ``model`` defaults to ``JOB_<job>``. Raises
+        ``RuntimeError`` if the registration fails or is cancelled.
+        """
+        result = self.register_checkpoint(job_id, checkpoint_id, model=model, version=version)
+        if result.get(_registry.OUT_OPERATION):
+            result = self.wait_for_registration(result[_registry.OUT_OPERATION])
+            if result[_registry.OUT_STATUS] != _registry.OPERATION_SUCCEEDED:
+                message = f"registering checkpoint {checkpoint_id} {result[_registry.OUT_STATUS].lower()}"
+                if result.get(_registry.OUT_ERROR):
+                    message += f": {result[_registry.OUT_ERROR]}"
+                raise RuntimeError(message)
+        target = _registry.qualify_model_name(
+            model or _registry.default_model_name(job_id), self.database, self.schema
+        )
+        found = self.find_registered_version(target, job_id, checkpoint_id)
+        if found is None:
+            raise RuntimeError(
+                f"checkpoint {checkpoint_id} was registered, but its version of {target} was not found"
+            )
+        return target, found
 
     @staticmethod
     def _normalize_job_status(status) -> str:
@@ -3904,6 +4289,16 @@ class CortexTrainingClient:
                 return {OUT_DEPLOYMENT: deployment_id, OUT_DROPPED: True}
             raise
         status = _model_deployment_status(job)
+        sub_job = _model_deployment_sub_job(job) or {}
+        if (sub_job.get(WIRE_INFERENCE_CONFIG) or {}).get(
+            WIRE_DEPLOYMENT_CLASS
+        ) == PRODUCTION_DEPLOYMENT_CLASS:
+            # Job cancel refuses a PRODUCTION deployment; only the deployments
+            # route ends it. It also removes its MODEL DEPLOYMENT record, which
+            # outlives a failed or ended deployment and keeps its model from
+            # being dropped, so it is sent whatever the status. A repeat is a 200.
+            self._send("DELETE", f"{self._prefix}/deployments/{deployment_id}")
+            return {OUT_DEPLOYMENT: deployment_id, OUT_DROPPED: True}
         if status in {DEPLOYMENT_STATUS_FAILED, DEPLOYMENT_STATUS_TERMINATED}:
             return {OUT_DEPLOYMENT: deployment_id, OUT_DROPPED: False, OUT_STATUS: status}
         if status not in {DEPLOYMENT_STATUS_DROPPING, DEPLOYMENT_STATUS_DROPPED}:
